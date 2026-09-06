@@ -71,6 +71,7 @@ mod project_exit;
 mod project_map;
 mod project_policy;
 mod project_readings;
+mod prompt_budget;
 mod proposals;
 mod recurrence;
 mod redact;

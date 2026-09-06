@@ -71,6 +71,35 @@ export interface RunDetail {
    * records was reachable only by reading the database.
    */
   successor_run_id: number | null;
+  /**
+   * How much of this run's prompt the daemon wrote itself, as an estimated
+   * token count: the MCP tool schemas it announced, the standing instructions
+   * it appended, the helper definitions it passed, and the prompt.
+   *
+   * `estimate` and not `tokens`, in the field name and in the label on screen,
+   * because it is four characters to the token and nothing finer — there is no
+   * tokenizer anywhere in this product. `core/src/prompt_budget.rs` holds the
+   * ruler and the argument for it.
+   *
+   * `null` for a run whose prompt this daemon did not author — the local model,
+   * the Codex CLI — and for every run launched before the column existed.
+   * Neither of those is a run that wrote nothing.
+   */
+  authored_prompt_estimate: number | null;
+  /**
+   * Everything else in the prompt, as an estimate: the CLI's own.
+   *
+   * **One residual, never a breakdown.** The CLI's system prompt, its built-in
+   * tool definitions, whatever it loaded from a CLAUDE.md and the conversation
+   * itself are all in this one number, undivided, because nothing the daemon
+   * receives separates them — and CLAUDE.md in particular is not something the
+   * daemon ever sends, so its size is not a thing this product can know. A
+   * field here claiming to split it out would be inventing the number.
+   *
+   * `null` whenever either side is unknown, which includes every run that
+   * reported no token usage at all.
+   */
+  cli_own_estimate: number | null;
 }
 
 /** What a run has written since a byte offset, while it is still writing. */

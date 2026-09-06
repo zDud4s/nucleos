@@ -8,6 +8,7 @@ import { ApiRefusal } from "./client";
 import {
   declaredRule,
   declaredVerdict,
+  foldPathPrefix,
   foldPrefix,
   useDeclarableGithubOps,
   useDeclareGithubOp,
@@ -75,15 +76,23 @@ const ADMITTED = CATALOGUE.filter((operation) => operation.declarable).map(
 /** The day a rule the fixture declares was written down. Any day that is not today will do. */
 const DECLARED_ON = "2026-03-14 09:41:00";
 
-interface StoredRule {
-  verdict: Verdict;
-  /** `null` is a rule with no justification, which is a state the table really has. */
-  note: string | null;
-  /**
-   * `created_at`, and the fake keeps it through a redeclaration because the daemon does:
-   * `DO UPDATE SET verdict = …, note = …` names two columns and not this one.
-   */
-  created_at: string;
+/**
+ * PURE: the identity of a rule, which is the TOOL and the folded prefix and never the prefix alone.
+ *
+ * The daemon's unique index is `(project_id, tool, prefix)`, so a project may hold `deny
+ * migrations` — a command — and `deny Edit migrations` — a directory — at the same time. A fake
+ * keyed on the prefix would let one of them overwrite the other and answer 204 about it, which
+ * would make every assertion written above it vacuous.
+ *
+ * The separator is a NUL because no tool and no prefix can contain one. Sorted, these keys come out
+ * in the daemon's own `ORDER BY tool, prefix`: `\u0000` precedes every letter, so the command rules
+ * lead, and `Edit` precedes `Write`.
+ *
+ * WHICH fold follows the tool, exactly as `project_policy` chooses between `fold_prefix` and
+ * `fold_path_prefix`: a command loses its case and a path keeps it.
+ */
+function ruleKey(tool: string | null, prefix: string): string {
+  return `${tool ?? ""}\u0000${tool === null ? foldPrefix(prefix) : foldPathPrefix(prefix)}`;
 }
 
 /**
@@ -94,7 +103,8 @@ interface StoredRule {
  * shell shows afterwards is the list the daemon is now enforcing.
  */
 function fakeDaemon(project = "alpha") {
-  const rules = new Map<string, StoredRule>();
+  /** Keyed by {@link ruleKey}, holding the whole row the GET serves. */
+  const rules = new Map<string, ShellRule>();
   const ops = new Set<string>();
   const targets = new Set<string>();
   /*
@@ -129,28 +139,41 @@ function fakeDaemon(project = "alpha") {
 
     if (table === "shell-rules") {
       if (method === "GET") {
-        // `ORDER BY prefix`, over the folded spelling, which is the only one stored. One row per
-        // rule, carrying its own verdict — see `ShellRule` for why that and not two lists.
-        return [...rules.keys()].sort().map((prefix): ShellRule => {
-          const stored = rules.get(prefix) as StoredRule;
-          return { prefix, ...stored };
-        });
+        // `ORDER BY tool, prefix`, over the folded spelling, which is the only one stored. One row
+        // per rule, carrying its own verdict and its own tool — see `ShellRule` for why that and
+        // not two lists, and `ruleKey` for why sorting the keys is that ORDER BY.
+        return [...rules.keys()].sort().map((key) => rules.get(key) as ShellRule);
       }
-      const prefix = foldPrefix(String(body?.prefix ?? ""));
+      // Absent means a rule about a COMMAND, which is the reading every request written before the
+      // field existed had — and `#[serde(default)]` on both request shapes is the daemon saying so.
+      const tool = (body?.tool as string | null | undefined) ?? null;
+      const prefix = tool === null ? foldPrefix(String(body?.prefix ?? "")) : foldPathPrefix(String(body?.prefix ?? ""));
+      const key = ruleKey(tool, String(body?.prefix ?? ""));
       if (method === "POST") {
         // `note = excluded.note`, and not a merge. Whatever arrived is now the note, `null`
         // included — which is the trap `Note` exists to make somebody choose out loud. `created_at`
         // is not in the `DO UPDATE` at all, so a redeclaration keeps the day the rule was first
         // written down.
-        rules.set(prefix, {
+        rules.set(key, {
+          prefix,
+          tool,
           verdict: body?.verdict as Verdict,
           note: (body?.note as string | null | undefined) ?? null,
-          created_at: rules.get(prefix)?.created_at ?? DECLARED_ON,
+          created_at: rules.get(key)?.created_at ?? DECLARED_ON,
         });
         return undefined;
       }
-      if (!rules.delete(prefix)) {
-        throw new ApiRefusal(404, "no_such_rule", `${id} has declared no rule for \`${prefix}\``);
+      if (!rules.delete(key)) {
+        // The tool is in the sentence when there is one, because "there is no rule for
+        // `migrations`" can be false on the very screen it is read on: the other one is still
+        // listed. The command half names the FOLDED spelling, which is what missed.
+        throw new ApiRefusal(
+          404,
+          "no_such_rule",
+          tool === null
+            ? `${id} has declared no rule for \`${prefix}\``
+            : `${id} has declared no \`${tool}\` rule for \`${prefix}\``,
+        );
       }
       return undefined;
     }
@@ -198,8 +221,19 @@ function fakeDaemon(project = "alpha") {
   return {
     call,
     sent,
-    declareRule: (prefix: string, verdict: Verdict, note: string | null = null) => {
-      rules.set(foldPrefix(prefix), { verdict, note, created_at: DECLARED_ON });
+    declareRule: (
+      prefix: string,
+      verdict: Verdict,
+      note: string | null = null,
+      tool: string | null = null,
+    ) => {
+      rules.set(ruleKey(tool, prefix), {
+        prefix: tool === null ? foldPrefix(prefix) : foldPathPrefix(prefix),
+        tool,
+        verdict,
+        note,
+        created_at: DECLARED_ON,
+      });
     },
     declareOp: (opKind: string) => ops.add(opKind),
     declareTarget: (branch: string) => targets.add(branch),
@@ -207,6 +241,11 @@ function fakeDaemon(project = "alpha") {
       integration = arm;
     },
   };
+}
+
+/** One row as the route serves it, for the PURE tests, which have no fake daemon to ask. */
+function shellRow(overrides: Partial<ShellRule> = {}): ShellRule {
+  return { prefix: "npm ci", tool: null, verdict: "allow", note: null, created_at: DECLARED_ON, ...overrides };
 }
 
 /** A cache from the app's own factory, so the retry policy under test is the app's policy. */
@@ -248,9 +287,10 @@ describe("the three reads", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     expect(result.current.data).toEqual([
-      { prefix: "npm ci", verdict: "allow", note: null, created_at: DECLARED_ON },
+      { prefix: "npm ci", tool: null, verdict: "allow", note: null, created_at: DECLARED_ON },
       {
         prefix: "remove-item -recurse",
+        tool: null,
         verdict: "deny",
         note: "never from a worktree",
         created_at: DECLARED_ON,
@@ -348,6 +388,7 @@ describe("declaring", () => {
       await result.current.declare.mutateAsync({
         projectId: "alpha",
         prefix: "Cargo  Fmt",
+        tool: null,
         verdict: "allow",
         note: { write: "formatting cannot break anything" },
       });
@@ -363,13 +404,14 @@ describe("declaring", () => {
    * silent drop, so the body is built rather than spread out of the hook's input — `projectId` is
    * addressing, not a field.
    */
-  it("sends the route's three fields and nothing else", async () => {
+  it("sends the route's four fields and nothing else", async () => {
     const { result } = renderHook(() => useDeclareShellRule(), { wrapper: mount() });
 
     await act(async () => {
       await result.current.mutateAsync({
         projectId: "alpha",
         prefix: "npm ci",
+        tool: null,
         verdict: "allow",
         note: { write: "why" },
       });
@@ -377,7 +419,52 @@ describe("declaring", () => {
 
     const post = fake.sent.find((call) => call.method === "POST");
     expect(post?.path).toBe("/projects/alpha/shell-rules");
-    expect(Object.keys(post?.body ?? {}).sort()).toEqual(["note", "prefix", "verdict"]);
+    expect(Object.keys(post?.body ?? {}).sort()).toEqual(["note", "prefix", "tool", "verdict"]);
+    // `null` is SENT and not left out. The route reads the two the same way, so this costs nothing
+    // on the wire — what it buys is a caller who had to decide which kind of rule they meant.
+    expect(post?.body?.tool).toBeNull();
+  });
+
+  /**
+   * **The tool travels, and the case of a path travels with it.**
+   *
+   * `declare_shell_rule` folds a path through `fold_path_prefix`, which does not lower-case,
+   * because whether a path's case matters is the filesystem's question and the núcleo answers it at
+   * comparison time. A declaration that arrived lower-cased would have thrown that away before the
+   * daemon ever saw it — and on a case-sensitive filesystem a `deny` that cannot match is an allow.
+   */
+  it("declares a rule about a tool, and the path keeps the case it was typed in", async () => {
+    const { result } = renderHook(
+      () => ({ rules: useProjectShellRules("alpha"), declare: useDeclareShellRule() }),
+      { wrapper: mount() },
+    );
+    await waitFor(() => expect(result.current.rules.isSuccess).toBe(true));
+
+    await act(async () => {
+      await result.current.declare.mutateAsync({
+        projectId: "alpha",
+        prefix: "  Core\\Migrations/ ",
+        tool: "Edit",
+        verdict: "deny",
+        note: { write: "sqlx checksums a migration that has already been applied" },
+      });
+    });
+
+    const post = fake.sent.find((call) => call.method === "POST");
+    expect(post?.body?.tool).toBe("Edit");
+    expect(post?.body?.prefix).toBe("  Core\\Migrations/ ");
+
+    await waitFor(() =>
+      expect(result.current.rules.data).toEqual([
+        {
+          prefix: "Core/Migrations",
+          tool: "Edit",
+          verdict: "deny",
+          note: "sqlx checksums a migration that has already been applied",
+          created_at: DECLARED_ON,
+        },
+      ]),
+    );
   });
 
   it("declares a github op and a landing target for a branch that does not exist yet", async () => {
@@ -426,7 +513,7 @@ describe("withdrawing", () => {
     );
 
     await act(async () => {
-      await result.current.forget.mutateAsync({ projectId: "alpha", prefix: "NPM  CI" });
+      await result.current.forget.mutateAsync({ projectId: "alpha", prefix: "NPM  CI", tool: null });
     });
 
     await waitFor(() => expect(result.current.rules.data).toEqual([]));
@@ -435,7 +522,60 @@ describe("withdrawing", () => {
     expect(remove?.path).toBe("/projects/alpha/shell-rules");
     // The typed spelling goes over the wire and the daemon folds it — the shell does not fold on
     // the way out, because a second place that computes the key is a second place it can drift.
-    expect(remove?.body).toEqual({ prefix: "NPM  CI" });
+    expect(remove?.body).toEqual({ prefix: "NPM  CI", tool: null });
+  });
+
+  /**
+   * **A prefix alone no longer names a rule, and the DELETE body is where that is felt.**
+   *
+   * The daemon's `WHERE` matches `(project_id, tool, prefix)`. A project may hold `deny migrations`
+   * as a command and `deny Edit migrations` as a directory at once, so a withdrawal that left the
+   * tool out would take the command rule while the write rule stayed on screen — the failure whose
+   * only symptom is "I deleted it and it is still there".
+   */
+  it("names the tool as well as the prefix, so the other rule of that name survives", async () => {
+    fake.declareRule("migrations", "deny");
+    fake.declareRule("migrations", "deny", "nothing writes a migration by hand", "Edit");
+
+    const { result } = renderHook(
+      () => ({ rules: useProjectShellRules("alpha"), forget: useForgetShellRule() }),
+      { wrapper: mount() },
+    );
+    await waitFor(() => expect(result.current.rules.data).toHaveLength(2));
+
+    await act(async () => {
+      await result.current.forget.mutateAsync({
+        projectId: "alpha",
+        prefix: "migrations",
+        tool: null,
+      });
+    });
+
+    await waitFor(() =>
+      expect(result.current.rules.data).toEqual([
+        {
+          prefix: "migrations",
+          tool: "Edit",
+          verdict: "deny",
+          note: "nothing writes a migration by hand",
+          created_at: DECLARED_ON,
+        },
+      ]),
+    );
+    expect(fake.sent.find((call) => call.method === "DELETE")?.body).toEqual({
+      prefix: "migrations",
+      tool: null,
+    });
+
+    // And named, the write rule goes too — a rule about a tool is withdrawable, not permanent.
+    await act(async () => {
+      await result.current.forget.mutateAsync({
+        projectId: "alpha",
+        prefix: "migrations",
+        tool: "Edit",
+      });
+    });
+    await waitFor(() => expect(result.current.rules.data).toEqual([]));
   });
 
   it("closes a landing target, in the body too", async () => {
@@ -491,7 +631,7 @@ describe("a refusal reaches the caller with its sentence", () => {
     let refused: unknown;
     await act(async () => {
       refused = await result.current
-        .mutateAsync({ projectId: "alpha", prefix: "Remove-Item" })
+        .mutateAsync({ projectId: "alpha", prefix: "Remove-Item", tool: null })
         .catch((error: unknown) => error);
     });
 
@@ -518,7 +658,7 @@ describe("a refusal reaches the caller with its sentence", () => {
     const real = await vi.importActual<typeof import("./client")>("./client");
     const prose =
       "Failed to deserialize the JSON body into the target type: unknown field `notes`, " +
-      "expected one of `prefix`, `verdict`, `note` at line 1 column 52";
+      "expected one of `prefix`, `tool`, `verdict`, `note` at line 1 column 52";
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -541,6 +681,7 @@ describe("a refusal reaches the caller with its sentence", () => {
         .mutateAsync({
           projectId: "alpha",
           prefix: "npm ci",
+          tool: null,
           verdict: "allow",
           note: { write: "why" },
         })
@@ -586,6 +727,7 @@ describe("the note a rule carries", () => {
       await result.current.declare.mutateAsync({
         projectId: "alpha",
         prefix: showing?.prefix ?? "",
+        tool: showing?.tool ?? null,
         verdict: "allow",
         note: { write: showing?.note ?? "" },
       });
@@ -595,6 +737,7 @@ describe("the note a rule carries", () => {
       expect(result.current.rules.data).toEqual([
         {
           prefix: "remove-item",
+          tool: null,
           verdict: "allow",
           note: "nothing here deletes recursively",
           created_at: DECLARED_ON,
@@ -621,6 +764,7 @@ describe("the note a rule carries", () => {
       await result.current.declare.mutateAsync({
         projectId: "alpha",
         prefix: "Remove-Item",
+        tool: null,
         verdict: "allow",
         note: { erase: true },
       });
@@ -629,7 +773,12 @@ describe("the note a rule carries", () => {
     // `null` on the wire and not a missing field. The route's `Option<String>` reads the two the
     // same way, and sending it says out loud that the absence was a decision.
     const post = fake.sent.find((call) => call.method === "POST");
-    expect(post?.body).toEqual({ prefix: "Remove-Item", verdict: "allow", note: null });
+    expect(post?.body).toEqual({
+      prefix: "Remove-Item",
+      tool: null,
+      verdict: "allow",
+      note: null,
+    });
     // And the erasure is visible where the note now is: on the row the GET serves.
     await waitFor(() => expect(result.current.rules.data?.[0].note).toBeNull());
   });
@@ -668,15 +817,60 @@ describe("the spelling a rule is stored under", () => {
     expect(foldPrefix("İnvoke")).toBe("İnvoke");
   });
 
+  /**
+   * **The path fold, and the omission that is the whole of it: it does not lower-case.**
+   *
+   * A mirror of `project_policy::fold_path_prefix` — trim, `\` as `/`, no trailing `/`. A command
+   * is case-insensitive to us, because `Remove-Item` and `remove-item` are one cmdlet whatever the
+   * filesystem thinks; a path's case belongs to the FILESYSTEM, and the núcleo answers that question
+   * at comparison time in `write_denied_by_project`. A preview that lower-cased would show an owner
+   * a path that is not the one being stored — and on a case-sensitive filesystem the stored rule
+   * would be a refusal that can never match, which is an allow.
+   */
+  it("folds a path without touching its case, unlike a command prefix", () => {
+    expect(foldPathPrefix("  Core\\Migrations/ ")).toBe("Core/Migrations");
+    expect(foldPathPrefix("migrations/")).toBe("migrations");
+    expect(foldPathPrefix("docs\\notes")).toBe("docs/notes");
+    // The same string through the two folds, which is the difference stated as one line.
+    expect(foldPrefix("Core/Migrations")).toBe("core/migrations");
+    expect(foldPathPrefix("Core/Migrations")).toBe("Core/Migrations");
+  });
+
+  /**
+   * A prefix and a tool together are a rule's identity, so a lookup that ignored the tool would
+   * answer about the wrong rule — telling a form the `Edit` rule it is about to declare already
+   * exists, and offering it the command rule's justification to keep.
+   */
+  it("tells a rule about a path from a rule about a command of the same name", () => {
+    const rules: ShellRule[] = [
+      shellRow({ prefix: "migrations", tool: null, verdict: "deny" }),
+      shellRow({
+        prefix: "migrations",
+        tool: "Edit",
+        verdict: "deny",
+        note: "nothing writes a migration by hand",
+      }),
+    ];
+
+    expect(declaredRule(rules, "migrations")?.tool).toBeNull();
+    expect(declaredRule(rules, "migrations", "Edit")?.note).toBe(
+      "nothing writes a migration by hand",
+    );
+    // A tool nothing was declared under is not the other rule wearing a different name.
+    expect(declaredRule(rules, "migrations", "Write")).toBeNull();
+    // And the lookup folds by the tool it was given: a path keeps its case, so this misses.
+    expect(declaredRule(rules, "MIGRATIONS", "Edit")).toBeNull();
+    expect(declaredRule(rules, "MIGRATIONS")?.tool).toBeNull();
+  });
+
   it("finds a rule under the spelling somebody typed, on whichever side it sits", () => {
     const rules: ShellRule[] = [
-      { prefix: "npm ci", verdict: "allow", note: null, created_at: DECLARED_ON },
-      {
+      shellRow({ prefix: "npm ci", verdict: "allow" }),
+      shellRow({
         prefix: "remove-item -recurse",
         verdict: "deny",
         note: "never from a worktree",
-        created_at: DECLARED_ON,
-      },
+      }),
     ];
 
     expect(declaredVerdict(rules, "NPM  CI")).toBe("allow");

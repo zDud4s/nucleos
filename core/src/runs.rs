@@ -232,6 +232,77 @@ pub struct RunStatusResponse {
     /// The run that continued this one after a context handoff, when there was one. Without it the
     /// link the handoff records is reachable only by reading the database directly.
     pub successor_run_id: Option<i64>,
+    /// How much of this run's prompt this daemon wrote itself, as an estimated token count.
+    ///
+    /// The MCP tool schemas, `--append-system-prompt`, the `--agents` JSON and the prompt — the four
+    /// things `runner::authored_prompt` prices off the argument vector. `null` for a run this daemon
+    /// did not author a prompt for, and for every run launched before the column existed; neither is
+    /// a run that wrote nothing, which is why this is not defaulted to zero anywhere on the way out.
+    ///
+    /// `estimate` and not `tokens` in the name, and the label on screen says the same. Four
+    /// characters to the token — see `prompt_budget`, which holds the ruler and the argument for it.
+    #[sqlx(default)]
+    pub authored_prompt_estimate: Option<i64>,
+    /// Everything else in the prompt, as an estimate: the CLI's own.
+    ///
+    /// The whole reported prompt minus the part above. **One residual and never a breakdown** — the
+    /// CLI's system prompt, its built-in tool definitions, whatever it loaded from CLAUDE.md and the
+    /// conversation itself are all in here, undivided, because nothing in the stream separates them
+    /// and this daemon does not send the one people ask about. `prompt_budget`'s header is where
+    /// that refusal is argued; this field is where it shows.
+    ///
+    /// `null` whenever either side is unknown, which includes every run that reported no usage at
+    /// all. A zero here means the estimate above met or exceeded the whole reported prompt, which
+    /// happens on a short run because chars/4 overshoots on schema JSON.
+    #[sqlx(default)]
+    pub cli_own_estimate: Option<i64>,
+    /// The stored character count, read only so the estimate above can be derived from it.
+    ///
+    /// Not serialised: the wire contract is estimates, and offering characters beside them would
+    /// invite a second reader to divide by four somewhere else.
+    #[serde(skip)]
+    #[sqlx(default)]
+    pub authored_prompt_chars: Option<i64>,
+    /// Read only to complete the reported prompt total, which is input + cache reads + cache
+    /// creation and not the first of the three — `token_efficiency::Measures::total_prompt_tokens`
+    /// makes the same argument: "any ratio taken from `input_tokens` alone is wrong by omission".
+    ///
+    /// Not serialised, because adding a fourth token count to this response is a separate decision
+    /// from computing a residual with it.
+    #[serde(skip)]
+    #[sqlx(default)]
+    pub cache_creation_tokens: Option<i64>,
+}
+
+impl RunStatusResponse {
+    /// The whole prompt this run reported, or `None` if any of its three parts is missing.
+    ///
+    /// Deliberately the same shape as `token_efficiency::Measures::total_prompt_tokens`, which is
+    /// private to that module and belongs to a different feature. Any of the three being unknown
+    /// makes the total unknown rather than smaller — a run that reported two of three and had the
+    /// third counted as zero would show a residual that is too small by exactly the missing part.
+    fn reported_prompt_tokens(&self) -> Option<i64> {
+        let input = self.input_tokens?;
+        let read = self.cache_read_tokens?;
+        let created = self.cache_creation_tokens?;
+        input.checked_add(read)?.checked_add(created)
+    }
+
+    /// Fills the two derived fields from the columns just read.
+    ///
+    /// Derived on the way out rather than stored: the residual is the difference between something
+    /// written at launch and something written at the end, so a stored copy would be wrong for the
+    /// whole life of a running run and would have to be rewritten to stop being.
+    fn with_prompt_budget(mut self) -> Self {
+        self.authored_prompt_estimate = self
+            .authored_prompt_chars
+            .map(crate::prompt_budget::estimate_from_chars);
+        self.cli_own_estimate = crate::prompt_budget::residual_estimate(
+            self.reported_prompt_tokens(),
+            self.authored_prompt_estimate,
+        );
+        self
+    }
 }
 
 pub async fn create_run(
@@ -804,6 +875,39 @@ async fn append_run_events(pool: &sqlx::SqlitePool, run_id: i64, stdout: &str) {
         .execute(pool)
         .await;
     }
+}
+
+/// Records how much of this run's prompt the daemon itself wrote, in characters.
+///
+/// `None` writes nothing at all, and that is the whole reason this takes an `Option` rather than an
+/// `AuthoredPrompt`: the column is NULL for every run whose prompt is not one this daemon authored —
+/// the local model, the Codex CLI, every fake — and NULL there is a real answer. Writing `0` instead
+/// would say those runs were launched with an empty prompt and no tools, which is a claim about
+/// their contents rather than an admission of not knowing.
+///
+/// In CHARACTERS, not in the estimate. The four-characters-to-the-token ruler belongs to whoever
+/// reads the column, so a row written today is not stuck with today's ruler if the ruler improves.
+///
+/// Best effort, like `append_run_events` above and for the same reason: this is bookkeeping about a
+/// run, and a failure to write it must not turn a launch that is otherwise fine into a failed one.
+///
+/// `pub(crate)` because `spawn_run` is not the only launcher that writes a `runs` row. An assistant
+/// turn inserts its own and spawns its own CLI, and it is the launcher that actually carries an
+/// `--mcp-config` — so a column wired only here would be non-null on every run whose schema cost is
+/// a real zero and null on every run that pays one, which is exactly backwards.
+pub(crate) async fn record_authored_prompt(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+    authored: Option<crate::prompt_budget::AuthoredPrompt>,
+) {
+    let Some(authored) = authored else {
+        return;
+    };
+    let _ = sqlx::query("UPDATE runs SET authored_prompt_chars = ? WHERE id = ?")
+        .bind(authored.total_chars() as i64)
+        .bind(run_id)
+        .execute(pool)
+        .await;
 }
 
 /// How often a LIVE run's context fill is copied from the stream mirror into its row.
@@ -1489,6 +1593,11 @@ fn spawn_run(
                 permission,
                 resume_session_id: resume_session_id.clone(),
                 mcp_config: None,
+                // No server, so no surface for one to announce. Written out beside its pair rather
+                // than left to a default, because the two fields are only ever true together: a box
+                // named here would describe tools this run is never offered, and `authored_prompt`
+                // would charge it for them.
+                mcp_box: None,
                 tool_policy,
                 progress_timeout: Some(progress_timeout),
                 // The brake that was missing. These are the runs nobody is watching, and the
@@ -1534,6 +1643,20 @@ fn spawn_run(
                 run_messages.lock().unwrap().insert(id, messages_tx);
                 request.messages = Some(messages_rx);
             }
+            // What this launch itself wrote into the model's prompt, priced from the request that is
+            // about to become an argument vector — and priced HERE, in the last statement before the
+            // spawn, because `request` is moved into the runner on the very next line and nothing
+            // downstream ever sees those values again.
+            //
+            // The runner decides whether there is anything to say: `authored_prompt` answers `None`
+            // for every runner whose prompt this daemon does not author, and a `None` writes no row
+            // rather than a zero. Recomputing this later from the run's stored `prompt` would be a
+            // second source of truth that omits the three flags — which are most of the number.
+            //
+            // Re-written on every attempt, deliberately: a retry starts a fresh CLI on a fresh
+            // context and pays for the whole prompt again, so the column describes the attempt that
+            // is running rather than the first one that was tried.
+            record_authored_prompt(&pool, id, runner.authored_prompt(&request)).await;
             let result = tokio::time::timeout(
                 run_timeout,
                 runner.run_prompt_with_context_fill(
@@ -3351,9 +3474,14 @@ pub async fn get_run(
     Path(id): Path<i64>,
 ) -> Result<Json<RunStatusResponse>, StatusCode> {
     let run = sqlx::query_as::<_, RunStatusResponse>(
+        // `cache_creation_tokens` and `authored_prompt_chars` are read and not answered: they are
+        // the two inputs `with_prompt_budget` needs to derive the pair of estimates this response
+        // does answer. Selecting them here rather than in a second query keeps the residual and the
+        // numbers it was computed from as one read of one row.
         "SELECT id, project_id, status, gate_status, gate_exit_code, gate_output, exit_code, stdout,
                 stderr, session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens,
-                num_turns, context_fill, steerable, successor_run_id
+                num_turns, context_fill, steerable, successor_run_id, cache_creation_tokens,
+                authored_prompt_chars
          FROM runs WHERE id = ?",
     )
     .bind(id)
@@ -3362,7 +3490,7 @@ pub async fn get_run(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(Json(run))
+    Ok(Json(run.with_prompt_budget()))
 }
 
 /// `?leading=` on `GET /runs/{id}/stop`: how many decisions accompany the last one. Absent is
@@ -6038,6 +6166,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         crate::project_policy::declare_shell_rule(
             &state.pool,
             "proj",
+            None,
             "bash scripts/gates.sh",
             crate::project_policy::Verdict::Allow,
             None,
@@ -10114,5 +10243,189 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
 
         let ids: std::collections::HashSet<i64> = live.iter().map(|row| row.id).collect();
         assert_eq!(ids, std::collections::HashSet::from([running, parked]));
+    }
+
+    /* --------------------------------------------- what the prompt cost us -- */
+
+    /// A request shaped like the one a launch builds, with the three authored flags filled in.
+    ///
+    /// Written out here rather than borrowed from `runner`'s own test helper because that one is
+    /// private to its module — and because the point of this test is that the numbers come off THIS
+    /// struct, so the struct being visible in the test is part of what is being read.
+    fn authored_request() -> crate::runner::RunRequest {
+        crate::runner::RunRequest {
+            prompt: "do the thing".to_string(),
+            env: Vec::new(),
+            cwd: None,
+            permission: crate::runner::Permission::Default,
+            resume_session_id: None,
+            mcp_config: None,
+            mcp_box: None,
+            tool_policy: crate::runner::ToolPolicy::Unrestricted,
+            progress_timeout: None,
+            max_turns: None,
+            session_id: None,
+            fork_session: false,
+            include_partial_messages: false,
+            images: Vec::new(),
+            steerable: false,
+            classifier_governs_tools: false,
+            ambient_mcp: false,
+            model: None,
+            effort: None,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            append_system_prompt: Some("stand up straight".to_string()),
+            denied_tools: Vec::new(),
+            session_name: None,
+            context_window: None,
+            messages: None,
+            allowed_mcp_tools: None,
+        }
+    }
+
+    async fn a_run_row(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('do the thing', 'running', 'real', '2026-09-05T00:00:00+00:00')
+             RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn stored_authored_chars(pool: &sqlx::SqlitePool, id: i64) -> Option<i64> {
+        sqlx::query_scalar("SELECT authored_prompt_chars FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// What the CLI runner says it authored is what lands in the column, in characters.
+    ///
+    /// The assertion is on the ARITHMETIC and not on a literal: the prompt and the instructions are
+    /// both in this test, so their lengths are readable from it, and pinning a byte count would only
+    /// restate them in a form that goes stale when somebody rewords the fixture.
+    #[tokio::test]
+    async fn a_cli_run_records_what_it_authored() {
+        let pool = retention_pool().await;
+        let id = a_run_row(&pool).await;
+        let request = authored_request();
+        let runner = crate::runner::ClaudeCliRunner {
+            model: "claude-sonnet-5".to_string(),
+            plan_model: None,
+            review_model: None,
+        };
+
+        let authored = crate::runner::CommandRunner::authored_prompt(&runner, &request)
+            .expect("the CLI runner authors the prompt it launches");
+        record_authored_prompt(&pool, id, Some(authored)).await;
+
+        assert_eq!(
+            authored.prompt_chars,
+            "do the thing".len(),
+            "the prompt is charged whichever way it travels"
+        );
+        assert_eq!(authored.system_prompt_chars, "stand up straight".len());
+        assert_eq!(
+            authored.schema_chars, 0,
+            "a launch with no --mcp-config is offered no tools, so there is no schema block to pay \
+             for — a real zero rather than an unknown"
+        );
+        assert_eq!(
+            stored_authored_chars(&pool, id).await,
+            Some(authored.total_chars() as i64)
+        );
+    }
+
+    /// Every other runner writes NULL, and NULL is the answer rather than the absence of one.
+    ///
+    /// The local model sends none of these flags and the Codex CLI sends different ones, so a zero
+    /// here would be a claim about their prompts — that they were launched empty — made by a module
+    /// that has never seen either argument vector. This is the same distinction
+    /// `runs.permission_mode` keeps for anything that is not a chat turn.
+    #[tokio::test]
+    async fn a_run_that_is_not_a_cli_run_records_nothing_at_all() {
+        let pool = retention_pool().await;
+        let id = a_run_row(&pool).await;
+        let request = authored_request();
+        let local = crate::runner::OllamaRunner::new(
+            "http://localhost:11434".to_string(),
+            "qwen3:4b".to_string(),
+        );
+
+        let authored = crate::runner::CommandRunner::authored_prompt(&local, &request);
+        assert!(
+            authored.is_none(),
+            "a runner this daemon does not build an argument vector for claimed to author one"
+        );
+        record_authored_prompt(&pool, id, authored).await;
+
+        assert_eq!(
+            stored_authored_chars(&pool, id).await,
+            None,
+            "a run whose prompt we did not write read back as one we wrote nothing into"
+        );
+    }
+
+    /// The two derived readings, and the run that is entitled to neither.
+    ///
+    /// The residual is the whole reported prompt — input plus cache reads plus cache CREATION, never
+    /// the first of the three — minus what we wrote. A run that reported no usage gets `null` for it
+    /// rather than a number, which is the difference between "we do not know" and "the CLI read
+    /// nothing but us".
+    #[tokio::test]
+    async fn the_residual_is_the_whole_reported_prompt_minus_what_we_wrote() {
+        let measured = RunStatusResponse {
+            id: 1,
+            project_id: None,
+            status: "completed".to_string(),
+            gate_status: None,
+            gate_exit_code: None,
+            gate_output: None,
+            exit_code: Some(0),
+            stdout: None,
+            stderr: None,
+            session_id: None,
+            cost_usd: None,
+            input_tokens: Some(1_000),
+            output_tokens: Some(500),
+            cache_read_tokens: Some(20_000),
+            num_turns: Some(3),
+            context_fill: None,
+            steerable: false,
+            successor_run_id: None,
+            authored_prompt_estimate: None,
+            cli_own_estimate: None,
+            authored_prompt_chars: Some(44_000),
+            cache_creation_tokens: Some(9_000),
+        }
+        .with_prompt_budget();
+
+        assert_eq!(measured.authored_prompt_estimate, Some(11_000));
+        assert_eq!(
+            measured.cli_own_estimate,
+            Some(19_000),
+            "the residual must be taken off input + cache reads + cache creation, not off input"
+        );
+
+        let silent = RunStatusResponse {
+            input_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            ..measured
+        }
+        .with_prompt_budget();
+
+        assert_eq!(silent.authored_prompt_estimate, Some(11_000));
+        assert_eq!(
+            silent.cli_own_estimate, None,
+            "a run that reported no usage has no residual, and certainly not the whole of what we \
+             wrote"
+        );
     }
 }

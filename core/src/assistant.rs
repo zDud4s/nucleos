@@ -1606,7 +1606,25 @@ async fn send_message_inner(
     };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().to_string();
-    let config = build_mcp_config(&exe, errand.as_ref().map(|turn| turn.errand.id));
+    // The box this turn's server will serve, named ONCE and then used twice: it is the argument
+    // `build_mcp_config` is called with on the next line, and the value that travels to the launch
+    // as `RunRequest::mcp_box`, where `runner::authored_prompt` prices the schema block by it.
+    //
+    // A local variable rather than the same expression written out again at the launch, and that is
+    // the whole point of it existing. The config file and the price have to describe the same
+    // server, and the only way to guarantee that is for both to read one evaluation. Recovering the
+    // box at the far end — from `mcp_path`, from the file's contents, or from the chat's errand row
+    // read a second time — would be a number that looks measured, agrees with the file until
+    // somebody changes one side, and announces its disagreement to nobody. An errand's server
+    // advertises 6 tools where an unboxed one advertises 48, so the two answers differ by roughly
+    // twelve to one, and the wrong one is not obviously wrong on the page.
+    //
+    // `notebook` on `TurnLaunch` carries this same errand's row, and is deliberately not what the
+    // box is read from: it is set by its own expression for its own purpose — where the answer is
+    // written afterwards — and two expressions that happen to agree today are exactly the drift
+    // this variable exists to prevent.
+    let mcp_box = errand.as_ref().map(|turn| turn.errand.id);
+    let config = build_mcp_config(&exe, mcp_box);
     let mcp_path = mcp_config_path(chat_id);
     write_mcp_config(&mcp_path, &config).map_err(|e| e.to_string())?;
 
@@ -1755,6 +1773,10 @@ async fn send_message_inner(
             resume,
             session_id,
             mcp_path,
+            // The same value `build_mcp_config` was given above, handed on unchanged. Moved here
+            // BEFORE `errand` is consumed by `notebook` below, which is why it was taken as a
+            // local in the first place.
+            mcp_box,
             cwd,
             tool_policy,
             notebook: errand.map(|turn| turn.errand),
@@ -2298,6 +2320,20 @@ struct TurnLaunch {
     /// The id this turn is recorded under, which is `resume` when there is one.
     session_id: String,
     mcp_path: std::path::PathBuf,
+    /// Which surface the server at `mcp_path` announces — an errand id, or `None` for the whole
+    /// tool list.
+    ///
+    /// Beside `mcp_path` because it is the other half of the same fact, and carried from
+    /// `send_message_inner` rather than recomputed here because it is literally the argument
+    /// `build_mcp_config` was called with. The launch pays for what its server announces
+    /// (`runner::authored_prompt`), so a box that disagreed with the file would be an accounting
+    /// error of roughly twelve to one on every errand turn — and one that no test of the config
+    /// file, and no test of the price, could see on its own.
+    ///
+    /// Not derived from `notebook` below, which happens to hold the same errand today. That field
+    /// answers a different question — where this turn's answer gets written afterwards — and two
+    /// fields free to be set from two expressions are two things that can drift apart.
+    mcp_box: Option<i64>,
     cwd: Option<std::path::PathBuf>,
     tool_policy: crate::runner::ToolPolicy,
     /// The errand whose notebook this turn's answer is appended to, if it belongs to one.
@@ -2325,6 +2361,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         resume,
         session_id,
         mcp_path,
+        mcp_box,
         cwd,
         tool_policy,
         notebook,
@@ -2556,6 +2593,13 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             permission,
             resume_session_id: resume,
             mcp_config: Some(turn.mcp_path.clone()),
+            // What that server announces, which is not the same for every turn: an errand's is
+            // boxed to its own four tools plus the handful every box keeps, an ordinary chat's
+            // serves the lot. The number arrives from `send_message_inner`, where it was the
+            // argument to the `build_mcp_config` call that wrote the file named on the line above —
+            // so the file and this are one expression read twice, and `authored_prompt` charges
+            // this turn for the surface its own server really offers.
+            mcp_box,
             // Decided by `tool_policy_for`, which is where the rule is written out. The
             // default remains what it always was — the orchestrator talks to NucleOS and to
             // nothing else, and the MCP allowlist does not enforce that on its own, because
@@ -2646,6 +2690,25 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // only take away tools it is entitled to call.
             allowed_mcp_tools: None,
         };
+
+        // What this turn itself wrote into the model's prompt, priced off the request that is about
+        // to become an argument vector, and priced HERE because `request` is moved into `serve_turn`
+        // on the very next statement and nothing downstream sees these values again.
+        //
+        // This is the launcher the measurement exists for. `runs::spawn_run` records the same thing
+        // and sets `mcp_config: None`, so every row it writes carries a schema cost of zero — a
+        // real zero, and correct, but it means the largest term in the sum was measured against the
+        // one launcher that never pays it. A chat turn carries `--mcp-config` on every single turn,
+        // and the schema block it pays for is the biggest thing the daemon puts in front of the
+        // model.
+        //
+        // Best effort by way of `record_authored_prompt`, which writes nothing on `None` and
+        // swallows its own database error: this is bookkeeping about a turn somebody is waiting
+        // for, and it may not be the reason that turn fails. The runner decides whether there is
+        // anything to say at all — a chat answered by a fake or by the Codex CLI authors no prompt
+        // this daemon can price, and answers `None`, which leaves the column NULL rather than
+        // claiming a zero.
+        crate::runs::record_authored_prompt(&pool, id, runner.authored_prompt(&request)).await;
 
         let result = serve_turn(
             &runner,
@@ -4483,6 +4546,149 @@ mod tests {
         assert_eq!(answered_by(&state.pool, id).await.as_deref(), Some("local"));
     }
 
+    /* ------------------------------------------ what a turn's prompt cost -- */
+
+    /// Waits for the turn's own accounting of its prompt to land, and answers `None` if it never
+    /// does.
+    ///
+    /// A poll rather than a single read, because the recording happens inside the task
+    /// `spawn_assistant_turn` spawns and `send_message` returns the moment the row exists. `None` is
+    /// distinguishable from a recorded zero on purpose — the column is nullable and NULL is a real
+    /// answer there, so a test asking whether anything was recorded at all must be able to tell the
+    /// two apart.
+    async fn await_authored_chars(pool: &SqlitePool, id: i64) -> Option<i64> {
+        for _ in 0..100 {
+            let recorded: Option<i64> =
+                sqlx::query_scalar("SELECT authored_prompt_chars FROM runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            if recorded.is_some() {
+                return recorded;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// A fake that stands in for the CLI runner on the one question these two tests ask: what the
+    /// launch site recorded about the prompt it wrote. See `FakeCommandRunner::prices_its_prompt`.
+    fn pricing_fake() -> Arc<FakeCommandRunner> {
+        Arc::new(FakeCommandRunner {
+            prices_its_prompt: true,
+            ..Default::default()
+        })
+    }
+
+    /// A chat turn records what it authored, and the schema block is in the number.
+    ///
+    /// **This is the launcher the measurement exists for.** `runs::spawn_run` records the same thing
+    /// and sets no `mcp_config` at all, so every row it writes carries a schema cost of zero — a
+    /// real zero, correctly recorded, and completely beside the point: the tool schemas are the
+    /// largest thing this daemon puts in front of a model, and until this turn was wired they were
+    /// measured, tested and stored against the only launcher that never pays for them.
+    ///
+    /// The assertion is arithmetic over values the test can name — the surface, asked of the same
+    /// function that priced it, plus the prompt — rather than a literal. The surface moves whenever
+    /// a tool's description changes, and a pinned byte count would be a test that fails on every
+    /// honest edit while proving nothing about the wiring.
+    #[tokio::test]
+    async fn a_chat_turn_records_what_it_authored_including_the_schema_block() {
+        let mut state = test_state().await;
+        let runner = pricing_fake();
+        state.runner = runner.clone();
+
+        let id = send_message(&state, "authored-chat", "hello", Origin::Shell)
+            .await
+            .unwrap();
+        let recorded = await_authored_chars(&state.pool, id)
+            .await
+            .expect("a chat turn must record what the daemon wrote into its prompt");
+
+        assert!(
+            runner.last_mcp_config.lock().unwrap().is_some(),
+            "the premise of this test is that a chat turn IS offered a server — if that stops \
+             being true, the figure below stops being about anything"
+        );
+        // This chat is not an errand, so its server announces the whole tool list.
+        let surface = crate::mcp_tools::NucleosTools::advertised_schema_chars(None) as i64;
+        assert!(surface > 0, "the daemon's server announces nothing at all");
+        assert_eq!(
+            recorded,
+            surface + "hello".len() as i64,
+            "a chat turn's authored prompt is the schema block its server announces plus the \
+             prompt itself; nothing else was set on this turn"
+        );
+    }
+
+    /// An errand turn is charged for the surface ITS server announces, and not for the whole one.
+    ///
+    /// The error this pins is a factor of roughly twelve. `assistant::build_mcp_config` gives an
+    /// errand's server `--box errand`, so it advertises the four errand tools and the handful every
+    /// box keeps; charging that turn the unboxed figure would report an errand as costing an order
+    /// of magnitude more prompt than it does — a number that looks measured, is wrong, and has
+    /// nothing anywhere to disagree with it.
+    ///
+    /// The prompt is read back off the launch rather than written out here, because an errand's
+    /// turn is not the text somebody typed: the preamble and the notebook are prepended to it, and
+    /// re-deriving that in the test would be a second copy of `ErrandTurn::prompt_for`.
+    #[tokio::test]
+    async fn an_errand_turn_records_the_surface_its_own_server_announces() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = pricing_fake();
+        let state = AppState {
+            runner: runner.clone(),
+            ..with_files_root(test_state().await, dir.path().to_path_buf())
+        };
+        let errand = open_errand(&state, "carros", "errand-authored").await;
+        crate::errands::set_brain(&state.pool, errand.id, crate::errands::Brain::Cloud)
+            .await
+            .unwrap();
+
+        let id = send_message(&state, "errand-authored", "procura", Origin::Shell)
+            .await
+            .unwrap();
+        let recorded = await_authored_chars(&state.pool, id)
+            .await
+            .expect("an errand turn must record what the daemon wrote into its prompt");
+
+        let boxed = crate::mcp_tools::NucleosTools::advertised_schema_chars(Some(errand.id)) as i64;
+        let whole = crate::mcp_tools::NucleosTools::advertised_schema_chars(None) as i64;
+        assert!(
+            boxed > 0 && boxed * 8 < whole,
+            "the premise: an errand's box is a small, non-empty part of the whole surface. It \
+             said {boxed} against {whole}"
+        );
+
+        // The property first, and the diagnosis after it, deliberately in that order: this is the
+        // assertion that fails when the box goes missing, and what it prints — the boxed figure
+        // against the whole one — is the whole difference between a measured number and a
+        // plausible one.
+        let prompt = runner
+            .last_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the launch was handed a prompt");
+        assert_eq!(
+            recorded,
+            boxed + prompt.len() as i64,
+            "an errand turn was charged for tools its own server never announced: it recorded \
+             {recorded} where the box is {boxed} and the whole surface is {whole}"
+        );
+        assert!(
+            recorded < whole,
+            "the whole surface alone is {whole}, so {recorded} cannot be a boxed turn's prompt"
+        );
+        assert_eq!(
+            *runner.last_mcp_box.lock().unwrap(),
+            Some(Some(errand.id)),
+            "the launch must carry the same errand `build_mcp_config` was given, or the price and \
+             the config file are describing two different servers"
+        );
+    }
+
     #[tokio::test]
     async fn a_paused_errand_starts_no_turn() {
         let (state, _dir, _runner) = errand_state().await;
@@ -4777,6 +4983,7 @@ mod tests {
                 name: "reviewer".to_string(),
                 description: "Reviews code".to_string(),
                 prompt: "You are a code reviewer".to_string(),
+                tools: None,
                 model: Some("opus".to_string()),
                 effort: None,
             }],
@@ -6720,6 +6927,7 @@ mod tests {
             permission: crate::runner::Permission::Default,
             resume_session_id: resume,
             mcp_config: None,
+            mcp_box: None,
             tool_policy: crate::runner::ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,

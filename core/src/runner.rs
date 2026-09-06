@@ -132,10 +132,10 @@ pub enum ToolPolicy {
 /// that must not act cannot be handed `bypassPermissions` because there is one field and it holds
 /// one value, chosen once, at the call that starts the run.
 ///
-/// Deliberately NOT `chats::PermissionMode`, which has five values and is the CONVERSATION's
-/// policy. `Manual` and `Auto` both project onto `Default` here, because what separates them lives
-/// in the `PreToolUse` hook and not on a command line. Keeping the two types apart is what stops
-/// somebody answering one question with the other.
+/// Deliberately NOT `chats::PermissionMode`, which has six values and is the CONVERSATION's
+/// policy. `Manual`, `Auto` and `DontAsk` all three project onto `Default` here, because what
+/// separates them lives in the `PreToolUse` hook and not on a command line. Keeping the two types
+/// apart is what stops somebody answering one question with the other.
 ///
 /// Called `Default` and not `Auto` so nobody has to wonder why an autopilot run carries a
 /// conversation's policy: it is the rung with no elevation, which is what every run that is not a
@@ -176,6 +176,13 @@ impl Permission {
     /// for both would be paying twice for two judgements. `manual` is exactly "decide nothing, the
     /// hook decides" — which is the posture we want FROM THE CLI whatever rung the conversation is
     /// on.
+    ///
+    /// **`dontAsk` on that list is not our `dont_ask` either**, and the collision of names is the
+    /// reason this paragraph exists. `chats::PermissionMode::DontAsk` is a rung of THIS house,
+    /// enforced entirely by the hook, and it launches `manual` like the two rungs beside it. The
+    /// CLI's `dontAsk` is the CLI's own idea of not asking, decided by a surface we do not control
+    /// and cannot see the reasons of. Selecting it would move the decision off the classifier and
+    /// onto that surface, which is the one thing every value in this enum is arranged to avoid.
     pub fn cli_value(self) -> &'static str {
         match self {
             Self::Default => "manual",
@@ -187,13 +194,15 @@ impl Permission {
 
     /// Which rung a conversation's policy launches the CLI on.
     ///
-    /// Lossy on purpose, and the loss is the point: `Manual` and `Auto` are the same command line
-    /// and differ only in what the hook lets through.
+    /// Lossy on purpose, and the loss is the point: `Manual`, `Auto` and `DontAsk` are the same
+    /// command line and differ only in what the hook lets through — `Manual` asks about every
+    /// mutation, `Auto` asks only about what the classifier does not recognise, and `DontAsk`
+    /// refuses that same remainder instead of asking about it. Three policies, one command line.
     pub fn for_chat(mode: crate::chats::PermissionMode) -> Self {
         match mode {
-            crate::chats::PermissionMode::Manual | crate::chats::PermissionMode::Auto => {
-                Self::Default
-            }
+            crate::chats::PermissionMode::Manual
+            | crate::chats::PermissionMode::Auto
+            | crate::chats::PermissionMode::DontAsk => Self::Default,
             crate::chats::PermissionMode::AcceptEdits => Self::AcceptEdits,
             crate::chats::PermissionMode::Plan => Self::Plan,
             crate::chats::PermissionMode::Bypass => Self::Bypass,
@@ -220,6 +229,23 @@ pub struct RunRequest {
     pub permission: Permission,
     pub resume_session_id: Option<String>,
     pub mcp_config: Option<PathBuf>,
+    /// Which surface the server named by `mcp_config` announces: an errand id for a boxed server,
+    /// `None` for one that serves the whole tool list.
+    ///
+    /// **The other half of a pair.** `mcp_config` says a server is offered at all; this says what
+    /// that server offers. The two are set together or not at all, and a `Some` here beside a
+    /// `None` there is a state no caller builds — nothing is announced by a server that does not
+    /// exist.
+    ///
+    /// **It is the ARGUMENT, carried, and never a re-derivation.** The value is the `errand` that
+    /// `assistant::build_mcp_config(exe, errand)` was called with, passed along from that same call
+    /// site — so the box this field names and the box the config file describes are one expression
+    /// evaluated once, and cannot drift. The alternatives were to read the box back out of the
+    /// config path, out of the file, or out of the chat's errand row; each is a second source of
+    /// truth for a fact the launch already holds in a local variable, and each goes quietly wrong
+    /// the day one side changes. [`authored_prompt`] is the only reader, and its doc says what such
+    /// a guess would cost.
+    pub mcp_box: Option<i64>,
     pub tool_policy: ToolPolicy,
     pub progress_timeout: Option<Duration>,
     /// How many model responses this run may take before the daemon stops it. `None` is no ceiling.
@@ -540,9 +566,20 @@ fn policy_unverified_after_stream(policy: ToolPolicy, init_seen: bool) -> Option
 /// advertises it and `advertised_tools_violate` kills the run at the `init` event. The tool set can
 /// move underneath a version that never changed, which means the version number is not the signal:
 /// the stderr line naming the offending tools is.
+///
+/// Re-measured 2026-09-05, reading a live session's advertised tool surface rather than a version
+/// number, for the same reason the paragraph above gives: `TaskCreate`, `TaskGet`, `TaskList` and
+/// `TaskUpdate` had already moved inside a single version, so pinning this list to a version string
+/// again would not have caught the next four either. That pass added `ArtifactCheck`,
+/// `ArtifactComments`, `ArtifactData` (siblings of `Artifact`, already here) and `ListAgents`
+/// (sibling of `ListMcpResourcesTool`). `scripts/tool-surface.mjs` automates this measurement by
+/// hand after a `claude update`; it is not wired into any gate because it needs the CLI installed.
 pub(crate) const BUILTIN_TOOLS: &[&str] = &[
     "Agent",
     "Artifact",
+    "ArtifactCheck",
+    "ArtifactComments",
+    "ArtifactData",
     "AskUserQuestion",
     "Bash",
     "BashOutput",
@@ -558,6 +595,7 @@ pub(crate) const BUILTIN_TOOLS: &[&str] = &[
     "Glob",
     "Grep",
     "KillShell",
+    "ListAgents",
     "ListMcpResourcesTool",
     "LSP",
     "Monitor",
@@ -613,6 +651,16 @@ pub struct Subagent {
     pub description: String,
     /// The system prompt this helper runs under.
     pub prompt: String,
+    /// The tools this helper may call, or `None` to inherit the conversation's whole surface.
+    ///
+    /// Absent is today's behaviour, preserved: a helper defined before this field existed, or one
+    /// defined since without naming it, gets everything the parent run has — every call it makes
+    /// still comes back through the same `PreToolUse` hook under the parent's `run_id`, which is the
+    /// second barrier this field is the first half of. Present grants the CLI exactly this list and
+    /// nothing else; `Some(vec![])` is a helper granted no tools at all, a coherent and different
+    /// thing from absent, not a shorthand for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
     /// Which model answers as this helper, or `None` to inherit the conversation's.
     ///
     /// Absent rather than the CLI's literal `"inherit"`: absence already means it, and offering two
@@ -1747,6 +1795,72 @@ pub trait CommandRunner: Send + Sync {
     fn model_for_stage(&self, _stage: Option<&str>) -> Option<String> {
         None
     }
+
+    /// What this runner would itself write into the model's prompt for `request`, or `None` for a
+    /// runner whose prompt this daemon does not author.
+    ///
+    /// **`None` is the default, and every runner but the Anthropic CLI one keeps it.** The four
+    /// pieces `AuthoredPrompt` counts are the four `cli_args` puts on the command line, and they are
+    /// facts about THAT argument vector: `OllamaRunner` sends no tool schemas and has no notion of a
+    /// subagent, `CodexCliRunner` builds a different vector entirely, and the fakes build none. A
+    /// default that answered `Some(…)` by measuring the request anyway would attribute this daemon's
+    /// argv to processes that never received it, which is the one thing this accounting must not do.
+    /// Silence is the honest answer, and the column behind it stays NULL — exactly as
+    /// `runs.permission_mode` is NULL for anything that is not a chat turn.
+    fn authored_prompt(
+        &self,
+        _request: &RunRequest,
+    ) -> Option<crate::prompt_budget::AuthoredPrompt> {
+        None
+    }
+}
+
+/// The part of one CLI run's prompt that this daemon wrote, measured off the same values
+/// [`cli_args`] puts on the command line.
+///
+/// Read this beside `cli_args` and not from anywhere else. Every field below names a flag written
+/// there, under the same condition it is written under, so the two go wrong together or not at all;
+/// a second source of truth for any of them is a number that quietly stops matching the day somebody
+/// changes a flag.
+///
+/// **The schema block is priced from `mcp_config` being present, and priced BY THE BOX that config
+/// names.** A run with no `--mcp-config` is offered no tools by this daemon, so its schema cost is a
+/// real zero rather than an unknown. A run that has one pays for whatever its own server announces,
+/// which is not the same figure for every run: an unboxed server advertises the whole tool list, an
+/// errand's server advertises four errand tools and the handful every box keeps, and the two differ
+/// by roughly twelve to one. Charging every server the unboxed figure — which this did while the
+/// only launcher recording a row never set `mcp_config` at all — would have overstated an errand
+/// turn by that factor the moment a chat turn started being recorded, which is what it now is.
+///
+/// **Which box is a fact the launch holds, not one this function may infer.** It arrives on
+/// `RunRequest::mcp_box`, carried from the `assistant::build_mcp_config(exe, errand)` call that
+/// wrote the config file, so the price and the surface are two readings of one expression. The
+/// tempting shortcut — recover the box from the config path, or parse the file, or look up the
+/// chat's errand — is the thing this pair of fields exists to forbid: every one of those produces a
+/// number that LOOKS measured, agrees with the file only for as long as nobody edits either side,
+/// and reports its disagreement to nobody when it stops. `served_in_box` in `mcp_tools` is the same
+/// argument one layer down, and says why the price and the fold must not be two copies of a rule.
+pub(crate) fn authored_prompt(request: &RunRequest) -> crate::prompt_budget::AuthoredPrompt {
+    crate::prompt_budget::AuthoredPrompt {
+        schema_chars: match request.mcp_config {
+            None => 0,
+            Some(_) => crate::mcp_tools::NucleosTools::advertised_schema_chars(request.mcp_box),
+        },
+        // Only counted when the flag is actually written. `Some("")` is not a state any caller
+        // builds, but counting an absent value as zero and a present one by its length is what keeps
+        // this in step with the `if let` in `cli_args`.
+        system_prompt_chars: request.append_system_prompt.as_ref().map_or(0, String::len),
+        // Empty writes NO flag — not `{}` — so an empty helper set costs nothing, and calling
+        // `agents_json` on it would charge two characters for a flag that was never written.
+        agents_chars: if request.agents.is_empty() {
+            0
+        } else {
+            agents_json(&request.agents).len()
+        },
+        // Charged whether it travels as a positional argument or on stdin. `steerable` decides which
+        // of the two, and the model reads the same characters either way.
+        prompt_chars: request.prompt.len(),
+    }
 }
 
 /// A tool-free Ollama boundary for local triage.
@@ -2138,6 +2252,15 @@ impl CommandRunner for ClaudeCliRunner {
             Some("review") => self.review_model.clone(),
             _ => None,
         }
+    }
+
+    /// The one runner that authors a prompt this daemon can price, because it is the one whose
+    /// argument vector `cli_args` builds. See the trait's default for why nobody else answers.
+    fn authored_prompt(
+        &self,
+        request: &RunRequest,
+    ) -> Option<crate::prompt_budget::AuthoredPrompt> {
+        Some(authored_prompt(request))
     }
 
     async fn run_prompt(
@@ -2938,6 +3061,11 @@ pub struct FakeCommandRunner {
     pub last_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub last_resume: std::sync::Mutex<Option<String>>,
     pub last_mcp_config: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// Which box the launch said its server serves. Recorded beside `last_mcp_config` because the
+    /// two are one fact in two halves, and this is the half that is easy to get wrong: a path is
+    /// obviously present or absent, whereas a box that quietly disagrees with the config file looks
+    /// exactly like an honest `None` and is charged as the whole tool surface.
+    pub last_mcp_box: std::sync::Mutex<Option<Option<i64>>>,
     pub last_tool_policy: std::sync::Mutex<Option<ToolPolicy>>,
     pub last_session_id: std::sync::Mutex<Option<String>>,
     pub last_fork_session: std::sync::Mutex<Option<bool>>,
@@ -2972,6 +3100,21 @@ pub struct FakeCommandRunner {
     pub last_append_system_prompt: std::sync::Mutex<Option<Option<String>>>,
     pub last_denied_tools: std::sync::Mutex<Option<Vec<String>>>,
     pub last_session_name: std::sync::Mutex<Option<Option<String>>>,
+    /// Test-only: whether this double answers `authored_prompt` the way `ClaudeCliRunner` does.
+    ///
+    /// `false` by default, and that default is the honest one: a fake builds no argument vector, so
+    /// the trait's own reasoning applies to it unchanged — it leaves `runs.authored_prompt_chars`
+    /// NULL, exactly as the local model and the Codex CLI do, and every existing test here wants
+    /// precisely that.
+    ///
+    /// Turned on by the handful of tests asking a question about a LAUNCH SITE rather than about a
+    /// runner: does this launcher record what it wrote into the prompt, and does it record the right
+    /// figure? There is no other way to ask it. The one runner that answers `Some(_)` is the one
+    /// that spawns a real `claude`, so a test wanting the recording to happen would have to spawn a
+    /// process — and what it would then be testing is the CLI's presence on the machine, not the
+    /// call this daemon makes. The arithmetic itself is not on trial here; it is pinned against the
+    /// real function in `runner`'s own tests.
+    pub prices_its_prompt: bool,
     /// Test-only: return an `Err` (simulated launch failure — no work done) for the first N calls.
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
@@ -3023,6 +3166,20 @@ pub struct FakeCommandRunner {
 #[cfg(test)]
 #[async_trait]
 impl CommandRunner for FakeCommandRunner {
+    /// `None` unless a test has explicitly asked this double to stand in for the CLI runner here —
+    /// see [`FakeCommandRunner::prices_its_prompt`] for why that is opt-in and what it is for.
+    ///
+    /// When it is asked, it answers through the very same free function `ClaudeCliRunner` calls, so
+    /// the double cannot come to price a request differently from the runner it is standing in for.
+    /// A second copy of that arithmetic living in the test double would be a test that keeps passing
+    /// after the production rule changes underneath it.
+    fn authored_prompt(
+        &self,
+        request: &RunRequest,
+    ) -> Option<crate::prompt_budget::AuthoredPrompt> {
+        self.prices_its_prompt.then(|| authored_prompt(request))
+    }
+
     /// The live-process door, so a conversation that keeps its CLI is exercised in tests rather than
     /// only in production.
     ///
@@ -3165,6 +3322,7 @@ impl CommandRunner for FakeCommandRunner {
         *self.last_permission.lock().unwrap() = Some(request.permission);
         *self.last_resume.lock().unwrap() = request.resume_session_id.clone();
         *self.last_mcp_config.lock().unwrap() = request.mcp_config.clone();
+        *self.last_mcp_box.lock().unwrap() = Some(request.mcp_box);
         *self.last_tool_policy.lock().unwrap() = Some(request.tool_policy);
         *self.last_session_id.lock().unwrap() = request.session_id.clone();
         *self.last_fork_session.lock().unwrap() = Some(request.fork_session);
@@ -3338,6 +3496,7 @@ mod tests {
             name: name.to_string(),
             description: "Reviews code".to_string(),
             prompt: "You are a code reviewer".to_string(),
+            tools: None,
             model: None,
             effort: None,
         }
@@ -3382,6 +3541,53 @@ mod tests {
 
         assert!(sent["reviewer"].get("model").is_none(), "{}", args[at + 1]);
         assert!(sent["reviewer"].get("effort").is_none(), "{}", args[at + 1]);
+    }
+
+    /// Absent, not `null` and not `[]`: a helper that named no restriction inherits the parent's
+    /// whole tool surface, today's behaviour, and the object sent to the CLI says nothing at all
+    /// rather than saying "no restriction" in a way that could later be confused with "no tools".
+    #[test]
+    fn a_helper_that_named_no_tools_sends_no_tools_key() {
+        let mut request = baseline_run_request();
+        request.agents = vec![a_helper("reviewer")];
+
+        let args = cli_args(&request, "sonnet");
+        let at = args.iter().position(|arg| arg == "--agents").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+
+        assert!(sent["reviewer"].get("tools").is_none(), "{}", args[at + 1]);
+    }
+
+    /// A helper that named a restriction sends exactly that list, so the CLI grants it those tools
+    /// and nothing else.
+    #[test]
+    fn a_helper_may_be_restricted_to_named_tools() {
+        let mut request = baseline_run_request();
+        let mut helper = a_helper("reviewer");
+        helper.tools = Some(vec!["Read".to_string(), "Grep".to_string()]);
+        request.agents = vec![helper];
+
+        let args = cli_args(&request, "sonnet");
+        let at = args.iter().position(|arg| arg == "--agents").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+
+        assert_eq!(
+            sent["reviewer"]["tools"],
+            serde_json::json!(["Read", "Grep"])
+        );
+    }
+
+    /// A helper stored before this field existed — its JSON object has no `tools` key at all —
+    /// deserialises identically to one that named no restriction, and runs the same way: inheriting
+    /// the parent's whole surface, exactly as it did before this field was added.
+    #[test]
+    fn a_helper_stored_before_tools_existed_still_deserialises() {
+        let stored = r#"{"description":"Reviews code","prompt":"You are a code reviewer"}"#;
+        let agent: Subagent = serde_json::from_str(stored).unwrap();
+
+        assert_eq!(agent.tools, None);
+        assert_eq!(agent.description, "Reviews code");
+        assert_eq!(agent.prompt, "You are a code reviewer");
     }
 
     #[test]
@@ -3913,6 +4119,66 @@ mod tests {
         );
     }
 
+    /// A run offered no server is charged nothing for schemas, and that zero is an answer rather
+    /// than a gap.
+    ///
+    /// This daemon writes `--mcp-config` or it does not; when it does not, the model is offered no
+    /// tools by us and there is no schema block in its prompt to pay for. The second half of the
+    /// test is the state the pairing forbids: a box named with no server to announce it still costs
+    /// nothing, because it is `mcp_config` that decides whether anything is announced at all.
+    #[test]
+    fn a_request_offered_no_server_is_charged_nothing_for_schemas() {
+        let mut request = baseline_run_request();
+        assert!(request.mcp_config.is_none());
+        assert_eq!(authored_prompt(&request).schema_chars, 0);
+
+        request.mcp_box = Some(7);
+        assert_eq!(
+            authored_prompt(&request).schema_chars,
+            0,
+            "a box with no server behind it announced nothing, so it may not be charged for"
+        );
+    }
+
+    /// A boxed server announces a fraction of the surface, and the price follows the box rather
+    /// than the mere presence of the flag.
+    ///
+    /// **The assertions are relationships and not byte counts, on purpose.** The figure is
+    /// `serde_json` run over the live tool router, so it moves whenever a tool is added, renamed, or
+    /// has a sentence added to its description — and a hardcoded literal here would fail on every
+    /// honest edit and teach its next reader to paste in whatever the failure printed. What has to
+    /// hold is the property: the boxed price is the box's own, it is a small part of the whole, and
+    /// it is what a boxed request is charged.
+    ///
+    /// The order-of-magnitude bound is the one that would have caught the bug this pair of fields
+    /// exists to prevent. Pricing every server unboxed overstated an errand turn by roughly twelve
+    /// to one, which is invisible in a total and enormous in a bill.
+    #[test]
+    fn a_boxed_request_is_charged_for_the_box_and_not_the_whole_surface() {
+        let mut request = baseline_run_request();
+        request.mcp_config = Some(PathBuf::from("mcp.json"));
+        let whole = authored_prompt(&request).schema_chars;
+
+        request.mcp_box = Some(7);
+        let boxed = authored_prompt(&request).schema_chars;
+
+        assert_eq!(
+            boxed,
+            crate::mcp_tools::NucleosTools::advertised_schema_chars(Some(7)),
+            "the price must be the box's own announcement, taken from the one function that folds it"
+        );
+        assert!(
+            boxed > 0,
+            "an errand's server announces four errand tools and the handful every box keeps, so \
+             its surface is small and is not empty"
+        );
+        assert!(
+            boxed * 8 < whole,
+            "a boxed server must announce a small part of the whole surface — measured at roughly \
+             twelve to one — and this said {boxed} against {whole}"
+        );
+    }
+
     fn baseline_run_request() -> RunRequest {
         RunRequest {
             prompt: "test prompt".to_string(),
@@ -3921,6 +4187,7 @@ mod tests {
             permission: Permission::Default,
             resume_session_id: None,
             mcp_config: None,
+            mcp_box: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,
@@ -4046,6 +4313,7 @@ mod tests {
             permission: Permission::Default,
             resume_session_id: None,
             mcp_config: None,
+            mcp_box: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,
@@ -5505,6 +5773,28 @@ mod tests {
             assert!(
                 denied.split(',').any(|t| t == tool),
                 "{tool} must be denied under McpOnly, or it is advertised and kills the turn"
+            );
+        }
+    }
+
+    /// The two tests above assert hand-picked subsets — the ones that already cost a dead run — and
+    /// that is documentation worth keeping, but it left the other ~31 names in `BUILTIN_TOOLS` with
+    /// no assertion at all: a name could fall out of the list on an edit and nothing here would
+    /// notice. This iterates the whole const instead, so the list and the flag it produces can never
+    /// drift apart silently again.
+    #[test]
+    fn every_built_in_name_reaches_the_deny_flag() {
+        let args = args_for(ToolPolicy::McpOnly, None);
+        let denied = args
+            .windows(2)
+            .find(|w| w[0] == "--disallowedTools")
+            .map(|w| w[1].clone())
+            .expect("McpOnly must deny built-ins");
+        let denied: std::collections::HashSet<&str> = denied.split(',').collect();
+        for tool in BUILTIN_TOOLS {
+            assert!(
+                denied.contains(tool),
+                "{tool} is in BUILTIN_TOOLS but missing from --disallowedTools: {denied:?}"
             );
         }
     }

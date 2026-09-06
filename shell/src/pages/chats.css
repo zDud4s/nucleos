@@ -1973,6 +1973,35 @@
   flex: 1;
 }
 
+/* The tools trigger sits inside a `.chats-helper-field` beside the model and effort
+   `select`s, so it borrows their sizing and only needs its own control face — matched
+   to a `select`'s padding and border rather than to `.chats-meta-more`'s bare icon,
+   since here it is a fourth field on the row and not a menu launcher. */
+.chats-helper-tools-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chats-helper-tools-trigger:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.chats-helper-tools-trigger:focus-visible {
+  border-color: var(--border-strong);
+  outline: none;
+}
+
 /* Why the daemon would refuse this one, said in place rather than as a single
    "no" about the whole set — which is all a bare 400 could tell anybody. The
    pending tone on purpose: it is the one that asks a person for something, and

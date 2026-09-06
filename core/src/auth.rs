@@ -66,7 +66,9 @@ pub enum Scope {
     /// own environment. That is the property that makes it safe, not the mode's name.
     Control,
     /// One autonomous run's key. Minted when the run is created, dead the moment the run stops
-    /// running, and good for exactly one route: asking the safety gate about its own tool call.
+    /// running, and good for exactly three routes, all of them one conversation about its own tool
+    /// calls: asking the safety gate beforehand, waiting for a person's answer when the gate cannot
+    /// decide alone, and reporting back what actually happened.
     ///
     /// Nothing is lost by keeping it that narrow — only orchestrator turns are given an
     /// `--mcp-config`, so a `worktree`, `shadow` or triage run has no daemon tool to call in the
@@ -117,10 +119,11 @@ impl ApiTokenLevel {
     }
 }
 
-/// The only route a run token opens, and the reason a run token exists.
+/// The first route a run token opens, and the reason a run token exists.
 const HOOK_ROUTE: &str = "/hooks/pretooluse-decision";
 
-/// The second half of the same conversation, and the only other door a run has.
+/// The second door of the same conversation, and the only other one a run had until this route
+/// grew a third.
 ///
 /// The gate above answers in milliseconds because the hook can only wait five seconds. A tool call
 /// somebody has to say yes to cannot be answered in five seconds, so the gate says `asking` and the
@@ -130,6 +133,16 @@ const HOOK_ROUTE: &str = "/hooks/pretooluse-decision";
 /// A run reaches only its own question: `hooks::wait_for_run` finds the ask by the run id the key
 /// names, and a run has at most one tool call in flight because the hook that asks is synchronous.
 const ASK_WAIT_ROUTE: &str = "/hooks/ask-wait";
+
+/// The third door: the OUTCOME of the same tool call the first two routes decided about and waited
+/// on, reported after the fact.
+///
+/// It is not a narrower version of `HOOK_ROUTE` — the handler behind it never returns a `Decision`
+/// and can never block anything, because by the time it fires the tool has already run (or already
+/// failed). It sits in the same `Scope::Run` arm as the other two rather than in a table of its
+/// own for the same reason they do: this is still one run asking about one tool call of its own,
+/// now completing the loop instead of opening it.
+const POSTTOOLUSE_ROUTE: &str = "/hooks/posttooluse";
 
 /// The email sidecar's whole daemon surface: report what it fetched, and ask where it got to.
 ///
@@ -397,7 +410,10 @@ const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
 pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
     match scope {
         Scope::Control => true,
-        Scope::Run(_) => method == Method::POST && (path == HOOK_ROUTE || path == ASK_WAIT_ROUTE),
+        Scope::Run(_) => {
+            method == Method::POST
+                && (path == HOOK_ROUTE || path == ASK_WAIT_ROUTE || path == POSTTOOLUSE_ROUTE)
+        }
         Scope::Service(Service::Email) => route_is_listed(EMAIL_ROUTES, method, path),
         Scope::Service(Service::Council) => route_is_listed(COUNCIL_ROUTES, method, path),
         Scope::TeamRun(_) => route_is_listed(TEAM_ROUTES, method, path),
@@ -909,6 +925,7 @@ mod tests {
             // path is what `permits` matches on.
             .route(HOOK_ROUTE, post(|| async { "decided" }))
             .route(ASK_WAIT_ROUTE, post(|| async { "waited" }))
+            .route(POSTTOOLUSE_ROUTE, post(|| async { "recorded" }))
             .route("/proposals/{id}/approve", post(|| async {}))
             .route("/worktrees/{run_id}/release", post(|| async {}))
             // All three, because the point of the test below is that they are graded differently:
@@ -1083,6 +1100,7 @@ mod tests {
         ("GET", "/email/cursor"),
         ("GET", "/files"),
         ("POST", HOOK_ROUTE),
+        ("POST", POSTTOOLUSE_ROUTE),
         ("GET", "/api-tokens"),
     ];
 
@@ -1093,6 +1111,25 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .uri("/secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The new door, checked the same way `rejects_missing_token` checks every other one: a hook
+    /// call reporting an outcome is exactly as unauthenticated without a bearer token as any other
+    /// request, and this route must not have grown an exception for it.
+    #[tokio::test]
+    async fn posttooluse_route_rejects_missing_token() {
+        let app = protected_router(test_state("expected-token").await);
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(POSTTOOLUSE_ROUTE)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1173,7 +1210,8 @@ mod tests {
 
     /// The whole point of the scope. A `worktree` or `shadow` run has a Bash tool and the classifier
     /// permits `echo $NUCLEOS_DAEMON_TOKEN`, so whatever is in its environment must be assumed
-    /// published. What it opens is one route.
+    /// published. What it opens is three routes, all of them the same conversation about its own
+    /// tool calls.
     #[tokio::test]
     async fn a_run_token_opens_the_gate_route_and_nothing_else() {
         let state = test_state("control-token").await;
@@ -1193,6 +1231,12 @@ mod tests {
             StatusCode::OK,
             "a run must be able to wait for the answer it was told to wait for"
         );
+        // The third leg: reporting back what the tool call it asked about actually did.
+        assert_eq!(
+            status_of(&app, "POST", POSTTOOLUSE_ROUTE, &run_token).await,
+            StatusCode::OK,
+            "a run must be able to report the outcome of its own tool call"
+        );
         // 403, not 401: it authenticated. It is simply not allowed to approve anything.
         assert_eq!(
             status_of(&app, "POST", "/proposals/7/approve", &run_token).await,
@@ -1211,11 +1255,12 @@ mod tests {
     /// unreviewed proposals, and the slot ceiling counts pieces of work in flight.
     ///
     /// **Honest note on what this test is worth.** It passes before `POST /jobs` was added to any
-    /// table as well as after, because `permits` gives `Scope::Run` exactly one route and everything
-    /// else is refused by construction. So it did not drive the change and it is not evidence the
-    /// change works — it is a pin, and its value is the day somebody widens `Scope::Run` to a second
-    /// route and has to decide, in front of this assertion, whether jobs are on the list. The test
-    /// that DID have to fail first is the one below it.
+    /// table as well as after, because `permits` gives `Scope::Run` a small, named list of routes
+    /// (`HOOK_ROUTE`, `ASK_WAIT_ROUTE`, `POSTTOOLUSE_ROUTE`) and everything else is refused by
+    /// construction. So it did not drive the change and it is not evidence the change works — it
+    /// is a pin, and its value is the day somebody widens `Scope::Run` further and has to decide,
+    /// in front of this assertion, whether jobs are on the list. The test that DID have to fail
+    /// first is the one below it.
     #[tokio::test]
     async fn a_run_token_cannot_ask_for_a_job() {
         let state = test_state("control-token").await;
@@ -2223,15 +2268,17 @@ mod tests {
         }
     }
 
-    /// The pin that says this scope did not widen the run token.
+    /// The pin that says this scope did not widen the run token beyond its three named routes.
     ///
-    /// `Scope::Run`'s doc claims it is "good for exactly one route", and three comments in this file
-    /// lean on that being true. A new scope is exactly the change that makes somebody widen the old
-    /// one by accident.
+    /// `Scope::Run`'s doc claims it is "good for exactly three routes", and other comments in this
+    /// file lean on that being true. A new scope is exactly the change that makes somebody widen
+    /// the old one by accident.
     #[test]
     fn a_run_token_still_reaches_exactly_the_hook_route() {
         let run = Scope::Run(1);
         assert!(permits(&run, &Method::POST, HOOK_ROUTE));
+        assert!(permits(&run, &Method::POST, ASK_WAIT_ROUTE));
+        assert!(permits(&run, &Method::POST, POSTTOOLUSE_ROUTE));
 
         for (method, pattern) in TEAM_ROUTES {
             assert!(
