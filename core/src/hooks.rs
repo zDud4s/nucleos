@@ -1,4 +1,5 @@
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +20,32 @@ pub struct PreToolUsePayload {
     pub tool_name: String,
     #[serde(default)]
     pub tool_input: Value,
+}
+
+/// What arrives with a `PostToolUse`/`PostToolUseFailure` report: the OUTCOME of a call this
+/// daemon already decided about (spec-adjacent to `PreToolUsePayload`, but never a second
+/// decision).
+#[derive(Deserialize)]
+pub struct PostToolUsePayload {
+    // Same claim-vs-key relationship `posttooluse_outcome` resolves for `PreToolUsePayload::run_id`
+    // above: a scoped key names its own run and this claim is dropped; a key naming no run leaves
+    // the claim as the only identifier there is.
+    pub run_id: i64,
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_input: Value,
+    // The field `PreToolUsePayload` has no reason to carry, and the entire reason this payload
+    // exists: measured against the installed CLI (2.1.260), the CLI's own embedded hook
+    // documentation marks `tool_response` a `PostToolUse`-only field. It is what turns a barrier
+    // that only judges INTENT into a ledger that also knows the RESULT.
+    #[serde(default)]
+    pub tool_response: Value,
+    // The CLI's `hook_event_name`, echoed back so a success (`PostToolUse`) and a failure
+    // (`PostToolUseFailure`) are told apart once they reach `shadow::record_outcome`, which stores
+    // it verbatim in `outcome_event`. No `#[serde(default)]`: every real invocation of this hook
+    // carries it, and a payload that does not is exactly the malformed input this route should
+    // refuse to guess about.
+    pub event: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -211,12 +238,17 @@ enum ProjectRules {
 /// **And a `const` will not do, which is the half that is easy to try and undo.** A `const` is
 /// inlined as a value at each use site, so `&NO_SHELL_RULES` borrows a temporary; that temporary
 /// lives for `'static` only if rvalue static promotion applies, and promotion refuses any type with
-/// drop glue. `ShellRules` holds two `Vec`s, so it has drop glue, so the borrow is a local and
+/// drop glue. `ShellRules` holds three `Vec`s, so it has drop glue, so the borrow is a local and
 /// `declared()` stops compiling with `E0515: cannot return value referencing temporary value`. The
 /// `static` has one address with the program's lifetime and nothing to promote.
+///
+/// It is also why `ShellRules::deny_writes` is a `Vec` of pairs and not a map keyed by tool: a
+/// `HashMap::new()` is not a `const fn`, so a shape chosen for the read side would have taken this
+/// `static` away and the `E0515` above with it.
 static NO_SHELL_RULES: crate::project_policy::ShellRules = crate::project_policy::ShellRules {
     allow: Vec::new(),
     deny: Vec::new(),
+    deny_writes: Vec::new(),
 };
 
 impl ProjectRules {
@@ -545,19 +577,21 @@ pub async fn pretooluse_decision(
     // uses, so the filter cannot drift away from what it filters; see `shell_rules_of` for why a
     // read nobody would consult is still worth not taking.
     //
-    // The GitHub policy comes from the same place under the same gate, and the gate fits it exactly:
-    // `classify` consults `policy` only in `classify_segment`, which is reached only for the two
-    // shell tools `reads_shell_rules` names. A `Read` cannot be a `gh` line.
-    let (rules, policy) = if classifier::reads_shell_rules(&payload.tool_name) {
-        (
-            shell_rules_of(&state, project_id.as_deref()).await,
-            github_policy_of(&state, project_id.as_deref()).await,
-        )
+    // The GitHub policy comes from the same place under its OWN gate, and the two gates were one
+    // until the rules learned about writes. `classify` consults `policy` only in `classify_segment`,
+    // reached only for the two shell tools — a `Read` cannot be a `gh` line, and neither can an
+    // `Edit`. But an `Edit` does now read the rules, so a shared gate would have started building a
+    // per-project GitHub policy in front of every file edit, for an argument that branch can never
+    // reach. `reads_github_policy` is the half that stayed still.
+    let rules = if classifier::reads_shell_rules(&payload.tool_name) {
+        shell_rules_of(&state, project_id.as_deref()).await
     } else {
-        (
-            ProjectRules::none(),
-            std::borrow::Cow::Borrowed(&state.github.policy),
-        )
+        ProjectRules::none()
+    };
+    let policy = if classifier::reads_github_policy(&payload.tool_name) {
+        github_policy_of(&state, project_id.as_deref()).await
+    } else {
+        std::borrow::Cow::Borrowed(&state.github.policy)
     };
     let classification = rules.downgrade_if_unreadable(classifier::classify(
         &payload.tool_name,
@@ -860,6 +894,70 @@ pub async fn pretooluse_decision(
     }
 
     Json(classification.decision)
+}
+
+/// Records the OUTCOME of a tool call this daemon already decided about. **Never a second
+/// decision** — measured against the installed CLI (2.1.260), a `PostToolUse` response carries no
+/// `permissionDecision`, because by the time this fires the tool has already run (or already
+/// failed) and there is nothing left to block. Blocking here would be a second barrier, with its
+/// own failure surface, on a cooperative path where the call already happened — an expensive
+/// warning rather than a protection.
+///
+/// Named for what it does rather than for the event that triggers it: `posttooluse_decision`
+/// would have been the wrong name for the one handler in this file that never returns a
+/// `Decision`.
+///
+/// Wired to BOTH `PostToolUse` and `PostToolUseFailure` (`autopilot.rs`'s `wire_event`), which is
+/// why `PostToolUsePayload::event` exists at all — `PostToolUse` alone would let this ledger
+/// answer "did it happen?" only for a yes, and stay silent about every no.
+pub async fn posttooluse_outcome(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Json(mut payload): Json<PostToolUsePayload>,
+) -> StatusCode {
+    // Exactly `pretooluse_decision`'s construction, for exactly its reason: a scoped key names its
+    // own run and the daemon resolved that name from its own state, so the key decides and the
+    // body's claim is dropped. A key naming no run (the control token) leaves the claim as the
+    // only identifier there is.
+    let run_id = match scope {
+        Scope::Run(id) => id,
+        _ => payload.run_id,
+    };
+    payload.run_id = run_id;
+
+    // Validated against runs actually in flight, exactly as `pretooluse_decision` validates it
+    // before trusting anything derived from it: the hook's environment sits inside the same
+    // cooperative trust model as the token, so the daemon never blindly trusts a run_id it did not
+    // itself hand out. A stray outcome naming a finished or unknown run has nothing to complete.
+    if !state.run_handles.lock().unwrap().contains_key(&run_id) {
+        return StatusCode::OK;
+    }
+
+    // Unconditional on `mode`, unlike `pretooluse_decision`'s call to `record_decision`:
+    // `record_outcome` is UPDATE-only and matches nothing for a `real`-mode run, which never had a
+    // decision row to begin with. Gating on mode here would only duplicate a check the UPDATE's
+    // own WHERE clause already makes redundant.
+    if let Err(error) = shadow::record_outcome(
+        &state.pool,
+        run_id,
+        &payload.tool_name,
+        &payload.tool_input,
+        &payload.tool_response,
+        &payload.event,
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id = run_id,
+            %error,
+            "posttooluse-outcome: failed to record outcome"
+        );
+    }
+
+    // Always OK, on every path. There is no `permissionDecision` to give and nothing for a caller
+    // to retry or appeal — this route only ever records, and a failure to record is this daemon's
+    // problem, not the CLI's.
+    StatusCode::OK
 }
 
 /// The reason an orchestrator turn is refused a tool that would act. A constant because the tests
@@ -1395,6 +1493,14 @@ fn project_guidance(root: &str) -> Option<String> {
 const BYPASS_STILL_ASKS: &str =
     "this conversation does not ask about anything else, and asks about this: it deletes";
 
+/// The clause a refusal on `dont_ask` carries, after the classifier's own sentence.
+///
+/// A constant and not a literal at the return, for the reason `BYPASS_STILL_ASKS` above is one: the
+/// test that pins the rung's position asserts on this text, and two copies of a sentence that must
+/// match is how a reason drifts away from the test that guards it. The leading em dash is part of
+/// it — this is APPENDED to a reason, never used alone.
+const DONT_ASK_CLAUSE: &str = " — and this conversation asks nobody";
+
 /// Which of the classifier's `allow`s survive this rung.
 ///
 /// The ladder is the CLI's own, and what separates its steps is not what the classifier DECIDED but
@@ -1414,6 +1520,13 @@ const BYPASS_STILL_ASKS: &str =
 ///
 /// `WRITE_TOOLS` is subtracted from `manual` for the mirror-image reason: `read-local` covers
 /// ordinary in-workspace writes too, and those are the next rung up, not this one.
+///
+/// **`dont_ask` is here with `auto` and that is the whole of its share of this function.** This is
+/// consulted only where the classifier has ALREADY said `allow`, so the only thing a rung can do
+/// here is keep an allow or drop it, and `dont_ask` keeps every one of them — it is `auto`'s
+/// permission exactly, not a narrower one. What makes the rung different is not in this function at
+/// all: it is what happens to the calls that are NOT allows, which `auto` turns into a question and
+/// `dont_ask` turns into a refusal, one screen down in `rooted_decision`.
 fn allowed_at(
     permission: crate::chats::PermissionMode,
     action_class: &str,
@@ -1429,7 +1542,8 @@ fn allowed_at(
         // tools, and those calls arrive here and are governed exactly as `auto`'s are.
         crate::chats::PermissionMode::Plan
         | crate::chats::PermissionMode::Auto
-        | crate::chats::PermissionMode::Bypass => true,
+        | crate::chats::PermissionMode::Bypass
+        | crate::chats::PermissionMode::DontAsk => true,
     }
 }
 
@@ -1456,17 +1570,16 @@ async fn rooted_decision(
     //
     // Filtered like the sibling call, and for the same reason: an unreadable list parks everything,
     // so a read no tool call could consult is a read whose failure costs more than the read itself.
-    // The GitHub policy rides the same gate, as it does there.
-    let (rules, policy) = if crate::classifier::reads_shell_rules(&payload.tool_name) {
-        (
-            shell_rules_of(state, project_id).await,
-            github_policy_of(state, project_id).await,
-        )
+    // The GitHub policy rides its own gate, as it does there, and for the reason given there.
+    let rules = if crate::classifier::reads_shell_rules(&payload.tool_name) {
+        shell_rules_of(state, project_id).await
     } else {
-        (
-            ProjectRules::none(),
-            std::borrow::Cow::Borrowed(&state.github.policy),
-        )
+        ProjectRules::none()
+    };
+    let policy = if crate::classifier::reads_github_policy(&payload.tool_name) {
+        github_policy_of(state, project_id).await
+    } else {
+        std::borrow::Cow::Borrowed(&state.github.policy)
     };
     let mut classification = crate::classifier::classify(
         &payload.tool_name,
@@ -1610,6 +1723,40 @@ async fn rooted_decision(
         });
     }
 
+    // **A conversation that asks nobody.** Everything below this line asks a person; `dont_ask`
+    // is the rung that has no person, so it stops here and answers instead.
+    //
+    // The POSITION is the feature, and each of the three boundaries around it is load-bearing:
+    //
+    // - **After the `deny` return** and after the third-party-text barrier, so this can never
+    //   SOFTEN a refusal. A call those two turned down is already gone by the time control reaches
+    //   here, and a future edit that moves this block above them would quietly convert their
+    //   refusals into this one's — the same verdict with a weaker reason, and the barrier's warning
+    //   never logged.
+    // - **After `allowed_at`**, so every allow still runs. This rung's promise is that it permits
+    //   PRECISELY what `auto` permits; moved above that block it would refuse the reads, the
+    //   in-workspace writes and the recognised commands as well, which is not a stricter version of
+    //   this feature but a different and useless one.
+    // - **Before `ask_about`**, which is the point of the whole change. No `Ask` is ever registered,
+    //   so nothing waits out the 45-second window for an answer nobody is there to give, and
+    //   `spawn_judge` — reached only from inside the block below — never fires, so the rung costs no
+    //   model call either.
+    //
+    // What it does NOT do: end the run. This refuses ONE tool call and returns, exactly as a
+    // classifier `deny` does on every other rung; the turn goes on and the model may do something
+    // else. Nothing here mints a proposal, stops a prober or terminates a conversation, and nothing
+    // here should start.
+    //
+    // The reason is the classifier's own, with a clause appended rather than replaced: a refusal
+    // that said only "this conversation asks nobody" would tell the model the rung and not the
+    // fact, and the model's next attempt would be a guess.
+    if permission == crate::chats::PermissionMode::DontAsk {
+        return Json(Decision {
+            decision: "deny".to_owned(),
+            reason: format!("{}{DONT_ASK_CLAUSE}", classification.reason),
+        });
+    }
+
     if let Some(chat_id) = chat_of_run(&state.pool, run_id).await {
         let ask_id = crate::hooks::ask_about(
             &chat_id,
@@ -1621,7 +1768,9 @@ async fn rooted_decision(
         // is a rung that lies; not `accept_edits`, one line above for the same reason; not `bypass`,
         // which is the rung of asking nobody; and not `plan`, whose restraint already comes from the
         // CLI's own flag and which is governed here without a second opinion. One mode has a judge,
-        // and the reason each of the other four exists is to decide without one.
+        // and the reason each of the other four exists is to decide without one. `dont_ask` is not
+        // among the four because it never arrives — it returned above, before the ask was
+        // registered, which is what makes it the rung that summons no judge at all.
         if permission == crate::chats::PermissionMode::Auto {
             spawn_judge(
                 state,
@@ -3588,6 +3737,7 @@ mod tests {
         crate::project_policy::declare_shell_rule(
             &state.pool,
             "alpha",
+            None,
             "bash scripts/gates.sh",
             crate::project_policy::Verdict::Allow,
             None,
@@ -3712,6 +3862,7 @@ mod tests {
         crate::project_policy::declare_shell_rule(
             &state.pool,
             "alpha",
+            None,
             "ls",
             crate::project_policy::Verdict::Deny,
             None,
@@ -3883,6 +4034,7 @@ mod tests {
         crate::project_policy::declare_shell_rule(
             &state.pool,
             "alpha",
+            None,
             "ls",
             crate::project_policy::Verdict::Deny,
             None,
@@ -5665,6 +5817,7 @@ mod tests {
         crate::project_policy::declare_shell_rule(
             &state.pool,
             "alpha",
+            None,
             "npm ci",
             crate::project_policy::Verdict::Deny,
             None,
@@ -5744,6 +5897,247 @@ mod tests {
         assert_eq!(decision.reason, UNTRUSTED_CONTEXT_DENY_REASON);
     }
 
+    /// The rung's two halves, asserted against `auto` on the same probes, because the claim is a
+    /// DIFFERENCE and either half alone would pass a rung that was `auto` under another name.
+    ///
+    /// Three of the four probes must come back identical on both runs — that is the "allows what
+    /// `auto` allows" half, and it is the one a careless implementation breaks, by putting the
+    /// refusal above `allowed_at` and refusing the reads too. Only the fourth diverges: the command
+    /// no rule recognises, which `auto` turns into a question and this rung turns into a refusal.
+    ///
+    /// The reason is asserted too, and it is not decoration: a refusal that named only the rung
+    /// would tell the model WHO said no and not WHAT was wrong, and the model's next attempt would
+    /// be a guess. The classifier's sentence stays, with a clause after it.
+    #[tokio::test]
+    async fn dont_ask_allows_what_auto_allows_and_refuses_what_auto_would_ask_about() {
+        let (state, asked) = state_with_judge(Ok("YES"), std::time::Duration::ZERO).await;
+        let app = test_router(state.clone());
+        let asking = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Auto,
+        )
+        .await;
+        let silent = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::DontAsk,
+        )
+        .await;
+
+        for (label, tool, input) in [
+            ("a read", "Read", serde_json::json!({"file_path": "a.rs"})),
+            (
+                "a recognised non-mutating command",
+                "Bash",
+                serde_json::json!({"command": "git status"}),
+            ),
+            (
+                "an in-workspace write",
+                "Write",
+                serde_json::json!({"file_path": "C:/Projects/nucleos/a.rs", "content": "x"}),
+            ),
+        ] {
+            assert_eq!(
+                decide(&app, &probe(asking, tool, input.clone()))
+                    .await
+                    .decision,
+                "allow",
+                "{label}: `auto` must allow it, or the comparison below proves nothing"
+            );
+            assert_eq!(
+                decide(&app, &probe(silent, tool, input)).await.decision,
+                "allow",
+                "{label}: this rung permits PRECISELY what `auto` permits"
+            );
+        }
+
+        let unrecognised = |run_id| {
+            probe(
+                run_id,
+                "Bash",
+                serde_json::json!({"command": "npm install"}),
+            )
+        };
+        assert_eq!(
+            decide(&app, &unrecognised(asking)).await.decision,
+            "asking",
+            "`auto` stops to ask about a command no rule recognises"
+        );
+        let refused = decide(&app, &unrecognised(silent)).await;
+        assert_eq!(
+            refused.decision, "deny",
+            "and this rung refuses the very same call instead of asking about it"
+        );
+        assert!(
+            refused.reason.ends_with(DONT_ASK_CLAUSE),
+            "the rung must say it was the one that refused: {:?}",
+            refused.reason
+        );
+        assert!(
+            refused.reason.len() > DONT_ASK_CLAUSE.len(),
+            "and the classifier's own sentence must survive in front of that clause: {:?}",
+            refused.reason
+        );
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only `auto` spent a model call; this rung decided without one"
+        );
+    }
+
+    /// The cost claim, which is the reason the rung exists at all.
+    ///
+    /// A registered `Ask` is what waits out `ASK_WINDOW` — 45 seconds per unrecognised action, for
+    /// an answer nobody is there to give. Asserting the verdict cannot see that: a `deny` returned
+    /// AFTER `ask_about` would read identically here and still have minted the question and
+    /// summoned the judge. The empty register and the judge counter are what pin the return ABOVE
+    /// them.
+    #[tokio::test]
+    async fn dont_ask_registers_no_question_and_summons_no_judge() {
+        let (state, asked) = state_with_judge(Ok("YES"), std::time::Duration::ZERO).await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::DontAsk,
+        )
+        .await;
+        let chat_id = chat_of_run(&state.pool, run_id).await.unwrap();
+
+        assert_eq!(
+            decide(
+                &app,
+                &probe(
+                    run_id,
+                    "Bash",
+                    serde_json::json!({"command": "npm install"})
+                )
+            )
+            .await
+            .decision,
+            "deny"
+        );
+
+        assert!(
+            asks_for(&chat_id).is_empty(),
+            "nothing may wait out the 45-second window on a conversation that asks nobody"
+        );
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "and no judge may be summoned either — the refusal is free"
+        );
+    }
+
+    /// A refusal here costs ONE TOOL CALL, and the plan this rung was argued from said it ended the
+    /// run. It does not, and this test exists so that nobody later "fixes" the code to match that
+    /// sentence.
+    ///
+    /// `DENIAL_LIMIT` is 3 and this refuses four times deliberately:
+    /// `count_denial_and_stop_a_prober` is reached only from the autopilot branch, never from
+    /// `rooted_decision`, so a rooted turn's refusals are not counted at all and the fourth must be
+    /// answered exactly like the first. A `denials` column that moved, or a run that stopped being
+    /// `running`, would both be the same mistake — the hook terminating a conversation, which
+    /// `rooted_decision` has never done.
+    #[tokio::test]
+    async fn a_refused_dont_ask_turn_is_still_running() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::DontAsk,
+        )
+        .await;
+
+        for attempt in 1..=DENIAL_LIMIT + 1 {
+            assert_eq!(
+                decide(
+                    &app,
+                    &probe(
+                        run_id,
+                        "Bash",
+                        serde_json::json!({"command": "npm install"})
+                    )
+                )
+                .await
+                .decision,
+                "deny",
+                "attempt {attempt} must be answered like every other one"
+            );
+        }
+
+        let (status, denials): (String, i64) =
+            sqlx::query_as("SELECT status, denials FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "running",
+            "the turn survives a refusal — the hook never terminates a conversation"
+        );
+        assert_eq!(
+            denials, 0,
+            "and a rooted refusal is not a probe: nothing on this path counts one"
+        );
+
+        assert_eq!(
+            decide(
+                &app,
+                &probe(run_id, "Read", serde_json::json!({"file_path": "a.rs"}))
+            )
+            .await
+            .decision,
+            "allow",
+            "and the turn goes on: the next call is decided on its own merits"
+        );
+    }
+
+    /// The lowering block belongs to `bypass` and to nothing else.
+    ///
+    /// It turns a `deny`/`destructive` into a question, and a question needs somebody to answer it.
+    /// On this rung there is nobody, so the lowering has no destination and must not run —
+    /// `rm -rf target` stays a refusal.
+    ///
+    /// The reason is the second assertion and it pins the POSITION of the new guard: a classifier
+    /// `deny` returns above it, carrying the classifier's own sentence, so the "asks nobody" clause
+    /// must NOT appear here. If it did, the guard had been moved up over the `deny` return, and the
+    /// third-party-text barrier a few lines below it would have been stepped over too.
+    #[tokio::test]
+    async fn dont_ask_never_lowers_a_destructive_refusal_into_a_question() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::DontAsk,
+        )
+        .await;
+
+        let decision = decide(
+            &app,
+            &probe(
+                run_id,
+                "Bash",
+                serde_json::json!({"command": "rm -rf target"}),
+            ),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny");
+        assert_ne!(
+            decision.reason, BYPASS_STILL_ASKS,
+            "the lowering block must not have reached this rung"
+        );
+        assert!(
+            !decision.reason.contains("asks nobody"),
+            "a classifier refusal returns above the rung's guard and keeps its own reason: {:?}",
+            decision.reason
+        );
+    }
+
     /// A refusal stays a refusal on every rung below `bypass` — including `accept_edits`, the one
     /// most likely to be written as a union of allowed sets laid over the `deny` return.
     #[tokio::test]
@@ -5756,6 +6150,7 @@ mod tests {
             crate::chats::PermissionMode::AcceptEdits,
             crate::chats::PermissionMode::Plan,
             crate::chats::PermissionMode::Auto,
+            crate::chats::PermissionMode::DontAsk,
         ] {
             let run_id = rooted_turn_on(&state, "C:/Projects/nucleos", permission).await;
             assert_eq!(
@@ -7443,5 +7838,83 @@ mod tests {
 
         assert_eq!(decision.decision, "deny", "{}", decision.reason);
         assert_eq!(queued_rows(&state).await.len(), 1);
+    }
+
+    /// The `PostToolUse` route shares `pretooluse_decision`'s scope-decides construction, and this
+    /// is its own version of `the_gate_judges_a_turn_by_its_key_and_not_by_the_id_it_claims`: a
+    /// run's key decides which run's outcome this is, and a body naming a different run cannot
+    /// attribute an outcome to it — the claim is dropped, not compared and refused.
+    #[tokio::test]
+    async fn posttooluse_outcome_is_recorded_against_the_keys_run_and_not_the_claim() {
+        let state = test_state().await;
+        let mine = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let other = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let app = test_router(state.clone());
+
+        // A decision for `mine`, so there is a row for the outcome below to complete.
+        let decision = decide(
+            &app,
+            &format!(r#"{{"run_id":{mine},"tool_name":"Read","tool_input":{{}}}}"#),
+        )
+        .await;
+        assert_eq!(decision.decision, "allow");
+
+        // The outcome's BODY claims `other`'s id, but arrives under `mine`'s own key.
+        let status = posttooluse_outcome(
+            State(state.clone()),
+            Extension(Scope::Run(mine)),
+            Json(PostToolUsePayload {
+                run_id: other,
+                tool_name: "Read".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({"success": true}),
+                event: "PostToolUse".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mine_row: shadow::ShadowDecision =
+            sqlx::query_as("SELECT * FROM shadow_decisions WHERE run_id = ?")
+                .bind(mine)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(mine_row.outcome_event.as_deref(), Some("PostToolUse"));
+        assert!(mine_row.outcome.is_some());
+
+        let other_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM shadow_decisions WHERE run_id = ?")
+                .bind(other)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            other_rows, 0,
+            "the claimed run_id must never receive an outcome that belongs to the key's own run"
+        );
+    }
+
+    /// A `PostToolUseFailure` report for a run that has already left `run_handles` — finished,
+    /// crashed, or simply unknown — has nothing to complete and must not be treated as an error:
+    /// there is no decision to appeal and nobody waiting on an answer.
+    #[tokio::test]
+    async fn posttooluse_outcome_for_an_unknown_run_is_a_silent_no_op() {
+        let state = test_state().await;
+
+        let status = posttooluse_outcome(
+            State(state.clone()),
+            Extension(Scope::Run(999_999)),
+            Json(PostToolUsePayload {
+                run_id: 999_999,
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({"command": "echo hi"}),
+                tool_response: serde_json::json!({"success": false}),
+                event: "PostToolUseFailure".to_owned(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
     }
 }

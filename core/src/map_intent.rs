@@ -456,6 +456,10 @@ pub(crate) async fn ask_once(
         permission: crate::runner::Permission::Default,
         resume_session_id: None,
         mcp_config: None,
+        // The box that server would announce, and there is no server. Beside its pair for the
+        // same reason `allowed_mcp_tools` below carries the sentence it does: this is only ever
+        // read next to an `mcp_config`.
+        mcp_box: None,
         // The argument is `local_agent::verdict`'s: a reader that could edit the repository is not
         // reading it. It is also the only policy `OllamaRunner` accepts at all — it refuses
         // anything else outright — so the local half of the owner's choice depends on this value.

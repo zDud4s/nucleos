@@ -1416,6 +1416,12 @@ impl Driver {
             permission: crate::runner::Permission::Default,
             resume_session_id: None,
             mcp_config: with_tools.then(|| mcp_config_path(&self.id)),
+            // Unboxed, and said out loud rather than left to a default. The council writes its
+            // config with `build_mcp_config(&exe, None)` above, so a seat that is given tools is
+            // offered the whole surface and pays for the whole surface. Spelling it here is what
+            // puts the pairing on the page: the line above says a server exists, this one says
+            // what it announces, and the two are read together by `runner::authored_prompt`.
+            mcp_box: None,
             tool_policy: if with_tools {
                 crate::runner::ToolPolicy::McpOnly
             } else {

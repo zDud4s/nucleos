@@ -47,6 +47,8 @@ function detail(overrides: Partial<RunDetail> = {}): RunDetail {
     context_fill: 40_000,
     steerable: false,
     successor_run_id: null,
+    authored_prompt_estimate: 10_500,
+    cli_own_estimate: 18_700,
     ...overrides,
   };
 }
@@ -425,5 +427,48 @@ describe("RunDetail — the handoff", () => {
     expect(await screen.findByRole("link", { name: "Run 6 continued it" })).toBeDefined();
     // And the meter says the run was past the point where the daemon splits it.
     expect(screen.getByText(/at the handoff mark/)).toBeDefined();
+  });
+});
+
+/* ------------------------------------------------------- what it cost us -- */
+
+describe("RunDetail — the prompt budget", () => {
+  it("shows what the daemon wrote and what it did not", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(detail({ authored_prompt_estimate: 10_500, cli_own_estimate: 18_700 }), NO_TAIL, []),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    // Both readings, both labelled `estimate` and neither labelled `tokens` —
+    // it is four characters to the token and there is no tokenizer in this
+    // product to make it anything better.
+    expect(await screen.findByText(/10,500 estimate — what we wrote/)).toBeDefined();
+    expect(screen.getByText(/18,700 estimate — the CLI's own/)).toBeDefined();
+  });
+
+  it("names the rest unknown when the run reported no tokens", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(detail({ authored_prompt_estimate: 10_500, cli_own_estimate: null }), NO_TAIL, []),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    // A residual of zero would read as *the CLI added nothing*, which is the
+    // opposite of the truth about a run that simply never reported its usage.
+    expect(await screen.findByText(/10,500 estimate — what we wrote/)).toBeDefined();
+    expect(screen.getByText("the rest is unknown")).toBeDefined();
+    expect(screen.queryByText(/estimate — the CLI's own/)).toBeNull();
+  });
+
+  it("says nothing was recorded for a run whose prompt it did not write", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(detail({ authored_prompt_estimate: null, cli_own_estimate: null }), NO_TAIL, []),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(await screen.findByText("This run did not record what went into its prompt.")).toBeDefined();
+    expect(screen.queryByText(/estimate — what we wrote/)).toBeNull();
   });
 });

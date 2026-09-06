@@ -25,7 +25,7 @@ import type {
   ShellRule,
   Verdict,
 } from "../data/project-policy";
-import { foldPrefix } from "../data/project-policy";
+import { foldPathPrefix, foldPrefix } from "../data/project-policy";
 import type { ListingRead, ProjectRepo, ReadOutcome } from "../data/project-github";
 import type { Branches, Commit } from "../data/project-git";
 import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
@@ -637,14 +637,51 @@ export function proposal(overrides: Partial<Proposal> = {}): Proposal {
  */
 export const DECLARED_ON = "2026-03-14 09:41:00";
 
-/** `ORDER BY prefix`, which is the order the route serves its rows in. */
-function byPrefix(left: ShellRule, right: ShellRule): number {
-  return left.prefix < right.prefix ? -1 : left.prefix > right.prefix ? 1 : 0;
+/**
+ * `ORDER BY tool, prefix`, which is the order the route serves its rows in.
+ *
+ * The tool leads, and `''` — the column's spelling of "no tool" — sorts before every letter, so the
+ * command rules come first and `Edit` before `Write`. Sorting by prefix alone would be stable
+ * rather than wrong, which is worse: the order would follow whatever a test happened to declare
+ * first and a page relying on it would pass here and be wrong in front of the daemon.
+ */
+function byToolThenPrefix(left: ShellRule, right: ShellRule): number {
+  const tools = (left.tool ?? "") < (right.tool ?? "") ? -1 : (left.tool ?? "") > (right.tool ?? "") ? 1 : 0;
+  return tools !== 0 ? tools : left.prefix < right.prefix ? -1 : left.prefix > right.prefix ? 1 : 0;
 }
 
-/** One declared shell rule, whole, with the fields a test does not care about filled in. */
+/**
+ * PURE: the identity of a rule, which is the TOOL and the folded prefix — never the prefix alone.
+ *
+ * The daemon's unique index is `(project_id, tool, prefix)` and its `WHERE` names the same triple,
+ * so a project may hold `deny migrations` — a command — and `deny Edit migrations` — a directory —
+ * at once. A fake that identified a rule by the prefix would let a declaration of one overwrite the
+ * other and answer 204 about it, and every assertion resting on the list it then served would be
+ * vacuous: a page could draw one row where the daemon has two, and this double would agree.
+ *
+ * WHICH fold follows the tool, as it does in `project_policy`: a command loses its case through
+ * `foldPrefix`, a path keeps it through `foldPathPrefix`.
+ */
+function ruleKey(tool: string | null, prefix: string): string {
+  return `${tool ?? ""}\u0000${tool === null ? foldPrefix(prefix) : foldPathPrefix(prefix)}`;
+}
+
+/**
+ * One declared shell rule, whole, with the fields a test does not care about filled in.
+ *
+ * `tool: null` by default, which is a rule about a COMMAND prefix — what every rule in this app was
+ * until the route learned to carry a tool. A fixture defaulting the other way would make the older
+ * kind of rule the one a test has to spell out, and the older kind is still most of them.
+ */
 export function shellRule(overrides: Partial<ShellRule> = {}): ShellRule {
-  return { prefix: "npm ci", verdict: "allow", note: null, created_at: DECLARED_ON, ...overrides };
+  return {
+    prefix: "npm ci",
+    tool: null,
+    verdict: "allow",
+    note: null,
+    created_at: DECLARED_ON,
+    ...overrides,
+  };
 }
 
 /**
@@ -681,7 +718,7 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
           const { status, code, detail } = state.policyReadRefusal;
           throw new ApiRefusal(status, code, detail);
         }
-        if (table === "shell-rules") return [...state.shellRules].sort(byPrefix);
+        if (table === "shell-rules") return [...state.shellRules].sort(byToolThenPrefix);
         if (table === "github-ops") return [...state.githubOps].sort();
         // Two halves, because one route owns both: where a landing goes by default, and the extra
         // places it may be sent. The default is never in `targets` — it is admissible with no row,
@@ -696,28 +733,37 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       }
 
       if (table === "shell-rules") {
-        // The núcleo folds on the way in, so the fake does too: a prefix is identified by its
-        // folded spelling and by nothing else.
-        const prefix = foldPrefix(String(body?.prefix ?? ""));
+        // The núcleo folds on the way in, so the fake does too — and it identifies a rule by the
+        // TOOL and the folded prefix together, because that is the triple the unique index names.
+        // See `ruleKey`: keyed on the prefix alone, a project's command rule and its write rule of
+        // the same name overwrite each other here and nowhere else.
+        //
+        // An absent tool is a rule about a command, which is the reading `#[serde(default)]` gives
+        // both request shapes and the one every request written before the field existed had.
+        const tool = (body?.tool as string | null | undefined) ?? null;
+        const key = ruleKey(tool, String(body?.prefix ?? ""));
+        const others = state.shellRules.filter((rule) => ruleKey(rule.tool, rule.prefix) !== key);
         if (method === "DELETE") {
-          state.shellRules = state.shellRules.filter((rule) => rule.prefix !== prefix);
+          state.shellRules = others;
           return undefined;
         }
-        const already = state.shellRules.find((rule) => rule.prefix === prefix);
+        const already = state.shellRules.find((rule) => ruleKey(rule.tool, rule.prefix) === key);
         const written: ShellRule = {
-          prefix,
+          // The fold the daemon would have stored, which for a path keeps its case.
+          prefix:
+            tool === null
+              ? foldPrefix(String(body?.prefix ?? ""))
+              : foldPathPrefix(String(body?.prefix ?? "")),
+          tool,
           verdict: body?.verdict as Verdict,
           // `note = excluded.note`, and NOT a merge — whatever arrived is now the note, `null`
           // included. That is the trap the `Note` union exists to make a caller choose out loud.
           note: (body?.note as string | null | undefined) ?? null,
-          // Absent from the `DO UPDATE` in the núcleo, so a redeclaration keeps the day the prefix
+          // Absent from the `DO UPDATE` in the núcleo, so a redeclaration keeps the day the rule
           // was first written down.
           created_at: already?.created_at ?? DECLARED_ON,
         };
-        state.shellRules = [
-          ...state.shellRules.filter((rule) => rule.prefix !== prefix),
-          written,
-        ];
+        state.shellRules = [...others, written];
         return undefined;
       }
 

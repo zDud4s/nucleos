@@ -340,6 +340,11 @@ const HOOK_SOURCE: &str = include_str!("../hooks/ask_daemon.py");
 /// `${CLAUDE_PROJECT_DIR}` and not an absolute path: the same settings file is read from worktrees
 /// and from copies of the project, and a path baked in at install time would point at whichever one
 /// happened to be wired first.
+///
+/// The SAME entry is registered under every event `wire_classifier_hook` wires — `PreToolUse`,
+/// `PostToolUse`, `PostToolUseFailure` — because it is one script that reads `hook_event_name` out
+/// of its own payload to tell them apart (`core/hooks/ask_daemon.py`'s `main`). Nothing here needs
+/// to know which event it is being registered under.
 fn hook_entry() -> serde_json::Value {
     serde_json::json!({
         "matcher": "*",
@@ -348,6 +353,44 @@ fn hook_entry() -> serde_json::Value {
             "command": "python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""
         }]
     })
+}
+
+/// Registers one hook entry under `event_name` in `hooks`, deduped the same way for every event.
+///
+/// A free function rather than the chain inlined three times, because `.entry("hooks")…
+/// .entry("PreToolUse")` used to CONSUME the map's `as_object_mut()` borrow to reach the one
+/// event's array — there is no way to chain a second `.entry(...)` off the end of that without
+/// borrowing `hooks` again from scratch. Re-`entry()`ing from `hooks` once per event, here, is
+/// what lets a second and third event be appended instead of only the first one ever landing.
+///
+/// Compared the way `classifier_hook_is_wired` compares: against the script's path anywhere in
+/// the entry. The invocation around it is the user's business — `python`, `py -3`, a venv — and
+/// re-registering ours beside theirs would ask the daemon about every tool call twice.
+///
+/// **This dedupe does not look at which event it is scanning, and that is only safe because
+/// `hook_entry()` returns the identical command for every event it is wired under.** If the
+/// command ever came to differ by event — say, a flag naming the event so the script did not have
+/// to sniff `hook_event_name` out of its own payload — a `PostToolUse` entry already on disk could
+/// satisfy this check while wiring `PreToolUse`, and the barrier that matters most would silently
+/// stop being (re-)registered. Splitting the check by event, at that point, is not optional.
+fn wire_event(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
+    event_name: &str,
+    entry: serde_json::Value,
+) -> Result<(), String> {
+    let list = hooks
+        .entry(event_name)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| format!("`{event_name}` is not a list"))?;
+
+    let already = list.iter().any(|existing| {
+        serde_json::to_string(existing).is_ok_and(|text| text.contains(HOOK_SCRIPT))
+    });
+    if !already {
+        list.push(entry);
+    }
+    Ok(())
 }
 
 /// Puts this daemon's classifier hook into `dir`, so a conversation continued there may act.
@@ -391,20 +434,17 @@ pub(crate) fn wire_classifier_hook(dir: &Path) -> Result<(), String> {
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
-        .ok_or_else(|| format!("{}: `hooks` is not an object", settings_path.display()))?
-        .entry("PreToolUse")
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut()
-        .ok_or_else(|| format!("{}: `PreToolUse` is not a list", settings_path.display()))?;
+        .ok_or_else(|| format!("{}: `hooks` is not an object", settings_path.display()))?;
 
-    // Compared the way the gate compares: against the script's path anywhere in the entry. The
-    // invocation around it is the user's business — `python`, `py -3`, a venv — and re-registering
-    // ours beside theirs would ask the daemon about every tool call twice.
-    let already = hooks
-        .iter()
-        .any(|entry| serde_json::to_string(entry).is_ok_and(|text| text.contains(HOOK_SCRIPT)));
-    if !already {
-        hooks.push(hook_entry());
+    // `PreToolUse` is the barrier `classifier_hook_is_wired` gates activation on, and it is wired
+    // first for that reason alone — order does not matter to the settings file, only to a reader
+    // of this diff. `PostToolUse` and `PostToolUseFailure` are the outcome half wired beside it:
+    // the CLI fires the first after a successful call and the second after a failed one, never
+    // both, so wiring only one of them would make this ledger blind to every tool call that did
+    // NOT succeed.
+    for event_name in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+        wire_event(hooks, event_name, hook_entry())
+            .map_err(|error| format!("{}: {error}", settings_path.display()))?;
     }
 
     let body = serde_json::to_string_pretty(&settings)
@@ -435,6 +475,15 @@ pub(crate) fn wire_classifier_hook(dir: &Path) -> Result<(), String> {
 ///
 /// `dir` is the directory the CLI will actually run in, which for a worktree run is the worktree
 /// and not the project root: settings are read from where the process starts.
+///
+/// **Checks `PreToolUse` only, deliberately, even though `wire_classifier_hook` now registers two
+/// more events.** The barrier the gate exists to guarantee — a run cannot act without a tool call
+/// being classified first — is entirely the `PreToolUse` half; `PostToolUse`/`PostToolUseFailure`
+/// only ever RECORD an outcome after the tool has already run, and cannot be the thing standing
+/// between a stranger's text and a shell. Requiring all three here would also break every project
+/// already wired before this pair existed, refusing activation to a project whose actual barrier
+/// is intact until its `.claude/settings.json` happens to be rewritten. Do not "complete" this
+/// check without re-reading this paragraph first.
 pub(crate) fn classifier_hook_is_wired(dir: &Path) -> bool {
     let Ok(settings) = std::fs::read_to_string(dir.join(".claude/settings.json")) else {
         return false;
@@ -1447,6 +1496,32 @@ mod tests {
         );
     }
 
+    /// The outcome half of the ledger is wired the moment `PreToolUse` is: without `PostToolUse`
+    /// and `PostToolUseFailure` registered too, the CLI never reports what a tool call did, and
+    /// `shadow::record_outcome` has nothing arriving to complete.
+    #[test]
+    fn wiring_a_project_registers_all_three_events() {
+        let root = TempDir::new().unwrap();
+
+        wire_classifier_hook(root.path()).unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            let entries = settings["hooks"][event]
+                .as_array()
+                .unwrap_or_else(|| panic!("`{event}` was not wired: {settings}"));
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| serde_json::to_string(entry).unwrap().contains(HOOK_SCRIPT)),
+                "our hook is missing from `{event}`: {entries:?}"
+            );
+        }
+    }
+
     #[test]
     fn wiring_keeps_whatever_else_the_settings_already_said() {
         let root = TempDir::new().unwrap();
@@ -1465,7 +1540,36 @@ mod tests {
         // it, and a wiring that ate a person's PostToolUse hook would be a worse bug than the one
         // it fixes.
         assert_eq!(settings["model"], "opus");
-        assert!(settings["hooks"]["PostToolUse"].is_array());
+        let post_tool_use = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        // Their entry survives...
+        assert!(
+            post_tool_use
+                .iter()
+                .any(|entry| entry["matcher"] == "Edit"
+                    && entry["hooks"].as_array().unwrap().is_empty()),
+            "the user's own PostToolUse entry must survive: {post_tool_use:?}"
+        );
+        // ...and gains ours BESIDE it, because `PostToolUse` is now one of the events this daemon
+        // wires too. A writer that treated an existing array as "already handled" and skipped it,
+        // or one that replaced it outright, would either leave this ledger blind or eat the
+        // user's own hook — the two failures this assertion tells apart.
+        assert!(
+            post_tool_use
+                .iter()
+                .any(|entry| serde_json::to_string(entry).unwrap().contains(HOOK_SCRIPT)),
+            "our hook must be registered beside theirs: {post_tool_use:?}"
+        );
+        assert!(classifier_hook_is_wired(root.path()));
+    }
+
+    /// A project wired before `PostToolUse`/`PostToolUseFailure` existed has neither entry at
+    /// all, and the gate must still say it is wired: the barrier it guarantees was, and remains,
+    /// the `PreToolUse` one alone (see the doc comment on `classifier_hook_is_wired`).
+    #[test]
+    fn a_project_wired_before_the_outcome_pair_existed_still_passes_the_gate() {
+        let root = TempDir::new().unwrap();
+        write_nucleos_hook(&root);
+
         assert!(classifier_hook_is_wired(root.path()));
     }
 

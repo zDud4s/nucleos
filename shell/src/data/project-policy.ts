@@ -80,8 +80,27 @@ export type Verdict = "allow" | "deny";
  * {@link Verdict} — which is now a sentence a page can put beside a rule rather than beside a heading.
  */
 export interface ShellRule {
-  /** FOLDED, as stored and as enforced — see {@link foldPrefix}. */
+  /** FOLDED, as stored and as enforced — see {@link foldPrefix} and {@link foldPathPrefix}. */
   prefix: string;
+  /**
+   * Which tool's writes this rule governs — `"Edit"` or `"Write"` — or `null` for a rule about a
+   * COMMAND prefix.
+   *
+   * **The field that tells the two kinds of rule apart, and nothing else can.** `deny migrations`
+   * is a command nobody may run here; `deny Edit migrations` is a directory nothing may write into.
+   * They may both be declared at once — the núcleo's unique index is `(project_id, tool, prefix)` —
+   * so a page keying a row on the prefix alone draws one row where there are two, and a page
+   * showing the prefix alone shows a path as if it were a command.
+   *
+   * **A write rule can only ever say `deny`.** `POST /projects/{id}/shell-rules` refuses an `allow`
+   * that names a tool with `unenforceable_allow`, because the write chain in `classifier::classify`
+   * has no allow side to reach and `project_policy::shell_rules` drops such a row on the way out.
+   * A control offering to flip one is a control that knows the request will be refused.
+   *
+   * It also says which FOLD the prefix went through: `null` was lower-cased by
+   * {@link foldPrefix}, a tool name means {@link foldPathPrefix}, which keeps a path's case.
+   */
+  tool: string | null;
   verdict: Verdict;
   /** `null` for a rule nobody justified. An absent justification, never an absent field. */
   note: string | null;
@@ -161,6 +180,19 @@ export type Note =
 export interface ShellRuleDeclaration {
   projectId: string;
   prefix: string;
+  /**
+   * `"Edit"` or `"Write"` for a rule about writes to a PATH, `null` for one about a command prefix.
+   *
+   * Not optional, for {@link Note}'s reason in a smaller key: the two mean different things to the
+   * daemon and the field is the only thing that says which was meant. A `null` written out is a
+   * caller saying "a command", where an omitted field would be a caller who did not think about it
+   * — and the route reads both the same way, so the compiler is the only place the difference can
+   * still be asked about.
+   *
+   * `unknown_tool` (422) for anything else, and `unenforceable_allow` (422) for a tool beside an
+   * `allow` — see {@link ShellRule.tool}.
+   */
+  tool: string | null;
   verdict: Verdict;
   note: Note;
 }
@@ -362,10 +394,10 @@ function useDeclarationWrite<Input extends { projectId: string }>(
  * carries a `detail` worth putting on screen verbatim.
  */
 export function useDeclareShellRule() {
-  return useDeclarationWrite(({ projectId, prefix, verdict, note }: ShellRuleDeclaration) =>
+  return useDeclarationWrite(({ projectId, prefix, tool, verdict, note }: ShellRuleDeclaration) =>
     apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/shell-rules`, {
       method: "POST",
-      body: JSON.stringify({ prefix, verdict, note: noteField(note) }),
+      body: JSON.stringify({ prefix, tool, verdict, note: noteField(note) }),
     }),
   );
 }
@@ -377,13 +409,20 @@ export function useDeclareShellRule() {
  * and encoding one into a path segment only to decode it again buys nothing. `no_such_rule` (404)
  * when nothing matched, and its `detail` names the prefix in its FOLDED spelling — which is the
  * answer a caller who typed the wrong case needs to see.
+ *
+ * **And the tool goes with it, because a prefix alone no longer names a rule.** A project may hold
+ * `deny migrations` and `deny Edit migrations` at the same time; the daemon's `WHERE` matches on
+ * `(project_id, tool, prefix)`, so a DELETE that left the tool out would take the command rule
+ * while the write rule stayed on screen. Sending it is how a caller says which of the two it meant,
+ * and `null` says the command one — the reading every DELETE written before the field existed had.
  */
 export function useForgetShellRule() {
-  return useDeclarationWrite(({ projectId, prefix }: { projectId: string; prefix: string }) =>
-    apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/shell-rules`, {
-      method: "DELETE",
-      body: JSON.stringify({ prefix }),
-    }),
+  return useDeclarationWrite(
+    ({ projectId, prefix, tool }: { projectId: string; prefix: string; tool: string | null }) =>
+      apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/shell-rules`, {
+        method: "DELETE",
+        body: JSON.stringify({ prefix, tool }),
+      }),
   );
 }
 
@@ -486,11 +525,41 @@ export function foldPrefix(prefix: string): string {
 }
 
 /**
- * PURE: the rule already declared for a typed prefix, or `null` for one that is not.
+ * PURE: what the núcleo will actually store for a typed PATH prefix, and deliberately not
+ * {@link foldPrefix}.
  *
- * Folds before it looks, because case is not part of a rule's identity — asking with the typed
- * spelling is how a form would offer to "create" a rule that already exists and then silently
- * overwrite it.
+ * A mirror of `project_policy::fold_path_prefix`: trim, write `\` as `/` so a Windows spelling and
+ * a POSIX one are one prefix, drop a trailing `/` so `migrations` and `migrations/` are one prefix
+ * — and **no lower-casing**, which is the whole reason there are two of these.
+ *
+ * `foldPrefix` lower-cases because a command is case-insensitive to us: `Remove-Item` and
+ * `remove-item` are one cmdlet whatever the filesystem thinks. A path's case is the FILESYSTEM's
+ * business, and the núcleo answers that question at comparison time, in `write_denied_by_project`,
+ * with the fold the filesystem itself uses. A preview that lower-cased would be showing an owner a
+ * path that is not the one being stored — which is the lie the preview exists to prevent, told from
+ * the other side.
+ *
+ * A preview and never the decision, like its sibling: what comes back from the daemon is the folded
+ * truth.
+ */
+export function foldPathPrefix(prefix: string): string {
+  return prefix.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+/**
+ * PURE: the rule already declared for a typed prefix under a given tool, or `null` for one that is
+ * not.
+ *
+ * Folds before it looks, because the typed spelling is not a rule's identity — asking with it is how
+ * a form would offer to "create" a rule that already exists and then silently overwrite it. WHICH
+ * fold follows the tool, exactly as it does in the núcleo: a command goes through
+ * {@link foldPrefix} and loses its case, a path through {@link foldPathPrefix} and keeps it.
+ *
+ * **The tool is part of what is being asked, and defaults to `null` because that is the older
+ * question.** `deny migrations` and `deny Edit migrations` are two rules the daemon lets a project
+ * hold at once, so a lookup that ignored the tool would answer about the wrong one — telling a form
+ * that the `Edit` rule it is about to declare already exists, and offering it the command rule's
+ * justification to keep.
  *
  * **The whole row and not just the verdict, because the row is what an edit has to send back.**
  * `POST /projects/{id}/shell-rules` rewrites `verdict` and `note` from what it is given, so
@@ -504,9 +573,13 @@ export function foldPrefix(prefix: string): string {
  * table that has ended up disagreeing with itself, and the same direction `shell_rules` takes about
  * a verdict it cannot parse.
  */
-export function declaredRule(rules: ShellRule[], prefix: string): ShellRule | null {
-  const folded = foldPrefix(prefix);
-  const matching = rules.filter((rule) => rule.prefix === folded);
+export function declaredRule(
+  rules: ShellRule[],
+  prefix: string,
+  tool: string | null = null,
+): ShellRule | null {
+  const folded = tool === null ? foldPrefix(prefix) : foldPathPrefix(prefix);
+  const matching = rules.filter((rule) => rule.tool === tool && rule.prefix === folded);
   return matching.find((rule) => rule.verdict === "deny") ?? matching[0] ?? null;
 }
 
