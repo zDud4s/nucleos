@@ -359,6 +359,10 @@ const SHOTS_TO_TAKE = [
      shot alone cannot answer. */
   ["09e-chat-composer", { path: "/chats/c-preview" }],
   ["09f-chat-composer-light", { path: "/chats/c-preview", theme: "light" }],
+  /* The OTHER box. `/chats` with nothing open is the front door, which is a different component
+     from the one above and had none of its controls for a long time without anybody being able to
+     see that from a test — jsdom computes no layout and applies no stylesheet. */
+  ["09g-chat-front-door", { path: "/chats" }],
   ["10-catalogue-dark", { path: "/agents" }],
   ["11-catalogue-light", { path: "/agents", theme: "light" }],
   /* The editor, which is the half of the page that is not on screen at rest —
