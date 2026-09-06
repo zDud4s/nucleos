@@ -43,6 +43,7 @@ mod join;
 mod land;
 mod local_agent;
 mod logging;
+mod machine_config;
 mod mailsend;
 mod map_anchor;
 mod map_intent;

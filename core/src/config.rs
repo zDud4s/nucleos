@@ -458,12 +458,21 @@ where
 /// without a restart. The second reader is the reason it stopped being a literal in `main.rs`.
 pub const MODELS_CONFIG_PATH: &str = ".ai/nucleos-models.yaml";
 
+/// `.ai/nucleos-models.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Unlike its seven neighbours this file's loader could already refuse, so splitting the parser out
+/// buys no new strictness — it buys the write route a function with the shape every other claim's
+/// validator has, and it keeps the door and the loader reading one grammar rather than two.
+pub fn parse_models_config(contents: &str) -> Result<ModelsConfig, String> {
+    serde_yaml::from_str::<ModelsConfig>(contents).map_err(|error| error.to_string())
+}
+
 pub fn load_models_config(path: &Path) -> std::io::Result<ModelsConfig> {
     if !path.exists() {
         return Ok(ModelsConfig::default());
     }
     let contents = std::fs::read_to_string(path)?;
-    serde_yaml::from_str(&contents)
+    parse_models_config(&contents)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
@@ -549,14 +558,27 @@ impl EmailConfig {
     }
 }
 
+/// `.ai/email.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_email_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a typo in an optional pillar's config cannot stop the daemon from starting. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_email_config(contents: &str) -> Result<EmailConfig, String> {
+    serde_yaml::from_str::<EmailConfig>(contents)
+        .map(EmailConfig::validated)
+        .map_err(|error| error.to_string())
+}
+
 /// Reads `.ai/email.yaml`. Absent or unreadable → defaults, with a warning; never an error, so a
 /// typo in an optional pillar's config cannot stop the daemon from starting.
 pub fn load_email_config(path: &Path) -> EmailConfig {
     if !path.exists() {
         return EmailConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<EmailConfig>(&text)) {
-        Ok(Ok(config)) => config.validated(),
+    match std::fs::read_to_string(path).map(|text| parse_email_config(&text)) {
+        Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "email config: could not be parsed; the pillar stays off");
             EmailConfig::default()
@@ -692,6 +714,19 @@ impl VoiceConfig {
     }
 }
 
+/// `.ai/voice.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_voice_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a typo in a dictation aid cannot stop the daemon from starting. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_voice_config(contents: &str) -> Result<VoiceConfig, String> {
+    serde_yaml::from_str::<VoiceConfig>(contents)
+        .map(VoiceConfig::validated)
+        .map_err(|error| error.to_string())
+}
+
 /// Reads `.ai/voice.yaml`. Absent, unreadable or malformed → defaults, with a warning; never an error.
 ///
 /// This follows `load_email_config` rather than `load_schedule_rules`, and the choice matters in two
@@ -701,8 +736,8 @@ pub fn load_voice_config(path: &Path) -> VoiceConfig {
     if !path.exists() {
         return VoiceConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<VoiceConfig>(&text)) {
-        Ok(Ok(config)) => config.validated(),
+    match std::fs::read_to_string(path).map(|text| parse_voice_config(&text)) {
+        Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "voice config: could not be parsed; the pillar stays off");
             VoiceConfig::default()
@@ -750,11 +785,22 @@ impl Default for CalendarConfig {
     }
 }
 
+/// `.ai/calendar.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_calendar_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a typo in two policy strings cannot stop the daemon from starting. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_calendar_config(contents: &str) -> Result<CalendarConfig, String> {
+    serde_yaml::from_str::<CalendarConfig>(contents).map_err(|error| error.to_string())
+}
+
 pub fn load_calendar_config(path: &Path) -> CalendarConfig {
     if !path.exists() {
         return CalendarConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<CalendarConfig>(&text)) {
+    match std::fs::read_to_string(path).map(|text| parse_calendar_config(&text)) {
         Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "calendar config: could not be parsed; defaults apply");
@@ -815,6 +861,17 @@ impl Default for WebConfig {
     }
 }
 
+/// `.ai/web.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_web_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a broken file costs fidelity and never safety. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_web_config(contents: &str) -> Result<WebConfig, String> {
+    serde_yaml::from_str::<WebConfig>(contents).map_err(|error| error.to_string())
+}
+
 /// Reads `.ai/web.yaml`. Absent, unreadable or malformed → defaults, with a warning.
 ///
 /// The failure mode is deliberately asymmetric with the rest of this module: falling back to
@@ -826,7 +883,7 @@ pub fn load_web_config(path: &Path) -> WebConfig {
     if !path.exists() {
         return WebConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<WebConfig>(&text)) {
+    match std::fs::read_to_string(path).map(|text| parse_web_config(&text)) {
         Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "web config: could not be parsed; the pillar stays off and nothing is trusted");
@@ -879,6 +936,17 @@ impl Default for BrowserConfig {
     }
 }
 
+/// `.ai/browser.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_browser_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a broken file costs a capability and never grants one. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_browser_config(contents: &str) -> Result<BrowserConfig, String> {
+    serde_yaml::from_str::<BrowserConfig>(contents).map_err(|error| error.to_string())
+}
+
 /// Reads `.ai/browser.yaml`. Absent, unreadable or malformed → defaults, with a warning.
 ///
 /// Defaults mean the pillar is OFF, so a broken file costs a capability and never grants one — the
@@ -888,7 +956,7 @@ pub fn load_browser_config(path: &Path) -> BrowserConfig {
     if !path.exists() {
         return BrowserConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<BrowserConfig>(&text)) {
+    match std::fs::read_to_string(path).map(|text| parse_browser_config(&text)) {
         Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "browser config: could not be parsed; the pillar stays off");
@@ -927,6 +995,17 @@ where
     Ok(Option::<String>::deserialize(deserializer)?.filter(|text| !text.trim().is_empty()))
 }
 
+/// `.ai/telegram.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_telegram_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a typo never invents a doctrine nobody wrote. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_telegram_config(contents: &str) -> Result<TelegramConfig, String> {
+    serde_yaml::from_str::<TelegramConfig>(contents).map_err(|error| error.to_string())
+}
+
 /// Reads `.ai/telegram.yaml`. Absent, unreadable or malformed → default (`doctrine: None`), with a
 /// warning — the same asymmetry `load_web_config` and `load_browser_config` both take: a typo in a
 /// per-developer file must cost fidelity (no doctrine prepended) and never stop the daemon, and
@@ -935,7 +1014,7 @@ pub fn load_telegram_config(path: &Path) -> TelegramConfig {
     if !path.exists() {
         return TelegramConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<TelegramConfig>(&text)) {
+    match std::fs::read_to_string(path).map(|text| parse_telegram_config(&text)) {
         Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "telegram config: could not be parsed; every turn is launched exactly as before");
@@ -990,6 +1069,17 @@ impl Default for GithubConfig {
     }
 }
 
+/// `.ai/github.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_github_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a typo in a convenience list cannot take the daemon down. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_github_config(contents: &str) -> Result<GithubConfig, String> {
+    serde_yaml::from_str::<GithubConfig>(contents).map_err(|error| error.to_string())
+}
+
 /// Reads `.ai/github.yaml`. Absent, unreadable or malformed -> defaults, with a warning.
 ///
 /// The same asymmetry `load_web_config` has and the same reason: falling back to defaults here means
@@ -1003,7 +1093,7 @@ pub fn load_github_config(path: &Path) -> GithubConfig {
     if !path.exists() {
         return GithubConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<GithubConfig>(&text)) {
+    match std::fs::read_to_string(path).map(|text| parse_github_config(&text)) {
         Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "github config: could not be parsed; the pillar stays capable and stops being autonomous");
@@ -1300,29 +1390,40 @@ pub fn load_council_config(path: &Path, local_available: bool) -> Option<Council
     if !path.exists() {
         return None;
     }
-    let config = match std::fs::read_to_string(path).map(|text| serde_yaml::from_str(&text)) {
-        Ok(Ok(config)) => config,
+    match std::fs::read_to_string(path).map(|text| parse_council_config(&text, local_available)) {
+        Ok(Ok(config)) => Some(config),
         Ok(Err(error)) => {
-            tracing::warn!(%error, path = %path.display(), "council config: could not be parsed; there is no council");
-            return None;
+            tracing::warn!(%error, path = %path.display(), "council config: unusable; there is no council");
+            None
         }
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "council config: could not be read; there is no council");
-            return None;
+            None
         }
-    };
+    }
+}
 
+/// `.ai/council.yaml`'s grammar AND its roster rules, which for this file are the same question:
+/// a council whose seats do not add up is not a council, so `faults` belongs on this side of the
+/// door rather than after it.
+///
+/// `local_available` is a parameter for the reason [`load_council_config`] gives — whether this
+/// machine can answer locally is proved by probing at startup, not asserted by a file. The write
+/// route therefore passes `true`: the door refuses what is wrong about the ROSTER however the
+/// machine is configured, and leaves "no local model is up right now" to startup, which is where
+/// that fact is actually known. Refusing a local seat at the door because Ollama happens to be
+/// down would make the file uneditable on exactly the machine that needs it edited.
+pub fn parse_council_config(
+    contents: &str,
+    local_available: bool,
+) -> Result<CouncilConfig, String> {
+    let config: CouncilConfig =
+        serde_yaml::from_str(contents).map_err(|error| error.to_string())?;
     let faults = CouncilConfig::faults(&config, local_available);
     if !faults.is_empty() {
-        tracing::warn!(
-            path = %path.display(),
-            faults = %faults.join("; "),
-            "council config: the roster is not usable; there is no council"
-        );
-        return None;
+        return Err(faults.join("; "));
     }
-
-    Some(config.validated())
+    Ok(config.validated())
 }
 
 /// `deny_unknown_fields` on every rule type and on the file itself: without it a typo like
