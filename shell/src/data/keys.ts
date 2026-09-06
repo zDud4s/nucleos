@@ -526,5 +526,7 @@ export const keys = {
      * about to be compared against.
      */
     machine: ["system", "machine"] as const,
+    /** The credentials this machine holds, by presence only -- `GET /config/secrets`. */
+    secrets: ["system", "secrets"] as const,
   },
 } as const;

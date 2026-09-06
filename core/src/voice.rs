@@ -1851,6 +1851,7 @@ mod tests {
             council: Arc::new(crate::council::CouncilRuntime::default()),
             workflow_library: None,
             machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }

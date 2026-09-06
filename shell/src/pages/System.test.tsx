@@ -19,7 +19,7 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 import { System } from "./System";
-import type { MachineConfig } from "../data/machine-config";
+import type { MachineConfig, MachineSecret } from "../data/machine-config";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
 import type {
@@ -113,6 +113,7 @@ interface SystemWorld {
   voiceConfig: VoiceConfig;
   calendarConfig: CalendarConfig;
   machine: MachineConfig;
+  secrets: MachineSecret[];
 }
 
 /**
@@ -163,6 +164,10 @@ function systemWorld(overrides: Partial<SystemWorld> = {}): SystemWorld {
     voiceConfig: DEFAULT_VOICE_CONFIG,
     calendarConfig: DEFAULT_CALENDAR_CONFIG,
     machine: machineWorld(),
+    secrets: [
+      { key: "github-token", area: "github", what: "the token gh is handed", present: false },
+      { key: "web-search-api-key", area: "web", what: "the search provider's key", present: true },
+    ],
     ...overrides,
   };
 }
@@ -259,7 +264,33 @@ function systemFetch(
       return await shared(path, init);
     }
 
+    if (init?.method === "PUT") {
+      const putMatch = /^\/config\/secrets\/([^/]+)$/.exec(path);
+      if (putMatch !== null && typeof init.body === "string") {
+        const key = decodeURIComponent(putMatch[1]);
+        const row = world.secrets.find((entry) => entry.key === key);
+        if (row === undefined) throw new ApiRefusal(403, "not_ours", "not_ours");
+        const { value } = JSON.parse(init.body) as { value: string };
+        if (value === "") {
+          throw new ApiRefusal(422, "invalid", "an empty value is not a credential");
+        }
+        world.secrets = world.secrets.map((entry) =>
+          entry.key === key ? { ...entry, present: true } : entry,
+        );
+        return undefined;
+      }
+      return await shared(path, init);
+    }
+
     if (init?.method === "DELETE") {
+      const forgetMatch = /^\/config\/secrets\/([^/]+)$/.exec(path);
+      if (forgetMatch !== null) {
+        const key = decodeURIComponent(forgetMatch[1]);
+        world.secrets = world.secrets.map((entry) =>
+          entry.key === key ? { ...entry, present: false } : entry,
+        );
+        return undefined;
+      }
       const revokeMatch = /^\/api-tokens\/([^/]+)$/.exec(path);
       if (revokeMatch !== null) {
         const name = decodeURIComponent(revokeMatch[1]);
@@ -294,6 +325,8 @@ function systemFetch(
         return world.calendarConfig;
       case "/config/machine":
         return world.machine;
+      case "/config/secrets":
+        return { secrets: world.secrets };
       default:
         return await shared(path, init);
     }
@@ -873,6 +906,53 @@ describe("System - this machine's settings", () => {
     // back to a file they cannot see to look for a line nobody named.
     expect(await screen.findByText(/did not find expected node content/)).toBeDefined();
     expect(world.machine.settings.find((row) => row.path === ".ai/browser.yaml")?.exists).toBe(false);
+  });
+});
+
+describe("System - credentials", () => {
+  it("puts a credential beside the file it belongs with, and never renders a value", async () => {
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    // The github credential renders inside the github panel, not in a list of
+    // its own: a pillar and its key are one decision.
+    const githubPanel = (await screen.findByRole("heading", { name: "github" })).closest(
+      "section",
+    ) as HTMLElement;
+    expect(within(githubPanel).getByText("github-token")).toBeDefined();
+    expect(within(githubPanel).getByText("not set")).toBeDefined();
+
+    // The input is a password field and starts empty, whatever is stored.
+    const input = within(githubPanel).getByLabelText("github-token");
+    expect(input.getAttribute("type")).toBe("password");
+    expect((input as HTMLInputElement).value).toBe("");
+  });
+
+  it("stores a credential, clears the box, and reports only that it is set", async () => {
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    const githubPanel = (await screen.findByRole("heading", { name: "github" })).closest(
+      "section",
+    ) as HTMLElement;
+    const input = within(githubPanel).getByLabelText("github-token");
+    fireEvent.change(input, { target: { value: "ghp_a_real_looking_token" } });
+    fireEvent.click(within(githubPanel).getByRole("button", { name: "Set" }));
+
+    await waitFor(() => {
+      expect(world.secrets.find((row) => row.key === "github-token")?.present).toBe(true);
+    });
+
+    // The box is cleared and the token is nowhere on the page. A credential that
+    // stayed on screen after being stored is a credential in a screenshot.
+    await waitFor(() => {
+      expect((input as HTMLInputElement).value).toBe("");
+    });
+    expect(document.body.textContent).not.toContain("ghp_a_real_looking_token");
   });
 });
 

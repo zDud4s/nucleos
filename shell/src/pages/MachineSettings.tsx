@@ -1,11 +1,15 @@
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
+  useForgetSecret,
   useMachineConfig,
+  useMachineSecrets,
+  useStoreSecret,
   useWriteMachineSetting,
+  type MachineSecret,
   type MachineSetting,
 } from "../data/machine-config";
-import { Badge, Button, ErrorNote, Panel, RefusalNote } from "../ui";
+import { Badge, Button, ConfirmButton, ErrorNote, Panel, RefusalNote } from "../ui";
 
 /**
  * This machine's settings — the files whose author is the daemon rather than
@@ -42,6 +46,7 @@ import { Badge, Button, ErrorNote, Panel, RefusalNote } from "../ui";
  */
 export function MachineSettings() {
   const config = useMachineConfig();
+  const secrets = useMachineSecrets();
 
   if (config.isPending) return <p className="sy-loading">reading this machine's settings…</p>;
   if (config.error) {
@@ -67,7 +72,11 @@ export function MachineSettings() {
       </Panel>
 
       {config.data.settings.map((setting) => (
-        <SettingPanel key={setting.path} setting={setting} />
+        <SettingPanel
+          key={setting.path}
+          setting={setting}
+          secrets={(secrets.data?.secrets ?? []).filter((row) => row.area === setting.area)}
+        />
       ))}
     </>
   );
@@ -82,7 +91,13 @@ export function MachineSettings() {
  * text as though it were the file. `contents ?? ""` seeds it once and the
  * `saved` flag is what says the two agree.
  */
-function SettingPanel({ setting }: { setting: MachineSetting }) {
+function SettingPanel({
+  setting,
+  secrets,
+}: {
+  setting: MachineSetting;
+  secrets: MachineSecret[];
+}) {
   const write = useWriteMachineSetting();
   const [draft, setDraft] = useState(setting.contents ?? "");
   const [saved, setSaved] = useState(false);
@@ -101,6 +116,10 @@ function SettingPanel({ setting }: { setting: MachineSetting }) {
       }
     >
       <p className="sy-note">{setting.what}</p>
+
+      {secrets.map((secret) => (
+        <SecretControl key={secret.key} secret={secret} />
+      ))}
 
       <dl className="sy-config-facts">
         <div className="sy-fact">
@@ -158,5 +177,81 @@ function SettingPanel({ setting }: { setting: MachineSetting }) {
           <ErrorNote>the núcleo did not answer — nothing was written</ErrorNote>
         ))}
     </Panel>
+  );
+}
+
+/**
+ * One credential: whether it is set, a box to set it, and a way to forget it.
+ *
+ * It sits inside the panel for its own area rather than in a list of its own,
+ * which the núcleo makes safe to rely on — a test there asserts every credential
+ * names an area that has a settings file. The pairing is the useful one: a
+ * mailbox and its password are one decision, and putting them on two screens is
+ * how somebody configures half of a pillar and cannot see why it is still off.
+ *
+ * The value is write-only, everywhere. There is no route that serves one back,
+ * the input is cleared the moment it is accepted, and `present` is the only
+ * thing this ever renders about a stored credential.
+ */
+function SecretControl({ secret }: { secret: MachineSecret }) {
+  const store = useStoreSecret();
+  const forget = useForgetSecret();
+  const [value, setValue] = useState("");
+
+  return (
+    <div className="sy-secret">
+      <div className="sy-secret-head">
+        <span className="sy-secret-key">{secret.key}</span>
+        {secret.present === true && <Badge tone="info">set</Badge>}
+        {secret.present === false && <Badge tone="off">not set</Badge>}
+        {/* Not the same as "not set", and acting on the two differs: one wants a
+            credential pasted, the other wants somebody to look at the store. */}
+        {secret.present === null && <Badge tone="pending">could not be asked</Badge>}
+      </div>
+      <p className="sy-note">{secret.what}</p>
+      <div className="sy-setting-controls">
+        <input
+          type="password"
+          className="sy-secret-input"
+          aria-label={secret.key}
+          autoComplete="off"
+          spellCheck={false}
+          value={value}
+          placeholder={secret.present === true ? "replace it" : "paste it here"}
+          onChange={(event) => {
+            setValue(event.target.value);
+          }}
+        />
+        <Button
+          disabled={value === "" || store.isPending}
+          onClick={() => {
+            store.mutate(
+              { key: secret.key, value },
+              // Cleared on success only. Clearing it on failure would take away
+              // what somebody pasted along with the error telling them why.
+              { onSuccess: () => { setValue(""); } },
+            );
+          }}
+        >
+          {store.isPending ? "storing…" : "Set"}
+        </Button>
+        {secret.present === true && (
+          <ConfirmButton
+            intent="stop"
+            label="Forget"
+            confirmLabel="Forget it"
+            onConfirm={() => {
+              forget.mutate(secret.key);
+            }}
+          />
+        )}
+      </div>
+      {store.error != null &&
+        (isApiRefusal(store.error) ? (
+          <RefusalNote refusal={store.error} />
+        ) : (
+          <ErrorNote>the núcleo did not answer — nothing was stored</ErrorNote>
+        ))}
+    </div>
   );
 }

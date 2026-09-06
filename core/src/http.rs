@@ -49,6 +49,11 @@ pub fn build_router(state: AppState) -> Router {
             "/config/machine",
             get(get_machine_config).post(post_machine_config),
         )
+        .route("/config/secrets", get(get_machine_secrets))
+        .route(
+            "/config/secrets/{key}",
+            axum::routing::put(put_machine_secret).delete(delete_machine_secret),
+        )
         .route("/backup", post(post_backup))
         .route("/backups", get(get_backups))
         .route("/backups/{name}/restore", post(post_backup_restore))
@@ -3688,6 +3693,149 @@ async fn post_machine_config(
     .await
     {
         tracing::error!(%error, path = %setting.path, "the settings file was written but the feed line was lost");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The credentials this machine holds, by whether they are set — never by what they are.
+///
+/// The listing carries no value and there is no route that serves one, which is enforced a layer
+/// down: [`crate::secrets::SecretStore`] has no method that returns a secret, so a future handler
+/// cannot serve one by accident. Presence is the only question a settings page has.
+async fn get_machine_secrets(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let rows = crate::machine_config::SECRETS
+        .iter()
+        .map(|secret| {
+            // A store that cannot answer is reported as unknown rather than as absent. "Not set"
+            // is a fact somebody would act on by pasting a credential they have already pasted.
+            let present = state.secrets.present(secret.key).ok();
+            serde_json::json!({
+                "key": secret.key,
+                "area": secret.area,
+                "what": secret.what,
+                "present": present,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({ "secrets": rows })))
+}
+
+/// A credential on its way in. Deliberately derives no `Debug`.
+///
+/// `Debug` is how a secret ends up in a log: one `tracing::warn!(?body, …)` written in a hurry by
+/// somebody debugging an unrelated failure, and the credential is on disk in the daemon's rotating
+/// log file. Not deriving it makes that line refuse to compile.
+#[derive(Deserialize)]
+struct SecretRequest {
+    value: String,
+}
+
+/// Stores one credential, or refuses.
+///
+/// **Why the app may write these at all**, given that `--set-*` reads from stdin precisely to keep
+/// a token off a command line: that reasoning is about ARGV. A Windows command line is readable by
+/// any process running as the same user and is recorded verbatim in PSReadLine's history, so a
+/// token passed as an argument lands on disk in cleartext at the moment somebody was securely
+/// storing it. None of that is true of a request body over loopback to the one process that
+/// already holds every one of these credentials and hands them to the sidecars it starts.
+///
+/// Admin, by appearing in no table in `auth.rs`, on the same default-deny footing as everything
+/// else under `/config`. The kill switch is consulted for the same reason the settings write
+/// consults it: the control token reaches here, and a credential is a capability.
+async fn put_machine_secret(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<SecretRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    // `daemon-token` takes this path: it is not in the table, so it is `not_ours` like any other
+    // key nobody declared. That is deliberate rather than incidental — see `SECRETS`.
+    let Some(secret) = crate::machine_config::secret_for(&key) else {
+        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
+    };
+
+    // An empty value is refused rather than stored. Storing one would leave a credential that
+    // exists and does not work, which reads as "configured" everywhere it is asked about — the
+    // worst of the three available states. Forgetting it is what DELETE is for.
+    if body.value.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "invalid",
+                "detail": "an empty value is not a credential; use DELETE to forget one",
+            })),
+        ));
+    }
+
+    state
+        .secrets
+        .store(secret.key, &body.value)
+        .map_err(|error| {
+            // `error` and never the value.
+            tracing::warn!(%error, key = %secret.key, "storing a credential failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    // The key, never the value, and no length either — a length is a hint about a secret.
+    if let Err(error) = feed::append(
+        &state.pool,
+        None,
+        "secret_stored",
+        &format!("the {} credential was set from the app", secret.key),
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, key = %secret.key, "the credential was stored but the feed line was lost");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Forgets one credential.
+///
+/// Idempotent, because [`crate::secrets::delete_secret`] already treats a missing entry as done:
+/// a page that had to distinguish "forgotten" from "was not there" would be asking a question
+/// whose two answers call for the same next step.
+async fn delete_machine_secret(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let Some(secret) = crate::machine_config::secret_for(&key) else {
+        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
+    };
+
+    state.secrets.forget(secret.key).map_err(|error| {
+        tracing::warn!(%error, key = %secret.key, "forgetting a credential failed");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
+
+    if let Err(error) = feed::append(
+        &state.pool,
+        None,
+        "secret_forgotten",
+        &format!("the {} credential was forgotten from the app", secret.key),
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, key = %secret.key, "the credential was forgotten but the feed line was lost");
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -13165,6 +13313,7 @@ mod tests {
                 files_root: None,
                 workflow_library: None,
                 machine_config_root: None,
+                secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -14071,6 +14220,7 @@ mod tests {
             files_root: None,
             workflow_library: None,
             machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -15132,6 +15282,7 @@ mod tests {
             files_root: Some(root),
             workflow_library: None,
             machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             ..state
         }
     }
@@ -19451,6 +19602,141 @@ mod tests {
         assert_ne!(installed[0]["hash"], installed[0]["origin_hash"]);
         // Drift is not an update on offer: nobody published a new version.
         assert!(installed[0]["update_available"].is_null());
+    }
+
+    /// A credential goes in, and only its presence ever comes back.
+    ///
+    /// The value is asserted absent from the whole response body rather than from the field it
+    /// would have been put in: a future handler that added `"value"` beside `"present"` would pass
+    /// a narrower check, and the point of this one is that no shape of leak passes it.
+    #[tokio::test]
+    async fn a_credential_is_stored_and_only_its_presence_is_ever_reported() {
+        let state = test_state().await;
+
+        let (_, before) = workflow_call(state.clone(), "GET", "/config/secrets", None).await;
+        let row = |body: &serde_json::Value| {
+            body["secrets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["key"] == "github-token")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row(&before)["present"], false);
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "PUT",
+            "/config/secrets/github-token",
+            Some(serde_json::json!({ "value": "ghp_a_real_looking_token" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, after) = workflow_call(state, "GET", "/config/secrets", None).await;
+        assert_eq!(row(&after)["present"], true);
+        assert!(
+            !after.to_string().contains("ghp_a_real_looking_token"),
+            "no route may serve a credential back"
+        );
+    }
+
+    /// The daemon's own token is not a credential this app may set.
+    ///
+    /// It is the app's key to the daemon: overwriting it through the API would lock out the caller
+    /// making the request, and the recovery is a restart plus a credential the app can no longer be
+    /// told. It is absent from `SECRETS`, so it refuses by the ordinary path rather than by a
+    /// special case somebody could delete.
+    #[tokio::test]
+    async fn the_daemon_token_cannot_be_written_through_the_api() {
+        let state = test_state().await;
+        for method in ["PUT", "DELETE"] {
+            let (status, body) = workflow_call(
+                state.clone(),
+                method,
+                "/config/secrets/daemon-token",
+                Some(serde_json::json!({ "value": "a-new-token" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} must be refused");
+            assert_eq!(body["refusal"], "not_ours");
+        }
+
+        // And it is not listed either, so nothing invites somebody to try.
+        let (_, listing) = workflow_call(state, "GET", "/config/secrets", None).await;
+        assert!(!listing.to_string().contains("daemon-token"));
+    }
+
+    /// An empty value is refused rather than stored.
+    ///
+    /// Storing one leaves a credential that exists and does not work, which reads as "configured"
+    /// everywhere it is asked about — the worst of the three available states.
+    #[tokio::test]
+    async fn an_empty_value_is_refused_rather_than_stored() {
+        let state = test_state().await;
+        let (status, body) = workflow_call(
+            state.clone(),
+            "PUT",
+            "/config/secrets/openrouter-api-key",
+            Some(serde_json::json!({ "value": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["refusal"], "invalid");
+        assert!(body["detail"].as_str().unwrap().contains("DELETE"));
+
+        let (_, listing) = workflow_call(state, "GET", "/config/secrets", None).await;
+        let row = listing["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["key"] == "openrouter-api-key")
+            .unwrap()
+            .clone();
+        assert_eq!(row["present"], false, "nothing was stored");
+    }
+
+    /// Forgetting is idempotent, because "forgotten" and "was not there" call for the same next
+    /// step and a page that had to tell them apart would be asking a question with one answer.
+    #[tokio::test]
+    async fn forgetting_a_credential_is_idempotent() {
+        let state = test_state().await;
+        for _ in 0..2 {
+            let (status, _) = workflow_call(
+                state.clone(),
+                "DELETE",
+                "/config/secrets/telegram-token",
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+    }
+
+    /// The kill switch stops a credential being written, for the reason it stops a settings write:
+    /// the control token reaches here, and a credential is a capability.
+    #[tokio::test]
+    async fn the_kill_switch_stops_a_credential_being_written() {
+        let state = test_state().await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/kill",
+            Some(serde_json::json!({ "engaged": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = workflow_call(
+            state,
+            "PUT",
+            "/config/secrets/github-token",
+            Some(serde_json::json!({ "value": "ghp_something" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
     }
 
     /// A state whose machine-settings root is a directory this test owns.
@@ -26785,6 +27071,7 @@ mod tests {
             files_root: None,
             workflow_library: None,
             machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),

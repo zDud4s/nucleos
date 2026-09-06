@@ -1339,6 +1339,7 @@ mod tests {
             files_root: None,
             workflow_library: None,
             machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -2511,6 +2512,7 @@ mod tests {
                 files_root: Some(root),
                 workflow_library: None,
                 machine_config_root: None,
+                secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
                 ..state
             },
             temp,

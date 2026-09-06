@@ -1166,6 +1166,7 @@ async fn main() {
         // Said out loud on failure rather than swallowed: every settings route refuses
         // without it, and "the daemon cannot name its own working directory" is not a
         // sentence anybody should have to infer from a 500.
+        secrets: std::sync::Arc::new(secrets::OsCredentialStore),
         machine_config_root: std::env::current_dir()
             .inspect_err(|error| {
                 tracing::warn!(%error, "the daemon cannot name its own working directory; this machine's settings cannot be edited from the app")

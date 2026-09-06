@@ -186,6 +186,88 @@ pub fn setting_for(rel: &str) -> Option<&'static Setting> {
     SETTINGS.iter().find(|setting| setting.path == path)
 }
 
+/* ------------------------------------------------------------ the other half -- */
+
+/// One credential this machine holds, named so the page can ask for it without ever being told it.
+///
+/// The second half of this machine's settings, and it is a separate table rather than a field on
+/// [`Setting`] because it is a different KIND of thing with a different store and a different rule:
+/// a settings file is read and written as text, and a credential may only ever be written. The
+/// asymmetry is the point — see [`SECRETS`].
+pub struct Secret {
+    /// The key in the OS credential store, under the service name `secrets.rs` pins.
+    pub key: &'static str,
+    /// Which pillar this credential belongs to, matching a [`Setting::area`] wherever one exists,
+    /// so the page can put the key beside the file it goes with.
+    pub area: &'static str,
+    /// What it is and what stops working without it, in one sentence.
+    pub what: &'static str,
+}
+
+/// The credentials the app may set, and the deliberate absence of the one it may not.
+///
+/// # Why these live in the credential store and not in the files above
+///
+/// Every config type in `config.rs` says it where the temptation was closest: `.ai/email.yaml`
+/// holds the mailbox but not its password, `.ai/web.yaml` holds the provider but not its key,
+/// `.ai/nucleos-models.yaml` names the hosted model but not the OpenRouter key. Those files are
+/// versioned and this is a single-user desktop; a secret in one of them is a secret in somebody's
+/// git history. Keeping the split is what lets `GET /config/machine` serve file contents verbatim.
+///
+/// # Why the app may write them at all
+///
+/// Four of the five are settable today only by `nucleos-core --set-*`, which reads from stdin
+/// rather than argv — a Windows command line is readable by any process running as the same user
+/// and is recorded verbatim in PSReadLine's history, so a token passed as an argument is a token on
+/// disk in cleartext at the exact moment somebody was securely storing it. That reasoning is about
+/// ARGV, and it does not reach a request body over loopback to the one process that already holds
+/// every one of these. The fifth, `web-search-api-key`, has no setter at all: `main.rs` reads it
+/// and nothing in the repository writes it, so the web pillar is reachable today only by opening
+/// Credential Manager by hand.
+///
+/// # Why `daemon-token` is not here
+///
+/// It is the app's own key to the daemon. Overwriting it through the API would lock out the caller
+/// making the request — the shell included — and the recovery is a restart plus a credential the
+/// app can no longer be told. It is minted at startup and rotated by overwrite, and that stays a
+/// thing done from a terminal by somebody who understands they are cutting the line they are
+/// standing on. `SECRETS` not containing it is the whole of that rule, and a test pins it.
+pub static SECRETS: &[Secret] = &[
+    Secret {
+        key: "github-token",
+        area: "github",
+        what: "the token every `gh` call is handed as GH_TOKEN; without it the GitHub pillar can read nothing and do nothing",
+    },
+    Secret {
+        key: "email-imap-password",
+        area: "email",
+        what: "the mailbox's app password; without it the email sidecar does not start, whatever `.ai/email.yaml` says",
+    },
+    Secret {
+        key: "telegram-token",
+        area: "telegram",
+        what: "the bot token; without it the Telegram sidecar does not start",
+    },
+    Secret {
+        key: "web-search-api-key",
+        area: "web",
+        what: "the search provider's key; without it the web pillar cannot search, and until now nothing in this app or its CLI could set one",
+    },
+    Secret {
+        key: "openrouter-api-key",
+        area: "models",
+        what: "OpenRouter's key; without it a hosted chat turn is refused before any request leaves the machine, however `hosted_assistant_model` is set",
+    },
+];
+
+/// The row for `key`, or `None` for a credential this app does not set.
+///
+/// Total, like [`setting_for`]: `daemon-token` is not an error to ask about, it is simply not on
+/// this list, and that is an answer.
+pub fn secret_for(key: &str) -> Option<&'static Secret> {
+    SECRETS.iter().find(|secret| secret.key == key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +300,38 @@ mod tests {
                 !setting.takes_effect.is_empty(),
                 "{} must say when a write starts mattering",
                 setting.path
+            );
+        }
+    }
+
+    /// The daemon's own token is absent, and every other row says what it is for.
+    ///
+    /// The absence is the rule, not an oversight: `daemon-token` is the app's key to the daemon,
+    /// and writing it through the API would cut the line the caller is standing on. Pinned here so
+    /// that adding it becomes a deliberate act somebody has to delete a test for.
+    #[test]
+    fn the_daemon_token_is_not_a_credential_this_app_may_set() {
+        assert!(secret_for("daemon-token").is_none());
+        assert!(SECRETS.iter().all(|secret| secret.key != "daemon-token"));
+        for secret in SECRETS {
+            assert!(
+                !secret.what.is_empty(),
+                "{} must say what it is for",
+                secret.key
+            );
+        }
+    }
+
+    /// Every credential names an area that has a settings file, so the page can put the key beside
+    /// the file it goes with rather than in a list of its own.
+    #[test]
+    fn every_credential_belongs_beside_a_settings_file() {
+        for secret in SECRETS {
+            assert!(
+                SETTINGS.iter().any(|setting| setting.area == secret.area),
+                "{} names the area {}, which has no settings file",
+                secret.key,
+                secret.area
             );
         }
     }
