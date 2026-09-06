@@ -2994,6 +2994,12 @@ async fn spawn_agent(
         permission: crate::runner::Permission::Default,
         resume_session_id: None,
         mcp_config,
+        // Unboxed, like the council seat this launch is modelled on: `write_mcp_config` above
+        // calls `assistant::build_mcp_config(&exe, None)`, so a member with tools is offered the
+        // whole surface. `allowed_mcp_tools` below narrows what the member may CALL, which is a
+        // different question from what its server announces — and it is the announcement that is
+        // paid for in the prompt.
+        mcp_box: None,
         tool_policy: if with_tools {
             crate::runner::ToolPolicy::McpOnly
         } else {

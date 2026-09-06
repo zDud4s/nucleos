@@ -1700,13 +1700,21 @@ function Project({ chatId }: { chatId: string }) {
 }
 
 /**
- * The five rungs, in the order the CLI's own picker shows them.
+ * The six rungs, ordered from least to most that happens unasked.
+ *
+ * It used to be "the order the CLI's own picker shows them", and that stopped being the ordering
+ * argument the moment a rung appeared that the CLI does not have. `dont_ask` sits BESIDE `auto`
+ * rather than above it, and the placement is the claim: it allows precisely what `auto` allows —
+ * same classifier, same rules — and refuses the remainder instead of asking about it. Nothing more
+ * runs on it than on `auto`, so putting it any higher would read as a wider permission than it is.
  *
  * `needsTools` is which of them a conversation with no tools cannot stand on. `plan` is a flag the
  * CLI is launched with, so it means something whatever the conversation can reach; `auto` is the
- * neutral state and is what every conversation already has. The other three are entirely about what
+ * neutral state and is what every conversation already has. The other four are entirely about what
  * the hook lets through, and a conversation whose turns get no `Bash`, `Read` or `Write` has nothing
- * for them to be about.
+ * for them to be about — `dont_ask` included, and it is the one whose flag is easiest to get wrong:
+ * it shares `auto`'s permissions but not `auto`'s reason for being reachable, because choosing it is
+ * choosing what the hook does with a refusal, and a conversation with no tools never gets there.
  */
 const PERMISSION_RUNGS: {
   mode: PermissionMode;
@@ -1737,6 +1745,12 @@ const PERMISSION_RUNGS: {
     label: "Auto",
     why: "runs what the rules recognise; a local judge may answer for the rest",
     needsTools: false,
+  },
+  {
+    mode: "dont_ask",
+    label: "Never ask",
+    why: "runs what auto runs, and refuses the rest instead of asking",
+    needsTools: true,
   },
   {
     mode: "bypass",

@@ -181,17 +181,20 @@ export interface ChatProject {
 }
 
 /**
- * The five rungs a conversation can stand on, spelled as the daemon spells them.
+ * The six rungs a conversation can stand on, spelled as the daemon spells them.
  *
  * `manual` asks before anything changes; `accept_edits` adds the edits;
  * `plan` answers with a plan; `auto` runs what the rules allow and asks about
- * the rest; `bypass` asks about nothing but a delete inside the project.
+ * the rest; `dont_ask` runs exactly what `auto` runs and refuses that same rest
+ * instead of asking about it; `bypass` asks about nothing but a delete inside
+ * the project.
  */
 export type PermissionMode =
   | "manual"
   | "accept_edits"
   | "plan"
   | "auto"
+  | "dont_ask"
   | "bypass";
 
 /** A conversation already had in the IDE that this daemon could continue. */

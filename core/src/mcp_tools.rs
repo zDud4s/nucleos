@@ -38,10 +38,41 @@ impl NucleosTools {
 
     /// Whether this instance will announce and dispatch one name.
     fn serves(&self, tool: &str) -> bool {
-        match self.errand {
-            None => true,
-            Some(_) => ERRAND_TOOLS.contains(&tool),
-        }
+        served_in_box(self.errand, tool)
+    }
+
+    /// What this server ANNOUNCES for one box, in characters of JSON.
+    ///
+    /// The tool schemas are the largest thing this daemon puts into a run's prompt without writing
+    /// a word of it by hand: `#[tool(...)]` on each method, `schemars` on each parameter struct, and
+    /// the whole block re-sent with the tool list on every request the CLI makes. Nothing in the
+    /// CLI's stream reports its size — `extract_usage` reads four totals, and the `init` event's
+    /// `tools` field is a list of NAMES — so if it is to be priced at all it is priced here, off the
+    /// same router that answers `list_tools`.
+    ///
+    /// It measures what the SERVER announces, which is the only thing a box narrows. Quoting
+    /// `assistant::build_mcp_config`: "`--allowedTools` only ever GRANTS — it cannot take a tool
+    /// away — so an errand is kept to its own surface by the SERVER announcing less, not by the
+    /// launch asking for less." That is why the parameter is the errand and not an allow-list: a run
+    /// handed a narrow `--allowedTools` against an unboxed server still pays for every schema the
+    /// server announced, and pricing it from the allow-list would tell it otherwise.
+    ///
+    /// Pure — no pool, no I/O, no process. `Self::tool_router()` is the static router the
+    /// `#[tool_router]` macro builds, the same one `list_tools` filters through the same
+    /// [`served_in_box`], so this cannot drift from what is served without the filter drifting too.
+    ///
+    /// `serde_json::to_string(&tool).len()` rather than a hand-rolled sum of name, description and
+    /// schema: the wire form is what is paid for, and its punctuation and key names are a real part
+    /// of it. A tool that somehow fails to serialise counts as nothing instead of panicking — this
+    /// is an estimate feeding a display, and no reading here is worth taking a daemon down for.
+    pub fn advertised_schema_chars(errand: Option<i64>) -> usize {
+        Self::tool_router()
+            .list_all()
+            .into_iter()
+            .filter(|tool| served_in_box(errand, &tool.name))
+            .filter_map(|tool| serde_json::to_string(&tool).ok())
+            .map(|json| json.len())
+            .sum()
     }
 
     /// The errand whose folder the `errand_*` tools reach, or the refusal to guess one.
@@ -1847,6 +1878,20 @@ pub const ERRAND_TOOLS: &[&str] = &[
     "web_read",
     "web_search",
 ];
+
+/// Whether a box announces and dispatches one name. `None` is the whole server.
+///
+/// Lifted out of `NucleosTools::serves` when a second caller appeared that has no instance to ask:
+/// `advertised_schema_chars` prices what a box WOULD announce, from a launch site that never builds
+/// a server. Two copies of this three-line match is how the price and the surface would come to
+/// disagree — and the disagreement would be silent in both directions, because neither side has any
+/// way to observe the other.
+fn served_in_box(errand: Option<i64>, tool: &str) -> bool {
+    match errand {
+        None => true,
+        Some(_) => ERRAND_TOOLS.contains(&tool),
+    }
+}
 
 /// The tools a hosted turn may be offered — a third-party model reached over OpenRouter, not a
 /// process this machine runs.
@@ -4088,6 +4133,83 @@ mod tests {
             assert!(
                 registered.iter().any(|tool| tool == name),
                 "{name} is in the errand's box and is not a tool this server exposes"
+            );
+        }
+    }
+
+    /// What the schema block costs, and that a box is what makes it cost less.
+    ///
+    /// **The band is wide on purpose and the exact byte count is deliberately not asserted.** Every
+    /// tool added to this server moves the figure by a few thousand characters, and a test pinned to
+    /// today's total would go red on a change that has nothing wrong with it — the loudest kind of
+    /// false alarm, because the fix is to edit the number, which teaches everyone to edit the number.
+    /// What is worth holding is the ORDER OF MAGNITUDE (this block is tens of thousands of
+    /// characters, not hundreds and not millions — that is the fact that makes it worth showing at
+    /// all) and the RELATIONSHIP between the two boxes, which is a property of the design rather
+    /// than of the current tool count.
+    ///
+    /// The relationship is asserted as a ratio for the same reason: `ERRAND_TOOLS` is six names out
+    /// of the whole server, so its surface must be a small fraction of the unboxed one, and that
+    /// stays true however many tools either side gains.
+    ///
+    /// **Measured 2026-09-05: 48 tools and 41,083 characters unboxed; 6 tools and 3,085 under
+    /// `--box errand`.** About 10,270 estimated tokens the model reads before anybody has said
+    /// anything, and about 771 for an errand. Piping a `tools/list` JSON-RPC call into
+    /// `nucleos-core.exe --mcp-tools` answered 41,976 and 3,194 for the same two boxes — the same
+    /// tool COUNTS, 48 and 6, and roughly 18 bytes per tool more. That gap is the wire framing the
+    /// probe measures and this does not: the array's separators and the JSON-RPC envelope around
+    /// them. Two per cent, an order of magnitude inside the error of the ruler this figure is read
+    /// with, and it is recorded rather than chased — the thing that would have mattered, the two
+    /// sides reading different tool sets, is exactly what the matching counts rule out.
+    #[test]
+    fn the_announced_schema_block_is_measured_from_what_the_server_serves() {
+        let unboxed = NucleosTools::advertised_schema_chars(None);
+        let errand = NucleosTools::advertised_schema_chars(Some(7));
+
+        assert!(
+            (20_000..80_000).contains(&unboxed),
+            "the unboxed schema block measured {unboxed} characters, which is outside the order of \
+             magnitude this server has ever had — either a great many tools arrived at once or the \
+             router is no longer being read"
+        );
+        assert!(
+            errand * 4 < unboxed,
+            "an errand box announced {errand} characters against an unboxed {unboxed}: the box is \
+             supposed to be a small fraction of the server, and this one is not"
+        );
+        assert!(
+            errand > 0,
+            "an errand box announced nothing at all, so the filter is matching no tool"
+        );
+    }
+
+    /// The number this feature reports and the number the server announces are the same number.
+    ///
+    /// `advertised_schema_chars` prices what `list_tools` would answer, and the only thing keeping
+    /// them equal is that both go through `served_in_box`. This asserts the tool COUNTS agree, which
+    /// is what would break first if a second copy of that predicate ever appeared.
+    #[test]
+    fn the_priced_surface_is_the_same_surface_the_box_announces() {
+        for errand in [None, Some(7)] {
+            let announced: Vec<String> = NucleosTools::tool_router()
+                .list_all()
+                .into_iter()
+                .filter(|tool| served_in_box(errand, &tool.name))
+                .map(|tool| tool.name.into_owned())
+                .collect();
+            let expected: usize = announced.len();
+
+            assert_eq!(
+                expected,
+                match errand {
+                    None => NucleosTools::tool_router().list_all().len(),
+                    Some(_) => ERRAND_TOOLS.len(),
+                },
+                "the box {errand:?} announced {announced:?}"
+            );
+            assert!(
+                NucleosTools::advertised_schema_chars(errand) > 0,
+                "the box {errand:?} announces {expected} tools and prices them at nothing"
             );
         }
     }

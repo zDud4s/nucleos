@@ -2097,7 +2097,7 @@ describe("Chats - what it may do without asking", () => {
   // The owner's decision, and the reason the menu opens at all rather than being greyed whole: a
   // disabled control with no explanation is a dead end, and one of the two reasons — an unwired
   // hook — is a button away in the panel above.
-  it("offers Plan and Auto without tools, and says why the other three are out of reach", async () => {
+  it("offers Plan and Auto without tools, and says why the other four are out of reach", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(
         [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/fresh-worktree" })],
@@ -2131,6 +2131,11 @@ describe("Chats - what it may do without asking", () => {
     expect(reachable(/Auto/)).toBe(true);
     expect(reachable(/Manual/)).toBe(false);
     expect(reachable(/Edit automatically/)).toBe(false);
+    // `dont_ask` allows precisely what `auto` allows, and is out of reach here anyway: what a
+    // person chooses when they choose it is what the hook does with the calls it does NOT allow,
+    // and a conversation whose turns get no tools never has one. Grouping it with `auto` on this
+    // flag would be reading the permissions and not the choice.
+    expect(reachable(/Never ask/)).toBe(false);
     expect(reachable(/Bypass permissions/)).toBe(false);
     expect(
       screen.getAllByText(/the classifier hook is not wired in this project/).length,

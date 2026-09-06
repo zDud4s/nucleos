@@ -6208,7 +6208,9 @@ fn within_length(
 ///
 /// The prefixes come back FOLDED, because that is how the table stores them and how they are
 /// enforced. Serving the typed spelling would show an owner a `Remove-Item` the classifier knows as
-/// `remove-item`, which is the very lie `project_policy::fold_prefix` exists to stop.
+/// `remove-item`, which is the very lie `project_policy::fold_prefix` exists to stop. WHICH fold a
+/// prefix got follows `tool`: a command is lower-cased and a path is not, so two rows that look
+/// alike on screen were folded by two different functions and only that field says which.
 ///
 /// **`created_at` is served, and it is not padding.** The note says WHY a rule is there; this says
 /// WHEN, and the column's stated purpose is a list nobody can justify *six months from now* — which
@@ -6221,6 +6223,19 @@ fn within_length(
 #[derive(serde::Serialize)]
 struct ShellRuleView {
     prefix: String,
+    /// Which tool this rule governs the writes of, or `null` for a rule about a COMMAND prefix.
+    ///
+    /// **Serialised on every row, `null` included, and that is not a formality.** The two kinds of
+    /// rule live in one list and a prefix alone cannot tell them apart: `deny migrations` is a
+    /// command nobody may run, `deny Edit migrations` is a directory nothing may write into, and
+    /// served without this field the second reads on screen as the first. That was true for exactly
+    /// one chunk — `0131` gave the column to the table and to the classifier, and no route could
+    /// write it — and it stops being true here, where the POST below learns to carry a tool.
+    ///
+    /// `null` and never `""`, for `DeclaredShellRule::tool`'s reason: the empty string is SQLite's
+    /// business, forced by a UNIQUE index that treats every NULL as distinct, and a page made to
+    /// compare against a magic empty string would get it wrong once.
+    tool: Option<String>,
     verdict: crate::project_policy::Verdict,
     /// `null` for a rule declared with no justification — an absent note and not an absent field,
     /// so a page can tell "nobody said why" from a shape it failed to parse.
@@ -6230,8 +6245,12 @@ struct ShellRuleView {
 
 /// What this project's worktrees may run without asking, and what they may never run.
 ///
-/// Ordered by prefix, which is `declared_shell_rules`' `ORDER BY` and not this handler's arithmetic
-/// — the verdict is on every row, so any grouping a page wants is a filter it can do itself.
+/// Ordered by tool and then by prefix, which is `declared_shell_rules`' `ORDER BY` and not this
+/// handler's arithmetic — the verdict and the tool are on every row, so any grouping a page wants
+/// is a filter it can do itself. Nothing is filtered out here either: a write rule and a command
+/// rule come back in one list, because the route serves ROWS and the screen decides how to show
+/// them. That is the argument `ShellRuleView` already makes about the allow/deny split, and the
+/// tool is that same argument one field over.
 async fn get_project_shell_rules(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -6244,6 +6263,7 @@ async fn get_project_shell_rules(
                     .into_iter()
                     .map(|rule| ShellRuleView {
                         prefix: rule.prefix,
+                        tool: rule.tool,
                         verdict: rule.verdict,
                         note: rule.note,
                         created_at: rule.created_at,
@@ -6266,6 +6286,20 @@ async fn get_project_shell_rules(
 #[serde(deny_unknown_fields)]
 struct ShellRuleDeclaration {
     prefix: String,
+    /// The tool whose writes this rule is about, or absent for a rule about a command prefix.
+    ///
+    /// **`#[serde(default)]` because every client that existed before this field sent none**, and a
+    /// body without it is a shell rule — which is what those clients meant and what the route did.
+    /// It has to be DECLARED all the same, and not merely tolerated: this struct carries
+    /// `deny_unknown_fields`, so until the field exists here a client sending `"tool": "Edit"` is
+    /// answered 422 by serde with a sentence about an unknown field, which reads as a malformed
+    /// request rather than as a route that has not learned the word yet.
+    ///
+    /// Which values are admissible is decided in the handler and not by a type, because the answer
+    /// is the migration's `CHECK (tool IN ('', 'Edit', 'Write'))` and a refusal that names the
+    /// offending value is worth more here than an enum's parse error — see `unknown_tool`.
+    #[serde(default)]
+    tool: Option<String>,
     verdict: crate::project_policy::Verdict,
     /// Why, for whoever reads the list next. Never consulted by the classifier.
     #[serde(default)]
@@ -6275,9 +6309,11 @@ struct ShellRuleDeclaration {
 /// Declares one shell rule, or changes the verdict of one already declared.
 ///
 /// **Idempotent, and not by this handler's arithmetic.** `declare_shell_rule`'s
-/// `ON CONFLICT (project_id, prefix) DO UPDATE SET verdict = excluded.verdict, note = excluded.note`
-/// is what makes a second POST of the same prefix an EDIT. The identity of a rule is the prefix it
-/// names and the unique index enforces that, so a redeclaration can never become a second row — the
+/// `ON CONFLICT (project_id, tool, prefix) DO UPDATE SET verdict = excluded.verdict, note =
+/// excluded.note` is what makes a second POST of the same rule an EDIT. The identity of a rule is
+/// the TOOL and the prefix together and the unique index enforces that triple, so a redeclaration
+/// can never become a second row — while `deny migrations` and `deny Edit migrations` are two rules
+/// that may both stand, because they are two claims about two different things. The
 /// two ways of losing the `DO UPDATE` cost something else instead: no `ON CONFLICT` clause at all is
 /// `UNIQUE constraint failed` and a 500, and `DO NOTHING` — the spelling its two siblings in
 /// `project_policy` use — is worse for being silent, leaving the first verdict standing while the
@@ -6306,6 +6342,17 @@ struct ShellRuleDeclaration {
 /// never be enforced while the engine went on enforcing them. Migration `0128` says the same in one
 /// line: "Do lado `deny` não há nada a validar — uma recusa a mais nunca deixou correr nada."
 ///
+/// **A write rule can only DENY, and this route is the third place that says so and the only one a
+/// person meets.** The other two are silent by construction: `classifier::classify` has no allow
+/// branch anywhere on a write path — "there is no `allow` counterpart here, and there must not be
+/// one" — and `project_policy::shell_rules` drops a tool-carrying `allow` on its way out of the
+/// table, with a `tracing::warn!` nobody standing at a screen will ever read. An owner who wrote
+/// one would be holding a permission that decides nothing, believing it decides something. So an
+/// `allow` that names a tool is refused at the door with `unenforceable_allow`, and the sentence
+/// says what a `deny` of the same path WOULD do — the same move `unmatchable_prefix` makes one
+/// paragraph up, for the same reason: a permission that is silently not one is worse than a refusal
+/// somebody can act on.
+///
 /// The refusals name the offending value, because a refusal that does not say what was wrong sends
 /// the owner to read source code to find out which of seven shape guards they tripped.
 async fn post_project_shell_rule(
@@ -6321,6 +6368,17 @@ async fn post_project_shell_rule(
     }
     project_is_on_the_roster(&state, &id).await?;
 
+    // **Emptiness is two questions since the `tool` column existed, and this is the first.**
+    //
+    // What follows asks whether anything ARRIVED, and until there were write rules that was the
+    // whole guard — correctly, because there was one fold and it cannot do this. A command prefix
+    // goes through `project_policy::fold_prefix`, which is `classifier::normalize_command`: it
+    // collapses whitespace and lower-cases, so it can shorten a string and never empty one that
+    // survived `trim()`. A PATH prefix goes through `fold_path_prefix` instead, which rewrites `\`
+    // as `/` and only THEN strips the trailing `/` — so `"/"`, `"\\"` and `"///"` arrive non-empty,
+    // pass this check, and come out of that fold as the empty string. The second question — does
+    // it survive the fold — therefore lives in the `Some(tool)` arm below, beside the fold that is
+    // able to answer it no.
     let prefix = body.prefix.trim();
     within_length("prefix", prefix)?;
     if prefix.is_empty() {
@@ -6333,21 +6391,130 @@ async fn post_project_shell_rule(
         ));
     }
 
-    // See the doc above for why this is inside the `Allow` arm and must stay there.
-    if body.verdict == crate::project_policy::Verdict::Allow
-        && !crate::classifier::shell_form_is_readable(prefix)
+    // Which tool's writes this rule is about, or `None` for a rule about a command prefix — which
+    // is every rule anybody could declare before this handler learned the word.
+    //
+    // Refused BY NAME here rather than left to the table, exactly as `empty_prefix` above stands in
+    // front of the column's `prefix <> ''`: `tool` is stored under
+    // `CHECK (tool IN ('', 'Edit', 'Write'))`, and a value the CHECK would reject must never reach
+    // the CHECK, because a constraint failure comes back through the `internal` arm below as a 500
+    // that names nothing. The two names are `classifier::WRITE_TOOLS`, which is the only list the
+    // write chain consults — a rule about a third tool could not be enforced even by a column that
+    // agreed to hold it.
+    let tool = body.tool.as_deref();
+    if let Some(tool) = tool
+        && !["Edit", "Write"].contains(&tool)
     {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
-                "refusal": "unmatchable_prefix",
+                "refusal": "unknown_tool",
                 "detail": format!(
-                    "`{prefix}` can never be allowed: `classify_segment` guards `rules.allows` \
-                     with the same shape check this just failed, so the permission would be \
-                     stored and never fire. Declared as a `deny` it would be enforced."
+                    "`{tool}` is not a tool whose writes this núcleo governs: only `Edit` and \
+                     `Write` reach the write chain in `classifier::classify`, so a rule about \
+                     anything else would be stored and never consulted. Send no tool at all for a \
+                     rule about a COMMAND prefix."
                 ),
             })),
         ));
+    }
+
+    // The shape a prefix has to be in, and WHICH question that is depends on what kind of prefix
+    // this is. Written as a match on the tool rather than as two conditions in a row, because the
+    // two guards are mutually exclusive as a matter of MEANING and not of ordering: a path is not a
+    // shell line, and running one through `shell_form_is_readable` would refuse ordinary directory
+    // names for looking like flags and redirections.
+    match tool {
+        // See the doc above for why this is inside the `Allow` arm and must stay there.
+        None => {
+            if body.verdict == crate::project_policy::Verdict::Allow
+                && !crate::classifier::shell_form_is_readable(prefix)
+            {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "refusal": "unmatchable_prefix",
+                        "detail": format!(
+                            "`{prefix}` can never be allowed: `classify_segment` guards \
+                             `rules.allows` with the same shape check this just failed, so the \
+                             permission would be stored and never fire. Declared as a `deny` it \
+                             would be enforced."
+                        ),
+                    })),
+                ));
+            }
+        }
+        Some(tool) => {
+            // The rule this whole chunk is built around, refused where somebody can read it. The
+            // doc above names the two silent places that already enforce it.
+            if body.verdict == crate::project_policy::Verdict::Allow {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "refusal": "unenforceable_allow",
+                        "detail": format!(
+                            "a rule about a tool can only REFUSE. `{tool}` allowed to write to \
+                             `{prefix}` would be stored and decide nothing: the write chain in \
+                             `classifier::classify` ends at `read-local`, so there is no allow \
+                             side for it to reach, and `project_policy::shell_rules` drops such a \
+                             row on the way back out of the table. Declared as a `deny` the same \
+                             path WOULD be enforced — `{tool}` would be refused at it and at \
+                             everything under it."
+                        ),
+                    })),
+                ));
+            }
+            // The second half of `empty_prefix`, and it is here because only this fold can reach
+            // it. `fold_path_prefix` writes `\` as `/` and then strips the trailing `/`, so a
+            // prefix of nothing but separators — `/`, `//`, `\`, `\\`, `///` — survives the trim
+            // check above and lands on the column's `prefix CHECK (prefix <> '')` as the empty
+            // string. A CHECK failure comes back through the `internal` arm below as a 500 that
+            // names nothing, which is precisely what the guard above promises cannot happen: a
+            // value the CHECK would reject must never reach the CHECK.
+            //
+            // Asked by CALLING the fold, not by restating what it does. A condition written to
+            // match a fold is a second source of truth that stops matching in silence the day the
+            // fold learns to strip something else, and what it lets back through is this same
+            // nameless 500. `fold_for` is `pub(crate)` for exactly that reason: one function
+            // answers what gets stored, and every guard about what gets stored asks that function.
+            if crate::project_policy::fold_for(Some(tool), prefix).is_empty() {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "refusal": "empty_prefix",
+                        "detail": format!(
+                            "`{prefix}` names no path: a path prefix is stored with `\\` written \
+                             as `/` and the trailing `/` dropped, so a prefix of nothing but \
+                             separators folds to the empty string and there is no rule left to \
+                             enforce. Write the path out, relative to the project root — there is \
+                             no prefix that means the whole worktree."
+                        ),
+                    })),
+                ));
+            }
+            // The three characters `classifier::lands_inside_the_workspace` refuses in a `cd` or
+            // `mkdir` target, refused here for the same reason and against the same code. Nothing
+            // expands them on the way to a comparison: `write_denied_by_project` puts the stored
+            // prefix through `normalize_path`, which GLUES an ordinary-looking `~`, `$HOME` or
+            // `%USERPROFILE%` onto the workspace — so `~/notes` would be stored as a refusal of
+            // `<workspace>/~/notes`, a directory no write can ever land in. A refusal that cannot
+            // match is an allow, which is why this is a 422 and not a warning.
+            if prefix.starts_with('~') || prefix.contains('$') || prefix.contains('%') {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "refusal": "unmatchable_prefix",
+                        "detail": format!(
+                            "`{prefix}` can never match a write: a leading `~`, a `$` or a `%` \
+                             arrives UNEXPANDED, and `normalize_path` joins it onto the workspace \
+                             as an ordinary name — so the refusal would be about a directory that \
+                             cannot exist, and a refusal that cannot match is an allow. Write the \
+                             path out, relative to the project root."
+                        ),
+                    })),
+                ));
+            }
+        }
     }
 
     // A note of nothing but whitespace is NO note, and it is folded to `NULL` here rather than
@@ -6362,7 +6529,9 @@ async fn post_project_shell_rule(
         .map(str::trim)
         .filter(|note| !note.is_empty());
 
-    crate::project_policy::declare_shell_rule(&state.pool, &id, prefix, body.verdict, note)
+    // The tool goes down as it arrived — `None` is a shell rule and `Some` is a write rule, and
+    // `declare_shell_rule` folds the prefix by whichever of the two folds that answer picks.
+    crate::project_policy::declare_shell_rule(&state.pool, &id, tool, prefix, body.verdict, note)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "declaring a project shell rule failed");
@@ -6372,10 +6541,25 @@ async fn post_project_shell_rule(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Which rule to withdraw, and it takes TWO fields for a reason worth stating.
+///
+/// **A prefix alone no longer names a row.** The unique index is `(project_id, tool, prefix)`, so a
+/// project may hold `deny migrations` — a command — and `deny Edit migrations` — a directory — at
+/// once, and they are two rules. A DELETE that carried only the prefix would have to pick one of
+/// them, and whichever it picked would be right half the time; `forget_shell_rule`'s `WHERE` names
+/// the triple, so the tool has to arrive for the statement to be able to name the row.
+///
+/// **Absent means the SHELL rule, and that is the answer that keeps the old clients honest.** Every
+/// DELETE written before this field existed meant a command prefix, because a command prefix was
+/// the only thing that could be declared. `#[serde(default)]` makes that reading the default one,
+/// rather than "whichever row sorts first" — which is a delete that lands on a rule nobody named.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ShellRuleTarget {
     prefix: String,
+    /// The tool whose rule to withdraw, or absent for the rule about a command prefix.
+    #[serde(default)]
+    tool: Option<String>,
 }
 
 /// Withdraws one shell rule.
@@ -6388,7 +6572,10 @@ struct ShellRuleTarget {
 ///
 /// **No shape guard and no kill switch.** A rule stored before either existed still has to be
 /// withdrawable, and an emergency stop must never stand between somebody and narrowing what their
-/// project may do.
+/// project may do. That covers the tool as well: `unknown_tool` guards the POST because a value
+/// outside the CHECK cannot be STORED, while here an unknown tool simply matches no row and earns
+/// the 404 it deserves — refusing it by name would put a shape guard in front of a withdrawal, and
+/// the one row it could keep somebody from removing is a row written before the guard existed.
 async fn delete_project_shell_rule(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -6408,22 +6595,36 @@ async fn delete_project_shell_rule(
         ));
     }
 
-    let forgotten = crate::project_policy::forget_shell_rule(&state.pool, &id, prefix)
+    let tool = body.tool.as_deref();
+    let forgotten = crate::project_policy::forget_shell_rule(&state.pool, &id, tool, prefix)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "forgetting a project shell rule failed");
             refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
         })?;
     if !forgotten {
+        // **The sentence names the tool as well as the prefix**, because with two rules able to
+        // share a prefix "there is no rule for `migrations`" is a claim that can be false on the
+        // very screen it is read on: the other one is still listed, and "I deleted it and it is
+        // still there" has no answer without the missing word.
+        //
+        // The COMMAND half names the folded spelling — the answer somebody who typed the wrong case
+        // needs — through `normalize_command`, which is the function `project_policy::fold_prefix`
+        // wraps and therefore not a second spelling of the fold. The write half deliberately echoes
+        // what was sent instead: `fold_path_prefix` is private to `project_policy`, and restating
+        // its three steps here to decorate a 404 would be exactly the second spelling of a key that
+        // module exists to prevent. It keeps its case either way, which is the part of a path
+        // somebody could get wrong and needs to see.
+        let detail = match tool {
+            None => format!(
+                "{id} has declared no rule for `{}`",
+                crate::classifier::normalize_command(prefix)
+            ),
+            Some(tool) => format!("{id} has declared no `{tool}` rule for `{prefix}`"),
+        };
         return Err((
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "refusal": "no_such_rule",
-                "detail": format!(
-                    "{id} has declared no rule for `{}`",
-                    crate::classifier::normalize_command(prefix)
-                ),
-            })),
+            Json(serde_json::json!({ "refusal": "no_such_rule", "detail": detail })),
         ));
     }
 
@@ -20345,13 +20546,16 @@ mod tests {
         let rules = listed.as_array().unwrap();
         assert_eq!(rules.len(), 2);
 
-        // `ORDER BY prefix`, so `cargo fmt` is first. The row is asserted whole: the four fields
-        // together are what makes a rule editable without losing anything, and asserting the note
-        // alone would pass a shape that had dropped the verdict.
+        // `ORDER BY tool, prefix`, and both rules are about a command, so `cargo fmt` is first. The
+        // row is asserted WHOLE: the five fields together are what makes a rule editable without
+        // losing anything, and asserting the note alone would pass a shape that had dropped the
+        // verdict. `tool` is `null` here and it is asserted rather than skipped — a rule about a
+        // command has no tool, and an omitted field is a shape a page would have to guess at.
         assert_eq!(
             rules[0],
             serde_json::json!({
                 "prefix": "cargo fmt",
+                "tool": serde_json::Value::Null,
                 "verdict": "allow",
                 "note": "formatting cannot break anything",
                 "created_at": "2020-01-01 00:00:00",
@@ -20589,6 +20793,403 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::NO_CONTENT);
         }
+    }
+
+    /// A write rule comes back naming the tool it governs, in the spelling a PATH is stored under.
+    ///
+    /// **The defect this whole chunk had to close, asserted from the outside.** `0131` gave the
+    /// table a `tool` column and taught the classifier to honour it, and the GET went on serving
+    /// `{prefix, verdict, note, created_at}` — so a `deny Edit core/migrations` came back looking
+    /// exactly like a rule about a command called `core/migrations`. It was unreachable while no
+    /// route could write a tool, and it stopped being unreachable in the same commit as this test.
+    ///
+    /// The prefix is typed with a leading space, a Windows separator, a trailing slash AND a
+    /// capital, and only the first three come back folded. That asymmetry is the assertion: a path
+    /// goes through `fold_path_prefix`, which deliberately does not lower-case, because
+    /// `write_denied_by_project` asks the containment question against the real filesystem and a
+    /// case folded at storage time would hard-code Windows' answer into the table.
+    #[tokio::test]
+    async fn a_write_rule_comes_back_naming_the_tool_it_governs() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({
+                "prefix": "  Core\\Migrations/ ",
+                "tool": "Edit",
+                "verdict": "deny",
+                "note": "sqlx checksums a migration that has already been applied",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, listed) =
+            reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let rules = listed
+            .as_array()
+            .expect("the route serves an array of rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["tool"], "Edit");
+        assert_eq!(
+            rules[0]["prefix"], "Core/Migrations",
+            "a path is folded by `fold_path_prefix`, which keeps its case"
+        );
+        assert_eq!(rules[0]["verdict"], "deny");
+        assert_eq!(
+            rules[0]["note"],
+            "sqlx checksums a migration that has already been applied"
+        );
+    }
+
+    /// A rule about a command still comes back with the field, saying `null`.
+    ///
+    /// Asserted as PRESENT-and-null rather than merely not `"Edit"`, because the two shapes are
+    /// different promises to a page: an omitted field is one a client has to guess about, and a
+    /// `null` says the daemon looked and there is no tool. `serde` would omit it under a
+    /// `skip_serializing_if`, which is the one edit that could make this quietly wrong again.
+    #[tokio::test]
+    async fn a_shell_rule_still_comes_back_with_no_tool_at_all() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "npm ci", "verdict": "allow" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        let rule = &listed.as_array().expect("an array of rules")[0];
+        assert!(
+            rule.get("tool").is_some(),
+            "the field is SERVED on every row: an absent field is a shape a page has to guess at"
+        );
+        assert_eq!(rule["tool"], serde_json::Value::Null);
+    }
+
+    /// An `allow` that names a tool is refused at the door, and told what would have worked.
+    ///
+    /// **The rule this chunk is built around, at the only place a person meets it.** The núcleo
+    /// enforces it twice already and silently both times: `classify` has no allow branch on a write
+    /// path, and `shell_rules` drops such a row on the way out with a log line. Stored, the rule
+    /// would leave an owner holding a permission that decides nothing — which is worse than a
+    /// refusal, because there is nothing to act on.
+    ///
+    /// The detail is asserted for the ESCAPE and not only for the complaint: `unmatchable_prefix`
+    /// set the house style by naming what would be enforced instead, and a refusal that only says
+    /// no sends somebody to read `classifier.rs` to find out what to type next.
+    #[tokio::test]
+    async fn an_allow_that_names_a_tool_is_refused_and_told_what_would_work() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, refused) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({
+                "prefix": ".ai",
+                "tool": "Edit",
+                "verdict": "allow",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused["refusal"], "unenforceable_allow");
+        let detail = refused["detail"]
+            .as_str()
+            .expect("a sentence to put on screen");
+        assert!(detail.contains("`Edit`"), "{detail}");
+        assert!(detail.contains("`.ai`"), "{detail}");
+        assert!(
+            detail.contains("`deny`"),
+            "the refusal has to say what WOULD be enforced: {detail}"
+        );
+
+        // And nothing was written. A 422 over a row that landed anyway is the failure this guard
+        // exists to prevent, and only the table can say.
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(listed.as_array().expect("an array").len(), 0);
+    }
+
+    /// A tool this núcleo cannot deny for is refused by name, before the column's CHECK sees it.
+    ///
+    /// `NotebookEdit` is the value worth using: it is a real Claude Code tool that writes files and
+    /// is deliberately NOT in `classifier::WRITE_TOOLS`, so a rule about it is the mistake somebody
+    /// will actually make. The empty string is the other half — `''` is what the column stores for
+    /// "no tool", and a client that sent it explicitly would otherwise have declared a shell rule by
+    /// a spelling `DeclaredShellRule::tool` exists to keep out of everyone's hands.
+    ///
+    /// Refused HERE and not at the table, for `empty_prefix`'s reason: a `CHECK` failure comes back
+    /// through the `internal` arm as a 500 that names nothing.
+    #[tokio::test]
+    async fn a_tool_nobody_can_deny_is_refused_by_name() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        for tool in ["NotebookEdit", "Bash", "edit", ""] {
+            let (status, refused) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(serde_json::json!({
+                    "prefix": "core/migrations",
+                    "tool": tool,
+                    "verdict": "deny",
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{tool}");
+            assert_eq!(refused["refusal"], "unknown_tool", "{tool}");
+            let detail = refused["detail"].as_str().expect("a sentence");
+            assert!(detail.contains(&format!("`{tool}`")), "{detail}");
+            // The two that exist, named — otherwise the next thing to try is a guess.
+            assert!(
+                detail.contains("`Edit`") && detail.contains("`Write`"),
+                "{detail}"
+            );
+        }
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(listed.as_array().expect("an array").len(), 0);
+    }
+
+    /// A path prefix that the fold empties is refused BY NAME, and never by a 500.
+    ///
+    /// **The one input that could still reach the column's CHECK.** `empty_prefix` guards the raw
+    /// trim, which was the whole of it while there was one fold: `fold_prefix` is
+    /// `classifier::normalize_command`, and collapsing whitespace cannot empty a string that
+    /// survived `trim()`. `fold_path_prefix` can — it rewrites `\` as `/` and only then drops the
+    /// trailing `/`, so every spelling below arrives non-empty, passes the trim check and folds to
+    /// `""` on its way into `prefix CHECK (prefix <> '')`. That failure comes back through the
+    /// `internal` arm as a 500 that names nothing, and a 500 is the one answer this handler's
+    /// refusals exist to prevent: the owner is told the núcleo broke when what happened is that
+    /// they typed a prefix it cannot store.
+    ///
+    /// Both halves of the fold are exercised on purpose. `/` reaches the empty through the trailing
+    /// strip alone; `\` reaches it only because the rewrite runs FIRST, so a guard written against
+    /// `/` alone would pass this test and still 500 on the Windows spelling — which is the spelling
+    /// somebody pasting a path on this machine will produce.
+    #[tokio::test]
+    async fn a_path_prefix_that_folds_to_nothing_is_refused_by_name_and_not_by_a_five_hundred() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        for prefix in ["/", "//", "\\", "\\\\", "///", " / ", "/\\/"] {
+            let (status, refused) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(serde_json::json!({
+                    "prefix": prefix,
+                    "tool": "Edit",
+                    "verdict": "deny",
+                })),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "`{prefix}` folds to nothing and has to be refused by name, not by a 500: {refused}"
+            );
+            assert_eq!(refused["refusal"], "empty_prefix", "{prefix}");
+            let detail = refused["detail"]
+                .as_str()
+                .expect("a sentence to put on screen");
+            // The house style: name the offending value, then say what would work instead.
+            assert!(detail.contains(prefix.trim()), "{detail}");
+            assert!(detail.contains("project root"), "{detail}");
+        }
+
+        // A path that only LOOKS like one of those keeps working — the guard is about a prefix made
+        // of nothing but separators, and `/core` is a directory somebody may well want to close.
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({
+                "prefix": "/core",
+                "tool": "Edit",
+                "verdict": "deny",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // And nothing but that one landed. A 422 over a row stored anyway is the failure the guard
+        // exists to prevent, and only the table can say.
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        let rows = listed.as_array().expect("an array");
+        assert_eq!(rows.len(), 1, "{listed}");
+        assert_eq!(rows[0]["prefix"], "/core");
+    }
+
+    /// A path that could never match is refused the way an unmatchable command is, and for the
+    /// same reason said about a different comparison.
+    ///
+    /// `~`, `$` and `%` are the three `classifier::lands_inside_the_workspace` refuses in a `cd` or
+    /// `mkdir` target: nothing expands them on this side of the decision, so `normalize_path` glues
+    /// them onto the workspace as ordinary names and the stored refusal is about a directory that
+    /// cannot exist. A refusal that cannot match is an ALLOW — the asymmetry `fold_prefix` was
+    /// written to close, arrived at from the path side.
+    ///
+    /// **The other half is the assertion that keeps the guard honest**: a path is not a shell line,
+    /// so it is not asked to look like one. `docs/r&d` is a perfectly ordinary directory and
+    /// `shell_form_is_readable` refuses it for the `&`, which is why that guard stays on the shell
+    /// arm — and a `$` in a COMMAND deny is still stored, because a deny is compared at the line
+    /// level with no shape guard above it.
+    #[tokio::test]
+    async fn a_path_that_could_never_match_is_refused_the_way_an_unmatchable_command_is() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        for prefix in ["~/notes", "$HOME/notes", "%USERPROFILE%/notes"] {
+            let (status, refused) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(serde_json::json!({
+                    "prefix": prefix,
+                    "tool": "Write",
+                    "verdict": "deny",
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{prefix}");
+            assert_eq!(refused["refusal"], "unmatchable_prefix", "{prefix}");
+            assert!(
+                refused["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains(prefix)),
+                "the refusal names the value: {refused}"
+            );
+        }
+
+        // A directory whose name a shell would read as two commands is still a directory.
+        for body in [
+            serde_json::json!({ "prefix": "docs/r&d", "tool": "Edit", "verdict": "deny" }),
+            serde_json::json!({ "prefix": "echo $HOME", "verdict": "deny" }),
+        ] {
+            let (status, _) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "each guard belongs to one kind of prefix and must not reach the other: {body}"
+            );
+        }
+    }
+
+    /// Two rules may share a prefix, and a DELETE that names no tool takes the command one.
+    ///
+    /// **The row a delete lands on is decided by the tool, and there is no safe default but this
+    /// one.** The unique index is `(project_id, tool, prefix)`, so `migrations` as a command and
+    /// `migrations` as a path are two rules a project may hold at once. Every DELETE written before
+    /// the field existed meant the command — it was the only thing that could be declared — so an
+    /// absent tool has to mean exactly that, and never "whichever row sorts first", which is a
+    /// delete that lands on a rule nobody named while answering 204.
+    ///
+    /// The 404s at the end are the other half: with two rules able to share a prefix, "there is no
+    /// rule for `migrations`" is a sentence that can be false on the very screen it is read on.
+    #[tokio::test]
+    async fn a_delete_that_names_no_tool_takes_the_command_rule_and_leaves_the_write_rule() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        for body in [
+            serde_json::json!({ "prefix": "migrations", "verdict": "deny" }),
+            serde_json::json!({ "prefix": "migrations", "tool": "Edit", "verdict": "deny" }),
+        ] {
+            assert_eq!(
+                reach_request(
+                    state.clone(),
+                    "POST",
+                    "/projects/alpha/shell-rules",
+                    Some(body.clone()),
+                )
+                .await
+                .0,
+                StatusCode::NO_CONTENT,
+                "{body}"
+            );
+        }
+
+        // Both stand. `ON CONFLICT (project_id, tool, prefix)` names the triple, so the second
+        // declaration is not an edit of the first — they are two claims about two different things.
+        let (_, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(listed.as_array().expect("an array").len(), 2);
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "migrations" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
+        let rules = listed.as_array().expect("an array");
+        assert_eq!(rules.len(), 1, "only the command rule was named");
+        assert_eq!(rules[0]["tool"], "Edit");
+
+        // Asked again, the command rule is gone and the sentence says so without a tool in it.
+        let (status, refused) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "migrations" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(refused["refusal"], "no_such_rule");
+        let detail = refused["detail"].as_str().expect("a sentence");
+        assert!(detail.contains("no rule for `migrations`"), "{detail}");
+
+        // A tool that declared nothing here is a 404 that NAMES it, which is what answers "I
+        // deleted it and it is still there" — the rule still on screen belongs to the other tool.
+        let (status, refused) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "migrations", "tool": "Write" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            refused["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("`Write` rule")),
+            "the 404 names the tool: {refused}"
+        );
+
+        // And named, the write rule goes.
+        let (status, _) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "migrations", "tool": "Edit" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(listed.as_array().expect("an array").len(), 0);
     }
 
     /// The declarable set is the ops intersected with the ceilings, computed rather than listed.
@@ -27247,6 +27848,85 @@ mod tests {
         assert_eq!(parsed["output_tokens"], 500);
         assert_eq!(parsed["cache_read_tokens"], 20000);
         assert_eq!(parsed["num_turns"], 12);
+    }
+
+    /// The two derived readings on the run response: what this daemon wrote, and everything else.
+    ///
+    /// Both are estimates and both are named so on the wire. The residual is the whole reported
+    /// prompt — input plus cache reads plus cache creation — minus the authored estimate; taking it
+    /// off `input_tokens` alone would be wrong by omission, and wrong in the flattering direction.
+    ///
+    /// The second half of this test is the half that matters: a run that recorded nothing about what
+    /// it authored answers `null` for BOTH, not zero for one and the whole prompt for the other. A
+    /// run launched before the column existed is exactly that run, and there are a great many of
+    /// them.
+    #[tokio::test]
+    async fn the_run_response_carries_what_we_wrote_and_what_we_did_not() {
+        let state = test_state().await;
+        let measured = sqlx::query(
+            "INSERT INTO runs
+             (prompt, status, mode, input_tokens, output_tokens, cache_read_tokens,
+              cache_creation_tokens, authored_prompt_chars, created_at)
+             VALUES ('measured run', 'completed', 'real', 1000, 500, 20000, 9000, 44000,
+                     '2026-09-05T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let unrecorded = sqlx::query(
+            "INSERT INTO runs
+             (prompt, status, mode, input_tokens, output_tokens, cache_read_tokens,
+              cache_creation_tokens, created_at)
+             VALUES ('older run', 'completed', 'real', 1000, 500, 20000, 9000,
+                     '2026-09-05T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let router = build_router(state);
+
+        let parsed = read_run(&router, measured).await;
+        assert_eq!(parsed["authored_prompt_estimate"], 11_000);
+        assert_eq!(parsed["cli_own_estimate"], 19_000);
+        assert!(
+            parsed.get("authored_prompt_chars").is_none(),
+            "the wire contract is estimates; characters are an implementation detail of the column"
+        );
+
+        let parsed = read_run(&router, unrecorded).await;
+        assert_eq!(
+            parsed.get("authored_prompt_estimate"),
+            Some(&serde_json::Value::Null),
+            "a run that recorded nothing must not read back as a run that wrote nothing"
+        );
+        assert_eq!(
+            parsed.get("cli_own_estimate"),
+            Some(&serde_json::Value::Null),
+            "with no authored figure there is nothing to subtract, so there is no residual — and \
+             certainly not the whole prompt attributed to the CLI"
+        );
+    }
+
+    /// `GET /runs/{id}`, parsed. Two reads in one test is what this exists for.
+    async fn read_run(router: &Router, id: i64) -> serde_json::Value {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/runs/{id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 
     /// A runner that publishes a context fill and then never returns.
