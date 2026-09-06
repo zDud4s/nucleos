@@ -4796,6 +4796,7 @@ mod tests {
             run_tails: Default::default(),
             files_root: Some(root),
             workflow_library: None,
+            machine_config_root: None,
             email: Arc::new(crate::state::EmailRuntime::default()),
             voice: Arc::new(crate::voice::VoiceRuntime::default()),
             // Off, like `web` beside it: no test in this module drives a browser, and a department
@@ -6754,6 +6755,7 @@ mod tests {
         let state = AppState {
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
             ..state
         };
 

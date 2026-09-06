@@ -1163,6 +1163,14 @@ async fn main() {
         // `None` when this machine has no home directory to hang a library off. Resolved here and
         // not per request, like `files_root` above: it is a fact about the machine.
         workflow_library: seeded_library(),
+        // Said out loud on failure rather than swallowed: every settings route refuses
+        // without it, and "the daemon cannot name its own working directory" is not a
+        // sentence anybody should have to infer from a 500.
+        machine_config_root: std::env::current_dir()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "the daemon cannot name its own working directory; this machine's settings cannot be edited from the app")
+            })
+            .ok(),
         telegram_doctrine: telegram_config.doctrine,
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,

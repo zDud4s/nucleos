@@ -202,6 +202,7 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
             email: Arc::new(crate::state::EmailRuntime::default()),
             voice: Arc::new(crate::voice::VoiceRuntime::default()),
             browser: Arc::new(crate::browser::BrowserRuntime::disabled()),

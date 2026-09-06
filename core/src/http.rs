@@ -45,6 +45,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/readout", get(health_readout))
         .route("/sidecars", get(get_sidecars))
         .route("/config/email", get(get_email_config))
+        .route(
+            "/config/machine",
+            get(get_machine_config).post(post_machine_config),
+        )
         .route("/backup", post(post_backup))
         .route("/backups", get(get_backups))
         .route("/backups/{name}/restore", post(post_backup_restore))
@@ -3555,6 +3559,138 @@ struct EmailConfigView {
     retain_bodies_days: u8,
     /// Why local triage is unavailable when a local model was configured but could not be trusted.
     local_triage_disabled: Option<String>,
+}
+
+/* --------------------------------------------------- this machine's settings -- */
+
+/// The root every row in [`crate::machine_config`] is relative to, or a refusal when startup could
+/// not name one. See [`crate::state::AppState::machine_config_root`].
+fn machine_config_root(
+    state: &AppState,
+) -> Result<std::path::PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .machine_config_root
+        .clone()
+        .ok_or_else(|| refusal(StatusCode::INTERNAL_SERVER_ERROR, "no_machine_root"))
+}
+
+/// This machine's settings: the fence, and what is currently inside it.
+///
+/// The whole table every time, including rows whose file does not exist, because "this pillar has
+/// never been configured" is the answer the page most needs and an absent row cannot give it. That
+/// is the same reason `GET /projects/{id}/ownership` serves claims rather than files.
+///
+/// `resolved` is served beside each row for a reason this machine makes concrete: there are twenty
+/// worktrees on it, every one of them has an `.ai/`, and `.ai/voice.yaml` names a different file in
+/// each. A page that showed the relative path alone would let somebody edit settings with great
+/// confidence in the wrong checkout.
+///
+/// No secret is in any of these files by construction — every one of them lives in the OS
+/// credential store instead, and each config type's doc says so where the temptation was closest.
+/// So the contents go over the wire as they are.
+async fn get_machine_config(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let root = machine_config_root(&state)?;
+    let read_root = root.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        crate::machine_config::SETTINGS
+            .iter()
+            .map(|setting| {
+                let target = read_root.join(setting.path);
+                let contents = std::fs::read_to_string(&target).ok();
+                serde_json::json!({
+                    "path": setting.path,
+                    "area": setting.area,
+                    "what": setting.what,
+                    "takes_effect": setting.takes_effect,
+                    "exists": contents.is_some(),
+                    "contents": contents,
+                    "resolved": target.display().to_string(),
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+
+    Ok(Json(serde_json::json!({
+        "root": root.display().to_string(),
+        "settings": rows,
+    })))
+}
+
+/// Writes one of this machine's settings files, having first made it prove it parses.
+///
+/// Deliberately the same shape as [`post_project_write`] — same refusal names, same validate-then-
+/// write order, same atomic rename — because it is the same act against a different root, and two
+/// write routes that disagreed about what `invalid` means would be two contracts for one page.
+///
+/// **Admin, by appearing in no table in `auth.rs`.** `permits` is default-deny, which is what
+/// protects a route nobody thought about; this one was thought about, and the answer is the same.
+/// It matters more here than for a project's rules file: `.ai/github.yaml` names what a run may do
+/// on GitHub without asking, and `.ai/nucleos-models.yaml` names the models every route is built
+/// from. The control token reaches this, and `assistant.rs` hands that token to an MCP-only
+/// assistant turn — which is precisely why the kill switch is consulted below.
+///
+/// The global kill switch only. There is no project-scoped one to ask about: this file is not any
+/// project's, which is the whole reason it has its own registry.
+async fn post_machine_config(
+    State(state): State<AppState>,
+    Json(body): Json<WriteRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // Unreadable reads as engaged, the rule `assistant.rs` already pins: a stop nobody can ask
+    // about is not a stop anybody may assume is off.
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let Some(setting) = crate::machine_config::setting_for(&body.path) else {
+        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
+    };
+
+    let root = machine_config_root(&state)?;
+    // `setting.path` and not `body.path`: the caller's spelling has been matched against the table
+    // and has done its job. Joining the table's own string is what makes a path that normalises to
+    // a row unable to reach a file the row does not name.
+    let target = inspect::safe_write_target(&root, setting.path)
+        .map_err(|error| refusal(inspect_status(error), "unwritable"))?;
+
+    if let Err(detail) = (setting.validate)(&body.contents) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "refusal": "invalid", "detail": detail })),
+        ));
+    }
+
+    let contents = body.contents;
+    tokio::task::spawn_blocking(move || write_atomically(&target, &contents))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .map_err(|error| {
+            tracing::warn!(%error, path = %setting.path, "writing a machine settings file failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    // `None` for the project, because there is not one — this is the machine's own line. After the
+    // write and loudly on failure, for the reason `post_project_write` gives: a feed line about a
+    // write that then failed claims something that did not happen.
+    if let Err(error) = feed::append(
+        &state.pool,
+        None,
+        "config_written",
+        &format!("{} written from the app", setting.path),
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, path = %setting.path, "the settings file was written but the feed line was lost");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_email_config(State(state): State<AppState>) -> Json<EmailConfigView> {
@@ -13028,6 +13164,7 @@ mod tests {
                 run_tails: Default::default(),
                 files_root: None,
                 workflow_library: None,
+                machine_config_root: None,
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -13933,6 +14070,7 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -14993,6 +15131,7 @@ mod tests {
         AppState {
             files_root: Some(root),
             workflow_library: None,
+            machine_config_root: None,
             ..state
         }
     }
@@ -19312,6 +19451,200 @@ mod tests {
         assert_ne!(installed[0]["hash"], installed[0]["origin_hash"]);
         // Drift is not an update on offer: nobody published a new version.
         assert!(installed[0]["update_available"].is_null());
+    }
+
+    /// A state whose machine-settings root is a directory this test owns.
+    ///
+    /// The `TempDir` is returned rather than dropped, for the reason the other helpers here give:
+    /// its drop is what deletes the directory, so a test that let it fall would be asserting
+    /// against a root that had already gone.
+    async fn state_with_machine_root() -> (AppState, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = test_state().await;
+        state.machine_config_root = Some(temp.path().to_path_buf());
+        (state, temp)
+    }
+
+    /// The fence lists every row, including the pillars nobody has ever configured.
+    ///
+    /// "This has never been set up" is the answer the page most needs and an absent row cannot
+    /// give it — the same reason `GET /projects/{id}/ownership` serves claims rather than files.
+    /// The resolved path is asserted too, because on a machine with twenty worktrees the relative
+    /// path alone would let somebody edit settings with great confidence in the wrong checkout.
+    #[tokio::test]
+    async fn the_fence_lists_every_setting_including_the_ones_never_configured() {
+        let (state, temp) = state_with_machine_root().await;
+        let (status, body) = workflow_call(state, "GET", "/config/machine", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let rows = body["settings"].as_array().unwrap();
+        assert_eq!(rows.len(), crate::machine_config::SETTINGS.len());
+        for row in rows {
+            assert_eq!(row["exists"], false, "{} should not exist yet", row["path"]);
+            assert!(row["contents"].is_null());
+            assert!(!row["what"].as_str().unwrap().is_empty());
+            assert!(!row["takes_effect"].as_str().unwrap().is_empty());
+            assert!(
+                row["resolved"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(temp.path().to_str().unwrap()),
+                "every row must name the file it would actually write"
+            );
+        }
+    }
+
+    /// A write lands, and the next read is the file rather than what the caller said it was.
+    #[tokio::test]
+    async fn a_setting_is_written_and_read_back() {
+        let (state, temp) = state_with_machine_root().await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({
+                "path": ".ai/calendar.yaml",
+                "contents": "working_hours_start: \"10:00\"\n",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // On disk, under the root the state named — not merely in the answer.
+        let written = std::fs::read_to_string(temp.path().join(".ai/calendar.yaml")).unwrap();
+        assert!(written.contains("10:00"));
+
+        let (_, body) = workflow_call(state, "GET", "/config/machine", None).await;
+        let row = body["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == ".ai/calendar.yaml")
+            .unwrap()
+            .clone();
+        assert_eq!(row["exists"], true);
+        assert!(row["contents"].as_str().unwrap().contains("10:00"));
+    }
+
+    /// A file that does not parse is refused, and — the half that matters — the good file that was
+    /// already there is still there.
+    ///
+    /// Validate-then-write is the whole contract of this route. A route that wrote first and
+    /// validated after would turn one bad keystroke into a pillar that stays off after the next
+    /// restart, and the loaders are fail-soft precisely so that nobody would be told.
+    #[tokio::test]
+    async fn a_file_that_does_not_parse_is_refused_and_the_old_one_survives() {
+        let (state, temp) = state_with_machine_root().await;
+        let good = "enabled: true\nmax_sessions: 3\n";
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({ "path": ".ai/browser.yaml", "contents": good })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({
+                "path": ".ai/browser.yaml",
+                "contents": "max_sessions: \"not a number\"\n",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["refusal"], "invalid");
+        // The parser's own words, so somebody can fix the line rather than guess at it.
+        assert!(!body["detail"].as_str().unwrap().is_empty());
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".ai/browser.yaml")).unwrap(),
+            good,
+            "a refused write must not have touched the file"
+        );
+    }
+
+    /// A path this machine does not configure is refused, whichever way it is spelled.
+    ///
+    /// The three here are three different mistakes: a file that belongs to the `.ai/` workflow
+    /// harness, a file that is a PROJECT's and has its own door, and traversal. All three get
+    /// `not_ours` because from this route's point of view they are the same answer — the table
+    /// does not name them.
+    #[tokio::test]
+    async fn a_path_this_machine_does_not_configure_is_refused() {
+        let (state, temp) = state_with_machine_root().await;
+        for path in [
+            ".ai/project.yaml",
+            ".ai/autopilot.yaml",
+            "../.ai/voice.yaml",
+        ] {
+            let (status, body) = workflow_call(
+                state.clone(),
+                "POST",
+                "/config/machine",
+                Some(serde_json::json!({ "path": path, "contents": "enabled: true\n" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path} must be refused");
+            assert_eq!(body["refusal"], "not_ours");
+        }
+        assert!(
+            !temp.path().join(".ai").exists(),
+            "a refused write must not have created so much as a directory"
+        );
+    }
+
+    /// The kill switch stops a settings write, and the reason is not symmetry with the project
+    /// route — it is that the control token reaches here and `assistant.rs` hands that token to an
+    /// MCP-only assistant turn. `.ai/github.yaml` names what a run may do without asking.
+    #[tokio::test]
+    async fn the_kill_switch_stops_a_settings_write() {
+        let (state, _temp) = state_with_machine_root().await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/kill",
+            Some(serde_json::json!({ "engaged": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({ "path": ".ai/calendar.yaml", "contents": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
+    }
+
+    /// Without a root, both routes refuse by name rather than guessing at one.
+    ///
+    /// A daemon that cannot name its own working directory has no idea which of this machine's
+    /// twenty checkouts it would be editing, and picking one would be the worst available answer.
+    #[tokio::test]
+    async fn without_a_root_every_settings_route_refuses() {
+        let state = test_state().await;
+        assert!(state.machine_config_root.is_none());
+
+        let (status, body) = workflow_call(state.clone(), "GET", "/config/machine", None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["refusal"], "no_machine_root");
+
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({ "path": ".ai/calendar.yaml", "contents": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["refusal"], "no_machine_root");
     }
 
     /// An installed workflow's declared file is in the fence and cannot be written from here.
@@ -26451,6 +26784,7 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),

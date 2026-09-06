@@ -1357,6 +1357,7 @@ mod tests {
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
