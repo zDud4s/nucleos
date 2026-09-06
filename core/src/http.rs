@@ -45,6 +45,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/readout", get(health_readout))
         .route("/sidecars", get(get_sidecars))
         .route("/config/email", get(get_email_config))
+        .route(
+            "/config/machine",
+            get(get_machine_config).post(post_machine_config),
+        )
+        .route("/config/secrets", get(get_machine_secrets))
+        .route(
+            "/config/secrets/{key}",
+            axum::routing::put(put_machine_secret).delete(delete_machine_secret),
+        )
         .route("/backup", post(post_backup))
         .route("/backups", get(get_backups))
         .route("/backups/{name}/restore", post(post_backup_restore))
@@ -3555,6 +3564,281 @@ struct EmailConfigView {
     retain_bodies_days: u8,
     /// Why local triage is unavailable when a local model was configured but could not be trusted.
     local_triage_disabled: Option<String>,
+}
+
+/* --------------------------------------------------- this machine's settings -- */
+
+/// The root every row in [`crate::machine_config`] is relative to, or a refusal when startup could
+/// not name one. See [`crate::state::AppState::machine_config_root`].
+fn machine_config_root(
+    state: &AppState,
+) -> Result<std::path::PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .machine_config_root
+        .clone()
+        .ok_or_else(|| refusal(StatusCode::INTERNAL_SERVER_ERROR, "no_machine_root"))
+}
+
+/// This machine's settings: the fence, and what is currently inside it.
+///
+/// The whole table every time, including rows whose file does not exist, because "this pillar has
+/// never been configured" is the answer the page most needs and an absent row cannot give it. That
+/// is the same reason `GET /projects/{id}/ownership` serves claims rather than files.
+///
+/// `resolved` is served beside each row for a reason this machine makes concrete: there are twenty
+/// worktrees on it, every one of them has an `.ai/`, and `.ai/voice.yaml` names a different file in
+/// each. A page that showed the relative path alone would let somebody edit settings with great
+/// confidence in the wrong checkout.
+///
+/// No secret is in any of these files by construction — every one of them lives in the OS
+/// credential store instead, and each config type's doc says so where the temptation was closest.
+/// So the contents go over the wire as they are.
+async fn get_machine_config(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let root = machine_config_root(&state)?;
+    let read_root = root.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        crate::machine_config::SETTINGS
+            .iter()
+            .map(|setting| {
+                let target = read_root.join(setting.path);
+                let contents = std::fs::read_to_string(&target).ok();
+                serde_json::json!({
+                    "path": setting.path,
+                    "area": setting.area,
+                    "what": setting.what,
+                    "takes_effect": setting.takes_effect,
+                    "exists": contents.is_some(),
+                    "contents": contents,
+                    "resolved": target.display().to_string(),
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+
+    Ok(Json(serde_json::json!({
+        "root": root.display().to_string(),
+        "settings": rows,
+    })))
+}
+
+/// Writes one of this machine's settings files, having first made it prove it parses.
+///
+/// Deliberately the same shape as [`post_project_write`] — same refusal names, same validate-then-
+/// write order, same atomic rename — because it is the same act against a different root, and two
+/// write routes that disagreed about what `invalid` means would be two contracts for one page.
+///
+/// **Admin, by appearing in no table in `auth.rs`.** `permits` is default-deny, which is what
+/// protects a route nobody thought about; this one was thought about, and the answer is the same.
+/// It matters more here than for a project's rules file: `.ai/github.yaml` names what a run may do
+/// on GitHub without asking, and `.ai/nucleos-models.yaml` names the models every route is built
+/// from. The control token reaches this, and `assistant.rs` hands that token to an MCP-only
+/// assistant turn — which is precisely why the kill switch is consulted below.
+///
+/// The global kill switch only. There is no project-scoped one to ask about: this file is not any
+/// project's, which is the whole reason it has its own registry.
+async fn post_machine_config(
+    State(state): State<AppState>,
+    Json(body): Json<WriteRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // Unreadable reads as engaged, the rule `assistant.rs` already pins: a stop nobody can ask
+    // about is not a stop anybody may assume is off.
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let Some(setting) = crate::machine_config::setting_for(&body.path) else {
+        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
+    };
+
+    let root = machine_config_root(&state)?;
+    // `setting.path` and not `body.path`: the caller's spelling has been matched against the table
+    // and has done its job. Joining the table's own string is what makes a path that normalises to
+    // a row unable to reach a file the row does not name.
+    let target = inspect::safe_write_target(&root, setting.path)
+        .map_err(|error| refusal(inspect_status(error), "unwritable"))?;
+
+    if let Err(detail) = (setting.validate)(&body.contents) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "refusal": "invalid", "detail": detail })),
+        ));
+    }
+
+    let contents = body.contents;
+    tokio::task::spawn_blocking(move || write_atomically(&target, &contents))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .map_err(|error| {
+            tracing::warn!(%error, path = %setting.path, "writing a machine settings file failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    // `None` for the project, because there is not one — this is the machine's own line. After the
+    // write and loudly on failure, for the reason `post_project_write` gives: a feed line about a
+    // write that then failed claims something that did not happen.
+    if let Err(error) = feed::append(
+        &state.pool,
+        None,
+        "config_written",
+        &format!("{} written from the app", setting.path),
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, path = %setting.path, "the settings file was written but the feed line was lost");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The credentials this machine holds, by whether they are set — never by what they are.
+///
+/// The listing carries no value and there is no route that serves one, which is enforced a layer
+/// down: [`crate::secrets::SecretStore`] has no method that returns a secret, so a future handler
+/// cannot serve one by accident. Presence is the only question a settings page has.
+async fn get_machine_secrets(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let rows = crate::machine_config::SECRETS
+        .iter()
+        .map(|secret| {
+            // A store that cannot answer is reported as unknown rather than as absent. "Not set"
+            // is a fact somebody would act on by pasting a credential they have already pasted.
+            let present = state.secrets.present(secret.key).ok();
+            serde_json::json!({
+                "key": secret.key,
+                "area": secret.area,
+                "what": secret.what,
+                "present": present,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({ "secrets": rows })))
+}
+
+/// A credential on its way in. Deliberately derives no `Debug`.
+///
+/// `Debug` is how a secret ends up in a log: one `tracing::warn!(?body, …)` written in a hurry by
+/// somebody debugging an unrelated failure, and the credential is on disk in the daemon's rotating
+/// log file. Not deriving it makes that line refuse to compile.
+#[derive(Deserialize)]
+struct SecretRequest {
+    value: String,
+}
+
+/// Stores one credential, or refuses.
+///
+/// **Why the app may write these at all**, given that `--set-*` reads from stdin precisely to keep
+/// a token off a command line: that reasoning is about ARGV. A Windows command line is readable by
+/// any process running as the same user and is recorded verbatim in PSReadLine's history, so a
+/// token passed as an argument lands on disk in cleartext at the moment somebody was securely
+/// storing it. None of that is true of a request body over loopback to the one process that
+/// already holds every one of these credentials and hands them to the sidecars it starts.
+///
+/// Admin, by appearing in no table in `auth.rs`, on the same default-deny footing as everything
+/// else under `/config`. The kill switch is consulted for the same reason the settings write
+/// consults it: the control token reaches here, and a credential is a capability.
+async fn put_machine_secret(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<SecretRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    // `daemon-token` takes this path: it is not in the table, so it is `not_ours` like any other
+    // key nobody declared. That is deliberate rather than incidental — see `SECRETS`.
+    let Some(secret) = crate::machine_config::secret_for(&key) else {
+        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
+    };
+
+    // An empty value is refused rather than stored. Storing one would leave a credential that
+    // exists and does not work, which reads as "configured" everywhere it is asked about — the
+    // worst of the three available states. Forgetting it is what DELETE is for.
+    if body.value.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "invalid",
+                "detail": "an empty value is not a credential; use DELETE to forget one",
+            })),
+        ));
+    }
+
+    state
+        .secrets
+        .store(secret.key, &body.value)
+        .map_err(|error| {
+            // `error` and never the value.
+            tracing::warn!(%error, key = %secret.key, "storing a credential failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    // The key, never the value, and no length either — a length is a hint about a secret.
+    if let Err(error) = feed::append(
+        &state.pool,
+        None,
+        "secret_stored",
+        &format!("the {} credential was set from the app", secret.key),
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, key = %secret.key, "the credential was stored but the feed line was lost");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Forgets one credential.
+///
+/// Idempotent, because [`crate::secrets::delete_secret`] already treats a missing entry as done:
+/// a page that had to distinguish "forgotten" from "was not there" would be asking a question
+/// whose two answers call for the same next step.
+async fn delete_machine_secret(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let Some(secret) = crate::machine_config::secret_for(&key) else {
+        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
+    };
+
+    state.secrets.forget(secret.key).map_err(|error| {
+        tracing::warn!(%error, key = %secret.key, "forgetting a credential failed");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
+
+    if let Err(error) = feed::append(
+        &state.pool,
+        None,
+        "secret_forgotten",
+        &format!("the {} credential was forgotten from the app", secret.key),
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, key = %secret.key, "the credential was forgotten but the feed line was lost");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_email_config(State(state): State<AppState>) -> Json<EmailConfigView> {
@@ -13028,6 +13312,8 @@ mod tests {
                 run_tails: Default::default(),
                 files_root: None,
                 workflow_library: None,
+                machine_config_root: None,
+                secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -13933,6 +14219,8 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -14993,6 +15281,8 @@ mod tests {
         AppState {
             files_root: Some(root),
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             ..state
         }
     }
@@ -19312,6 +19602,335 @@ mod tests {
         assert_ne!(installed[0]["hash"], installed[0]["origin_hash"]);
         // Drift is not an update on offer: nobody published a new version.
         assert!(installed[0]["update_available"].is_null());
+    }
+
+    /// A credential goes in, and only its presence ever comes back.
+    ///
+    /// The value is asserted absent from the whole response body rather than from the field it
+    /// would have been put in: a future handler that added `"value"` beside `"present"` would pass
+    /// a narrower check, and the point of this one is that no shape of leak passes it.
+    #[tokio::test]
+    async fn a_credential_is_stored_and_only_its_presence_is_ever_reported() {
+        let state = test_state().await;
+
+        let (_, before) = workflow_call(state.clone(), "GET", "/config/secrets", None).await;
+        let row = |body: &serde_json::Value| {
+            body["secrets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["key"] == "github-token")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row(&before)["present"], false);
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "PUT",
+            "/config/secrets/github-token",
+            Some(serde_json::json!({ "value": "ghp_a_real_looking_token" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, after) = workflow_call(state, "GET", "/config/secrets", None).await;
+        assert_eq!(row(&after)["present"], true);
+        assert!(
+            !after.to_string().contains("ghp_a_real_looking_token"),
+            "no route may serve a credential back"
+        );
+    }
+
+    /// The daemon's own token is not a credential this app may set.
+    ///
+    /// It is the app's key to the daemon: overwriting it through the API would lock out the caller
+    /// making the request, and the recovery is a restart plus a credential the app can no longer be
+    /// told. It is absent from `SECRETS`, so it refuses by the ordinary path rather than by a
+    /// special case somebody could delete.
+    #[tokio::test]
+    async fn the_daemon_token_cannot_be_written_through_the_api() {
+        let state = test_state().await;
+        for method in ["PUT", "DELETE"] {
+            let (status, body) = workflow_call(
+                state.clone(),
+                method,
+                "/config/secrets/daemon-token",
+                Some(serde_json::json!({ "value": "a-new-token" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} must be refused");
+            assert_eq!(body["refusal"], "not_ours");
+        }
+
+        // And it is not listed either, so nothing invites somebody to try.
+        let (_, listing) = workflow_call(state, "GET", "/config/secrets", None).await;
+        assert!(!listing.to_string().contains("daemon-token"));
+    }
+
+    /// An empty value is refused rather than stored.
+    ///
+    /// Storing one leaves a credential that exists and does not work, which reads as "configured"
+    /// everywhere it is asked about — the worst of the three available states.
+    #[tokio::test]
+    async fn an_empty_value_is_refused_rather_than_stored() {
+        let state = test_state().await;
+        let (status, body) = workflow_call(
+            state.clone(),
+            "PUT",
+            "/config/secrets/openrouter-api-key",
+            Some(serde_json::json!({ "value": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["refusal"], "invalid");
+        assert!(body["detail"].as_str().unwrap().contains("DELETE"));
+
+        let (_, listing) = workflow_call(state, "GET", "/config/secrets", None).await;
+        let row = listing["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["key"] == "openrouter-api-key")
+            .unwrap()
+            .clone();
+        assert_eq!(row["present"], false, "nothing was stored");
+    }
+
+    /// Forgetting is idempotent, because "forgotten" and "was not there" call for the same next
+    /// step and a page that had to tell them apart would be asking a question with one answer.
+    #[tokio::test]
+    async fn forgetting_a_credential_is_idempotent() {
+        let state = test_state().await;
+        for _ in 0..2 {
+            let (status, _) = workflow_call(
+                state.clone(),
+                "DELETE",
+                "/config/secrets/telegram-token",
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+    }
+
+    /// The kill switch stops a credential being written, for the reason it stops a settings write:
+    /// the control token reaches here, and a credential is a capability.
+    #[tokio::test]
+    async fn the_kill_switch_stops_a_credential_being_written() {
+        let state = test_state().await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/kill",
+            Some(serde_json::json!({ "engaged": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = workflow_call(
+            state,
+            "PUT",
+            "/config/secrets/github-token",
+            Some(serde_json::json!({ "value": "ghp_something" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
+    }
+
+    /// A state whose machine-settings root is a directory this test owns.
+    ///
+    /// The `TempDir` is returned rather than dropped, for the reason the other helpers here give:
+    /// its drop is what deletes the directory, so a test that let it fall would be asserting
+    /// against a root that had already gone.
+    async fn state_with_machine_root() -> (AppState, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = test_state().await;
+        state.machine_config_root = Some(temp.path().to_path_buf());
+        (state, temp)
+    }
+
+    /// The fence lists every row, including the pillars nobody has ever configured.
+    ///
+    /// "This has never been set up" is the answer the page most needs and an absent row cannot
+    /// give it — the same reason `GET /projects/{id}/ownership` serves claims rather than files.
+    /// The resolved path is asserted too, because on a machine with twenty worktrees the relative
+    /// path alone would let somebody edit settings with great confidence in the wrong checkout.
+    #[tokio::test]
+    async fn the_fence_lists_every_setting_including_the_ones_never_configured() {
+        let (state, temp) = state_with_machine_root().await;
+        let (status, body) = workflow_call(state, "GET", "/config/machine", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let rows = body["settings"].as_array().unwrap();
+        assert_eq!(rows.len(), crate::machine_config::SETTINGS.len());
+        for row in rows {
+            assert_eq!(row["exists"], false, "{} should not exist yet", row["path"]);
+            assert!(row["contents"].is_null());
+            assert!(!row["what"].as_str().unwrap().is_empty());
+            assert!(!row["takes_effect"].as_str().unwrap().is_empty());
+            assert!(
+                row["resolved"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(temp.path().to_str().unwrap()),
+                "every row must name the file it would actually write"
+            );
+        }
+    }
+
+    /// A write lands, and the next read is the file rather than what the caller said it was.
+    #[tokio::test]
+    async fn a_setting_is_written_and_read_back() {
+        let (state, temp) = state_with_machine_root().await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({
+                "path": ".ai/calendar.yaml",
+                "contents": "working_hours_start: \"10:00\"\n",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // On disk, under the root the state named — not merely in the answer.
+        let written = std::fs::read_to_string(temp.path().join(".ai/calendar.yaml")).unwrap();
+        assert!(written.contains("10:00"));
+
+        let (_, body) = workflow_call(state, "GET", "/config/machine", None).await;
+        let row = body["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == ".ai/calendar.yaml")
+            .unwrap()
+            .clone();
+        assert_eq!(row["exists"], true);
+        assert!(row["contents"].as_str().unwrap().contains("10:00"));
+    }
+
+    /// A file that does not parse is refused, and — the half that matters — the good file that was
+    /// already there is still there.
+    ///
+    /// Validate-then-write is the whole contract of this route. A route that wrote first and
+    /// validated after would turn one bad keystroke into a pillar that stays off after the next
+    /// restart, and the loaders are fail-soft precisely so that nobody would be told.
+    #[tokio::test]
+    async fn a_file_that_does_not_parse_is_refused_and_the_old_one_survives() {
+        let (state, temp) = state_with_machine_root().await;
+        let good = "enabled: true\nmax_sessions: 3\n";
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({ "path": ".ai/browser.yaml", "contents": good })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({
+                "path": ".ai/browser.yaml",
+                "contents": "max_sessions: \"not a number\"\n",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["refusal"], "invalid");
+        // The parser's own words, so somebody can fix the line rather than guess at it.
+        assert!(!body["detail"].as_str().unwrap().is_empty());
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".ai/browser.yaml")).unwrap(),
+            good,
+            "a refused write must not have touched the file"
+        );
+    }
+
+    /// A path this machine does not configure is refused, whichever way it is spelled.
+    ///
+    /// The three here are three different mistakes: a file that belongs to the `.ai/` workflow
+    /// harness, a file that is a PROJECT's and has its own door, and traversal. All three get
+    /// `not_ours` because from this route's point of view they are the same answer — the table
+    /// does not name them.
+    #[tokio::test]
+    async fn a_path_this_machine_does_not_configure_is_refused() {
+        let (state, temp) = state_with_machine_root().await;
+        for path in [
+            ".ai/project.yaml",
+            ".ai/autopilot.yaml",
+            "../.ai/voice.yaml",
+        ] {
+            let (status, body) = workflow_call(
+                state.clone(),
+                "POST",
+                "/config/machine",
+                Some(serde_json::json!({ "path": path, "contents": "enabled: true\n" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path} must be refused");
+            assert_eq!(body["refusal"], "not_ours");
+        }
+        assert!(
+            !temp.path().join(".ai").exists(),
+            "a refused write must not have created so much as a directory"
+        );
+    }
+
+    /// The kill switch stops a settings write, and the reason is not symmetry with the project
+    /// route — it is that the control token reaches here and `assistant.rs` hands that token to an
+    /// MCP-only assistant turn. `.ai/github.yaml` names what a run may do without asking.
+    #[tokio::test]
+    async fn the_kill_switch_stops_a_settings_write() {
+        let (state, _temp) = state_with_machine_root().await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/kill",
+            Some(serde_json::json!({ "engaged": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({ "path": ".ai/calendar.yaml", "contents": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
+    }
+
+    /// Without a root, both routes refuse by name rather than guessing at one.
+    ///
+    /// A daemon that cannot name its own working directory has no idea which of this machine's
+    /// twenty checkouts it would be editing, and picking one would be the worst available answer.
+    #[tokio::test]
+    async fn without_a_root_every_settings_route_refuses() {
+        let state = test_state().await;
+        assert!(state.machine_config_root.is_none());
+
+        let (status, body) = workflow_call(state.clone(), "GET", "/config/machine", None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["refusal"], "no_machine_root");
+
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({ "path": ".ai/calendar.yaml", "contents": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["refusal"], "no_machine_root");
     }
 
     /// An installed workflow's declared file is in the fence and cannot be written from here.
@@ -26451,6 +27070,8 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),

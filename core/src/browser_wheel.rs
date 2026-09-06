@@ -625,6 +625,8 @@ mod tests {
             // No files folder: nothing on the wheel's path reads or writes one.
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser,
