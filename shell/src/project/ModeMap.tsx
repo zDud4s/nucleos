@@ -10,6 +10,7 @@ import { ExtractSpec } from "./ExtractSpec";
 import { JunctionPanel } from "./JunctionPanel";
 import { DecisionsWaiting } from "./DecisionsWaiting";
 import { TriagePanel } from "./TriagePanel";
+import { ErrorNote } from "../ui";
 
 /**
  * "What is in here, what did nobody ask for, and what did this project actually decide?"
@@ -114,9 +115,9 @@ export function ModeMap({ projectId }: ModeMapProps) {
           <DecisionsWaiting projectId={projectId} />
         </div>
       ) : map.isError ? (
-        <p className="text-sm text-text-faint">
+        <ErrorNote>
           The núcleo could not read this project&rsquo;s map — its folder may have moved.
-        </p>
+        </ErrorNote>
       ) : map.data === undefined ? (
         <p className="text-sm text-text-faint">Reading the project&rsquo;s tree…</p>
       ) : (
@@ -205,9 +206,15 @@ function Views({
             onClick={() => onView(candidate)}
             aria-current={candidate === view ? "true" : undefined}
             title={means}
+            /*
+              The door you are behind is `.ui-current` — a 2px rule on the leading edge — and
+              nothing else. It was the brand colour over a raised fill, which is the one thing the
+              cyan may never mark; and a fill cannot mark anything in the light theme, where
+              `--surface` and `--surface-raised` are the same white.
+            */
             className={
               candidate === view
-                ? "inline-flex items-baseline gap-2 rounded-md border border-accent bg-surface-raised px-3 py-1.5 text-xs text-text"
+                ? "ui-current inline-flex items-baseline gap-2 rounded-md border border-border px-3 py-1.5 text-xs text-text"
                 : "inline-flex items-baseline gap-2 rounded-md border border-border px-3 py-1.5 text-xs text-text-muted hover:text-text"
             }
           >

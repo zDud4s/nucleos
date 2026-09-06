@@ -21,7 +21,7 @@ import {
   type FleetActions,
 } from "../canvas/FleetCanvas";
 import { buildFleet, loadLayout, saveLayout, type FleetColumn, type Layout } from "../canvas/model";
-import { Button, ErrorNote, PageHeader, Panel, RefusalNote, StaleNote, StatCard } from "../ui";
+import { Button, ErrorNote, PageHeader, Panel, Quiet, RefusalNote, StaleNote, StatCard } from "../ui";
 import "./fleet.css";
 
 /**
@@ -128,10 +128,14 @@ export function Fleet() {
 
       {capacity !== undefined && capacity.projects.length === 0 && (
         <Panel title="Nothing to run yet">
-          <p className="fleet-empty">
-            No project is registered with the núcleo. Add one on Projects, and its column appears
-            here — empty, at <code>0/N</code>, which is a different fact from not being there.
-          </p>
+          {/* The way out stays on the line; the reasoning behind it is one
+              click away. "No project is registered" on its own reads as a
+              listing that failed to load — the sentence about `0/N` is what
+              makes the emptiness a fact somebody can act on, and it is the
+              paragraph `Quiet`'s disclosure exists to hold. */}
+          <Quiet says="No project is registered with the núcleo. Add one on Projects, and its column appears here.">
+            Empty, at <code>0/N</code>, which is a different fact from not being there.
+          </Quiet>
         </Panel>
       )}
 
@@ -195,7 +199,7 @@ function ProjectColumn({ column, canStart }: { column: FleetColumn; canStart: bo
           {project.slots.length}/{project.limit}
         </span>
       </header>
-      {cards.length === 0 && <p className="fleet-column-empty">nothing in flight</p>}
+      {cards.length === 0 && <Quiet says="nothing in flight" />}
       {cards.map((card) => (
         <SlotCard key={card.key} card={card} />
       ))}

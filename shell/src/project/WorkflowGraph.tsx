@@ -10,6 +10,7 @@ import {
   type WorkflowGraph as Graph,
 } from "../data/workflow-graph";
 import { openInVscode } from "../lib/vscode";
+import { Quiet, RefusalNote } from "../ui";
 
 /**
  * The canvas, its inspector, and the guard that stands between an overlay and an eject.
@@ -41,10 +42,13 @@ export function WorkflowGraph({ projectId, name, originPath, ejected }: Workflow
     return <p className="text-xs text-text-faint">Reading the graph…</p>;
   }
   if (graph.data.nodes.length === 0) {
+    /*
+      The one-line absence, in the shared primitive rather than in a paragraph this file sizes and
+      colours itself. There is nothing to teach here and nothing to press: the bundle is installed,
+      it simply has no order declared in it yet, and `Teach` would answer that with a poster.
+    */
     return (
-      <p className="max-w-prose text-xs text-text-muted">
-        This bundle has no sequence in it yet — skills and scripts and nothing saying in what order.
-      </p>
+      <Quiet says="This bundle has no sequence in it yet — skills and scripts and nothing saying in what order." />
     );
   }
 
@@ -250,12 +254,25 @@ function Inspector({
             follow the bundle again
           </button>
         ) : null}
+        {/*
+          A refusal is the middle weight of the escalation ladder, and it was being drawn at the
+          top: a full Wrong Red box, which is what an error gets. `isApiRefusal` has already
+          established that the núcleo declined this on purpose and said why — nothing is broken —
+          so it takes `RefusalNote`, which is the 3px Stated Blue rule and the code in mono. The
+          code is the part the hand-rolled box dropped, and it is the only thing here that can be
+          searched for.
+
+          The `kill_switch` sentence stays this route's own, because only this route knows that the
+          thing being refused writes into the project's folder. Every other code now falls through
+          to the shared floor instead of to a raw `detail`.
+        */}
         {overlay.isError && isApiRefusal(overlay.error) ? (
-          <p className="rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
-            {overlay.error.code === "kill_switch"
-              ? "the emergency stop is engaged, and this writes into the project's folder."
-              : overlay.error.detail}
-          </p>
+          <RefusalNote
+            refusal={overlay.error}
+            sentences={{
+              kill_switch: "the emergency stop is engaged, and this writes into the project's folder.",
+            }}
+          />
         ) : null}
       </div>
 

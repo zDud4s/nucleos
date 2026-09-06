@@ -3,18 +3,30 @@
  * cursor, `mail-` throughout — as `runs-` is for the run index and `feed-`
  * for the feed.
  *
- * The rule this file lives under: **no class appears in `Mail.tsx` that is
- * not defined below.** `tsc` and vitest both pass happily on a class no
- * stylesheet has ever heard of, and the defect shows up only as something
- * looking wrong on a screen nobody is testing. Grep the component against
- * this file before calling the page done.
+ * The rule this file lives under: **no `mail-` class appears in `Mail.tsx` or
+ * `MailDetail.tsx` that is not defined below.** `tsc` and vitest both pass
+ * happily on a class no stylesheet has ever heard of, and the defect shows up
+ * only as something looking wrong on a screen nobody is testing. Grep the
+ * components against this file before calling the page done. `ui-` classes are
+ * the exception and are not this file's to define — they arrive with a
+ * primitive imported from `../ui`, which is where their recipe and their
+ * argument both live.
  */
 
 /* ================================================================ shared == */
 
+/**
+ * The prose standing above a control, and the line that stands in for a panel
+ * while it is still being read.
+ *
+ * The loading line is **not** `Quiet`, and that is a decision rather than an
+ * oversight: a wait is not an absence, and a wait wearing the vocabulary of an
+ * empty section claims the queue is empty when in truth nobody has answered
+ * yet. The page's one genuine absence — the skipped-message panel — is a
+ * `Quiet` and no longer has a class here at all.
+ */
 .mail-note,
-.mail-loading,
-.mail-absence {
+.mail-loading {
   margin: 0;
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
@@ -26,24 +38,57 @@
   font-style: italic;
 }
 
-.mail-absence code {
+/* A feed kind as a literal off the wire — `email_fetch_skipped`. Was
+   `.mail-absence code`, and outlived that paragraph because the chip is about
+   the token rather than about the prose that happens to hold it. `base.css`
+   already sets `code` in the mono face at 0.925em, so only the chip is here. */
+.mail-kind {
   padding: 0 var(--space-1);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
-  font-family: var(--font-mono);
-  font-size: 0.9em;
 }
 
-/* The queue panel's aside — untriaged count, or nothing at all until the
-   queue has answered once (`ui/nav.ts`'s badge rule, restated here). */
-.mail-count {
-  padding: 0.1em var(--space-2);
-  border-radius: var(--radius-pill);
-  background: var(--tone-pending-bg);
-  color: var(--tone-pending-fg);
-  font-family: var(--font-mono);
+/* Both `dl`s label their fields the same way, and said twice they were free to
+   drift apart. The label rank, which is what a `dt` gets: 11px uppercase with
+   the tracking that stops it being a smear. */
+.mail-config-fact dt,
+.mail-detail-fact dt {
+  color: var(--text-faint);
   font-size: var(--text-xs);
-  font-variant-numeric: tabular-nums;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+/**
+ * A labelled field. Two of them — the queue's search box and the three boxes of
+ * the reply form — written out twice with six declarations in common, which is
+ * the duplication this pass is treating one file at a time.
+ *
+ * It is a page recipe and not a primitive because there is no `.ui-input` or
+ * `.ui-field` to adopt: `ui.css` ships neither, DESIGN.md records that as the
+ * largest remaining hole in the component layer, and four distinct label/field
+ * recipes are in circulation across the app waiting on it. Saying it once here
+ * is the smallest correct step, not the answer.
+ */
+.mail-search-field,
+.mail-detail-reply-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.mail-search-field input,
+.mail-detail-reply-field input,
+.mail-detail-reply-field textarea {
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-sm);
 }
 
 /* ---------------------------------------------------------------- triage -- */
@@ -72,50 +117,16 @@
   margin-bottom: var(--space-4);
 }
 
-.mail-search-field {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-
 .mail-search-field input {
   min-width: 18rem;
-  padding: var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--text-sm);
 }
 
 /* ------------------------------------------------------------------ list -- */
 
-.mail-list {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--border);
-  overflow: hidden;
-}
-
-/* One message. Hairline-separated, like the feed: read by scanning down it,
-   not by picking out cards. */
-.mail-row {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-3) var(--space-4);
-  background: var(--surface);
-}
-
+/* The column and the row itself are `Rows`/`Row`; only the arrangement inside
+   a row is this page's. The argument for a hairline-ruled list over a column
+   of cards now lives on the component, where all four lists that had grown it
+   can read it. */
 .mail-row-head {
   display: flex;
   flex-wrap: wrap;
@@ -141,27 +152,6 @@
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
-}
-
-.mail-verdict {
-  padding: 0 var(--space-2);
-  border-radius: var(--radius-sm);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-}
-
-/* A pin is a standing decision to keep seeing this sender in full; a mute is
-   the opposite. Warm and quiet, in the same vocabulary as the state tones,
-   without claiming either one is a `StateBadge` domain of its own. */
-.mail-verdict-pin {
-  background: var(--tone-active-bg);
-  color: var(--tone-active-fg);
-}
-
-.mail-verdict-mute {
-  background: var(--tone-off-bg);
-  color: var(--tone-off-fg);
 }
 
 /* A link to `/mail/$emailId` — block and undecorated so it reads as the row's
@@ -215,10 +205,6 @@
 
 .mail-config-fact dt {
   flex: 0 0 8rem;
-  color: var(--text-faint);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
 }
 
 .mail-config-fact dd {
@@ -235,13 +221,6 @@
   grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
   gap: var(--space-3);
   margin: 0;
-}
-
-.mail-detail-fact dt {
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 .mail-detail-fact dd {
@@ -269,8 +248,13 @@
 
 /**
  * A message body is text a sender wrote, not markup — this page renders it in
- * a `pre` and nowhere does it reach `dangerouslySetInnerHTML`. `pre-wrap` so a
- * long line wraps instead of forcing the panel to scroll sideways.
+ * a `pre` and nowhere does it reach `dangerouslySetInnerHTML`.
+ *
+ * The wrapping is not restated here. `base.css` already gives every `pre` the
+ * mono face, `pre-wrap` and `overflow-wrap: anywhere`, and says in its own
+ * comment that e-mail bodies are what it was written for — a long line wraps
+ * rather than forcing the panel to scroll sideways, and this rule repeating it
+ * was three declarations free to disagree with the floor they sat on.
  */
 .mail-detail-body {
   max-height: 28rem;
@@ -282,11 +266,8 @@
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
   color: var(--text);
-  font-family: var(--font-mono);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
 }
 
 /* --------------------------------------------------------- attachments -- */
@@ -298,16 +279,6 @@
   margin: 0;
   padding: 0;
   list-style: none;
-}
-
-.mail-detail-attachment {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
 }
 
 .mail-detail-attachment-head {
@@ -353,26 +324,16 @@
   gap: var(--space-3);
 }
 
+/* The reply labels are the label rank rather than the search bar's plain one —
+   three stacked fields need the column of uppercase words to scan down. */
 .mail-detail-reply-field {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 .mail-detail-reply-field input,
 .mail-detail-reply-field textarea {
   width: 100%;
-  padding: var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--text-sm);
   text-transform: none;
   letter-spacing: normal;
 }

@@ -345,8 +345,10 @@ function Block({
     >
       <span className="calendar-block-clock">{placement.clock}</span>
       <span className="calendar-block-title">{occurrence.title}</span>
-      {occurrence.source === "proposal" && <span className="calendar-visually-hidden">proposed</span>}
-      {placement.moved && <span className="calendar-visually-hidden">moved</span>}
+      {/* `sr-only` from `base.css`, as the month chip does — the tone is the
+          whole of the mark on screen, and colour is not a label. */}
+      {occurrence.source === "proposal" && <span className="sr-only">proposed</span>}
+      {placement.moved && <span className="sr-only">moved</span>}
     </button>
   );
 }

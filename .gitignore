@@ -22,6 +22,17 @@
 .claude/hooks/*
 !.claude/hooks/ask_daemon.py
 
+# Impeccable's design base. PRODUCT.md is the durable product truth, DESIGN.md the
+# visual system; both are read by every /impeccable command and by any design skill
+# that needs project context. They stay local by the owner's standing decision on
+# agent working material, alongside .impeccable.md, which they supersede.
+/PRODUCT.md
+/DESIGN.md
+/.impeccable.md
+# The sidecar DESIGN.md cannot hold: tonal ramps, shadow/motion/breakpoint
+# tokens, and renderable component snippets. Regenerated with DESIGN.md.
+.impeccable/
+
 # ─────────────────────────────────────────────────────────────
 # Rust + Tauri + Node build artifacts
 # ─────────────────────────────────────────────────────────────

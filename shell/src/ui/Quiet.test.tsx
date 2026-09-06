@@ -68,4 +68,13 @@ describe("Quiet", () => {
     expect(section?.getAttribute("aria-label")).toBe("Commands");
     expect(section?.querySelector(":scope > .ui-quiet")).toBeTruthy();
   });
+
+  it("announces only when it is the answer to something you just did", () => {
+    const { rerender } = render(<Quiet says="nothing came back" />);
+    // A page opening with seven quiet panels must not announce seven absences.
+    expect(screen.queryByRole("status")).toBeNull();
+
+    rerender(<Quiet says="that provider is unavailable" announce />);
+    expect(screen.getByRole("status").textContent).toContain("unavailable");
+  });
 });

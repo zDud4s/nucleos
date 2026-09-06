@@ -9,9 +9,10 @@
  * spelled out in full.
  *
  * Only colour and shadow are redefined under `prefers-color-scheme: light`.
- * Spacing, type and radii are facts about the layout, not about the light in
- * the room, and duplicating them into the light block is how the two themes
- * start to drift apart.
+ * Everything else here — type, spacing, radii, motion, stacking, opacity and
+ * measure — is a fact about the layout rather than about the light in the room,
+ * and duplicating any of it into the light block is how the two themes start to
+ * drift apart.
  *
  * The seven state tones are the app's whole colour vocabulary for *state*.
  * Interaction does not get a hue of its own — a primary button is expressed by
@@ -157,6 +158,78 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
   --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45);
   --shadow-lg: 0 18px 48px rgba(0, 0, 0, 0.55);
+
+  /* ------------------------------------------------------------ motion -- */
+  /**
+   * One curve and three durations.
+   *
+   * The rail defined these first and kept them to itself — they lived on
+   * `.nav`, so nothing outside the sidebar could reach them, and the rest of
+   * the app wrote `120ms ease` by hand in eleven places instead. Two timing
+   * systems in one window is something you feel before you can name it.
+   *
+   * `ease-out-quart` decelerates the way a thrown object does. No bounce and
+   * no elastic anywhere: in a console read for eight hours that is a joke told
+   * twice. One curve is the statement — a second one would have to argue why
+   * this motion is a different kind of motion.
+   *
+   * `prefers-reduced-motion` is answered once, globally, in `base.css`. Do not
+   * repeat that media query beside a transition; it only creates a second
+   * place to forget.
+   */
+  --ease: cubic-bezier(0.25, 1, 0.5, 1);
+  --dur-quick: 140ms; /* feedback: hover, a colour, a chevron turning. */
+  --dur-settle: 220ms; /* something arriving and taking its place. */
+  --dur-slide: 240ms; /* the largest gesture the app makes. */
+
+  /* ----------------------------------------------------------- z-index -- */
+  /**
+   * Four rungs, named for what stacks rather than for how high. The numbers
+   * were already 1/5/20/50 across six files; what was missing was any
+   * statement of which of them is allowed to cover which.
+   */
+  --z-sticky: 1; /* stays put while its own container scrolls. */
+  --z-cover: 5; /* covers its container, and nothing beyond it. */
+  --z-overlay: 20; /* over the page: the drawer, a context menu. */
+  --z-top: 50; /* over everything, an overlay included. */
+
+  /* ----------------------------------------------------------- opacity -- */
+  /* Disabled was 0.45 on a button and 0.5 on a tab — the same state, dimmed by
+     two different amounts, in the same stylesheet. It is one number. */
+  --opacity-disabled: 0.5;
+  --opacity-quiet: 0.7; /* a decorative mark that must not compete. */
+  /* The ghost left at the origin of a drag. Lower than `quiet` on purpose and
+     not by taste: at 0.7 the copy still competes with the cursor, which is the
+     one thing the fade exists to prevent. It is not `disabled` either — the chip
+     is the live subject of the gesture, not a control you cannot use. */
+  --opacity-ghost: 0.4;
+
+  /* ----------------------------------------------------------- measure -- */
+  /* A line stops being readable somewhere past 75 characters, and this app has
+     two reading modes: a note standing beside the thing it explains, and a body
+     of prose you actually sit down with. */
+  --measure: 52ch;
+  --measure-prose: 70ch;
+
+  /* The page's own column. Six declarations across three stylesheets already
+     agreed on 64rem for a stack of sections, which is the widest this app lets
+     a decision get before it stops being one column. The agreement was never
+     written down, so the seventh page was free to disagree by accident. */
+  --width-column: 64rem;
+
+  /* The ceiling on a well that scrolls. Four pages had picked their own — 28rem,
+     32rem and two more — which is four answers to one question. A payload is
+     unbounded by nature, and a panel as tall as the longest one it has ever held
+     is a panel nobody can scan past. */
+  --well-cap: 30rem;
+
+  /* ---------------------------------------------------------- hairline -- */
+  /* One pixel, named. A hairline list draws its separators as a 1px `gap` over
+     a `--border` ground rather than as a border on every row — one rule instead
+     of two, and no `:last-child` exception to forget. That only works while the
+     gap and the border are the same pixel, and as a bare `1` in the gap it read
+     as a magic number sitting next to a real one. */
+  --hairline: 1px;
 }
 
 @media (prefers-color-scheme: light) {

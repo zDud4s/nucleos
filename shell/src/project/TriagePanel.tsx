@@ -14,7 +14,7 @@ import {
   type TriageCounts,
   type TriageReport,
 } from "../data/project-map";
-import { RelativeTime } from "../ui";
+import { ErrorNote, Inset, RelativeTime, SectionTitle } from "../ui";
 import { GiveStamp } from "./GiveStamp";
 
 /**
@@ -158,9 +158,9 @@ export function TriagePanel({
 
   return (
     <section aria-label="The triager" className="flex flex-col gap-6">
-      <h2 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle level={2}>
         What a model thought was worth your eyes
-      </h2>
+      </SectionTitle>
 
       <p className="max-w-prose text-sm text-text-muted">
         A model reads one decision at a time, with the mechanical evidence beside it, and answers a
@@ -227,9 +227,15 @@ function Run({ projectId }: { projectId: string }) {
             aria-pressed={candidate === brain}
             disabled={triage.isPending}
             onClick={() => setBrain(candidate)}
+            /*
+              The chosen brain is `.ui-current` — a 2px rule on the leading edge — and nothing
+              else. It was `border-accent` over a raised fill: the brand colour marks the wordmark,
+              links and the focus ring and never a selection, and a fill marks nothing in the light
+              theme, where `--surface` and `--surface-raised` are the same white.
+            */
             className={
               candidate === brain
-                ? "rounded-md border border-accent bg-surface-raised px-3 py-1.5 text-sm text-text"
+                ? "ui-current rounded-md border border-border px-3 py-1.5 text-sm text-text"
                 : "rounded-md border border-border px-3 py-1.5 text-sm text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
             }
           >
@@ -359,11 +365,8 @@ function Report({ report }: { report: TriageReport }) {
  * done.
  */
 function Failed({ error }: { error: unknown }) {
-  const box =
-    "max-w-prose rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted";
-
   if (!isApiRefusal(error)) {
-    return <p className={box}>The núcleo did not answer, so nothing was triaged and nothing was recorded.</p>;
+    return <ErrorNote>The núcleo did not answer, so nothing was triaged and nothing was recorded.</ErrorNote>;
   }
 
   const sentence =
@@ -375,7 +378,7 @@ function Failed({ error }: { error: unknown }) {
           ? "The núcleo could not read which brain was asked for."
           : error.detail;
 
-  return <p className={box}>{sentence}</p>;
+  return <ErrorNote>{sentence}</ErrorNote>;
 }
 
 /**
@@ -436,9 +439,9 @@ function Flagged({
 
   return (
     <div className="flex flex-col gap-2">
-      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle>
         The triager asked for your eyes
-      </h3>
+      </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
         {rows.length} {plural(rows.length, "decision", "decisions")} nobody had stamped, which a
         model thought you should look at. What it says is that something looked odd to it — never
@@ -472,9 +475,9 @@ function Silenced({ rows, recency }: { rows: Judged[]; recency: Recency }) {
 
   return (
     <div className="flex flex-col gap-2">
-      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle>
         Silenced, which is not a verdict
-      </h3>
+      </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
         {rows.length} {plural(rows.length, "decision", "decisions")} the triager saw no sign of a
         problem in. That is a claim about the triager and about nothing else. Nobody looked. It is
@@ -594,9 +597,9 @@ function Record({
 
   return (
     <div className="flex flex-col gap-2 border-t border-border pt-4">
-      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle>
         Every silencing this project has ever had
-      </h3>
+      </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
         {total} {plural(total, "silencing is", "silencings are")} on record. The list above is only
         the ones that still describe the map: a silencing about a decision you have since stamped,
@@ -628,10 +631,7 @@ function Record({
           >
             <ul className="flex flex-col gap-2">
               {shown.map((entry) => (
-                <li
-                  key={`${entry.decision_id}-${entry.computed_at}`}
-                  className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-3"
-                >
+                <Inset as="li" key={`${entry.decision_id}-${entry.computed_at}`}>
                   <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
                     <span className="text-xs text-text-muted">{entry.section}</span>
                     <span className="truncate font-mono text-xs text-text-faint">
@@ -658,7 +658,7 @@ function Record({
                       silencing is kept: a record deleted by its own subject is not one.
                     </p>
                   ) : null}
-                </li>
+                </Inset>
               ))}
             </ul>
           </div>
@@ -805,7 +805,7 @@ function Line({ pair, children }: { pair: Judged; children?: ReactNode }) {
   const { row, held } = pair;
 
   return (
-    <li className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-3">
+    <Inset as="li">
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
         <span className="text-xs text-text-muted">{row.section}</span>
         <span className="truncate font-mono text-xs text-text-faint">{row.spec_slug}</span>
@@ -824,7 +824,7 @@ function Line({ pair, children }: { pair: Judged; children?: ReactNode }) {
         </p>
       )}
       {children}
-    </li>
+    </Inset>
   );
 }
 

@@ -2,7 +2,7 @@ import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import { useConcurrency } from "../data/fleet";
 import { useProjects } from "../data/system";
 import { useProjectWorkflows } from "../data/workflows";
-import { StateBadge } from "../ui";
+import { Count, StateBadge } from "../ui";
 import { ModeState } from "./ModeState";
 import { ModeMap } from "./ModeMap";
 import { ModeCode } from "./ModeCode";
@@ -198,6 +198,24 @@ export function Workspace() {
         )}
       </header>
 
+      {/*
+        Links, and deliberately not the `Tabs` primitive — the same conclusion System and Projects
+        each reached about their own strips, and the three now agree to the declaration. Every item
+        here is a real `<a href>` to `/projects/<id>/<mode>`, and the current one is marked with
+        `aria-current="page"`. Radix's `Trigger` puts `role="tab"` on whatever it renders, `asChild`
+        and a `Link` included, so adopting it would replace the link role, swap `aria-current` for
+        `aria-selected`, collapse five tab stops into one roving one, and point `aria-controls` at
+        panels that exist only for the mode you are already on. A tab widget switches panels inside
+        a page; this switches pages.
+
+        What IS adopted is the rule underneath the appearance: **the active indicator is `--text`
+        and never `--accent`.** The brand colour marks the wordmark, links and the focus ring and
+        nothing else — a selection wearing it reads as a status, and a status wearing it reads as
+        something you can click. `.ui-current` is the class that normally carries this and it does
+        not fit: it is an inset rule on the LEADING edge, and the mark a tab strip needs is under
+        the label, on the same line as the rule this nav already draws. The ink is what carries,
+        which is what `.ui-tab[data-state="active"]` marks its own with too.
+      */}
       <nav aria-label="Project modes" className="flex gap-1 border-b border-border">
         {MODES.map((candidate) => {
           const holds = holding[candidate];
@@ -210,7 +228,7 @@ export function Workspace() {
               title={holds?.means}
               className={
                 candidate === mode
-                  ? "-mb-px flex items-baseline gap-2 border-b-2 border-accent px-3 py-2 text-sm font-medium text-text"
+                  ? "-mb-px flex items-baseline gap-2 border-b-2 border-text px-3 py-2 text-sm font-medium text-text"
                   : quiet
                     ? "-mb-px flex items-baseline gap-2 border-b-2 border-transparent px-3 py-2 text-sm text-text-faint hover:text-text"
                     : "-mb-px flex items-baseline gap-2 border-b-2 border-transparent px-3 py-2 text-sm text-text-muted hover:text-text"
@@ -219,11 +237,13 @@ export function Workspace() {
               {MODE_LABEL[candidate]}
               {/*
                 Said where the decision to press is taken rather than after the press. Absent until
-                the answer is in, so the strip never puts a nought on a tab it has not asked about.
+                the answer is in, so the strip never puts a nought on a tab it has not asked about —
+                which is `Count`'s own rule for an `undefined` reading, so the ternary this used to
+                spell out is now the component's. What the primitive adds over the hand-rolled span
+                is `tabular-nums` and `nowrap`: five of these sit on one line and a digit that
+                changes width under a poll would shift the labels beside it.
               */}
-              {holds === undefined ? null : (
-                <span className="font-mono text-xs text-text-faint">{holds.count}</span>
-              )}
+              <Count n={holds?.count} />
             </Link>
           );
         })}

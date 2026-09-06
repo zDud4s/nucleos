@@ -4,15 +4,28 @@
  * borrows its merge doors from, and `mail-` for the sibling pillar this one
  * shares a sender's verdict with.
  *
- * The rule this file lives under: **no class appears in `Contacts.tsx` that
- * is not defined below.** `tsc` and vitest both pass happily on a class no
- * stylesheet has ever heard of, and the defect shows up only as something
- * looking wrong on a screen nobody is testing. Grep the component against
- * this file before calling the page done.
+ * The rule this file lives under: **no `contacts-` class appears in
+ * `Contacts.tsx` that is not defined below.** `tsc` and vitest both pass happily
+ * on a class no stylesheet has ever heard of, and the defect shows up only as
+ * something looking wrong on a screen nobody is testing. Grep the component
+ * against this file before calling the page done. `ui-` classes are the
+ * exception and are not this file's to define — they arrive with a primitive
+ * imported from `../ui`, which is where their recipe and their argument both
+ * live.
  */
 
 /* =============================================================== shared == */
 
+/**
+ * The prose standing above a list, and the line that stands in for the list
+ * while it is still being read.
+ *
+ * Neither is an absence, which is why neither is `Quiet`. The note sits above a
+ * list that has something in it and says what the reader is about to decide;
+ * the loading line is a wait, and a wait wearing the vocabulary of an empty
+ * section claims the roster is empty when in truth nobody has answered yet.
+ * This page's two genuine empty states are `Teach` blocks and already were.
+ */
 .contacts-note,
 .contacts-loading {
   margin: 0 0 var(--space-3);
@@ -24,13 +37,6 @@
 .contacts-loading {
   color: var(--text-faint);
   font-style: italic;
-}
-
-.contacts-count {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-variant-numeric: tabular-nums;
-  color: var(--text-faint);
 }
 
 .contacts-meta {
@@ -49,6 +55,17 @@
   overflow-wrap: anywhere;
 }
 
+/**
+ * A row of controls — the two doors on an identity question, the three sender
+ * verdicts on a roster row, and the unmerge button beside them.
+ *
+ * One recipe and not three. These were `contacts-actions`, `contacts-verdict
+ * -actions` and `contacts-unmerge`, written out separately with the same four
+ * declarations between them — the duplication this pass is treating, one file
+ * further down. `align-items: center` is the half the verdict group was
+ * missing: without it a refusal note landing beside the buttons stretches them
+ * to its own height.
+ */
 .contacts-actions {
   display: flex;
   flex-wrap: wrap;
@@ -65,6 +82,8 @@
 
 /* ==================================================== identity questions == */
 
+/* The column of questions. Each item is an `Inset`, which paints its own box —
+   this only spaces them and takes the list markers off. */
 .contacts-questions {
   display: flex;
   flex-direction: column;
@@ -74,16 +93,6 @@
   list-style: none;
 }
 
-.contacts-question {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
-}
-
 .contacts-question-head {
   display: flex;
   flex-wrap: wrap;
@@ -91,10 +100,19 @@
   gap: var(--space-2);
 }
 
+/**
+ * Which question this is — "question #21".
+ *
+ * Mono because the number is the daemon's, and a neutral rung because it is an
+ * identifier. It was `--accent`, which is the one colour in this system that
+ * means nothing: the wordmark, links and the focus ring, and nothing else. An
+ * id painted in it reads as a link that does not navigate — the same correction
+ * `.waiting-card-id` already carries, on the same number from the same table.
+ */
 .contacts-question-id {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
-  color: var(--accent);
+  color: var(--text-muted);
   white-space: nowrap;
 }
 
@@ -104,22 +122,26 @@
   gap: var(--space-3);
 }
 
+/**
+ * The facts of one side of a merge, stacked tight under its own heading.
+ *
+ * **No box, and that is the decision.** This sits inside a card inside a panel,
+ * and the system graduates exactly twice — a bordered, filled box here is a
+ * third card rank, which is the boxes-in-boxes the anti-references name. It
+ * used to be one: a `--radius-sm` frame on `--surface`, a rung *below* the
+ * inset it sits in, so in dark it read as a well pretending to be a card and in
+ * light — where `--surface` and `--surface-raised` are the same white — as a
+ * bare outline around nothing.
+ *
+ * What separates the two sides now is the grid gap and the heading each
+ * carries. The heading is the point: the merge is not symmetrical, and which of
+ * the two survives is the whole reason both are shown. `.waiting-side` reached
+ * the same answer from the same starting recipe.
+ */
 .contacts-side {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-}
-
-.contacts-side-role {
-  margin: 0;
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 .contacts-side-name {
@@ -145,19 +167,6 @@
   overflow-wrap: anywhere;
 }
 
-/* The refusal this card can see coming — warm, not red: nothing has failed
-   yet, and nothing will if one of the two decisions is settled first. */
-.contacts-conflict {
-  margin: 0;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--tone-paused-border);
-  border-radius: var(--radius-sm);
-  background: var(--tone-paused-bg);
-  color: var(--tone-paused-fg);
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-}
-
 /* Said before either button, not discovered after: refusing is permanent. */
 .contacts-permanent {
   margin: 0;
@@ -167,29 +176,8 @@
 
 /* ===================================================================== roster == */
 
-.contacts-roster {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--border);
-  overflow: hidden;
-}
-
-/* One address. Hairline-separated, like the mail queue: read by scanning
-   down it, not by picking out cards. */
-.contacts-row {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3) var(--space-4);
-  background: var(--surface);
-}
-
+/* The head line of one address row. The row and the column around it are
+   `Rows`/`Row`; only the arrangement inside the row is this page's. */
 .contacts-row-head {
   display: flex;
   flex-wrap: wrap;
@@ -213,22 +201,11 @@
   font-size: var(--text-sm);
 }
 
+/* Wider than `.contacts-actions`, and it holds two of them: the gap has to say
+   which buttons belong to which group. */
 .contacts-row-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-3);
-}
-
-.contacts-verdict-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
-
-.contacts-unmerge {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
 }

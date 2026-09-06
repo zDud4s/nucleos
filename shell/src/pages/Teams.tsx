@@ -24,6 +24,7 @@ import {
   Meter,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
   Sparkline,
@@ -270,7 +271,7 @@ function LiveTask({ run, team }: { run: TeamRun; team: TeamView | null }) {
         round {run.round} · started <RelativeTime at={run.created_at} />
       </p>
       {detail.data === undefined ? (
-        <p className="teams-loading">reading what it has spent…</p>
+        <Quiet says="reading what it has spent…" />
       ) : (
         // The money meter lives here and only here: this is the one place in
         // the pillar where a spend and the ceiling it runs against both exist.
@@ -312,7 +313,7 @@ function DepartmentTable({
   return (
     <div className="teams-table-scroller">
       <table className="teams-table">
-        <caption className="teams-said">Every department, with what it is doing now</caption>
+        <caption className="sr-only">Every department, with what it is doing now</caption>
         <thead>
           <tr>
             <th scope="col">Department</th>
@@ -430,7 +431,7 @@ function Headcount({ team }: { team: TeamView }) {
       className="teams-figure teams-figure-none"
       title="nobody yet — a task cannot start without a roster"
     >
-      0<span className="teams-said"> — nobody yet, so no task can start</span>
+      0<span className="sr-only"> — nobody yet, so no task can start</span>
     </span>
   );
 }
@@ -451,7 +452,7 @@ function Ratio({ value, ceiling }: { value: number; ceiling: number }) {
     <span className={full ? "teams-figure teams-figure-full" : "teams-figure"}>
       {value}
       <span className="teams-figure-of"> / {ceiling}</span>
-      {full && <span className="teams-said"> — at the ceiling</span>}
+      {full && <span className="sr-only"> — at the ceiling</span>}
     </span>
   );
 }
@@ -484,7 +485,7 @@ function OnItsOwn({ grants, triggers }: { grants: TeamGrant[]; triggers: TeamTri
           >
             <span aria-hidden="true">{MODE_MARK[mode]}</span>
             <span aria-hidden="true">{POWER_WORD[kind]}</span>
-            <span className="teams-said">
+            <span className="sr-only">
               {kind}: {said}
             </span>
           </li>
@@ -553,7 +554,7 @@ function Routines({ armed, total }: { armed: number; total: number }) {
         title={`${total} routine${total === 1 ? "" : "s"}, none armed`}
       >
         <span aria-hidden="true">◇</span>
-        <span className="teams-said">
+        <span className="sr-only">
           {total} {total === 1 ? "routine" : "routines"}, none armed
         </span>
       </li>
@@ -566,7 +567,7 @@ function Routines({ armed, total }: { armed: number; total: number }) {
     >
       <span aria-hidden="true">◆</span>
       <span aria-hidden="true">{armed}</span>
-      <span className="teams-said">
+      <span className="sr-only">
         {armed} armed {armed === 1 ? "routine" : "routines"}
       </span>
     </li>

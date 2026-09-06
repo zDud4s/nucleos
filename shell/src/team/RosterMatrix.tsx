@@ -1,4 +1,5 @@
 import type { TeamView } from "../data/teams";
+import { Quiet } from "../ui";
 
 /**
  * Who works where — every specialist against every department.
@@ -98,11 +99,13 @@ export function RosterMatrix({ teams }: RosterMatrixProps) {
   */
   if (teams.length === 0 || specialists.length === 0) {
     return (
-      <p className="teams-empty">
-        {teams.length === 0
-          ? "no department has been created yet."
-          : "no department has anybody in it yet — a task cannot start without a roster."}
-      </p>
+      <Quiet
+        says={
+          teams.length === 0
+            ? "no department has been created yet."
+            : "no department has anybody in it yet — a task cannot start without a roster."
+        }
+      />
     );
   }
 
@@ -121,7 +124,7 @@ export function RosterMatrix({ teams }: RosterMatrixProps) {
         <thead>
           <tr>
             <th className="teams-matrix-corner" scope="col">
-              <span className="teams-matrix-said">Specialist</span>
+              <span className="sr-only">Specialist</span>
             </th>
             {teams.map((team) => (
               <th className="teams-matrix-col" scope="col" key={team.id}>
@@ -146,7 +149,7 @@ export function RosterMatrix({ teams }: RosterMatrixProps) {
                   >
                     <span aria-hidden="true">{MARK[standing]}</span>
                     {/* The glyph is for the eye; this is the same fact in words. */}
-                    <span className="teams-matrix-said">{SAID[standing]}</span>
+                    <span className="sr-only">{SAID[standing]}</span>
                   </td>
                 );
               })}

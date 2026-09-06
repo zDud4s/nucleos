@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import {
   DropdownMenu,
@@ -142,6 +143,7 @@ import {
   CostLine,
   ErrorNote,
   PageHeader,
+  Quiet,
   RefusalNote,
   RelativeTime,
   relativeText,
@@ -1607,11 +1609,12 @@ function StartBox({
         <div className="chats-composer-actions">
           <label className="chats-attach" title="Attach a picture">
             <ImagePlus className="chats-tool-icon" aria-hidden="true" />
-            <span className="chats-offscreen">Attach a picture</span>
+            <span className="sr-only">Attach a picture</span>
             <input
               type="file"
               accept="image/*"
               multiple
+              className="sr-only"
               aria-label="Attach a picture"
               onChange={(event) => {
                 void attach(event.target.files);
@@ -4016,7 +4019,10 @@ function Transcript({
   // told them would be the window contradicting itself.
   if (turns.length === 0 && notices.length === 0 && precededBy) return null;
   if (turns.length === 0 && notices.length === 0)
-    return <p className="chats-empty">nothing has been said yet.</p>;
+    /* The app's one-line absence, said in the app's own component. `.chats-loading` beside it in
+       the stylesheet stayed hand-rolled on purpose: a "reading…" line is a wait, not an absence,
+       and `Quiet` is the muted rung because there the sentence is the content. */
+    return <Quiet says="nothing has been said yet." />;
   return (
     /* Around the turns and not around the whole door, because this is the only subtree that draws
        one: a turn in flight is the one thing here that grows the page on a poll of its own. */
@@ -4558,8 +4564,11 @@ function LiveAnswer({ turnId, since }: { turnId: number; since: string }) {
       <WhatItDid did={live.data?.did ?? []} turnId={turnId} settled={false} />
       <p className="chats-turn-live">
         {/* Turning, because the three words below can stand unchanged for two minutes while a
-            build runs and a page that never moves is a page that looks stopped. `base.css`
-            already clamps every animation for anybody who asked for less motion. */}
+            build runs and a page that never moves is a page that looks stopped. For anybody who
+            asked for less motion the icon is removed outright rather than left to the global
+            clamp in `base.css`, which would land it on its last frame and hold it there — a
+            broken ring standing still says "damaged". The elapsed clock carries the proof of
+            life instead; see `.chats-turn-spinner` in `chats.css`. */}
         <LoaderCircle className="chats-turn-spinner" aria-hidden="true" />
         <span>
           {doing !== null
@@ -4694,6 +4703,13 @@ function TurnPicture({ path }: { path: string }) {
  * by finding a small target is a thing that traps people. The same object URL the thumbnail is
  * already holding — fetching the bytes a second time to show the same picture larger would be
  * paying twice for one file.
+ *
+ * Rendered through a portal on `document.body`, and it has to be. `.chats-app` is a query container
+ * now — that is what moved the layout's fold off the window and onto the column it actually governs
+ * — and a query container is a containing block for `position: fixed` descendants. Left where it
+ * was, this would have covered the main column and stopped at the rail, which is the one thing a
+ * lightbox must not do. A React portal moves only the DOM node: events still bubble through the
+ * React tree, so every handler above it is untouched.
  */
 function PictureOverlay({
   url,
@@ -4712,7 +4728,7 @@ function PictureOverlay({
     return () => window.removeEventListener("keydown", escape);
   }, [onClose]);
 
-  return (
+  return createPortal(
     <div
       className="chats-picture-overlay"
       role="dialog"
@@ -4728,7 +4744,8 @@ function PictureOverlay({
       >
         close
       </button>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -5554,11 +5571,12 @@ function Composer({
               bare file input is the one control on this page nobody can style into the others. */}
           <label className="chats-attach" title="Attach a picture">
             <ImagePlus className="chats-tool-icon" aria-hidden="true" />
-            <span className="chats-offscreen">Attach a picture</span>
+            <span className="sr-only">Attach a picture</span>
             <input
               type="file"
               accept="image/*"
               multiple
+              className="sr-only"
               aria-label="Attach a picture"
               onChange={(event) => {
                 void attach(event.target.files);

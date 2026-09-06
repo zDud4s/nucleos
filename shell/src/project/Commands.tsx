@@ -10,7 +10,7 @@ import {
   useRunProjectCommand,
   type ProjectCommand,
 } from "../data/project-commands";
-import { Quiet } from "../ui";
+import { ErrorNote, Inset, Quiet } from "../ui";
 import {
   CommandDialog,
   CommandEmpty,
@@ -128,10 +128,9 @@ export function Commands({ projectId }: CommandsProps) {
                 marked a verdict has nothing to say about being green, and saying nothing is more
                 honest than drawing a bar of verbs that were never claimed to mean anything.
               */
-              <p className="text-sm text-text-faint">
-                No command here is marked a gate, so nothing on this page claims to say whether{" "}
-                {projectId} is green.
-              </p>
+              <Quiet
+                says={`No command here is marked a gate, so nothing on this page claims to say whether ${projectId} is green.`}
+              />
             ) : (
               gates.map((row) => (
                 <GateButton
@@ -191,7 +190,7 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
   const ready = name.trim() !== "" && command.trim() !== "";
 
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface p-4">
+    <Inset>
       {rows.length > 0 ? (
         <ul className="flex flex-col gap-1">
           {rows.map((row) => (
@@ -307,14 +306,12 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
           </span>
         </div>
 
+        {/* The núcleo's own words for `invalid`, which name the part that was wrong. */}
         {refused !== null ? (
-          <p className="rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
-            {/* The núcleo's own words for `invalid`, which name the part that was wrong. */}
-            {DECLARE_REFUSALS[refused.code] ?? refused.detail}
-          </p>
+          <ErrorNote>{DECLARE_REFUSALS[refused.code] ?? refused.detail}</ErrorNote>
         ) : null}
       </div>
-    </div>
+    </Inset>
   );
 }
 

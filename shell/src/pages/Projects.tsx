@@ -35,10 +35,12 @@ import { useProjects } from "../data/system";
 import {
   Badge,
   Button,
+  Count,
   ErrorNote,
   Meter,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
   Teach,
@@ -385,6 +387,22 @@ function ProjectViews({
  *
  * The shell can tell the first apart with certainty (it holds `project_root`).
  * It cannot tell the second from the third, and says so rather than picking.
+ *
+ * **All three answers are `RefusalNote` now.** Two of them were a hand-rolled
+ * copy of it — `.pj-absence`, an info tint with a 3px left rule, which is that
+ * component's recipe under a page's own name — and they carried the same
+ * `role="status"` for the same reason: a refusal is a considered answer and
+ * nothing broke, so nothing should interrupt what a screen reader is in the
+ * middle of saying. What the primitive adds is the refusal's own code beside
+ * the sentence, which is the string that survives a rewording and the one a
+ * person quotes when the sentence does not explain enough.
+ *
+ * The 404 sentence is keyed on `error.code` rather than on the literal
+ * `not_found`, and that is not cleverness for its own sake: `client.ts` derives
+ * a code from the status only when the daemon did not name one itself, so a
+ * route answering 404 under a name of its own would slip past a hardcoded key
+ * and take the generic sentence instead. The branch has already decided this is
+ * the 404; the key only says "whatever this one was called".
  */
 function InspectAbsence({
   error,
@@ -398,22 +416,12 @@ function InspectAbsence({
   if (!isApiRefusal(error)) {
     return <ErrorNote>the núcleo did not answer — nothing is known about {what}</ErrorNote>;
   }
-  if (error.status === 404 && projectRoot === null) {
-    return (
-      <p className="pj-absence" role="status">
-        This project has no folder recorded, so there is nothing to look inside. A folder is named
-        when the project is put into shadow or acting, on the Autopilot page.
-      </p>
-    );
-  }
   if (error.status === 404) {
-    return (
-      <p className="pj-absence" role="status">
-        Not found — and the núcleo answers the same way for two different things: that path is not
-        there, or the folder recorded for this project ({projectRoot}) is gone from the disk. Check
-        the folder before hunting for the file.
-      </p>
-    );
+    const said =
+      projectRoot === null
+        ? "This project has no folder recorded, so there is nothing to look inside. A folder is named when the project is put into shadow or acting, on the Autopilot page."
+        : `Not found — and the núcleo answers the same way for two different things: that path is not there, or the folder recorded for this project (${projectRoot}) is gone from the disk. Check the folder before hunting for the file.`;
+    return <RefusalNote refusal={error} sentences={{ [error.code]: said }} />;
   }
   return (
     <RefusalNote
@@ -469,7 +477,7 @@ function BrowsePanel({ projectId, projectRoot }: { projectId: string; projectRoo
           <p className="pj-loading">reading the folder…</p>
         )}
         {listing.data !== undefined && ordered.length === 0 && (
-          <p className="pj-empty">this folder is empty.</p>
+          <Quiet says="this folder is empty." />
         )}
         {ordered.length > 0 && (
           <ul className="pj-listing" aria-label="Folder contents">
@@ -603,7 +611,7 @@ function FileView({
       )}
       {!file.isError && file.data === undefined && <p className="pj-loading">reading the file…</p>}
       {file.data !== undefined && file.data === "" && (
-        <p className="pj-empty">that file is empty — a real answer, not a failed read.</p>
+        <Quiet says="that file is empty — a real answer, not a failed read." />
       )}
       {file.data !== undefined && file.data !== "" && <FileBody text={file.data} />}
     </Panel>
@@ -703,7 +711,7 @@ function GrepPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
         <p className="pj-loading">searching…</p>
       )}
       {matches.data !== undefined && groups.length === 0 && (
-        <p className="pj-empty">nothing in that folder contains it.</p>
+        <Quiet says="nothing in that folder contains it." />
       )}
       {groups.length > 0 && (
         <ul className="pj-matches" aria-label="Matches">
@@ -761,7 +769,7 @@ function DiffPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
       )}
       {!diff.isError && diff.data === undefined && <p className="pj-loading">reading the tree…</p>}
       {diff.data !== undefined && diff.data.trim() === "" && (
-        <p className="pj-empty">nothing is uncommitted — the tree is clean.</p>
+        <Quiet says="nothing is uncommitted — the tree is clean." />
       )}
       {diff.data !== undefined && diff.data.trim() !== "" && <DiffBody diff={diff.data} />}
     </Panel>
@@ -965,7 +973,7 @@ function Autonomy({ rules }: { rules: ProjectRules }) {
     <Panel title="What starts work here without you" aside={<Count n={running.length} />}>
       <div className="pj-table-scroller">
         <table className="pj-table">
-          <caption className="pj-said">
+          <caption className="sr-only">
             Every rule that can start work in this project with nobody asking, what makes it go, and
             when it last did.
           </caption>
@@ -1006,7 +1014,7 @@ function RuleRows({ rule }: { rule: AutonomyRule }) {
               {CLOCK_MARK[rule.clock]}
             </span>
             {rule.name}
-            <span className="pj-said">, {CLOCK_SAID[rule.clock]}</span>
+            <span className="sr-only">, {CLOCK_SAID[rule.clock]}</span>
           </span>
           {/* Always drawn, whatever its length, and clamped to one line. A field
               that appears on some rows and not others starts the next column at
@@ -1105,7 +1113,7 @@ function Today({ today }: { today: AutonomyRule["today"] }) {
     <span className={full ? "pj-figure pj-figure-full" : "pj-figure"}>
       {today.fired}
       <span className="pj-figure-of"> / {today.cap}</span>
-      {full && <span className="pj-said"> — today&apos;s allowance is spent</span>}
+      {full && <span className="sr-only"> — today&apos;s allowance is spent</span>}
     </span>
   );
 }
@@ -1129,10 +1137,17 @@ function GatePanel({ command, beforePublish }: { command: string | null; beforeP
       {configured ? (
         <code className="pj-gate">{command}</code>
       ) : (
-        <p className="pj-note">
-          No gate is configured, so nothing measures this project&apos;s work. That is why a job item
-          can read <em>passed</em> with no gate status: there was nothing to pass.
-        </p>
+        /* The one absence on this page with a reason worth keeping but not worth
+           reading twice. `Quiet` puts the fact on the line and the consequence one
+           click behind it — the sentence is kept rather than cut, because "no gate
+           is configured" alone reads as a field that failed to load rather than as
+           a project nobody has gated. */
+        <Quiet says="No gate is configured, so nothing measures this project’s work.">
+          <p>
+            That is why a job item can read <em>passed</em> with no gate status: there was nothing
+            to pass.
+          </p>
+        </Quiet>
       )}
       {/* The second moment the same command can run, and the one nothing else on this
           page would reveal. A landing that takes twenty minutes has a reason, and the
@@ -1434,11 +1449,4 @@ function WipError({ error }: { error: unknown }) {
       }}
     />
   );
-}
-
-/* ---------------------------------------------------------------- shared -- */
-
-function Count({ n }: { n: number | undefined }) {
-  if (n === undefined) return null;
-  return <span className="pj-count">{n}</span>;
 }

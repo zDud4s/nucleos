@@ -8,10 +8,12 @@
  * has ever heard of, and the defect shows up only as something looking wrong on
  * a screen nobody is testing.
  *
- * The `ui-` rules this page leans on — the relative time in every row's head —
- * are not repeated here. They live in `runs.css` under its own heading, on loan
- * from the design system until they move to `ui.css`, and both sheets are in
- * the bundle because both pages are statically imported by the router.
+ * `ui-` classes are the exception and are not this file's to define — they
+ * arrive with a primitive imported from `../ui`, which is where their recipe
+ * and their argument both live. The relative time in every row's head is one of
+ * those, and the sentence that used to stand here is now history: it said the
+ * rule was on loan from `runs.css` until it moved to `ui.css`, and it has
+ * moved. No page stylesheet defines a `ui-` class any more.
  */
 
 /* --------------------------------------------------------------- filters -- */
@@ -95,6 +97,14 @@
 
 /* ------------------------------------------------------------------ list -- */
 
+/**
+ * The feed while it is still being read.
+ *
+ * A wait, and deliberately not `Quiet`. An absence and a wait are two different
+ * facts, and a wait wearing the vocabulary of an empty section claims the
+ * núcleo has done nothing when in truth it has not answered yet. The page's two
+ * genuine empty states are `Teach` blocks and already were.
+ */
 .feed-loading {
   margin: 0;
   color: var(--text-faint);
@@ -102,32 +112,20 @@
   font-style: italic;
 }
 
-.feed-list {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--border);
-  overflow: hidden;
-}
-
 /**
- * One line. Hairline-separated rather than carded: the feed is read by
- * scanning down it, and fifty cards with their own borders turn a column into a
- * pile. The 1px gap over a `--border` ground is what draws the rules.
+ * The list and the line it is made of are `Rows` / `Row` now, and the argument
+ * this file used to make for them travels with the component: the feed is read
+ * by scanning down it, so it is hairline-separated rather than carded, because
+ * fifty boxes with their own borders turn a column into a pile. The rules are a
+ * 1px gap over a `--border` ground, which is also why a row paints a fill it
+ * looks like it does not need. See `.ui-rows` in `ui.css` — this page is one of
+ * the four that had grown that recipe byte for byte.
+ *
+ * A row here stacks, which is `Row`'s default: the head below is one line, but
+ * the summary and the observation sit under it. `layout="line"` is for the
+ * other feed on this app's screens — `.ap-feed-line` in the cockpit, which
+ * really is a badge, a summary and a time on one baseline.
  */
-.feed-row {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-3) var(--space-4);
-  background: var(--surface);
-}
-
 .feed-row-head {
   display: flex;
   flex-wrap: wrap;
@@ -142,10 +140,35 @@
   margin-left: auto;
 }
 
-.feed-row-run {
+/**
+ * The row's two ids, which are one mark in two roles.
+ *
+ * Mono because both numbers are the daemon's — the face is the claim about
+ * where a value came from — and `--text-xs` because they stand beside the
+ * summary rather than above it. Written once: these were two rules agreeing on
+ * the face and the size and disagreeing only about what the id *does*, which is
+ * the half that stays below. Each also carried a `letter-spacing: 0` that reset
+ * nothing: the only tracking in the cascade above them is `base.css`'s on
+ * `h1`–`h4`, so both were declarations defending against a rule that does not
+ * exist.
+ */
+.feed-row-run,
+.feed-row-owner {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  letter-spacing: 0;
+}
+
+/**
+ * A run id, and the only id on this row that is a real link.
+ *
+ * `--accent` stays, and it is the Reserved Cyan Rule's third permitted use
+ * rather than an exception to it: `/runs/{id}` exists, so this navigates. The
+ * rule bans cyan on an *identifier* — a number painted like a link that does
+ * not go anywhere — and `.feed-row-owner` below is exactly that case answered
+ * the other way, on the same row: it narrows the feed instead of navigating, so
+ * it is a neutral rung with a dotted underline and never the brand colour.
+ */
+.feed-row-run {
   color: var(--accent);
   text-decoration: none;
 }
@@ -166,9 +189,6 @@
   border: none;
   background: none;
   color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  letter-spacing: 0;
   text-decoration: underline dotted;
   text-underline-offset: 3px;
   cursor: pointer;
