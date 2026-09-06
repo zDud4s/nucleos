@@ -89,6 +89,174 @@
   padding-right: 0;
 }
 
+/**
+ * The box *inside* a panel body. One rung up, one rank down.
+ *
+ * Ten page stylesheets had independently written the same seven declarations —
+ * `ap-row`, `ap-card`, `ap-switch`, `browser-card`, `contacts-question`,
+ * `runs-preset`, `sy-sidecar`, `sy-backup`, `sy-token`, `waiting-card` — and all
+ * ten disagreed with `.ui-panel` on every property the two share: fill, radius,
+ * shadow and padding. Nobody chose that. It is what happens when a component
+ * that is needed does not exist, and it is why the fourteen boxes-in-boxes in
+ * this app look like an accident: two cards drawn to two unrelated recipes,
+ * stacked.
+ *
+ * Folding them onto `.ui-panel` was the other candidate and it is the wrong
+ * answer, for the reason DESIGN.md gives — a Panel is already a card, so an
+ * inner box wearing the *same* recipe reads as two siblings that got nested by
+ * mistake. What absorbs a nesting is not sameness, it is rank: this is the panel
+ * graduated exactly one step on each axis. A rung up the neutral ladder
+ * (`--surface-raised` on the panel's `--surface`), a step down the radius ladder
+ * (`--radius-md`, which the ladder assigns to rows and controls rather than to
+ * panels), no shadow at all, and `--space-3` inside the body's `--space-5`. Read
+ * together those four say "a group within this panel" rather than "another
+ * panel". Read separately, as ten pages had them, they say nothing.
+ *
+ * The border stays, and Flat-By-Default is not being ignored. In the light theme
+ * `--surface` and `--surface-raised` are both `#ffffff`: a fill-only raise is
+ * invisible there, and the hairline is the whole of the boundary. Dropping it
+ * would have made this correct in dark and absent in light.
+ *
+ * `--surface-raised` and not `--surface`, which is the one thing the copies
+ * genuinely disagreed about — nine more boxes (`runs-row`, `teams-rule`,
+ * `council-seat`, `errands-rule`, `mail-detail-attachment`, …) used the lower
+ * rung. The split is a dark-theme artefact: in light the two tokens are the same
+ * white, so those nine and these ten already render identically, and only dark
+ * had to be decided. On a `--surface` panel the lower rung leaves the box with
+ * no fill of its own and only a frame, which is the flat-outline card the
+ * anti-references name. The rung up is the one that carries.
+ *
+ * It is one box and not a head/body pair, so it carries its own padding — do not
+ * put `.ui-panel-head` or `.ui-panel-body` inside one. Usable on its own; harmless
+ * beside `.ui-panel`, which it overrides on everything the two share, though
+ * saying both says nothing the inset does not.
+ *
+ * The graduation stops here, deliberately: there is no third rank. An inset
+ * inside an inset is the boxes-in-boxes again with an extra frame — the three
+ * places that go that deep today (`Contacts.tsx:148→180`, `Waiting.tsx:870→879`,
+ * `Autopilot.tsx:324→406→410`) want either no box at all or `.ui-panel-dim`,
+ * which drops to the sunken rung and reads as a well rather than as a card.
+ */
+.ui-panel-inset {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+/* ----------------------------------------------------------------- count -- */
+
+/**
+ * How many, in the corner of a heading. Nine pages wrote this one out.
+ *
+ * A number and not a pill, which is a decision the app has already made once:
+ * `LimitChip` was demoted from a bordered chip to bare text precisely so that a
+ * quantity could never be mistaken for a badge, and a count is the same kind of
+ * fact. Every one of the nine copies had arrived at bare text too — the pill
+ * only exists in the rail, where a shut sidebar has no room for the word the
+ * number belongs to and the pill is what is left of it.
+ *
+ * Mono and tabular because the count came from the daemon and changes under a
+ * poll; a column of these down the right edge of a panel head must stay a column
+ * rather than wobble as the digits change width. Faint, because it qualifies the
+ * title beside it and is not competing with it.
+ *
+ * `white-space: nowrap` is the one declaration the nine copies did not have.
+ * `.ui-panel-aside` wraps, and "3 waiting" breaking across two lines in a corner
+ * is the only failure this component has.
+ *
+ * The recipe is `.ui-reading-time`'s, to the property. They are kept apart
+ * because `readings.tsx` owns that class and a count is not a time — but if the
+ * two ever drift, that is the bug, not the fix.
+ */
+.ui-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ rows -- */
+
+/**
+ * A column read by scanning down it, ruled by hairlines.
+ *
+ * Four pages carry this byte for byte — `contacts-roster`, `feed-list`,
+ * `mail-list`, `voice-list` — and two of the four say in a comment why it is not
+ * a column of cards: fifty bordered boxes stacked vertically is a pile, and the
+ * eye stops reading it as a list. This and `.ui-panel-inset` are the two ways to
+ * present a collection, and the question that picks between them is whether a
+ * reader scans the column or picks items out of it.
+ *
+ * The rules are drawn by a 1px gap over a ground painted in the border colour,
+ * which is a trick and worth naming as one. The obvious alternative —
+ * `border-bottom` on every row plus a `:last-child` exception — is two rules
+ * where this is one, and the exception is the half everyone forgets, which is
+ * how a list ends with a rule hanging under nothing. It also doubles up wherever
+ * two of these meet. The cost is that a row must paint its own fill or the
+ * ground shows through: that is the mechanism, not decoration, which is why
+ * `.ui-rows-row` sets a background it looks like it does not need.
+ *
+ * `overflow: hidden` on the container is what lets square rows sit inside a
+ * rounded box without their corners poking out of it.
+ *
+ * The four copies split on the row's inner gap, `--space-1` against
+ * `--space-2`. The tighter one wins: feed and mail are the two lists the other
+ * two name as their model, and a row that wants more air can say so, whereas a
+ * row that wants less cannot take it back without knowing what it is undoing.
+ */
+.ui-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--hairline);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow: hidden;
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--border);
+}
+
+.ui-rows-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+}
+
+/**
+ * A row whose parts sit on one line instead of stacking.
+ *
+ * Added because two lists could not adopt this component without it, and both
+ * for the same reason: a subsystem line is a name, a state badge and a reason
+ * side by side (`system.css`), and a feed line is a badge, a summary and a time
+ * (`autopilot.css`). Under the stacking default each would have needed a wrapper
+ * `div` inside every row — a box put back exactly where the primitive exists to
+ * remove one.
+ *
+ * It is a modifier on the row and not a `className` the caller passes, because
+ * the row's `background` is not decoration: the rules of this list are a 1px gap
+ * over a `--border` ground, so a row that loses its fill is a gap you can see
+ * through. Handing out `className` here means handing out the ability to delete
+ * a rule by accident.
+ *
+ * `baseline` and not `center`: these lines mix a 0.6875rem badge with body text,
+ * and centring them sits the small thing off the line the eye is reading along.
+ * It wraps, because the reason on a subsystem row can be a sentence.
+ */
+.ui-rows-row-line {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
+}
+
 /* ----------------------------------------------------------------- badge -- */
 
 .ui-badge {
@@ -179,13 +347,28 @@
   line-height: 1.4;
   cursor: pointer;
   transition:
-    background-color 120ms ease,
-    border-color 120ms ease,
-    color 120ms ease;
+    background-color var(--dur-quick) var(--ease),
+    border-color var(--dur-quick) var(--ease),
+    color var(--dur-quick) var(--ease);
 }
 
 .ui-button:hover:not(:disabled) {
   border-color: var(--text-faint);
+}
+
+/**
+ * Pressed. The app had no `:active` anywhere, so every button in it released
+ * without ever having been held — the pointer went down, nothing acknowledged
+ * it, and the only feedback was whatever happened afterwards. On a control that
+ * fires a run against somebody's repository that gap is worth closing.
+ *
+ * One rung down the ladder rather than a hue, and the transition is suppressed
+ * on the way in: a press must register in the frame it happens, not 140ms later.
+ */
+.ui-button:active:not(:disabled) {
+  background: var(--surface);
+  border-color: var(--border-strong);
+  transition-duration: 0s;
 }
 
 .ui-button:disabled {
@@ -193,7 +376,7 @@
      leaves no trace of what is missing. The exception is deliberate elsewhere —
      an action that would act on stale data is removed, not disabled, because
      there the answer is "not now" rather than "not for you". */
-  opacity: 0.45;
+  opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }
 
@@ -314,12 +497,31 @@
 
 /* ----------------------------------------------------------------- teach -- */
 
+/**
+ * The empty state with something to say — and the app's only one.
+ *
+ * Fifteen pages had grown their own, in four recipes, and sorting them settled
+ * what this component is for. Three of those recipes were a single faint or
+ * muted line ("no runs yet", "nothing waiting"), which is not an empty state at
+ * all — it is a value that happens to be absent, and it belongs to `.ui-quiet`
+ * below. What is left, and what this is, is the case where the emptiness is the
+ * screen: nothing has ever been here, the reader does not yet know what would
+ * put something here, and there is a control that would. A title, a sentence,
+ * and a way out.
+ *
+ * The distinction is worth holding, because the failure mode is a page that
+ * answers "no results for that filter" with a paragraph and a button.
+ *
+ * Left-aligned, capped at the measure, and padded rather than centred: a
+ * centred block of prose in the middle of a viewport is a poster, and this is a
+ * page that is about to have content in it.
+ */
 .ui-teach {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
   align-items: flex-start;
-  max-width: 52ch;
+  max-width: var(--measure);
   padding: var(--space-6) var(--space-5);
   color: var(--text-muted);
 }
@@ -342,6 +544,31 @@
 
 /* --------------------------------------------------------------- section -- */
 
+/**
+ * A labelled group, and the label above it.
+ *
+ * Seven pages hand-rolled this heading rather than importing it, and the seven
+ * disagree in ways that are worth recording, because every one of them is a
+ * drift away from a rule this app already wrote down:
+ *
+ * - Four set it in the mono face (`ap-subhead`, `calendar-subhead`,
+ *   `waiting-subhead`, `web-search-subhead`). The face is a claim about origin,
+ *   and "pending" over a list is not something the daemon produced. The display
+ *   face small is the one the design assigns to a section title.
+ * - Two set it in the body face at `--tracking-wide` (`browser-subhead`,
+ *   `teams-round-head`, and `contacts-side-role` / `waiting-side-role` copy the
+ *   first). That is the *label* style — column heads, gauge labels, field names
+ *   — which is a different rank from a heading, and at 11px the 0.08em against
+ *   0.14em difference is exactly what stops the two being told apart.
+ * - Five carry their own `margin: var(--space-4) 0 var(--space-2)`, because a
+ *   bare `<h3>` has to. That margin is what `.ui-section` exists to remove: the
+ *   container owns the rhythm, the title owns the type, and a heading that
+ *   brings its own spacing double-counts inside one.
+ *
+ * So nothing is being added here. `.ui-section-title` was already the section
+ * header, in the exact shape DESIGN.md specifies for one, and its being imported
+ * by zero pages is the whole of the problem.
+ */
 .ui-section {
   display: flex;
   flex-direction: column;
@@ -374,6 +601,28 @@
 
 /* ----------------------------------------------------------------- quiet -- */
 
+/**
+ * Nothing here — said in one line, which is what an absence usually deserves.
+ *
+ * Written for a panel whose body turned out to be empty, and it is also the
+ * other three of the four empty-state recipes the pages grew: twenty-six sites
+ * across fifteen pages, all of them one short sentence, none of them needing the
+ * title-and-a-way-out that `.ui-teach` gives. The two together are the whole
+ * vocabulary: a line when the reader already knows what would fill the space, a
+ * teaching block when they do not.
+ *
+ * That asymmetry is measurable and it is the explanation: `Teach` is imported by
+ * seventeen pages, `Quiet` by none. The pages were never confused about which
+ * kind of nothing they had — they reached for the component that existed, and
+ * hand-rolled the one that did not.
+ *
+ * The copies split on the text rung, ten in `--text-faint` against sixteen in
+ * `--text-muted`. Muted, and not only because it is the majority: faint is the
+ * rung for metadata standing beside content, and here the sentence *is* the
+ * content — the only thing the region has to say. A page whose answer is set
+ * fainter than its labels reads as though it failed rather than as though it is
+ * empty.
+ */
 .ui-quiet {
   display: flex;
   flex: 1 1 auto;
@@ -410,15 +659,143 @@
 /**
  * The paragraph the line replaced, on its own row once asked for.
  *
- * `52ch` is the measure `.ui-teach` uses, and for the same reason: this is the same prose that
+ * `--measure` is what `.ui-teach` caps at, and for the same reason: this is the same prose that
  * used to sit in the panel, and prose that runs the width of a workspace is prose nobody finishes.
  */
 .ui-quiet-why {
   flex-basis: 100%;
-  max-width: 52ch;
+  max-width: var(--measure);
   font-size: var(--text-xs);
   line-height: var(--leading-normal);
   color: var(--text-faint);
+}
+
+/* --------------------------------------------------------------- current -- */
+
+/**
+ * "This one" — the row you are on, the item that is selected, the target a drag
+ * is over.
+ *
+ * A 2px rule on the leading edge, in the top neutral rung, and nothing else.
+ *
+ * **Why not a fill.** Six pages independently reached for `--accent-quiet`, and
+ * that is not six oversights: the neutral answer did not exist. The surface
+ * ladder has four rungs in dark and only three in light, where `--surface` and
+ * `--surface-raised` are both `#ffffff` — because you cannot raise something
+ * above white, so the light theme spends borders and shadows on elevation
+ * instead. Anything built on a fill therefore works in dark and vanishes in
+ * light, which is exactly why the brand colour looked like the only option.
+ * An edge does not depend on the fill, so it crosses both themes without the
+ * fourth rung light cannot have.
+ *
+ * **Why it leaves the focus ring alone.** `--focus-ring` is an `outline` in the
+ * accent, drawn outside the box. This is an inset shadow, drawn inside it, in a
+ * neutral. Where they used to be the same cyan saying two different things,
+ * "where you are looking" and "which one is chosen" can now be true at once and
+ * read as two facts.
+ *
+ * **Why it is not new vocabulary.** `.ui-note-refusal` above already says "this
+ * one is different" with a rule on the leading edge rather than a frame. This is
+ * the same idiom in another role, which is the point — an app that marks things
+ * two ways has to be read twice.
+ *
+ * Decided by the owner on 2026-09-06, from a rendering of the four candidates in
+ * both themes. Do not reopen it with a fill.
+ */
+.ui-current {
+  box-shadow: inset 2px 0 0 var(--text);
+}
+
+/* ------------------------------------------------------------------ well -- */
+
+/**
+ * A recess cut into a surface — the third rank, and not a third card.
+ *
+ * The rule is that a box inside a box inside a box does not exist: an inset
+ * inside an inset goes flat or it goes down. This is what "goes down" means, and
+ * until now it was prescribed without being provided, so three pages built it
+ * separately (`waiting-payload-raw`, `ap-root`, `ap-raw`) and one of the three
+ * gave it a border, which made it a third card again.
+ *
+ * **No border, and that is the whole mechanism.** A recess is read from being
+ * darker than its surroundings, not from being outlined; the outline is what
+ * makes a thing read as sitting *on* the surface rather than being cut into it.
+ * It is also why this is not `.ui-panel-dim`, which keeps the panel's border
+ * because it is a panel that recedes rather than a hole in one.
+ *
+ * Mono by default: what goes in a well is nearly always something the machine
+ * produced — a path, a payload, a raw response — and the face is the claim that
+ * nobody wrote it by hand.
+ */
+.ui-well {
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+}
+
+/**
+ * A well holding something a person reads rather than something a machine
+ * produced.
+ *
+ * The default recipe above is mono at `--text-xs` in `--text-muted`, and that is
+ * a *claim*: nobody wrote this by hand. Six pages hit the same wall, and the
+ * clearest statement of it came from `council.css` — a seat's answer set in mono
+ * while the chairman's synthesis below it stays in the body face would assert
+ * two different authors. `errands` put a notebook a person writes at 11px muted
+ * and said so; `mail` declined the well outright for a message body.
+ *
+ * So the recess stays and the face changes. Same hole, same surface; what
+ * differs is who filled it.
+ */
+.ui-well-reading {
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  overflow-wrap: normal;
+}
+
+/**
+ * A well that stops growing and scrolls instead.
+ *
+ * What goes in one is unbounded by nature — a diff, a message body, a fetched
+ * article — and a panel whose height is set by the longest payload it has ever
+ * held is a panel nobody can scan past. Four pages had written their own ceiling
+ * (`28rem`, `32rem`, and two more), which is four answers to one question, so the
+ * number is a token and the question is answered once.
+ */
+.ui-well-capped {
+  max-height: var(--well-cap);
+  overflow: auto;
+}
+
+/**
+ * A well inside a panel that has already receded.
+ *
+ * `.ui-panel-dim` and `.ui-well` are both `--surface-sunken`, in both themes —
+ * an oversight in the well's design, which assumed it would always sit on
+ * `--surface` or `--surface-raised`. Put one inside the other and the recess is
+ * a rectangle with no contrast at all; `voice.css` found this and declined the
+ * adoption rather than ship it, which was the right call.
+ *
+ * The ladder has nothing below sunken to go to, so the boundary is drawn instead
+ * of dug. An inset hairline and not a `border`, because a border would move the
+ * content two pixels the moment a well changed ground.
+ */
+.ui-panel-dim .ui-well {
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+/* An ordered well: the content is machine output and its ordering is part of it. */
+ol.ui-well {
+  margin: 0;
+  padding-left: calc(var(--space-3) + var(--space-4));
 }
 
 /* ----------------------------------------------------------------- notes -- */
@@ -432,6 +809,16 @@
   border-radius: var(--radius-md);
   font-size: var(--text-sm);
   line-height: var(--leading-snug);
+  /* Almost everything a note carries came from the daemon — a path, a model id,
+     a refusal code — and one unbroken token pushes whatever grid the note sits
+     in sideways. `council.css` had `overflow-wrap` on every daemon string in the
+     file for exactly this reason, and could not adopt `ErrorNote` without it. */
+  overflow-wrap: anywhere;
+  /* And it has to stop somewhere. Seven of the twelve hand-rolled error boxes in
+     `project/` had capped themselves at this width before adopting `ErrorNote`,
+     which is seven people independently noticing that a sentence running the
+     full width of a 1200px window is not a sentence anybody finishes. */
+  max-width: var(--measure-prose);
 }
 
 /* Something broke. Red, and assertive to a screen reader. */
@@ -467,6 +854,31 @@
 
 .ui-note-text {
   color: var(--text);
+}
+
+/**
+ * What is about to happen will not be allowed.
+ *
+ * The rung between the refusal and the error, and the one the ladder was
+ * missing: `RefusalNote` reports a "no" that has already been said, and
+ * `ErrorNote` reports a fault. Neither covers "press this and it will be
+ * refused" — which is a different sentence, because it is addressed to
+ * somebody who can still choose otherwise.
+ *
+ * The `paused` tone, used as its full triple. Paused is the app's word for held
+ * by a rule or a ceiling, which is exactly what is standing in the way here, and
+ * it is deliberately not red: nothing has gone wrong yet.
+ *
+ * Two pages had written this rule byte for byte under their own names
+ * (`waiting-conflict`, `contacts-conflict`), both at `--radius-sm`. That is the
+ * inline-mark rung on a padded box; the ladder says a note is `--radius-md`, and
+ * the shared copy takes the ladder's answer rather than preserving the drift of
+ * whichever page wrote it first.
+ */
+.ui-note-conflict {
+  color: var(--tone-paused-fg);
+  background: var(--tone-paused-bg);
+  border-color: var(--tone-paused-border);
 }
 
 /* The data is old, not wrong. The quietest note in the set. */
@@ -808,10 +1220,22 @@
   color: var(--text);
 }
 
-/* The director. The accent is identity, not state — see tokens.css. */
+/**
+ * The director, marked in ink rather than in the brand colour.
+ *
+ * It used to argue that the accent was identity here and not state, which is a
+ * distinction the eye does not make: a pill is a peer among peers, and the one
+ * wearing the accent reads as the selected one. Settled by the owner on
+ * 2026-09-06 — the shared layer spends no accent at all, and "this one" is
+ * always the same ink. The rail is the one sanctioned exception, and it is not
+ * in this file.
+ *
+ * A solid `--text` hairline against the neighbours' `--border`, and no halo:
+ * `.ui-current`'s inset filete cannot be borrowed, because a pill's radius
+ * clips it to a sliver.
+ */
 .ui-who-leads {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-quiet);
+  border-color: var(--text);
 }
 
 /* Serves more than one department. Dashed means "not only ours" everywhere. */
@@ -868,16 +1292,17 @@
 /**
  * One bar per day the window covers for this department.
  *
- * Quiet by default and the most recent one in the accent, because the question
- * a pulse answers is "and now?". The accent is identity — which bar is the
- * latest — and not a state, which is what tokens.css reserves it for.
+ * Quiet by default and the most recent one in ink, because the question a pulse
+ * answers is "and now?". It was the accent until 2026-09-06 on the same
+ * "identity, not state" argument `.ui-who-leads` used to make, and the owner
+ * settled both the same way: the shared layer spends no accent.
  */
 .ui-spark-bar {
   fill: var(--border-strong);
 }
 
 .ui-spark-now {
-  fill: var(--accent);
+  fill: var(--text);
 }
 
 /* Fewer than two points: the same dashed rail an absent ceiling gets. */
@@ -967,17 +1392,118 @@
 }
 
 /* The accent as identity — which tab you are on — and not as a state. */
+/* The current tab, marked by contrast rather than by hue. This was the brand
+   cyan, which is reserved for the wordmark, links and the focus ring — a
+   selection wearing it reads as a status, and a status wearing it reads as
+   something you can click. */
 .ui-tab[data-state="active"] {
-  border-bottom-color: var(--accent);
+  border-bottom-color: var(--text);
   color: var(--text);
 }
 
 .ui-tab:disabled {
   pointer-events: none;
-  opacity: 0.5;
+  opacity: var(--opacity-disabled);
 }
 
 .ui-tab-panel {
   min-width: 0;
   outline: none;
+}
+
+/* --------------------------------------------------------------- readings -- */
+
+/**
+ * The three formatters from `src/ui/readings.tsx`: a relative time, a cost, and
+ * a meter. They lived in `src/pages/runs.css` on loan, which meant twenty pages
+ * imported the components while their appearance depended on whether the Runs
+ * route had been visited — a defect that shows up only as something looking
+ * wrong on a screen nobody is testing.
+ */
+
+/* A relative time. Tabular figures so a column of them does not jitter as the
+   seconds tick over. */
+.ui-reading-time,
+.ui-reading-raw {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A timestamp we could not parse is shown as itself, and marked as unusual. */
+.ui-reading-raw {
+  color: var(--tone-info-fg);
+}
+
+.ui-cost {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.ui-cost-money {
+  color: var(--text);
+}
+
+.ui-cost-tokens {
+  color: var(--text-faint);
+}
+
+.ui-meter {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-2) 0 0;
+}
+
+/**
+ * The bar.
+ *
+ * `position: relative` because the handoff mark is placed against it — the mark
+ * is at a fixed fraction of the track and not at a fraction of the fill, which
+ * is the whole reason it says anything.
+ */
+.ui-meter-track {
+  position: relative;
+  display: block;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.ui-meter-fill {
+  display: block;
+  height: 100%;
+  background: var(--tone-info-fg);
+}
+
+/* Past four fifths the run is about to be handed off, which is a fact about
+   what happens next rather than a fault — the warm tone, not the red one. */
+.ui-meter-past .ui-meter-fill {
+  background: var(--tone-paused-fg);
+}
+
+.ui-meter-mark {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--text);
+  opacity: 0.7;
+}
+
+.ui-meter-text,
+.ui-meter-absent {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
 }

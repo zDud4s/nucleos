@@ -9,8 +9,11 @@ export { Badge, type BadgeProps, type BadgeTone } from "./Badge";
 export { Button, type ButtonIntent, type ButtonProps, type ButtonVariant } from "./Button";
 export { ConfirmButton, type ConfirmButtonProps } from "./ConfirmButton";
 export { CopyButton, type CopyButtonProps } from "./CopyButton";
+export { ConflictNote, type ConflictNoteProps } from "./ConflictNote";
 export { CopyOnce, type CopyOnceProps } from "./CopyOnce";
+export { Count, type CountProps } from "./Count";
 export { ErrorNote, type ErrorNoteProps } from "./ErrorNote";
+export { Inset, type InsetAs, type InsetProps } from "./Inset";
 /**
  * Two primitives in one module — the second recorded exception to one
  * primitive per file. See the header of `Meter.tsx`: the pair exists for the
@@ -36,12 +39,21 @@ export {
   type RelativeTimeProps,
 } from "./readings";
 export { RefusalNote, type RefusalNoteProps } from "./RefusalNote";
+/**
+ * A container and its item in one module — the third recorded exception to one
+ * primitive per file. See the header of `Rows.tsx`: a row exists only inside
+ * one of these, and it paints the fill that keeps the container's hairline
+ * ground from showing through, so the two are one mechanism written twice.
+ */
+export { Row, Rows, type RowProps, type RowsProps } from "./Rows";
 export { Section, type SectionProps } from "./Section";
+export { SectionTitle, type SectionTitleProps } from "./SectionTitle";
 export { Sparkline, type SparklineProps } from "./Sparkline";
 export { StaleNote, type StaleNoteProps } from "./StaleNote";
 export { StatCard, type StatCardProps } from "./StatCard";
 export { StateBadge, type StateBadgeProps } from "./StateBadge";
 export { Teach, type TeachProps } from "./Teach";
+export { Well, type WellProps } from "./Well";
 export { Who, type WhoProps } from "./Who";
 export { readState, type StateDomain, type StateReading } from "./state-map";
 /**

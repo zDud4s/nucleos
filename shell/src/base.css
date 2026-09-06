@@ -190,6 +190,56 @@ textarea {
   outline: none;
 }
 
+/* ---------------------------------------------------- visually hidden -- */
+
+/**
+ * Said to a screen reader, absent to the eye.
+ *
+ * A utility and not a component, which is why it is here rather than in
+ * `ui.css`: it has no look, it belongs to no `src/ui/` component, and the thing
+ * it does — decouple the accessible name from the visible one — is a fact about
+ * the document. Nine copies of it existed when this was written, seven of them
+ * in page stylesheets under seven different names (`agents-said`, `pj-said`,
+ * `teams-said`, `chats-offscreen`, `calendar-visually-hidden`, …), which is nine
+ * chances to get an accessibility primitive subtly wrong and no way to fix them
+ * all at once. The `chats-` and `teams-` copies are gone; the rest are being
+ * retired page by page, so treat that list as the census it was and not as an
+ * inventory of what is still out there.
+ *
+ * `clip-path: inset(50%)` and not `clip: rect(0 0 0 0)`. `clip` is deprecated,
+ * takes a *physical* rectangle — so it is the wrong shape the moment a document
+ * is laid out right-to-left — and in some engines it drops the text out of the
+ * accessibility tree along with the pixels, which is the exact opposite of the
+ * point. `clip-path` is direction-agnostic and purely visual. The one copy that
+ * still used `clip` was the file input at `chats.css:2758`, which has since
+ * adopted this rule — the deprecated recipe is out of the tree entirely.
+ *
+ * The rest of the recipe is not decoration: `position: absolute` takes it out of
+ * flow, the 1px box plus `margin: -1px` keeps a non-zero rendered size (a 0×0
+ * element is skipped by several screen readers), `overflow: hidden` does the
+ * hiding `clip-path` cannot do for descendants, and `white-space: nowrap` stops
+ * a sentence squeezed into 1px from becoming a column of single letters that
+ * some readers announce one at a time.
+ *
+ * Deliberately unlayered, and that word is load-bearing in the other direction
+ * from the `@layer base` note above. Tailwind ships its own `.sr-only` in the
+ * `utilities` layer — still on `clip: rect()` — and `dialog.tsx`, `command.tsx`
+ * and `Roster.tsx` already spell the class that way. Unlayered CSS beats every
+ * layer, so writing it here replaces that older recipe for the three components
+ * that already use it rather than fighting it.
+ */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 img,
 svg {
   display: block;

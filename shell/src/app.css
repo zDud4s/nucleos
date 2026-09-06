@@ -220,7 +220,7 @@
   font-family: inherit;
   text-align: left;
   cursor: pointer;
-  transition: background-color 120ms ease;
+  transition: background-color var(--dur-quick) var(--ease);
 }
 
 .nav-switch-button:hover {
@@ -698,8 +698,8 @@
   text-decoration: none;
   white-space: nowrap;
   transition:
-    background-color var(--nav-quick) var(--nav-ease),
-    color var(--nav-quick) var(--nav-ease);
+    background-color var(--dur-quick) var(--ease),
+    color var(--dur-quick) var(--ease);
 }
 
 .nav-item:hover {
@@ -1302,8 +1302,8 @@
  * no animation at all — four transitions in twenty-five stylesheets — and this
  * rail is deliberately not the place that changes.
  *
- * `.impeccable.md` calls the product's manner "silêncio operacional": quiet when
- * everything is fine, loud only in proportion to what is wrong. So nothing here
+ * `PRODUCT.md` states the product's manner as silence when things are well and
+ * weight, without hysteria, when they are not. So nothing here
  * loops, nothing pulses for attention, nothing announces itself. Motion is spent
  * on exactly three jobs:
  *
@@ -1318,22 +1318,18 @@
  *      with it — see `.nav { transition: width }` below for what was tried and
  *      thrown away.
  *
- * Durations are the three the rail needs and no more — 140ms for feedback, 220ms
- * for something that arrives, 240ms for the slide — on one easing curve. `ease-out-quart` decelerates
- * the way a thrown object does; no bounce and no elastic anywhere, which in a
- * console read for eight hours would be a joke told twice.
+ * Durations and the curve are no longer defined here. They were — on `.nav`,
+ * which meant nothing outside the rail could reach them, and the rest of the app
+ * wrote `120ms ease` by hand instead. They now live in `tokens.css` as
+ * `--dur-quick`, `--dur-settle`, `--dur-slide` and `--ease`, and the rail is one
+ * consumer of them rather than their owner. The budget argued above still holds;
+ * what changed is that the numbers are the app's and not the sidebar's.
  *
  * `prefers-reduced-motion` is already answered for the whole app in `base.css`,
  * where a `*` rule cuts every duration to 0.01ms, pseudo-elements included. So
  * every keyframe below is off for anyone who asked for that, and duplicating the
  * media query here would only create a second place to forget.
  */
-.nav {
-  --nav-ease: cubic-bezier(0.25, 1, 0.5, 1);
-  --nav-quick: 140ms;
-  --nav-settle: 220ms;
-  --nav-slide: 240ms;
-}
 
 /**
  * The rail sliding between its two widths — the only thing that moves, and the
@@ -1365,7 +1361,7 @@
  * rail is born at is not one.
  */
 .nav {
-  transition: width var(--nav-slide) var(--nav-ease);
+  transition: width var(--dur-slide) var(--ease);
 }
 
 /* A panel that arrives from under the button that opened it. 4px, because the
@@ -1378,7 +1374,7 @@
 }
 
 .nav-switch-menu {
-  animation: nav-menu-in var(--nav-quick) var(--nav-ease);
+  animation: nav-menu-in var(--dur-quick) var(--ease);
 }
 
 /**
@@ -1405,7 +1401,7 @@
 }
 
 .nav-sub > li {
-  animation: nav-row-in var(--nav-quick) var(--nav-ease) backwards;
+  animation: nav-row-in var(--dur-quick) var(--ease) backwards;
 }
 
 .nav-sub > li:nth-child(2) {
@@ -1429,7 +1425,7 @@
    curve, same 140ms, because they mean the same thing in two places. */
 .nav-switch-chevron,
 .nav-disclose-icon {
-  transition: transform var(--nav-quick) var(--nav-ease);
+  transition: transform var(--dur-quick) var(--ease);
 }
 
 .nav-switch-button[aria-expanded="true"] .nav-switch-chevron {
@@ -1462,7 +1458,7 @@
   inset: 0 auto 0 0;
   width: 2px;
   background: var(--accent);
-  animation: nav-here var(--nav-settle) var(--nav-ease);
+  animation: nav-here var(--dur-settle) var(--ease);
 }
 
 /**
@@ -1483,7 +1479,7 @@
 
 .nav-badge,
 .nav-dot {
-  animation: nav-badge-in var(--nav-settle) var(--nav-ease);
+  animation: nav-badge-in var(--dur-settle) var(--ease);
 }
 
 /**
@@ -1514,13 +1510,13 @@
 .nav-collapsed .nav-badge,
 .nav-collapsed .nav-dot,
 .nav-collapsed .app-notify-count {
-  animation: nav-corner-in var(--nav-settle) var(--nav-ease);
+  animation: nav-corner-in var(--dur-settle) var(--ease);
 }
 
 /* Collapsed, the mark IS the button, and nothing else in the rail says so. A
    sixth of a scale under the pointer is the whole tooltip. */
 .nav-switch-mark {
-  transition: transform var(--nav-quick) var(--nav-ease);
+  transition: transform var(--dur-quick) var(--ease);
 }
 
 .nav-collapsed .nav-switch-button:hover .nav-switch-mark {
@@ -1534,8 +1530,8 @@
 .nav-switch-item,
 .nav-disclose {
   transition:
-    background-color var(--nav-quick) var(--nav-ease),
-    color var(--nav-quick) var(--nav-ease);
+    background-color var(--dur-quick) var(--ease),
+    color var(--dur-quick) var(--ease);
 }
 
 /* -------------------------------------------------------------- takeover -- */
