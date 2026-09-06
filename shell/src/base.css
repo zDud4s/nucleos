@@ -43,12 +43,26 @@
  * page behind it. In a window whose panes are full-height and scroll independently, that is the
  * behaviour of the two that surprises people less.
  *
- * On `*` and not on `html`, because `html` is not what scrolls: `.app-shell` is
- * `height: 100vh; overflow: hidden` and the app has eighteen scrolling regions inside it, each an
- * element that would bounce on its own. Zero specificity, so anything that needs to say otherwise
- * still can — `body[data-scroll-locked]` at the end of this file does.
+ * Declared at each scrolling region, and NOT on `*`, which is where this started and what broke
+ * the rail. `html` is not what scrolls — `.app-shell` is `height: 100vh; overflow: hidden` and the
+ * app has eighteen scrolling regions inside it — so `*` looked like the one selector that reached
+ * all of them without naming any. It reaches far more than that.
+ *
+ * The property applies to **scroll containers**, and `overflow: hidden` makes one: a box that can
+ * never scroll is still a container, and with `none` on it a wheel that lands there is swallowed
+ * instead of chained to the region that can. Every row in the rail is such a box — `.nav-item` is
+ * `overflow: hidden` for its label's ellipsis — so the sidebar became unscrollable by wheel while
+ * staying perfectly scrollable by `scrollTop`, which is why it read as a layout bug and was not
+ * one. Measured 2026-09-06 in the preview bundle under headless Chromium: a 300px wheel over the
+ * rail moved it 0px, and setting `overscroll-behavior: auto` on nothing but the descendants whose
+ * computed overflow was not `visible` moved it the full 300.
+ *
+ * So the rule below covers the viewport — inert while nothing scrolls it, and the thing
+ * `body[data-scroll-locked]` at the end of this file overrides — and every region that actually
+ * scrolls carries the declaration beside its own `overflow`, where the next one added will see it.
  */
-* {
+html,
+body {
   overscroll-behavior: none;
 }
 

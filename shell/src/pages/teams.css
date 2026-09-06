@@ -1192,6 +1192,7 @@
 .teams-act-raw {
   max-height: 12rem;
   overflow: auto;
+  overscroll-behavior: none;
   margin: 0;
   padding: var(--space-2);
   border: 1px solid var(--border);

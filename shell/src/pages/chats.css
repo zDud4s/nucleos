@@ -614,6 +614,7 @@
 .chats-diff {
   max-height: 24rem;
   overflow: auto;
+  overscroll-behavior: none;
   padding: var(--space-2);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken, rgba(0, 0, 0, 0.04));
@@ -1392,6 +1393,7 @@
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
   overflow: auto;
+  overscroll-behavior: none;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -1879,6 +1881,7 @@
 .chats-denials {
   max-height: 22rem;
   overflow-y: auto;
+  overscroll-behavior: none;
 }
 
 /* ------------------------------------------------------------- helpers -- */
@@ -1908,6 +1911,7 @@
   margin: 0;
   padding: 0;
   overflow-y: auto;
+  overscroll-behavior: none;
   list-style: none;
 }
 
@@ -2579,6 +2583,7 @@
   margin: 0 0 var(--space-2);
   padding: var(--space-1);
   overflow-y: auto;
+  overscroll-behavior: none;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
