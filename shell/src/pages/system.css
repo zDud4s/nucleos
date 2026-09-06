@@ -454,20 +454,34 @@
   margin: 0 0 var(--space-3);
 }
 
-.sy-unconfigured {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
+.sy-setting-label {
+  display: block;
+  margin: 0 0 var(--space-1);
 }
 
-.sy-unconfigured-area {
-  padding: var(--space-1) var(--space-3);
-  border: 1px dashed var(--border);
-  border-radius: var(--radius-pill);
+.sy-setting-editor {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken, var(--surface));
+  color: var(--text);
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal, 1.5);
+  resize: vertical;
+}
+
+.sy-setting-editor:focus-visible {
+  outline: 2px solid var(--focus, var(--accent));
+  outline-offset: 1px;
+}
+
+.sy-setting-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
 }

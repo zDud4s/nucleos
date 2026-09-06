@@ -34,12 +34,13 @@ import {
   type VoiceConfig,
 } from "../data/system";
 import { Badge, Button, ConfirmButton, CopyOnce, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime, StateBadge } from "../ui";
+import { MachineSettings } from "./MachineSettings";
 import "./system.css";
 
 /**
  * System — the machine's own state, not a project's.
  *
- * Three tabs. S1 and S2 built the health view (the daemon's own subsystem
+ * Four tabs. S1 and S2 built the health view (the daemon's own subsystem
  * readout and the sidecars' own liveness) plus, on top of it, the project
  * brakes and the editable budget; and the whole backups view (snapshots,
  * staged restore and the PII tally). Health data is read off
@@ -47,23 +48,32 @@ import "./system.css";
  * the app, which every pillar's own health reading (Browser's included)
  * narrows rather than asking again.
  *
- * This packet (S3) builds the tokens view: minting and revoking API tokens
- * with a show-once secret, plus a config index reading the three `/config/*`-
- * shaped routes that actually exist and naming the four areas that have none.
+ * S3 built the tokens view: minting and revoking API tokens with a show-once
+ * secret, plus a config index reading the three `/config/*`-shaped routes that
+ * existed — and naming, honestly, the four areas that had no route at all.
+ *
+ * The settings view is what answers that confession. `GET`/`POST
+ * /config/machine` now serve the whole of this machine's settings — the nine
+ * `.ai/*.yaml` whose author is the daemon rather than any project — so every
+ * pillar can be configured here instead of in a text editor followed by a
+ * restart. The config index above it stays, narrowed to what it is actually
+ * good at: showing what the daemon is RUNNING, which is a different reading
+ * from what is on disk whenever the two have been allowed to drift.
  */
 
-/** The three tabs, in the order they read. */
-const VIEWS = ["health", "backups", "tokens"] as const;
+/** The four tabs, in the order they read. */
+const VIEWS = ["health", "backups", "tokens", "settings"] as const;
 export type SystemView = (typeof VIEWS)[number];
 
 const VIEW_LABEL: Record<SystemView, string> = {
   health: "Health",
   backups: "Backups",
   tokens: "Tokens",
+  settings: "Settings",
 };
 
 /**
- * A `$view` param as one of the three.
+ * A `$view` param as one of the four.
  *
  * Falls back to `health` rather than refusing: a route parameter is a string,
  * anybody can type one, and a typo in a path is not a missing page.
@@ -87,6 +97,7 @@ export function System() {
         {view === "health" && <HealthView health={health} sidecars={sidecars} />}
         {view === "backups" && <BackupsView />}
         {view === "tokens" && <TokensView />}
+        {view === "settings" && <MachineSettings />}
       </div>
     </>
   );
@@ -814,16 +825,19 @@ function RevokeError({ error }: { error: unknown }) {
 /* ------------------------------------------------------------------- config -- */
 
 /**
- * Areas with no configuration route at all, verified against `core/src/http.rs`'s
- * `/config/*` set plus the two asymmetric paths above it — `/config/email` is
- * the only `/config/*` route, and nothing serves web, browser, council or
- * models. Named rather than requested: there is nothing to ask for.
- */
-const UNCONFIGURED_AREAS = ["web", "browser", "council", "models"] as const;
-
-/**
- * Readouts for the config routes that exist, and an honest list of the ones
- * that do not.
+ * What the pillars are actually DOING, as the daemon has them in memory.
+ *
+ * These three stay here, and stay read-only, now that the Settings tab can
+ * write the files they come from. They are not the same reading and neither
+ * replaces the other: this is the parsed and running view — clamps applied,
+ * `armed` computed, a malformed file already fallen back to defaults — where
+ * the Settings tab shows the bytes on disk. The two disagree exactly when
+ * somebody has edited a file and not restarted, and that gap is the thing
+ * worth being able to see rather than the thing to design away.
+ *
+ * The panel that used to sit here naming `web`, `browser`, `council` and
+ * `models` as areas with no configuration route is gone, because that is no
+ * longer true of any of them.
  */
 function ConfigIndex() {
   return (
@@ -831,7 +845,6 @@ function ConfigIndex() {
       <EmailConfigPanel />
       <VoiceConfigPanel />
       <CalendarConfigPanel />
-      <UnconfiguredAreasPanel />
     </>
   );
 }
@@ -947,29 +960,6 @@ function CalendarConfigFacts({ config }: { config: CalendarConfig }) {
       />
       <ConfigFact term="working weekdays" value={config.working_weekdays.join(", ")} />
     </dl>
-  );
-}
-
-/**
- * The four areas the núcleo exposes no configuration route for at all — named
- * plainly, the same way the Teams page names its missing routes, rather than
- * drawing a request that would only 404.
- */
-function UnconfiguredAreasPanel() {
-  return (
-    <Panel title="Not exposed by the núcleo">
-      <p className="sy-note">
-        These areas have no configuration route in the núcleo — there is nothing here to read or
-        write, and this page does not ask.
-      </p>
-      <ul className="sy-unconfigured" aria-label="Areas with no configuration route">
-        {UNCONFIGURED_AREAS.map((area) => (
-          <li key={area} className="sy-unconfigured-area">
-            {area}
-          </li>
-        ))}
-      </ul>
-    </Panel>
   );
 }
 
