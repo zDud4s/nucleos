@@ -1682,21 +1682,28 @@ describe("Chats - the helpers a conversation may hand work to", () => {
 
     // One PATCH carrying the WHOLE set — which is how the daemon stores it, and what makes "two
     // windows saved at once" answerable with "the last one wins" instead of a merge rule.
+    //
+    // Parsed rather than matched against a `JSON.stringify`, for the reason the test below states
+    // about itself: what is asserted is WHICH FIELDS travel, and a string comparison also pins
+    // their order. `save()` spreads the draft, so the order on the wire is `blankHelper`'s
+    // insertion order and not the order written here — the same object, failing for a reason this
+    // test is not about.
     await waitFor(() => {
-      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
-        method: "PATCH",
-        body: JSON.stringify({
-          agents: [
-            {
-              name: "reviewer",
-              description: "Reviews a diff for correctness",
-              prompt: "You are a code reviewer.",
-              tools: null,
-              model: null,
-              effort: null,
-            },
-          ],
-        }),
+      const patch = daemon.apiFetch.mock.calls.find(
+        ([url, init]) => url === "/assistant/chats/c-1" && init?.method === "PATCH",
+      );
+      expect(patch).toBeDefined();
+      expect(JSON.parse(patch![1].body)).toEqual({
+        agents: [
+          {
+            name: "reviewer",
+            description: "Reviews a diff for correctness",
+            prompt: "You are a code reviewer.",
+            tools: null,
+            model: null,
+            effort: null,
+          },
+        ],
       });
     });
   });
@@ -1753,6 +1760,7 @@ describe("Chats - the helpers a conversation may hand work to", () => {
             description: "d, revised",
             prompt: "p",
             reasoning: "high",
+            tools: null,
             model: null,
             effort: null,
           },
