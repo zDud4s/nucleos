@@ -112,9 +112,10 @@ function ConveneForm() {
   return (
     <Panel title="Convene a council">
       <p className="council-note">
-        One question, put to every seat in <code>.ai/council.yaml</code>. Each seat answers on its
-        own, ranks the others blind, and a chairman writes a synthesis. This page does not offer a
-        roster override — the roster lives in the file, and a per-question one is not built here.
+        One question, put to every seat in <code>~/.nucleos/council.yaml</code>. Each seat answers
+        on its own, ranks the others blind, and a chairman writes a synthesis. This page does not
+        offer a roster override — the roster lives in the file, and a per-question one is not built
+        here.
       </p>
       <form
         className="council-form"

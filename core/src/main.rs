@@ -1118,10 +1118,20 @@ async fn main() {
     // Read after the local model has been probed, because whether a `kind: local` seat is runnable
     // is not something a config file can assert — startup PROVES it, and a roster naming a local
     // seat this daemon cannot answer with is refused rather than quietly re-routed to the cloud.
-    let council_config = config::load_council_config(
-        std::path::Path::new(".ai/council.yaml"),
-        local_model.is_some(),
-    );
+    let council_config = match council::config_path() {
+        Some(path) => config::load_council_config(&path, local_model.is_some()),
+        // No home directory means there is nowhere a roster could be, so there is no council —
+        // and that is all it means. Warned rather than fatal, like every other missing-pillar
+        // path here: a daemon that will not boot costs the operator mail, autopilot and the API
+        // over a feature that ships off.
+        None => {
+            tracing::warn!(
+                "no home directory, so {} cannot be read; the council stays off",
+                council::CONFIG_DISPLAY_PATH
+            );
+            None
+        }
+    };
     // Minted only when there is a council to use it, and never the control token: a seat is an
     // agent CLI deciding what to call next, and `auth::COUNCIL_ROUTES` is what it can reach. A
     // failure to mint leaves `None`, and `council::start` refuses — a seat with a key that

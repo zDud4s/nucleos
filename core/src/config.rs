@@ -1092,10 +1092,11 @@ pub fn seat_kind_for_engine(engine: &str) -> Option<SeatKind> {
 /// asking which half is set, and one of them would eventually guess.
 ///
 /// Both forms are valid forever. The tempting cleanup — migrate the file, drop `{ kind, ref }` — is
-/// refused for a concrete reason: `.ai/council.yaml` is under `.ai/`, which is gitignored, so it is
-/// per-developer configuration and not a fact of the repository. A form retired here does not
-/// produce an error on the machines still using it; `load_council_config` returns `None` on a roster
-/// with faults, so it produces a council that silently stops existing at the next daemon start.
+/// refused for a concrete reason: the roster lives at `~/.nucleos/council.yaml`, outside any
+/// checkout, so it is one person's configuration on one machine and nothing shipped here can
+/// rewrite it. A form retired here does not produce an error on the machines still using it;
+/// `load_council_config` returns `None` on a roster with faults, so it produces a council that
+/// silently stops existing at the next daemon start.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SeatSpec {
@@ -1219,7 +1220,7 @@ impl CouncilSeat {
     }
 }
 
-/// `.ai/council.yaml`. Absent means there is no council — this pillar has no useful default,
+/// `~/.nucleos/council.yaml`. Absent means there is no council — this pillar has no useful default,
 /// because a roster nobody chose is a list of models nobody agreed to pay for.
 ///
 /// `deny_unknown_fields`, and here it is load-bearing rather than tidy: `member:` for `members:`
@@ -1285,7 +1286,8 @@ impl CouncilConfig {
     }
 }
 
-/// Reads `.ai/council.yaml`. Absent, unreadable, malformed or invalid → `None`, with a warning.
+/// Reads the roster at `path` — `council::config_path()` in production, a tempdir in the tests
+/// below. Absent, unreadable, malformed or invalid → `None`, with a warning.
 ///
 /// This follows `load_web_config` and NOT `load_models_config`, and the direction was chosen rather
 /// than inherited. Erroring would stop the daemon — mail, autopilot, voice and the API with it —

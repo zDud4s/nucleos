@@ -16,8 +16,31 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use crate::config::{CouncilConfig, CouncilSeat, SeatAgent, SeatKind, SeatSpec};
+
+/// The roster on this machine, or `None` when there is no home directory to hang it off.
+///
+/// `~/.nucleos` and not the app's data directory, for the reason `workflows::library_root` argues
+/// at length where it made the same choice: a file a person is meant to open, read and edit is the
+/// opposite kind of thing to a database, and putting it where only the app can find it is putting
+/// it where nobody edits it.
+///
+/// And not `.ai/council.yaml`, which is where this started. `.ai/` is the agent harness's own
+/// directory inside one checkout, so the roster only existed for a daemon started from that
+/// directory, and every worktree on this machine was a council that had to be written again. The
+/// pillar is the product's, not the harness's; the file follows.
+pub fn config_path() -> Option<PathBuf> {
+    crate::commands::home().map(|home| home.join(".nucleos").join("council.yaml"))
+}
+
+/// The same file as a person is shown it, and the only spelling any refusal uses.
+///
+/// Deliberately not the absolute path [`config_path`] returns. The absolute one is what the daemon
+/// opens; `~/.nucleos/council.yaml` is what somebody can be told to go and write, on any machine,
+/// without the sentence carrying another person's username.
+pub const CONFIG_DISPLAY_PATH: &str = "~/.nucleos/council.yaml";
 
 /// A council's status. Text in the database, as `runs.status` is.
 pub const STATUS_RUNNING: &str = "running";
@@ -407,10 +430,10 @@ pub fn stage3_prompt(
 
 /// The council's settings, resolved once at startup.
 ///
-/// `None` inside is the shipped state and means there is no council: `.ai/council.yaml` is absent,
-/// unreadable, or names a roster the daemon will not run. Held as one field on `AppState` for the
-/// same reason `voice` and `web` are — read together, switched on together, and a `Default` that
-/// means "off" so no test that ignores councils has to know this exists.
+/// `None` inside is the shipped state and means there is no council: [`CONFIG_DISPLAY_PATH`] is
+/// absent, unreadable, or names a roster the daemon will not run. Held as one field on `AppState`
+/// for the same reason `voice` and `web` are — read together, switched on together, and a
+/// `Default` that means "off" so no test that ignores councils has to know this exists.
 #[derive(Clone, Default)]
 pub struct CouncilRuntime {
     config: Option<CouncilConfig>,
@@ -717,7 +740,7 @@ pub async fn set_stage2(
 /// Why a council could not be started. Every variant is a refusal BEFORE anything is spent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartError {
-    /// `.ai/council.yaml` is absent, unreadable, or names a roster the daemon will not run.
+    /// [`CONFIG_DISPLAY_PATH`] is absent, unreadable, or names a roster the daemon will not run.
     NotConfigured,
     /// The roster asks for a local seat and this daemon has no local model to answer with.
     ///
@@ -738,7 +761,7 @@ impl std::fmt::Display for StartError {
         match self {
             StartError::NotConfigured => write!(
                 formatter,
-                "no council is configured — write a roster to .ai/council.yaml and restart"
+                "no council is configured — write a roster to {CONFIG_DISPLAY_PATH} and restart"
             ),
             StartError::NoLocalModel => write!(
                 formatter,
@@ -3474,10 +3497,11 @@ mod tests {
 
     /// The two forms sit in one roster, and neither is on the way out.
     ///
-    /// `.ai/council.yaml` is under `.ai/`, which is gitignored — it is per-developer configuration,
-    /// not a fact of this repository. A form retired here would not error on the machines still
-    /// using it; it would give them a council that silently stops existing at the next daemon
-    /// start. So this asserts coexistence, not migration.
+    /// The roster lives at [`CONFIG_DISPLAY_PATH`], outside any checkout — it is one person's
+    /// configuration on one machine, not a fact of this repository, and nothing here can migrate
+    /// it. A form retired here would not error on the machines still using it; it would give them
+    /// a council that silently stops existing at the next daemon start. So this asserts
+    /// coexistence, not migration.
     #[tokio::test]
     async fn a_roster_may_name_an_agent_in_one_seat_and_a_model_in_the_next() {
         let runner = std::sync::Arc::new(ScriptedRunner::default());
@@ -3888,6 +3912,33 @@ mod tests {
         ));
     }
 
+    /// The roster is the product's file, so it sits where the workflow library sits.
+    ///
+    /// This asserts the absence as hard as the presence. `.ai/` is the agent harness's directory
+    /// inside one checkout, and a daemon that reads its roster from there has a different council
+    /// per working copy and none at all when started from anywhere else — which is what this move
+    /// ended. A later refactor that reaches back for a repo-relative path fails here.
+    #[test]
+    fn the_roster_lives_beside_the_workflow_library_and_not_in_ai() {
+        let Some(path) = config_path() else {
+            // No home directory on this machine: there is nothing to assert about a path that does
+            // not exist, and `main.rs` treats the same `None` as "no council" rather than an error.
+            return;
+        };
+        let text = path.to_string_lossy().replace('\\', "/");
+        assert!(text.ends_with(".nucleos/council.yaml"), "{text}");
+        assert!(!text.contains("/.ai/"), "{text}");
+
+        // The library made the same choice, and the two must not drift apart into two ideas of
+        // where a person's own files live.
+        let library = crate::workflows::library_root().unwrap();
+        assert_eq!(path.parent(), library.parent());
+
+        // What a refusal prints is the readable form, never the absolute one.
+        assert_eq!(CONFIG_DISPLAY_PATH, "~/.nucleos/council.yaml");
+        assert!(!StartError::NotConfigured.to_string().contains(".ai/"));
+    }
+
     /// A daemon with no council says so, rather than failing in a way the caller has to guess at.
     #[tokio::test]
     async fn without_configuration_the_routes_say_so() {
@@ -3903,7 +3954,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        assert!(message.contains(".ai/council.yaml"), "{message}");
+        assert!(message.contains(CONFIG_DISPLAY_PATH), "{message}");
 
         // The reads still work: a daemon whose council was switched off yesterday still has to be
         // able to show the ones it ran the day before.

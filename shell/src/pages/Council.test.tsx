@@ -196,7 +196,7 @@ describe("Council - refusals convening meets", () => {
           throw new ApiRefusal(
             503,
             "unavailable",
-            "no council is configured — write a roster to .ai/council.yaml and restart",
+            "no council is configured — write a roster to ~/.nucleos/council.yaml and restart",
           );
         },
       }),
@@ -206,7 +206,24 @@ describe("Council - refusals convening meets", () => {
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
     fireEvent.click(screen.getByRole("button", { name: "Convene" }));
 
-    expect(await screen.findByText(/no council is configured/i)).toBeDefined();
+    // The whole sentence, path included. This page passes the daemon's prose through untouched,
+    // so a refusal that names the wrong file is a refusal that sends somebody to the wrong file —
+    // and matching only the first clause is what would let that ship.
+    expect(
+      await screen.findByText(/write a roster to ~\/\.nucleos\/council\.yaml and restart/),
+    ).toBeDefined();
+  });
+
+  it("tells the reader where the roster lives, and it is not inside the repository", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}));
+
+    await renderCouncil("/council");
+
+    // The convene form's own copy, not the daemon's. It is a second place the path is written,
+    // and the two saying different things is worse than either being wrong alone.
+    const note = await screen.findByText(/One question, put to every seat in/);
+    expect(note.textContent).toContain("~/.nucleos/council.yaml");
+    expect(note.textContent).not.toContain(".ai/");
   });
 
   it("carries the budget sentence naming the limit and the spend on a 429", async () => {

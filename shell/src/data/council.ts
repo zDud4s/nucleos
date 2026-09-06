@@ -17,10 +17,10 @@ import { POLL, pollWhile } from "./poll";
  * says that. `SeatView.ref` below is deliberately the wire spelling.
  *
  * **This page never sends `roster`.** `POST /council` accepts a per-question
- * override of `.ai/council.yaml`'s roster, and nothing here offers one — a
- * roster override is a thing nobody has asked for yet (see the packet's
- * follow-ups), and a control for it would be a decision this slice did not
- * verify against any design.
+ * override of `~/.nucleos/council.yaml`'s roster, and nothing here offers
+ * one — a roster override is a thing nobody has asked for yet (see the
+ * packet's follow-ups), and a control for it would be a decision this slice
+ * did not verify against any design.
  */
 
 /** One row of the list — `CouncilSummary`. */
