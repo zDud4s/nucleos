@@ -275,6 +275,7 @@
 .mail-detail-body {
   max-height: 28rem;
   overflow: auto;
+  overscroll-behavior: none;
   margin: 0;
   padding: var(--space-3);
   border: 1px solid var(--border);

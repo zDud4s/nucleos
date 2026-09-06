@@ -269,6 +269,7 @@
 .web-content {
   max-height: 32rem;
   overflow: auto;
+  overscroll-behavior: none;
   margin: 0;
   padding: var(--space-3);
   border: 1px solid var(--border);

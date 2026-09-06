@@ -463,6 +463,7 @@
 .runs-pre {
   max-height: 24rem;
   overflow: auto;
+  overscroll-behavior: none;
   margin: var(--space-3) 0 0;
   padding: var(--space-3);
   border: 1px solid var(--border);

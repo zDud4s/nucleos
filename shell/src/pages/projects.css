@@ -380,6 +380,7 @@
   padding: var(--space-3);
   max-height: 32rem;
   overflow: auto;
+  overscroll-behavior: none;
   background: var(--surface-sunken);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -538,6 +539,7 @@
   padding: var(--space-3);
   max-height: 32rem;
   overflow: auto;
+  overscroll-behavior: none;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
@@ -877,6 +879,7 @@
   margin: 0;
   padding: var(--space-2);
   overflow: auto;
+  overscroll-behavior: none;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   line-height: var(--leading-snug);

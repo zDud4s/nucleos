@@ -34,6 +34,7 @@
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: none;
   background: var(--bg);
 }
 
@@ -437,8 +438,12 @@
   overflow-y: auto;
   /* Asking for `overflow-y` alone computes `overflow-x` to `auto`, which makes this a horizontal
      scroll container with nothing in it to scroll — and a touchpad's sideways drift used to drag
-     the whole rail and spring it back. Nothing to declare here any more: the `*` rule in
-     `base.css` now refuses that on both axes, for this region and the seventeen others. */
+     the whole rail and spring it back. The shorthand below covers both axes, which is why it is
+     the shorthand: the sideways drift and the vertical bounce are the same declaration.
+
+     Written here rather than inherited from a `*` rule, which is what `base.css` used to do and
+     what stopped this region scrolling by wheel at all — see the block there for the mechanism. */
+  overscroll-behavior: none;
   padding: var(--space-3) var(--space-2);
   mask-image: var(--scroll-fade);
   -webkit-mask-image: var(--scroll-fade);
@@ -1218,6 +1223,7 @@
 .app-drawer-body {
   min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: none;
   padding: var(--space-4);
 }
 
