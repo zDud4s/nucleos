@@ -3,10 +3,18 @@
  * for Voice. **No class appears in `Files.tsx` that is not defined below** —
  * `tsc` and vitest both pass on a class no stylesheet has ever heard of, so
  * this file is grepped against the component before the page is called done.
+ * `ui-` classes are the exception and are not this file's to define: they
+ * arrive with a primitive imported from `../ui`, which is where their recipe
+ * and their argument both live.
  *
  * Everything that shows a path is monospaced and wraps rather than scrolls
  * the page, the same rule `projects.css` states for its own file paths and
  * diffs: a Windows path is routinely wider than a panel.
+ *
+ * The boxes are no longer this file's. The folder tree and the move form are
+ * `Inset`, the search hits are `Rows`, the two counts are `Count` and the
+ * one-line absence is `Quiet`. What is left below is the layout around those
+ * and the type inside them.
  */
 
 /* =============================================================== layout == */
@@ -31,8 +39,19 @@
   min-width: 0;
 }
 
-.fi-loading,
-.fi-empty {
+/**
+ * A reading that has not landed yet — and deliberately **not** `Quiet`.
+ *
+ * `Quiet` is muted because in an empty region the sentence is the content: an
+ * answer set fainter than the labels around it reads as failure rather than as
+ * emptiness. A wait is the other case. "reading the folder…" and "searching…"
+ * are placeholders for the thing about to replace them, neither is ever what
+ * the panel has to say, and faint is the rung for something standing beside
+ * content rather than being it. `system.css` records the same split for
+ * `.sy-loading`; the sentence that really is an absence — "nothing under this
+ * folder matches" — went to `Quiet` and is no longer written here.
+ */
+.fi-loading {
   margin: 0;
   font-size: var(--text-sm);
   color: var(--text-faint);
@@ -45,34 +64,94 @@
  * folder is decided by the breadcrumb the moment the drop lands, not by which
  * pixel the cursor happens to be over, so there is no reason to draw the
  * target zone smaller than the page.
+ *
+ * **A drop target does not get a hue.** This was a 2px `--accent` dash over an
+ * `--accent-quiet` fill, and DESIGN.md names that use outright: the brand
+ * colour marks the wordmark, links and the focus ring, and a target wearing it
+ * reads as a status while the seven state tones sit unused. Contrast-not-hue
+ * instead — the page ground lifts one rung to `--surface`, and the dash is
+ * this system's own way of saying provisional, which is exactly what a target
+ * nothing has been dropped on yet is. The rung carries in both themes: light
+ * lifts `#f5f6f9` to `#ffffff`, and the dashed `--border-strong` edge is the
+ * half that never depended on the fill.
+ *
+ * `--z-cover` and not a bare 5: it covers its own container and nothing beyond
+ * it, which is the whole of what that rung means.
  */
 .fi-drop-overlay {
   position: absolute;
   inset: 0;
-  z-index: 5;
+  z-index: var(--z-cover);
   display: flex;
   align-items: center;
   justify-content: center;
-  margin: 0;
-  border: 2px dashed var(--accent);
+  border: 2px dashed var(--border-strong);
   border-radius: var(--radius-lg);
-  background: var(--accent-quiet);
+  background: var(--surface);
   font-size: var(--text-md);
   font-weight: var(--weight-semibold);
   color: var(--text);
   pointer-events: none;
 }
 
+/* ================================================================= type == */
+
+/**
+ * Everything on this page that names a thing on disk, in the daemon's face.
+ *
+ * The header states the rule and this is the one place it is written out. A
+ * folder in the tree, an entry in the table, and the three fields a name or a
+ * path is typed into are all the same claim about origin — the value came off
+ * a disk the núcleo read — and the fields belong in the list because what is
+ * typed into them becomes one.
+ */
+.fi-tree-label,
+.fi-entry-name,
+.fi-search input,
+.fi-field input,
+.fi-rename input {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+/**
+ * The same claim one rung smaller: a breadcrumb, a size, a modified time, a
+ * hit's path, the names a drop refused. Every one of these stands beside the
+ * thing it qualifies rather than being it, which is what the smaller size
+ * says.
+ */
+.fi-crumb,
+.fi-table td.fi-col-num,
+.fi-hit-path,
+.fi-hit-size,
+.fi-drop-refusals {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
 /* ================================================================= tree == */
 
+/**
+ * The tree box is an `Inset`; this is the one thing it says on top of the
+ * recipe.
+ *
+ * The rule that stood here was `.ui-panel-inset` on fill, radius and border,
+ * and disagreed on the other two: `--space-2` of padding where the inset has
+ * `--space-3`, and a 2px gap that is not on the 4px grid at all. Padding is
+ * one of the four properties the thirty page copies each answered differently,
+ * and re-answering one of them here is how that problem gets rebuilt a page at
+ * a time; 2px is the stray the grid exists to make visible. What is real is
+ * the density — a folder tree is rows of one line each, sitting closer than
+ * the stacked head-over-facts an inset is shaped for — and that is a fact
+ * about the contents rather than about the box, which is the distinction
+ * `system.css` draws for `.sy-kill`.
+ *
+ * The `nav` stays outside the `Inset`. The primitive renders a `div` or an
+ * `li` and is deliberately not widened, and the landmark with its "Folders"
+ * label is not this page's to drop for the sake of one element.
+ */
 .fi-tree {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
+  gap: var(--space-1);
 }
 
 .fi-tree-node {
@@ -87,21 +166,28 @@
   border-radius: var(--radius-sm);
 }
 
-.fi-tree-row-active {
-  background: var(--accent-quiet);
-}
+/* The open folder wears `.ui-current` and no class of its own — the row is a
+   `div`, so the shared class applies directly. It used to be
+   `.fi-tree-row-active { background: var(--accent-quiet) }`: the brand colour
+   marking a selection, which the Reserved Cyan Rule forbids, and a fill besides,
+   which the light theme cannot show since `--surface` and `--surface-raised` are
+   the same white there. */
 
+/* The fill and the border-width a bare `button` already gets from `base.css`
+   are not restated: the reset there is layered, so this unlayered rule would
+   win and say the same thing twice — and its `border: 0` would set the STYLE
+   to none, which is the trap that reset's own comment was written about. */
 .fi-tree-toggle {
   width: 1.1rem;
   padding: 0;
   font-size: var(--text-xs);
   line-height: 1;
   color: var(--text-faint);
-  background: none;
-  border: 0;
   cursor: pointer;
 }
 
+/* The global ring at a 1px offset, which is the offset the system allows a
+   tight control. Colour and width untouched. */
 .fi-tree-toggle:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
@@ -112,16 +198,21 @@
   width: 1.1rem;
 }
 
+/* Text, and not the link colour it would inherit from the `Button` around it.
+   Every row of this tree is a link, so a column of accent is a column with no
+   hierarchy left in it — what is marked here is the current folder, not the
+   fact that a folder can be clicked. */
 .fi-tree-label {
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
   color: var(--text);
 }
 
+/* The children of an open node sit at the tree's own density, not the inset's
+   — the same `--space-1` the box above is modified to, written twice because
+   this is a different element and not because the two ever disagreed. */
 .fi-tree-children {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
 }
 
 /* ============================================================ breadcrumbs == */
@@ -133,11 +224,6 @@
   gap: var(--space-1);
 }
 
-.fi-crumb {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-}
-
 /* =============================================================== toolbar == */
 
 .fi-toolbar {
@@ -147,11 +233,14 @@
   gap: var(--space-4);
 }
 
+/* `--space-1` and not the 2px that stood here: the grid is four pixels wide,
+   and a stray is a bug you can see rather than a value you have to measure.
+   The tree carried the same two-pixel gap and lost it for the same reason. */
 .fi-search,
 .fi-field {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
   font-size: var(--text-xs);
   color: var(--text-faint);
 }
@@ -160,8 +249,6 @@
 .fi-field input {
   padding: var(--space-2);
   min-width: 14rem;
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
   color: var(--text);
   background: var(--surface);
   border: 1px solid var(--border);
@@ -202,6 +289,9 @@
   cursor: pointer;
 }
 
+/* `:focus-within` and not `:focus-visible`, so the global ring never applies
+   here: what takes focus is the file input inside, and the label is what is on
+   screen. The full declaration is the point rather than a restatement. */
 .fi-upload-label:focus-within {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
@@ -233,6 +323,13 @@
 /**
  * A folder the daemon would not remove without saying so — §6.18's "delete
  * with contents", surfaced the moment a plain delete answers 409.
+ *
+ * Left as this page's own box rather than becoming `ConflictNote`, and the
+ * reason is structural: that primitive renders a `<p>`, and this note carries
+ * the two-button escalation the sentence exists to introduce. Adopting it
+ * would mean a box around a note to hold the buttons — the wrapper the
+ * primitives exist to remove. Recorded so the next reader knows it was looked
+ * at.
  */
 .fi-not-empty {
   display: flex;
@@ -259,33 +356,32 @@
 
 /* ================================================================= move == */
 
+/**
+ * The move form is an `Inset`; this is the one thing it says on top of the
+ * recipe.
+ *
+ * The box the old rule drew was `.ui-panel-inset` to the property — the same
+ * fill, the same radius, the same border, the same `--space-3` of padding and
+ * the same `--space-2` gap — and the only real difference was the flow: a
+ * destination field, two buttons and whatever the daemon refused, on one line.
+ * That is a fact about this box's contents rather than about the box, so it is
+ * drift and not intent, exactly as `system.css` concluded for `.sy-kill`. None
+ * of the four properties the copies disagreed about is restated below.
+ *
+ * The `<form>` stays outside the `Inset`, for the reason the tree's `<nav>`
+ * does: submit-on-Enter is behaviour, and `Inset` renders a `div` or an `li`.
+ */
 .fi-move {
-  display: flex;
-  flex-wrap: wrap;
+  flex-flow: row wrap;
   align-items: flex-end;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
 }
 
 /* ================================================================ table == */
 
+/* No `:focus-visible` rule of its own: the global ring in `base.css` is
+   already 2px `--focus-ring` at a 2px offset, which is what stood here. */
 .fi-table-wrap {
   border-radius: var(--radius-md);
-}
-
-.fi-table-wrap:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-}
-
-.fi-count {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-variant-numeric: tabular-nums;
-  color: var(--text-faint);
 }
 
 .fi-table {
@@ -314,24 +410,21 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* The label rank — 11px uppercase at `--tracking-wide` — and not the
+   section-title rank, which is the display face at `--tracking-wider`. The
+   fill and border a bare button already gets from `base.css` are not restated,
+   and neither is the global focus ring: 2px at a 2px offset is what it is. */
 .fi-sort-button {
   padding: 0;
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
   color: var(--text-faint);
-  background: none;
-  border: 0;
   cursor: pointer;
 }
 
 .fi-sort-button:hover {
   color: var(--text);
-}
-
-.fi-sort-button:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
 }
 
 .fi-table td {
@@ -341,8 +434,6 @@
 }
 
 .fi-table td.fi-col-num {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
   color: var(--text-muted);
 }
 
@@ -354,14 +445,23 @@
   background: var(--surface-sunken);
 }
 
-.fi-row-focus,
-.fi-row-focus:hover {
-  background: var(--accent-quiet);
+/**
+ * The row the keyboard is on.
+ *
+ * `.ui-current`'s recipe rather than the class, and on the first cell rather
+ * than the row: this is a `border-collapse: collapse` table, where a `tr` paints
+ * no shadow of its own, so an inset rule there would simply not appear. The
+ * first cell is the row's leading edge, which is where the rule asks for it —
+ * the same answer `agents.css` reached for the same table.
+ *
+ * It was `background: var(--accent-quiet)` on the row: the brand colour marking
+ * a selection, and a fill, which the light theme cannot show.
+ */
+.fi-row-focus > td:first-child {
+  box-shadow: inset 2px 0 0 var(--text);
 }
 
 .fi-entry-name {
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
   word-break: break-all;
 }
 
@@ -371,10 +471,14 @@
   gap: var(--space-1);
 }
 
+/* The one gap on this page still off the 4px grid, and kept on purpose. This
+   field opens inside a table cell that pads at `--space-1`, so the row it is
+   in already grows when a rename starts; `--space-1` here would grow it
+   further and shift every row below the one being renamed. The two other 2px
+   strays this file carried were gaps between stacked elements, cost nothing to
+   put on the grid, and are gone. */
 .fi-rename input {
   padding: 2px var(--space-1);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
   color: var(--text);
   background: var(--surface);
   border: 1px solid var(--border);
@@ -383,36 +487,29 @@
 
 /* =============================================================== search == */
 
-.fi-hits {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.fi-hit {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-2);
-  padding: var(--space-1) 0;
-  border-bottom: 1px solid var(--border);
-}
-
+/**
+ * A hit is a `Row` in a `Rows`, and what stood here was that component written
+ * out badly.
+ *
+ * The old `.fi-hits` was a flex column and `.fi-hit` drew a `border-bottom` on
+ * every one of them with no `:last-child` exception — which is the failure
+ * `.ui-rows` exists to make impossible, and it shipped: the result list ended
+ * with a rule hanging under nothing. The shared column draws its separators as
+ * a 1px `gap` over a `--border` ground instead, which is one rule where the
+ * obvious alternative is two and the second is the half everyone forgets.
+ *
+ * `layout="line"` because a hit is a name, a path and a size on one baseline;
+ * under the stacking default each would have needed a wrapper `div` inside
+ * every row.
+ */
 .fi-hit-path {
   flex: 1 1 16rem;
   min-width: 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
   color: var(--text-faint);
   word-break: break-all;
 }
 
 .fi-hit-size {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
 }
@@ -425,9 +522,13 @@
 
 /* ============================================================== context == */
 
+/* `--z-overlay` and not a bare 20: this sits over the page, which is the rung
+   DESIGN.md names the drawer and a context menu for by name. The shadow is the
+   one kind this system allows — the surface genuinely floats over content it
+   does not belong to, rather than expressing hierarchy. */
 .fi-context-menu {
   position: fixed;
-  z-index: 20;
+  z-index: var(--z-overlay);
   display: flex;
   flex-direction: column;
   min-width: 9rem;
@@ -443,8 +544,6 @@
   text-align: left;
   font-size: var(--text-sm);
   color: var(--text);
-  background: none;
-  border: 0;
   border-radius: var(--radius-sm);
   cursor: pointer;
 }
@@ -453,6 +552,8 @@
   background: var(--surface-sunken);
 }
 
+/* The global ring at the -2px offset the system allows an inset case: at the
+   default the ring would be drawn outside the menu's own edge. */
 .fi-context-item:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
@@ -485,6 +586,4 @@
 .fi-drop-refusals {
   margin: 0;
   padding-left: var(--space-4);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
 }

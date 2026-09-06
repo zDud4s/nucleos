@@ -10,7 +10,18 @@ import {
   type TeamRun,
   type TeamView,
 } from "../data/teams";
-import { Button, ErrorNote, Meter, Panel, RefusalNote, RelativeTime, StateBadge, usd } from "../ui";
+import {
+  Button,
+  ErrorNote,
+  Inset,
+  Meter,
+  Panel,
+  Quiet,
+  RefusalNote,
+  RelativeTime,
+  StateBadge,
+  usd,
+} from "../ui";
 import { daemonProse } from "./prose";
 
 /**
@@ -58,18 +69,18 @@ export function Work({ team, runs }: WorkProps) {
       )}
 
       <Panel title="Tasks">
-        {runs.length === 0 && <p className="teams-empty">no task yet for this department.</p>}
+        {runs.length === 0 && <Quiet says="no task yet for this department." />}
         {done.length > 0 && (
           <ul className="teams-runs" aria-label="Tasks">
             {done.map((run) => (
-              <li className="teams-run" key={run.id}>
+              <Inset as="li" key={run.id}>
                 <div className="teams-run-head">
                   <Link to={`/team-runs/${run.id}`}>{run.request}</Link>
                   <StateBadge domain="team_run" state={run.state} />
                   <RelativeTime at={run.created_at} />
                 </div>
                 {run.why !== null && <p className="teams-run-why">{run.why}</p>}
-              </li>
+              </Inset>
             ))}
           </ul>
         )}
@@ -183,7 +194,7 @@ function LiveTask({ run, ceiling }: { run: TeamRun; ceiling: number | null }) {
       </p>
 
       {detail.data === undefined ? (
-        <p className="teams-loading">reading the rounds…</p>
+        <Quiet says="reading the rounds…" />
       ) : (
         <>
           <Rounds items={detail.data.items} round={detail.data.round} />
@@ -210,7 +221,7 @@ function LiveTask({ run, ceiling }: { run: TeamRun; ceiling: number | null }) {
  */
 function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
   if (items.length === 0) {
-    return <p className="teams-empty">nothing planned yet — the núcleo has not picked this up.</p>;
+    return <Quiet says="nothing planned yet — the núcleo has not picked this up." />;
   }
 
   const rounds = [...new Set(items.map((item) => item.round))].sort((a, b) => a - b);
@@ -233,7 +244,7 @@ function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
                   <span className="teams-round-mark" aria-hidden="true">
                     {MARK[item.state] ?? "·"}
                   </span>
-                  <span className="teams-said">{item.state}</span>
+                  <span className="sr-only">{item.state}</span>
                 </span>
               ))}
           </span>
@@ -242,7 +253,7 @@ function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
       <li className="teams-round-line">
         <span className="teams-round-no">round {Math.max(...rounds, round) + 1}</span>
         <span className="teams-round-who">
-          <span className="teams-empty">not planned yet</span>
+          <span className="teams-round-none">not planned yet</span>
         </span>
       </li>
     </ol>

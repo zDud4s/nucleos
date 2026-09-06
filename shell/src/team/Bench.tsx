@@ -16,6 +16,7 @@ import {
   ConfirmButton,
   ErrorNote,
   Panel,
+  Quiet,
   RefusalNote,
   Tabs,
   TabsContent,
@@ -75,7 +76,7 @@ export function Bench() {
           {team.isError ? (
             <BenchError error={team.error} />
           ) : (
-            <p className="teams-loading">reading the department…</p>
+            <Quiet says="reading the department…" />
           )}
         </Panel>
       </>

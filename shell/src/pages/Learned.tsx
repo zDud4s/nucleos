@@ -14,12 +14,16 @@ import {
   Badge,
   Button,
   ConfirmButton,
+  Count,
   ErrorNote,
+  Inset,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
   Teach,
+  Well,
   type BadgeTone,
 } from "../ui";
 import "./learned.css";
@@ -82,7 +86,7 @@ export function Learned() {
       )}
 
       {waiting.length > 0 && (
-        <Panel title="Waiting for you" aside={`${waiting.length}`}>
+        <Panel title="Waiting for you" aside={<Count n={waiting.length} />}>
           <p className="learned-lede">
             Declared, and reaching nothing until you answer. Approving adds it to every later run in
             its scope; refusing keeps the refusal on the record rather than erasing the question.
@@ -98,8 +102,12 @@ export function Learned() {
                     row.proposal_id === null ? (
                       // A proposed row whose question is gone cannot be decided from here, and a
                       // button that 404s is worse than none: it invites a click that teaches the
-                      // person the app is broken when the daemon is merely inconsistent.
-                      <span className="learned-orphan">no question to answer — decide in the daemon</span>
+                      // person the app is broken when the daemon is merely inconsistent. Said in
+                      // the row, and said as `Quiet`: what is missing here is the decision, which
+                      // is the one-line absence that component is for. It was set faint, which is
+                      // the rung for metadata standing beside content — here the sentence is all
+                      // the row has to say in place of its two buttons.
+                      <Quiet says="no question to answer — decide in the daemon" />
                     ) : (
                       <>
                         <Button
@@ -125,7 +133,7 @@ export function Learned() {
       )}
 
       {inForce.length > 0 && (
-        <Panel title="In force" aside={`${inForce.length}`}>
+        <Panel title="In force" aside={<Count n={inForce.length} />}>
           <p className="learned-lede">
             Appended to the brief of every node in scope — never replacing it. A machine-wide note
             reaches every project; a project's note reaches only that project.
@@ -152,7 +160,7 @@ export function Learned() {
       )}
 
       {over.length > 0 && (
-        <Panel title="No longer in force" aside={`${over.length}`}>
+        <Panel title="No longer in force" aside={<Count n={over.length} />}>
           <p className="learned-lede">
             Kept, not deleted. What was refused, what was taken back, and what a later text replaced.
           </p>
@@ -187,7 +195,11 @@ function Row({ row, decisions }: { row: Refinement; decisions?: ReactNode }) {
   const [open, setOpen] = useState(false);
 
   return (
-    <li className="learned-row">
+    // `Inset` and not a box of this page's own: a bordered, filled box inside a
+    // panel body is the shared recipe, and drawing it here on the lower rung was
+    // one of the copies the system counts. Its `--space-2` gap now carries the
+    // spacing the head, the title and the foot used to set for themselves.
+    <Inset as="li">
       <div className="learned-head">
         <Badge tone={KIND_TONE[row.kind]}>{KIND_LABEL[row.kind]}</Badge>
         <span className="learned-scope">{row.project_id ?? "this machine"}</span>
@@ -207,7 +219,7 @@ function Row({ row, decisions }: { row: Refinement; decisions?: ReactNode }) {
       </div>
 
       {open && <Chain id={row.id} />}
-    </li>
+    </Inset>
   );
 }
 
@@ -229,7 +241,12 @@ function Chain({ id }: { id: number }) {
   const { events, replaced, replaced_by: replacedBy } = history.data;
 
   return (
-    <div className="learned-chain">
+    // A well and not a box: the chain is the same row seen further back in time,
+    // and the rung below the row is what the system calls a recess cut into a
+    // surface. `reads` because every line of it is somebody's writing, which the
+    // well's default mono face would deny; `capped` because the decisions grow by
+    // one each time a person answers something.
+    <Well as="div" reads capped>
       {replacedBy !== null && (
         <p className="learned-chain-line">
           Replaced by <strong>{replacedBy.title}</strong>.
@@ -248,8 +265,11 @@ function Chain({ id }: { id: number }) {
           </ul>
         </>
       )}
+      {/* The one genuine absence on this page: a chain with no chain in it. One
+          line, nothing to teach, and `Quiet`'s muted rung rather than the faint
+          one — in an empty region the sentence is the content. */}
       {replaced.length === 0 && replacedBy === null && (
-        <p className="learned-chain-line">This one replaced nothing and nothing has replaced it.</p>
+        <Quiet says="This one replaced nothing and nothing has replaced it." />
       )}
       {events.length > 0 && (
         <ul className="learned-events">
@@ -262,7 +282,7 @@ function Chain({ id }: { id: number }) {
           ))}
         </ul>
       )}
-    </div>
+    </Well>
   );
 }
 

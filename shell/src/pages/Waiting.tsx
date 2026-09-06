@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import type { AgentRequest } from "../data/agents";
@@ -37,11 +37,16 @@ import {
 import {
   Button,
   ConfirmButton,
+  ConflictNote,
+  Count,
   ErrorNote,
+  Inset,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
+  Section,
   StaleNote,
   StateBadge,
   Teach,
@@ -225,9 +230,29 @@ function listClass(count: number): string {
 
 /* ------------------------------------------------------------- shared parts -- */
 
-function Count({ n }: { n: number | undefined }) {
-  if (n === undefined) return null;
-  return <span className="waiting-count">{n}</span>;
+/**
+ * A section's own prose — in front of a list that has something in it, one click
+ * behind the line when it has not.
+ *
+ * The sentences are the same either way and what changes is where a reader meets
+ * them. Above a populated list the note is what somebody needs *before* pressing
+ * a button: that approving a team action does not do the thing, that refusing a
+ * wheel closes the session. Above an empty one it is a paragraph explaining
+ * nothing, on a page of ten sections that are usually all empty at once — so the
+ * page grew longer the quieter the queue was, which is backwards. `Quiet` keeps
+ * the prose and charges no pixels for it.
+ */
+function SectionNote({
+  empty,
+  says,
+  children,
+}: {
+  empty: boolean;
+  says: string;
+  children: ReactNode;
+}) {
+  if (empty) return <Quiet says={says}>{children}</Quiet>;
+  return <p className="waiting-note">{children}</p>;
 }
 
 /** Stale, failed or not yet answered — the three things a list can be besides ready. */
@@ -236,9 +261,7 @@ function ReadingNotes({ view, what }: { view: Reading<unknown>; what: string }) 
     <>
       {view.stale && <StaleNote dataUpdatedAt={view.dataUpdatedAt} />}
       {view.error !== null && view.rows === undefined && <ListError error={view.error} what={what} />}
-      {view.error === null && view.rows === undefined && (
-        <p className="waiting-loading">reading {what}…</p>
-      )}
+      {view.error === null && view.rows === undefined && <Quiet says={`reading ${what}…`} />}
     </>
   );
 }
@@ -467,19 +490,19 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
 
   return (
     <Panel title="Wheel requests" aside={<Count n={view.rows?.length} />}>
-      <p className="waiting-note">
+      <SectionNote
+        empty={view.rows !== undefined && items.length === 0}
+        says="nothing has asked for the wheel."
+      >
         An agent has met a wall it may not climb and is asking for the window. Giving it the wheel
         opens a real browser on this machine, in the profile named on the card; refusing closes the
         session, and the run carries on without that page.
-      </p>
+      </SectionNote>
       <ReadingNotes view={view} what="the open browser sessions" />
-      {view.rows !== undefined && items.length === 0 && (
-        <p className="waiting-empty">nothing has asked for the wheel.</p>
-      )}
       {items.length > 0 && (
         <ul className={listClass(items.length)} aria-label="Wheel requests">
           {items.map((session) => (
-            <li className="waiting-card" key={session.id}>
+            <Inset as="li" key={session.id}>
               <div className="waiting-card-head">
                 <span className="waiting-card-id">wheel #{session.proposal_id}</span>
                 <span className="waiting-meta">{session.project_id ?? "no project"}</span>
@@ -526,7 +549,7 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
                   onConfirm={() => reject.mutate(session.proposal_id)}
                 />
               </div>
-            </li>
+            </Inset>
           ))}
         </ul>
       )}
@@ -562,7 +585,7 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
       {items.length > 0 && (
         <ul className={listClass(items.length)} aria-label="Action approvals">
           {items.map((proposal) => (
-            <li className="waiting-card" key={proposal.id}>
+            <Inset as="li" key={proposal.id}>
               <div className="waiting-card-head">
                 <span className="waiting-card-id">approval #{proposal.id}</span>
                 <span className="waiting-card-title">
@@ -611,7 +634,7 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
                   onConfirm={() => reject.mutate(proposal.id)}
                 />
               </div>
-            </li>
+            </Inset>
           ))}
         </ul>
       )}
@@ -646,14 +669,14 @@ function TeamActionSection({
 
   return (
     <Panel title="Team actions" aside={<Count n={view.rows?.length} />}>
-      <p className="waiting-note">
+      <SectionNote
+        empty={view.rows !== undefined && items.length === 0}
+        says="no department is waiting on an action."
+      >
         An action a department asked the núcleo to carry out under a propose grant. Approving does
         not do the thing — it lets the núcleo do it on its next tick, about ten seconds later.
-      </p>
+      </SectionNote>
       <ReadingNotes view={view} what="the team's action requests" />
-      {view.rows !== undefined && items.length === 0 && (
-        <p className="waiting-empty">no department is waiting on an action.</p>
-      )}
       {items.length > 0 && (
         <ul className={listClass(items.length)} aria-label="Team actions">
           {items.map((proposal) => (
@@ -739,7 +762,7 @@ function TeamActionCard({
   const action = executing?.find((row) => row.proposal_id === proposal.id);
 
   return (
-    <li className="waiting-card">
+    <Inset as="li">
       <div className="waiting-card-head">
         <span className="waiting-card-id">team action #{proposal.id}</span>
         <span className="waiting-card-title">
@@ -789,7 +812,7 @@ function TeamActionCard({
         approveError={approve.isError ? approve.error : null}
         refuseError={reject.isError ? reject.error : null}
       />
-    </li>
+    </Inset>
   );
 }
 
@@ -808,14 +831,14 @@ function RecruitmentSection({ view }: { view: Reading<Proposal> }) {
 
   return (
     <Panel title="Recruitment" aside={<Count n={view.rows?.length} />}>
-      <p className="waiting-note">
+      <SectionNote
+        empty={view.rows !== undefined && items.length === 0}
+        says="no department has asked for a specialist."
+      >
         A director asked for a specialist by name. The request is editable here before it is
         granted; saying not now leaves nothing behind — the department may ask again.
-      </p>
+      </SectionNote>
       <ReadingNotes view={view} what="the recruitment requests" />
-      {view.rows !== undefined && items.length === 0 && (
-        <p className="waiting-empty">no department has asked for a specialist.</p>
-      )}
       {items.length > 0 && (
         <ul className={listClass(items.length)} aria-label="Recruitment">
           {items.map((proposal) => (
@@ -867,7 +890,7 @@ function RecruitmentCard({
   const idFor = (name: string) => `recruit-${proposal.id}-${name}`;
 
   return (
-    <li className="waiting-card">
+    <Inset as="li">
       <div className="waiting-card-head">
         <span className="waiting-card-id">recruit #{proposal.id}</span>
         <RelativeTime at={proposal.created_at} />
@@ -973,27 +996,37 @@ function RecruitmentCard({
       )}
       {hire.isError && <DecisionRefusal error={hire.error} trustProse />}
       {reject.isError && <DecisionRefusal error={reject.error} trustProse={false} />}
-    </li>
+    </Inset>
   );
 }
 
 /* ------------------------------------------------------- 5. contact merges -- */
 
+/**
+ * One side of a suggested merge, under the word for what happens to it.
+ *
+ * `kept` and `absorbed` are a heading and not a field label — the whole point of
+ * showing both sides is that the merge is not symmetrical, and which of the two
+ * survives is the first thing a reader has to know. `Section` is the heading
+ * rank; the label rank it used to be written in is what a `dt` gets, and at 11px
+ * the two are told apart by 0.06em of tracking and nothing else.
+ */
 function MergeSideView({ side, role }: { side: MergeSide; role: string }) {
   return (
-    <div className="waiting-side">
-      <p className="waiting-side-role">{role}</p>
-      <p className="waiting-side-name">{side.display_name ?? "no name recorded"}</p>
-      <ul className="waiting-addresses">
-        {side.addresses.map((address) => (
-          <li key={address}>{address}</li>
-        ))}
-      </ul>
-      <p className="waiting-meta">{side.messages_in} messages in</p>
-      <p className="waiting-verdict">
-        {side.verdict === null ? "no standing decision" : `standing decision: ${side.verdict}`}
-      </p>
-    </div>
+    <Section label={role} level={3}>
+      <div className="waiting-side">
+        <p className="waiting-side-name">{side.display_name ?? "no name recorded"}</p>
+        <ul className="waiting-addresses">
+          {side.addresses.map((address) => (
+            <li key={address}>{address}</li>
+          ))}
+        </ul>
+        <p className="waiting-meta">{side.messages_in} messages in</p>
+        <p className="waiting-verdict">
+          {side.verdict === null ? "no standing decision" : `standing decision: ${side.verdict}`}
+        </p>
+      </div>
+    </Section>
   );
 }
 
@@ -1011,19 +1044,19 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
 
   return (
     <Panel title="Contact merges" aside={<Count n={view.rows?.length} />}>
-      <p className="waiting-note">
+      <SectionNote
+        empty={view.rows !== undefined && items.length === 0}
+        says="no two contacts look like the same person."
+      >
         Two records that look like one person. Merging is a pointer move and is undoable one address
         at a time; saying they are different people is recorded too, which is what stops the same
         suggestion coming back on every sweep.
-      </p>
+      </SectionNote>
       <ReadingNotes view={view} what="the suggested merges" />
-      {view.rows !== undefined && items.length === 0 && (
-        <p className="waiting-empty">no two contacts look like the same person.</p>
-      )}
       {items.length > 0 && (
         <ul className={listClass(items.length)} aria-label="Contact merges">
           {items.map((suggestion) => (
-            <li className="waiting-card" key={suggestion.proposal_id}>
+            <Inset as="li" key={suggestion.proposal_id}>
               <div className="waiting-card-head">
                 <span className="waiting-card-id">merge #{suggestion.proposal_id}</span>
                 <RelativeTime at={suggestion.created_at} />
@@ -1037,10 +1070,10 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
                   refuses a merge whose two people carry decisions that
                   contradict, and the remedy is to settle one of them first. */}
               {verdictsConflict(suggestion) && (
-                <p className="waiting-conflict">
+                <ConflictNote>
                   These two carry standing decisions that disagree, so the núcleo will refuse the
                   merge — settle one of them and decide this again.
-                </p>
+                </ConflictNote>
               )}
               <div className="waiting-actions">
                 <ConfirmButton
@@ -1063,7 +1096,7 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
                   }
                 />
               </div>
-            </li>
+            </Inset>
           ))}
         </ul>
       )}
@@ -1090,16 +1123,24 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
  * them, so this queue has nothing to read. Pointing a hook at a plausible path
  * would turn a missing feature into an unexplainable 404, which is strictly
  * worse than a sentence.
+ *
+ * A `Quiet` and not a refusal: nothing is wrong, and the sentence is a fact
+ * about the núcleo rather than a warning about this page. The whole of it is the
+ * line rather than a line with the reasoning behind a disclosure, because here
+ * the reasoning *is* the answer — a reader who does not open it is left with
+ * "cannot show them" and no idea that the record exists. The `dim` panel does
+ * the rest of the quietening.
  */
+const CALENDAR_ABSENCE =
+  "The núcleo can propose a calendar event and can decide one, but it mounts no route that " +
+  "lists the pending ones — so this queue cannot show them. Nothing is being hidden: what is " +
+  "missing is the door, not the record, and opening it is a change to the núcleo rather than " +
+  "to this page.";
+
 function CalendarEventAbsence() {
   return (
     <Panel title="Calendar events" variant="dim">
-      <p className="waiting-absence">
-        The núcleo can propose a calendar event and can decide one, but it mounts no route that
-        lists the pending ones — so this queue cannot show them. Nothing is being hidden: what is
-        missing is the door, not the record, and opening it is a change to the núcleo rather than to
-        this page.
-      </p>
+      <Quiet says={CALENDAR_ABSENCE} />
     </Panel>
   );
 }
@@ -1142,20 +1183,20 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
 
   return (
     <Panel title="Exclusion requests" aside={<Count n={view.rows?.length} />}>
-      <p className="waiting-note">
+      <SectionNote
+        empty={view.rows !== undefined && items.length === 0}
+        says="no job has asked to be kept apart from another."
+      >
         A request that two jobs of one project never run at the same time. Drawing the edge changed
         nothing; approving it writes the rule, and the higher-numbered job is the one that waits.
-      </p>
+      </SectionNote>
       <ReadingNotes view={view} what="the exclusion requests" />
-      {view.rows !== undefined && items.length === 0 && (
-        <p className="waiting-empty">no job has asked to be kept apart from another.</p>
-      )}
       {items.length > 0 && (
         <ul className={listClass(items.length)} aria-label="Exclusion requests">
           {items.map((proposal) => {
             const pair = readExclusionPair(proposal.tool_input);
             return (
-              <li className="waiting-card" key={proposal.id}>
+              <Inset as="li" key={proposal.id}>
                 <div className="waiting-card-head">
                   <span className="waiting-card-id">request #{proposal.id}</span>
                   <span className="waiting-card-title">
@@ -1195,7 +1236,7 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                     onConfirm={() => reject.mutate(proposal.id)}
                   />
                 </div>
-              </li>
+              </Inset>
             );
           })}
         </ul>
@@ -1218,19 +1259,19 @@ function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
 
   return (
     <Panel title="Skipped items" aside={<Count n={view.rows?.length} />}>
-      <p className="waiting-note">
+      <SectionNote
+        empty={view.rows !== undefined && items.length === 0}
+        says="no job put anything down."
+      >
         Work a job put down overnight because it needed a decision, and carried on without. Nothing
         resumes from here — the tree moved on hours ago — so the only thing left is to read it and
         put it away.
-      </p>
+      </SectionNote>
       <ReadingNotes view={view} what="the skipped items" />
-      {view.rows !== undefined && items.length === 0 && (
-        <p className="waiting-empty">no job put anything down.</p>
-      )}
       {items.length > 0 && (
         <ul className={listClass(items.length)} aria-label="Skipped items">
           {items.map((proposal) => (
-            <li className="waiting-card" key={proposal.id}>
+            <Inset as="li" key={proposal.id}>
               <div className="waiting-card-head">
                 <span className="waiting-card-id">item #{proposal.id}</span>
                 <span className="waiting-card-title">
@@ -1254,7 +1295,7 @@ function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
                   onConfirm={() => dismiss.mutate(proposal.id)}
                 />
               </div>
-            </li>
+            </Inset>
           ))}
         </ul>
       )}
@@ -1284,20 +1325,20 @@ function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
 
   return (
     <Panel title="Refused actions" aside={<Count n={view.rows?.length} />}>
-      <p className="waiting-note">
+      <SectionNote
+        empty={view.rows !== undefined && rows.length === 0}
+        says="the barrier has refused nothing."
+      >
         The barrier stopped these before they happened, in turns that have since ended. There is
         nothing here to allow: what they were going to do is written out so you can decide whether
         to do it yourself, and under it what the turn had read when it decided to — which is usually
         the half that answers whether the idea was the agent's or a stranger's.
-      </p>
+      </SectionNote>
       <ReadingNotes view={view} what="the refused actions" />
-      {view.rows !== undefined && rows.length === 0 && (
-        <p className="waiting-empty">the barrier has refused nothing.</p>
-      )}
       {rows.length > 0 && (
         <ul className={listClass(rows.length)} aria-label="Refused actions">
           {rows.map((proposal) => (
-            <li className="waiting-card" key={proposal.id}>
+            <Inset as="li" key={proposal.id}>
               <div className="waiting-card-head">
                 <span className="waiting-card-id">refusal #{proposal.id}</span>
                 <span className="waiting-card-title">
@@ -1313,7 +1354,7 @@ function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
               </p>
               <ToolInput raw={proposal.tool_input} />
               <ReadFrom raw={proposal.read_from} />
-            </li>
+            </Inset>
           ))}
         </ul>
       )}
@@ -1347,7 +1388,7 @@ function GitQueuePanel({ view }: { view: Reading<VcsRequestSummary> }) {
     <Panel title="Git queue" aside={<Count n={wanted.length} />}>
       <ReadingNotes view={view} what="the git queue" />
       {view.rows !== undefined && wanted.length === 0 && (
-        <p className="waiting-empty">nothing in the git queue is waiting on you.</p>
+        <Quiet says="nothing in the git queue is waiting on you." />
       )}
       {wanted.length > 0 && (
         <ul className={listClass(wanted.length)} aria-label="Git requests waiting on you">
@@ -1357,14 +1398,15 @@ function GitQueuePanel({ view }: { view: Reading<VcsRequestSummary> }) {
         </ul>
       )}
       {recent.length > 0 && (
-        <>
-          <p className="waiting-subhead">recently through the queue</p>
-          <ul className="waiting-list" aria-label="Recent git requests">
-            {recent.map((row) => (
-              <VcsRow key={row.id} row={row} />
-            ))}
-          </ul>
-        </>
+        <div className="waiting-recent">
+          <Section label="recently through the queue" level={3}>
+            <ul className="waiting-list" aria-label="Recent git requests">
+              {recent.map((row) => (
+                <VcsRow key={row.id} row={row} />
+              ))}
+            </ul>
+          </Section>
+        </div>
       )}
       {/* Nothing prunes `vcs_requests`, so this listing is the whole history and
           not a backlog. Arriving at the cap says the daemon has been running a
@@ -1404,14 +1446,14 @@ function ParkedRunsPanel({ view }: { view: Reading<AwaitingRun> }) {
 
   return (
     <Panel title="Parked runs" aside={<Count n={view.rows?.length} />}>
-      <p className="waiting-note">
+      <SectionNote
+        empty={view.rows !== undefined && rows.length === 0}
+        says="no run is parked."
+      >
         Worktree runs holding a tree while they wait. The decision that frees one is its approval
         above; giving the tree back without deciding is on the run&apos;s own page.
-      </p>
+      </SectionNote>
       <ReadingNotes view={view} what="the parked runs" />
-      {view.rows !== undefined && rows.length === 0 && (
-        <p className="waiting-empty">no run is parked.</p>
-      )}
       {rows.length > 0 && (
         <ul className={listClass(rows.length)} aria-label="Parked runs">
           {rows.map((run) => (

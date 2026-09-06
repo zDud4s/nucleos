@@ -3,11 +3,13 @@
  * `web-` throughout — as `mail-` is for the mail queue and `chats-` for the
  * chats master-detail.
  *
- * The rule this file lives under: **no class appears in `Web.tsx` that is
- * not defined below.** `tsc` and vitest both pass happily on a class no
+ * The rule this file lives under: **no `web-` class appears in `Web.tsx` that
+ * is not defined below.** `tsc` and vitest both pass happily on a class no
  * stylesheet has ever heard of, and the defect shows up only as something
  * looking wrong on a screen nobody is testing. Grep the component against
- * this file before calling the page done.
+ * this file before calling the page done. `ui-` classes are the exception and
+ * are not this file's to define — they arrive with a primitive imported from
+ * `../ui`, which is where their recipe and their argument both live.
  */
 
 /* =============================================================== the page == */
@@ -29,6 +31,16 @@
   min-width: 0;
 }
 
+/**
+ * The prose standing above a form, and the line that stands in for a reading
+ * while it is still being taken.
+ *
+ * Neither is an absence, which is why neither is `Quiet`. The note sits above
+ * the read form and says what pressing it will do; the loading line is a wait,
+ * and a wait wearing the vocabulary of an empty section claims the archive is
+ * empty when in truth nobody has answered yet. This page's real absences are
+ * `Quiet` and `Teach`, and both are primitives now.
+ */
 .web-note {
   margin: 0 0 var(--space-3);
   font-size: var(--text-sm);
@@ -36,11 +48,34 @@
   color: var(--text-muted);
 }
 
+/* Faint and italic, which is the second half of the same claim: faint is the
+   rung for something standing beside content rather than being it, and `Quiet`
+   is muted precisely because there the sentence *is* the content. */
 .web-loading {
   margin: 0;
   font-size: var(--text-sm);
   color: var(--text-faint);
   font-style: italic;
+}
+
+/**
+ * The label rank — 11px uppercase at `--tracking-wide` — under two names: a
+ * field's own label and a fact's column head.
+ *
+ * Grouped rather than shared with a primitive, because there is nothing to
+ * share with: DESIGN.md records the missing input primitive as the largest
+ * remaining hole in the component layer, and until `ui.css` has one, collecting
+ * the selector is as far as a page can take it. Not the section-title rank,
+ * which is the display face at `--tracking-wider` and belongs to
+ * `.ui-section-title` — the heading over a group is a different rank from the
+ * name of a field inside one, and at 11px that difference is all there is.
+ */
+.web-field,
+.web-fact dt {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
 }
 
 /* A field label over its own input — every form on this page shares it. */
@@ -49,10 +84,6 @@
   flex-direction: column;
   gap: var(--space-1);
   min-width: 0;
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 .web-field input {
@@ -71,6 +102,62 @@
 .web-field input:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
+}
+
+/**
+ * Everything the daemon produced that stands *beside* content rather than
+ * being it: a redirect's target, a result's url, a row's host.
+ *
+ * One rung and one face, where these were three rules spelling out the same
+ * three declarations. Faint is exactly the rung for metadata beside content,
+ * and mono is the claim about origin — every one of these is a machine's own
+ * string. `overflow-wrap: anywhere` belongs to all three for the reason
+ * `.web-url` gives below: a host is only distinguishable from what it imitates
+ * if nothing here truncates it.
+ */
+.web-outcome-redirect,
+.web-search-url,
+.web-row-host {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+/* The name of something that can be opened — an archived page, or a hit about
+   to become one. Two writings of the same declarations. */
+.web-row-title,
+.web-search-title {
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  overflow-wrap: anywhere;
+}
+
+/* The sentence under either. No margin of its own: both sit inside an `Inset`,
+   which spaces its own children — a margin here would be counted twice. */
+.web-row-snippet,
+.web-search-snippet {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+}
+
+/**
+ * The two columns this page has: the archive, and a search's hits. Each item
+ * is an `Inset`, which paints its own box — this only spaces them and takes
+ * the list markers off, the same division `browser-list` and
+ * `contacts-questions` already draw.
+ */
+.web-list,
+.web-search-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
 }
 
 /* ---------------------------------------------------------------- forms == */
@@ -102,102 +189,32 @@
 
 .web-outcome-redirect {
   margin: 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-  overflow-wrap: anywhere;
 }
 
 /* ------------------------------------------------------------------ search == */
 
+/**
+ * What a search answers with: a note about the provider, the archive's own
+ * hits, and the provider's — each of the last two a `Section`.
+ *
+ * The rhythm *between* them is here because `.ui-section` owns the rhythm
+ * *inside* one and deliberately no more, and a gap wider than a section's own
+ * is what says these are two answers rather than one list with a heading
+ * stranded in the middle of it.
+ */
 .web-search-results {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
   margin-top: var(--space-3);
-}
-
-.web-search-unavailable {
-  margin: 0 0 var(--space-3);
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
-
-.web-search-subhead {
-  margin: var(--space-3) 0 var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.web-search-subhead:first-child {
-  margin-top: 0;
-}
-
-.web-search-empty {
-  margin: 0;
-  font-size: var(--text-sm);
-  color: var(--text-faint);
-}
-
-.web-search-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.web-search-row {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-}
-
-.web-search-title {
-  color: var(--text);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-}
-
-.web-search-url {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-  overflow-wrap: anywhere;
-}
-
-.web-search-snippet {
-  margin: 0;
-  font-size: var(--text-xs);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
 }
 
 /* =================================================================== list == */
 
+/* The archive stands off the filter form above it; the search's own lists take
+   their spacing from the `Section` around them and want none of their own. */
 .web-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: var(--space-3) 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.web-row {
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-}
-
-.web-row-active {
-  border-color: var(--accent);
+  margin-top: var(--space-3);
 }
 
 .web-row-link {
@@ -209,26 +226,6 @@
   text-decoration: none;
 }
 
-.web-row-title {
-  color: var(--text);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  overflow-wrap: anywhere;
-}
-
-.web-row-host {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-
-.web-row-snippet {
-  margin: var(--space-1) 0 0;
-  font-size: var(--text-xs);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
-}
-
 /* ================================================================ reader == */
 
 .web-facts {
@@ -236,13 +233,6 @@
   grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
   gap: var(--space-2) var(--space-3);
   margin: 0 0 var(--space-3);
-}
-
-.web-fact dt {
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 .web-fact dd {
@@ -265,6 +255,15 @@
  * nowhere does this page reach `dangerouslySetInnerHTML` — a quarantined
  * page's banner and summary are a stranger's prose, exactly as untrusted as
  * the rest of it.
+ *
+ * A well by fill and by face, and still hand-rolled — the same answer
+ * `.browser-chain` reached from the other direction. `Well` takes an `as` and
+ * a `label` and nothing else, so adopting it would silently drop the `32rem`
+ * cap and the scroll with it, and a whole article would then run the length of
+ * the panel. The border stays for the reason `.ui-panel-inset` keeps its own:
+ * this box sits directly in a panel body rather than inside another box, so it
+ * is not the third rank a well exists to avoid, and the hairline is what draws
+ * the boundary in the light theme.
  */
 .web-content {
   max-height: 32rem;

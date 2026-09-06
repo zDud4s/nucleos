@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import { scopeEngaged, useScopedKills, useSetScopedKill } from "../data/autopilot";
@@ -33,7 +33,20 @@ import {
   type SubsystemReadout,
   type VoiceConfig,
 } from "../data/system";
-import { Badge, Button, ConfirmButton, CopyOnce, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime, StateBadge } from "../ui";
+import {
+  Badge,
+  Button,
+  ConfirmButton,
+  CopyOnce,
+  ErrorNote,
+  Inset,
+  PageHeader,
+  Panel,
+  Quiet,
+  RefusalNote,
+  RelativeTime,
+  StateBadge,
+} from "../ui";
 import "./system.css";
 
 /**
@@ -104,6 +117,28 @@ function headlineFor(readout: HealthReadout | undefined): string | undefined {
   return parts.join(", ");
 }
 
+/**
+ * The three views — links, and deliberately **not** `Tabs` from `../ui`.
+ *
+ * The primitive is the app's one tabs implementation and the reason to reach
+ * for it is real: `Bench` gets Radix's roving focus and its `aria-controls`
+ * wiring, and a second hand-rolled tab bar is how two of them come to behave
+ * differently. It cannot carry this one, and the difference is not cosmetic.
+ * These are routes rather than panels: every trigger here is a real `<a href>`
+ * to `/system/<view>`, which opens in a new window, is announced as a link, and
+ * marks the current one with `aria-current="page"`. Radix's `Trigger` puts
+ * `role="tab"` on whatever it renders — `asChild` and a `Link` included — so
+ * adopting it would replace the link role, swap `aria-current` for
+ * `aria-selected`, collapse three tab stops into one roving one, and leave
+ * `aria-controls` pointing at panels that exist only for the route you are
+ * already on. A tab widget switches panels inside a page. This switches pages.
+ *
+ * What was adopted is the rule underneath the appearance: the current tab is
+ * marked in `--text`, the way `.ui-tab[data-state="active"]` marks its own.
+ * The border used to be `--accent`, which the system reserves for the wordmark,
+ * links and the focus ring — a selection wearing the brand colour reads as a
+ * status.
+ */
 function ViewTabs({ view }: { view: SystemView }) {
   return (
     <nav className="sy-tabs" aria-label="System views">
@@ -185,7 +220,7 @@ function SidecarCardsPanel({ sidecars }: { sidecars: ReturnType<typeof useSideca
         <ErrorNote>the núcleo did not answer — nothing is known about the sidecars</ErrorNote>
       )}
       {sidecars.data !== undefined && sidecars.data.length === 0 && (
-        <p className="sy-empty">no sidecar is registered.</p>
+        <Quiet says="no sidecar is registered." />
       )}
       {sidecars.data !== undefined && sidecars.data.length > 0 && (
         <ul className="sy-sidecars" aria-label="Sidecars">
@@ -200,7 +235,7 @@ function SidecarCardsPanel({ sidecars }: { sidecars: ReturnType<typeof useSideca
 
 function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
   return (
-    <li className="sy-sidecar">
+    <Inset as="li">
       <div className="sy-sidecar-head">
         <span className="sy-sidecar-name">{sidecar.name}</span>
         <span className="sy-sidecar-state">{sidecar.state}</span>
@@ -241,7 +276,7 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
           )}
         </p>
       )}
-    </li>
+    </Inset>
   );
 }
 
@@ -260,29 +295,27 @@ function ScopedKillsPanel() {
   const projects = useProjects();
   const kills = useScopedKills();
   const setKill = useSetScopedKill();
+  const noProjects = projects.data !== undefined && projects.data.length === 0;
 
   return (
     <Panel title="Project brakes">
-      <p className="sy-note">
+      <PanelNote empty={noProjects} says="no project is registered.">
         A project brake holds what that project would START; it stops nothing already running. An
         absent row means the daemon was never told, which reads as released. The trigger brakes —
         scheduled rules, repo triggers, e-mail triage — live on <Link to="/autopilot">Autopilot</Link>.
-      </p>
+      </PanelNote>
       {kills.isError && kills.data === undefined && <SystemListError error={kills.error} what="the project brakes" />}
       {!kills.isError && kills.data === undefined && <p className="sy-loading">reading the project brakes…</p>}
       {projects.isError && projects.data === undefined && (
         <SystemListError error={projects.error} what="the projects" />
       )}
       {!projects.isError && projects.data === undefined && <p className="sy-loading">reading the projects…</p>}
-      {projects.data !== undefined && projects.data.length === 0 && (
-        <p className="sy-empty">no project is registered.</p>
-      )}
       {projects.data !== undefined && projects.data.length > 0 && (
         <ul className="sy-kills" aria-label="Project brakes">
           {projects.data.map((project) => {
             const engaged = scopeEngaged(kills.data, "project", project.project_id);
             return (
-              <li className="sy-kill" key={project.project_id}>
+              <Inset as="li" className="sy-kill" key={project.project_id}>
                 <span className="sy-kill-name">{project.project_id}</span>
                 <Badge tone={engaged ? "paused" : "active"}>{engaged ? "held" : "running"}</Badge>
                 <Button
@@ -295,7 +328,7 @@ function ScopedKillsPanel() {
                 >
                   {engaged ? `Release ${project.project_id}` : `Hold ${project.project_id}`}
                 </Button>
-              </li>
+              </Inset>
             );
           })}
         </ul>
@@ -527,12 +560,13 @@ function BackupsView() {
 function BackupsPanel() {
   const backups = useBackups();
   const takeBackup = useTakeBackup();
+  const noBackups = backups.data !== undefined && backups.data.length === 0;
 
   return (
     <Panel title="Backups">
-      <p className="sy-note">
+      <PanelNote empty={noBackups} says="no backup has been taken yet.">
         Staging a restore changes nothing yet — the swap happens the next time the núcleo starts.
-      </p>
+      </PanelNote>
       <div className="sy-backups-actions">
         <Button variant="ghost" disabled={takeBackup.isPending} onClick={() => takeBackup.mutate()}>
           Take a backup now
@@ -543,9 +577,6 @@ function BackupsPanel() {
       )}
       {backups.isError && backups.data === undefined && <SystemListError error={backups.error} what="the backups" />}
       {!backups.isError && backups.data === undefined && <p className="sy-loading">reading the backups…</p>}
-      {backups.data !== undefined && backups.data.length === 0 && (
-        <p className="sy-empty">no backup has been taken yet.</p>
-      )}
       {backups.data !== undefined && backups.data.length > 0 && (
         <ul className="sy-backups" aria-label="Backups">
           {backups.data.map((backup) => (
@@ -561,7 +592,7 @@ function BackupRow({ backup }: { backup: BackupInfo }) {
   const stageRestore = useStageRestore();
 
   return (
-    <li className="sy-backup">
+    <Inset as="li">
       <div className="sy-backup-head">
         <span className="sy-backup-name">{backup.name}</span>
         <span className="sy-backup-meta">
@@ -581,7 +612,7 @@ function BackupRow({ backup }: { backup: BackupInfo }) {
         </p>
       )}
       {stageRestore.isError && <RestoreError error={stageRestore.error} />}
-    </li>
+    </Inset>
   );
 }
 
@@ -624,7 +655,7 @@ function PiiObservations() {
     <Panel title="PII observations">
       {pii.isError && pii.data === undefined && <SystemListError error={pii.error} what="the PII tally" />}
       {!pii.isError && pii.data === undefined && <p className="sy-loading">reading…</p>}
-      {pii.data !== undefined && pii.data.length === 0 && <p className="sy-empty">nothing recorded.</p>}
+      {pii.data !== undefined && pii.data.length === 0 && <Quiet says="nothing recorded." />}
       {pii.data !== undefined && pii.data.length > 0 && (
         <table className="sy-pii-table">
           <thead>
@@ -751,7 +782,7 @@ function TokensPanel() {
       )}
       {!tokens.isError && tokens.data === undefined && <p className="sy-loading">reading the tokens…</p>}
       {tokens.data !== undefined && tokens.data.length === 0 && (
-        <p className="sy-empty">no token has been minted.</p>
+        <Quiet says="no token has been minted." />
       )}
       {tokens.data !== undefined && tokens.data.length > 0 && (
         <ul className="sy-tokens" aria-label="API tokens">
@@ -784,7 +815,7 @@ function TokenRow({ token }: { token: ApiTokenSummary }) {
   const revokeToken = useRevokeToken();
 
   return (
-    <li className="sy-token">
+    <Inset as="li">
       <div className="sy-token-head">
         <span className="sy-token-name">{token.name}</span>
         <Badge tone="info">{token.level}</Badge>
@@ -800,7 +831,7 @@ function TokenRow({ token }: { token: ApiTokenSummary }) {
         onConfirm={() => revokeToken.mutate(token.name)}
       />
       {revokeToken.isError && <RevokeError error={revokeToken.error} />}
-    </li>
+    </Inset>
   );
 }
 
@@ -974,6 +1005,29 @@ function UnconfiguredAreasPanel() {
 }
 
 /* ------------------------------------------------------------------- shared -- */
+
+/**
+ * A panel's own prose — in front of a list that has something in it, one click
+ * behind the line when it has not.
+ *
+ * The sentences are the same either way and what changes is where a reader
+ * meets them. Above a populated list the note is what somebody needs *before*
+ * pressing a button: that a brake holds what a project would start rather than
+ * stopping what it is doing, that staging a restore changes nothing until the
+ * núcleo restarts. Above an empty one it is a paragraph explaining rows that
+ * are not there. Keeping it rather than cutting it is the point of the
+ * disclosure — "no project is registered" on its own reads as a list that
+ * failed to load, and the paragraph is what makes the emptiness a fact.
+ *
+ * Not every note belongs behind one. `TokensPanel`'s explains the mint form
+ * above it and not the list below, and the moment the list is empty is exactly
+ * when somebody is about to mint their first token and most needs the three
+ * levels spelled out.
+ */
+function PanelNote({ empty, says, children }: { empty: boolean; says: string; children: ReactNode }) {
+  if (empty) return <Quiet says={says}>{children}</Quiet>;
+  return <p className="sy-note">{children}</p>;
+}
 
 function SystemListError({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;

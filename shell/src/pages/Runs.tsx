@@ -23,8 +23,10 @@ import {
   Button,
   ConfirmButton,
   ErrorNote,
+  Inset,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
   StaleNote,
@@ -229,7 +231,7 @@ function isFiltered(filters: RunFilters): boolean {
 /* ----------------------------------------------------------------- list -- */
 
 function RunList({ rows, filtered }: { rows: RunSearchResult[] | undefined; filtered: boolean }) {
-  if (rows === undefined) return <p className="runs-loading">reading the index…</p>;
+  if (rows === undefined) return <Quiet says="reading the index…" />;
 
   if (rows.length === 0) {
     return (
@@ -254,7 +256,7 @@ function RunList({ rows, filtered }: { rows: RunSearchResult[] | undefined; filt
     <>
       <ul className="runs-list" aria-label="Runs">
         {rows.map((row) => (
-          <li key={row.id} className="runs-row">
+          <Inset key={row.id} as="li">
             <div className="runs-row-head">
               <Link to={`/runs/${row.id}`} className="runs-row-link">
                 run {row.id}
@@ -270,7 +272,7 @@ function RunList({ rows, filtered }: { rows: RunSearchResult[] | undefined; filt
               </span>
             </div>
             <p className="runs-row-excerpt">{row.prompt_excerpt}</p>
-          </li>
+          </Inset>
         ))}
       </ul>
       {rows.length >= RUN_LIST_LIMIT && (
@@ -461,7 +463,7 @@ function PresetsRail({ onStarted }: { onStarted: (id: number) => void }) {
 
   return (
     <Panel title="Presets">
-      {saved === undefined && <p className="runs-loading">reading the saved requests…</p>}
+      {saved === undefined && <Quiet says="reading the saved requests…" />}
       {saved !== undefined && saved.length === 0 && (
         <Teach title="No saved requests">
           <p>
@@ -501,7 +503,7 @@ function PresetRow({
   onDelete: () => void;
 }) {
   return (
-    <li className="runs-preset">
+    <Inset as="li">
       <div className="runs-preset-head">
         <span className="runs-preset-name">{preset.name}</span>
         <span className="runs-preset-mode">{preset.mode}</span>
@@ -518,7 +520,7 @@ function PresetRow({
           onConfirm={onDelete}
         />
       </div>
-    </li>
+    </Inset>
   );
 }
 

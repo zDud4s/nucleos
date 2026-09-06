@@ -132,6 +132,14 @@ export interface SlotCardProps {
  * `wait_reason` and `round`/`max_rounds` appear only when the owner is a job:
  * they are columns of `jobs`, and a run has no equivalent. Showing them as zero
  * for a run would be inventing a number.
+ *
+ * **The kind is said in words and in a badge, and no longer in a stripe.** The
+ * card used to carry `fleet-card-${detail.kind}`, which painted a coloured left
+ * rule per kind in the state tones — a taxonomy wearing the colours reserved for
+ * status, so a job merely queued still got Acting Green. The head names the kind
+ * outright (`job 41`, `run 7`) and the two kinds that are themselves states,
+ * `unknown` and `orphaned`, render `StateBadge domain="slot"` below. That badge
+ * is what the tests read, and it was carrying the distinction all along.
  */
 export function SlotCard({ card, connectable = false }: SlotCardProps) {
   const actions = useContext(FleetActionsContext);
@@ -142,7 +150,7 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
 
   return (
     <article
-      className={`fleet-card fleet-card-${detail.kind}`}
+      className="fleet-card"
       aria-label={`slot ${slot.slot} — ${slot.owner_kind} ${slot.owner_id}`}
     >
       <header className="fleet-card-head">

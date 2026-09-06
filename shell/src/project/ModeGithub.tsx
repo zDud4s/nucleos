@@ -26,7 +26,7 @@ import {
   type ShellRule,
   type Verdict,
 } from "../data/project-policy";
-import { Button, Quiet, RefusalNote, Section } from "../ui";
+import { Button, Inset, Quiet, RefusalNote, Section, Well } from "../ui";
 
 /**
  * "What may this project do without asking?"
@@ -250,10 +250,10 @@ const MAPPING_SENTENCES: Record<string, string> = {
  */
 function Listing({ title, read }: { title: string; read: UseQueryResult<ReadOutcome> }) {
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+    <Inset>
       <p className="text-xs uppercase tracking-wide text-text-faint">{title}</p>
       <ListingBody read={read} />
-    </div>
+    </Inset>
   );
 }
 
@@ -288,9 +288,16 @@ function ListingBody({ read }: { read: UseQueryResult<ReadOutcome> }) {
         {said === "" ? (
           <p className="text-xs text-text-faint">And it printed nothing at all while failing.</p>
         ) : (
-          <pre className="overflow-x-auto whitespace-pre font-mono text-xs text-text-muted">
+          /*
+            A `Well` and not a bare `pre`: this is a raw payload, and the recess is what says the
+            text was not written here. `capped` because a failing `gh` can print any amount, and a
+            panel whose height is set by the longest thing it has ever printed is one nobody can
+            scan past — the cap scrolls instead, in both directions, which is what keeps the
+            terminal's own column alignment intact.
+          */
+          <Well as="pre" capped>
             {said}
-          </pre>
+          </Well>
         )}
       </div>
     );
@@ -306,8 +313,16 @@ function ListingBody({ read }: { read: UseQueryResult<ReadOutcome> }) {
     );
   }
 
+  /*
+    The listing itself, in the same recess. It is a terminal table — columns aligned with spaces —
+    and any element that reflowed it would turn `gh`'s own formatting into noise, which is why it
+    stays a `pre`; `Well` keeps the mono face that claims the machine produced it and scrolls the
+    overflow rather than growing the panel.
+  */
   return (
-    <pre className="overflow-x-auto whitespace-pre font-mono text-xs text-text">{listed}</pre>
+    <Well as="pre" capped>
+      {listed}
+    </Well>
   );
 }
 
@@ -480,7 +495,7 @@ function AutonomousOps({ projectId }: { projectId: string }) {
           doc says withdrawing narrows and an operation stored before the ceilings moved still has to
           be removable.
         */
-        <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+        <Inset>
           <p className="text-xs uppercase tracking-wide text-text-faint">No longer built</p>
           <p className="max-w-3xl text-xs text-text-muted">
             This project's table names operations this daemon does not build. They decide nothing —
@@ -508,7 +523,7 @@ function AutonomousOps({ projectId }: { projectId: string }) {
               </li>
             ))}
           </ul>
-        </div>
+        </Inset>
       )}
 
       {refused !== null ? (
@@ -547,11 +562,11 @@ function OpHalf({
   onToggle: (kind: string, on: boolean) => void;
 }) {
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+    <Inset>
       <p className="text-xs uppercase tracking-wide text-text-faint">{title}</p>
       <p className="max-w-3xl text-xs text-text-muted">{says}</p>
       {ops.length === 0 ? (
-        <p className="text-xs text-text-faint">This daemon builds none of this half.</p>
+        <Quiet says="This daemon builds none of this half." />
       ) : (
         <ul className="flex flex-col gap-1">
           {ops.map((op) => (
@@ -609,7 +624,7 @@ function OpHalf({
           ))}
         </ul>
       )}
-    </div>
+    </Inset>
   );
 }
 
@@ -766,11 +781,11 @@ function RuleList({
   onForget: (prefix: string) => void;
 }) {
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+    <Inset>
       <p className="text-xs uppercase tracking-wide text-text-faint">{title}</p>
       <p className="text-xs text-text-muted">{says}</p>
       {rows.length === 0 ? (
-        <p className="text-xs text-text-faint">None declared.</p>
+        <Quiet says="None declared." />
       ) : (
         <ul className="flex flex-col gap-1">
           {rows.map((rule) => (
@@ -818,7 +833,7 @@ function RuleList({
           ))}
         </ul>
       )}
-    </div>
+    </Inset>
   );
 }
 
@@ -884,7 +899,7 @@ function DeclareRule({
   }
 
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+    <Inset>
       <p className="text-xs uppercase tracking-wide text-text-faint">Declare a prefix</p>
 
       <div className="flex flex-wrap gap-2">
@@ -962,7 +977,7 @@ function DeclareRule({
           needs no shape the classifier can read.
         </span>
       </div>
-    </div>
+    </Inset>
   );
 }
 
@@ -1011,7 +1026,7 @@ function LandTargets({ projectId }: { projectId: string }) {
   const { integration, targets } = landing.data;
 
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+    <Inset>
       <p className="max-w-3xl text-xs text-text-muted">
         <span className="font-mono text-text">nucleos-core --land &lt;branch&gt;</span> sends what is
         in the worktree it is called from. The destination has to be one of these; a name that is not
@@ -1085,7 +1100,7 @@ function LandTargets({ projectId }: { projectId: string }) {
         */
         <RefusalNote refusal={refused} sentences={TARGET_SENTENCES} />
       ) : null}
-    </div>
+    </Inset>
   );
 }
 

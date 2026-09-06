@@ -36,7 +36,23 @@
   padding-bottom: 0;
 }
 
+/**
+ * The page root, and the yardstick the layout below measures itself against.
+ *
+ * `container-type: inline-size` is here rather than on `.chats-layout` because a
+ * container cannot answer a query about itself — the element that changes shape
+ * has to be *inside* the thing being measured. This box is the main column's full
+ * width minus the page padding, which is exactly the room the two columns have,
+ * and it costs nothing else: inline-size containment leaves block size alone, so
+ * `height: 100%` still resolves against `.app-page`.
+ *
+ * One consequence worth stating, because it is invisible until it bites:
+ * containment makes this box the containing block for `position: fixed`
+ * descendants. The one fixed thing on this page is the picture lightbox, which is
+ * why `PictureOverlay` renders through a portal instead of in place.
+ */
 .chats-app {
+  container: chats / inline-size;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -56,14 +72,26 @@
 /**
  * Where the list gives way.
  *
- * It was 60rem, and that was measured wrong: this query is on the WINDOW, but the
- * layout it governs is the window minus the shell's own rail and the page padding.
- * At a 1000px window the transcript was 358px and the conversation list beside it
- * was 304px — the list, which is a column of titles, was very nearly as wide as the
- * conversation. 72rem puts the fold where the transcript still has about 550px,
- * which is the narrowest a measure can be and still be one.
+ * It was `@media (max-width: 60rem)`, and that was measured wrong: the query was on
+ * the WINDOW, but the layout it governs is the window minus the shell's own rail and
+ * the page padding. At a 1000px window the transcript was 358px and the conversation
+ * list beside it was 304px — the list, which is a column of titles, was very nearly as
+ * wide as the conversation. The fix at the time was to move the window number to
+ * 72rem, which put the fold where the transcript still had about 550px.
+ *
+ * That number was right about the fold and wrong about what to measure, and it is the
+ * app's only stray breakpoint. So the measurement moved to the thing being measured:
+ * `.chats-app` is a query container, and 53rem is the same fold said honestly —
+ * 72rem of window, less the 15rem rail and the page's 2rem of padding on each side.
+ *
+ * Measuring the column rather than the window also fixes the half nobody had noticed.
+ * The rail collapses to 3.5rem, and under the old query the page folded at 1152px
+ * anyway, throwing away 11.5rem of room that was sitting right there. A container
+ * query cannot make that mistake: the same 53rem now reaches down to a window of
+ * about 60rem when the rail is shut, which is the app's own breakpoint arriving on
+ * its own.
  */
-@media (max-width: 72rem) {
+@container chats (max-width: 53rem) {
   .chats-layout {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -361,8 +389,11 @@
    `EditorDetail`. Two sets of rules were declared for it, in this file, with different values —
    which is what a screen nobody could see the second definition of looks like. */
 
-.chats-loading,
-.chats-empty {
+/* A wait, not an absence — which is why `.chats-empty` left this rule for `Quiet` and this one
+   did not. Every site wearing it says "reading …": the answer is not nothing, it is not known
+   yet, and faint is the right rung for a line that is about to be replaced by the thing it is
+   standing in for. `Quiet` is muted on purpose, because there the sentence IS the content. */
+.chats-loading {
   margin: 0;
   font-size: var(--text-sm);
   color: var(--text-faint);
@@ -509,7 +540,7 @@
   flex: none;
   width: 0.875rem;
   height: 0.875rem;
-  opacity: 0.7;
+  opacity: var(--opacity-quiet);
 }
 
 /**
@@ -623,12 +654,17 @@
   white-space: pre;
 }
 
+/* Added and removed, in the two tones that already mean it. These read
+   `var(--tone-go-text, #2f7d43)` and `var(--tone-stop-text, #a33a3a)`, and
+   neither token has ever existed anywhere in this app — so the fallback won
+   every time, and a hex literal does not answer `prefers-color-scheme`. Two
+   near-black greens on a white ground was the visible half of the bug. */
 .chats-diff-added {
-  color: var(--tone-go-text, #2f7d43);
+  color: var(--tone-active-fg);
 }
 
 .chats-diff-removed {
-  color: var(--tone-stop-text, #a33a3a);
+  color: var(--tone-danger-fg);
 }
 
 /* The lines that say WHERE rather than WHAT: file names and hunk headers, faint so the eye goes to
@@ -1090,10 +1126,17 @@
  *
  * It fades out after a couple of seconds because it is an answer to a gesture, not a state: a
  * highlight that stayed would still be there tomorrow, claiming to mean something.
+ *
+ * Stated Blue and not the accent. This ring marks the turn a search landed on, which is a
+ * selection — and the Reserved Cyan Rule spends the brand colour on the wordmark, links and the
+ * focus ring, nowhere else. Wearing the focus ring's own colour was the worse half of it: a
+ * keyboard user would have had two rings in the same cyan on the same screen, one meaning "you
+ * are here" and one meaning "it is there". Stated Blue is the tone for a fact with no verdict
+ * attached, which is exactly what "this is the one you asked for" is.
  */
 .chats-turn-lit {
   border-radius: var(--radius-md);
-  outline: 2px solid var(--accent-quiet);
+  outline: 2px solid var(--tone-info-border);
   outline-offset: var(--space-3);
   animation: chats-turn-lit-out 2500ms ease-out both;
 }
@@ -1101,7 +1144,7 @@
 @keyframes chats-turn-lit-out {
   0%,
   60% {
-    outline-color: var(--focus-ring);
+    outline-color: var(--tone-info-fg);
   }
   100% {
     outline-color: transparent;
@@ -1121,7 +1164,11 @@
  * the app to a hundredth of a millisecond for anybody who asked for less of it.
  */
 .chats-turn-arriving {
-  animation: chats-turn-in 220ms ease-out both;
+  /* `--dur-settle` is 220ms and is defined as "something arriving and taking its place",
+     which is this animation's whole description. The curve stays `ease-out` rather than
+     becoming `--ease`: that is a change of feel and not a change of bookkeeping, and it is
+     not this pass's to make. */
+  animation: chats-turn-in var(--dur-settle) ease-out both;
 }
 
 @keyframes chats-turn-in {
@@ -1202,7 +1249,7 @@
   color: var(--text-faint);
   opacity: 0;
   cursor: pointer;
-  transition: opacity 120ms ease;
+  transition: opacity var(--dur-quick) var(--ease);
 }
 
 .chats-turn-said:hover .chats-turn-again,
@@ -1349,7 +1396,7 @@
   width: 0.75rem;
   height: 0.75rem;
   align-self: center;
-  transition: transform 120ms ease;
+  transition: transform var(--dur-quick) var(--ease);
 }
 
 .chats-turn-did-caret-open {
@@ -1446,6 +1493,26 @@
 @keyframes chats-spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+/**
+ * The global clamp in `base.css` is not an answer for this one, and relying on
+ * it was the bug: it cuts the duration to 0.01ms and the iteration count to 1,
+ * so the loader does not stop spinning — it lands on its last frame and stays
+ * there. `LoaderCircle` is a circle with a piece missing, and a broken ring
+ * held still says "damaged", not "working".
+ *
+ * So it is removed rather than stilled, and nothing is lost by it. The line it
+ * sits in already says `thinking…` or `running <tool>…`, and the elapsed clock
+ * beside it advances every second. A clock is a re-render, not an animation,
+ * which means it survives this media query — it was always the honest proof of
+ * life here, and the spinner was only ever decorating it. The icon is already
+ * `aria-hidden`, so assistive technology reads exactly the same line either way.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .chats-turn-spinner {
+    display: none;
   }
 }
 
@@ -1571,7 +1638,7 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface);
-  transition: border-color 120ms ease;
+  transition: border-color var(--dur-quick) var(--ease);
 }
 
 .chats-composer-box:focus-within {
@@ -1706,10 +1773,17 @@
 }
 
 /* An open microphone is worth a colour. This control is the only one in the row whose "on" state
-   means something is being recorded, and it must not be mistakable for the "off" state at a glance. */
+   means something is being recorded, and it must not be mistakable for the "off" state at a glance.
+   The colour is the `active` tone, used as its full triple: the microphone really is doing the
+   thing. It was the brand accent, which is reserved for the wordmark, links and the focus ring —
+   worn by a status it made a running microphone look like something you could click. */
 .chats-handsfree-on {
-  color: var(--accent);
-  background: var(--accent-quiet);
+  color: var(--tone-active-fg);
+  background: var(--tone-active-bg);
+  /* The edge of the triple drawn as an inset shadow, because the resting button
+     is `border: none` and giving it a real one on only its "on" state would move
+     the row two pixels every time the microphone opened. */
+  box-shadow: inset 0 0 0 1px var(--tone-active-border);
 }
 
 .chats-handsfree-phase {
@@ -1977,20 +2051,6 @@
   margin: 0;
   color: var(--tone-pending-fg);
   font-size: var(--text-xs);
-}
-
-/* Reachable by a screen reader, absent to the eye — for the controls whose
-   whole visible content is an icon. */
-.chats-offscreen {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
-  padding: 0;
-  border: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  clip-path: inset(50%);
 }
 
 /**
@@ -2363,7 +2423,7 @@
   top: var(--space-1);
   right: var(--space-1);
   opacity: 0;
-  transition: opacity 120ms ease;
+  transition: opacity var(--dur-quick) var(--ease);
 }
 
 .chats-code-block:hover .chats-code-copy,
@@ -2720,17 +2780,13 @@
   cursor: pointer;
 }
 
-/* The label's own look lives with the other composer controls — see `.chats-tool`. What stays here
- * is the part that is only true of this one: the file input itself is the one control on the page
- * nobody can style into the others, so it is hidden and the label carries the whole button. */
-.chats-attach input {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
-}
+/* The label's own look lives with the other composer controls — see `.chats-tool`. The part that
+ * was only true of this one — the file input itself is the one control on the page nobody can
+ * style into the others, so it is hidden and the label carries the whole button — is now said by
+ * the input wearing the app's `.sr-only`. Hidden and still in the accessibility tree is exactly
+ * what that utility is for, and this copy was the last one in the shell still using the
+ * deprecated `clip: rect()` recipe, which drops the text out of that tree in some engines.
+ * `.chats-offscreen`, the icon-button labels' own copy of the same thing, went the same way. */
 
 /* Pictures a turn was sent with, under what was typed. Bounded so a tall screenshot does not turn
  * one turn into the whole page. */
@@ -2760,7 +2816,12 @@
   font-style: italic;
 }
 
-/* Taking a waiting message back. Quiet: it is an escape hatch, not the thing to reach for. */
+/* Taking a waiting message back. Quiet: it is an escape hatch, not the thing to reach for.
+   The hover was `--tone-danger-fg`, which DESIGN.md names as a live violation of the
+   Contrast-Not-Hue Rule: a hue arriving under the pointer makes an interaction look like a
+   status, and this control has not done anything wrong by being pointed at. It moves one rung
+   up the neutral ladder instead — faint to primary — which is how the rest of the app answers
+   a pointer. The word still says "drop"; the danger belongs to the confirm, not to the hover. */
 .chats-waiting-drop {
   align-self: flex-start;
   padding: 0;
@@ -2773,12 +2834,15 @@
 }
 
 .chats-waiting-drop:hover:not(:disabled) {
-  color: var(--tone-danger-fg);
+  color: var(--text);
 }
 
+/* 0.6 was a third answer to a question the app has already settled twice. Disabled is
+   `--opacity-disabled` everywhere, and the same state dimmed by three different amounts in
+   one window is the drift the token exists to end. */
 .chats-waiting-drop:disabled {
   cursor: default;
-  opacity: 0.6;
+  opacity: var(--opacity-disabled);
 }
 
 /* A picture opens. The button carries no chrome of its own — the image IS the target. */
@@ -2790,10 +2854,14 @@
   cursor: zoom-in;
 }
 
+/* Rendered through a portal on `document.body` — see `PictureOverlay`. `.chats-app` is a query
+   container now, and containment would otherwise make it the containing block for this, so
+   `inset: 0` would have covered the main column rather than the window. `--z-top` because that
+   is what 50 already was: over everything, an overlay included. */
 .chats-picture-overlay {
   position: fixed;
   inset: 0;
-  z-index: 50;
+  z-index: var(--z-top);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -3003,7 +3071,7 @@
 }
 
 .chats-forward-target:disabled {
-  opacity: 0.5;
+  opacity: var(--opacity-disabled);
   cursor: default;
 }
 

@@ -1,6 +1,7 @@
 // §spec mapa-do-projeto
 import type { Anchored, Junction } from "../data/project-map";
 import { OrphanCheck } from "./OrphanCheck";
+import { Inset, SectionTitle } from "../ui";
 
 /**
  * The junction: the nodes that do not match.
@@ -103,9 +104,9 @@ export function JunctionPanel({ junction, projectId }: JunctionPanelProps) {
 
   return (
     <section aria-label="The junction" className="flex flex-col gap-6">
-      <h2 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle level={2}>
         What does not match
-      </h2>
+      </SectionTitle>
 
       {counts.decisions === 0 ? <NoIntention /> : <Silent rows={silent} projectId={projectId} />}
       {lostTheComment.length > 0 ? <LostTheComment rows={lostTheComment} /> : null}
@@ -425,9 +426,9 @@ function Plausible({
 function Missing({ declared, decisions }: { declared: number; decisions: number }) {
   return (
     <div className="flex flex-col gap-2 border-t border-border pt-4">
-      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle>
         What this panel cannot see
-      </h3>
+      </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
         §5.1 names four derived states and this panel draws two of them. The other two — waiting on
         you, and silenced — both mean a triager looked at a node and formed an opinion about it, and
@@ -480,7 +481,7 @@ function Line({
   const named = capped(paths, 4);
 
   return (
-    <li className="flex flex-col gap-1 rounded-lg border border-border bg-surface p-3">
+    <Inset as="li">
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
         <span className="text-xs text-text-muted">{row.section}</span>
         <span className="truncate font-mono text-xs text-text-faint">{row.spec_slug}</span>
@@ -494,7 +495,7 @@ function Line({
         </p>
       ) : null}
       {children}
-    </li>
+    </Inset>
   );
 }
 

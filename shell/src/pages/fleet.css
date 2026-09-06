@@ -11,6 +11,11 @@
  * stylesheet has ever heard of, and the defect shows up only as something
  * looking wrong on screen.
  *
+ * Two of the boxes below are no longer this file's to draw: the column's
+ * "nothing in flight" and the page's "no project is registered" are both
+ * `Quiet`, the one-line absence. What is left is the layout around the
+ * primitives and the type inside them.
+ *
  * Imported from `Fleet.tsx` rather than from `main.tsx`, so the sheet arrives
  * with the page and cannot outlive it in the bundle. It still lands after the
  * design system in the cascade, because the page module is reached through
@@ -102,18 +107,6 @@
   font-size: var(--text-sm);
   color: var(--text-muted);
   white-space: nowrap;
-}
-
-.fleet-column-empty {
-  margin: 0;
-  font-size: var(--text-sm);
-  color: var(--text-faint);
-}
-
-.fleet-empty {
-  margin: 0;
-  color: var(--text-muted);
-  line-height: var(--leading-normal);
 }
 
 /* -------------------------------------------------------------- new job -- */
@@ -208,6 +201,32 @@
  * A fixed width on the canvas and a fluid one in a column: the surface needs
  * cards it can lay out against each other, and the column has already decided
  * how wide things are.
+ *
+ * **It carried a 3px coloured left rule and a `--shadow-sm`, and both are
+ * gone.** The stripe painted the kind of owner — job, run, item, undescribed,
+ * orphaned — and it painted it in state tones, which is the state vocabulary
+ * spent on a taxonomy: `--tone-active-border` is Acting Green, *it is really
+ * executing, right now*, and it sat on every job card including one whose own
+ * badge, an inch away, read "waiting for a slot". A card cannot say two things
+ * about itself and be read.
+ *
+ * Nothing replaces it, because the replacement was already on the card. Every
+ * kind names itself in the head — `job 41`, `run 7` — and the two kinds that
+ * are genuinely states carry `StateBadge domain="slot"`: "detail unavailable"
+ * against "awaiting reconciliation", the tone as its full triple, in words that
+ * survive for the one reader in twelve who cannot separate the red from the
+ * green. The stripe was a second, colour-only copy of a distinction the badge
+ * already draws, and the tests that guard that distinction were already reading
+ * the badge. The lift went with the stripe: this system is flat, and depth is a
+ * rung rather than a shadow.
+ *
+ * What is left is `.ui-panel-inset` to the declaration — the box inside a box,
+ * one rung up the ladder and one rank down it. It is written out here rather
+ * than adopted from `Inset` because a slot card is an `<article>` whose
+ * `aria-label` names the slot and its owner, and `Inset` renders a `div` or an
+ * `li` and takes no accessible name. Widening it is the shared layer's call,
+ * not this file's; until then this is the recipe, deliberately unchanged from
+ * it, and it is the wrong place to answer a question about the box.
  */
 .fleet-card {
   display: flex;
@@ -215,30 +234,8 @@
   gap: var(--space-2);
   padding: var(--space-3);
   border: 1px solid var(--border);
-  border-left: 3px solid var(--border-strong);
   border-radius: var(--radius-md);
   background: var(--surface-raised);
-  box-shadow: var(--shadow-sm);
-}
-
-/* The kind of owner, said in the left edge as well as in words. */
-.fleet-card-job {
-  border-left-color: var(--tone-active-border);
-}
-
-.fleet-card-run {
-  border-left-color: var(--tone-info-border);
-}
-
-/* Nothing described this owner — ordinary, and drawn as recessive. */
-.fleet-card-unknown {
-  border-left-color: var(--border);
-  background: var(--surface);
-}
-
-/* A leaked slot. It is a defect, and it is allowed to look like one. */
-.fleet-card-orphaned {
-  border-left-color: var(--tone-danger-border);
 }
 
 .fleet-card-head {
@@ -269,8 +266,19 @@
   margin: 0;
 }
 
+/**
+ * The qualifier under a card's badge: which round, which mode, which item.
+ *
+ * `.fleet-card-of` joins the two it has always belonged with. It was emitted by
+ * an item's card and defined nowhere — invisible to `scripts/css-contract.mjs`
+ * because the modifier that used to sit beside it, `fleet-card-${kind}`, marked
+ * the whole `fleet-card-` family as spoken for. Removing the modifier is what
+ * made the hole visible, which is the check working in the direction it is
+ * hardest to run by hand.
+ */
 .fleet-card-rounds,
-.fleet-card-mode {
+.fleet-card-mode,
+.fleet-card-of {
   margin: 0;
   font-size: var(--text-xs);
   color: var(--text-faint);
@@ -284,10 +292,12 @@
   overflow-wrap: anywhere;
 }
 
+/* A real link out, so the accent is correct here — and it is not restated:
+   `base.css` already gives every `a` the accent, and a page that writes it
+   again is a page that has to be changed twice. */
 .fleet-card-link {
   align-self: start;
   font-size: var(--text-sm);
-  color: var(--accent);
 }
 
 /* ------------------------------------------------------------- collision -- */
@@ -479,21 +489,57 @@
   overflow: hidden;
 }
 
-/* The library's own variables, pointed at this app's tokens so the canvas is
-   not a light rectangle in a dark window. */
+/**
+ * The library's own variables, pointed at this app's tokens so the canvas is
+ * not a light rectangle in a dark window.
+ *
+ * **The two selected marks are neutral, and were the brand colour.** A selected
+ * node wore `--focus-ring` and a selected edge wore `--accent`, so "this one"
+ * and "where you are looking" were the same cyan twice — which is the pair the
+ * This-One Rule exists to separate. Both now move to `--text`, the top rung of
+ * the neutral ladder and the same ink `.ui-current` marks a chosen row with,
+ * leaving `--focus-ring` to say the one thing it is reserved for.
+ *
+ * `.ui-current` itself does not fit here and the geometry is where it stops: it
+ * is an *inset* 2px rule on the leading edge, and the inside of a node wrapper
+ * is covered by the opaque card it holds, while an edge is a stroke with no box
+ * to draw inside at all. So the rule's reasoning is what carries — a neutral
+ * rung rather than the hue, and a mark that does not depend on a fill, because
+ * `--surface` and `--surface-raised` are the same white in the light theme.
+ * A ring outside the node and a stroke on the wire are where that lands.
+ */
 .fleet-canvas .react-flow {
   --xy-background-color: var(--surface-sunken);
   --xy-node-background-color: transparent;
   --xy-node-border: none;
-  --xy-node-boxshadow-selected: 0 0 0 2px var(--focus-ring);
   --xy-edge-stroke: var(--border-strong);
-  --xy-edge-stroke-selected: var(--accent);
+  --xy-edge-stroke-selected: var(--text);
   --xy-controls-button-background-color: var(--surface-raised);
   --xy-controls-button-background-color-hover: var(--surface);
   --xy-controls-button-color: var(--text-muted);
   --xy-controls-button-color-hover: var(--text);
   --xy-controls-button-border-color: var(--border);
   --xy-attribution-background-color: transparent;
+}
+
+/**
+ * The selected slot, marked where the mark actually lands.
+ *
+ * This was `--xy-node-boxshadow-selected`, and it was **inert**: xyflow paints
+ * that variable on `.react-flow__node-default`, `-input`, `-output` and `-group`
+ * only, and every node on this canvas is the custom `slotCard`. So the rule
+ * never matched, and clicking a slot changed the panel and nothing on the
+ * canvas. Found by the agent working `WorkflowCanvas`, which had the identical
+ * hole for the identical reason.
+ *
+ * The wrapper still gets `.selected` from xyflow, so the mark goes on the card
+ * inside it, and there the geometry the This-One Rule asks for works exactly:
+ * `.ui-current`'s own recipe, a 2px inset rule on the leading edge in the top
+ * neutral rung. The class itself is not used because `.fleet-card` may carry a
+ * shadow of its own, and `box-shadow` does not merge — it replaces.
+ */
+.fleet-canvas .react-flow__node.selected .fleet-card {
+  box-shadow: inset 2px 0 0 var(--text);
 }
 
 /* A node is the card and nothing else — the library's own chrome would be a
@@ -510,11 +556,21 @@
   cursor: auto;
 }
 
+/**
+ * Where a line starts and where it lands.
+ *
+ * `--text-muted` and not `--accent`: a handle is a control at rest, which is
+ * the rung the ghost button already sits on, and the brand colour is the
+ * wordmark, links and the focus ring — nothing else. It was the plainest of the
+ * page's cyan sites, because a handle is not even a selection standing in for
+ * one: it is a thing you grab. The 1px `--bg` ring stays, and it is what keeps
+ * the dot off the card edge it is drawn on rather than decoration.
+ */
 .fleet-handle {
   width: 10px;
   height: 10px;
   border: 1px solid var(--bg);
-  background: var(--accent);
+  background: var(--text-muted);
 }
 
 /* A rule in force is solid; a request still waiting is dashed and quieter,

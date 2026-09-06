@@ -3,17 +3,32 @@
  * throughout — as `council-` is for councils and `chats-` is for
  * conversations.
  *
- * The rule this file lives under: **no class appears in `Errands.tsx` that
- * is not defined below.** `tsc` and vitest both pass happily on a class no
- * stylesheet has ever heard of, and the defect shows up only as something
- * looking wrong on a screen nobody is testing. Grep the component against
- * this file before calling the page done.
+ * The rule this file lives under: **no `errands-` class appears in
+ * `Errands.tsx` that is not defined below.** `tsc` and vitest both pass
+ * happily on a class no stylesheet has ever heard of, and the defect shows up
+ * only as something looking wrong on a screen nobody is testing. Grep the
+ * component against this file before calling the page done. `ui-` classes are
+ * the exception and are not this file's to define — they arrive with a
+ * primitive imported from `../ui`, which is where their recipe and their
+ * argument both live.
  */
 
 /* ================================================================ shared == */
 
+/**
+ * Prose the page writes above something, and the line that stands in for a
+ * region while it is still being read.
+ *
+ * Neither is an absence, which is why neither is `Quiet`. A note explains what
+ * the reader is looking at; a loading line is a *wait*, and a wait wearing the
+ * vocabulary of an empty section claims the folder is empty when in truth
+ * nobody has answered yet. The five genuine absences on this page — no errand
+ * opened, no errand with that id, an unwritten notebook, an empty folder, no
+ * rule armed — are `Quiet`, which is muted rather than faint for the reason
+ * DESIGN.md gives: there the sentence *is* the content, and a page whose answer
+ * is set fainter than its labels reads as though it failed.
+ */
 .errands-note,
-.errands-empty,
 .errands-loading {
   margin: 0;
   font-size: var(--text-sm);
@@ -21,24 +36,49 @@
   color: var(--text-muted);
 }
 
-.errands-loading,
-.errands-empty {
+.errands-loading {
   color: var(--text-faint);
 }
 
-.errands-note code {
+/**
+ * A machine string set into the sentence around it — `chat_key` in the Teach
+ * block, a rule's cron expression in its head.
+ *
+ * One recipe and not two: `.errands-rule-cron` had the same four declarations
+ * under its own name. Sunken rather than bordered because it is a word inside a
+ * line of text, and a frame at that size reads as a badge.
+ */
+.errands-note code,
+.errands-rule-cron {
   padding: 0 var(--space-1);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
   font-family: var(--font-mono);
-  font-size: 0.9em;
+  font-size: var(--text-xs);
 }
 
-.errands-count {
+/**
+ * Something the daemon named: a folder, a topic key, a file path, a timezone.
+ *
+ * Five rules carried these declarations between them. Mono because the value
+ * came from the machine, faint because it stands beside the thing it qualifies
+ * rather than being it, and `overflow-wrap: anywhere` because a path has no
+ * spaces to break at.
+ */
+.errands-row-folder,
+.errands-chat-key,
+.errands-folder,
+.errands-file-path,
+.errands-rule-tz {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  font-variant-numeric: tabular-nums;
   color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+/* The one of the five that stands on its own line, above the editor it names. */
+.errands-file-path {
+  margin: 0 0 var(--space-2);
 }
 
 .errands-field {
@@ -51,26 +91,53 @@
   color: var(--text-faint);
 }
 
+/**
+ * The page's own controls, and there is no primitive to adopt: `ui.css` defines
+ * no `.ui-input` and no `.ui-field`, which DESIGN.md records as the largest
+ * remaining hole in the component layer. Until it is filled these stay here —
+ * written once for the three shapes rather than twice, which is what the file
+ * editor below was doing under its own name.
+ */
 .errands-field input,
-.errands-field textarea {
+.errands-field textarea,
+.errands-file-editor {
   padding: var(--space-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
   color: var(--text);
-  font-family: var(--font-body);
   font-size: var(--text-sm);
-  text-transform: none;
-  letter-spacing: normal;
-  line-height: var(--leading-snug);
 }
 
+/* The label above is uppercase and tracked; the control under it is neither. */
+.errands-field input,
 .errands-field textarea {
+  font-family: var(--font-body);
+  line-height: var(--leading-snug);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.errands-field textarea,
+.errands-file-editor {
   resize: vertical;
 }
 
+/* Somebody else's file, in the face that says so. */
+.errands-file-editor {
+  width: 100%;
+  font-family: var(--font-mono);
+  line-height: var(--leading-normal);
+}
+
+/**
+ * The one local override of the global ring, and it changes only the offset:
+ * the colour and the 2px are the shared ones, because these controls sit tight
+ * against their neighbours and 2px of clearance would collide.
+ */
 .errands-field input:focus-visible,
-.errands-field textarea:focus-visible {
+.errands-field textarea:focus-visible,
+.errands-file-editor:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
@@ -83,9 +150,76 @@
   grid-column: 1 / -1;
 }
 
-/* =================================================================== list == */
+/**
+ * A line of things on one baseline — the facts of an errand, its two controls,
+ * a rule's head, the buttons under an editor. Six rules carried these three
+ * declarations between them.
+ */
+.errands-facts,
+.errands-controls,
+.errands-rule-head,
+.errands-pause,
+.errands-brain,
+.errands-file-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
 
-.errands-list {
+/* The three that are a row of independent items rather than one control and
+   the refusal that lands beside it: they wrap when the column cannot hold
+   them. */
+.errands-facts,
+.errands-controls,
+.errands-rule-head {
+  flex-wrap: wrap;
+}
+
+.errands-facts,
+.errands-controls {
+  margin-bottom: var(--space-2);
+}
+
+/* Two separate decisions — pause and brain — set further apart than the
+   buttons inside each, or the pair reads as one group of four. */
+.errands-controls {
+  gap: var(--space-3);
+}
+
+.errands-file-actions {
+  margin-top: var(--space-2);
+}
+
+/**
+ * The name of the thing at the head of its row. The `flex` basis is what
+ * pushes the badges and the folder to the far end and lets them drop under the
+ * name when the column narrows.
+ */
+.errands-row-name,
+.errands-rule-name {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.errands-row-name {
+  flex: 1 1 10rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.errands-rule-name {
+  flex: 1 1 8rem;
+}
+
+/**
+ * The three columns this page stacks: errands, files, rules. One recipe, where
+ * there were three differing only in the gap.
+ */
+.errands-list,
+.errands-files,
+.errands-rules {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
@@ -94,10 +228,31 @@
   list-style: none;
 }
 
-.errands-row {
-  margin: 0;
+/* Tighter, because a file is one line and the link on it is the whole row. */
+.errands-files {
+  gap: var(--space-1);
 }
 
+/* The armed rules stand off from the form that arms another. */
+.errands-rules {
+  margin-bottom: var(--space-3);
+}
+
+/* =================================================================== list == */
+
+/**
+ * One errand, as a link that is the whole box.
+ *
+ * The row you are on is marked by `.ui-current` — a 2px inset rule on the
+ * leading edge, in `--text` — and by nothing else. It used to be
+ * `border-color: var(--accent)` over `background: var(--accent-quiet)`, which
+ * is the mark six pages had independently reached for and is wrong twice: the
+ * brand colour means identity and never selection, and a fill-based mark works
+ * in dark and disappears in light, where `--surface` and `--surface-raised` are
+ * both `#ffffff`. Decided by the owner on 2026-09-06 from a rendering of four
+ * candidates in both themes; see the This-One Rule in DESIGN.md and the comment
+ * on `.ui-current` in `ui.css`. Do not reopen it with a fill.
+ */
 .errands-row-link {
   display: flex;
   flex-wrap: wrap;
@@ -111,28 +266,6 @@
   text-decoration: none;
 }
 
-.errands-row-active .errands-row-link {
-  border-color: var(--accent);
-  background: var(--accent-quiet);
-}
-
-.errands-row-name {
-  flex: 1 1 10rem;
-  min-width: 0;
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.errands-row-folder {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-  overflow-wrap: anywhere;
-}
-
 .errands-row-investigation {
   flex: 1 1 100%;
   font-size: var(--text-xs);
@@ -140,6 +273,15 @@
   overflow-wrap: anywhere;
 }
 
+/**
+ * "Answers when spoken to and nothing else" — and this is *not* an empty state,
+ * which is why it is not `Quiet`.
+ *
+ * `done_when: null` is a fact about the errand, not a gap where a fact should
+ * be: it means this errand never takes a turn of its own. Faint and italic mark
+ * it as the derived reading rather than the operator's own words; the rung is a
+ * value's, not a region's.
+ */
 .errands-row-investigation-none {
   font-style: italic;
   color: var(--text-faint);
@@ -147,37 +289,14 @@
 
 /* ================================================================= detail == */
 
-.errands-facts {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  margin-bottom: var(--space-2);
-}
-
-.errands-chat-key,
-.errands-folder {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-  overflow-wrap: anywhere;
-}
-
-.errands-controls {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-3);
-  margin-bottom: var(--space-2);
-}
-
-.errands-pause,
-.errands-brain {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-}
-
+/**
+ * Out to the Feed, filtered to this errand.
+ *
+ * `--accent` and it stays: this is a link that navigates, which is one of the
+ * three things the Reserved Cyan Rule allows the brand colour to mark. Checked
+ * rather than assumed — the identical-looking `--accent` on an id in
+ * `contacts.css` and `waiting.css` was a violation and moved to a neutral rung.
+ */
 .errands-feed-link {
   display: inline-block;
   margin-top: var(--space-1);
@@ -203,121 +322,7 @@
   grid-column: 2;
 }
 
-.errands-investigation-form > button {
-  grid-column: 1 / -1;
-  justify-self: start;
-}
-
-/* ------------------------------------------------------------- notebook -- */
-
-.errands-notebook-body {
-  margin: 0;
-  padding: var(--space-3);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-}
-
-/* ----------------------------------------------------------------- files -- */
-
-.errands-files {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.errands-file {
-  margin: 0;
-}
-
-.errands-file-path {
-  margin: 0 0 var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-  overflow-wrap: anywhere;
-}
-
-.errands-file-editor {
-  width: 100%;
-  padding: var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  resize: vertical;
-}
-
-.errands-file-editor:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
-}
-
-.errands-file-actions {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  margin-top: var(--space-2);
-}
-
 /* ----------------------------------------------------------------- rules -- */
-
-.errands-rules {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: 0 0 var(--space-3);
-  padding: 0;
-  list-style: none;
-}
-
-.errands-rule {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-}
-
-.errands-rule-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-}
-
-.errands-rule-name {
-  flex: 1 1 8rem;
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-}
-
-.errands-rule-cron {
-  padding: 0 var(--space-1);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-}
-
-.errands-rule-tz {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
 
 .errands-rule-prompt {
   margin: 0;
@@ -362,6 +367,9 @@
   border-top: 1px solid var(--border);
 }
 
+/* The submit sits under the whole grid at its own width — both forms said so
+   separately. */
+.errands-investigation-form > button,
 .errands-rule-form > button {
   grid-column: 1 / -1;
   justify-self: start;

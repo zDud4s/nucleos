@@ -2,11 +2,13 @@
  * The Autopilot slice: the governance cockpit, `ap-` throughout — as `waiting-`
  * is for the queue, `runs-` for the runs and `fleet-` for the fleet.
  *
- * The rule this file lives under: **no class appears in `Autopilot.tsx` that is
- * not defined below.** `tsc` and vitest both pass happily on a class no
+ * The rule this file lives under: **no `ap-` class appears in `Autopilot.tsx`
+ * that is not defined below.** `tsc` and vitest both pass happily on a class no
  * stylesheet has ever heard of, and the defect shows up only as something
  * looking wrong on a screen nobody is testing. Grep the component against this
- * file before calling the page done.
+ * file before calling the page done. `ui-` classes are the exception and are
+ * not this file's to define — they arrive with a primitive imported from
+ * `../ui`, which is where their recipe and their argument both live.
  *
  * One column, like the queue and for the same reason: this page is read top to
  * bottom in the order the brakes apply. A two-column layout would put half the
@@ -15,11 +17,21 @@
 
 /* =============================================================== the page == */
 
+/**
+ * The page's own column, named rather than measured.
+ *
+ * `--width-column` is the 64rem the three blocks below each wrote out
+ * literally, and six sites across this page, `projects.css` and `system.css`
+ * had agreed on that number without ever saying so — which is exactly how a
+ * seventh gets to disagree by accident. It is a different measurement from the
+ * `78rem` outer cap on `.app-page`: that one is the window, this one is the
+ * column, and both stay.
+ */
 .ap-sections {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  max-width: 64rem;
+  max-width: var(--width-column);
 }
 
 /* The stat row under the header — the same shape the Fleet page uses. */
@@ -28,7 +40,7 @@
   grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
   gap: var(--space-3);
   margin-bottom: var(--space-4);
-  max-width: 64rem;
+  max-width: var(--width-column);
 }
 
 /* =============================================================== banners == */
@@ -47,7 +59,7 @@
   gap: var(--space-1);
   margin: 0 0 var(--space-4);
   padding: var(--space-3) var(--space-4);
-  max-width: 64rem;
+  max-width: var(--width-column);
   border-radius: var(--radius-md);
   border: 1px solid var(--border);
   border-left-width: 3px;
@@ -83,6 +95,14 @@
 
 /* ============================================================ shared text == */
 
+/**
+ * What a panel is for, said once above its list.
+ *
+ * Only above a list that has something in it. A panel with nothing in it says
+ * the same thing through `Quiet`, which keeps the prose one click behind the
+ * line rather than in front of it — a cockpit of seven panels that each explain
+ * themselves in a paragraph gets longer the quieter it is, which is backwards.
+ */
 .ap-note {
   margin: 0 0 var(--space-3);
   font-size: var(--text-sm);
@@ -90,25 +110,31 @@
   color: var(--text-muted);
 }
 
-.ap-empty,
+/**
+ * A wait, not an absence — which is why this survived while the six absences
+ * beside it became `Quiet`.
+ *
+ * The system settled the empty-state rung at `--text-muted`: in an empty region
+ * the sentence *is* the content, and content set fainter than the labels around
+ * it reads as failure rather than as emptiness. A line saying "reading…" is the
+ * other case entirely. It stands in for the thing that is about to replace it,
+ * so it should recede rather than be read, and faint is exactly that rung.
+ */
 .ap-loading {
   margin: 0;
   font-size: var(--text-sm);
   color: var(--text-faint);
 }
 
-/* A heading inside a panel, above a second block. */
-.ap-subhead {
-  margin: var(--space-4) 0 var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-/* The count in a panel's heading corner. Tabular, so a column of them is a
-   column rather than a wobble. */
+/**
+ * The count in a panel's heading corner. Tabular, so a column of them is a
+ * column rather than a wobble.
+ *
+ * One site left: the scoreboard's `1/2 classes ready`. That is a ratio with a
+ * trailing adjective rather than a quantity, and the shared `Count` takes a
+ * number and an optional noun — routing this through it would mean inventing a
+ * second shape for one call site. Every other count on this page is `Count`.
+ */
 .ap-count {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
@@ -117,6 +143,7 @@
 }
 
 .ap-meta {
+  margin: 0;
   font-size: var(--text-xs);
   color: var(--text-faint);
 }
@@ -132,6 +159,16 @@
   text-decoration: underline;
 }
 
+/* The small print under a control: what a brake covers, and what one cannot
+   promise. Same rung, and the hedge adds only what makes it a hedge. */
+.ap-switch-note,
+.ap-hedge {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--text-faint);
+}
+
 /**
  * A hedge: something the page can draw but must not promise.
  *
@@ -140,48 +177,152 @@
  * a control simply does not do what its neighbours do.
  */
 .ap-hedge {
-  margin: var(--space-2) 0 0;
-  font-size: var(--text-xs);
-  line-height: var(--leading-normal);
-  color: var(--text-faint);
+  margin-top: var(--space-2);
   font-style: italic;
+}
+
+/**
+ * A second group inside a panel, under its own heading.
+ *
+ * The heading is a `Section` now rather than the hand-rolled `.ap-subhead` that
+ * used to sit here, which set a section title in the mono face — and the face is
+ * a claim about origin, so "ask for one" in mono said the daemon wrote it. A
+ * section title also brings no margin of its own, because the container owns the
+ * rhythm. This is that container, and the air above it is the one thing
+ * `.ap-subhead` had that the shared heading deliberately does not.
+ */
+.ap-group {
+  margin-top: var(--space-4);
+}
+
+/* Same argument, one level down: inside a group the gap is the rhythm, so the
+   note must not also bring its own. */
+.ap-group .ap-note {
+  margin-bottom: 0;
+}
+
+/* ================================================================ fields == */
+
+/**
+ * The label rank: field names and the name over a control.
+ *
+ * Three copies of the same three declarations, said once. This is **not** a
+ * section title and must not be folded into `Section`: a heading is set in the
+ * display face at `--tracking-wider`, this is set in the body face at
+ * `--tracking-wide`, and at 11px that 0.06em is the whole of what stops a field
+ * name and a heading being told apart.
+ */
+.ap-fact dt,
+.ap-root-label,
+.ap-field-label {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/**
+ * The two fields this page owns.
+ *
+ * `ui.css` ships no input primitive — that is the largest remaining hole in the
+ * component layer, and closing it is not a page's job. What is a page's job is
+ * saying the shared half once: the two differ only in the face, in how they
+ * take their width, and in whether they resize.
+ */
+.ap-root-input,
+.ap-field-input {
+  padding: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+/* One of the app's four focus overrides, and like the other three it keeps the
+   colour and the 2px and changes only the offset — tight controls, little room
+   around them. */
+.ap-root-input:focus-visible,
+.ap-field-input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* A path came from the machine, so it is set in the machine's face, and it
+   takes whatever room the label and the button leave. */
+.ap-root-input {
+  flex: 1 1 20rem;
+  min-width: 0;
+  font-family: var(--font-mono);
+}
+
+/* A prompt is a person's sentence, and grows downwards as one. */
+.ap-field-input {
+  width: 100%;
+  font-family: var(--font-body);
+  line-height: var(--leading-normal);
+  resize: vertical;
+}
+
+.ap-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: flex-start;
 }
 
 /* ================================================================= lists == */
 
-.ap-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
+/* Three lists, one reset. What each one does with the space is below it. */
+.ap-list,
+.ap-switches,
+.ap-feed {
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-/* ---------------------------------------------------------- project rows -- */
-
-.ap-row {
+.ap-list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
+  gap: var(--space-3);
 }
 
-/* The project the shadow panels below are about. Marked with the brand rule
-   rather than a fill: it is a pointer, not a state. */
-.ap-row-selected {
-  border-color: var(--accent);
-  box-shadow: inset 3px 0 0 var(--accent);
-}
-
-.ap-row-head {
+/**
+ * The head line of a box: a name, some badges, a time.
+ *
+ * Three copies of the same four declarations — the project row's, the decision
+ * card's and the brake's. `Inset` takes no head slot, deliberately: the
+ * nineteen page copies of that box each had a `-head` div and they have nothing
+ * in common but `display: flex`. This page's three do have something in common,
+ * so they say it once here instead of three times.
+ */
+.ap-row-head,
+.ap-card-head,
+.ap-switch-head {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
+}
+
+/* ---------------------------------------------------------- project rows -- */
+
+/**
+ * The project the shadow panels below are about.
+ *
+ * A rung of the border ladder, and not the accent it used to be. Signal Cyan
+ * marks the wordmark, links and the focus ring and nothing else; a selection
+ * wearing it reads as a link that does not navigate, and it makes an
+ * interaction look like a status. The row is already at the top of the neutral
+ * fill ladder — `Inset` is `--surface-raised` — so what is left to move is the
+ * frame: the hairline goes to its strong weight and grows a 3px left rule,
+ * which is a border drawn as an inset shadow rather than elevation, and the
+ * same gesture the rail uses to mark the row you are on.
+ */
+.ap-row-selected {
+  border-color: var(--border-strong);
+  box-shadow: inset 3px 0 0 var(--border-strong);
 }
 
 .ap-facts {
@@ -195,13 +336,6 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-}
-
-.ap-fact dt {
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 .ap-fact dd {
@@ -225,10 +359,17 @@
  * Two states and no third: open is informational, locked is held. Neither is
  * red — a project that has not earned promotion is a project doing exactly what
  * shadow mode is for.
+ *
+ * Each state is its tone's full triple. It carried the foreground and the fill
+ * and skipped the edge, which is half a tone: on the raised fill of the row
+ * around it a 12% wash with no edge has no boundary of its own, and a tone that
+ * is not the whole triple is the first step towards a new colour being invented
+ * for the next condition.
  */
 .ap-gate {
   margin: 0;
   padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--tone-active-border);
   border-radius: var(--radius-sm);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
@@ -237,6 +378,7 @@
 }
 
 .ap-gate-locked {
+  border-color: var(--tone-shadow-border);
   color: var(--tone-shadow-fg);
   background: var(--tone-shadow-bg);
 }
@@ -250,6 +392,15 @@
  * prerequisite is missing — and a root is the one of the four prerequisites the
  * shell can do something about. Laid out as a row that wraps, so a long Windows
  * path does not push the button off the panel.
+ *
+ * A well, and not a third card. This sits inside a project row, which sits
+ * inside a panel, and the graduation stops at one step — panel, inset, then
+ * nothing. It used to carry a dashed frame saying "provisional", and at the
+ * third level in that frame was simply a third frame: what it produced was
+ * boxes-in-boxes, not provisionality. The sunken rung says "well" on its own in
+ * both themes (`#08090c` under the raised row in dark, `#eceef3` under white in
+ * light), and what says this is provisional is that it is only on the screen
+ * while a refusal is standing.
  */
 .ap-root {
   display: flex;
@@ -257,53 +408,11 @@
   align-items: center;
   gap: var(--space-2);
   padding: var(--space-3);
-  border: 1px dashed var(--border-strong);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
 }
 
-.ap-root-label {
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.ap-root-input {
-  flex: 1 1 20rem;
-  min-width: 0;
-  padding: var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  color: var(--text);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-}
-
-.ap-root-input:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
-}
-
 /* ============================================================ decision cards == */
-
-.ap-card {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
-}
-
-.ap-card-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-}
 
 .ap-card-id {
   font-family: var(--font-mono);
@@ -317,6 +426,8 @@
   color: var(--text);
 }
 
+/* Why the classifier decided what it did. When it recorded nothing, that is an
+   absence and `Quiet` says so — same rung, one shared recipe. */
 .ap-reason {
   margin: 0;
   font-size: var(--text-sm);
@@ -331,6 +442,10 @@
  * the difference is deliberate: there the question is whether an action may
  * happen, here it is whether the classifier read *this exact text* correctly.
  * Scrolls in its own box rather than stretching the card.
+ *
+ * A well, like the root field above and for the same reason: it is the third
+ * level in, the ladder has no third card rank, and the hairline it used to
+ * carry was the frame that made the nesting visible in the first place.
  */
 .ap-raw {
   margin: 0;
@@ -342,7 +457,6 @@
   line-height: var(--leading-snug);
   color: var(--text-muted);
   background: var(--surface-sunken);
-  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   white-space: pre-wrap;
   word-break: break-word;
@@ -400,26 +514,6 @@
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
   gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.ap-switch {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
-}
-
-.ap-switch-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
 }
 
 .ap-switch-name {
@@ -429,72 +523,30 @@
   color: var(--text);
 }
 
-.ap-switch-note {
-  margin: 0;
-  font-size: var(--text-xs);
-  line-height: var(--leading-normal);
-  color: var(--text-faint);
-}
-
-/* ================================================================== jobs == */
-
-.ap-job {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-raised);
-}
-
-.ap-job .ap-meta {
-  margin: 0;
-}
-
-.ap-form {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  align-items: flex-start;
-}
-
-.ap-field-label {
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.ap-field-input {
-  width: 100%;
-  padding: var(--space-2);
-  font-family: var(--font-body);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--text);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  resize: vertical;
-}
-
-.ap-field-input:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
-}
-
 /* ================================================================== feed == */
 
 .ap-feed {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
 }
 
+/**
+ * A ruled line, and not `Rows`.
+ *
+ * `Rows`/`Row` is the shared column read by scanning down it, and this embed is
+ * exactly that kind of column — but a `Row` stacks its children in a column and
+ * takes no `className`, while a feed line is a badge, a summary and a time on
+ * one baseline. Wrapping the line in a div inside a `Row` would put a box back
+ * where the primitive exists to take one out, so the hand-rolled version stays
+ * until `Row` can carry a horizontal line.
+ *
+ * That leaves the `border-bottom` plus `:last-child` pair below, which is the
+ * two-rule arrangement `.ui-rows` replaces with one — the exception is the half
+ * everybody forgets, and forgetting it is how a list ends with a rule hanging
+ * under nothing. It is written out here because it is not forgotten, not
+ * because it is the better shape.
+ */
 .ap-feed-line {
   display: flex;
   flex-wrap: wrap;

@@ -14,7 +14,17 @@ import {
   type SavedAttachments,
   type SavedFile,
 } from "../data/mail";
-import { Button, ConfirmButton, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime, StateBadge } from "../ui";
+import {
+  Button,
+  ConfirmButton,
+  ErrorNote,
+  Inset,
+  PageHeader,
+  Panel,
+  RefusalNote,
+  RelativeTime,
+  StateBadge,
+} from "../ui";
 import "./mail.css";
 
 /**
@@ -236,8 +246,12 @@ function AttachmentRow({ emailId, attachment }: { emailId: number; attachment: E
   const download = useDownloadAttachment(emailId);
   const senderName = attachment.filename ?? `attachment ${attachment.position}`;
 
+  // One item of a list this panel has already opened, so `Inset` draws it as an
+  // `li`. It was the same box hand-rolled — border, `--radius-md`, `--space-3`
+  // of padding — on `--surface` rather than the inset's `--surface-raised`,
+  // which is the one rung it disagreed with the system on.
   return (
-    <li className="mail-detail-attachment">
+    <Inset as="li">
       <div className="mail-detail-attachment-head">
         <span className="mail-detail-attachment-name">{senderName}</span>
         <span className="mail-detail-attachment-meta">
@@ -261,7 +275,7 @@ function AttachmentRow({ emailId, attachment }: { emailId: number; attachment: E
       {save.isSuccess && <SavedOneNote result={save.data} />}
       {save.isError && <AttachmentError error={save.error} what="that attachment could not be saved" />}
       {download.isError && <AttachmentError error={download.error} what="that attachment could not be downloaded" />}
-    </li>
+    </Inset>
   );
 }
 

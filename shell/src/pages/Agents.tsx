@@ -285,7 +285,7 @@ function Catalogue({
   return (
     <div className="agents-scroller">
       <table className="agents-table">
-        <caption className="agents-said">
+        <caption className="sr-only">
           Every agent in the catalogue, what it runs on and how much of it is spoken for
         </caption>
         <thead>
@@ -332,7 +332,15 @@ function CatalogueRow({
 }) {
   return (
     <tr className={open ? "agents-row agents-row-open" : "agents-row"}>
-      <th scope="row" className="agents-who">
+      {/*
+        The open row is marked by `.ui-current` — a 2px inset rule on the leading
+        edge, in `--text` — and by nothing else. It goes on the row header rather
+        than on the `tr` because in a `border-collapse: collapse` table a row is
+        not a box that paints a shadow of its own, while the header cell is, and
+        the header cell IS the row's leading edge. See the comment beside
+        `.agents-row-open` for the fill this replaced and why it went.
+      */}
+      <th scope="row" className={open ? "agents-who ui-current" : "agents-who"}>
         {/*
           The name is the control. There is no separate Edit button per row: the
           row IS the way in, and the editor it opens is the only one on the page.
@@ -395,10 +403,10 @@ function Called({ agent }: { agent: Agent }) {
         purpose: it comes from `::before`, so it is never in the accessibility
         tree, and the sentence below carries that fact in language instead.
       */}
-      <span className="agents-said">known to the núcleo as </span>
+      <span className="sr-only">known to the núcleo as </span>
       {agent.id}
       {diverged && (
-        <span className="agents-said">
+        <span className="sr-only">
           {" "}
           — renamed since; rosters, team items, job items and council seats all still point at this
           id
@@ -429,7 +437,7 @@ function Model({ agent }: { agent: Agent }) {
       title="names no model, so it can never take a council seat — a seat records the model it ran"
     >
       the engine&rsquo;s default
-      <span className="agents-said"> — names no model, so it can never take a council seat</span>
+      <span className="sr-only"> — names no model, so it can never take a council seat</span>
     </span>
   );
 }
@@ -471,7 +479,7 @@ function Tools({ agent }: { agent: Agent }) {
     <span className={`agents-tools agents-tools-${reading}`} title={`${agent.tool_policy}: ${TOOLS_SAID[reading]}`}>
       <span aria-hidden="true">{TOOLS_MARK[reading]}</span>
       <span aria-hidden="true">{agent.tool_policy}</span>
-      <span className="agents-said">
+      <span className="sr-only">
         {agent.tool_policy}: {TOOLS_SAID[reading]}
       </span>
     </span>
@@ -504,7 +512,7 @@ function Employed({ employment, known }: { employment: Employment; known: boolea
     return (
       <span className="agents-figure agents-figure-unknown" title="the department list has not answered yet">
         <span aria-hidden="true">·</span>
-        <span className="agents-said">the department list has not answered — this is not zero</span>
+        <span className="sr-only">the department list has not answered — this is not zero</span>
       </span>
     );
   }
@@ -513,7 +521,7 @@ function Employed({ employment, known }: { employment: Employment; known: boolea
     return (
       <span className="agents-figure agents-figure-none" title="no department names this one">
         <span aria-hidden="true">—</span>
-        <span className="agents-said">no department names this one</span>
+        <span className="sr-only">no department names this one</span>
       </span>
     );
   }
@@ -523,13 +531,13 @@ function Employed({ employment, known }: { employment: Employment; known: boolea
       {employment.directs.length > 0 && (
         <span className="agents-standing" title={`directs ${employment.directs.join(", ")}`}>
           <span aria-hidden="true">◉ {employment.directs.length}</span>
-          <span className="agents-said">directs {employment.directs.join(", ")}. </span>
+          <span className="sr-only">directs {employment.directs.join(", ")}. </span>
         </span>
       )}
       {employment.staffs.length > 0 && (
         <span className="agents-standing" title={`on the roster of ${employment.staffs.join(", ")}`}>
           <span aria-hidden="true">● {employment.staffs.length}</span>
-          <span className="agents-said">on the roster of {employment.staffs.join(", ")}.</span>
+          <span className="sr-only">on the roster of {employment.staffs.join(", ")}.</span>
         </span>
       )}
     </span>

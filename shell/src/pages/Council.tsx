@@ -13,11 +13,16 @@ import {
 import {
   Button,
   ConfirmButton,
+  Count,
   ErrorNote,
+  Inset,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
   StaleNote,
   StateBadge,
   Teach,
@@ -174,8 +179,12 @@ function CouncilList({
 }) {
   return (
     <Panel title="Councils" aside={<Count n={answered ? rows.length : undefined} />}>
+      {/* A wait and an absence, and they must not read the same. The loading
+          line is faint prose about to be replaced by the list; `Quiet` is the
+          answer that there is no list, which is the panel's content and is set
+          at the rung content is set at. */}
       {!answered && <p className="council-loading">reading the councils…</p>}
-      {answered && rows.length === 0 && <p className="council-empty">no council has been convened yet.</p>}
+      {answered && rows.length === 0 && <Quiet says="no council has been convened yet." />}
       {rows.length > 0 && (
         <ul className="council-list" aria-label="Councils">
           {rows.map((row) => (
@@ -187,13 +196,26 @@ function CouncilList({
   );
 }
 
+/**
+ * One council in the list, as a whole-row link.
+ *
+ * The row you are on is marked by `.ui-current` and by nothing else — a 2px
+ * rule on the leading edge, in a neutral. The class rather than a `current`
+ * prop because the box here has to be the `<a>` that carries the hit area, and
+ * neither `Inset` nor `Row` draws an anchor. `aria-current` is the same fact
+ * said to a screen reader and stays beside it.
+ */
 function CouncilRow({ row, active }: { row: CouncilSummary; active: boolean }) {
   return (
-    <li className={active ? "council-row council-row-active" : "council-row"}>
-      <Link className="council-row-link" to={`/council/${row.id}`} aria-current={active ? "page" : undefined}>
+    <li>
+      <Link
+        className={active ? "council-row-link ui-current" : "council-row-link"}
+        to={`/council/${row.id}`}
+        aria-current={active ? "page" : undefined}
+      >
         <span className="council-row-question">{row.question}</span>
         <StateBadge domain="council" state={row.status} />
-        <span className="council-row-phase">phase {row.stage} of 3</span>
+        <span className="council-phase">phase {row.stage} of 3</span>
         <RelativeTime at={row.created_at} />
       </Link>
     </li>
@@ -281,7 +303,7 @@ function SeatGrid({ seats }: { seats: SeatView[] }) {
   return (
     <Panel title="Seats" aside={<Count n={seats.length} />}>
       {seats.length === 0 ? (
-        <p className="council-empty">no seat has been recorded for this council yet.</p>
+        <Quiet says="no seat has been recorded for this council yet." />
       ) : (
         <ul className="council-seats" aria-label="Seats">
           {seats.map((seat) => (
@@ -317,7 +339,7 @@ function SeatCard({ seat }: { seat: SeatView }) {
   const abstained = seat.stage2_status === "ok" && seat.rankings.length === 0;
 
   return (
-    <li className="council-seat">
+    <Inset as="li">
       <div className="council-seat-head">
         <span className="council-seat-name">{seatName(seat.kind)}</span>
         <span className="council-seat-idx">seat {seat.seat_idx}</span>
@@ -347,7 +369,7 @@ function SeatCard({ seat }: { seat: SeatView }) {
       {/* A blank vote is a valid outcome, not a failure — the seat answered ok
           and simply ranked nobody. */}
       {abstained && <p className="council-seat-abstained">abstained</p>}
-    </li>
+    </Inset>
   );
 }
 
@@ -362,17 +384,20 @@ function Leaderboard({ leaderboard }: { leaderboard: LeaderboardEntry[] }) {
           that does not stop the chairman from writing a synthesis.
         </p>
       ) : (
-        <ul className="council-leaderboard" aria-label="Leaderboard">
+        /* A column read by scanning down it rather than picked out of, so it is
+           `Rows` and not a stack of boxes — and the three parts of a ranking sit
+           on one baseline, which is what `layout="line"` is. */
+        <Rows label="Leaderboard">
           {leaderboard.map((entry) => (
-            <li className="council-leaderboard-row" key={entry.seat_idx}>
+            <Row layout="line" key={entry.seat_idx}>
               <span className="council-leaderboard-seat">seat {entry.seat_idx}</span>
               <span className="council-leaderboard-rank">avg rank {entry.avg_rank.toFixed(2)}</span>
               {/* n travels with the average always: one vote and five votes are
                   not the same claim, and dropping this would present them as one. */}
               <span className="council-leaderboard-n">n = {entry.n}</span>
-            </li>
+            </Row>
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
@@ -406,14 +431,7 @@ function Synthesis({ synthesis, error }: { synthesis: string | null; error: stri
   }
   return (
     <Panel title="Synthesis">
-      <p className="council-note">no synthesis yet.</p>
+      <Quiet says="no synthesis yet." />
     </Panel>
   );
-}
-
-/* ---------------------------------------------------------------- shared -- */
-
-function Count({ n }: { n: number | undefined }) {
-  if (n === undefined) return null;
-  return <span className="council-count">{n}</span>;
 }

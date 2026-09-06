@@ -10,7 +10,7 @@ import {
   type TriageCounts,
   type Watch,
 } from "../data/project-map";
-import { RelativeTime } from "../ui";
+import { Inset, RelativeTime, SectionTitle } from "../ui";
 import { GiveStamp } from "./GiveStamp";
 
 /**
@@ -165,9 +165,9 @@ export function StampsPanel({
 
   return (
     <section aria-label="Your stamps" className="flex flex-col gap-6">
-      <h2 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle level={2}>
         What you said, and whether it still holds
-      </h2>
+      </SectionTitle>
 
       {/*
         §5.3's header, written as ONE sentence and not as four figures with captions. The words are
@@ -350,9 +350,9 @@ function OnYourDesk({
 
   return (
     <div className="flex flex-col gap-2">
-      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle>
         On your desk
-      </h3>
+      </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
         {total} {plural(total, "stamp", "stamps")} you gave stopped being true. §7 puts the diff
         between what you stamped and what is there now on the row: re-stamping is one click when it
@@ -465,9 +465,9 @@ function PartWay({
 
   return (
     <div className="flex flex-col gap-2">
-      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle>
         Part-way, and you know it
-      </h3>
+      </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
         {total} {plural(total, "decision", "decisions")} you stamped with a note. The note is on the
         row and never on a hover — §5.2 makes it the whole of amber. This verdict does not expire
@@ -524,9 +524,9 @@ function Withdrawn({
 
   return (
     <div className="flex flex-col gap-3">
-      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle>
         Withdrawn, and the document has not caught up
-      </h3>
+      </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
         {total} {plural(total, "decision", "decisions")} you changed your mind about. Withdrawing is
         a statement and not a forgetting: it stops the map asking without the line disappearing in
@@ -593,9 +593,9 @@ function NeverExpires({
 }) {
   return (
     <div className="flex flex-col gap-3">
-      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle>
         Stamped, and it will never come back to ask
-      </h3>
+      </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
         {`${stamps.unwatched} of your greens are standing on something that cannot move, so nothing will ever expire them.`}{" "}
         §7 says such a stamp is to be shown rather than enjoyed, and the three reasons below want
@@ -690,9 +690,9 @@ function Guessed({
         under it and one of them is the reassuring one. A heading that said only "guessed" would
         make the certain count read as a footnote to a complaint.
       */}
-      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle>
         What your greens are watching
-      </h3>
+      </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
         {`${stamps.guessed} of your greens are watching files matched by section number alone. Code names the section and never says which document the section belongs to, so such a stamp will expire — and it may expire because an unrelated file that happens to write the same §N about a different document changed.`}
       </p>
@@ -740,9 +740,9 @@ function NeverLooked({
 
   return (
     <div className="flex flex-col gap-2">
-      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle>
         Nobody has looked at these
-      </h3>
+      </SectionTitle>
       {/*
         The ordering is disclosed rather than left to be inferred, and this is the pile where it
         matters: §10 asks for recency of the anchor code's last change — *"o que é que se mexeu
@@ -803,7 +803,7 @@ function Line({
   const named = capped(paths, 4);
 
   return (
-    <li className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-3">
+    <Inset as="li">
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
         <span className="text-xs text-text-muted">{row.section}</span>
         <span className="truncate font-mono text-xs text-text-faint">{row.spec_slug}</span>
@@ -819,7 +819,7 @@ function Line({
         </p>
       ) : null}
       {children}
-    </li>
+    </Inset>
   );
 }
 
