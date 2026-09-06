@@ -7,6 +7,7 @@ import {
   useCouncils,
   useCreateCouncil,
   type CouncilSummary,
+  type CouncilView,
   type LeaderboardEntry,
   type SeatView,
 } from "../data/council";
@@ -240,6 +241,7 @@ function CouncilDetail({ id }: { id: string }) {
         <div className="council-facts">
           <StateBadge domain="council" state={detail.status} />
           <span className="council-phase">phase {detail.stage} of 3</span>
+          <span className="council-chairman">{chairmanLine(detail)}</span>
           <RelativeTime at={detail.created_at} />
         </div>
         {cancel.isError && <CancelRefusal error={cancel.error} />}
@@ -257,6 +259,24 @@ function CouncilDetail({ id }: { id: string }) {
       <Synthesis synthesis={detail.synthesis} error={detail.error} />
     </>
   );
+}
+
+/**
+ * Who chaired, and on what.
+ *
+ * This panel never said. The synthesis below it is one seat's writing, and a
+ * reader who disagrees with it has no way to ask which of the roster wrote it.
+ * `chairman_ref` is printed whether or not an agent chaired, because the model
+ * is the fact that survives — an agent can be renamed or deleted, and the row
+ * keeps the model that answered on purpose (`0065_council.sql`).
+ *
+ * A deleted chairman falls back to its id rather than to nothing: an id is
+ * ugly and is still an answer to "who".
+ */
+function chairmanLine(view: CouncilView): string {
+  const named = view.chairman_agent_name ?? view.chairman_agent_id;
+  if (named === null) return `chaired by ${view.chairman_ref}`;
+  return `chaired by ${named} on ${view.chairman_ref}`;
 }
 
 function DetailError({ error }: { error: unknown }) {
@@ -294,9 +314,24 @@ function SeatGrid({ seats }: { seats: SeatView[] }) {
   );
 }
 
-/** What this seat is called out loud, from what the wire actually names. */
-function seatName(kind: string): string {
-  const trimmed = kind.trim();
+/**
+ * What this seat is called out loud.
+ *
+ * An agent's name wins the title, and the model stays underneath it in
+ * `.council-seat-ref`: *who* answered and *what* ran are different facts, and
+ * the second is the one you reach for when the answer is bad. A seat the
+ * roster named by model has no name of its own, so its kind is still the title
+ * — that case is unchanged and is not the lesser one.
+ *
+ * The agent's id stands in when the name is gone. `agent_name` is read from
+ * the catalogue as the view is built, so a `null` beside a set `agent_id`
+ * means the agent has been deleted since it answered — a real state the seat
+ * says out loud rather than papering over with a blank line.
+ */
+function seatTitle(seat: SeatView): string {
+  if (seat.agent_name !== null) return seat.agent_name;
+  if (seat.agent_id !== null) return seat.agent_id;
+  const trimmed = seat.kind.trim();
   return trimmed === "" ? "unnamed seat" : trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
 }
 
@@ -316,14 +351,26 @@ function answerText(seat: SeatView): string {
 
 function SeatCard({ seat }: { seat: SeatView }) {
   const abstained = seat.stage2_status === "ok" && seat.rankings.length === 0;
+  // An agent that answered and is no longer in the catalogue. Told apart from a
+  // model-named seat by `agent_id`, which the row keeps forever.
+  const agentIsGone = seat.agent_id !== null && seat.agent_name === null;
 
   return (
     <li className="council-seat">
       <div className="council-seat-head">
-        <span className="council-seat-name">{seatName(seat.kind)}</span>
+        <span
+          className={
+            seat.agent_id === null ? "council-seat-name" : "council-seat-name council-seat-agent"
+          }
+        >
+          {seatTitle(seat)}
+        </span>
         <span className="council-seat-idx">seat {seat.seat_idx}</span>
       </div>
       <p className="council-seat-ref">{seat.ref}</p>
+      {agentIsGone && (
+        <p className="council-seat-gone">this agent is no longer in the catalogue</p>
+      )}
 
       <div className="council-seat-stage">
         <span className="council-seat-stage-label">stage 1</span>

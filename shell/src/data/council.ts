@@ -53,6 +53,18 @@ export interface SeatView {
   kind: string;
   /** The wire name. See the module header — this is `model_ref` in Rust. */
   ref: string;
+  /**
+   * The agent that took this seat, when one did. `null` for a seat the roster
+   * named by model, which is still the ordinary case and is not a lesser one.
+   */
+  agent_id: string | null;
+  /**
+   * The agent's name, read from the catalogue as the view is built rather than
+   * copied onto the row. So `agent_id` set with `agent_name` `null` is a real
+   * state and not a gap: the agent has been deleted since it answered. The
+   * card says so; it does not print an empty title.
+   */
+  agent_name: string | null;
   stage1_status: string;
   stage1_error: string | null;
   answer: string | null;
@@ -83,6 +95,10 @@ export interface CouncilView {
   error: string | null;
   chairman_kind: string;
   chairman_ref: string;
+  /** The agent that chaired, when one did — `null` when the roster named a model. */
+  chairman_agent_id: string | null;
+  /** `null` alongside a set `chairman_agent_id` means that agent is gone, as on a seat. */
+  chairman_agent_name: string | null;
   /** The chairman's synthesis, once phase 3 has produced one. Plain text, never markup. */
   synthesis: string | null;
   anon_map: Record<string, number>;
@@ -98,8 +114,10 @@ export interface CouncilView {
  *
  * `keys.council` landed as a minimal `{ all }` root — this packet's roster of
  * allowed files does not include `data/keys.ts`, so the list and detail keys
- * are built here, under that root, the same way `WAITING_KEYS` extends
- * `keys.waiting.all` in `data/waiting.ts`.
+ * are built here, under that root. It used to say `WAITING_KEYS` in
+ * `data/waiting.ts` does the same; that constant was retired into the Pillars
+ * namespace (`keys.ts:431` records the reform) and is no longer an example of
+ * anything.
  */
 const COUNCIL_KEYS = {
   list: [...keys.council.all, "list"] as const,

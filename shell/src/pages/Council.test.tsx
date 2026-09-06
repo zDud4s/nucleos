@@ -54,6 +54,8 @@ function seatView(overrides: Partial<SeatView> = {}): SeatView {
     seat_idx: 0,
     kind: "cloud",
     ref: "claude-opus-4",
+    agent_id: null,
+    agent_name: null,
     stage1_status: "ok",
     stage1_error: null,
     answer: "yes, ship it — the tests carry the proof",
@@ -74,6 +76,8 @@ function councilView(overrides: Partial<CouncilView> = {}): CouncilView {
     error: null,
     chairman_kind: "cloud",
     chairman_ref: "claude-opus-4",
+    chairman_agent_id: null,
+    chairman_agent_name: null,
     synthesis: null,
     anon_map: { A: 0, B: 1 },
     leaderboard: [],
@@ -183,6 +187,115 @@ describe("Council - an expired answer", () => {
     await renderCouncil("/council/c-1");
 
     expect(await screen.findByText("answered — the text has expired")).toBeDefined();
+  });
+});
+
+/* ------------------------------------------------------- seats an agent took -- */
+
+describe("Council - a seat an agent filled", () => {
+  it("shows who answered and what ran, name above and model beneath", async () => {
+    const view = councilView({
+      seats: [seatView({ agent_id: "ag-7", agent_name: "the sceptic" })],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+
+    const seats = await panelFor("Seats");
+    // Both facts on the card, not one. The name answers who, and the model is
+    // what a reader reaches for when the answer is bad — a card that showed
+    // only the name would have taken that away to make room for it.
+    expect(within(seats).getByText("the sceptic")).toBeDefined();
+    expect(within(seats).getByText("claude-opus-4")).toBeDefined();
+    // The kind was the title while no seat had a name of its own. It must not
+    // still be it, or an agent roster reads as a list of "Cloud, Cloud, Cloud".
+    expect(within(seats).queryByText("Cloud")).toBeNull();
+  });
+
+  it("keeps the kind as the title for a seat the roster named by model", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": councilView() }),
+    );
+
+    await renderCouncil("/council/c-1");
+
+    // The non-regression half: agents are an addition to this page, not a
+    // migration of it, and a roster written the old way renders as it did.
+    const seats = await panelFor("Seats");
+    expect(within(seats).getByText("Cloud")).toBeDefined();
+    expect(within(seats).getByText("claude-opus-4")).toBeDefined();
+  });
+});
+
+describe("Council - a seat whose agent was deleted", () => {
+  it("says the agent is gone instead of going blank", async () => {
+    const view = councilView({
+      seats: [seatView({ agent_id: "ag-7", agent_name: null })],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+
+    // `agent_name` is read from the catalogue as the view is built, so this
+    // pair — an id with no name — is the deleted agent, and the daemon is not
+    // wrong to serve it. The title falls back to the id: ugly, and still an
+    // answer to who. An empty title would be the page pretending nobody sat.
+    const seats = await panelFor("Seats");
+    const title = seats.querySelector(".council-seat-name");
+    expect(title?.textContent?.trim()).toBe("ag-7");
+    expect(within(seats).getByText(/no longer in the catalogue/i)).toBeDefined();
+    // And the model the seat recorded is untouched by the deletion — that is
+    // the whole reason the row copies it instead of reading it back.
+    expect(within(seats).getByText("claude-opus-4")).toBeDefined();
+  });
+});
+
+describe("Council - who chaired", () => {
+  it("names the chairman agent and the model it chaired on", async () => {
+    const view = councilView({
+      chairman_agent_id: "ag-1",
+      chairman_agent_name: "the arbiter",
+      chairman_ref: "gpt-5",
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+
+    // Scoped to the detail panel: the synthesis is one seat's writing, and
+    // until now this page never said whose.
+    const panel = await panelFor("This council");
+    expect(within(panel).getByText("chaired by the arbiter on gpt-5")).toBeDefined();
+  });
+
+  it("names the model alone when no agent chaired", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": councilView() }),
+    );
+
+    await renderCouncil("/council/c-1");
+
+    // `chairman_ref` is printed either way. It is the fact that survives the
+    // agent being renamed or deleted, which is why the row copies it.
+    const panel = await panelFor("This council");
+    expect(within(panel).getByText("chaired by claude-opus-4")).toBeDefined();
+  });
+
+  it("falls back to the id when the chairman's agent was deleted", async () => {
+    const view = councilView({
+      chairman_agent_id: "ag-1",
+      chairman_agent_name: null,
+      chairman_ref: "gpt-5",
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+
+    // The same state a seat handles, at the chairman's position: the name is
+    // read from the catalogue as the view is built, so a null beside a set id
+    // is a deletion, not a gap. The line does not collapse to "chaired by
+    // gpt-5" — that would say a model chaired when an agent did.
+    const panel = await panelFor("This council");
+    expect(within(panel).getByText("chaired by ag-1 on gpt-5")).toBeDefined();
   });
 });
 
