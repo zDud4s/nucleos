@@ -26,6 +26,8 @@ import {
   PageHeader,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
   StaleNote,
   StateBadge,
   Teach,
@@ -343,11 +345,16 @@ function FeedList({
 
   return (
     <>
-      <ul className="feed-list" aria-label="Feed">
+      {/* Hairline-ruled and not a column of cards: the feed is read by scanning
+          down it, not by picking lines out of it — the argument `.ui-rows` now
+          carries for all four lists that had grown it byte for byte. The label
+          is what a screen reader gets instead of the rules, which are not
+          announced. */}
+      <Rows label="Feed">
         {rows.map((entry) => (
           <FeedRow key={entry.id} entry={entry} onFilter={onFilter} />
         ))}
-      </ul>
+      </Rows>
       {!searching && rows.length >= FEED_LIST_LIMIT && (
         <p className="feed-ceiling">
           showing the newest {FEED_LIST_LIMIT} — a listing is capped at that; search with a date or
@@ -369,7 +376,10 @@ function FeedRow({
   const efficiency = entry.kind === "token_efficiency" ? readEfficiencySignal(entry.summary) : null;
 
   return (
-    <li className="feed-row">
+    /* The default stacking layout, not `layout="line"`: a line here is a head,
+       a summary and sometimes an observation under one another. The one-baseline
+       feed is the cockpit's `.ap-feed-line`, which is a different list. */
+    <Row>
       <div className="feed-row-head">
         <KindBadge kind={entry.kind} />
         {/* One kind, four situations — and budget and slot contention ask for
@@ -393,7 +403,7 @@ function FeedRow({
           <span className="feed-row-cause">{efficiency.cause}</span>
         </p>
       )}
-    </li>
+    </Row>
   );
 }
 

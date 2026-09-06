@@ -8,6 +8,7 @@ import {
   type TeamRun,
   type TeamView,
 } from "../data/teams";
+import { Quiet } from "../ui";
 import {
   ROW_GAP,
   buildRoster,
@@ -86,7 +87,7 @@ export function Roster({ team, runs }: RosterProps) {
   const at = new Map(view.boxes.map((box) => [box.id, box]));
 
   if (catalogue === undefined) {
-    return <p className="teams-loading">reading the catalogue…</p>;
+    return <Quiet says="reading the catalogue…" />;
   }
 
   const headless = !model.nodes.some((node) => node.layer === 1);
@@ -158,15 +159,15 @@ export function Roster({ team, runs }: RosterProps) {
         the only one worth printing.
       */}
       {headless ? (
-        <p className="teams-org-empty">
-          nobody is in charge of this department yet — it will refuse every task until somebody is.
-        </p>
+        <Quiet
+          says="nobody is in charge of this department yet — it will refuse every task until somebody is."
+        />
       ) : alone ? (
-        <p className="teams-org-empty">nobody on the roster yet</p>
+        <Quiet says="nobody on the roster yet" />
       ) : waiting ? (
-        <p className="teams-org-empty">reading the work…</p>
+        <Quiet says="reading the work…" />
       ) : (
-        !inFlight && <p className="teams-org-empty">nothing in flight</p>
+        !inFlight && <Quiet says="nothing in flight" />
       )}
     </div>
   );

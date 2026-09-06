@@ -21,6 +21,7 @@ import {
   LimitChip,
   Meter,
   Panel,
+  Quiet,
   RefusalNote,
   Who,
   usd,
@@ -216,7 +217,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
     }
   }, [existing, form]);
 
-  if (form === null) return <p className="teams-loading">reading the department…</p>;
+  if (form === null) return <Quiet says="reading the department…" />;
 
   const mutation = existing === null ? create : update;
   const valid = form.name.trim() !== "" && form.mission.trim() !== "" && form.directorAgentId.trim() !== "";
@@ -571,7 +572,7 @@ function Section({ title, note, children }: { title: string; note: string; child
   return (
     <Panel title={title} variant="flat">
       <div className="teams-section">
-        <p className="teams-section-note">{note}</p>
+        <p className="teams-note">{note}</p>
         <div className="teams-section-fields">{children}</div>
       </div>
     </Panel>

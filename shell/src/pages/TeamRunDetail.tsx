@@ -12,7 +12,18 @@ import {
   type TeamItem,
   type TeamRunView,
 } from "../data/teams";
-import { Button, ConfirmButton, ErrorNote, PageHeader, Panel, RefusalNote, StateBadge } from "../ui";
+import {
+  Button,
+  ConfirmButton,
+  ErrorNote,
+  Inset,
+  PageHeader,
+  Panel,
+  Quiet,
+  RefusalNote,
+  Section,
+  StateBadge,
+} from "../ui";
 import "./teams.css";
 
 /**
@@ -41,7 +52,7 @@ export function TeamRunDetail() {
     return (
       <>
         <PageHeader title="Team run" />
-        {run.isError ? <DetailError error={run.error} /> : <p className="teams-loading">reading the run…</p>}
+        {run.isError ? <DetailError error={run.error} /> : <Quiet says="reading the run…" />}
         <Link to="/teams">Back to the departments</Link>
       </>
     );
@@ -145,7 +156,7 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
 
 function OriginLine({ run }: { run: TeamRunView }) {
   return (
-    <p className="teams-origin">
+    <p className="teams-note">
       <OriginText run={run} />
       {run.root_id !== run.id && (
         <>
@@ -173,17 +184,20 @@ function RoundsPanel({ items }: { items: TeamItem[] }) {
   const rounds = groupByRound(items);
   return (
     <Panel title="Rounds">
-      {rounds.length === 0 && <p className="teams-empty">no item yet.</p>}
-      {rounds.map(([round, rows]) => (
-        <div className="teams-round" key={round}>
-          <p className="teams-round-head">round {round}</p>
-          <ul className="teams-items" aria-label={`Round ${round}`}>
-            {rows.map((item) => (
-              <ItemRow key={item.ordinal} item={item} />
-            ))}
-          </ul>
-        </div>
-      ))}
+      {rounds.length === 0 && <Quiet says="no item yet." />}
+      {/* The `ul` keeps its own label: `Section` names the region, and the list
+          inside it is a second thing a screen reader lands in. */}
+      <div className="teams-round-column">
+        {rounds.map(([round, rows]) => (
+          <Section key={round} label={`round ${round}`}>
+            <ul className="teams-items" aria-label={`Round ${round}`}>
+              {rows.map((item) => (
+                <ItemRow key={item.ordinal} item={item} />
+              ))}
+            </ul>
+          </Section>
+        ))}
+      </div>
     </Panel>
   );
 }
@@ -201,7 +215,7 @@ function groupByRound(items: TeamItem[]): [number, TeamItem[]][] {
 
 function ItemRow({ item }: { item: TeamItem }) {
   return (
-    <li className="teams-item">
+    <Inset as="li">
       <div className="teams-item-head">
         <span className="teams-item-agent">{item.agent_id}</span>
         <StateBadge domain="team_item" state={item.state} />
@@ -213,7 +227,7 @@ function ItemRow({ item }: { item: TeamItem }) {
       {/* `run_id` is a daemon run id — an integer, a different id space from
           `id`, which is a UUID string. */}
       {item.run_id !== null && <Link to={`/runs/${item.run_id}`}>see the run</Link>}
-    </li>
+    </Inset>
   );
 }
 
@@ -231,7 +245,7 @@ function ActionsPanel({
   return (
     <Panel title="Actions">
       {isError && actions.length === 0 && <ActionsError error={error} />}
-      {!isError && actions.length === 0 && <p className="teams-empty">nothing asked for yet.</p>}
+      {!isError && actions.length === 0 && <Quiet says="nothing asked for yet." />}
       {actions.length > 0 && (
         <ul className="teams-acts" aria-label="Actions">
           {actions.map((action) => (
@@ -259,7 +273,7 @@ function ActionCard({ action }: { action: TeamAction }) {
   const state = teamActionState(action);
   const payload = parseActionPayload(action.payload);
   return (
-    <li className="teams-act">
+    <Inset as="li">
       <div className="teams-act-head">
         <span className="teams-act-kind">{action.kind}</span>
         <StateBadge domain="team_action" state={state} />
@@ -284,7 +298,7 @@ function ActionCard({ action }: { action: TeamAction }) {
         {" — "}
         {action.proposal_id === null ? "this department may do that without asking" : "waiting on a decision"}
       </p>
-    </li>
+    </Inset>
   );
 }
 

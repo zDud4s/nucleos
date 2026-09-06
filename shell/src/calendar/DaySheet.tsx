@@ -14,7 +14,7 @@ import {
   type EventOccurrence,
 } from "../data/calendar";
 import { inputFromStamp, occurrenceMinutes, stampFromInput } from "../lib/calendar-grid";
-import { Badge, Button, ConfirmButton, ErrorNote, RefusalNote } from "../ui";
+import { Badge, Button, ConfirmButton, ErrorNote, Inset, Quiet, RefusalNote } from "../ui";
 import { placementOf, slotStamp, type Slot } from "./slot";
 
 /**
@@ -71,13 +71,18 @@ export function DaySheet({ slot, occurrences, now, config }: DaySheetProps) {
       </div>
 
       {occurrences.length === 0 ? (
-        <p className="calendar-empty">nothing on this day.</p>
+        <Quiet says="nothing on this day." />
       ) : (
         <ul className="calendar-occurrence-list">
           {occurrences.map((occurrence) => (
-            <li key={occurrenceKey(occurrence.event_id, occurrence.occurrence_local)}>
-              <OccurrenceActions occurrence={occurrence} />
-            </li>
+            /* The `li` is the box, and the box is the `li`. `OccurrenceActions`
+               renders an `Inset` as the list item itself rather than a bare
+               wrapper around one — a `li` whose only child is a bordered div is
+               a nesting nobody chose. */
+            <OccurrenceActions
+              key={occurrenceKey(occurrence.event_id, occurrence.occurrence_local)}
+              occurrence={occurrence}
+            />
           ))}
         </ul>
       )}
@@ -257,7 +262,15 @@ export function OccurrenceActions({ occurrence }: { occurrence: EventOccurrence 
   }
 
   return (
-    <div className="calendar-occurrence-actions">
+    /*
+      `Inset` — the box inside a panel body, one rung up and one rank down.
+      This page wrote those seven declarations out under the name
+      `calendar-occurrence-actions`, on `--surface` rather than
+      `--surface-raised`; the two are the same white in the light theme, so the
+      change is visible in dark only, and it is the shared rung the sheet should
+      have been on.
+    */
+    <Inset as="li">
       <p className="calendar-occurrence-title">
         <span className="calendar-occurrence-clock">{placement.clock}</span>
         {occurrence.title}
@@ -300,7 +313,7 @@ export function OccurrenceActions({ occurrence }: { occurrence: EventOccurrence 
       {cancel.isError && <OccurrenceError error={cancel.error} what="not skipped" />}
       {move.isError && <OccurrenceError error={move.error} what="not moved" />}
       {deleteSeries.isError && <OccurrenceError error={deleteSeries.error} what="the series was not deleted" />}
-    </div>
+    </Inset>
   );
 }
 

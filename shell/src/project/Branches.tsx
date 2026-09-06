@@ -6,7 +6,7 @@ import {
   type BranchRow,
   type BranchStanding,
 } from "../data/project-git";
-import { RelativeTime } from "../ui";
+import { ErrorNote, Quiet, RelativeTime, Row, Rows } from "../ui";
 
 /**
  * Where the work is, and how far it is from landing.
@@ -40,9 +40,9 @@ export function Branches({ projectId }: BranchesProps) {
 
   if (branches.isError) {
     return (
-      <p className="text-sm text-text-faint">
+      <ErrorNote>
         The núcleo could not read this project&rsquo;s branches — its folder may have moved.
-      </p>
+      </ErrorNote>
     );
   }
   if (branches.data === undefined) {
@@ -66,13 +66,21 @@ export function Branches({ projectId }: BranchesProps) {
       ) : null}
 
       {rows.length === 0 ? (
-        <p className="text-sm text-text-faint">No local branches.</p>
+        <Quiet says="No local branches." />
       ) : (
-        <ul className="flex flex-col gap-px overflow-hidden rounded-lg border border-border">
+        /*
+          `Rows` and not a column of cards, which is the question that picks between the app's two
+          ways of presenting a collection: this column is scanned down rather than picked out of.
+          It also fixes the rules. The hand-rolled version drew its separators as a 1px gap over
+          *nothing*, so what showed through was the page ground — which is a line in dark and
+          invisible in light. The shared list paints the border colour behind the gap, and every
+          row paints its own fill over it.
+        */
+        <Rows label="Local branches">
           {rows.map((row) => (
-            <Row key={row.name} row={row} integration={integration} />
+            <Line key={row.name} row={row} integration={integration} />
           ))}
-        </ul>
+        </Rows>
       )}
 
       {/*
@@ -103,12 +111,18 @@ export function Branches({ projectId }: BranchesProps) {
   );
 }
 
-function Row({ row, integration }: { row: BranchRow; integration: string | null }) {
+/*
+  Named `Line` and not `Row`, because `Row` is now the shared list item this renders inside. Two
+  components of one name in one file is how somebody imports the wrong one and gets a list that
+  loses its fill — the row's background is the mechanism that keeps the container's hairline
+  ground from showing through, not decoration.
+*/
+function Line({ row, integration }: { row: BranchRow; integration: string | null }) {
   const standing = standingOf(row, integration);
   const tone = STANDING_TONE[standing];
 
   return (
-    <li className="flex items-baseline gap-3 bg-surface px-3 py-2">
+    <Row layout="line">
       <span
         className="h-1.5 w-1.5 shrink-0 rounded-pill"
         style={{ background: `var(--tone-${tone}-fg)` }}
@@ -132,6 +146,6 @@ function Row({ row, integration }: { row: BranchRow; integration: string | null 
       <span className="ml-auto shrink-0 text-xs text-text-faint">
         <RelativeTime at={row.last_commit_at} />
       </span>
-    </li>
+    </Row>
   );
 }

@@ -29,27 +29,33 @@
 /* =============================================================== shared == */
 
 .calendar-note,
-.calendar-loading,
-.calendar-empty {
+.calendar-loading {
   margin: 0 0 var(--space-3);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
   color: var(--text-muted);
 }
 
-.calendar-loading,
-.calendar-empty {
+/* Faint and italic because the sentence is about the page's own progress and
+   not about the day — it is a value, not a region with nothing in it. The two
+   absences that used to share this rule are `Quiet` now, which is muted rather
+   than faint on purpose: an answer set fainter than the labels around it reads
+   as a page that failed rather than as one that is empty. */
+.calendar-loading {
   color: var(--text-faint);
   font-style: italic;
 }
 
-.calendar-subhead {
-  margin: var(--space-4) 0 var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
+/* The two groups in the held-notifications panel, stacked.
+
+   `Section` owns each group's internal rhythm and brings no outer margin —
+   the container owns that, which is the whole point of it. This gap is what
+   `.calendar-subhead`'s own `margin-top: var(--space-4)` used to be, said once
+   for the pair instead of once per heading. */
+.calendar-sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
 }
 
 .calendar-outcome {
@@ -58,18 +64,60 @@
   color: var(--tone-active-fg);
 }
 
-/* Said to a screen reader and to nobody else — the tone that marks a proposal
-   or a moved occurrence is colour, and colour is not a label. */
-.calendar-visually-hidden {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
-  padding: 0;
-  border: 0;
-  clip-path: inset(50%);
-  overflow: hidden;
-  white-space: nowrap;
+/* The tone that marks a proposal or a moved occurrence is colour, and colour
+   is not a label — so both grids say the word to a screen reader and to nobody
+   else. That is `.sr-only` from `base.css`, which is this recipe exactly and is
+   deliberately unlayered so it beats Tailwind's older `clip: rect()` version.
+   This file used to carry its own copy under the name `calendar-visually-hidden`.
+
+   The four focus rings below are the other thing this page says in more than
+   one place. Every focusable surface in both grids takes the same inset ring —
+   the month cell, the week's day head, an empty hour band and a block — and
+   the offset is negative because all four are flush against a neighbour, so an
+   outward ring would be drawn underneath the cell next to it. DESIGN.md calls
+   the focus ring the most consistent part of the system; four copies of it is
+   how that stops being true. */
+.calendar-day:focus-visible,
+.calendar-week-head:focus-visible,
+.calendar-slot:focus-visible,
+.calendar-block:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/*
+  One shape, drawn in both grids.
+
+  The date pill, the "today" fill and the selection ring are the same three
+  marks whether you are looking at a month cell or at the week's day head —
+  they answer the same question about the same day. Written twice, they drift,
+  and a month that says today one way and a week that says it another is two
+  calendars in one panel. Today is carried by contrast rather than by hue, the
+  way this app draws a primary button; it was an accent ring once, and the
+  accent is the brand. Selection is `--border-strong`, which is a rung and not
+  a tone, so it can sit on top of any of the other five things a day can be.
+*/
+.calendar-day-number,
+.calendar-week-head-number {
+  min-width: 1.5rem;
+  padding: 1px var(--space-1);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  text-align: center;
+  color: var(--text);
+}
+
+.calendar-day-today .calendar-day-number,
+.calendar-week-head-today .calendar-week-head-number {
+  background: var(--solid);
+  color: var(--solid-ink);
+  font-weight: var(--weight-semibold);
+}
+
+.calendar-day-selected,
+.calendar-week-head-selected {
+  box-shadow: inset 0 0 0 2px var(--border-strong);
 }
 
 /* ============================================================ the heading == */
@@ -200,11 +248,6 @@
   background: var(--surface-raised);
 }
 
-.calendar-day:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
-}
-
 /* A day from the month either side: dimmed INK, and never a dimmed surface —
    that shape belongs to the non-working day, and a Saturday in the next month
    has to be able to read as both at once. */
@@ -213,7 +256,11 @@
   color: var(--text-faint);
 }
 
-/* Not a working day, per `working_weekdays` — a sunken surface. */
+/* Not a working day, per `working_weekdays` — a sunken surface. Deliberately
+   NOT hoisted into the shared block with the date pill and the selection ring,
+   even though the week's head says the same thing: this rule has to come after
+   `.calendar-day`'s own fill and is no more specific than it, so it only works
+   where it stands. */
 .calendar-day-closed {
   background: var(--surface-sunken);
 }
@@ -221,11 +268,6 @@
 .calendar-day-closed:hover {
   background: var(--surface);
 }
-
-.calendar-day-selected {
-  box-shadow: inset 0 0 0 2px var(--border-strong);
-}
-
 /* ------------------------------------------------------------- dragging -- */
 
 /*
@@ -246,7 +288,16 @@
 }
 
 /* What is in the hand. Faded where it came from, so the eye follows the
-   cursor rather than arguing with the copy left behind. */
+   cursor rather than arguing with the copy left behind.
+
+   Raw, and neither `--opacity-disabled` (0.5) nor `--opacity-quiet` (0.7) is
+   the right name for it. This chip is not disabled — it is the live subject of
+   the gesture — and it is not a decorative mark standing beside content, which
+   is what quiet is for. It is the ghost at the origin of a drag, and it has to
+   fall further than either: at 0.7 the copy left behind still competes with the
+   cursor, which is the exact failure the fade exists to prevent. The system has
+   two opacities on purpose and a third would need to be argued for in
+   `tokens.css`, which is not this page's to write. */
 .calendar-chip-held,
 .calendar-block-held {
   opacity: 0.4;
@@ -261,24 +312,6 @@
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-1);
-}
-
-.calendar-day-number {
-  min-width: 1.5rem;
-  padding: 1px var(--space-1);
-  border-radius: var(--radius-sm);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  text-align: center;
-  color: var(--text);
-}
-
-/* Today, carried by contrast rather than by hue — the same way this app draws
-   a primary button. This was an accent ring, and the accent is the brand. */
-.calendar-day-today .calendar-day-number {
-  background: var(--solid);
-  color: var(--solid-ink);
-  font-weight: var(--weight-semibold);
 }
 
 /* The short/long-day badge. Warm rather than red — a 23- or 25-hour day is a
@@ -411,38 +444,15 @@
   cursor: pointer;
 }
 
-.calendar-week-head:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
+/* The week's half of the non-working day, and it lives here for the same
+   reason its month twin does — it must follow `.calendar-week-head`'s fill. */
+.calendar-week-head-closed {
+  background: var(--surface-sunken);
 }
 
 .calendar-week-head-name {
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
-}
-
-.calendar-week-head-number {
-  min-width: 1.5rem;
-  padding: 1px var(--space-1);
-  border-radius: var(--radius-sm);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  text-align: center;
-  color: var(--text);
-}
-
-.calendar-week-head-closed {
-  background: var(--surface-sunken);
-}
-
-.calendar-week-head-today .calendar-week-head-number {
-  background: var(--solid);
-  color: var(--solid-ink);
-  font-weight: var(--weight-semibold);
-}
-
-.calendar-week-head-selected {
-  box-shadow: inset 0 0 0 2px var(--border-strong);
 }
 
 .calendar-week-body {
@@ -517,11 +527,6 @@
   background: var(--surface-raised);
 }
 
-.calendar-slot:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
-}
-
 .calendar-slot-selected {
   box-shadow: inset 0 0 0 1px var(--border-strong);
 }
@@ -572,11 +577,6 @@
   text-align: left;
   overflow: hidden;
   cursor: pointer;
-}
-
-.calendar-block:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
 }
 
 .calendar-block[draggable="true"] {
@@ -656,23 +656,26 @@
 
 /* ========================================================== occurrences == */
 
-.calendar-occurrence-list {
+/*
+  Two plain columns of boxes, and the same six declarations for both: the day's
+  occurrences and the held notifications are lists whose items carry their own
+  frame, so the list itself only has to stop being a bulleted one and set the
+  air between them. Not `.ui-rows`, which is the other way to present a
+  collection — a hairline-ruled column read by scanning down it. These are
+  picked out of rather than scanned, and each item is a box.
+
+  The occurrence's own box is `Inset` now (`.ui-panel-inset`), which is the same
+  seven declarations this file used to write under the name
+  `.calendar-occurrence-actions`.
+*/
+.calendar-occurrence-list,
+.calendar-notifications {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   margin: 0;
   padding: 0;
   list-style: none;
-}
-
-.calendar-occurrence-actions {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
 }
 
 .calendar-occurrence-title {
@@ -709,26 +712,6 @@
   gap: var(--space-2);
 }
 
-.calendar-move-field {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.calendar-move-field input {
-  padding: var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--text-sm);
-}
-
 /* ============================================================ draft form == */
 
 .calendar-draft {
@@ -755,7 +738,20 @@
   gap: var(--space-3);
 }
 
-.calendar-draft-field {
+/*
+  One field recipe, for the two forms this sheet holds: the draft above and the
+  "Move to" beside an occurrence. They were written out twice and had already
+  started to disagree — the move field's input inherited the label's uppercase
+  and wide tracking because only the draft's copy undid them, so the same
+  `datetime-local` was set two ways depending on which of the two forms it was
+  in. The reset belongs to the control, not to one of its two callers.
+
+  There is no shared input primitive in `ui.css` to adopt here; DESIGN.md
+  records that as the largest open hole in the component layer, and this is the
+  page-local half of the answer rather than a private version of the missing one.
+*/
+.calendar-draft-field,
+.calendar-move-field {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
@@ -766,7 +762,8 @@
 }
 
 .calendar-draft-field input,
-.calendar-draft-field select {
+.calendar-draft-field select,
+.calendar-move-field input {
   padding: var(--space-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -787,15 +784,6 @@
 }
 
 /* ==================================================== held notifications == */
-
-.calendar-notifications {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
 
 .calendar-notification {
   display: flex;

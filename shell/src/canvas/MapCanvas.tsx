@@ -9,6 +9,7 @@ import type {
   Standing,
 } from "../data/project-map";
 import { useFileItems } from "../data/project-map";
+import { SectionTitle } from "../ui";
 import { NODE_H, type Layout } from "./layered";
 import {
   buildCommunities,
@@ -529,6 +530,15 @@ function Around({
         One file at a time, then — this shows the chosen one and everything in this community that
         touches it, either way. It is a smaller picture and not a looser one.
       </p>
+      {/*
+        **The chosen one is marked in `--text`, and was marked in the brand colour.** The This-One
+        Rule settles that a selection is `.ui-current` — a 2px inset rule on the leading edge, in
+        `--text` — and the class does not fit a pill: an inset shadow is clipped to the border box,
+        so on a 999px radius it draws a sliver of an arc rather than a rule. What carries is the
+        rule's reasoning rather than its geometry — the ink and not the hue, and a mark that does
+        not depend on a fill, because `--surface` and `--surface-raised` are the same white in the
+        light theme and the rung this chip moves would vanish there on its own.
+      */}
       <div role="group" aria-label="Around" className="flex flex-wrap gap-1">
         {counted.map((one) => (
           <button
@@ -539,7 +549,7 @@ function Around({
             onClick={() => setCentre(one.path)}
             className={
               one.path === at
-                ? "rounded-pill border border-accent bg-surface-raised px-2 py-0.5 font-mono text-[11px] text-text"
+                ? "rounded-pill border border-text bg-surface-raised px-2 py-0.5 font-mono text-[11px] text-text"
                 : "rounded-pill border border-border px-2 py-0.5 font-mono text-[11px] text-text-muted hover:border-border-strong hover:text-text"
             }
           >
@@ -650,9 +660,7 @@ function Claims({
   }
   return (
     <div className="flex flex-col gap-1">
-      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
-        Decisions that claim this file
-      </h3>
+      <SectionTitle>Decisions that claim this file</SectionTitle>
       <ul className="flex flex-col gap-1">
         {claims.map((claim) => {
           const standing = standings[String(claim.decision_id)];
@@ -661,7 +669,17 @@ function Claims({
               <span className="font-mono text-[11px] text-text-faint">
                 {claim.spec_slug} §{claim.section}
               </span>{" "}
-              <span className={isSettled(standing) ? "text-accent" : "text-text-faint"}>
+              {/*
+                A rung of the neutral ladder, and it was the brand colour. `isSettled` calls this
+                "the green/not-green split", which names the drift twice over: what shipped was
+                neither green nor a state tone but `--accent`, the one colour reserved for the
+                wordmark, links and the focus ring. "Stamped" is not one of the seven tones either,
+                so it does not get a tone invented for it — it gets words, which `standingLabel`
+                already supplies ("stamped", "lapsed — the code moved since", "nobody has looked").
+                What is left to carry is emphasis, and emphasis in this system is one rung: the
+                owner's word in `--text`, its absence in `--text-faint`.
+              */}
+              <span className={isSettled(standing) ? "text-text" : "text-text-faint"}>
                 {standingLabel(standing)}
               </span>
               <span className="ml-1 text-text">{claim.text}</span>
@@ -742,13 +760,26 @@ function FileDrawing({
           title={`${facts.items} declaration${facts.items === 1 ? "" : "s"}`}
           full={full}
           onFull={onFull}
+          /*
+            Three rungs of the neutral ladder, and two of the three were broken. Reachable from
+            outside wore `stroke-accent` — the brand colour marking an identifier, which the
+            Reserved Cyan Rule names outright — and what nothing reaches wore `stroke-border-subtle`,
+            a colour this app has never had: `tailwind.css` declares `--color-border` and
+            `--color-border-strong` and no third, so the utility compiled to nothing, SVG's default
+            `stroke` is `none`, and those boxes shipped with no outline at all.
+
+            So: exported takes `--text`, the same ink the This-One Rule marks a chosen thing with
+            and the top of the ladder; ordinary keeps `--border`; and what nothing reaches keeps the
+            sunken fill, which is the rung that was already carrying it and the one that reads as a
+            recess rather than as a box.
+          */
           accent={(id) => {
             const item = byId.get(id);
             if (item === undefined) return "fill-surface stroke-border";
             if (!item.exported && !reached.has(item.id)) {
-              return "fill-surface-sunken stroke-border-subtle";
+              return "fill-surface-sunken stroke-border";
             }
-            return item.exported ? "fill-surface stroke-accent" : "fill-surface stroke-border";
+            return item.exported ? "fill-surface stroke-text" : "fill-surface stroke-border";
           }}
         />
       )}
@@ -765,7 +796,10 @@ function FileDrawing({
         {found.items.map((item) => (
           <li key={item.id} className="font-mono text-[11px] text-text-muted">
             <span className="text-text-faint">{item.line}</span> {item.id}
-            {item.exported ? <span className="text-accent"> ·pub</span> : null}
+            {/* `--text` and not `--accent`, for the same reason the box outline above is: this is
+                an identifier's property, and the brand colour has three uses and this is not one.
+                A rung up from the row's `--text-muted` is what "reachable from outside" needs. */}
+            {item.exported ? <span className="text-text"> ·pub</span> : null}
             {item.documented ? null : <span className="text-text-faint"> ·undocumented</span>}
           </li>
         ))}
@@ -860,19 +894,34 @@ function Matrix({
                 </th>
                 {matrix.order.map((column, j) => {
                   const weight = matrix.cells.get(cellKey(row, column));
+                  /*
+                    The two marks this whole matrix exists to be counted by, and neither was
+                    drawable. Forwards wore `bg-accent/30` — the brand colour, hand-diluted — and
+                    backwards wore `bg-danger/30`, a name this app has never declared: there is
+                    `--color-tone-danger-bg` and no `--color-danger`, so the utility compiled to
+                    nothing and every dependency pointing backwards, the one number the paragraph
+                    above tells a reader to act on, shipped as an empty cell.
+
+                    Forwards is the ordinary case and takes no colour at all — a flight deck is grey
+                    until something is wrong — so it moves a rung to `--border`, which is a real
+                    fill in both themes where `--surface-raised` is white-on-white in light.
+                    Backwards is the finding and takes the danger tone as its own fill; the cell
+                    already carries the tone's edge weight through the border below it, and the
+                    figure inside stays `--text` because the number is the content.
+                  */
                   const tone =
                     i === j
                       ? "bg-surface-sunken"
                       : weight === undefined
                         ? ""
                         : j > i
-                          ? "bg-accent/30"
-                          : "bg-danger/30";
+                          ? "bg-border"
+                          : "bg-tone-danger-bg";
                   return (
                     <td
                       key={column}
                       title={weight === undefined ? undefined : `${row} uses ${column} — ${weight}`}
-                      className={`h-[19px] w-[19px] border border-border-subtle text-center ${tone}`}
+                      className={`h-[19px] w-[19px] border border-border text-center ${tone}`}
                     >
                       {weight ?? ""}
                     </td>
@@ -1059,7 +1108,12 @@ function Graph({
                 key={`${segment.from}>${segment.to}`}
                 d={`M${a.x} ${y1} C${a.x} ${mid} ${b.x} ${mid} ${b.x} ${y2}`}
                 fill="none"
-                className={segment.reversed ? "stroke-danger" : "stroke-border"}
+                /* `stroke-tone-danger-border` and not `stroke-danger`: the second is a colour
+                   this app never declared, so a reversed segment — the one edge in a layered
+                   drawing worth pointing at — was drawn with SVG's default stroke, which is
+                   `none`. The dash below was carrying the distinction alone, on a line nobody
+                   could see. The tone's edge member is the right half of the triple for a stroke. */
+                className={segment.reversed ? "stroke-tone-danger-border" : "stroke-border"}
                 strokeWidth={1.2}
                 strokeDasharray={segment.reversed ? "4 3" : undefined}
               />

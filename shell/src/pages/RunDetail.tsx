@@ -23,6 +23,7 @@ import {
   ErrorNote,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   StateBadge,
 } from "../ui";
@@ -70,7 +71,7 @@ function KnownRun({ id }: { id: number }) {
     return (
       <>
         <PageHeader title={`Run ${id}`} />
-        {run.isError ? <DetailError error={run.error} /> : <p className="runs-loading">reading run {id}…</p>}
+        {run.isError ? <DetailError error={run.error} /> : <Quiet says={`reading run ${id}…`} />}
         <Link to="/runs">Back to the index</Link>
       </>
     );

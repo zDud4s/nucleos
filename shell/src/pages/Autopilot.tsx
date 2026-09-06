@@ -30,11 +30,15 @@ import {
   Badge,
   Button,
   ConfirmButton,
+  Count,
   ErrorNote,
+  Inset,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
+  Section,
   StatCard,
   StaleNote,
   StateBadge,
@@ -321,7 +325,7 @@ function GovernanceRow({
   }
 
   return (
-    <li className={selected ? "ap-row ap-row-selected" : "ap-row"}>
+    <Inset as="li" className={selected ? "ap-row-selected" : undefined}>
       <div className="ap-row-head">
         <Button variant="link" onClick={() => onSelect(project.project_id)}>
           {project.project_id}
@@ -427,7 +431,7 @@ function GovernanceRow({
           </Button>
         </div>
       )}
-    </li>
+    </Inset>
   );
 }
 
@@ -448,7 +452,7 @@ function ShadowReviewPanel({ projectId }: { projectId: string | null }) {
         moves a project toward acting on its own — agreeing says the classifier read the action the
         way you would, disagreeing says it did not, and both are evidence.
       </p>
-      {projectId === null && <p className="ap-empty">choose a project above.</p>}
+      {projectId === null && <Quiet says="choose a project above." />}
       {projectId !== null && decisions.isError && decisions.data === undefined && (
         <ListError error={decisions.error} what="the shadow decisions" />
       )}
@@ -456,12 +460,12 @@ function ShadowReviewPanel({ projectId }: { projectId: string | null }) {
         <p className="ap-loading">reading the shadow decisions…</p>
       )}
       {decisions.data !== undefined && rows.length === 0 && (
-        <p className="ap-empty">nothing is waiting for a verdict on this project.</p>
+        <Quiet says="nothing is waiting for a verdict on this project." />
       )}
       {rows.length > 0 && (
         <ul className="ap-list" aria-label="Shadow decisions">
           {rows.map((decision) => (
-            <li className="ap-card" key={decision.id}>
+            <Inset as="li" key={decision.id}>
               <div className="ap-card-head">
                 <span className="ap-card-id">decision #{decision.id}</span>
                 <span className="ap-card-title">{decision.tool_name}</span>
@@ -486,11 +490,11 @@ function ShadowReviewPanel({ projectId }: { projectId: string | null }) {
                   <dd>{decision.classifier_version}</dd>
                 </div>
               </dl>
-              <p className="ap-reason">
-                {decision.reason === null || decision.reason.trim() === ""
-                  ? "the classifier recorded no reason"
-                  : decision.reason}
-              </p>
+              {decision.reason === null || decision.reason.trim() === "" ? (
+                <Quiet says="the classifier recorded no reason" />
+              ) : (
+                <p className="ap-reason">{decision.reason}</p>
+              )}
               <RawInput raw={decision.tool_input} />
               <div className="ap-actions">
                 <ConfirmButton
@@ -509,7 +513,7 @@ function ShadowReviewPanel({ projectId }: { projectId: string | null }) {
                   onConfirm={() => verdict.mutate({ decisionId: decision.id, verdict: "reject" })}
                 />
               </div>
-            </li>
+            </Inset>
           ))}
         </ul>
       )}
@@ -584,7 +588,7 @@ function ScoreboardPanel({
         the bar. The ready/total figure in the corner is the núcleo&apos;s own and is what the
         promote control gates on.
       </p>
-      {projectId === null && <p className="ap-empty">choose a project above.</p>}
+      {projectId === null && <Quiet says="choose a project above." />}
       {projectId !== null && scoreboard.isError && scoreboard.data === undefined && (
         <ListError error={scoreboard.error} what="the scoreboard" />
       )}
@@ -592,19 +596,24 @@ function ScoreboardPanel({
         <p className="ap-loading">reading the scoreboard…</p>
       )}
       {scoreboard.data !== undefined && rows.length === 0 && (
-        <p className="ap-empty">this project has recorded no classified decision yet.</p>
+        <Quiet says="this project has recorded no classified decision yet." />
       )}
       {evidence.length > 0 && <TallyTable label="Shadow evidence" rows={evidence} />}
       {history.length > 0 && (
-        <>
-          <p className="ap-subhead">enforced, and not evidence for promotion</p>
-          <p className="ap-note">
-            Decisions taken outside shadow were acted on rather than recorded as hypotheses, so the
-            shadow-exit bar does not count them — the núcleo reads shadow-mode rows only. They are
-            here because they are still what this project has been doing.
-          </p>
-          <TallyTable label="Enforced decisions" rows={history} />
-        </>
+        <div className="ap-group">
+          {/* `level={3}` because this heading sits inside a `Panel` that already
+              has an `h2`. Announced as a sibling of "Scoreboard" it would tell a
+              screen reader the enforced rows are a section of the page rather
+              than a group within this one. */}
+          <Section label="enforced, and not evidence for promotion" level={3}>
+            <p className="ap-note">
+              Decisions taken outside shadow were acted on rather than recorded as hypotheses, so
+              the shadow-exit bar does not count them — the núcleo reads shadow-mode rows only. They
+              are here because they are still what this project has been doing.
+            </p>
+            <TallyTable label="Enforced decisions" rows={history} />
+          </Section>
+        </div>
       )}
     </Panel>
   );
@@ -718,7 +727,7 @@ function TriggerKills() {
         {TRIGGER_SCOPES.map((scope) => {
           const engaged = scopeEngaged(kills.data, "trigger", scope.id);
           return (
-            <li className="ap-switch" key={scope.id}>
+            <Inset as="li" key={scope.id}>
               <div className="ap-switch-head">
                 <span className="ap-switch-name">{scope.label}</span>
                 {scope.reads ? (
@@ -746,7 +755,7 @@ function TriggerKills() {
                   triggers exist to be held.
                 </p>
               )}
-            </li>
+            </Inset>
           );
         })}
       </ul>
@@ -771,9 +780,7 @@ function JobsPanel({ rows, selected }: { rows: ProjectSummary[]; selected: strin
   return (
     <Panel title="Jobs in flight" aside={<Count n={jobs.data?.length} />}>
       {jobs.isError && jobs.data === undefined && <ListError error={jobs.error} what="the jobs" />}
-      {jobs.data !== undefined && live.length === 0 && (
-        <p className="ap-empty">nothing is running.</p>
-      )}
+      {jobs.data !== undefined && live.length === 0 && <Quiet says="nothing is running." />}
       {live.length > 0 && (
         <ul className="ap-list" aria-label="Jobs in flight">
           {live.map((job) => (
@@ -782,42 +789,46 @@ function JobsPanel({ rows, selected }: { rows: ProjectSummary[]; selected: strin
         </ul>
       )}
 
-      <p className="ap-subhead">ask for one</p>
-      <div className="ap-form">
-        <label className="ap-field-label" htmlFor="ap-job-prompt">
-          What should {selected ?? "a project"} do?
-        </label>
-        <textarea
-          id="ap-job-prompt"
-          className="ap-field-input"
-          rows={2}
-          value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
-        />
-        <Button
-          variant="approve"
-          intent="go"
-          disabled={blocked || prompt.trim() === "" || create.isPending}
-          onClick={() => {
-            if (selected === null) return;
-            create.mutate(
-              {
-                project_id: selected,
-                prompt: prompt.trim(),
-                budget_usd: null,
-                max_rounds: null,
-                // No picker here, exactly as there is none for budget or rounds:
-                // this panel is the one-line "start something" and the Fleet page
-                // is where a job is specified. Sending null keeps it the queue in
-                // one checkout, which is what this button has always started.
-                team_id: null,
-              },
-              { onSuccess: () => setPrompt("") },
-            );
-          }}
-        >
-          Start a job
-        </Button>
+      <div className="ap-group">
+        <Section label="ask for one" level={3}>
+          <div className="ap-form">
+            <label className="ap-field-label" htmlFor="ap-job-prompt">
+              What should {selected ?? "a project"} do?
+            </label>
+            <textarea
+              id="ap-job-prompt"
+              className="ap-field-input"
+              rows={2}
+              value={prompt}
+              onChange={(event) => setPrompt(event.target.value)}
+            />
+            <Button
+              variant="approve"
+              intent="go"
+              disabled={blocked || prompt.trim() === "" || create.isPending}
+              onClick={() => {
+                if (selected === null) return;
+                create.mutate(
+                  {
+                    project_id: selected,
+                    prompt: prompt.trim(),
+                    budget_usd: null,
+                    max_rounds: null,
+                    // No picker here, exactly as there is none for budget or rounds:
+                    // this panel is the one-line "start something" and the Fleet
+                    // page is where a job is specified. Sending null keeps it the
+                    // queue in one checkout, which is what this button has always
+                    // started.
+                    team_id: null,
+                  },
+                  { onSuccess: () => setPrompt("") },
+                );
+              }}
+            >
+              Start a job
+            </Button>
+          </div>
+        </Section>
       </div>
       {/* Said before the click rather than after the 409. A project that is off
           starts nothing, and one whose queue is full defers rather than refuses
@@ -838,7 +849,7 @@ function JobsPanel({ rows, selected }: { rows: ProjectSummary[]; selected: strin
 
 function JobRow({ job }: { job: Job }) {
   return (
-    <li className="ap-job">
+    <Inset as="li">
       <div className="ap-row-head">
         <span className="ap-card-id">job {job.id}</span>
         <StateBadge domain="job" state={job.status} />
@@ -855,7 +866,7 @@ function JobRow({ job }: { job: Job }) {
         {job.team_id !== null &&
           ` — ${job.team_name ?? job.team_id}, up to ${job.team_max_parallel ?? 1} at once`}
       </p>
-    </li>
+    </Inset>
   );
 }
 
@@ -902,7 +913,7 @@ function FeedEmbed() {
     >
       {feed.isError && feed.data === undefined && <ListError error={feed.error} what="the feed" />}
       {feed.data !== undefined && lines.length === 0 && (
-        <p className="ap-empty">the núcleo has not written a line yet.</p>
+        <Quiet says="the núcleo has not written a line yet." />
       )}
       {lines.length > 0 && (
         <ul className="ap-feed" aria-label="Recent feed lines">
@@ -938,29 +949,45 @@ function FeedLine({ entry }: { entry: FeedEntry }) {
  * disagree the first time somebody used the wrong one.
  */
 function WaitingSummary({ pending }: { pending: number | undefined }) {
+  const queue = (
+    <Link className="ap-link" to="/waiting">
+      Go to the queue
+    </Link>
+  );
+
+  /**
+   * An empty queue is the branch this panel is in most of the time, and it is
+   * the one branch that is an absence rather than a reading. `Quiet` keeps the
+   * sentence about *where* decisions are answered — that is what makes the
+   * emptiness a policy rather than a gap — and charges no pixels for it until
+   * somebody asks. The link is the `action` and stays visible: what would fill
+   * the space is the reason anybody is looking at an empty panel.
+   */
+  if (pending === 0) {
+    return (
+      <Panel title="Waiting on you">
+        <Quiet says="nothing is waiting on a decision." action={queue}>
+          Answering them is on the queue, not here — one page decides, so there is one place to
+          look.
+        </Quiet>
+      </Panel>
+    );
+  }
+
   return (
     <Panel title="Waiting on you">
       <p className="ap-note">
         {pending === undefined
           ? "the núcleo has not said how much is waiting."
-          : pending === 0
-            ? "nothing is waiting on a decision."
-            : `${pending} ${pending === 1 ? "decision is" : "decisions are"} waiting.`}{" "}
+          : `${pending} ${pending === 1 ? "decision is" : "decisions are"} waiting.`}{" "}
         Answering them is on the queue, not here — one page decides, so there is one place to look.
       </p>
-      <Link className="ap-link" to="/waiting">
-        Go to the queue
-      </Link>
+      {queue}
     </Panel>
   );
 }
 
 /* -------------------------------------------------------------- shared -- */
-
-function Count({ n }: { n: number | undefined }) {
-  if (n === undefined) return null;
-  return <span className="ap-count">{n}</span>;
-}
 
 function ListError({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
