@@ -4773,6 +4773,7 @@ mod tests {
                 name: "reviewer".to_string(),
                 description: "Reviews code".to_string(),
                 prompt: "You are a code reviewer".to_string(),
+                tools: None,
                 model: Some("opus".to_string()),
                 effort: None,
             }],

@@ -217,3 +217,7 @@ Then, from the repo root:
 
 - Gate: `cargo test -p nucleos-core` (**NOT** `--lib` — this is a bin-only crate; `--lib` errors)
 - `cargo build` · `cargo fmt --all` (check: `cargo fmt --all -- --check`) · `cargo clippy --all-targets`
+- After a `claude update`: run `node scripts/tool-surface.mjs`. It measures the CLI's own advertised
+  tool set against `runner.rs`'s `BUILTIN_TOOLS` blocklist and exits non-zero naming any tool the CLI
+  now offers that the blocklist does not yet deny — the check `advertised_tools_violate` otherwise
+  makes at runtime, on a real conversation, too late to matter.

@@ -16,7 +16,7 @@ use crate::backup;
 use crate::budget;
 use crate::feed::{self, FeedEntry};
 use crate::health;
-use crate::hooks::pretooluse_decision;
+use crate::hooks::{posttooluse_outcome, pretooluse_decision};
 use crate::inspect;
 use crate::presets;
 use crate::runs::{self, AwaitingRun, CreateRunError, cancel_run, create_run, get_run};
@@ -828,6 +828,12 @@ pub fn build_router(state: AppState) -> Router {
         // The blocking half of the same conversation. Beside the gate because it carries the same
         // key and answers the same question, a moment later.
         .route("/hooks/ask-wait", post(post_ask_wait))
+        // The third leg: what the tool call actually did, reported back after the fact. Never a
+        // `Decision` and never a second barrier — by the time this fires the call has already run
+        // (or already failed), so the handler only records and always answers OK. `auth::permits`
+        // gives `Scope::Run` this route beside the two above for the same reason it gives it those:
+        // one run, asking about one tool call of its own.
+        .route("/hooks/posttooluse", post(posttooluse_outcome))
         // The same gate for the sessions nobody launched. It is `Scope::Control` only, and by
         // construction rather than by a list: `permits` gives `Control` everything and answers every
         // other scope from an allowlist, so a route absent from all of them is reachable by the
@@ -10179,6 +10185,13 @@ fn cloud_choice(
 /// over the line `CreateProcess` fails with an error about nothing in particular and the turn looks
 /// broken rather than too big. Somebody who needs more has the CLI's own answer: files in the
 /// project's `.claude/agents/`, which this merges with rather than replaces.
+///
+/// A helper's `tools` list counts toward this same total — it is serialised inside the same object,
+/// on the way to the same argv element — but does not move the number. Measured against 49 built-in
+/// names at up to 22 characters each, granting a helper every one of them costs roughly 1,200
+/// characters; the ceiling was sized for prompts, which dwarf that, so it stays unchanged. A
+/// conversation defining enough helpers with a full list each to approach 8,000 hits the refusal
+/// this constant already gives, which is the ceiling doing its one job, not a new failure mode.
 const AGENTS_JSON_CEILING: usize = 8_000;
 
 /// The longest standing instructions this daemon will write, in characters.
@@ -10256,6 +10269,18 @@ fn checked_agents(agents: &[crate::runner::Subagent]) -> Result<(), StatusCode> 
         // without one is defined, listed, and never used.
         if agent.description.trim().is_empty() || agent.prompt.trim().is_empty() {
             return Err(StatusCode::BAD_REQUEST);
+        }
+
+        // Reuses `BUILTIN_TOOLS` for a different job than `checked_denials` puts it to: there it is
+        // the vocabulary of what a CONVERSATION may be denied, here it is the vocabulary of what a
+        // HELPER may be granted — same list, because both are naming the one set of tools this
+        // daemon knows about. Names only, never the CLI's `Bash(git *)` patterns, for the reason
+        // `checked_denials` already gives: a pattern is a rule language, and a typo in one is a
+        // restriction that silently is not one. `Some(vec![])` is checked and accepted here, not
+        // skipped — a helper granted no tools at all is a coherent, explicit thing to ask for, and
+        // treating it like `None` would make that restriction vanish.
+        if let Some(tools) = &agent.tools {
+            checked_denials(tools)?;
         }
 
         // A helper runs INSIDE the agent CLI, so its model has to be one that CLI can take — the
@@ -23669,6 +23694,10 @@ mod tests {
             // A model nobody offers, and a level the named model does not take.
             r#"{"agents":[{"name":"reviewer","description":"d","prompt":"p","model":"gpt-4-turbo"}]}"#,
             r#"{"agents":[{"name":"reviewer","description":"d","prompt":"p","effort":"colossal"}]}"#,
+            // A tool this daemon does not know, and a pattern rather than a name — both refused for
+            // the same reason `checked_denials` refuses them for a conversation's own denials.
+            r#"{"agents":[{"name":"reviewer","description":"d","prompt":"p","tools":["NoSuchTool"]}]}"#,
+            r#"{"agents":[{"name":"reviewer","description":"d","prompt":"p","tools":["Bash(git *)"]}]}"#,
         ] {
             assert_eq!(
                 patch_chat_request(state.clone(), &id, body).await,

@@ -540,9 +540,20 @@ fn policy_unverified_after_stream(policy: ToolPolicy, init_seen: bool) -> Option
 /// advertises it and `advertised_tools_violate` kills the run at the `init` event. The tool set can
 /// move underneath a version that never changed, which means the version number is not the signal:
 /// the stderr line naming the offending tools is.
+///
+/// Re-measured 2026-09-05, reading a live session's advertised tool surface rather than a version
+/// number, for the same reason the paragraph above gives: `TaskCreate`, `TaskGet`, `TaskList` and
+/// `TaskUpdate` had already moved inside a single version, so pinning this list to a version string
+/// again would not have caught the next four either. That pass added `ArtifactCheck`,
+/// `ArtifactComments`, `ArtifactData` (siblings of `Artifact`, already here) and `ListAgents`
+/// (sibling of `ListMcpResourcesTool`). `scripts/tool-surface.mjs` automates this measurement by
+/// hand after a `claude update`; it is not wired into any gate because it needs the CLI installed.
 pub(crate) const BUILTIN_TOOLS: &[&str] = &[
     "Agent",
     "Artifact",
+    "ArtifactCheck",
+    "ArtifactComments",
+    "ArtifactData",
     "AskUserQuestion",
     "Bash",
     "BashOutput",
@@ -558,6 +569,7 @@ pub(crate) const BUILTIN_TOOLS: &[&str] = &[
     "Glob",
     "Grep",
     "KillShell",
+    "ListAgents",
     "ListMcpResourcesTool",
     "LSP",
     "Monitor",
@@ -613,6 +625,16 @@ pub struct Subagent {
     pub description: String,
     /// The system prompt this helper runs under.
     pub prompt: String,
+    /// The tools this helper may call, or `None` to inherit the conversation's whole surface.
+    ///
+    /// Absent is today's behaviour, preserved: a helper defined before this field existed, or one
+    /// defined since without naming it, gets everything the parent run has — every call it makes
+    /// still comes back through the same `PreToolUse` hook under the parent's `run_id`, which is the
+    /// second barrier this field is the first half of. Present grants the CLI exactly this list and
+    /// nothing else; `Some(vec![])` is a helper granted no tools at all, a coherent and different
+    /// thing from absent, not a shorthand for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
     /// Which model answers as this helper, or `None` to inherit the conversation's.
     ///
     /// Absent rather than the CLI's literal `"inherit"`: absence already means it, and offering two
@@ -3338,6 +3360,7 @@ mod tests {
             name: name.to_string(),
             description: "Reviews code".to_string(),
             prompt: "You are a code reviewer".to_string(),
+            tools: None,
             model: None,
             effort: None,
         }
@@ -3382,6 +3405,53 @@ mod tests {
 
         assert!(sent["reviewer"].get("model").is_none(), "{}", args[at + 1]);
         assert!(sent["reviewer"].get("effort").is_none(), "{}", args[at + 1]);
+    }
+
+    /// Absent, not `null` and not `[]`: a helper that named no restriction inherits the parent's
+    /// whole tool surface, today's behaviour, and the object sent to the CLI says nothing at all
+    /// rather than saying "no restriction" in a way that could later be confused with "no tools".
+    #[test]
+    fn a_helper_that_named_no_tools_sends_no_tools_key() {
+        let mut request = baseline_run_request();
+        request.agents = vec![a_helper("reviewer")];
+
+        let args = cli_args(&request, "sonnet");
+        let at = args.iter().position(|arg| arg == "--agents").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+
+        assert!(sent["reviewer"].get("tools").is_none(), "{}", args[at + 1]);
+    }
+
+    /// A helper that named a restriction sends exactly that list, so the CLI grants it those tools
+    /// and nothing else.
+    #[test]
+    fn a_helper_may_be_restricted_to_named_tools() {
+        let mut request = baseline_run_request();
+        let mut helper = a_helper("reviewer");
+        helper.tools = Some(vec!["Read".to_string(), "Grep".to_string()]);
+        request.agents = vec![helper];
+
+        let args = cli_args(&request, "sonnet");
+        let at = args.iter().position(|arg| arg == "--agents").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+
+        assert_eq!(
+            sent["reviewer"]["tools"],
+            serde_json::json!(["Read", "Grep"])
+        );
+    }
+
+    /// A helper stored before this field existed — its JSON object has no `tools` key at all —
+    /// deserialises identically to one that named no restriction, and runs the same way: inheriting
+    /// the parent's whole surface, exactly as it did before this field was added.
+    #[test]
+    fn a_helper_stored_before_tools_existed_still_deserialises() {
+        let stored = r#"{"description":"Reviews code","prompt":"You are a code reviewer"}"#;
+        let agent: Subagent = serde_json::from_str(stored).unwrap();
+
+        assert_eq!(agent.tools, None);
+        assert_eq!(agent.description, "Reviews code");
+        assert_eq!(agent.prompt, "You are a code reviewer");
     }
 
     #[test]
@@ -5505,6 +5575,28 @@ mod tests {
             assert!(
                 denied.split(',').any(|t| t == tool),
                 "{tool} must be denied under McpOnly, or it is advertised and kills the turn"
+            );
+        }
+    }
+
+    /// The two tests above assert hand-picked subsets — the ones that already cost a dead run — and
+    /// that is documentation worth keeping, but it left the other ~31 names in `BUILTIN_TOOLS` with
+    /// no assertion at all: a name could fall out of the list on an edit and nothing here would
+    /// notice. This iterates the whole const instead, so the list and the flag it produces can never
+    /// drift apart silently again.
+    #[test]
+    fn every_built_in_name_reaches_the_deny_flag() {
+        let args = args_for(ToolPolicy::McpOnly, None);
+        let denied = args
+            .windows(2)
+            .find(|w| w[0] == "--disallowedTools")
+            .map(|w| w[1].clone())
+            .expect("McpOnly must deny built-ins");
+        let denied: std::collections::HashSet<&str> = denied.split(',').collect();
+        for tool in BUILTIN_TOOLS {
+            assert!(
+                denied.contains(tool),
+                "{tool} is in BUILTIN_TOOLS but missing from --disallowedTools: {denied:?}"
             );
         }
     }

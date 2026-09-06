@@ -40,6 +40,8 @@ export interface Subagent {
   description: string;
   /** The system prompt it runs under. */
   prompt: string;
+  /** Which tools it may call, or null/absent to inherit the conversation's whole surface. */
+  tools?: string[] | null;
   /** Which model answers as this helper, or null/absent to inherit the conversation's. */
   model?: string | null;
   /** How hard it is asked to think, or null/absent for its model's own default. */

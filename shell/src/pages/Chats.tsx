@@ -2951,11 +2951,23 @@ function ContextControls({ chatId }: { chatId: string }) {
 /* --------------------------------------------------------------- helpers -- */
 
 /** A helper as it is being written, before anybody has agreed it is one. */
-type HelperDraft = Subagent & { model: string | null; effort: string | null };
+type HelperDraft = Subagent & {
+  model: string | null;
+  effort: string | null;
+  tools: string[] | null;
+};
 
-/** What a fresh row starts as. Named so "add" and "reset" cannot drift apart. */
+/** What a fresh row starts as. Named so "add" and "reset" cannot drift apart. No restriction —
+ *  the helper inherits the parent's whole surface, exactly as it did before this field existed. */
 function blankHelper(): HelperDraft {
-  return { name: "", description: "", prompt: "", model: null, effort: null };
+  return {
+    name: "",
+    description: "",
+    prompt: "",
+    model: null,
+    effort: null,
+    tools: null,
+  };
 }
 
 /**
@@ -2969,10 +2981,15 @@ function blankHelper(): HelperDraft {
  * The rules themselves are not arbitrary: the CLI parses `--agents` inside a try/catch and answers
  * a throw with an empty agent list, so a helper it cannot build costs you every helper you wrote,
  * silently. That is what all of this is protecting against.
+ *
+ * `knownTools` is threaded in rather than read from `useDeniableTools` here — this function is not
+ * a component, and a hook called from one would break the rules of hooks the moment two helpers
+ * needed an answer in the same render.
  */
 function whyHelperIsRefused(
   helper: HelperDraft,
   others: HelperDraft[],
+  knownTools: string[],
 ): string | null {
   const name = helper.name.trim();
   if (name === "") return "needs a name — it is what the model calls it by";
@@ -2985,7 +3002,88 @@ function whyHelperIsRefused(
   if (helper.description.trim() === "")
     return "needs a description — it is what the model reads to decide whether to use it";
   if (helper.prompt.trim() === "") return "needs instructions to run under";
+  // Checked only once the served list has actually arrived — before that every name would read as
+  // unknown, and a helper opened with tools already set would flash a refusal it does not deserve.
+  // One membership check catches both a typo and a pattern like `Bash(git *)`: neither is ever a
+  // name the door serves, so neither is ever a name this list contains.
+  if (helper.tools !== null && knownTools.length > 0) {
+    const unknown = helper.tools.find((tool) => !knownTools.includes(tool));
+    if (unknown !== undefined)
+      return `"${unknown}" is not a tool the daemon can grant — a pattern is refused the same as a name it does not know`;
+  }
   return null;
+}
+
+/**
+ * Which tools this helper may call, or "no restriction — inherits" for what it does today.
+ *
+ * A separate control from `ChatDenials` rather than a shared one: that one takes something away
+ * from the whole conversation, this one GRANTS a subset to one helper, and null here means the
+ * opposite of empty there — absent is "everything", not "nothing". Checkboxes over the served list
+ * for the same reason `ChatDenials` uses them: a typed rule that matches no tool is a restriction
+ * somebody set and nobody applied, reported nowhere this app's user would read it.
+ *
+ * The top row is its own checkbox rather than a toggle beside the list, so the default state — no
+ * restriction — reads as a state you can SEE is selected, not as an absence of the others.
+ */
+function HelperToolsControl({
+  tools,
+  knownTools,
+  onChange,
+}: {
+  tools: string[] | null;
+  knownTools: string[];
+  onChange: (tools: string[] | null) => void;
+}) {
+  const toggle = (name: string, on: boolean) => {
+    const base = tools ?? [];
+    onChange(on ? [...base, name] : base.filter((tool) => tool !== name));
+  };
+
+  const label =
+    tools === null
+      ? "inherits everything"
+      : tools.length === 0
+        ? "nothing granted"
+        : `${tools.length} granted`;
+
+  return (
+    <div className="chats-helper-field">
+      <span>Tools</span>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          type="button"
+          disabled={knownTools.length === 0}
+          className="chats-helper-tools-trigger"
+        >
+          {label}
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="chats-meta-menu chats-denials">
+          <DropdownMenuLabel>Tools this helper may call</DropdownMenuLabel>
+          <DropdownMenuCheckboxItem
+            checked={tools === null}
+            onSelect={(event) => event.preventDefault()}
+            onCheckedChange={(on) => onChange(on === true ? null : [])}
+          >
+            no restriction — inherits the conversation
+          </DropdownMenuCheckboxItem>
+          <DropdownMenuSeparator />
+          {knownTools.map((name) => (
+            <DropdownMenuCheckboxItem
+              key={name}
+              checked={tools !== null && tools.includes(name)}
+              disabled={tools === null}
+              /* Several are usually granted together, so the menu is kept open. */
+              onSelect={(event) => event.preventDefault()}
+              onCheckedChange={(on) => toggle(name, on === true)}
+            >
+              {name}
+            </DropdownMenuCheckboxItem>
+          ))}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
 }
 
 /**
@@ -3015,6 +3113,8 @@ function ChatHelpers({
   const row = useChatRow(chatId);
   const patch = usePatchChat();
   const catalogue = useAssistantModels();
+  const deniable = useDeniableTools();
+  const knownTools = deniable.data?.tools ?? [];
   const [draft, setDraft] = useState<HelperDraft[]>([]);
 
   const saved = row?.agents;
@@ -3039,6 +3139,7 @@ function ChatHelpers({
         ...agent,
         model: agent.model ?? null,
         effort: agent.effort ?? null,
+        tools: agent.tools ?? null,
       })),
     );
   }, [open, saved]);
@@ -3046,7 +3147,9 @@ function ChatHelpers({
   const choices = (catalogue.data?.choices ?? []).filter(
     (choice) => choice.brain === "cloud",
   );
-  const refusals = draft.map((helper) => whyHelperIsRefused(helper, draft));
+  const refusals = draft.map((helper) =>
+    whyHelperIsRefused(helper, draft, knownTools),
+  );
   const ready = refusals.every((why) => why === null);
 
   const change = (at: number, patched: Partial<HelperDraft>) =>
@@ -3066,6 +3169,7 @@ function ChatHelpers({
           name: helper.name.trim(),
           description: helper.description.trim(),
           prompt: helper.prompt.trim(),
+          tools: helper.tools,
           model: helper.model,
           effort: helper.effort,
         })),
@@ -3178,6 +3282,11 @@ function ChatHelpers({
                     ))}
                   </select>
                 </label>
+                <HelperToolsControl
+                  tools={helper.tools}
+                  knownTools={knownTools}
+                  onChange={(tools) => change(index, { tools })}
+                />
                 <Button
                   variant="danger"
                   onClick={() =>

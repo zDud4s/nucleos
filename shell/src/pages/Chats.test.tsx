@@ -1628,6 +1628,7 @@ describe("Chats - the helpers a conversation may hand work to", () => {
               name: "reviewer",
               description: "Reviews a diff for correctness",
               prompt: "You are a code reviewer.",
+              tools: null,
               model: null,
               effort: null,
             },
@@ -1635,6 +1636,94 @@ describe("Chats - the helpers a conversation may hand work to", () => {
         }),
       });
     });
+  });
+
+  it("keeps a helper's tools when an unrelated field is edited and saved", async () => {
+    // THE TRAP: `save()` used to build each helper object field by field with no spread, so a field
+    // not named there disappeared with no error. This is the test that would have caught it — it
+    // fails against a `save()` missing the `tools` line, and only that line fixes it.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({
+            chat_id: "c-1",
+            agents: [
+              {
+                name: "reviewer",
+                description: "d",
+                prompt: "p",
+                tools: ["Read", "Edit"],
+              },
+            ],
+          }),
+        ],
+        { "c-1": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+
+    fireEvent.change(await screen.findByLabelText("When to use it"), {
+      target: { value: "d, revised" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({
+          agents: [
+            {
+              name: "reviewer",
+              description: "d, revised",
+              prompt: "p",
+              tools: ["Read", "Edit"],
+              model: null,
+              effort: null,
+            },
+          ],
+        }),
+      });
+    });
+  });
+
+  it("refuses a stored helper naming a tool the daemon does not serve, or a CLI pattern rather than a name", async () => {
+    // Neither of these could be reached through the checkbox menu itself — that only ever offers
+    // the served list — but a helper saved before the list moved, or edited through the API
+    // directly, can still arrive with a name the door would now refuse. Same rule as
+    // `checked_denials` on the daemon: a pattern like `Bash(git *)` is never a name the served list
+    // contains, so one membership check catches both.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({
+            chat_id: "c-1",
+            agents: [
+              { name: "reviewer", description: "d", prompt: "p", tools: ["NoSuchTool"] },
+              { name: "runner", description: "d", prompt: "p", tools: ["Bash(git *)"] },
+            ],
+          }),
+        ],
+        { "c-1": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+
+    // Waits on the served list arriving — before that, every name would read as unknown, which
+    // would flash a refusal a helper opened with valid tools does not deserve.
+    const alerts = await screen.findAllByRole("alert");
+    expect(alerts).toHaveLength(2);
+    expect(alerts[0].textContent).toMatch(/is not a tool the daemon can grant/i);
+    expect(alerts[1].textContent).toMatch(/is not a tool the daemon can grant/i);
+    const save = screen.getByRole("button", { name: /^save$/i }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith(
+      "/assistant/chats/c-1",
+      expect.objectContaining({ method: "PATCH" }),
+    );
   });
 
   it("says why a helper would be refused, in place, before anything is sent", async () => {

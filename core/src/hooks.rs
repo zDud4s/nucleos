@@ -1,4 +1,5 @@
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +20,32 @@ pub struct PreToolUsePayload {
     pub tool_name: String,
     #[serde(default)]
     pub tool_input: Value,
+}
+
+/// What arrives with a `PostToolUse`/`PostToolUseFailure` report: the OUTCOME of a call this
+/// daemon already decided about (spec-adjacent to `PreToolUsePayload`, but never a second
+/// decision).
+#[derive(Deserialize)]
+pub struct PostToolUsePayload {
+    // Same claim-vs-key relationship `posttooluse_outcome` resolves for `PreToolUsePayload::run_id`
+    // above: a scoped key names its own run and this claim is dropped; a key naming no run leaves
+    // the claim as the only identifier there is.
+    pub run_id: i64,
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_input: Value,
+    // The field `PreToolUsePayload` has no reason to carry, and the entire reason this payload
+    // exists: measured against the installed CLI (2.1.260), the CLI's own embedded hook
+    // documentation marks `tool_response` a `PostToolUse`-only field. It is what turns a barrier
+    // that only judges INTENT into a ledger that also knows the RESULT.
+    #[serde(default)]
+    pub tool_response: Value,
+    // The CLI's `hook_event_name`, echoed back so a success (`PostToolUse`) and a failure
+    // (`PostToolUseFailure`) are told apart once they reach `shadow::record_outcome`, which stores
+    // it verbatim in `outcome_event`. No `#[serde(default)]`: every real invocation of this hook
+    // carries it, and a payload that does not is exactly the malformed input this route should
+    // refuse to guess about.
+    pub event: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -860,6 +887,70 @@ pub async fn pretooluse_decision(
     }
 
     Json(classification.decision)
+}
+
+/// Records the OUTCOME of a tool call this daemon already decided about. **Never a second
+/// decision** — measured against the installed CLI (2.1.260), a `PostToolUse` response carries no
+/// `permissionDecision`, because by the time this fires the tool has already run (or already
+/// failed) and there is nothing left to block. Blocking here would be a second barrier, with its
+/// own failure surface, on a cooperative path where the call already happened — an expensive
+/// warning rather than a protection.
+///
+/// Named for what it does rather than for the event that triggers it: `posttooluse_decision`
+/// would have been the wrong name for the one handler in this file that never returns a
+/// `Decision`.
+///
+/// Wired to BOTH `PostToolUse` and `PostToolUseFailure` (`autopilot.rs`'s `wire_event`), which is
+/// why `PostToolUsePayload::event` exists at all — `PostToolUse` alone would let this ledger
+/// answer "did it happen?" only for a yes, and stay silent about every no.
+pub async fn posttooluse_outcome(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Json(mut payload): Json<PostToolUsePayload>,
+) -> StatusCode {
+    // Exactly `pretooluse_decision`'s construction, for exactly its reason: a scoped key names its
+    // own run and the daemon resolved that name from its own state, so the key decides and the
+    // body's claim is dropped. A key naming no run (the control token) leaves the claim as the
+    // only identifier there is.
+    let run_id = match scope {
+        Scope::Run(id) => id,
+        _ => payload.run_id,
+    };
+    payload.run_id = run_id;
+
+    // Validated against runs actually in flight, exactly as `pretooluse_decision` validates it
+    // before trusting anything derived from it: the hook's environment sits inside the same
+    // cooperative trust model as the token, so the daemon never blindly trusts a run_id it did not
+    // itself hand out. A stray outcome naming a finished or unknown run has nothing to complete.
+    if !state.run_handles.lock().unwrap().contains_key(&run_id) {
+        return StatusCode::OK;
+    }
+
+    // Unconditional on `mode`, unlike `pretooluse_decision`'s call to `record_decision`:
+    // `record_outcome` is UPDATE-only and matches nothing for a `real`-mode run, which never had a
+    // decision row to begin with. Gating on mode here would only duplicate a check the UPDATE's
+    // own WHERE clause already makes redundant.
+    if let Err(error) = shadow::record_outcome(
+        &state.pool,
+        run_id,
+        &payload.tool_name,
+        &payload.tool_input,
+        &payload.tool_response,
+        &payload.event,
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id = run_id,
+            %error,
+            "posttooluse-outcome: failed to record outcome"
+        );
+    }
+
+    // Always OK, on every path. There is no `permissionDecision` to give and nothing for a caller
+    // to retry or appeal — this route only ever records, and a failure to record is this daemon's
+    // problem, not the CLI's.
+    StatusCode::OK
 }
 
 /// The reason an orchestrator turn is refused a tool that would act. A constant because the tests
@@ -7446,5 +7537,83 @@ mod tests {
 
         assert_eq!(decision.decision, "deny", "{}", decision.reason);
         assert_eq!(queued_rows(&state).await.len(), 1);
+    }
+
+    /// The `PostToolUse` route shares `pretooluse_decision`'s scope-decides construction, and this
+    /// is its own version of `the_gate_judges_a_turn_by_its_key_and_not_by_the_id_it_claims`: a
+    /// run's key decides which run's outcome this is, and a body naming a different run cannot
+    /// attribute an outcome to it — the claim is dropped, not compared and refused.
+    #[tokio::test]
+    async fn posttooluse_outcome_is_recorded_against_the_keys_run_and_not_the_claim() {
+        let state = test_state().await;
+        let mine = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let other = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let app = test_router(state.clone());
+
+        // A decision for `mine`, so there is a row for the outcome below to complete.
+        let decision = decide(
+            &app,
+            &format!(r#"{{"run_id":{mine},"tool_name":"Read","tool_input":{{}}}}"#),
+        )
+        .await;
+        assert_eq!(decision.decision, "allow");
+
+        // The outcome's BODY claims `other`'s id, but arrives under `mine`'s own key.
+        let status = posttooluse_outcome(
+            State(state.clone()),
+            Extension(Scope::Run(mine)),
+            Json(PostToolUsePayload {
+                run_id: other,
+                tool_name: "Read".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({"success": true}),
+                event: "PostToolUse".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mine_row: shadow::ShadowDecision =
+            sqlx::query_as("SELECT * FROM shadow_decisions WHERE run_id = ?")
+                .bind(mine)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(mine_row.outcome_event.as_deref(), Some("PostToolUse"));
+        assert!(mine_row.outcome.is_some());
+
+        let other_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM shadow_decisions WHERE run_id = ?")
+                .bind(other)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            other_rows, 0,
+            "the claimed run_id must never receive an outcome that belongs to the key's own run"
+        );
+    }
+
+    /// A `PostToolUseFailure` report for a run that has already left `run_handles` — finished,
+    /// crashed, or simply unknown — has nothing to complete and must not be treated as an error:
+    /// there is no decision to appeal and nobody waiting on an answer.
+    #[tokio::test]
+    async fn posttooluse_outcome_for_an_unknown_run_is_a_silent_no_op() {
+        let state = test_state().await;
+
+        let status = posttooluse_outcome(
+            State(state.clone()),
+            Extension(Scope::Run(999_999)),
+            Json(PostToolUsePayload {
+                run_id: 999_999,
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({"command": "echo hi"}),
+                tool_response: serde_json::json!({"success": false}),
+                event: "PostToolUseFailure".to_owned(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
     }
 }
