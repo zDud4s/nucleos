@@ -28,6 +28,20 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
+/* The microphone, which jsdom has no API for at all. What the hook DECIDES is tested in
+   `data/dictation.test.ts`; what is left here is what the box does with a sentence once it has one,
+   so the mock keeps the callback and a test hands it words as if they had been spoken. */
+const dictation = vi.hoisted(() => ({
+  said: null as ((text: string) => void) | null,
+  toggle: vi.fn(),
+}));
+vi.mock("../data/dictation", () => ({
+  useDictation: (onText: (text: string) => void) => {
+    dictation.said = onText;
+    return { phase: "off", trouble: null, toggle: dictation.toggle };
+  },
+}));
+
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
@@ -2122,6 +2136,52 @@ describe("Chats - what it may do without asking", () => {
     expect(
       rung.compareDocumentPosition(send) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+  });
+
+  /* The gap this closes, and it is the same shape as the rung's above: the microphone lived only
+     in a conversation's own composer, and the two boxes that are NOT one — the front door, and an
+     editor session not carried on here yet — had none. Since almost every conversation here starts
+     as an editor session, that was most of the app. */
+  it("puts a microphone on the typing line of the door that has no conversation yet", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}));
+
+    const { container } = await renderChats("/chats");
+
+    const line = container.querySelector(".chats-composer-line") as HTMLElement;
+    const mic = await screen.findByRole("button", { name: /^Dictate$/ });
+    expect(line.contains(mic)).toBe(true);
+    expect(line.contains(screen.getByLabelText("Message"))).toBe(true);
+    // Not among the settings about the message. What it starts is the message itself.
+    expect(
+      (container.querySelector(".chats-composer-actions") as HTMLElement).contains(mic),
+    ).toBe(false);
+  });
+
+  /* Dictated, not sent — and that is the whole reason this box speaks TEXT rather than running the
+     hands-free conversation the way an open chat does. Here the first sentence is what CREATES the
+     conversation, and a conversation opened on a misheard sentence is a billed row that archives
+     and never deletes. So the words land where they can be read and fixed first.
+
+     Appended rather than substituted, because somebody who typed half a sentence and then reached
+     for the microphone meant to continue it. */
+  it("lands a spoken sentence in the box after what was already typed, and sends nothing", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}));
+
+    await renderChats("/chats");
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "olá" } });
+
+    act(() => dictation.said!("mundo"));
+
+    await waitFor(() => expect(textarea.value).toBe("olá mundo"));
+    // The list read on this route is a GET and happens anyway; what must not have happened is the
+    // POST that opens a conversation.
+    expect(
+      daemon.apiFetch.mock.calls.some(
+        (call) =>
+          String(call[0]) === "/assistant/chats" && (call[1] as RequestInit)?.method === "POST",
+      ),
+    ).toBe(false);
   });
 
   // The owner's decision, and the reason the menu opens at all rather than being greyed whole: a

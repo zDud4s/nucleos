@@ -132,6 +132,7 @@ import { attachmentFrom, isPicture } from "../lib/picture";
 import { stillGoing } from "../lib/editor";
 import { diffLines } from "../lib/diff";
 import { ConversationView, useVoiceConversation } from "../data/conversation";
+import { useDictation, type DictationView } from "../data/dictation";
 import type { ConversationPhase } from "../lib/conversation";
 import type { LocalPull, ModelChoice } from "../data/chats";
 import {
@@ -1449,6 +1450,25 @@ function StartBox({
   const box = useRef<HTMLTextAreaElement | null>(null);
   const sayable = text.trim() !== "" && !pending;
 
+  /* Appended, not substituted: somebody who typed half a sentence and then reached for the
+     microphone meant to continue it. The separating space is added only where there is not already
+     one, so dictating twice in a row does not open a gap that widens on every turn. The caret is
+     moved to the end because the box is written into next, and a caret left where it was would put
+     the following word in the middle of what was just said. */
+  const dictation = useDictation((said) => {
+    setText((was) => {
+      const joined = was === "" || /\s$/.test(was) ? `${was}${said}` : `${was} ${said}`;
+      setCaret(joined.length);
+      queueMicrotask(() => {
+        const field = box.current;
+        if (field === null) return;
+        field.focus();
+        field.setSelectionRange(joined.length, joined.length);
+      });
+      return joined;
+    });
+  });
+
   const command = commandAt(text, caret);
   const mention = mentionAt(text, caret);
   const live = (at: { query: string } | null) =>
@@ -1542,42 +1562,48 @@ function StartBox({
             ))}
           </ul>
         )}
-        <textarea
-          className="chats-composer-text"
-          aria-label="Message"
-          placeholder={placeholder}
-          ref={box}
-          rows={1}
-          value={text}
-          onPaste={(event) => {
-            const pictures = Array.from(event.clipboardData.files).filter(
-              isPicture,
-            );
-            if (pictures.length === 0) return;
-            event.preventDefault();
-            void attach(pictures);
-          }}
-          onChange={(event) => {
-            setText(event.target.value);
-            setCaret(event.target.selectionStart);
-            setDismissed(null);
-            setHighlight(0);
-          }}
-          // The caret moves without the text changing — arrows, a click, Home — and what is being
-          // typed is read from where it IS.
-          onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
-          onKeyDown={(event) => {
-            if (listTookTheKey(event, choices, highlight, setHighlight)) return;
-            if ((choices.length > 0 || noFolderYet) && event.key === "Escape") {
+        {/* The same one-line arrangement the conversation's own composer uses, and for the same
+            reason: the microphone belongs on the line being written on, not in the row of settings
+            about the message. `.chats-composer-line` keeps the button at the top as the box grows. */}
+        <div className="chats-composer-line">
+          <textarea
+            className="chats-composer-text"
+            aria-label="Message"
+            placeholder={placeholder}
+            ref={box}
+            rows={1}
+            value={text}
+            onPaste={(event) => {
+              const pictures = Array.from(event.clipboardData.files).filter(
+                isPicture,
+              );
+              if (pictures.length === 0) return;
               event.preventDefault();
-              setDismissed(live(command) ?? live(mention));
-              return;
-            }
-            if (event.key !== "Enter" || event.shiftKey) return;
-            event.preventDefault();
-            say();
-          }}
-        />
+              void attach(pictures);
+            }}
+            onChange={(event) => {
+              setText(event.target.value);
+              setCaret(event.target.selectionStart);
+              setDismissed(null);
+              setHighlight(0);
+            }}
+            // The caret moves without the text changing — arrows, a click, Home — and what is being
+            // typed is read from where it IS.
+            onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+            onKeyDown={(event) => {
+              if (listTookTheKey(event, choices, highlight, setHighlight)) return;
+              if ((choices.length > 0 || noFolderYet) && event.key === "Escape") {
+                event.preventDefault();
+                setDismissed(live(command) ?? live(mention));
+                return;
+              }
+              if (event.key !== "Enter" || event.shiftKey) return;
+              event.preventDefault();
+              say();
+            }}
+          />
+          <DictateToggle dictation={dictation} />
+        </div>
         <div className="chats-composer-actions">
           <label className="chats-attach" title="Attach a picture">
             <ImagePlus className="chats-tool-icon" aria-hidden="true" />
@@ -1631,7 +1657,55 @@ function StartBox({
           </button>
         </div>
       </form>
+      {dictation.trouble !== null && (
+        <p className="chats-handsfree-status">{dictation.trouble}</p>
+      )}
     </>
+  );
+}
+
+/**
+ * Speaking into the box instead of typing into it.
+ *
+ * **Not `HandsFreeToggle`, and the two must not be confused by whoever maintains them.** That one
+ * runs a conversation: it hears a sentence, sends it as a turn, and plays the answer out loud. This
+ * one produces TEXT and stops. The reason is not a smaller ambition — it is that neither end of the
+ * conversation exists here. `data/dictation.ts` carries the whole argument; the short version is
+ * that on this box the first sentence is what CREATES the conversation, and a conversation opened on
+ * a misheard sentence is a billed row that can be archived and never deleted.
+ *
+ * So what lands is a draft, in the box, with the caret after it — read it, fix the word it got
+ * wrong, and press send. Appended rather than replacing, because somebody who typed half a sentence
+ * and then reached for the microphone meant to continue it.
+ */
+function DictateToggle({ dictation }: { dictation: DictationView }) {
+  const listening = dictation.phase === "listening";
+  const writing = dictation.phase === "transcribing";
+
+  return (
+    <button
+      type="button"
+      className={listening ? "chats-handsfree chats-handsfree-on" : "chats-handsfree"}
+      aria-pressed={listening}
+      aria-label={listening ? "Stop dictating" : "Dictate"}
+      // Disabled only while the last sentence is being written down. Two recordings racing two
+      // transcripts into one box is the state this forecloses.
+      disabled={writing}
+      title={
+        listening
+          ? "stop, and write down what was said"
+          : "say it instead of typing it — the words land in the box for you to check before sending"
+      }
+      onClick={dictation.toggle}
+    >
+      {listening ? (
+        <MicOff className="chats-tool-icon" aria-hidden="true" />
+      ) : (
+        <Mic className="chats-tool-icon" aria-hidden="true" />
+      )}
+      {listening && <span className="chats-handsfree-phase">listening</span>}
+      {writing && <span className="chats-handsfree-phase">writing it down</span>}
+    </button>
   );
 }
 

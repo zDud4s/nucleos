@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { durationMs, encodeCapture } from "../lib/audio";
+import { finishCapture, startCapture, type ActiveCapture } from "../lib/capture";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   phaseAfter,
@@ -85,28 +85,8 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
 /* ------------------------------------------------------------ recording -- */
 
 /** What one in-progress recording is holding, kept in a ref rather than state — none of it should cause a render. */
-interface ActiveCapture {
-  kind: "dictation" | "memo";
-  stream: MediaStream;
-  context: AudioContext;
-  source: MediaStreamAudioSourceNode;
-  processor: ScriptProcessorNode;
-  sink: GainNode;
-  /** Raw mono frames, one `Float32Array` per `onaudioprocess` tick, concatenated only once recording stops. */
-  frames: Float32Array[];
-}
-
-/** Every chunk `onaudioprocess` handed over, joined into the one buffer `lib/audio.ts` expects. */
-function concatFrames(frames: Float32Array[]): Float32Array {
-  const total = frames.reduce((sum, chunk) => sum + chunk.length, 0);
-  const out = new Float32Array(total);
-  let offset = 0;
-  for (const chunk of frames) {
-    out.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return out;
-}
+/** The open microphone, plus the one thing this page needs to remember about it: which list it is for. */
+type ActiveRecording = ActiveCapture & { kind: "dictation" | "memo" };
 
 /** What a finished attempt at a capture came back as — read once, shown once, replaced by the next attempt. */
 type CaptureOutcome =
@@ -131,7 +111,7 @@ export function Voice() {
   const [hotkeyConflicts, setHotkeyConflicts] = useState<string[] | null>(null);
   const [hotkeyRegisterFailed, setHotkeyRegisterFailed] = useState(false);
 
-  const captureRef = useRef<ActiveCapture | null>(null);
+  const captureRef = useRef<ActiveRecording | null>(null);
   const registeredHotkeysRef = useRef<string | null>(null);
 
   /** The phase this window already holds, in case the host is mid-capture from before this page mounted. */
@@ -182,32 +162,7 @@ export function Voice() {
     setOutcome(null);
     setDelivery(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const AudioContextCtor =
-        window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const context = new AudioContextCtor();
-      const source = context.createMediaStreamSource(stream);
-      const processor = context.createScriptProcessor(4096, 1, 1);
-      /**
-       * `onaudioprocess` only fires once the graph reaches `destination` in
-       * every browser this ships to — but wiring the microphone straight
-       * there plays it out loud through the speakers while it records. A
-       * zero-gain node between the two keeps the graph live without making
-       * the capture audible; no automated test can see this, since jsdom has
-       * neither API.
-       */
-      const sink = context.createGain();
-      sink.gain.value = 0;
-
-      const frames: Float32Array[] = [];
-      processor.onaudioprocess = (event) => {
-        frames.push(new Float32Array(event.inputBuffer.getChannelData(0)));
-      };
-      source.connect(processor);
-      processor.connect(sink);
-      sink.connect(context.destination);
-
-      captureRef.current = { kind, stream, context, source, processor, sink, frames };
+      captureRef.current = { ...(await startCapture()), kind };
       setActiveKind(kind);
       setPhase(phaseAfter({ type: "start", kind }));
     } catch {
@@ -221,16 +176,7 @@ export function Voice() {
     captureRef.current = null;
     setPhase(phaseAfter({ type: "stop" }));
 
-    active.processor.disconnect();
-    active.source.disconnect();
-    active.sink.disconnect();
-    for (const track of active.stream.getTracks()) track.stop();
-    const deviceRate = active.context.sampleRate;
-    await active.context.close();
-
-    const interleaved = concatFrames(active.frames);
-    const bytes = encodeCapture(interleaved, 1, deviceRate);
-    const ms = durationMs(interleaved.length, deviceRate);
+    const { bytes, ms } = await finishCapture(active);
 
     try {
       const result = await postCapture(bytes, active.kind, ms);
