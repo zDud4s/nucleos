@@ -54,10 +54,26 @@
 /// tool schema — and counting them would suggest a precision this has nowhere near.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AuthoredPrompt {
-    /// The MCP tool schemas this run's server announces, from
-    /// `mcp_tools::NucleosTools::advertised_schema_chars`. Zero for a run launched without
-    /// `--mcp-config`, which is a real zero and not an unknown: such a run is offered no tools by
-    /// this daemon at all, so there is no schema block in its prompt to pay for.
+    /// The MCP tool schemas that were actually SENT in this run's prompt, from
+    /// `mcp_tools::NucleosTools::advertised_schema_chars`.
+    ///
+    /// **Two different facts arrive here as zero, and neither is an unknown.** A run launched
+    /// without `--mcp-config` is offered no tools by this daemon at all, so nothing was announced
+    /// and there is no schema block to pay for. A run whose schemas are DEFERRED was offered tools
+    /// and announced them — but the CLI keeps `ToolSearch`, advertises the tools by name, and fetches
+    /// a schema only when the model asks for one, so the block is not in the prompt either.
+    /// `runner::authored_prompt` holds the rule and `runner::schemas_are_deferred` the measurements
+    /// behind it; both zeros mean "this prompt did not carry the schemas", which is the only claim
+    /// this field makes.
+    ///
+    /// What the deferred run carries instead — the CLI's own by-name listing of those tools — lands
+    /// in the residual, with everything else the CLI wrote. **This module does not size it**, and
+    /// that is the header's argument rather than a gap. The only figure anyone has for it is a
+    /// difference between two whole-prompt totals (850 tokens for 48 deferred tools, measured), and
+    /// spreading a two-point difference over a tool count is a fit, not a character measurement.
+    /// This daemon never writes that listing and never sees it, so a number for it here would be
+    /// exactly the kind of invented split the module header refuses — and it would shrink the
+    /// residual by something nobody measured.
     pub schema_chars: usize,
     /// `--append-system-prompt`, appended to the CLI's own system prompt on EVERY turn of the run.
     /// Capped at `http::INSTRUCTIONS_CEILING` (8,000 characters) where it is stored.

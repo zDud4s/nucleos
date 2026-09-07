@@ -1840,10 +1840,28 @@ pub trait CommandRunner: Send + Sync {
 /// number that LOOKS measured, agrees with the file only for as long as nobody edits either side,
 /// and reports its disagreement to nobody when it stops. `served_in_box` in `mcp_tools` is the same
 /// argument one layer down, and says why the price and the fold must not be two copies of a rule.
+///
+/// **A server that is ANNOUNCED is not a server whose schemas are SENT, and only the second is
+/// charged.** When the CLI keeps its `ToolSearch` built-in it advertises MCP tools by NAME and
+/// fetches a schema only when the model asks for one, so the block this function prices is not in
+/// the prompt at all and the run owes nothing for it. When `ToolSearch` is denied the CLI cannot
+/// defer, ships every schema, and the whole announcement is the right price. [`schemas_are_deferred`]
+/// is where that question is asked, and where the measurements are written down — this rule was
+/// taken off a live CLI, not reasoned from its documentation.
+///
+/// Not a display nicety. `runs::RunStatusResponse::with_prompt_budget` derives "the CLI's own" by
+/// SUBTRACTING this estimate from the reported prompt total, so charging the authored side for a
+/// ~10,250-character schema block that was never sent understates the residual by exactly as much.
+/// And the common case is the deferring one: a shell chat turn is `ToolPolicy::Unrestricted`
+/// (`assistant::tool_policy_for`), so this arm is the one an ordinary turn takes.
 pub(crate) fn authored_prompt(request: &RunRequest) -> crate::prompt_budget::AuthoredPrompt {
     crate::prompt_budget::AuthoredPrompt {
         schema_chars: match request.mcp_config {
             None => 0,
+            // Announced but never sent: charged nothing, because nothing was read. This zero is a
+            // different fact from the one above it, and `AuthoredPrompt::schema_chars` is where the
+            // two are told apart for whoever reads the stored number.
+            Some(_) if schemas_are_deferred(request) => 0,
             Some(_) => crate::mcp_tools::NucleosTools::advertised_schema_chars(request.mcp_box),
         },
         // Only counted when the flag is actually written. `Some("")` is not a state any caller
@@ -1861,6 +1879,54 @@ pub(crate) fn authored_prompt(request: &RunRequest) -> crate::prompt_budget::Aut
         // of the two, and the model reads the same characters either way.
         prompt_chars: request.prompt.len(),
     }
+}
+
+/// Whether this run's MCP tool schemas are DEFERRED — announced by name, fetched only if the model
+/// asks — rather than shipped whole inside the prompt.
+///
+/// **Asked of `denied_tools`, and never of the policy.** The expression below is the one `cli_args`
+/// writes onto `--disallowedTools`, so the price and the flag go wrong together or not at all. A
+/// `match` on `ToolPolicy` variants would answer the same for today's two policies and still be the
+/// wrong contract: a run that is `Unrestricted` and names `"ToolSearch"` in its own `denied_tools`
+/// has had the deferral taken away from it by name, ships every schema, and a variant match would
+/// charge it nothing.
+///
+/// Measured on 2026-09-07 against CLI 2.1.263 — one prompt, one flag different per arm, input
+/// tokens as the CLI reported them:
+///
+/// | offered | tools | input tokens |
+/// |---|---|---|
+/// | nothing at all | 0 | 3,612 |
+/// | 48 nucleos tools, every built-in denied | 48 | 15,837 |
+/// | 32 built-ins, no MCP server | 32 | 29,756 |
+/// | 32 built-ins + the same 48 nucleos tools | 80 | 30,606 |
+///
+/// The same 48 tools cost 12,225 tokens in one row and 850 in the other. In the shipped regime
+/// `advertised_schema_chars / 4` is right to within 9% (10,250 estimated against ~11,160
+/// attributable); in the deferred one it overstates the truth by more than an order of magnitude.
+///
+/// **`ToolSearch` is the single variable, and that was tested directly rather than inferred.** The
+/// rows above differ by a whole built-in set, which leaves open the rival explanation that the CLI
+/// defers once some TOOL COUNT is passed. A further arm denied every built-in EXCEPT `ToolSearch`,
+/// against the same 48-tool server: 49 tools, 5,578 input tokens — deferred — where 48 tools with
+/// no `ToolSearch` cost 15,837 and shipped. A count threshold cannot make 49 defer while 48 ships.
+/// `"ToolSearch"` is itself on `BUILTIN_TOOLS`, which is how denying the built-ins denies it.
+///
+/// `ToolPolicy::None` answers `["*"]`, which names no tool literally, so it reads as deferred and is
+/// charged nothing. That is the right answer by a different road — such a run is advertised NO tools
+/// at all, so there is no schema block in its prompt either — and it is unreachable regardless:
+/// every `None`-policy request in this codebase pairs the policy with `mcp_config: None`
+/// (`council::run_cloud_seat` makes the config `with_tools.then(…)`, `map_intent` sets neither, and
+/// `create_run_inner` never sets a config at all). It is left to the literal question above rather
+/// than special-cased, because the moment this stops being one reading of what `cli_args` writes, it
+/// starts being a second source of truth.
+fn schemas_are_deferred(request: &RunRequest) -> bool {
+    // Deferral is a CAPABILITY, so the question is whether the run still has it: `ToolSearch` on
+    // the denied list is the CLI being unable to fetch a schema on demand, which is the shipped
+    // regime. Reading the same list the flag is built from is the whole point of asking here.
+    !denied_tools(&request.tool_policy, &request.denied_tools)
+        .iter()
+        .any(|name| name == "ToolSearch")
 }
 
 /// A tool-free Ollama boundary for local triage.
@@ -4129,6 +4195,10 @@ mod tests {
     #[test]
     fn a_request_offered_no_server_is_charged_nothing_for_schemas() {
         let mut request = baseline_run_request();
+        // `McpOnly` and not the baseline's `Unrestricted`, so that the zeros below are attributable
+        // to the ABSENT SERVER. An unrestricted run defers its schemas and reads 0 whatever its
+        // config says, which would make both assertions pass without touching what they are about.
+        request.tool_policy = ToolPolicy::McpOnly;
         assert!(request.mcp_config.is_none());
         assert_eq!(authored_prompt(&request).schema_chars, 0);
 
@@ -4157,6 +4227,11 @@ mod tests {
     fn a_boxed_request_is_charged_for_the_box_and_not_the_whole_surface() {
         let mut request = baseline_run_request();
         request.mcp_config = Some(PathBuf::from("mcp.json"));
+        // `McpOnly` is the only policy under which a schema price is non-zero at all: it denies the
+        // built-ins, `ToolSearch` among them, so the CLI cannot defer and the schemas really are in
+        // the prompt. Under the baseline's `Unrestricted` every assertion below would read 0 against
+        // 0 and the box-versus-whole comparison would be vacuous.
+        request.tool_policy = ToolPolicy::McpOnly;
         let whole = authored_prompt(&request).schema_chars;
 
         request.mcp_box = Some(7);
@@ -4176,6 +4251,80 @@ mod tests {
             boxed * 8 < whole,
             "a boxed server must announce a small part of the whole surface — measured at roughly \
              twelve to one — and this said {boxed} against {whole}"
+        );
+    }
+
+    /// The same server, announced twice, charged once — because only one of the two runs was sent
+    /// the schemas.
+    ///
+    /// **The assertion is the SPLIT, not either half.** One `RunRequest` with one `mcp_config` is
+    /// read under both policies, so nothing but the regime differs between the two readings; a test
+    /// that only pinned the zero would pass against code that charged nobody, and one that only
+    /// pinned the price would pass against the old code that charged everybody.
+    ///
+    /// Measured on 2026-09-07 against CLI 2.1.263, on one prompt with one flag moved per arm. The
+    /// same 48 nucleos tools cost **850** input tokens when the CLI kept `ToolSearch` and advertised
+    /// them by name, and **~12,225** when every built-in was denied and it had to ship the schemas.
+    /// That is the whole of why the daemon may not charge both alike: on the deferred run
+    /// `advertised_schema_chars / 4` claims ~10,250 tokens for a block the model never read, and
+    /// `runs::with_prompt_budget` subtracts it, so the CLI's own share is understated by as much.
+    #[test]
+    fn a_deferred_schema_is_not_charged_to_the_prompt_that_never_held_it() {
+        let mut request = baseline_run_request();
+        request.mcp_config = Some(PathBuf::from("mcp.json"));
+
+        // The ordinary chat turn: `assistant::tool_policy_for` returns this for a turn with a cwd,
+        // so the deferring regime is the common one and not the exotic one.
+        request.tool_policy = ToolPolicy::Unrestricted;
+        assert_eq!(
+            authored_prompt(&request).schema_chars,
+            0,
+            "the CLI keeps `ToolSearch` here, advertises the tools by name and fetches a schema only \
+             when asked — so the schema block is not in this prompt and may not be billed to it"
+        );
+
+        // One flag different. Same request, same server, same announcement.
+        request.tool_policy = ToolPolicy::McpOnly;
+        assert_eq!(
+            authored_prompt(&request).schema_chars,
+            crate::mcp_tools::NucleosTools::advertised_schema_chars(request.mcp_box),
+            "denying the built-ins denies `ToolSearch` with them, the CLI cannot defer, and the run \
+             really does read every schema its server announces"
+        );
+    }
+
+    /// Taking `ToolSearch` away BY NAME puts an unrestricted run back in the shipped regime, and it
+    /// must be charged like one.
+    ///
+    /// This is the test that makes the helper's contract "ask `denied_tools`" rather than "match the
+    /// policy": the policy here is `Unrestricted`, so a variant match would call this deferred and
+    /// charge it nothing, while the flag `cli_args` writes says otherwise and the CLI obeys the flag.
+    ///
+    /// It is also where the count hypothesis dies. The regime could in principle have been chosen by
+    /// how many tools were on offer rather than by which ones — so a further arm on 2026-09-07 denied
+    /// every built-in EXCEPT `ToolSearch`, against the same 48-tool server: **49 tools, 5,578 input
+    /// tokens, deferred**, where **48 tools with no `ToolSearch` cost 15,837 and shipped**. No count
+    /// threshold makes 49 defer while 48 ships. `ToolSearch` is the variable.
+    #[test]
+    fn denying_tool_search_by_name_is_charged_as_a_shipped_run() {
+        let mut request = baseline_run_request();
+        request.mcp_config = Some(PathBuf::from("mcp.json"));
+        assert!(
+            matches!(request.tool_policy, ToolPolicy::Unrestricted),
+            "the point of this test is a policy that would otherwise defer"
+        );
+        assert_eq!(
+            authored_prompt(&request).schema_chars,
+            0,
+            "untouched, this request defers"
+        );
+
+        request.denied_tools = vec!["ToolSearch".to_string()];
+        assert_eq!(
+            authored_prompt(&request).schema_chars,
+            crate::mcp_tools::NucleosTools::advertised_schema_chars(request.mcp_box),
+            "one name on `--disallowedTools` and the CLI has no way to fetch a schema on demand, so \
+             it ships them all — the price must follow the flag, not the policy the flag sits under"
         );
     }
 
