@@ -354,9 +354,9 @@ pub fn segment_verdict(
     discard: &str,
     confirm: &[String],
 ) -> Verdict {
-    let tokens: Vec<String> = segment.split_whitespace().map(|t| fold_control(t)).collect();
+    let tokens: Vec<String> = segment.split_whitespace().map(fold_control).collect();
     let discard_tokens: Vec<String> =
-        discard.split_whitespace().map(|t| fold_control(t)).collect();
+        discard.split_whitespace().map(fold_control).collect();
     if !discard_tokens.is_empty() && tokens.ends_with(&discard_tokens) {
         return Verdict::Discards;
     }
