@@ -30,12 +30,12 @@ function sendFrames(count: number, amplitude: number): void {
   const fullBatch = new Float32Array(FRAME_SAMPLES * batchFrames).fill(amplitude);
   let remaining = count;
   while (remaining >= batchFrames) {
-    callback({ inputBuffer: { getChannelData: () => fullBatch } } as AudioProcessingEvent);
+    callback({ inputBuffer: { getChannelData: () => fullBatch } } as unknown as AudioProcessingEvent);
     remaining -= batchFrames;
   }
   if (remaining > 0) {
     const tail = new Float32Array(FRAME_SAMPLES * remaining).fill(amplitude);
-    callback({ inputBuffer: { getChannelData: () => tail } } as AudioProcessingEvent);
+    callback({ inputBuffer: { getChannelData: () => tail } } as unknown as AudioProcessingEvent);
   }
 }
 
