@@ -23959,6 +23959,46 @@ mod tests {
         assert_eq!(after, before, "a refused spelling opened a conversation");
     }
 
+    /// The same refusal on the way into a conversation that is already open.
+    ///
+    /// `PatchChatRequest::permission_mode` claims in as many words that a spelling outside the list
+    /// "fails the whole request rather than falling to a default", and nothing held it to that. The
+    /// claim needs its own test rather than leaning on the opening call's: these are two structs,
+    /// and a `#[serde(other)]` arm or a hand-written `Deserialize` added to one would not be added
+    /// to both. The route matters more here than at the front door — the conversation exists, it
+    /// already has a rung, and there is something to widen.
+    ///
+    /// The pair is the assertion, and the second half is the point. A 422 on its own is satisfied
+    /// by a handler that refuses AFTER writing, so the rung is read back and has to still be the
+    /// one somebody deliberately set. A conversation parked on `plan` becoming `auto` because of a
+    /// typo is the failure, and it is silent: the caller sees a refusal and assumes nothing moved.
+    #[tokio::test]
+    async fn a_rung_nobody_can_spell_moves_no_conversation() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        // Set rather than opened on, so the rung under test is one a person chose and not the
+        // column's default — `auto` is what a dropped field also produces.
+        assert_eq!(
+            patch_chat_request(state.clone(), &chat_id, r#"{"permission_mode":"plan"}"#).await,
+            StatusCode::NO_CONTENT
+        );
+
+        assert_eq!(
+            patch_chat_request(state.clone(), &chat_id, r#"{"permission_mode":"bypasss"}"#).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        assert_eq!(
+            crate::chats::permission_mode_of(&state.pool, &chat_id)
+                .await
+                .unwrap(),
+            crate::chats::PermissionMode::Plan,
+            "a refused spelling moved the rung anyway"
+        );
+    }
+
     /// A chat opened with no `brain` at all is a cloud chat, matching the column default and every
     /// caller written before the field existed.
     #[tokio::test]
