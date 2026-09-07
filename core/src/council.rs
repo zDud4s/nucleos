@@ -654,7 +654,7 @@ pub struct SeatRow {
     /// future version with a field this one does not know about still reads.
     pub rankings: Option<String>,
     /// The second round, or the columns a council of one round never touches. `pending` is what
-    /// those keep — see `0134_council_revision.sql`, which argues why that is not tidied.
+    /// those keep — see `0136_council_revision.sql`, which argues why that is not tidied.
     pub revision_run_id: Option<i64>,
     pub revision_status: String,
     pub revision_error: Option<String>,
@@ -3681,7 +3681,7 @@ mod tests {
 
         for seat in get_seat_rows(&state.pool, &id).await.unwrap() {
             // `pending` and not `skipped`. A council of one round never had a fourth phase to skip,
-            // and `rounds` on the row is what says so — see `0134_council_revision.sql`.
+            // and `rounds` on the row is what says so — see `0136_council_revision.sql`.
             assert_eq!(seat.revision_status, SEAT_PENDING);
             assert_eq!(seat.revision_run_id, None);
             assert_eq!(seat.revision_error, None);

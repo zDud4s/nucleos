@@ -14,9 +14,19 @@
 -- That default is not tidiness: a second round asks every seat the question again, so it roughly
 -- doubles what phase 1 cost. Nobody is going to pay that by accident.
 --
--- Numbered 0134, having been planned as 0131. Master landed 0130 through 0133 between the plan and
--- the file, and the rule this repository keeps is the one `0065_council.sql` states at length: the
--- BRANCH gives way, master's lineage stands. A number is not reserved by being written down.
+-- Numbered 0136, having been planned as 0131 and written as 0134. Master landed 0130 through 0133
+-- between the plan and the file, and then 0134 and 0135 between the file and the landing, and the
+-- rule this repository keeps is the one `0065_council.sql` states at length: the BRANCH gives way,
+-- master's lineage stands. A number is not reserved by being written down.
+--
+-- Twice is worth recording rather than smoothing over, because the second time was not bad luck.
+-- The queue publishes a merge without gating it, so two branches can each land a 0134 that was
+-- green on its own — which is what happened on 2026-09-07 and left master unopenable for an hour
+-- (`UNIQUE constraint failed: _sqlx_migrations.version`). A long-lived branch will meet this every
+-- time master takes a migration, and the answer is always the same: renumber the half no database
+-- has run. This file's was read out of the live database before the rename, exactly as
+-- `fix(migrations): 0134 was claimed twice` prescribes — 134 there is `notify policy`, master's,
+-- and renaming an APPLIED file changes its checksum and the database then refuses to open at all.
 
 -- The `runs` row that produced this seat's revised answer. NULL until the round starts, and NULL
 -- forever on a council of one round. A logical foreign key and not a declared one, for the reason

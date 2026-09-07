@@ -4671,7 +4671,7 @@ async fn council_before_review(state: &AppState, job: &JobRow, artifacts: &str) 
         return BeforeReview::Deliberating;
     }
 
-    // The column is deliberately NOT cleared here. See `0135_job_review_council.sql`: `advance`
+    // The column is deliberately NOT cleared here. See `0137_job_review_council.sql`: `advance`
     // reaches this arm on every tick until the node actually starts, and a review that parks for a
     // worktree slot would come back to a NULL column and convene a second council. Rewriting the
     // same file on a retry is idempotent; paying for a second deliberation is not.
