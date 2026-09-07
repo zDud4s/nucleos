@@ -244,6 +244,43 @@ export function postConversation(
   });
 }
 
+/** The wire spelling of the fourth kind — a contract with `core/src/voice.rs`'s `Kind`. */
+const SEGMENT_KIND = "segment";
+
+export interface SegmentTranscribed {
+  text: string;
+  verdict: "continues" | "closes" | "discards" | "confirms";
+}
+
+/**
+ * One segment, transcribed and judged, with nothing delivered.
+ *
+ * A `204` — the core heard nothing in it — comes back as `{text: "", verdict: "continues"}` rather
+ * than `undefined`. That is deliberate and it is where today's code would have gone wrong: a cough
+ * between two sentences must leave the turn accumulating, and `postConversation`'s `undefined` is
+ * answered with `turnRefused`, which would end the thought.
+ */
+export async function postSegment(
+  bytes: Uint8Array,
+  durationMs: number,
+  format = "wav",
+): Promise<SegmentTranscribed> {
+  const params = new URLSearchParams({
+    kind: SEGMENT_KIND,
+    duration_ms: String(Math.max(0, Math.round(durationMs))),
+    format,
+  });
+  const heard = await apiFetch<SegmentTranscribed | undefined>(
+    `/voice/capture?${params.toString()}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: bytes,
+    },
+  );
+  return heard ?? { text: "", verdict: "continues" };
+}
+
 /**
  * The wire spelling of the third kind.
  *
