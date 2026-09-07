@@ -154,6 +154,9 @@ pub struct VoiceRuntime {
     /// actually exists. A hotkey that records and then fails is worse than one that was never armed.
     pub stt_command: String,
     pub hints: Vec<String>,
+    pub closing_words: Vec<String>,
+    pub discard_phrase: String,
+    pub confirm_words: Vec<String>,
     pub cleanup_prompt: String,
     pub retain_dictations_days: u8,
     /// The two chords, carried through so `GET /voice/config` can report them.
@@ -190,6 +193,9 @@ impl Default for VoiceRuntime {
             armed: false,
             stt_command: String::new(),
             hints: Vec::new(),
+            closing_words: vec!["câmbio".into()],
+            discard_phrase: "risca isso".into(),
+            confirm_words: vec!["sim".into()],
             cleanup_prompt: crate::config::DEFAULT_CLEANUP_PROMPT.to_string(),
             retain_dictations_days: 7,
             hotkey: String::new(),
@@ -211,6 +217,9 @@ impl VoiceRuntime {
             armed: config.armed(),
             stt_command: config.stt_command.clone(),
             hints: config.hints.clone(),
+            closing_words: config.closing_words.clone(),
+            discard_phrase: config.discard_phrase.clone(),
+            confirm_words: config.confirm_words.clone(),
             cleanup_prompt: config.cleanup_prompt.clone(),
             retain_dictations_days: config.retain_dictations_days,
             hotkey: config.hotkey.clone(),
@@ -1200,6 +1209,28 @@ mod tests {
 
     fn hints() -> Vec<String> {
         vec!["núcleo".to_string(), "NucleOS".to_string()]
+    }
+
+    #[test]
+    fn the_defaults_name_the_three_control_words() {
+        let config = crate::config::VoiceConfig::default();
+        assert_eq!(config.closing_words, vec!["câmbio".to_string()]);
+        assert_eq!(config.discard_phrase, "risca isso");
+        assert_eq!(config.confirm_words, vec!["sim".to_string()]);
+    }
+
+    #[test]
+    fn a_configured_closing_word_reaches_the_runtime() {
+        // The failure this pins is silent, and this file has already had it once: `from_config` ends
+        // with `..Self::default()`, so a field added to the struct and forgotten here compiles clean,
+        // passes every test, and leaves the config file inert. `voice.rs`'s own comment records the
+        // last time — "both keys existed in the config and nothing anywhere read either one".
+        let config = crate::config::VoiceConfig {
+            closing_words: vec!["terminado".to_string()],
+            ..crate::config::VoiceConfig::default()
+        };
+        let runtime = VoiceRuntime::from_config(&config, None);
+        assert_eq!(runtime.closing_words, vec!["terminado".to_string()]);
     }
 
     #[test]
