@@ -2758,7 +2758,19 @@ pub fn implement_prompt(
 ///
 /// Advisory by design: §5.5 gives ship/no-ship to the deterministic gate, and this opinion travels
 /// with the proposal as information.
-pub fn review_prompt(base: Option<&str>, artifacts: &str) -> String {
+///
+/// `council_file` says whether a council deliberated first and left [`COUNCIL_FILE`] beside the
+/// queue. It is a parameter and not a sentence written unconditionally, because a prompt that names
+/// a file which is not there is an instruction that fails by omission: the node reads nothing, gets
+/// an error it was not warned about, and either spends turns hunting for the file or quietly
+/// decides the whole paragraph was wrong. The consumer is off by default and a council can fail, so
+/// "absent" is the common case rather than the edge one.
+///
+/// And it is named as ADVICE, in the same breath as the sentence telling the node to judge the diff
+/// rather than the intent. A synthesis carries no authority here — the deterministic gate already
+/// holds ship/no-ship — so a node told to read it must not read it as a verdict it should agree
+/// with. The council never saw this tree; it deliberated on the task.
+pub fn review_prompt(base: Option<&str>, artifacts: &str, council_file: bool) -> String {
     let diff = match base {
         Some(sha) => {
             format!("Run `git diff {sha}..HEAD` — that is the whole of what this job changed.")
@@ -2769,13 +2781,25 @@ pub fn review_prompt(base: Option<&str>, artifacts: &str) -> String {
                  and review their combined diff."
             .to_owned(),
     };
+    let council = if council_file {
+        format!(
+            "\n\nA panel of models was asked about this task before you started, and its synthesis \
+             is in {artifacts}/{COUNCIL_FILE}. Read it as ADVICE and nothing more: the panel never \
+             saw this branch, it deliberated on the task, and the verdict on the tree is the \
+             project's gate rather than anyone's opinion. Where it disagrees with what you find in \
+             the diff, the diff is what is real."
+        )
+    } else {
+        String::new()
+    };
     format!(
         "You are the REVIEW node of an autonomous job. Every change on this branch was written by \
          other sessions whose reasoning you cannot see, and you are not going to be shown it. \
          Judge the diff, not the intent.\n\n\
          {diff}\n\n\
          The queue those changes were meant to satisfy is in {artifacts}/plan.json. Report what is \
-         wrong, what is missing against that queue, and nothing else. Change no files.\n\n\
+         wrong, what is missing against that queue, and nothing else. Change no files.\
+         {council}\n\n\
          {LOOK_WITH_THE_READING_TOOLS}"
     )
 }
@@ -3080,6 +3104,17 @@ pub const PLAN_FILE: &str = "plan.json";
 /// nothing. `plan.json` is machine-read and so has to be a document with fields; this is prose and
 /// is allowed to be.
 pub const SPEC_FILE: &str = "spec.md";
+
+/// The council's synthesis, written into the job's artifacts directory for the review node to read.
+///
+/// Markdown for the reason `SPEC_FILE` is: nothing parses it. It is a deliberation written for a
+/// reader, and giving it a schema would only invite the chairman to fill fields.
+///
+/// Only ever present when the `job_review` consumer is on AND a council actually settled with a
+/// synthesis, which is why `review_prompt` is told whether it exists rather than assuming it. See
+/// that function: a prompt naming a file that is not there is an instruction that fails by
+/// omission, and the node spends a tool call discovering it.
+pub const COUNCIL_FILE: &str = "council.md";
 
 /// Copies a round's plan aside and lists every archive the job has, newest last.
 ///
@@ -4493,6 +4528,172 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
     }
 }
 
+/// What the reason column says while a job is waiting on a council.
+///
+/// One word, like `budget` and `slot` beside it, because `park` compares it against the reason the
+/// pass started with to decide whether the feed hears about this again. A detail sentence that
+/// changed between ticks would flood the feed with one line every thirty seconds for the whole
+/// deliberation; the id it names does not change, so it does not.
+const WAIT_COUNCIL: &str = "council";
+
+/// What the council has to say before a job's review node starts.
+#[derive(Debug, PartialEq, Eq)]
+enum BeforeReview {
+    /// Start the node. `council_file` is whether a synthesis is sitting beside the queue for it.
+    Go { council_file: bool },
+    /// A council is deliberating. The job parks and the next tick asks again.
+    Deliberating,
+}
+
+/// The question the council is asked on a job's behalf.
+///
+/// **Written for seats that cannot see the repository, and that is not a limitation being worked
+/// around — it is the honest shape of the thing.** A council seat is spawned with `cwd: None`, so
+/// it has no tree, no diff and no `plan.json`; asking it to review the change would get an answer
+/// invented out of the question's own words. What it CAN do from the task alone is say where a task
+/// of this shape usually goes wrong, and that is a genuinely useful thing to hand somebody who is
+/// about to read a diff — it is the difference between a reviewer scanning and a reviewer looking
+/// somewhere.
+fn council_review_question(task: &str) -> String {
+    format!(
+        "An autonomous coding job was asked to do the task below and has finished it. A reviewer is \
+         about to read the resulting diff. You cannot see that diff, the repository or the queue — \
+         answer from the task alone, and do not pretend otherwise.\n\n\
+         Say where a change satisfying this task is most likely to have gone wrong: the mistake that \
+         still passes a test suite, the requirement that gets read as done when it was only \
+         started, and the thing a diff of this shape usually leaves out. Be specific to this task, \
+         not to software in general.\n\n\
+         The task:\n\n{task}"
+    )
+}
+
+/// Puts the council in front of a job's review node, when the owner asked for one.
+///
+/// **The council ADVISES the reviewer; it does not replace it.** The `review` node still runs and
+/// still writes the opinion the proposal carries — §5.5 gives ship/no-ship to the deterministic
+/// gate and nothing here moves it. All that changes is that a synthesis may be sitting in the
+/// artifacts directory when the node starts, which is a directory `review_prompt` already sends it
+/// to. `ReviewState` gains no variant and `next_step` stays pure, which is the whole reason this
+/// lives here in the driver rather than in the state machine.
+///
+/// **Every failure walks the job on rather than holding it.** A council that could not start, one
+/// that ended `error` or `cancelled`, one whose row has been pruned, one whose chairman left no
+/// transcript, a file that would not write — each of them answers `Go { council_file: false }`, and
+/// the job reviews exactly as a job with no council configured does. The asymmetry is deliberate:
+/// the cost of proceeding unadvised is a slightly worse review, and the cost of waiting is a job
+/// that holds a worktree and its project's concurrency slot until the lifetime ceiling retires it.
+///
+/// The one thing that DOES hold the job is a council still deliberating, which is bounded by the
+/// council's own `timeout_seconds` and settled at daemon startup by `council::reconcile` — so a
+/// parked job always eventually sees a terminal status, even across a crash.
+async fn council_before_review(state: &AppState, job: &JobRow, artifacts: &str) -> BeforeReview {
+    let pool = &state.pool;
+    let unadvised = BeforeReview::Go {
+        council_file: false,
+    };
+
+    let existing: Option<String> = match sqlx::query_scalar::<_, Option<String>>(
+        "SELECT review_council_id FROM jobs WHERE id = ?",
+    )
+    .bind(job.id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(value) => value.flatten(),
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not read a job's review council");
+            return unadvised;
+        }
+    };
+
+    let Some(council_id) = existing else {
+        // Asked of the runtime and not of the row: no roster at all and a roster that did not ask
+        // for this answer the same way, which is the shipped state and must stay a silent no-op.
+        //
+        // **Read only on this branch, never above the column.** The flag decides whether to CONVENE
+        // a council, not whether to finish reading one. An owner who switches the consumer off — or
+        // restarts a daemon onto an edited roster — while a job is parked on a deliberation already
+        // paid for should get the synthesis it bought, not a job left waiting on a council nothing
+        // will ever look at again.
+        if !state.council.advises_job_review() {
+            return unadvised;
+        }
+        let question = council_review_question(job.prompt.as_deref().unwrap_or_default());
+        let council_id = match crate::council::start(state, &question, None).await {
+            Ok(id) => id,
+            // Unreachable while `advises_job_review` implies a roster, and answered silently anyway:
+            // "there is no council" is not an error a job has done anything about.
+            Err(crate::council::StartError::NotConfigured) => return unadvised,
+            Err(error) => {
+                tracing::warn!(job_id = job.id, %error, "a job's review council would not start");
+                return unadvised;
+            }
+        };
+        // Written before the job parks, and a failed write walks the job on. The council is running
+        // either way — that money is spent — but a job that parked without recording the id would
+        // convene a SECOND council on its next tick and park on that one too, which is the failure
+        // this order exists to make impossible.
+        if let Err(error) = sqlx::query("UPDATE jobs SET review_council_id = ? WHERE id = ?")
+            .bind(&council_id)
+            .bind(job.id)
+            .execute(pool)
+            .await
+        {
+            tracing::warn!(
+                job_id = job.id,
+                council_id,
+                %error,
+                "a job's review council started and could not be recorded; reviewing unadvised"
+            );
+            return unadvised;
+        }
+        return BeforeReview::Deliberating;
+    };
+
+    let row = match crate::council::get_council_row(pool, &council_id).await {
+        Ok(Some(row)) => row,
+        // The council is gone: pruned past its ninety days, or deleted. There is nothing to wait
+        // for and nothing to read, so this is the "council that failed" case by another door.
+        Ok(None) => {
+            tracing::warn!(
+                job_id = job.id,
+                council_id,
+                "a job's review council is no longer on record; reviewing unadvised"
+            );
+            return unadvised;
+        }
+        Err(error) => {
+            tracing::warn!(job_id = job.id, council_id, %error, "could not read a job's review council");
+            return unadvised;
+        }
+    };
+    if !row.is_settled() {
+        return BeforeReview::Deliberating;
+    }
+
+    // The column is deliberately NOT cleared here. See `0137_job_review_council.sql`: `advance`
+    // reaches this arm on every tick until the node actually starts, and a review that parks for a
+    // worktree slot would come back to a NULL column and convene a second council. Rewriting the
+    // same file on a retry is idempotent; paying for a second deliberation is not.
+    let Some(synthesis) = crate::council::synthesis_of(pool, &row).await else {
+        // Terminal with no synthesis: `error`, `cancelled`, or a chairman whose transcript was
+        // pruned. Nothing to say, and saying nothing must not stop the review.
+        return unadvised;
+    };
+
+    let path = std::path::Path::new(artifacts).join(COUNCIL_FILE);
+    if let Err(error) = tokio::fs::write(&path, synthesis.as_bytes()).await {
+        tracing::warn!(
+            job_id = job.id,
+            council_id,
+            %error,
+            "could not write a job's council synthesis; reviewing unadvised"
+        );
+        return unadvised;
+    }
+    BeforeReview::Go { council_file: true }
+}
+
 /// Performs one move for a job.
 async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
     let pool = &state.pool;
@@ -4696,8 +4897,24 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             step
         }
         Next::SpawnReview => {
-            let prompt = review_prompt(job.head_sha.as_deref(), &artifacts);
-            spawn_node(state, job, "review", prompt, None, worktree, NoRoom::Park).await
+            // In front of the node rather than inside `next_step`, which stays pure: this reads
+            // the database, starts a council and writes a file, and none of those belong in a
+            // function whose whole value is that it can be tested with a struct literal.
+            match council_before_review(state, job, &artifacts).await {
+                BeforeReview::Go { council_file } => {
+                    let prompt = review_prompt(job.head_sha.as_deref(), &artifacts, council_file);
+                    spawn_node(state, job, "review", prompt, None, worktree, NoRoom::Park).await
+                }
+                BeforeReview::Deliberating => {
+                    park(
+                        state,
+                        job,
+                        WAIT_COUNCIL,
+                        "a council is deliberating on this job before its review",
+                    )
+                    .await
+                }
+            }
         }
         Next::SpawnReplan => {
             // Archived BEFORE the node starts, because the node is about to overwrite `plan.json`
@@ -7005,7 +7222,7 @@ mod tests {
     #[test]
     fn the_nodes_that_only_look_are_told_what_to_look_with() {
         let replan = replan_prompt("t", 1, &[], "/wt/.nucleos", None, &[]);
-        let review = review_prompt(Some("abc123"), "/wt/.nucleos");
+        let review = review_prompt(Some("abc123"), "/wt/.nucleos", false);
 
         for prompt in [&replan, &review] {
             assert!(prompt.contains("Read, Grep and Glob"));
@@ -11750,13 +11967,326 @@ mod tests {
     /// builder's session because no builder session is kept for it to resume.
     #[test]
     fn the_review_node_is_given_a_diff_and_no_reasoning() {
-        let with_base = review_prompt(Some("deadbeef"), "/wt/.nucleos");
+        let with_base = review_prompt(Some("deadbeef"), "/wt/.nucleos", false);
         assert!(with_base.contains("git diff deadbeef..HEAD"));
 
         // No recorded base: git would not answer when the job started. Asking for the branch's own
         // commits is worse than naming a sha and better than reviewing a guess.
-        let without = review_prompt(None, "/wt/.nucleos");
+        let without = review_prompt(None, "/wt/.nucleos", false);
         assert!(without.contains("git log --oneline"));
+    }
+
+    // -- The council in front of the review node ---------------------------------------------
+
+    /// A roster that would advise, with the consumers the caller asks for.
+    ///
+    /// Cloud seats only: a local seat would be refused by `resolve_seat` against `NoAssistants`,
+    /// and these tests are about the job's side of the seam rather than about who may sit.
+    fn advising_roster(job_review: bool) -> crate::config::CouncilConfig {
+        crate::config::CouncilConfig {
+            timeout_seconds: 1,
+            rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+            consumers: crate::config::CouncilConsumers {
+                job_review,
+                proposal_advice: false,
+            },
+            chairman: crate::config::SeatSpec {
+                kind: Some(crate::config::SeatKind::Cloud),
+                model_ref: Some("the-chairman".to_string()),
+                agent: None,
+            },
+            members: vec![crate::config::SeatSpec {
+                kind: Some(crate::config::SeatKind::Cloud),
+                model_ref: Some("a-member".to_string()),
+                agent: None,
+            }],
+        }
+    }
+
+    /// The same state, with a council runtime swapped in. `token` is what decides whether
+    /// `council::start` can get past its second line -- see `a_council_that_will_not_start...`.
+    async fn state_with_council(
+        pool: sqlx::SqlitePool,
+        config: Option<crate::config::CouncilConfig>,
+        token: Option<&str>,
+    ) -> AppState {
+        let state = test_state(pool).await;
+        AppState {
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::new(
+                config,
+                token.map(str::to_string),
+            )),
+            ..state
+        }
+    }
+
+    /// A council row written by hand, so a job's side of the seam can be walked without spending a
+    /// deliberation. A synthesis is put where the real thing puts it: the transcript of the run in
+    /// `chairman_run_id`, which is not a column and must not be treated as one.
+    async fn seed_council(pool: &sqlx::SqlitePool, id: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO council_runs
+               (id, created_at, question, status, stage, anon_seed, chairman_kind, chairman_ref)
+             VALUES (?, ?, 'what should the reviewer look at', ?, 3, ?, 'cloud', 'the-chairman')",
+        )
+        .bind(id)
+        .bind(Utc::now().to_rfc3339())
+        .bind(status)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("insert a council");
+    }
+
+    /// Settles a seeded council with the text its chairman wrote.
+    async fn settle_council(pool: &sqlx::SqlitePool, id: &str, synthesis: &str) {
+        let run_id: i64 = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at, stdout)
+             VALUES ('project-a', 'synthesize', 'completed', 'assistant', ?, ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(synthesis)
+        .execute(pool)
+        .await
+        .expect("insert the chairman's run")
+        .last_insert_rowid();
+        sqlx::query("UPDATE council_runs SET status = ?, chairman_run_id = ? WHERE id = ?")
+            .bind(crate::council::STATUS_DONE)
+            .bind(run_id)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("settle the council");
+    }
+
+    /// A job with everything done but its review, and a directory to hand work through.
+    async fn job_ready_to_review(pool: &sqlx::SqlitePool, worktree: &std::path::Path) -> i64 {
+        let job_id = seed_job(pool, "project-a", "reviewing").await.unwrap();
+        sqlx::query("UPDATE jobs SET project_root = ? WHERE id = ?")
+            .bind(worktree.to_string_lossy().into_owned())
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        seed_worktree(pool, job_id, worktree).await;
+        seed_items(pool, job_id, &["passed", "passed"]).await;
+        job_id
+    }
+
+    async fn stages_run(pool: &sqlx::SqlitePool, job_id: i64) -> Vec<String> {
+        sqlx::query_scalar("SELECT stage FROM runs WHERE job_id = ? ORDER BY id")
+            .bind(job_id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn review_council_of(pool: &sqlx::SqlitePool, job_id: i64) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>("SELECT review_council_id FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn councils_held(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM council_runs")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn council_file_in(worktree: &std::path::Path) -> std::path::PathBuf {
+        worktree
+            .join(crate::worktree::ARTIFACTS_DIR)
+            .join(COUNCIL_FILE)
+    }
+
+    /// **The non-regression test, and the one that matters most in this file.** Both consumers ship
+    /// off, and off has to mean the pipeline that ran yesterday: the review node starts on the same
+    /// pass, with a prompt that names no council, and nothing is convened or written down.
+    #[tokio::test]
+    async fn a_job_with_council_review_off_walks_exactly_as_it_did() {
+        let pool = test_pool().await;
+        // The shipped state: no roster at all, which is what `CouncilRuntime::default()` is.
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = job_ready_to_review(&pool, worktree.path()).await;
+
+        assert_eq!(
+            next_step(&load_view(&pool, job_id).await.unwrap()),
+            Next::SpawnReview
+        );
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(stages_run(&pool, job_id).await, vec!["review"]);
+        assert_eq!(councils_held(&pool).await, 0);
+        assert_eq!(review_council_of(&pool, job_id).await, None);
+        assert_ne!(job_status(&pool, job_id).await, "waiting");
+
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !prompt.contains(COUNCIL_FILE),
+            "a review with no council must not be sent to a file that is not there: {prompt}"
+        );
+    }
+
+    /// A configured council that refuses to start is a council that never happened, and the job
+    /// walks on. Deterministic because the refusal is `Unavailable` -- a runtime holding a roster
+    /// and no daemon key, which `council::start` turns down before any row exists.
+    #[tokio::test]
+    async fn a_council_that_will_not_start_does_not_hold_the_job() {
+        let pool = test_pool().await;
+        let state = state_with_council(pool.clone(), Some(advising_roster(true)), None).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = job_ready_to_review(&pool, worktree.path()).await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(stages_run(&pool, job_id).await, vec!["review"]);
+        assert_eq!(councils_held(&pool).await, 0);
+        assert_eq!(review_council_of(&pool, job_id).await, None);
+        assert_ne!(
+            job_status(&pool, job_id).await,
+            "waiting",
+            "a council that could not convene must never be able to park a job"
+        );
+    }
+
+    /// The whole of the parked path: the job waits while the council deliberates, and the tick
+    /// after it settles writes the synthesis beside the queue and starts the node.
+    ///
+    /// `waiting` and not a status of its own, deliberately -- see `LIVE_STATUSES`, which is
+    /// duplicated in `LIVE_JOBS_SQL`, in a migration's index and in `concurrency.rs`. A status that
+    /// falls out of that list stops being ticked while still holding a concurrency slot.
+    #[tokio::test]
+    async fn a_council_review_parks_the_job_and_unparks_it_when_the_council_settles() {
+        let pool = test_pool().await;
+        let state =
+            state_with_council(pool.clone(), Some(advising_roster(true)), Some("key")).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = job_ready_to_review(&pool, worktree.path()).await;
+
+        // A council already convened for this job and still thinking. Seeded rather than spent:
+        // this test is about what the JOB does with a council, not about the council.
+        seed_council(&pool, "council-1", crate::council::STATUS_RUNNING).await;
+        sqlx::query("UPDATE jobs SET review_council_id = 'council-1' WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+        assert_eq!(job_status(&pool, job_id).await, "waiting");
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some(WAIT_COUNCIL));
+        assert!(
+            stages_run(&pool, job_id).await.is_empty(),
+            "the review must not start while the council it is going to read is still writing"
+        );
+
+        // The council settles. `drive` is what a tick actually calls, and it unparks before it
+        // re-reads anything -- so the whole pass is driven rather than `advance` alone.
+        settle_council(&pool, "council-1", "watch the cursor").await;
+        let job = load_job(&pool, job_id).await.unwrap();
+        drive(&state, job, Utc::now()).await;
+
+        let written = std::fs::read_to_string(council_file_in(worktree.path()))
+            .expect("the synthesis lands where `review_prompt` sends the node");
+        assert_eq!(written, "watch the cursor");
+        assert_eq!(stages_run(&pool, job_id).await, vec!["review"]);
+        let prompt: String =
+            sqlx::query_scalar("SELECT prompt FROM runs WHERE job_id = ? AND stage = 'review'")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(prompt.contains(COUNCIL_FILE));
+
+        // And the latch held: the column is not cleared when the council settles, precisely so a
+        // pass that comes back here cannot convene a second deliberation.
+        assert_eq!(
+            review_council_of(&pool, job_id).await.as_deref(),
+            Some("council-1")
+        );
+        assert_eq!(councils_held(&pool).await, 1);
+    }
+
+    /// Four ways a council ends with nothing to say -- errored, cancelled, gone from the record
+    /// entirely, and settled with no transcript to read -- and none of them may hold the job. The
+    /// review runs unadvised, which is exactly what a job with no council configured does.
+    #[tokio::test]
+    async fn a_council_that_failed_does_not_hold_the_job() {
+        for (label, status) in [
+            ("errored", Some(crate::council::STATUS_ERROR)),
+            ("cancelled", Some(crate::council::STATUS_CANCELLED)),
+            ("pruned", None),
+            ("done with no synthesis", Some(crate::council::STATUS_DONE)),
+        ] {
+            let pool = test_pool().await;
+            let state =
+                state_with_council(pool.clone(), Some(advising_roster(true)), Some("key")).await;
+            let worktree = tempfile::tempdir().unwrap();
+            let job_id = job_ready_to_review(&pool, worktree.path()).await;
+            if let Some(status) = status {
+                seed_council(&pool, "council-1", status).await;
+            }
+            sqlx::query("UPDATE jobs SET review_council_id = 'council-1' WHERE id = ?")
+                .bind(job_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let job = load_job(&pool, job_id).await.unwrap();
+            advance(&state, &job, Utc::now()).await;
+
+            assert_eq!(
+                stages_run(&pool, job_id).await,
+                vec!["review"],
+                "a council that {label} must not stop the review from happening"
+            );
+            assert_ne!(job_status(&pool, job_id).await, "waiting", "{label}");
+            assert!(
+                !council_file_in(worktree.path()).exists(),
+                "a council that {label} writes no advice, and the node must not be told there is any"
+            );
+        }
+    }
+
+    /// A prompt naming a file that is not there is an instruction that fails by omission: the node
+    /// reads nothing, gets an error nobody warned it about, and either hunts for the file or
+    /// decides the whole paragraph was wrong. The consumer is off by default, so absent is the
+    /// COMMON case here rather than the edge one.
+    #[test]
+    fn the_review_prompt_names_the_council_file_only_when_it_exists() {
+        let without = review_prompt(Some("deadbeef"), "/wt/.nucleos", false);
+        assert!(!without.contains(COUNCIL_FILE));
+
+        let with = review_prompt(Some("deadbeef"), "/wt/.nucleos", true);
+        assert!(with.contains(&format!("/wt/.nucleos/{COUNCIL_FILE}")));
+        // Named as advice, in the same paragraph. The gate holds ship/no-ship and the panel never
+        // saw this branch, so a node told to read a synthesis must not read it as a verdict.
+        assert!(with.contains("ADVICE"));
+        assert!(
+            with.contains("the diff is what is real"),
+            "the node is told which of the two to believe when they disagree: {with}"
+        );
+        // And nothing else about the prompt moved.
+        assert!(with.contains("git diff deadbeef..HEAD"));
+        assert!(with.contains("/wt/.nucleos/plan.json"));
+        assert!(with.contains("Read, Grep and Glob"));
     }
 
     /// The words an owner would leave on a job in flight, and the item they arrive beside.

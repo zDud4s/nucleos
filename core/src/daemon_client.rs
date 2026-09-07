@@ -675,6 +675,64 @@ impl DaemonClient {
         response.json().await.map_err(|e| e.to_string())
     }
 
+    /// Convene a council, and hand back the id it will be readable by.
+    ///
+    /// The id and not the answer, because there is no answer yet: `POST /council` is a `202` and
+    /// the deliberation runs for minutes afterwards. A caller gets the id now and reads the result
+    /// with [`Self::get_council`] on a later turn — which is why the tool that calls this has a
+    /// sibling, and why one tool would have been useless.
+    ///
+    /// Refusals come back as the daemon's own sentence. Every error arm of `post_council` is a
+    /// `(StatusCode, String)` written in prose — which panel refused, which seat was wrong, what
+    /// the budget had left — and a caller told "the core refused: 400" instead would have to guess
+    /// at what to do differently.
+    pub async fn ask_council(&self, question: &str) -> Result<String, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/council")
+            .json(&serde_json::json!({ "question": question }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let said = response.text().await.unwrap_or_default();
+            return Err(if said.trim().is_empty() {
+                format!("the core refused: {status}")
+            } else {
+                said
+            });
+        }
+        let body: Value = response.json().await.map_err(|e| e.to_string())?;
+        body["id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "council response missing id".into())
+    }
+
+    /// One council in full: its status, its phase, every seat's answer, and the synthesis if there
+    /// is one yet.
+    ///
+    /// No roster is sent by this client, deliberately. The override exists and the shell offers it,
+    /// but a turn convening a council has just been handed a question it could not answer alone —
+    /// letting it also choose who gets asked would let it assemble a panel that agrees with it.
+    pub async fn get_council(&self, council_id: &str) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::GET, &format!("/council/{council_id}"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let said = response.text().await.unwrap_or_default();
+            return Err(if said.trim().is_empty() {
+                format!("the core refused: {status}")
+            } else {
+                said
+            });
+        }
+        response.json().await.map_err(|e| e.to_string())
+    }
+
     pub async fn propose_action(
         &self,
         kind: &str,
