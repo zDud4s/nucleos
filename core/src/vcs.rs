@@ -1578,6 +1578,10 @@ pub async fn claim_next(
 ) -> sqlx::Result<Option<ClaimedRequest>> {
     let started_at = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
+    // The tuple is the `RETURNING` clause's own shape and lives exactly as long as the next few
+    // lines, which turn it into `ClaimedRequest`. Naming a struct for it would put the column order
+    // in two places and invite them to drift; carrying `run_id` is what pushed it past the lint.
+    #[allow(clippy::type_complexity)]
     let claimed: Option<(i64, String, String, String, String, bool, Option<i64>)> = sqlx::query_as(
         "UPDATE vcs_requests
             SET status = 'running', started_at = ?1
