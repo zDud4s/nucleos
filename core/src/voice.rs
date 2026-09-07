@@ -315,6 +315,73 @@ fn fold_control(word: &str) -> String {
         .to_string()
 }
 
+/// What one transcribed segment does to the turn it belongs to.
+///
+/// `Serialize` and lowercase because this crosses the wire to `shell/src/lib/turn-assembly.ts`; a
+/// spelling mismatch there is a runtime surprise and nothing at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    /// Accumulate and keep listening. Silence alone always lands here — that is the whole change.
+    Continues,
+    /// Deliver everything accumulated, this segment included, minus the word itself.
+    Closes,
+    /// Ask to throw away everything since the last delivery.
+    Discards,
+    /// Yes to the question a `Discards` asked.
+    Confirms,
+}
+
+/// PURE: whether a segment ended the turn, asked to discard it, confirmed a discard, or none.
+///
+/// **Order matters and is fixed:** discard, then closing, then confirm. A spelling that somebody
+/// puts in two lists resolves as the earlier one with no diagnostic, and Task 11 will be adding
+/// measured spellings to `closing_words` — so the precedence is written down rather than left to
+/// whoever reads the `if`s in order.
+///
+/// **Whole tokens, last position only, no fuzzy matching** — and the asymmetry is the argument. A
+/// missed closing word leaves the turn open and costs a repetition; a false positive sends half a
+/// thought and cannot be taken back by speaking. The strict side is the default and stays it.
+pub fn segment_verdict(
+    segment: &str,
+    closing: &[String],
+    discard: &str,
+    confirm: &[String],
+) -> Verdict {
+    let tokens: Vec<String> = segment.split_whitespace().map(|t| fold_control(t)).collect();
+    let discard_tokens: Vec<String> =
+        discard.split_whitespace().map(|t| fold_control(t)).collect();
+    if !discard_tokens.is_empty() && tokens.ends_with(&discard_tokens) {
+        return Verdict::Discards;
+    }
+    let Some(last) = tokens.last() else {
+        return Verdict::Continues;
+    };
+    if closing.iter().any(|w| fold_control(w) == *last) {
+        return Verdict::Closes;
+    }
+    if tokens.len() == 1 && confirm.iter().any(|w| fold_control(w) == *last) {
+        return Verdict::Confirms;
+    }
+    Verdict::Continues
+}
+
+/// PURE: the segment without the control word that ended it.
+///
+/// Drops the last token ONLY when it is one of `closing` — handed any other text it returns it
+/// whole, because a function that truncated unconditionally would eat a word off every segment it
+/// was ever called on by mistake.
+pub fn strip_control_tail(segment: &str, closing: &[String]) -> String {
+    let mut tokens: Vec<&str> = segment.split_whitespace().collect();
+    let ends_with_control = tokens
+        .last()
+        .is_some_and(|last| closing.iter().any(|w| fold_control(w) == fold_control(last)));
+    if ends_with_control {
+        tokens.pop();
+    }
+    tokens.join(" ")
+}
+
 /// PURE: the exact text handed to the cleanup model.
 pub fn build_cleanup_prompt(instructions: &str, transcript: &str) -> String {
     format!("{instructions}\n\n=== BEGIN TRANSCRIPT ===\n{transcript}\n=== END TRANSCRIPT ===")
@@ -1242,6 +1309,38 @@ mod tests {
         // A near miss stays a near miss — trimming must never create a match.
         assert_ne!(fold_control("câmbios"), "cambio");
         assert_ne!(fold_control("cambial"), "cambio");
+    }
+
+    #[test]
+    fn a_control_word_matches_only_as_the_last_token() {
+        let closing = vec!["câmbio".to_string()];
+        let discard = "risca isso";
+        let confirm = vec!["sim".to_string()];
+        let v = |s: &str| segment_verdict(s, &closing, discard, &confirm);
+
+        assert_eq!(v("está feito Câmbio."), Verdict::Closes);
+        assert_eq!(v("cambio"), Verdict::Closes);
+        assert_eq!(v("não, risca isso"), Verdict::Discards);
+        assert_eq!(v("sim"), Verdict::Confirms);
+
+        // Morphology, and the word anywhere but last.
+        assert_eq!(v("os câmbios subiram"), Verdict::Continues);
+        assert_eq!(v("é cambial"), Verdict::Continues);
+        assert_eq!(v("eu disse-lhe câmbio e ele desligou"), Verdict::Continues);
+        // Half the discard phrase is not the discard phrase.
+        assert_eq!(v("risca"), Verdict::Continues);
+        assert_eq!(v("isso"), Verdict::Continues);
+        assert_eq!(v(""), Verdict::Continues);
+    }
+
+    #[test]
+    fn the_closing_word_never_reaches_the_delivered_text() {
+        let closing = vec!["câmbio".to_string()];
+        assert_eq!(strip_control_tail("está feito Câmbio.", &closing), "está feito");
+        // Nothing to strip: the text is returned whole rather than losing its last word.
+        assert_eq!(strip_control_tail("está feito", &closing), "está feito");
+        // A segment that was only the word delivers nothing of its own.
+        assert_eq!(strip_control_tail("câmbio", &closing), "");
     }
 
     #[test]
