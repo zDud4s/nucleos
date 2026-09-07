@@ -2,6 +2,7 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiFetch, probeHealth } from "./client";
+import type { NotifyPolicy } from "./feed";
 import { keys } from "./keys";
 import { POLL } from "./poll";
 
@@ -611,5 +612,85 @@ export function usePiiTally() {
   return useQuery({
     queryKey: keys.system.pii,
     queryFn: () => apiFetch<PiiTallyRow[]>("/pii/observations"),
+  });
+}
+
+/* ------------------------------------------------- notification policy -- */
+
+/**
+ * Which feed kinds still reach Telegram — `GET /notifications/policy`.
+ *
+ * **No `refetchInterval`, deliberately**, and it says so here because in this
+ * layer not polling is the exception: almost every neighbour runs at
+ * `POLL.fast`, and a reader who finds none assumes an oversight. This is the
+ * initial state of a FORM. Refetching it every three seconds would walk over
+ * the switches somebody is in the middle of flipping — so it refreshes when a
+ * save settles (`useSetNotifyPolicy` below) and not on a clock.
+ *
+ * A brand-new install answers `{"families": [], "kinds": []}` rather than 404:
+ * no rule is not an error, it is the default that lets everything through.
+ */
+export function useNotifyPolicy() {
+  return useQuery({
+    queryKey: keys.system.notifyPolicy,
+    queryFn: () => apiFetch<NotifyPolicy>("/notifications/policy"),
+  });
+}
+
+/**
+ * Which kinds this machine has actually written — `GET /notifications/kinds`.
+ *
+ * **No `refetchInterval`**, for a different reason from the one above: this is
+ * an observation of the feed over ninety days, and it does not meaningfully
+ * change while somebody has a settings tab open. Reading it once per open is
+ * what makes the absence of an index on `feed (kind)` the right trade — the
+ * `DISTINCT` runs when the tab is opened, not every three seconds.
+ *
+ * The list is the RETENTION WINDOW, not all of history: `feed::prune` deletes
+ * anything past ninety days. The tab unions it with the kinds that only exist
+ * as a stored rule — see `groupKinds` — so a rule for a kind that has not shown
+ * up in a year still has a row to be undone in.
+ */
+export function useObservedKinds() {
+  return useQuery({
+    queryKey: keys.system.notifyKinds,
+    queryFn: () => apiFetch<string[]>("/notifications/kinds"),
+  });
+}
+
+/**
+ * Save the whole policy — `PUT /notifications/policy`, answering **204**.
+ *
+ * Sends the policy WHOLE rather than a delta, because the núcleo replaces
+ * rather than merges: a partial write would invite the two halves to drift.
+ * Two people editing at once means the last save wins, silently — accepted
+ * rather than solved, because this is a single-owner desktop app and optimistic
+ * concurrency is machinery for a case that needs two windows open on the same
+ * page at the same time.
+ *
+ * `retry: false` like every mutation here — a 400 is a refusal, not a glitch —
+ * and `onSettled` invalidates the read, the same pattern `useMintToken` uses.
+ * That is what replaces the poll: the read does not repeat on a clock, it
+ * repeats when somebody saves.
+ *
+ * What it does NOT do is undo a refused edit. React Query shares structure
+ * between fetches, so a refetch that finds the policy unchanged hands back the
+ * SAME object, and a page keyed on that reference never re-seeds. The rejected
+ * switches stay as the owner left them — which is the better outcome anyway,
+ * because the refusal names the row they need to fix and throwing their edits
+ * away would make them type it twice.
+ */
+export function useSetNotifyPolicy() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (policy: NotifyPolicy) =>
+      apiFetch<void>("/notifications/policy", {
+        method: "PUT",
+        body: JSON.stringify(policy),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.notifyPolicy });
+    },
   });
 }

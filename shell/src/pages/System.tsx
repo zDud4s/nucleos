@@ -48,12 +48,13 @@ import {
   StateBadge,
 } from "../ui";
 import { MachineSettings } from "./MachineSettings";
+import { NotificationsView } from "./NotificationsView";
 import "./system.css";
 
 /**
  * System — the machine's own state, not a project's.
  *
- * Four tabs. S1 and S2 built the health view (the daemon's own subsystem
+ * Five tabs. S1 and S2 built the health view (the daemon's own subsystem
  * readout and the sidecars' own liveness) plus, on top of it, the project
  * brakes and the editable budget; and the whole backups view (snapshots,
  * staged restore and the PII tally). Health data is read off
@@ -72,21 +73,27 @@ import "./system.css";
  * restart. The config index above it stays, narrowed to what it is actually
  * good at: showing what the daemon is RUNNING, which is a different reading
  * from what is on disk whenever the two have been allowed to drift.
+ *
+ * The notifications tab is the newest, and belongs here for the same reason the
+ * budget does: it is the machine's own behaviour, not a project's. It edits
+ * which feed kinds still reach Telegram — a preference the núcleo stores and
+ * the sidecar obeys, so nothing on this page decides anything by itself.
  */
 
-/** The four tabs, in the order they read. */
-const VIEWS = ["health", "backups", "tokens", "settings"] as const;
+/** The five tabs, in the order they read. */
+const VIEWS = ["health", "backups", "tokens", "notifications", "settings"] as const;
 export type SystemView = (typeof VIEWS)[number];
 
 const VIEW_LABEL: Record<SystemView, string> = {
   health: "Health",
   backups: "Backups",
   tokens: "Tokens",
+  notifications: "Notifications",
   settings: "Settings",
 };
 
 /**
- * A `$view` param as one of the four.
+ * A `$view` param as one of the five.
  *
  * Falls back to `health` rather than refusing: a route parameter is a string,
  * anybody can type one, and a typo in a path is not a missing page.
@@ -110,6 +117,7 @@ export function System() {
         {view === "health" && <HealthView health={health} sidecars={sidecars} />}
         {view === "backups" && <BackupsView />}
         {view === "tokens" && <TokensView />}
+        {view === "notifications" && <NotificationsView />}
         {view === "settings" && <MachineSettings />}
       </div>
     </>

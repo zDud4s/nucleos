@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"nucleostelegram/notifier"
 )
 
 type Client struct {
@@ -162,6 +164,30 @@ func (c *Client) GetFeed() ([]map[string]any, error) {
 		return nil, fmt.Errorf("parse feed response: %w", err)
 	}
 	return feed, nil
+}
+
+// GetNotifyPolicy is which feed kinds the owner still wants forwarded. Read once per notifier
+// round, beside GetFeed, and never cached: the policy is a handful of rows, the round already
+// makes five calls, and a cache is the difference between a switch that works when you flip it and
+// one that works a while later.
+//
+// The caller decides what a failure means, and in the notifier it means everything passes — the
+// mechanism guards against noise, so its own failure must not be silence.
+func (c *Client) GetNotifyPolicy() (notifier.Policy, error) {
+	var policy notifier.Policy
+
+	body, status, err := c.do(http.MethodGet, "/notifications/policy", nil)
+	if err != nil {
+		return policy, fmt.Errorf("get notify policy: %w", err)
+	}
+	if err := statusError("get notify policy", status, body); err != nil {
+		return policy, err
+	}
+
+	if err := json.Unmarshal(body, &policy); err != nil {
+		return notifier.Policy{}, fmt.Errorf("parse notify policy response: %w", err)
+	}
+	return policy, nil
 }
 
 func (c *Client) GetBudget() (map[string]any, error) {

@@ -551,3 +551,94 @@
   font-family: var(--font-mono);
   font-size: var(--text-sm);
 }
+
+/* -- notifications: which feed kinds still reach Telegram ---------------- */
+
+.sy-notify-families {
+  list-style: none;
+  margin: var(--space-3) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.sy-notify-family {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+}
+
+.sy-notify-family-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.sy-notify-switch {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+}
+
+.sy-notify-label {
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+/* Pushed to the right so the count and the disclosure sit at a predictable
+   edge, whatever the label's length. */
+.sy-notify-disclose {
+  margin-left: auto;
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.sy-notify-heading {
+  margin: var(--space-4) 0 var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.sy-notify-kinds {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0 0 0 var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.sy-notify-kind {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* The kind's own name, not its family's — truncated rather than wrapped, with
+   the literal in a title so a long one is still readable in full. */
+.sy-notify-kind-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.sy-notify-kind select {
+  margin-left: auto;
+}
+
+.sy-notify-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}

@@ -59,6 +59,7 @@ mod mcp_tools;
 mod mentions;
 mod notes;
 mod notify;
+mod notify_policy;
 mod openrouter;
 mod ownership;
 mod pii_shadow;
