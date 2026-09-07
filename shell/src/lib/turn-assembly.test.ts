@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { EMPTY_TURN, onSegment } from "./turn-assembly";
+import { EMPTY_TURN, onIdle, onSegment } from "./turn-assembly";
 
 describe("turn assembly", () => {
   it("a silent pause closes a segment and never the turn", () => {
@@ -70,5 +70,26 @@ describe("turn assembly", () => {
     }
     const asked = onSegment(state, { text: "risca isso", verdict: "discards", elapsedMs: 30_000 });
     expect(asked.signal).toEqual({ type: "confirmDiscard" });
+  });
+
+  it("the five minute cap delivers rather than discards", () => {
+    let state = EMPTY_TURN;
+    for (let i = 0; i < 9; i += 1) {
+      state = onSegment(state, { text: `parte ${i}`, verdict: "continues", elapsedMs: 30_000 }).state;
+    }
+    const next = onSegment(state, { text: "parte 9", verdict: "continues", elapsedMs: 30_000 });
+    expect(next.signal?.type).toBe("deliver");
+    expect((next.signal as { text: string }).text).toContain("parte 0");
+    expect(next.state).toEqual(EMPTY_TURN);
+  });
+
+  it("ten idle minutes abandon the mode", () => {
+    expect(onIdle(EMPTY_TURN, 10 * 60_000).signal).toEqual({ type: "abandon" });
+  });
+
+  it("idle time resets when somebody speaks", () => {
+    const waited = onIdle(EMPTY_TURN, 9 * 60_000).state;
+    const spoke = onSegment(waited, { text: "ainda aqui", verdict: "continues", elapsedMs: 800 }).state;
+    expect(onIdle(spoke, 9 * 60_000).signal).toBeNull();
   });
 });

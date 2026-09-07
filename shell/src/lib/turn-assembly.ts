@@ -17,6 +17,9 @@ export type Segment = {
   elapsedMs: number;
 };
 
+const MAX_TURN_MS = 5 * 60_000;
+const IDLE_LIMIT_MS = 10 * 60_000;
+
 export const EMPTY_TURN: TurnState = {
   segments: [],
   speechMs: 0,
@@ -29,18 +32,14 @@ export function onSegment(
   segment: Segment,
 ): { state: TurnState; signal: TurnSignal | null } {
   const hasText = segment.text.length > 0;
-
-  if (segment.verdict === "discards") {
-    return {
-      state: {
-        segments: state.segments,
-        speechMs: state.speechMs + (hasText ? segment.elapsedMs : 0),
-        idleMs: hasText ? 0 : state.idleMs + segment.elapsedMs,
-        pendingDiscard: true,
-      },
-      signal: { type: "confirmDiscard" },
-    };
-  }
+  const isDiscardRequest = segment.verdict === "discards";
+  const segments = hasText && !isDiscardRequest ? [...state.segments, segment.text] : state.segments;
+  const nextState: TurnState = {
+    segments,
+    speechMs: state.speechMs + (hasText ? segment.elapsedMs : 0),
+    idleMs: 0,
+    pendingDiscard: isDiscardRequest,
+  };
 
   if (segment.verdict === "confirms" && state.pendingDiscard) {
     return {
@@ -49,8 +48,6 @@ export function onSegment(
     };
   }
 
-  const segments = hasText ? [...state.segments, segment.text] : state.segments;
-
   if (segment.verdict === "closes") {
     return {
       state: EMPTY_TURN,
@@ -58,13 +55,41 @@ export function onSegment(
     };
   }
 
+  if (nextState.speechMs >= MAX_TURN_MS && !nextState.pendingDiscard) {
+    return {
+      state: EMPTY_TURN,
+      signal: { type: "deliver", text: segments.join(" ") },
+    };
+  }
+
+  if (isDiscardRequest) {
+    return {
+      state: nextState,
+      signal: { type: "confirmDiscard" },
+    };
+  }
+
   return {
-    state: {
-      segments,
-      speechMs: state.speechMs + (hasText ? segment.elapsedMs : 0),
-      idleMs: hasText ? 0 : state.idleMs + segment.elapsedMs,
-      pendingDiscard: false,
-    },
+    state: nextState,
+    signal: null,
+  };
+}
+
+export function onIdle(
+  state: TurnState,
+  elapsedMs: number,
+): { state: TurnState; signal: TurnSignal | null } {
+  const idleMs = state.idleMs + elapsedMs;
+
+  if (idleMs >= IDLE_LIMIT_MS) {
+    return {
+      state: EMPTY_TURN,
+      signal: { type: "abandon" },
+    };
+  }
+
+  return {
+    state: { ...state, idleMs },
     signal: null,
   };
 }
