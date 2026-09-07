@@ -41,6 +41,10 @@ export type ConversationEvent =
   | { type: "speechStarted" }
   /** ...and stopped. */
   | { type: "speechEnded" }
+  /** The accumulated segments form a complete turn. */
+  | { type: "turnClosed" }
+  /** The accumulated segments were discarded. */
+  | { type: "turnDiscarded" }
   /** The núcleo would not take the turn — a kill switch, a chat with no model. */
   | { type: "turnRefused" }
   /** The first unit of the answer is ready to play. */
@@ -52,6 +56,7 @@ export type ConversationAction =
   | "openMic"
   | "closeMic"
   | "startRecording"
+  | "transcribeSegment"
   | "sendTurn"
   /** Barge-in: stop the answer mid-word and start recording what is being said over it. */
   | "stopPlaybackAndRecord"
@@ -110,9 +115,18 @@ export function onConversationEvent(
     case "hearing":
       // An answer that lands while somebody is mid-sentence is held rather than played over them.
       // It is not lost: the turn it belongs to is abandoned by rule 4 as soon as this one is sent.
-      return event.type === "speechEnded"
-        ? { phase: "thinking", action: "sendTurn" }
-        : { phase: "hearing", action: "nothing" };
+      switch (event.type) {
+        case "speechStarted":
+          return { phase: "hearing", action: "startRecording" };
+        case "speechEnded":
+          return { phase: "hearing", action: "transcribeSegment" };
+        case "turnClosed":
+          return { phase: "thinking", action: "sendTurn" };
+        case "turnDiscarded":
+          return { phase: "listening", action: "nothing" };
+        default:
+          return { phase: "hearing", action: "nothing" };
+      }
 
     case "thinking":
       switch (event.type) {

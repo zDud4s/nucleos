@@ -11,6 +11,8 @@ const EVENTS: ConversationEvent["type"][] = [
   "toggled",
   "speechStarted",
   "speechEnded",
+  "turnClosed",
+  "turnDiscarded",
   "turnRefused",
   "answerStarted",
   "answerEnded",
@@ -45,6 +47,7 @@ describe("the conversation mode", () => {
       "toggled",
       "speechStarted",
       "speechEnded",
+      "turnClosed",
       "answerStarted",
       "answerEnded",
     ]);
@@ -52,6 +55,7 @@ describe("the conversation mode", () => {
     expect(actions).toEqual([
       "openMic",
       "startRecording",
+      "transcribeSegment",
       "sendTurn",
       "nothing",
       "nothing",
@@ -143,6 +147,49 @@ describe("the conversation mode", () => {
     expect(onConversationEvent("hearing", { type: "answerStarted" })).toEqual({
       phase: "hearing",
       action: "nothing",
+    });
+  });
+
+  it("silence ends a segment and leaves the conversation hearing", () => {
+    expect(onConversationEvent("hearing", { type: "speechEnded" })).toEqual({
+      phase: "hearing",
+      action: "transcribeSegment",
+    });
+  });
+
+  it("speech starting again inside a turn records the next segment", () => {
+    // Without this, segment 1 records and every segment after it is dropped: `startRecording` is the
+    // only thing that seeds the recording buffer, and `onAudioFrame` throws away frames while it is
+    // null. This is the transition the whole feature stands on.
+    expect(onConversationEvent("hearing", { type: "speechStarted" })).toEqual({
+      phase: "hearing",
+      action: "startRecording",
+    });
+  });
+
+  it("a closed turn is what sends it", () => {
+    expect(onConversationEvent("hearing", { type: "turnClosed" })).toEqual({
+      phase: "thinking",
+      action: "sendTurn",
+    });
+  });
+
+  it("a discarded turn goes back to listening without sending", () => {
+    expect(onConversationEvent("hearing", { type: "turnDiscarded" })).toEqual({
+      phase: "listening",
+      action: "nothing",
+    });
+  });
+
+  it("segmentation does not start while the answer is playing", () => {
+    // The AEC is unproven (spec §7). Speech STARTING is still barge-in; a segment must not open.
+    expect(onConversationEvent("speaking", { type: "speechEnded" })).toEqual({
+      phase: "speaking",
+      action: "nothing",
+    });
+    expect(onConversationEvent("speaking", { type: "speechStarted" })).toEqual({
+      phase: "hearing",
+      action: "stopPlaybackAndRecord",
     });
   });
 

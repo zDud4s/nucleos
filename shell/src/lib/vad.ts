@@ -33,7 +33,7 @@ export interface GateConfig {
   exit: number;
   /** Frames of speech required before a turn is declared started. */
   minSpeechFrames: number;
-  /** Frames of silence tolerated inside a turn before it is declared finished. */
+  /** Frames of silence tolerated inside a segment before it is declared finished. */
   hangoverFrames: number;
 }
 
@@ -51,8 +51,8 @@ export interface GateConfig {
  *
  * **`hangoverFrames`.** This is the one that ruins a conversation if it is wrong. The pauses INSIDE a
  * sentence — "o que… está a correr?" — fall below any silence threshold, and a gate that ends the
- * turn there sends half a question and answers it. Twenty frames is roughly 640 ms: longer than a
- * pause for breath, short enough that the end of a turn does not feel like waiting.
+ * segment there ends one transcription and lets the next begin. Twenty frames is roughly 640 ms:
+ * longer than a pause for breath, short enough that the end of a segment does not feel like waiting.
  */
 export const DEFAULT_GATE: GateConfig = {
   enter: 0.6,

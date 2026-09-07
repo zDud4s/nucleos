@@ -654,6 +654,17 @@ pub struct VoiceConfig {
     /// Terms said often and heard badly. Applied twice on purpose — as decoding bias and as a
     /// deterministic pass — so a term is fixed even when the bias was not enough.
     pub hints: Vec<String>,
+    /// What ends a turn, now that silence does not. A list and not a literal because the spelling a
+    /// transcriber returns is a measurement, not a decision: `-l auto` picks a language per segment,
+    /// so the same spoken word comes back differently depending on what whisper thought it heard.
+    /// Phase 1 measures those spellings and they are added here.
+    pub closing_words: Vec<String>,
+    /// What throws the accumulated turn away. Two tokens, matched as two — `risca` alone is a verb
+    /// somebody says about code.
+    pub discard_phrase: String,
+    /// What confirms a discard. Throwing away three minutes of thinking on one misheard phrase is
+    /// the expensive mistake in this pair, so it takes two utterances and not one.
+    pub confirm_words: Vec<String>,
     pub cleanup_prompt: String,
 }
 
@@ -669,6 +680,9 @@ impl Default for VoiceConfig {
             conversation_hotkey: "Ctrl+Alt+C".to_string(),
             retain_dictations_days: 7,
             hints: Vec::new(),
+            closing_words: vec!["câmbio".into()],
+            discard_phrase: "risca isso".into(),
+            confirm_words: vec!["sim".into()],
             cleanup_prompt: DEFAULT_CLEANUP_PROMPT.to_string(),
         }
     }
