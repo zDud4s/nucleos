@@ -467,6 +467,48 @@ impl Op {
     }
 }
 
+/// Every operation kind this queue can construct, as `Op::kind()` spells them.
+///
+/// A list rather than an `Op::all()`, because the variants carry data and a catalogue has no
+/// arguments to invent. What keeps the two honest is
+/// `every_op_kind_is_in_the_declarable_catalogue`, which builds one of each variant and asks: a
+/// seventh operation that never reached this list would be one the queue performs and no project
+/// can declare, and nothing else in the tree would say so.
+pub const GIT_OP_KINDS: [&str; 6] = ["merge", "push", "tag", "fetch", "rebase", "branch-delete"];
+
+/// One operation a project may declare, with the flag the shell draws it by.
+///
+/// `declarable` is always `true` today and the field is not decoration: the GitHub catalogue's
+/// `false` rows are how an operation this build refuses is drawn as a FACT rather than as a
+/// checkbox that cannot be ticked. Serving the shape now means the day a ceiling arrives is a
+/// change of value and not a change of wire.
+///
+/// **Not a reuse of `github::OpStanding`/`DeclarableOpView`**: those carry `half`, which separates
+/// a read that is in force from an action that is recorded and inert. These six are all writes the
+/// queue performs the same way, and a `half` here would be a field with no meaning.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeclarableGitOp {
+    pub kind: &'static str,
+    pub declarable: bool,
+}
+
+/// PURE: `GIT_OP_KINDS`, wrapped for the wire a picker draws its checkboxes from.
+///
+/// The GitHub analogue, `github::every_op`, has to consult two ceilings and stamp a `half` per
+/// operation because its catalogue is bigger than what a project may ask for. This queue has no
+/// such gap: everything in `GIT_OP_KINDS` is something the queue performs and something a project
+/// may declare, in lockstep, so there is nothing here to compute — every row comes back
+/// `declarable: true`, and the day that stops being true is the day this stops being a `map`.
+pub fn declarable_git_ops() -> Vec<DeclarableGitOp> {
+    GIT_OP_KINDS
+        .iter()
+        .map(|kind| DeclarableGitOp {
+            kind,
+            declarable: true,
+        })
+        .collect()
+}
+
 /// Who is asking, which decides whether the request needs a human's sign-off before it may queue.
 ///
 /// A human's order in an interactive session already is the approval — asking again two seconds
@@ -3039,6 +3081,44 @@ mod tests {
         let back =
             Op::from_stored(op.kind(), &op.to_args()).expect("a stored operation must parse back");
         assert_eq!(back, op);
+    }
+
+    #[test]
+    fn every_op_kind_is_in_the_declarable_catalogue() {
+        // One of each variant, so adding a seventh to `Op` fails here rather than shipping an
+        // operation the queue performs and no project can declare.
+        let one_of_each = [
+            Op::Merge {
+                source: Branch::new("a").unwrap(),
+                target: Branch::new("b").unwrap(),
+            },
+            Op::Push {
+                remote: Remote::new("origin").unwrap(),
+                branch: Branch::new("a").unwrap(),
+            },
+            Op::Tag {
+                name: TagName::new("v1").unwrap(),
+                at: Branch::new("a").unwrap(),
+            },
+            Op::Fetch {
+                remote: Remote::new("origin").unwrap(),
+            },
+            Op::BranchDelete {
+                branch: Branch::new("a").unwrap(),
+            },
+            Op::Rebase {
+                branch: Branch::new("a").unwrap(),
+                onto: Branch::new("b").unwrap(),
+            },
+        ];
+        for op in &one_of_each {
+            assert!(
+                GIT_OP_KINDS.contains(&op.kind()),
+                "{} is not declarable",
+                op.kind()
+            );
+        }
+        assert_eq!(GIT_OP_KINDS.len(), one_of_each.len());
     }
 
     #[test]
