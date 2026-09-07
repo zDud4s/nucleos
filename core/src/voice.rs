@@ -291,6 +291,21 @@ fn fold_for_hint(word: &str) -> String {
         .collect()
 }
 
+/// PURE: the form a CONTROL word is compared in — the hint fold, plus the punctuation a
+/// transcriber puts at the end of an utterance.
+///
+/// **Separate from `fold_for_hint` on purpose.** Hints go through that function unmodified, and a
+/// hint like `C#` folds to `c#`, which no word from `apply_hints` can equal — inert, which is what
+/// somebody who wrote it expects. Trimming punctuation there would fold it to `c` and rewrite every
+/// standalone "c" in every dictation. Control words need the trim; hints must not have it.
+///
+/// `!c.is_alphanumeric()` rather than `is_ascii_punctuation`, because whisper emits `…` and `»`.
+fn fold_control(word: &str) -> String {
+    fold_for_hint(word)
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
+        .to_string()
+}
+
 /// PURE: the exact text handed to the cleanup model.
 pub fn build_cleanup_prompt(instructions: &str, transcript: &str) -> String {
     format!("{instructions}\n\n=== BEGIN TRANSCRIPT ===\n{transcript}\n=== END TRANSCRIPT ===")
@@ -1185,6 +1200,26 @@ mod tests {
 
     fn hints() -> Vec<String> {
         vec!["núcleo".to_string(), "NucleOS".to_string()]
+    }
+
+    #[test]
+    fn the_control_fold_trims_a_transcribers_full_stop() {
+        assert_eq!(fold_control("Câmbio."), "cambio");
+        assert_eq!(fold_control("câmbio!"), "cambio");
+        assert_eq!(fold_control("câmbio…"), "cambio");
+        assert_eq!(fold_control("cambio"), "cambio");
+        // A near miss stays a near miss — trimming must never create a match.
+        assert_ne!(fold_control("câmbios"), "cambio");
+        assert_ne!(fold_control("cambial"), "cambio");
+    }
+
+    #[test]
+    fn the_hint_fold_is_untouched_so_a_hint_with_punctuation_stays_inert() {
+        // `C#` folds to `c#`, which no alphanumeric word from `apply_hints` can equal. If this ever
+        // becomes "c", every standalone "c" in every dictation is rewritten to `C#`.
+        assert_eq!(fold_for_hint("C#"), "c#");
+        assert_eq!(fold_for_hint("Node.js"), "node.js");
+        assert_eq!(fold_for_hint("NÚCLEO"), "nucleo");
     }
 
     /// Hints must not rewrite the inside of unrelated words.
