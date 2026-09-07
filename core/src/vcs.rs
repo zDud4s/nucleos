@@ -1268,9 +1268,9 @@ pub fn unqueueable_but_shared(command: &str) -> Option<String> {
     }
 }
 
-/// Admits a request into the queue and returns its row id. Provenance alone decides the initial
-/// status: `Human`/`Shell` already carry their approval and start `queued`; `Run`/`Job` are
-/// autonomous and start `awaiting_approval`.
+/// Admits a request into the queue and returns its row id. Provenance and the project's declaration
+/// decide the initial status: through this ordinary door, `Human`/`Shell` already carry their
+/// approval and start `queued`; `Run`/`Job` are autonomous and start `awaiting_approval`.
 ///
 /// **Nothing writes the transition out of `awaiting_approval`, and that is settled rather than
 /// pending.** This said it belonged to Chunk 4 "alongside the `proposals.rs` wiring that grants it".
@@ -1288,6 +1288,27 @@ pub async fn submit(
     origin: Origin,
 ) -> sqlx::Result<i64> {
     submit_on(pool, repo, op, origin).await
+}
+
+/// `submit`, for an operation kind the project declared in advance.
+///
+/// This is a door of its own rather than a branch inside `submit`, because the truth it asserts is
+/// different: consent was given earlier and elsewhere, before this command existed. `Origin` must
+/// still record who asked, so a run remains `Origin::Run(id)` rather than being rewritten as
+/// `Origin::Human`. The latter would be the same kind of audit lie this module refuses for
+/// `Origin::Shell`.
+///
+/// `Origin::needs_approval` answers whether the provenance brings its own approval. A human or
+/// shell order does; a run or job request does not. Here the project's declaration brings the
+/// approval instead, so the request starts `queued`. This does not wake or transition a row out of
+/// `awaiting_approval`; it steps past that state when the row is created.
+pub async fn submit_declared(
+    pool: &sqlx::SqlitePool,
+    repo: &ResolvedRepo,
+    op: &Op,
+    origin: Origin,
+) -> sqlx::Result<i64> {
+    admit(pool, repo, op, origin, "queued", false).await
 }
 
 /// `submit`, against a caller's own executor, so an admission can be part of a larger transaction.
@@ -1310,7 +1331,12 @@ pub async fn submit_on<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    admit(executor, repo, op, origin, false).await
+    let status = if origin.needs_approval() {
+        "awaiting_approval"
+    } else {
+        "queued"
+    };
+    admit(executor, repo, op, origin, status, false).await
 }
 
 /// `submit`, for the landing that comes OUT of a conflict resolution.
@@ -1331,7 +1357,12 @@ pub async fn submit_resolution(
     op: &Op,
     origin: Origin,
 ) -> sqlx::Result<i64> {
-    admit(pool, repo, op, origin, true).await
+    let status = if origin.needs_approval() {
+        "awaiting_approval"
+    } else {
+        "queued"
+    };
+    admit(pool, repo, op, origin, status, true).await
 }
 
 async fn admit<'e, E>(
@@ -1339,16 +1370,12 @@ async fn admit<'e, E>(
     repo: &ResolvedRepo,
     op: &Op,
     origin: Origin,
+    status: &str,
     from_resolution: bool,
 ) -> sqlx::Result<i64>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let status = if origin.needs_approval() {
-        "awaiting_approval"
-    } else {
-        "queued"
-    };
     let created_at = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
         "INSERT INTO vcs_requests (op, args, project_id, project_root, repo_key, origin, run_id, status, created_at, from_resolution)
@@ -3205,6 +3232,34 @@ mod tests {
 
         assert_eq!(run_id_of(&pool, from_run).await, Some(7));
         assert_eq!(run_id_of(&pool, from_job).await, None);
+    }
+
+    /// The contrast `submit_declared` exists to draw: through the ORDINARY door, `Origin::Run` still
+    /// waits for a human, exactly as `an_autonomous_request_waits_for_approval_before_it_can_queue`
+    /// above already pins. What follows is the declared door landing the same origin somewhere else.
+    #[tokio::test]
+    async fn a_declared_git_op_from_a_run_is_queued_rather_than_awaiting_approval() {
+        // The row records that a RUN asked — `Origin::Human` would be a lie of the kind this module
+        // already refuses for `Shell` — and it starts `queued`, because the project consented before
+        // the command existed.
+        let pool = test_pool().await;
+        let repo = repo_for("alpha");
+        let op = Op::Push {
+            remote: Remote::new("origin").unwrap(),
+            branch: Branch::new("feat/x").unwrap(),
+        };
+        let id = submit_declared(&pool, &repo, &op, Origin::Run(7))
+            .await
+            .unwrap();
+
+        assert_eq!(status_of(&pool, id).await, "queued");
+        let origin: String = sqlx::query_scalar("SELECT origin FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(origin, "run");
+        assert_eq!(run_id_of(&pool, id).await, Some(7));
     }
 
     #[tokio::test]
