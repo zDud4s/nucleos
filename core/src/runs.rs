@@ -23,6 +23,24 @@ pub struct CreateRunRequest {
     /// being created a particular way.
     #[serde(default)]
     pub steerable: bool,
+    /// What this run may do without stopping to ask, when there is nobody to ask.
+    ///
+    /// Absent means what it has always meant: the column stays NULL, `pretooluse_decision`
+    /// reads NULL as `Auto`, and a call the classifier will not decide parks the run for a
+    /// person. The one value that changes anything today is `dont_ask`, and what it changes is
+    /// a PARK into a REFUSAL — the run keeps going and does the rest of the work.
+    ///
+    /// It is a tightening and never a widening, which is why this field is safe to expose on a
+    /// route that starts unattended work. `dont_ask` permits precisely what `auto` permits
+    /// (`allowed_at`) and refuses everything `auto` would have stopped to ask about; there is no
+    /// spelling here that lets a run do something it could not do before.
+    ///
+    /// A spelling outside the six fails the whole request rather than falling back to `auto`,
+    /// for the reason the two chat routes give: the READER is lenient so that rows written
+    /// before the column existed still parse, and applying that leniency to a REQUEST would let
+    /// a typo quietly widen what an unattended run may do.
+    #[serde(default)]
+    pub permission_mode: Option<crate::chats::PermissionMode>,
 }
 
 fn default_run_mode() -> String {
@@ -416,13 +434,19 @@ pub async fn create_run(
     // the GC skips it, and it holds one of the project's concurrency slots, narrowing the whole
     // project until the daemon restarts, the only thing that reconciles `running` rows.
     let id = crate::http::uncancellable(async move {
-        create_run_inner(
+        // `create_run_with` rather than `create_run_inner`, which is the same funnel with this
+        // one argument fixed at `None`. The three callers outside this module (the scheduler,
+        // the repo trigger, the triage loop) go on using the wrapper and go on getting NULL,
+        // which is what every run they have ever made carried.
+        create_run_with(
             &state,
             req.prompt,
             req.project_id,
             req.cwd,
             &req.mode,
             req.steerable,
+            None,
+            req.permission_mode,
         )
         .await
     })
@@ -1331,13 +1355,18 @@ async fn prepare_handoff_successor(
     // across a handoff — so the successor keeps it, and `spawn_handoff_if_needed` launches
     // listening. Row and launch move together: a launch that listened while its row refused would
     // hold stdin open with no way to close it, which is the failure the old comment here feared.
+    // `permission_mode` travels with the rest, and it has to: a successor is the SAME work
+    // carried on in a fresh window, so a rung the predecessor was given and the successor was
+    // not would be a run that quietly went back to parking halfway through. Nothing sets the
+    // column on this path today — the assistant writes it and the assistant does not hand off
+    // — which is exactly why it is copied now, while the answer is still "nothing changes".
     let inserted = sqlx::query(
         "INSERT INTO runs (
              project_id, cwd, prompt, status, mode, session_id, read_untrusted, created_at,
-             job_id, stage, item_id, steerable
+             job_id, stage, item_id, steerable, permission_mode
          )
          SELECT project_id, cwd, ?, 'running', mode, ?, read_untrusted, ?, job_id, stage, item_id,
-                steerable
+                steerable, permission_mode
          FROM runs WHERE id = ?",
     )
     .bind(&prompt)
@@ -2078,7 +2107,7 @@ pub async fn create_run_inner(
     mode: &str,
     steerable: bool,
 ) -> Result<i64, CreateRunError> {
-    create_run_with(state, prompt, project_id, cwd, mode, steerable, None).await
+    create_run_with(state, prompt, project_id, cwd, mode, steerable, None, None).await
 }
 
 /// Starts the one run that is given its work already staged: a merge conflict, put there by the
@@ -2104,6 +2133,12 @@ pub async fn create_resolution_run(
         "worktree",
         false,
         Some(Provisioning::Resolution(resolution)),
+        // No rung asked for. A job's node and item, and the queue's conflict resolution, are
+        // started by the daemon rather than by a caller who could have an opinion — and the
+        // park is the RIGHT answer for them: `a_park_here_would_only_destroy` already refuses
+        // the cases where it is not, on evidence, and a blanket rung here would take that
+        // judgement away from it.
+        None,
     )
     .await
 }
@@ -2132,6 +2167,12 @@ pub async fn create_job_node_run(
         // and is watching.
         false,
         Some(Provisioning::Node(node)),
+        // No rung asked for. A job's node and item, and the queue's conflict resolution, are
+        // started by the daemon rather than by a caller who could have an opinion — and the
+        // park is the RIGHT answer for them: `a_park_here_would_only_destroy` already refuses
+        // the cases where it is not, on evidence, and a blanket rung here would take that
+        // judgement away from it.
+        None,
     )
     .await
 }
@@ -2158,6 +2199,12 @@ pub async fn create_job_item_run(
         "worktree",
         false,
         Some(Provisioning::Item(item)),
+        // No rung asked for. A job's node and item, and the queue's conflict resolution, are
+        // started by the daemon rather than by a caller who could have an opinion — and the
+        // park is the RIGHT answer for them: `a_park_here_would_only_destroy` already refuses
+        // the cases where it is not, on evidence, and a blanket rung here would take that
+        // judgement away from it.
+        None,
     )
     .await
 }
@@ -2290,6 +2337,7 @@ async fn create_run_with(
     mode: &str,
     steerable: bool,
     provisioning: Option<Provisioning>,
+    permission_mode: Option<crate::chats::PermissionMode>,
 ) -> Result<i64, CreateRunError> {
     let node = provisioning.as_ref().and_then(Provisioning::node);
     let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
@@ -2346,9 +2394,13 @@ async fn create_run_with(
 
     let now = chrono::Utc::now().to_rfc3339();
     let session_id = crate::auth::generate_uuid_v4();
+    // `permission_mode` binds NULL for every caller that says nothing, which is every caller
+    // that existed before the field did. `0129` documents NULL on this column as "no CLI turn
+    // wrote one", and that reading survives: a run that ASKS for a rung is a run somebody
+    // deliberately gave one to, and the hook tells the two apart by `Option`, not by spelling.
     let inserted = sqlx::query(
-        "INSERT INTO runs (project_id, cwd, prompt, status, mode, session_id, steerable, created_at)
-         VALUES (?, ?, ?, 'running', ?, ?, ?, ?)",
+        "INSERT INTO runs (project_id, cwd, prompt, status, mode, session_id, steerable, permission_mode, created_at)
+         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)",
     )
     .bind(&project_id)
     .bind(&cwd)
@@ -2356,6 +2408,7 @@ async fn create_run_with(
     .bind(mode)
     .bind(&session_id)
     .bind(i64::from(steerable))
+    .bind(permission_mode.map(crate::chats::PermissionMode::as_str))
     .bind(&now)
     .execute(&state.pool)
     .await;
@@ -7031,6 +7084,99 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         );
     }
 
+    /// The rung asked for on the way in is the rung on the row.
+    ///
+    /// Through the ROUTE and not through the handler, which is the whole point of the second
+    /// half: a body reaches `CreateRunRequest` by deserialisation, and that is where a spelling
+    /// outside the six is refused. A test that built the struct in Rust would have proved the
+    /// column and skipped the guard, and the guard is the part that could quietly go missing —
+    /// `PermissionMode`'s READER is lenient on purpose, so that rows written before the column
+    /// existed still parse as something, and leniency reaching a REQUEST is how a typo widens
+    /// what an unattended run may do.
+    ///
+    /// Counted before and after rather than asserted at zero, because the fixture starts runs of
+    /// its own and an absolute count would be measuring the fixture.
+    #[tokio::test]
+    async fn a_run_may_be_started_on_a_rung_and_never_on_a_misspelt_one() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"prompt":"a run that asks nobody","permission_mode":"dont_ask"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(created.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: CreateRunResponse = serde_json::from_slice(&body).unwrap();
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT permission_mode FROM runs WHERE id = ?")
+                .bind(created.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.as_deref(), Some("dont_ask"));
+
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"prompt":"a typo is not a rung","permission_mode":"dont_askk"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "a refused spelling started a run");
+    }
+
+    /// A run that says nothing keeps the column NULL, which is what every run before this field
+    /// carried and what `0129` documents as "no CLI turn wrote one".
+    ///
+    /// The pair to the test above, and it is the half that keeps the change from being a
+    /// default: an assertion on `dont_ask` alone would pass just as well against a route that
+    /// stamped every run with a rung.
+    #[tokio::test]
+    async fn a_run_that_names_no_rung_is_stored_without_one() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+
+        let created = create_run_via_http(&app, "an ordinary run").await;
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT permission_mode FROM runs WHERE id = ?")
+                .bind(created.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, None);
+    }
+
     #[tokio::test]
     async fn create_then_get_run_reaches_completed_status() {
         let app = test_router(test_state().await);
@@ -8352,6 +8498,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 cwd: None,
                 mode: "real".to_owned(),
                 steerable: false,
+                permission_mode: None,
             }),
         )
         .await;
@@ -8379,6 +8526,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 cwd: None,
                 mode: "real".to_owned(),
                 steerable: false,
+                permission_mode: None,
             }),
         )
         .await;
@@ -8408,6 +8556,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 cwd: None,
                 mode: "worktree".to_owned(),
                 steerable: false,
+                permission_mode: None,
             }),
         )
         .await;
@@ -8453,6 +8602,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 cwd: None,
                 mode: "worktree".to_owned(),
                 steerable: false,
+                permission_mode: None,
             }),
         )
         .await;
@@ -8495,6 +8645,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 cwd: None,
                 mode: "real".to_owned(),
                 steerable: false,
+                permission_mode: None,
             }),
         )
         .await;
@@ -8557,6 +8708,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 cwd: Some(repo.to_string_lossy().into_owned()),
                 mode: "worktree".to_owned(),
                 steerable: false,
+                permission_mode: None,
             }),
         ));
 

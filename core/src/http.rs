@@ -8998,6 +8998,7 @@ async fn run_preset(
             // steering existed, so `false` is the answer each of them was saved with — a preset must
             // not become a way to obtain a listening run that its author never asked for.
             steerable: false,
+            permission_mode: None,
         }),
     )
     .await
@@ -29919,6 +29920,7 @@ mod tests {
                 cwd: None,
                 mode: "real".to_owned(),
                 steerable: false,
+                permission_mode: None,
             },
         )
         .await
