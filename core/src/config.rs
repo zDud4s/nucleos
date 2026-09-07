@@ -1130,6 +1130,22 @@ pub const DEFAULT_COUNCIL_TIMEOUT_SECONDS: u64 = 600;
 /// and an unbounded one is a council that stays `running` for as long as the daemon lives.
 pub const MAX_COUNCIL_TIMEOUT_SECONDS: u64 = 3_600;
 
+/// How many deliberation rounds a council runs when the file does not say.
+///
+/// One, which is what the pillar has always done: every seat answers, every seat ranks the others
+/// blind, a chairman synthesises. The second round is opt-in and the default is not a placeholder —
+/// a second round asks every seat the question again, so it roughly doubles what phase 1 cost, and
+/// a feature that expensive is one somebody chooses rather than one they inherit.
+pub const DEFAULT_COUNCIL_ROUNDS: u32 = 1;
+
+/// The most rounds this file accepts.
+///
+/// Two, and the ceiling is a decision rather than an arbitrary stop. A third round would ask every
+/// seat to revise a revision it has already seen ranked, and there is no third ranking to revise
+/// against — `.ai/specs/2026-08-11-council-design.md` §10 named exactly one further round, not a
+/// loop. When somebody wants the loop they can argue for it here.
+pub const MAX_COUNCIL_ROUNDS: u32 = 2;
+
 /// Where one seat's answer comes from.
 ///
 /// Two variants and no `Auto`. Which machine a question leaves — or does not leave — is the whole
@@ -1182,10 +1198,11 @@ pub fn seat_kind_for_engine(engine: &str) -> Option<SeatKind> {
 /// asking which half is set, and one of them would eventually guess.
 ///
 /// Both forms are valid forever. The tempting cleanup — migrate the file, drop `{ kind, ref }` — is
-/// refused for a concrete reason: `.ai/council.yaml` is under `.ai/`, which is gitignored, so it is
-/// per-developer configuration and not a fact of the repository. A form retired here does not
-/// produce an error on the machines still using it; `load_council_config` returns `None` on a roster
-/// with faults, so it produces a council that silently stops existing at the next daemon start.
+/// refused for a concrete reason: the roster lives at `~/.nucleos/council.yaml`, outside any
+/// checkout, so it is one person's configuration on one machine and nothing shipped here can
+/// rewrite it. A form retired here does not produce an error on the machines still using it;
+/// `load_council_config` returns `None` on a roster with faults, so it produces a council that
+/// silently stops existing at the next daemon start.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SeatSpec {
@@ -1309,7 +1326,7 @@ impl CouncilSeat {
     }
 }
 
-/// `.ai/council.yaml`. Absent means there is no council — this pillar has no useful default,
+/// `~/.nucleos/council.yaml`. Absent means there is no council — this pillar has no useful default,
 /// because a roster nobody chose is a list of models nobody agreed to pay for.
 ///
 /// `deny_unknown_fields`, and here it is load-bearing rather than tidy: `member:` for `members:`
@@ -1320,12 +1337,60 @@ impl CouncilSeat {
 pub struct CouncilConfig {
     #[serde(default = "default_council_timeout")]
     pub timeout_seconds: u64,
+    /// 1 or 2. Two adds a second deliberation round: after the blind ranking every seat is shown
+    /// the same anonymised peer answers it ranked, plus where the council placed them, and revises
+    /// its own answer — and the chairman then synthesises the revised ones.
+    ///
+    /// A FAULT rather than a clamp when it is anything else, which is the one place this field
+    /// parts company with `timeout_seconds` two lines up. A clock outside its bounds has an obvious
+    /// nearest legal value and costs nothing to guess at; `rounds: 3` does not, because both
+    /// candidates are defensible and they differ by the price of a whole extra round. So it joins
+    /// the fault list and the council stays off, which is the branch `load_council_config` took
+    /// over `load_models_config`'s on purpose: the operator is told, and nothing is spent guessing.
+    #[serde(default = "default_council_rounds")]
+    pub rounds: u32,
+    /// Which of the daemon's own decisions get the council's opinion before a person sees them.
+    ///
+    /// Absent means none of them, which is what every roster written before this field already
+    /// meant. `#[serde(default)]` on the struct AND on each flag, so `consumers: { job_review:
+    /// true }` is a legal half-answer: an operator turning one on should not have to write the
+    /// other down to leave it alone.
+    #[serde(default)]
+    pub consumers: CouncilConsumers,
     pub chairman: SeatSpec,
     pub members: Vec<SeatSpec>,
 }
 
+/// The internal callers a configured council is allowed to advise.
+///
+/// **Both false by default, and both are advice rather than authority.** A consumer costs minutes
+/// of paid deliberation in front of something that was going to happen anyway, so neither is
+/// inherited — and neither decides anything: the job's `review` node still runs and still writes
+/// its own opinion, and a proposal gets a NOTE on its event log while the human keeps the verdict.
+/// `.ai/decisions.md` fixed that second half — the arbiter of an ambiguity is the person, and the
+/// council gates nothing — so a flag here that approved anything would contradict a standing
+/// decision rather than extend a feature.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CouncilConsumers {
+    /// Before a job's `review` node starts, put the job's task to the council and leave the
+    /// synthesis in the job's artifacts directory for the node to read. The job waits while the
+    /// council deliberates.
+    #[serde(default)]
+    pub job_review: bool,
+    /// When a run is stopped for an approval, put the refused action to the council and write the
+    /// synthesis onto the proposal as a note. Best-effort and out of band: the proposal is created
+    /// and the run is parked exactly as they were, whatever the council does or fails to do.
+    #[serde(default)]
+    pub proposal_advice: bool,
+}
+
 fn default_council_timeout() -> u64 {
     DEFAULT_COUNCIL_TIMEOUT_SECONDS
+}
+
+fn default_council_rounds() -> u32 {
+    DEFAULT_COUNCIL_ROUNDS
 }
 
 impl CouncilConfig {
@@ -1343,6 +1408,15 @@ impl CouncilConfig {
             faults.push(format!(
                 "the roster has {} members, above the ceiling of {MAX_COUNCIL_SEATS}",
                 self.members.len()
+            ));
+        }
+        // Named in the list rather than clamped. See the field's own note: there is no obvious
+        // nearest legal value for a third round, and guessing one spends money the operator did not
+        // agree to spend.
+        if !(1..=MAX_COUNCIL_ROUNDS).contains(&self.rounds) {
+            faults.push(format!(
+                "rounds is {}; a council runs 1 round or {MAX_COUNCIL_ROUNDS}",
+                self.rounds
             ));
         }
         for (index, seat) in self.seats().enumerate() {
@@ -1375,7 +1449,8 @@ impl CouncilConfig {
     }
 }
 
-/// Reads `.ai/council.yaml`. Absent, unreadable, malformed or invalid → `None`, with a warning.
+/// Reads the roster at `path` — `council::config_path()` in production, a tempdir in the tests
+/// below. Absent, unreadable, malformed or invalid → `None`, with a warning.
 ///
 /// This follows `load_web_config` and NOT `load_models_config`, and the direction was chosen rather
 /// than inherited. Erroring would stop the daemon — mail, autopilot, voice and the API with it —
@@ -2966,6 +3041,78 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         assert_eq!(
             council_config_from(&chosen, true).unwrap().timeout_seconds,
             120
+        );
+    }
+
+    /// A round count outside `1..=MAX_COUNCIL_ROUNDS` is a FAULT, not a clamp — the whole council is
+    /// refused and the operator is told, rather than quietly handed whichever neighbour the loader
+    /// guessed. The difference is money: rounding `rounds: 3` down to 2 still buys a second round
+    /// nobody asked for, and rounding it up is not a shape this file knows how to run at all.
+    ///
+    /// The clock in the test above IS clamped, and the asymmetry is the thing being held: a clock
+    /// has an obvious nearest legal value and a round count does not.
+    #[test]
+    fn a_third_round_is_not_a_shape_this_file_accepts() {
+        assert_eq!(
+            council_config_from(A_GOOD_ROSTER, true).unwrap().rounds,
+            DEFAULT_COUNCIL_ROUNDS,
+            "a file that says nothing about rounds runs the council it always ran"
+        );
+        assert_eq!(
+            council_config_from(&format!("rounds: 2\n{A_GOOD_ROSTER}"), true)
+                .unwrap()
+                .rounds,
+            2
+        );
+
+        for refused in ["rounds: 0", "rounds: 3", "rounds: 99"] {
+            assert!(
+                council_config_from(&format!("{refused}\n{A_GOOD_ROSTER}"), true).is_none(),
+                "`{refused}` must leave the council off rather than be clamped into one"
+            );
+        }
+        // Not a `u32` at all: serde refuses it before `faults` is ever reached, and the loader's
+        // parse branch reports it. Asserted because the OUTCOME has to be the same either way —
+        // there is no council, and the daemon still boots.
+        assert!(council_config_from(&format!("rounds: -1\n{A_GOOD_ROSTER}"), true).is_none());
+    }
+
+    /// The default is the one that matters here: every roster ever written predates this field, and
+    /// each consumer spends minutes of paid deliberation in front of something that was going to
+    /// happen anyway. Inheriting either by upgrading is the failure this test exists to catch.
+    #[test]
+    fn a_roster_that_says_nothing_about_consumers_advises_nobody() {
+        let silent = council_config_from(A_GOOD_ROSTER, true).unwrap();
+        assert!(!silent.consumers.job_review);
+        assert!(!silent.consumers.proposal_advice);
+
+        // And a half-answer leaves the other half alone rather than being refused for being
+        // incomplete: turning one consumer on must not require writing the other one down.
+        let half = council_config_from(
+            &format!("consumers: {{ job_review: true }}\n{A_GOOD_ROSTER}"),
+            true,
+        )
+        .expect("naming one consumer is a complete roster");
+        assert!(half.consumers.job_review);
+        assert!(!half.consumers.proposal_advice);
+
+        let both = council_config_from(
+            &format!("consumers: {{ job_review: true, proposal_advice: true }}\n{A_GOOD_ROSTER}"),
+            true,
+        )
+        .unwrap();
+        assert!(both.consumers.job_review && both.consumers.proposal_advice);
+
+        // `deny_unknown_fields` on the nested struct too. A misspelt consumer that parsed into a
+        // silent `false` would be the worst kind of failure here: the operator believes they have
+        // turned advice on, the daemon boots, and nothing ever says otherwise.
+        assert!(
+            council_config_from(
+                &format!("consumers: {{ job_reviews: true }}\n{A_GOOD_ROSTER}"),
+                true
+            )
+            .is_none(),
+            "a misspelt consumer is an arrest, not a consumer that quietly stays off"
         );
     }
 

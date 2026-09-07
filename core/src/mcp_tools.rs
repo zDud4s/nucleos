@@ -115,6 +115,22 @@ struct JobParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct CouncilAskParams {
+    question: String,
+}
+
+/// No roster field, and its absence is the decision.
+///
+/// `POST /council` takes a per-question override and the shell offers one, but a turn reaching for
+/// a council has just met a question it could not answer alone. Letting it also pick who gets asked
+/// would let it assemble a panel that agrees with it, which is the one thing a second opinion is
+/// for not doing. The roster stays where a person put it.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct CouncilGetParams {
+    council_id: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct IdParams {
     id: i64,
 }
@@ -569,6 +585,48 @@ impl NucleosTools {
         Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
     ) -> String {
         json_result(self.client.shadow_queue(&project_id).await)
+    }
+
+    // The council, as two tools rather than one. A deliberation takes minutes and `POST /council`
+    // answers `202` the moment the record exists, so a single tool could only ever return an id —
+    // and an id nothing can read back is a receipt for work the caller then goes blind to, which is
+    // the mistake `get_job` was added to undo after `create_job` shipped without it.
+    //
+    // The description has to say the waiting part in the model's own terms. A tool that reads like
+    // "ask several models" gets called as though it answers, and the turn ends with an id in its
+    // mouth and nothing else.
+    #[tool(
+        description = "Convene a NucleOS council: put ONE question to every seat of the roster the \
+                       owner configured, each answering independently, then ranking the others \
+                       blind, then a chairman writing one synthesis. Returns a council_id \
+                       IMMEDIATELY and the deliberation keeps running for minutes afterwards — it \
+                       does NOT return an answer. Read the result with get_council on a later \
+                       turn. Costs several model invocations, so use it for a hard, open question \
+                       where being wrong is expensive and a second opinion is worth paying for, \
+                       not for anything one model can settle."
+    )]
+    async fn ask_council(
+        &self,
+        Parameters(CouncilAskParams { question }): Parameters<CouncilAskParams>,
+    ) -> String {
+        match self.client.ask_council(&question).await {
+            Ok(id) => serde_json::json!({ "council_id": id }).to_string(),
+            Err(msg) => error_json(msg),
+        }
+    }
+
+    #[tool(
+        description = "Read a council convened earlier with ask_council: its status (running, \
+                       done, error, cancelled), which phase it is in, every seat's answer, the \
+                       average-rank leaderboard, and the chairman's synthesis once there is one. \
+                       A council still running has no synthesis yet and is worth asking about \
+                       again later rather than waiting on."
+    )]
+    async fn get_council(
+        &self,
+        Parameters(CouncilGetParams { council_id }): Parameters<CouncilGetParams>,
+    ) -> String {
+        json_result(self.client.get_council(&council_id).await)
     }
 
     #[tool(description = "Create a NucleOS run for a project")]
@@ -2003,6 +2061,12 @@ pub enum ToolEffect {
 /// here. `vcs_ticket` reads back what the owner's own queue did, and acts on nothing.
 const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("approve_proposal", ToolEffect::Acts),
+    // Convening spends money — up to nine model invocations on one question — and `council::start`
+    // reads the budget before it writes a row, which is the same shape as `create_run`'s. Nothing
+    // it starts touches the world outside this daemon, and it is still an act: what it spends is
+    // the owner's, and `permitted_after_untrusted` reads this table BY NAME to keep a turn that has
+    // just read a stranger's words from spending it.
+    ("ask_council", ToolEffect::Acts),
     // The browser's six, all `ReadsUntrusted`, and the classification is an ASSERTION ABOUT THE
     // FENCE rather than an observation about the verbs (spec §6.1a). `browser_act` clicks and types;
     // under the fence of §6.2 nothing it does leaves the machine with a consequence — no non-GET
@@ -2078,6 +2142,10 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("errand_files_write", ToolEffect::WritesOwn),
     ("errand_notebook_read", ToolEffect::ReadsOwn),
     ("get_budget", ToolEffect::ReadsOwn),
+    // The house's own deliberation, read back. Every word in it was written by a model this daemon
+    // launched against a question this daemon was given — no stranger's text reaches it — so this
+    // is a read of our own state in the same sense `get_run` is.
+    ("get_council", ToolEffect::ReadsOwn),
     ("get_email", ToolEffect::ReadsUntrusted),
     ("get_email_queue", ToolEffect::ReadsUntrusted),
     // A job row and a job listing: this daemon's own record of work it started itself. `ReadsOwn`
@@ -3309,6 +3377,7 @@ mod tests {
             names,
             [
                 "approve_proposal",
+                "ask_council",
                 "browser_act",
                 "browser_close",
                 "browser_handoff",
@@ -3325,6 +3394,7 @@ mod tests {
                 "errand_files_write",
                 "errand_notebook_read",
                 "get_budget",
+                "get_council",
                 "get_email",
                 "get_email_queue",
                 "get_job",
@@ -3817,6 +3887,48 @@ mod tests {
                 !list.contains(&"send_to_chat"),
                 "send_to_chat must stay off {name}"
             );
+        }
+    }
+
+    /// Convening is an act and reading the result is not, and the pair is graded apart on purpose.
+    ///
+    /// `permitted_after_untrusted` reads `TOOL_EFFECTS` BY NAME, so one tool doing both would have
+    /// had to carry one grade for two jobs — and the safe grade for a tool that can spend nine
+    /// model invocations is the one that stops a tainted turn from calling it. Grading the pair as
+    /// one `ReadsOwn` would have handed that spend to a turn holding a stranger's words; grading it
+    /// as one `Acts` would have stopped that same turn from ever reading back a council a person
+    /// convened.
+    #[test]
+    fn the_council_pair_is_graded_apart() {
+        assert_eq!(tool_effect("ask_council"), ToolEffect::Acts);
+        assert_eq!(tool_effect("get_council"), ToolEffect::ReadsOwn);
+    }
+
+    /// Neither council tool reaches any narrowed box, and the one that matters is the first.
+    ///
+    /// A council seat holding `ask_council` is a council convening a council. Three things already
+    /// stop that and this is the fourth: `COUNCIL_TOOLS` is an allow-list, `hooks::council_decision`
+    /// filters against that same constant, and `auth::COUNCIL_ROUTES` gives a seat's key a `403` on
+    /// `POST /council` with nobody's cooperation required. The last of those is the one that holds
+    /// if a model ignores everything else, and `the_councils_key_reads_and_cannot_start_anything`
+    /// is where it is pinned.
+    ///
+    /// The other three absences are the ordinary reading of each box: a department node and an
+    /// errand answer to somebody in particular and spend that person's attention, and the hosted
+    /// box is `ReadsOwn` throughout. What is left is the server with no `--box`, which is the
+    /// orchestrator the owner asked for this tool for.
+    #[test]
+    fn no_council_tool_reaches_a_narrowed_box() {
+        for tool in ["ask_council", "get_council"] {
+            for (list, name) in [
+                (LOCAL_TOOLS, "LOCAL_TOOLS"),
+                (COUNCIL_TOOLS, "COUNCIL_TOOLS"),
+                (TEAM_TOOLS, "TEAM_TOOLS"),
+                (ERRAND_TOOLS, "ERRAND_TOOLS"),
+                (HOSTED_TOOLS, "HOSTED_TOOLS"),
+            ] {
+                assert!(!list.contains(&tool), "{tool} must stay off {name}");
+            }
         }
     }
 

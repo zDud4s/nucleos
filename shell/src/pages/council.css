@@ -59,6 +59,7 @@
  * 3" is a position rather than how many.
  */
 .council-phase,
+.council-chairman,
 .council-seat-idx,
 .council-seat-ref,
 .council-leaderboard-n {
@@ -103,6 +104,73 @@
 }
 
 .council-field textarea:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* The roster control, which is shut on most visits and is laid out as part of
+   the form rather than as a panel of its own: a card inside a card is the
+   nesting this shell already has too much of, and the hairline says "still the
+   same form, one step further in" without spending a second surface on it. */
+
+.council-roster-open {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.council-roster {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.council-roster-seats {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* The row's control and its Remove sit on one line, aligned at the bottom so
+   the button lines up with the select and not with the label above it. */
+.council-roster-seat {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+}
+
+.council-roster-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+/* Same recipe as the textarea above, including the two resets: the field's
+   label is uppercase and faint, and a control that inherited those would be
+   shouting its own value back at the reader. */
+.council-select {
+  width: 100%;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.council-select:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
@@ -178,6 +246,13 @@
   gap: var(--space-2);
 }
 
+/* An agent's name is arbitrary text and can be longer than the fact beside it,
+   so it breaks rather than pushing the row wider. */
+.council-chairman {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 /* =================================================================== seats == */
 
 /* The grid of seats. Each seat is an `Inset`, which paints its own box — this
@@ -203,10 +278,42 @@
   font-weight: var(--weight-medium);
 }
 
+/**
+ * The title when an agent holds the seat.
+ *
+ * Not a colour, a weight or a size — the head already says "this is the name".
+ * What differs is that a kind is one short word this page capitalised itself,
+ * while an agent's name is somebody's own text: it is never transformed, and
+ * it is long often enough that a flex head needs permission to break it.
+ */
+.council-seat-agent {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 /* Pulled up against the head: the ref names what the line above it ran, and the
    inset's own column gap would read as a break between two separate facts. */
 .council-seat-ref {
   margin: calc(var(--space-2) * -1) 0 0;
+  overflow-wrap: anywhere;
+}
+
+/**
+ * The agent that answered has since been deleted. Sits under the model line
+ * because that is the order the card reads in — who, what, and then the caveat
+ * about who — and stays quiet: it explains the id above it, it does not
+ * announce a failure. Nothing failed; the council still has its answer.
+ *
+ * It cancels the card's gap the same way `.council-seat-ref` does, and for the
+ * same reason: a line that explains the one above it has to sit against it. At
+ * the card's own spacing it would read as a third fact rather than a footnote
+ * on the first.
+ */
+.council-seat-gone {
+  margin: calc(var(--space-2) * -1) 0 0;
+  font-size: var(--text-xs);
+  font-style: italic;
+  color: var(--text-muted);
   overflow-wrap: anywhere;
 }
 

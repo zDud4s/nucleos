@@ -3977,8 +3977,9 @@ pub async fn run_retention_loop(state: AppState) {
             Err(error) => tracing::warn!(%error, "feed: retention sweep failed"),
         }
         // Unconditional, unlike the pillar's other work: a council is deleted whether or not
-        // `.ai/council.yaml` still names a roster. Gating the sweep on the pillar being configured
-        // would make a roster somebody removed the way their history stops being collected.
+        // `~/.nucleos/council.yaml` still names a roster. Gating the sweep on the pillar being
+        // configured would make a roster somebody removed the way their history stops being
+        // collected.
         match crate::council::prune(&state.pool, crate::council::retention_days(), now).await {
             Ok(0) => {}
             Ok(pruned) => {

@@ -1,0 +1,29 @@
+-- The council advises a job's review node, and this is where the job remembers which council.
+--
+-- **Advice, not a verdict.** The `review` node still runs and still writes the opinion the
+-- proposal carries; §5.5 gives ship/no-ship to the deterministic gate and nothing here moves it.
+-- The council simply deliberates FIRST, and its synthesis lands in the job's artifacts directory
+-- as `council.md` — a directory `review_prompt` already sends the node to read. That is the whole
+-- integration: `ReviewState` gains no variant, `next_step` stays pure, and a daemon with the
+-- consumer switched off runs the pipeline it ran yesterday, byte for byte.
+--
+-- Opt-in, off by default, and the default lives in `CouncilConfig::consumers` rather than here:
+-- a council is minutes of paid deliberation in front of a node that was already going to run, so
+-- the cost has to be something the owner asked for by name.
+
+-- The council convened for this job's review, or NULL for every job that never asked for one.
+--
+-- **The column is not cleared when the council settles**, and that is deliberate rather than an
+-- omission of tidying. It is the latch that stops a second council: `advance` reaches
+-- `Next::SpawnReview` on every tick until the node actually starts, and if the review node fails
+-- to get a worktree slot and parks, the next tick reads this column again. Cleared, it would read
+-- NULL and convene a whole second council — minutes of models, paid twice, for one review. Left
+-- standing, it reads back as a council that is already terminal, the synthesis is rewritten
+-- (idempotently) and the node starts. What the job pays for that is one extra row of storage.
+--
+-- A logical foreign key and not a declared one, the reading `0065_council.sql` gives for
+-- `chairman_run_id`: `council::prune` deletes finished councils after ninety days and a job that
+-- outlived one would be unloadable rather than merely uninformative. A council id this reads back
+-- as missing is treated exactly as a council that failed — the job proceeds unadvised, because a
+-- council that cannot answer must never be able to hold a job.
+ALTER TABLE jobs ADD COLUMN review_council_id TEXT;
