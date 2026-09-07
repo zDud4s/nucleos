@@ -20,7 +20,15 @@ import {
 } from "../lib/conversation";
 import { durationMs, encodeCapture } from "../lib/audio";
 import {
+  EMPTY_TURN,
+  onIdle,
+  onSegment,
+  TurnSignal,
+  TurnState,
+} from "../lib/turn-assembly";
+import {
   energyOf,
+  FRAME_MS,
   FRAME_SAMPLES,
   GateState,
   IDLE_GATE,
@@ -28,7 +36,8 @@ import {
   PREROLL_FRAMES,
 } from "../lib/vad";
 import { loadSileroSession, SpeechProbe } from "../lib/silero";
-import { fetchSpeechUnit, postConversation } from "./voice";
+import { apiFetch } from "./client";
+import { fetchSpeechUnit, postSegment } from "./voice";
 
 /** The chord's event, emitted by `shell/src-tauri/src/dictation.rs`. */
 const TOGGLE_EVENT = "voice://conversation-toggle";
@@ -90,6 +99,10 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
   /** The last `PREROLL_FRAMES` frames, kept always — see `PREROLL_FRAMES` for why. */
   const prerollRef = useRef<Float32Array[]>([]);
   const recordingRef = useRef<Float32Array[] | null>(null);
+  const turnRef = useRef<TurnState>(EMPTY_TURN);
+  const pendingTurnRef = useRef<string | null>(null);
+  /** Segment requests stay in speech order even when the next pause arrives before one completes. */
+  const segmentChainRef = useRef<Promise<void>>(Promise.resolve());
   const playerRef = useRef<HTMLAudioElement | null>(null);
   /** Bumped on every barge-in and every exit, so audio from an abandoned turn cannot start playing. */
   const generationRef = useRef(0);
@@ -120,6 +133,11 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
     recordingRef.current = null;
     prerollRef.current = [];
     gateRef.current = IDLE_GATE;
+    turnRef.current = EMPTY_TURN;
+    pendingTurnRef.current = null;
+    segmentChainRef.current = Promise.resolve();
+    // A segment already at the core cannot be cancelled, so invalidate its answer before closing.
+    generationRef.current += 1;
     // Silero's state is a memory of what it just heard. Carried across a closed microphone, the next
     // conversation would start mid-thought about a sentence from the last one.
     probeRef.current?.reset();
@@ -218,9 +236,50 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
     }
   }, []);
 
-  const sendTurn = useCallback(async () => {
+  const actOnTurnSignal = useCallback((signal: TurnSignal | null) => {
+    if (signal === null) return;
+    switch (signal.type) {
+      case "deliver":
+        pendingTurnRef.current = signal.text;
+        setHeard(signal.text);
+        dispatchRef.current({ type: "turnClosed" });
+        return;
+      case "discard":
+        dispatchRef.current({ type: "turnDiscarded" });
+        return;
+      case "confirmDiscard":
+        setHeard("discard this turn?");
+        return;
+      case "abandon":
+        dispatchRef.current({ type: "toggled" });
+        return;
+    }
+  }, []);
+
+  const transcribeSegment = useCallback(() => {
     const frames = recordingRef.current ?? [];
     recordingRef.current = null;
+    const samples = concat(frames);
+    const rate = liveRef.current?.context.sampleRate ?? 16000;
+    const elapsedMs = durationMs(samples.length, rate);
+    const generation = generationRef.current;
+
+    segmentChainRef.current = segmentChainRef.current.then(async () => {
+      try {
+        const segment = await postSegment(encodeCapture(samples, 1, rate), elapsedMs);
+        if (generationRef.current !== generation) return;
+        const next = onSegment(turnRef.current, { ...segment, elapsedMs });
+        turnRef.current = next.state;
+        actOnTurnSignal(next.signal);
+      } catch (error) {
+        if (generationRef.current === generation) setTrouble(sentenceFor(error));
+      }
+    });
+  }, [actOnTurnSignal]);
+
+  const sendTurn = useCallback(async () => {
+    const text = pendingTurnRef.current ?? "";
+    pendingTurnRef.current = null;
     const chat = chatRef.current;
     const generation = generationRef.current;
 
@@ -230,22 +289,20 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
       return;
     }
 
-    const samples = concat(frames);
-    const rate = liveRef.current?.context.sampleRate ?? 16000;
     try {
-      const result = await postConversation(
-        encodeCapture(samples, 1, rate),
-        chat,
-        durationMs(samples.length, rate),
+      const result = await apiFetch<{ turn_id?: number; queued?: boolean }>(
+        "/assistant/message",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            chat_id: chat,
+            text,
+            wait_if_busy: true,
+            origin: "voice",
+          }),
+        },
       );
-      if (result === undefined) {
-        // 204: the gate opened on something that was not speech after all. Common with the
-        // placeholder energy source, and not worth a red message.
-        dispatchRef.current({ type: "turnRefused" });
-        return;
-      }
-      setHeard(result.text);
-      if (result.turn_id === null) {
+      if (result.turn_id == null) {
         // Queued behind a turn already in flight. There is nothing to listen to yet, and the answer
         // that eventually comes belongs to the message that was already running.
         dispatchRef.current({ type: "turnRefused" });
@@ -314,6 +371,13 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
    * built and would otherwise hold the first render's closure for the life of the microphone.
    */
   const onAudioFrame = useCallback((frame: Float32Array) => {
+    const idle = onIdle(turnRef.current, FRAME_MS);
+    turnRef.current = idle.state;
+    if (idle.signal !== null) {
+      actOnTurnSignal(idle.signal);
+      return;
+    }
+
     // Synchronous and first, because these two are what the recording IS. Deferring them behind the
     // probe below would put the audio's order at the mercy of how fast inference happens to be.
     const recording = recordingRef.current;
@@ -349,7 +413,7 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
       .finally(() => {
         pendingRef.current -= 1;
       });
-  }, []);
+  }, [actOnTurnSignal]);
 
   const perform = useCallback(
     (action: ConversationAction) => {
@@ -373,6 +437,9 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
           stopPlayback();
           recordingRef.current = [...prerollRef.current];
           return;
+        case "transcribeSegment":
+          transcribeSegment();
+          return;
         case "sendTurn":
           void sendTurn();
           return;
@@ -380,7 +447,7 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
           return;
       }
     },
-    [closeMic, openMic, sendTurn, stopPlayback],
+    [closeMic, openMic, sendTurn, stopPlayback, transcribeSegment],
   );
 
   const dispatch = useCallback(
