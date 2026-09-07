@@ -148,6 +148,20 @@ export interface DeclarableOp {
 }
 
 /**
+ * One git operation the shared queue can build — `DeclarableGitOpView` in `core/src/http.rs`.
+ *
+ * Unlike {@link DeclarableOp}, this has no `half`: every operation here is a write performed by the
+ * queue, so the GitHub distinction between a live read and a recorded, inert action has no meaning.
+ * `declarable` remains explicit because the catalogue is a fact about this daemon build.
+ */
+export interface DeclarableGitOp {
+  /** The typed name, as `op_kind` goes over the wire — `push`, `branch-delete`. */
+  kind: string;
+  /** Whether a project may declare this operation on this daemon build. */
+  declarable: boolean;
+}
+
+/**
  * What a declaration does to the rule's note, spelled as a choice the caller has to make.
  *
  * **This union exists to close a trap, and the trap is worth stating in full.**
@@ -248,6 +262,22 @@ export function useProjectGithubOps(projectId: string | null) {
 }
 
 /**
+ * Which git operations this project lets the shared queue perform for an autonomous run.
+ *
+ * A tick does not let the agent run the command in its shell: the tool call is still denied and
+ * returns a ticket id, while the queue receives that ticket as already consented and performs the
+ * operation. This raw list is what the project HAS declared; {@link useDeclarableGitOps} says what
+ * this daemon can build, and a picker needs both so a stranded declaration remains withdrawable.
+ */
+export function useProjectGitOps(projectId: string | null) {
+  return useQuery({
+    queryKey: keys.projects.gitOps(projectId ?? ""),
+    queryFn: () => apiFetch<string[]>(`/projects/${encodeURIComponent(projectId ?? "")}/git-ops`),
+    enabled: projectId !== null,
+  });
+}
+
+/**
  * Every GitHub operation this daemon can build, and whether a project may declare it —
  * `GET /github/declarable-ops`.
  *
@@ -275,6 +305,21 @@ export function useDeclarableGithubOps() {
   return useQuery({
     queryKey: keys.github.declarableOps,
     queryFn: () => apiFetch<DeclarableOp[]>("/github/declarable-ops"),
+  });
+}
+
+/**
+ * Every git operation this daemon's shared queue can build, and whether a project may declare it —
+ * `GET /vcs/declarable-ops`.
+ *
+ * Machine-wide and compiled into the daemon, so it takes no project id and has a cache root apart
+ * from project declarations. The project read stays raw on purpose: if a later build drops a kind,
+ * its stored row must remain visible as a fact its owner can withdraw.
+ */
+export function useDeclarableGitOps() {
+  return useQuery({
+    queryKey: keys.vcs.declarableOps,
+    queryFn: () => apiFetch<DeclarableGitOp[]>("/vcs/declarable-ops"),
   });
 }
 
@@ -365,6 +410,7 @@ function useDeclarationWrite<Input extends { projectId: string }>(
       for (const key of [
         keys.projects.shellRules(projectId),
         keys.projects.githubOps(projectId),
+        keys.projects.gitOps(projectId),
         keys.projects.landTargets(projectId),
       ]) {
         void queryClient.invalidateQueries({ queryKey: key });
@@ -456,6 +502,37 @@ export function useDeclareGithubOp() {
 export function useForgetGithubOp() {
   return useDeclarationWrite(({ projectId, opKind }: { projectId: string; opKind: string }) =>
     apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/github-ops`, {
+      method: "DELETE",
+      body: JSON.stringify({ op_kind: opKind }),
+    }),
+  );
+}
+
+/**
+ * Grant one git operation to the shared queue for this project's autonomous runs.
+ *
+ * Presence is the grant, and a second declaration is idempotent. The emergency stop refuses this
+ * widening with 423; an unknown project is 404 and a kind outside the compiled catalogue is 422.
+ * None of those refusals should be retried: each describes settled authority, not a transient read.
+ */
+export function useDeclareGitOp() {
+  return useDeclarationWrite(({ projectId, opKind }: { projectId: string; opKind: string }) =>
+    apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/git-ops`, {
+      method: "POST",
+      body: JSON.stringify({ op_kind: opKind }),
+    }),
+  );
+}
+
+/**
+ * Withdraw one git operation from this project's autonomous queue grants.
+ *
+ * The kind travels in the body like the other declaration families. Withdrawal narrows authority,
+ * so the emergency stop does not gate it; 404 means there was no stored declaration to remove.
+ */
+export function useForgetGitOp() {
+  return useDeclarationWrite(({ projectId, opKind }: { projectId: string; opKind: string }) =>
+    apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/git-ops`, {
       method: "DELETE",
       body: JSON.stringify({ op_kind: opKind }),
     }),
