@@ -371,16 +371,19 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
    * built and would otherwise hold the first render's closure for the life of the microphone.
    */
   const onAudioFrame = useCallback((frame: Float32Array) => {
-    const idle = onIdle(turnRef.current, FRAME_MS);
-    turnRef.current = idle.state;
-    if (idle.signal !== null) {
-      actOnTurnSignal(idle.signal);
-      return;
-    }
-
     // Synchronous and first, because these two are what the recording IS. Deferring them behind the
     // probe below would put the audio's order at the mercy of how fast inference happens to be.
     const recording = recordingRef.current;
+    if (recording === null) {
+      // Until transcription returns, `onSegment` cannot zero the clock. Counting recorded frames
+      // here can therefore abandon the mode in the middle of a sentence that began near the limit.
+      const idle = onIdle(turnRef.current, FRAME_MS);
+      turnRef.current = idle.state;
+      if (idle.signal !== null) {
+        actOnTurnSignal(idle.signal);
+        return;
+      }
+    }
     if (recording !== null) recording.push(frame);
 
     prerollRef.current.push(frame);
