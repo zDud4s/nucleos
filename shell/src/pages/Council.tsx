@@ -34,13 +34,17 @@ import "./council.css";
  * `Projects` pattern: a list that is always on screen, with the detail added
  * below it once something is selected rather than replacing it.
  *
- * Three phases, always drawn in the same order regardless of how far a council
- * got: seats (phase 1 and 2 together, one card per seat) and the leaderboard
- * (phase 2's output) render whenever there are seats at all, and only the
- * synthesis panel (phase 3) changes shape when the chairman never wrote one —
- * a council whose chairman failed still has two phases worth of real answers
- * on it, and hiding them behind the one panel that failed would throw the rest
- * away.
+ * The phases are always drawn in the same order regardless of how far a council
+ * got: seats (every phase a seat took part in, one card per seat) and the
+ * leaderboard (the ranking's output) render whenever there are seats at all,
+ * and only the synthesis panel changes shape when the chairman never wrote one
+ * — a council whose chairman failed still has real answers on it, and hiding
+ * them behind the one panel that failed would throw the rest away.
+ *
+ * How many phases there are is the council's own fact, not this page's:
+ * `stages_total` is three, or four where a second round was configured, and
+ * every phase counter here reads it rather than assuming the number it was
+ * true to assume until revisions existed.
  */
 export function Council() {
   const params = useParams({ strict: false }) as { councilId?: string };
@@ -65,8 +69,10 @@ export function Council() {
         <Teach title="Choose a council">
           <p>
             Pick a question from the list, or convene a new one above. Every seat answers on its
-            own, ranks the others blind, and a chairman writes a synthesis — three phases, in
-            order, and this page shows all three whichever one a council has reached.
+            own, ranks the others blind, and a chairman writes a synthesis. A council configured
+            for a second round adds a revision between the ranking and the synthesis; each row
+            says how many phases it has, and this page shows all of them whichever one a council
+            has reached.
           </p>
         </Teach>
       )}
@@ -464,7 +470,7 @@ function CouncilRow({ row, active }: { row: CouncilSummary; active: boolean }) {
       <Link className="council-row-link" to={`/council/${row.id}`} aria-current={active ? "page" : undefined}>
         <span className="council-row-question">{row.question}</span>
         <StateBadge domain="council" state={row.status} />
-        <span className="council-row-phase">phase {row.stage} of 3</span>
+        <span className="council-row-phase">phase {row.stage} of {row.stages_total}</span>
         <RelativeTime at={row.created_at} />
       </Link>
     </li>
@@ -509,7 +515,7 @@ function CouncilDetail({ id }: { id: string }) {
         <p className="council-question">{detail.question}</p>
         <div className="council-facts">
           <StateBadge domain="council" state={detail.status} />
-          <span className="council-phase">phase {detail.stage} of 3</span>
+          <span className="council-phase">phase {detail.stage} of {detail.stages_total}</span>
           <span className="council-chairman">{chairmanLine(detail)}</span>
           <RelativeTime at={detail.created_at} />
         </div>
@@ -523,7 +529,7 @@ function CouncilDetail({ id }: { id: string }) {
         )}
       </Panel>
 
-      <SeatGrid seats={detail.seats} />
+      <SeatGrid seats={detail.seats} stagesTotal={detail.stages_total} />
       <Leaderboard leaderboard={detail.leaderboard} />
       <Synthesis synthesis={detail.synthesis} error={detail.error} />
     </>
@@ -567,7 +573,15 @@ function CancelRefusal({ error }: { error: unknown }) {
 
 /* ------------------------------------------------------------------- seats -- */
 
-function SeatGrid({ seats }: { seats: SeatView[] }) {
+/**
+ * `stagesTotal` travels down to the cards, and is not derived inside them.
+ *
+ * A one-round council leaves `revision_status` at `pending` on every seat and
+ * never writes `skipped`, so a card reading that field alone cannot tell "no
+ * revision was ever going to happen" from "the revision has not started yet".
+ * The council row knows, so the council row is asked.
+ */
+function SeatGrid({ seats, stagesTotal }: { seats: SeatView[]; stagesTotal: number }) {
   return (
     <Panel title="Seats" aside={<Count n={seats.length} />}>
       {seats.length === 0 ? (
@@ -575,7 +589,7 @@ function SeatGrid({ seats }: { seats: SeatView[] }) {
       ) : (
         <ul className="council-seats" aria-label="Seats">
           {seats.map((seat) => (
-            <SeatCard key={seat.seat_idx} seat={seat} />
+            <SeatCard key={seat.seat_idx} seat={seat} stagesTotal={stagesTotal} />
           ))}
         </ul>
       )}
@@ -618,8 +632,28 @@ function answerText(seat: SeatView): string {
   return "no answer recorded";
 }
 
-function SeatCard({ seat }: { seat: SeatView }) {
+/**
+ * The same three readings for the revised answer, and a fourth this one needs.
+ *
+ * A seat may legitimately produce no revision on a council that ran one — its
+ * run failed, or timed out, or the ranking never happened — and the chairman
+ * then read its FIRST answer. Saying so is the point: a blank here would look
+ * like text that went missing, when it is a seat that stood by what it wrote.
+ */
+function revisedText(seat: SeatView): string {
+  if (seat.revised_answer !== null) return seat.revised_answer;
+  if (seat.revision_status === "ok") return "revised — the text has expired";
+  if (seat.revision_status === "skipped") return "not asked to revise";
+  return "the first answer stood";
+}
+
+function SeatCard({ seat, stagesTotal }: { seat: SeatView; stagesTotal: number }) {
   const abstained = seat.stage2_status === "ok" && seat.rankings.length === 0;
+  // Four phases means a revision round was configured for this council, so the
+  // seat has a third block to draw even while it is still `pending`. Three
+  // means there was never going to be one, and a block reading "waiting" would
+  // promise a phase that is not coming.
+  const revised = stagesTotal > 3;
   // An agent that answered and is no longer in the catalogue. Told apart from a
   // model-named seat by `agent_id`, which the row keeps forever.
   const agentIsGone = seat.agent_id !== null && seat.agent_name === null;
@@ -664,6 +698,21 @@ function SeatCard({ seat }: { seat: SeatView }) {
       {/* A blank vote is a valid outcome, not a failure — the seat answered ok
           and simply ranked nobody. */}
       {abstained && <p className="council-seat-abstained">abstained</p>}
+
+      {revised && (
+        <>
+          <div className="council-seat-stage">
+            <span className="council-seat-stage-label">revision</span>
+            <StateBadge domain="council_seat" state={seat.revision_status} />
+          </div>
+          {seat.revision_error !== null && (
+            <p className="council-seat-error" role="alert">
+              {seat.revision_error}
+            </p>
+          )}
+          <p className="council-seat-answer">{revisedText(seat)}</p>
+        </>
+      )}
     </li>
   );
 }

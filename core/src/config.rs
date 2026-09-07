@@ -1040,6 +1040,22 @@ pub const DEFAULT_COUNCIL_TIMEOUT_SECONDS: u64 = 600;
 /// and an unbounded one is a council that stays `running` for as long as the daemon lives.
 pub const MAX_COUNCIL_TIMEOUT_SECONDS: u64 = 3_600;
 
+/// How many deliberation rounds a council runs when the file does not say.
+///
+/// One, which is what the pillar has always done: every seat answers, every seat ranks the others
+/// blind, a chairman synthesises. The second round is opt-in and the default is not a placeholder —
+/// a second round asks every seat the question again, so it roughly doubles what phase 1 cost, and
+/// a feature that expensive is one somebody chooses rather than one they inherit.
+pub const DEFAULT_COUNCIL_ROUNDS: u32 = 1;
+
+/// The most rounds this file accepts.
+///
+/// Two, and the ceiling is a decision rather than an arbitrary stop. A third round would ask every
+/// seat to revise a revision it has already seen ranked, and there is no third ranking to revise
+/// against — `.ai/specs/2026-08-11-council-design.md` §10 named exactly one further round, not a
+/// loop. When somebody wants the loop they can argue for it here.
+pub const MAX_COUNCIL_ROUNDS: u32 = 2;
+
 /// Where one seat's answer comes from.
 ///
 /// Two variants and no `Auto`. Which machine a question leaves — or does not leave — is the whole
@@ -1231,12 +1247,28 @@ impl CouncilSeat {
 pub struct CouncilConfig {
     #[serde(default = "default_council_timeout")]
     pub timeout_seconds: u64,
+    /// 1 or 2. Two adds a second deliberation round: after the blind ranking every seat is shown
+    /// the same anonymised peer answers it ranked, plus where the council placed them, and revises
+    /// its own answer — and the chairman then synthesises the revised ones.
+    ///
+    /// A FAULT rather than a clamp when it is anything else, which is the one place this field
+    /// parts company with `timeout_seconds` two lines up. A clock outside its bounds has an obvious
+    /// nearest legal value and costs nothing to guess at; `rounds: 3` does not, because both
+    /// candidates are defensible and they differ by the price of a whole extra round. So it joins
+    /// the fault list and the council stays off, which is the branch `load_council_config` took
+    /// over `load_models_config`'s on purpose: the operator is told, and nothing is spent guessing.
+    #[serde(default = "default_council_rounds")]
+    pub rounds: u32,
     pub chairman: SeatSpec,
     pub members: Vec<SeatSpec>,
 }
 
 fn default_council_timeout() -> u64 {
     DEFAULT_COUNCIL_TIMEOUT_SECONDS
+}
+
+fn default_council_rounds() -> u32 {
+    DEFAULT_COUNCIL_ROUNDS
 }
 
 impl CouncilConfig {
@@ -1254,6 +1286,15 @@ impl CouncilConfig {
             faults.push(format!(
                 "the roster has {} members, above the ceiling of {MAX_COUNCIL_SEATS}",
                 self.members.len()
+            ));
+        }
+        // Named in the list rather than clamped. See the field's own note: there is no obvious
+        // nearest legal value for a third round, and guessing one spends money the operator did not
+        // agree to spend.
+        if !(1..=MAX_COUNCIL_ROUNDS).contains(&self.rounds) {
+            faults.push(format!(
+                "rounds is {}; a council runs 1 round or {MAX_COUNCIL_ROUNDS}",
+                self.rounds
             ));
         }
         for (index, seat) in self.seats().enumerate() {
@@ -2868,6 +2909,39 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
             council_config_from(&chosen, true).unwrap().timeout_seconds,
             120
         );
+    }
+
+    /// A round count outside `1..=MAX_COUNCIL_ROUNDS` is a FAULT, not a clamp — the whole council is
+    /// refused and the operator is told, rather than quietly handed whichever neighbour the loader
+    /// guessed. The difference is money: rounding `rounds: 3` down to 2 still buys a second round
+    /// nobody asked for, and rounding it up is not a shape this file knows how to run at all.
+    ///
+    /// The clock in the test above IS clamped, and the asymmetry is the thing being held: a clock
+    /// has an obvious nearest legal value and a round count does not.
+    #[test]
+    fn a_third_round_is_not_a_shape_this_file_accepts() {
+        assert_eq!(
+            council_config_from(A_GOOD_ROSTER, true).unwrap().rounds,
+            DEFAULT_COUNCIL_ROUNDS,
+            "a file that says nothing about rounds runs the council it always ran"
+        );
+        assert_eq!(
+            council_config_from(&format!("rounds: 2\n{A_GOOD_ROSTER}"), true)
+                .unwrap()
+                .rounds,
+            2
+        );
+
+        for refused in ["rounds: 0", "rounds: 3", "rounds: 99"] {
+            assert!(
+                council_config_from(&format!("{refused}\n{A_GOOD_ROSTER}"), true).is_none(),
+                "`{refused}` must leave the council off rather than be clamped into one"
+            );
+        }
+        // Not a `u32` at all: serde refuses it before `faults` is ever reached, and the loader's
+        // parse branch reports it. Asserted because the OUTCOME has to be the same either way —
+        // there is no council, and the daemon still boots.
+        assert!(council_config_from(&format!("rounds: -1\n{A_GOOD_ROSTER}"), true).is_none());
     }
 
     #[test]

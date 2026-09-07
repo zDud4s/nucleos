@@ -45,6 +45,7 @@ function councilSummary(overrides: Partial<CouncilSummary> = {}): CouncilSummary
     question: "should we ship the frontend rewrite?",
     status: "running",
     stage: 1,
+    stages_total: 3,
     ...overrides,
   };
 }
@@ -62,6 +63,9 @@ function seatView(overrides: Partial<SeatView> = {}): SeatView {
     stage2_status: "ok",
     stage2_error: null,
     rankings: [{ anon: "B", rank: 1 }],
+    revision_status: "pending",
+    revision_error: null,
+    revised_answer: null,
     ...overrides,
   };
 }
@@ -73,6 +77,7 @@ function councilView(overrides: Partial<CouncilView> = {}): CouncilView {
     question: "should we ship the frontend rewrite?",
     status: "running",
     stage: 2,
+    stages_total: 3,
     error: null,
     chairman_kind: "cloud",
     chairman_ref: "claude-opus-4",
@@ -646,5 +651,76 @@ describe("Council - convening with a chosen panel", () => {
     // assemble a panel that cannot be convened and learn it on submit.
     expect(within(await screen.findByRole("list", { name: "Panel" })).getAllByRole("listitem")).toHaveLength(8);
     expect(add.hasAttribute("disabled")).toBe(true);
+  });
+});
+
+/* --------------------------------------------------------- the second round -- */
+
+describe("Council - a council that runs a second round", () => {
+  it("counts its phases out of four and draws the revision", async () => {
+    const view = councilView({
+      stage: 3,
+      stages_total: 4,
+      seats: [
+        seatView({
+          revision_status: "ok",
+          revised_answer: "still yes, and the migration is the part to watch",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary({ stage: 3, stages_total: 4 })], { "c-1": view }),
+    );
+
+    await renderCouncil("/council/c-1");
+
+    // The total is the council's own fact, read off the row. A page that had
+    // gone on saying "of 3" would have reported a council on its third of four
+    // phases as finished.
+    expect(await screen.findByText("phase 3 of 4")).toBeDefined();
+
+    const seats = await panelFor("Seats");
+    expect(within(seats).getByText("revision")).toBeDefined();
+    expect(
+      within(seats).getByText("still yes, and the migration is the part to watch"),
+    ).toBeDefined();
+    // Beside the first answer, never instead of it: the ranking was cast over
+    // the first one, so a card showing only the revision would be showing a
+    // leaderboard of text it never displayed.
+    expect(within(seats).getByText("yes, ship it — the tests carry the proof")).toBeDefined();
+  });
+
+  it("says the first answer stood when a seat did not revise", async () => {
+    const view = councilView({
+      stage: 4,
+      stages_total: 4,
+      seats: [seatView({ revision_status: "error", revision_error: "the seat timed out" })],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+
+    // The chairman read this seat's FIRST answer, and the card says so. A blank
+    // would read as text that went missing rather than as a seat whose revision
+    // failed and whose original answer was used.
+    const seats = await panelFor("Seats");
+    expect(within(seats).getByText("the first answer stood")).toBeDefined();
+    expect(within(seats).getByText("the seat timed out")).toBeDefined();
+  });
+
+  it("draws no revision at all on a council of one round", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": councilView() }),
+    );
+
+    await renderCouncil("/council/c-1");
+
+    // The non-regression half, and the reason the card is TOLD the total rather
+    // than reading `revision_status`: a one-round council leaves every seat at
+    // `pending` forever, so a card deciding for itself would have drawn a
+    // "waiting" badge for a phase that was never coming.
+    const seats = await panelFor("Seats");
+    expect(within(seats).queryByText("revision")).toBeNull();
+    expect(await screen.findByText("phase 2 of 3")).toBeDefined();
   });
 });

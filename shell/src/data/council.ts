@@ -37,8 +37,15 @@ export interface CouncilSummary {
   created_at: string;
   question: string;
   status: string;
-  /** 1, then 2, then 3. Rendered as "phase n of 3". */
+  /** 1, then 2, then 3 — and 4 on a council configured for a second round. */
   stage: number;
+  /**
+   * Three, or four with a second round. Served on the LIST as well as on the
+   * detail, because this is the other place a phase number is drawn: a row
+   * reading "phase 3" with no total reads as finished on a council that still
+   * has a fourth phase to run.
+   */
+  stages_total: number;
 }
 
 /** One peer's vote for one seat, in the anonymised alphabet stage 2 ranks under. */
@@ -79,6 +86,26 @@ export interface SeatView {
   stage2_status: string;
   stage2_error: string | null;
   rankings: Ranking[];
+  /**
+   * The second round, when there was one.
+   *
+   * `pending` on every seat of a one-round council, and it stays that way
+   * forever — the daemon does not write `skipped` across a phase that was never
+   * part of the council. So this field alone cannot say whether a revision is
+   * still coming; `CouncilView.stages_total` is what answers that, and is why a
+   * card is told the total rather than inferring it from here.
+   */
+  revision_status: string;
+  revision_error: string | null;
+  /**
+   * What the seat wrote the second time. `null` until there is one, and `null`
+   * forever on a council of one round.
+   *
+   * Beside `answer`, never instead of it: the ranking was cast over the FIRST
+   * answers, so a card that showed only the revision would be showing a
+   * leaderboard of text it never displayed.
+   */
+  revised_answer: string | null;
 }
 
 /** One seat's place in the leaderboard. `n` travels with the average on purpose — see below. */
@@ -100,6 +127,16 @@ export interface CouncilView {
   question: string;
   status: string;
   stage: number;
+  /**
+   * How many phases THIS council runs: three, or four when a second round was
+   * configured for it.
+   *
+   * Read from the row and not from the daemon's current configuration, because
+   * the file is editable and a council that ran four phases in March has to
+   * keep reading as one. It is also the only thing that tells a page whether
+   * `stage: 3` is the last phase or the second to last.
+   */
+  stages_total: number;
   error: string | null;
   chairman_kind: string;
   chairman_ref: string;
