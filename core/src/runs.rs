@@ -246,14 +246,27 @@ pub struct RunStatusResponse {
     /// Everything else in the prompt, as an estimate: the CLI's own.
     ///
     /// The whole reported prompt minus the part above. **One residual and never a breakdown** — the
-    /// CLI's system prompt, its built-in tool definitions, whatever it loaded from CLAUDE.md and the
-    /// conversation itself are all in here, undivided, because nothing in the stream separates them
-    /// and this daemon does not send the one people ask about. `prompt_budget`'s header is where
-    /// that refusal is argued; this field is where it shows.
+    /// CLI's system prompt, its built-in tool definitions, whatever it loaded from CLAUDE.md, the
+    /// by-name tool listing a deferring run gets instead of schemas, and the conversation itself are
+    /// all in here, undivided, because nothing in the stream separates them and this daemon does not
+    /// send the one people ask about. `prompt_budget`'s header is where that refusal is argued; this
+    /// field is where it shows.
     ///
     /// `null` whenever either side is unknown, which includes every run that reported no usage at
-    /// all. A zero here means the estimate above met or exceeded the whole reported prompt, which
-    /// happens on a short run because chars/4 overshoots on schema JSON.
+    /// all. A zero here means the estimate above met or exceeded the whole reported prompt.
+    ///
+    /// **What dominates that is DEFERRAL, and this doc used to blame the wrong thing.** It said a
+    /// zero "happens on a short run because chars/4 overshoots on schema JSON", which is not the
+    /// cause on the ordinary case: a chat turn is `ToolPolicy::Unrestricted`, the CLI keeps
+    /// `ToolSearch` and advertises MCP tools by name, and the schema JSON is not in the prompt at all
+    /// — so charging it here subtracted roughly 10,250 estimated tokens that were never paid, and
+    /// understated this residual by exactly that. `runner::authored_prompt` now charges the schemas
+    /// only when they are shipped, and holds the rule and the measurements. Nor does the old
+    /// sentence survive being checked in the SHIPPED regime, where it would at least be on topic:
+    /// measured there, chars/4 put the schema block at 10,250 against ~11,160 attributable, so it
+    /// runs about 8% LOW rather than high. A residual can still reach zero on a genuinely short run,
+    /// where the prompt this daemon authored is most of what the model read — but the ruler's few
+    /// percent is not the reason, and deferral is the mechanism that used to force it.
     #[sqlx(default)]
     pub cli_own_estimate: Option<i64>,
     /// The stored character count, read only so the estimate above can be derived from it.
