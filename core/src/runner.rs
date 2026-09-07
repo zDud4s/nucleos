@@ -1087,8 +1087,16 @@ pub(crate) fn detail_of(input: &serde_json::Value) -> Option<String> {
     // `description` last, and last on purpose: it is what a `Task` carries and nothing else does,
     // and a tool that also says where it acted must answer with that instead. A key ordered above
     // it would make the sentence a model wrote win over the file it opened.
-    const KEYS: [&str; 7] = [
+    //
+    // `notebook_path` is here because `NotebookEdit` names its target with it and nothing else in
+    // this list matched, so every notebook write showed as a bare tool name with no file beside
+    // it. That is cosmetic on an allow and it is not cosmetic on an approval: a person was being
+    // asked to permit a write without being told what it writes, which is not a question anyone
+    // can answer. It sits beside `file_path` because it IS the file path, under the one tool that
+    // spells it differently.
+    const KEYS: [&str; 8] = [
         "file_path",
+        "notebook_path",
         "path",
         "command",
         "pattern",
@@ -3484,6 +3492,28 @@ mod tests {
     /// test which DOES care about the transcript is visibly different at the call site.
     fn discard_transcript() -> std::sync::Arc<std::sync::Mutex<String>> {
         std::sync::Arc::new(std::sync::Mutex::new(String::new()))
+    }
+
+    /// A notebook write says which notebook, like every other write says which file.
+    ///
+    /// `detail_of` is what `ask_about` puts beside a tool name, so while `notebook_path` was off
+    /// the list a `manual` rung asking about a `NotebookEdit` showed the tool and nothing else
+    /// — a question about a write with the write left out, which is not a question anybody
+    /// can answer. The second case pins the ORDER rather than restating the first: `description`
+    /// is deliberately last, and a path must beat the sentence a model wrote about it.
+    #[test]
+    fn a_notebook_write_says_which_notebook() {
+        assert_eq!(
+            detail_of(&serde_json::json!({"notebook_path": "C:/repo/notes.ipynb"})),
+            Some("C:/repo/notes.ipynb".to_owned())
+        );
+        assert_eq!(
+            detail_of(&serde_json::json!({
+                "description": "tidy the notebook up a bit",
+                "notebook_path": "notes.ipynb",
+            })),
+            Some("notes.ipynb".to_owned())
+        );
     }
 
     #[test]

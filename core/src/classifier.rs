@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 12;
+pub const CLASSIFIER_VERSION: u32 = 13;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -23,7 +23,27 @@ pub const CLASSIFIER_VERSION: u32 = 12;
 ///
 /// `TodoWrite` writes the agent's task list, which lives in the session and not in the project.
 const READ_LOCAL_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Skill", "TodoWrite"];
-const WRITE_TOOLS: &[&str] = &["Edit", "Write"];
+/// Tools that put bytes in a file the project keeps.
+///
+/// **`NotebookEdit` joined this list on 2026-09-08, and it is a LOOSENING, deliberately.** Before
+/// that it was outside every list here, so it classified as `unrecognized-tool` and every call
+/// asked a person -- or, on an unattended run, was refused outright. That is conservative and it
+/// is also wrong in the way an unread rule is wrong: a notebook write was the one file write this
+/// file had no opinion about, so `.ai/autopilot.yaml` and the workspace boundary were enforced
+/// against `Edit` and `Write` and not against the third tool that does the same thing.
+///
+/// The order of the two halves of that change is the whole of its safety. `written_path` had to
+/// learn `notebook_path` FIRST, because the four guards below read the target out of the tool
+/// input and answer `false` when they cannot find one -- and `false` at those call sites means
+/// "this write is fine", not "I could not tell". Adding the name alone would have moved every
+/// notebook write from `pending_approval` straight to `allow`/`read-local`, boundary and
+/// self-governing guards passing vacuously on the way. That is strictly worse than the state it
+/// was meant to fix, and it is the shape of this mistake: the guards do not fail loudly.
+/// Public to the crate so `http` can refuse a declared rule by asking THIS list rather than
+/// repeating it. The handler used to carry its own `["Edit", "Write"]`, which is two lists for
+/// one fact and the ordinary way they come to disagree: the day this one grew, the door would
+/// have gone on refusing a rule the write chain had just learned to enforce.
+pub(crate) const WRITE_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
 /// Tools that start a subagent. Both spellings, because the CLI has used each.
 ///
@@ -638,7 +658,10 @@ pub fn classify(
 /// come to disagree, and here they would disagree silently — the caller skipping a load the
 /// classifier then needed.
 pub fn reads_shell_rules(tool_name: &str) -> bool {
-    matches!(tool_name, "Bash" | "PowerShell" | "Edit" | "Write")
+    matches!(
+        tool_name,
+        "Bash" | "PowerShell" | "Edit" | "Write" | "NotebookEdit"
+    )
 }
 
 /// PURE: whether the GitHub policy can change this tool's verdict at all.
@@ -1558,8 +1581,24 @@ pub(crate) fn matches_command_prefix<S: AsRef<str>>(command: &str, prefixes: &[S
     })
 }
 
+/// PURE: the file a write tool is aiming at, whichever key that tool uses to name it.
+///
+/// `Edit` and `Write` say `file_path`; `NotebookEdit` says `notebook_path`. Four guards used to
+/// read the first key inline, one copy each, and a copy that does not know a key returns `false`
+/// -- which every one of those call sites reads as a verdict rather than as an absence. One reader
+/// so the four cannot come to disagree, and so that admitting the next write tool is a line here
+/// instead of four edits somebody does three of.
+///
+/// First match wins and the order is not meaningful: no tool sends both keys, and one that did
+/// would be a tool this file has not reasoned about.
+fn written_path(tool_input: &Value) -> Option<&str> {
+    ["file_path", "notebook_path"]
+        .iter()
+        .find_map(|key| tool_input.get(key).and_then(Value::as_str))
+}
+
 fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>) -> bool {
-    let Some(file_path) = tool_input.get("file_path").and_then(Value::as_str) else {
+    let Some(file_path) = written_path(tool_input) else {
         return false;
     };
     let normalized = fold_for_match(&normalize_path(file_path, cwd));
@@ -1573,7 +1612,7 @@ fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>) -> bool {
 }
 
 fn targets_file_that_runs_on_next_command(tool_input: &Value, cwd: Option<&Path>) -> bool {
-    let Some(file_path) = tool_input.get("file_path").and_then(Value::as_str) else {
+    let Some(file_path) = written_path(tool_input) else {
         return false;
     };
     let normalized = fold_for_match(&normalize_path(file_path, cwd));
@@ -1590,7 +1629,7 @@ fn writes_outside_cwd(tool_input: &Value, cwd: Option<&Path>) -> bool {
     let Some(cwd) = cwd else {
         return false;
     };
-    let Some(file_path) = tool_input.get("file_path").and_then(Value::as_str) else {
+    let Some(file_path) = written_path(tool_input) else {
         return false;
     };
 
@@ -1643,7 +1682,7 @@ fn write_denied_by_project(
     if rules.deny_writes.is_empty() {
         return false;
     }
-    let Some(file_path) = tool_input.get("file_path").and_then(Value::as_str) else {
+    let Some(file_path) = written_path(tool_input) else {
         return false;
     };
     let target = fold_for_containment(&normalize_path(file_path, cwd));
@@ -2783,13 +2822,83 @@ mod tests {
 
     /// The tool axis defaults to refusing, and has to keep doing so: a tool nobody has reasoned
     /// about is a capability nobody has bounded.
+    ///
+    /// `NotebookEdit` was the third name here until 2026-09-08 and is reasoned about now, which
+    /// is why it LEFT rather than being swapped for another. The two that remain are the point:
+    /// both bring text in from outside, neither has a rule of its own in this file, and both
+    /// still ask.
     #[test]
     fn a_tool_this_file_has_not_reasoned_about_still_asks() {
-        for tool_name in ["WebFetch", "WebSearch", "NotebookEdit"] {
+        for tool_name in ["WebFetch", "WebSearch"] {
             assert_classification(
                 classify(tool_name, &json!({}), None),
                 "pending_approval",
                 "unrecognized-tool",
+            );
+        }
+    }
+
+    /// The half of version 13 that makes the other half safe.
+    ///
+    /// Admitting `NotebookEdit` to `WRITE_TOOLS` is only defensible if the guards can SEE a
+    /// notebook write, and the day before this landed they could not: all four read `file_path`,
+    /// a `NotebookEdit` sends `notebook_path`, and a guard that finds no path answers `false` —
+    /// which its call site reads as "this write is fine". Every row below would have passed
+    /// vacuously, including the two that must not.
+    ///
+    /// Written as a MATRIX against `Write` rather than as five assertions about `NotebookEdit`
+    /// alone, because the claim being made is "the same treatment as a file write" and a test
+    /// naming one tool cannot make that claim. If a rule ever stops applying to one of the two,
+    /// this fails on the row where they part company and names it.
+    #[test]
+    fn a_notebook_write_is_contained_exactly_as_a_file_write_is() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+
+        for (key, tool) in [("file_path", "Write"), ("notebook_path", "NotebookEdit")] {
+            for (target, decision, class) in [
+                // Inside the workspace, governing nothing: the ordinary write.
+                (r"C:\work\repo\notes.ipynb", "allow", "read-local"),
+                // Outside it. Denied rather than asked about, which is the compiled refusal
+                // `outside-workspace` exists to be.
+                (r"C:\elsewhere\notes.ipynb", "deny", "outside-workspace"),
+                // The agent's own governance. A person decides, always.
+                (r"C:\work\repo\.ai\autopilot.yaml", "pending_approval", "self-governing-file"),
+                // A file whose contents run on somebody else's next command.
+                (r"C:\work\repo\build.rs", "pending_approval", "executes-on-next-command"),
+            ] {
+                assert_classification(
+                    classify(tool, &json!({key: target}), cwd),
+                    decision,
+                    class,
+                );
+            }
+
+            // No workspace at all: there is nothing for the write to be inside of, so the one
+            // guard that reads no path is the one that answers.
+            assert_classification(
+                classify(tool, &json!({key: "notes.ipynb"}), None),
+                "pending_approval",
+                "no-workspace",
+            );
+        }
+    }
+
+    /// A write tool that names no target is not a write this file can place, and it says so
+    /// rather than allowing it.
+    ///
+    /// The companion to the matrix above, and the reason `written_path` returns an `Option`
+    /// instead of a `&str` with an empty default: an empty path normalises to the workspace
+    /// root, which is INSIDE it, so a default would turn "I cannot tell what this writes" into
+    /// the most permissive answer available. With a cwd the call still lands on `read-local`
+    /// like any other in-workspace write — that is the pre-existing treatment of a write whose
+    /// shape is unreadable, unchanged here and pinned so a future default cannot pass unnoticed.
+    #[test]
+    fn a_write_that_names_no_file_is_not_placed_outside_the_workspace() {
+        for tool in ["Write", "NotebookEdit"] {
+            assert_classification(
+                classify(tool, &json!({}), None),
+                "pending_approval",
+                "no-workspace",
             );
         }
     }
@@ -4006,7 +4115,14 @@ mod tests {
     /// list, and added `confined-to-workspace` — the first class whose verdict depends on WHO asked
     /// for the work, since it is offered only to an unattended node of a job the owner commissioned,
     /// and 12 gave a project's alçada a second dimension — a tool name — so that `deny` can now name
-    /// a PATH an `Edit` or a `Write` may not touch here, where before it could only name a command.
+    /// a PATH an `Edit` or a `Write` may not touch here, where before it could only name a
+    /// command, and 13 admitted `NotebookEdit` to `WRITE_TOOLS` — the first bump on this list
+    /// that ALLOWS more than the version before it at the same rung, since an in-workspace
+    /// notebook write used to ask and now does not. Narrated that way deliberately: read as a
+    /// tightening it would be read wrong. What made it safe to make was `written_path` landing
+    /// in the same commit, so the workspace boundary and the self-governing guards find a
+    /// `notebook_path` where they would otherwise have found no path at all and waved the
+    /// write through.
     /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
@@ -4021,7 +4137,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 12);
+        assert_eq!(CLASSIFIER_VERSION, 13);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
@@ -4770,12 +4886,15 @@ mod tests {
     /// `classify_shell_command`, so gating both on one predicate would have built a per-project
     /// policy overlay in front of every file edit for an argument that branch cannot reach.
     ///
-    /// `NotebookEdit` is in the negative list on purpose. It writes files and is not in
-    /// `WRITE_TOOLS`, so it is `unrecognized-tool` today and this file's rules cannot touch it —
-    /// the day that changes, this line is the one that has to change with it.
+    /// `NotebookEdit` moved to the POSITIVE list on 2026-09-08, which is the day the comment
+    /// that stood here predicted. It is in `WRITE_TOOLS` now, so `write_denied_by_project` can
+    /// decide it, so the rules have to be loaded for it — a stored refusal nobody reads is a
+    /// refusal that was lost, and keeping that sentence true is the whole job of
+    /// `reads_shell_rules`. It stays in the GitHub negative list below and that is not an
+    /// oversight: a notebook write is no more a `gh` line than an `Edit` is.
     #[test]
     fn an_edit_now_reads_the_rules_and_still_never_reads_the_github_policy() {
-        for tool_name in ["Bash", "PowerShell", "Edit", "Write"] {
+        for tool_name in ["Bash", "PowerShell", "Edit", "Write", "NotebookEdit"] {
             assert!(reads_shell_rules(tool_name), "{tool_name}");
         }
         for tool_name in [
@@ -4786,7 +4905,6 @@ mod tests {
             "TodoWrite",
             "Agent",
             "Task",
-            "NotebookEdit",
         ] {
             assert!(!reads_shell_rules(tool_name), "{tool_name}");
         }

@@ -6806,25 +6806,37 @@ async fn post_project_shell_rule(
     // is every rule anybody could declare before this handler learned the word.
     //
     // Refused BY NAME here rather than left to the table, exactly as `empty_prefix` above stands in
-    // front of the column's `prefix <> ''`: `tool` is stored under
-    // `CHECK (tool IN ('', 'Edit', 'Write'))`, and a value the CHECK would reject must never reach
-    // the CHECK, because a constraint failure comes back through the `internal` arm below as a 500
-    // that names nothing. The two names are `classifier::WRITE_TOOLS`, which is the only list the
-    // write chain consults — a rule about a third tool could not be enforced even by a column that
-    // agreed to hold it.
+    // front of the column's `prefix <> ''`: `tool` is stored under a closed `CHECK`, and a value
+    // the CHECK would reject must never reach the CHECK, because a constraint failure comes back
+    // through the `internal` arm below as a 500 that names nothing.
+    //
+    // **Asked of `classifier::WRITE_TOOLS` rather than spelled again here.** This guard carried
+    // its own `["Edit", "Write"]` until 2026-09-08, which is two lists for one fact, and the day
+    // the classifier admitted `NotebookEdit` this door would have gone on refusing a rule the
+    // write chain had just learned to enforce — a refusal nobody could have debugged from the
+    // message, since the message was quoting the wrong list with complete confidence.
+    //
+    // The column's CHECK is still a second copy and cannot be anything else: SQL cannot read a
+    // Rust const. `0138` is the migration that widened it, and the two are kept in step by the
+    // test below that sends every name on this list at the real table.
     let tool = body.tool.as_deref();
     if let Some(tool) = tool
-        && !["Edit", "Write"].contains(&tool)
+        && !crate::classifier::WRITE_TOOLS.contains(&tool)
     {
+        let governed = crate::classifier::WRITE_TOOLS
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
                 "refusal": "unknown_tool",
                 "detail": format!(
-                    "`{tool}` is not a tool whose writes this núcleo governs: only `Edit` and \
-                     `Write` reach the write chain in `classifier::classify`, so a rule about \
-                     anything else would be stored and never consulted. Send no tool at all for a \
-                     rule about a COMMAND prefix."
+                    "`{tool}` is not a tool whose writes this núcleo governs: only {governed} \
+                     reach the write chain in `classifier::classify`, so a rule about anything \
+                     else would be stored and never consulted. Send no tool at all for a rule \
+                     about a COMMAND prefix."
                 ),
             })),
         ));
@@ -21985,11 +21997,18 @@ mod tests {
 
     /// A tool this núcleo cannot deny for is refused by name, before the column's CHECK sees it.
     ///
-    /// `NotebookEdit` is the value worth using: it is a real Claude Code tool that writes files and
-    /// is deliberately NOT in `classifier::WRITE_TOOLS`, so a rule about it is the mistake somebody
-    /// will actually make. The empty string is the other half — `''` is what the column stores for
-    /// "no tool", and a client that sent it explicitly would otherwise have declared a shell rule by
-    /// a spelling `DeclaredShellRule::tool` exists to keep out of everyone's hands.
+    /// `NotebookEdit` used to be the value worth using here and stopped being one on 2026-09-08,
+    /// when it joined `classifier::WRITE_TOOLS`. It moved to the test below rather than being
+    /// deleted: a name that crosses from the refused list to the accepted one is the single case
+    /// where both halves have to be asserted, or the widening is only half-done in exactly the
+    /// way nobody notices — the door opens and the column still says no, or the reverse.
+    ///
+    /// `Bash` is what remains of the same idea and is the better example anyway: it is a real
+    /// tool, it is governed by this file, and its rules are COMMAND rules, so naming it as the
+    /// subject of a write rule is a category error somebody will make. The empty string is the
+    /// other half — `''` is what the column stores for "no tool", and a client that sent it
+    /// explicitly would otherwise have declared a shell rule by a spelling
+    /// `DeclaredShellRule::tool` exists to keep out of everyone's hands.
     ///
     /// Refused HERE and not at the table, for `empty_prefix`'s reason: a `CHECK` failure comes back
     /// through the `internal` arm as a 500 that names nothing.
@@ -21998,7 +22017,7 @@ mod tests {
         let state = test_state().await;
         project_on_the_roster(&state, "alpha").await;
 
-        for tool in ["NotebookEdit", "Bash", "edit", ""] {
+        for tool in ["Bash", "edit", ""] {
             let (status, refused) = reach_request(
                 state.clone(),
                 "POST",
@@ -22014,15 +22033,61 @@ mod tests {
             assert_eq!(refused["refusal"], "unknown_tool", "{tool}");
             let detail = refused["detail"].as_str().expect("a sentence");
             assert!(detail.contains(&format!("`{tool}`")), "{detail}");
-            // The two that exist, named — otherwise the next thing to try is a guess.
-            assert!(
-                detail.contains("`Edit`") && detail.contains("`Write`"),
-                "{detail}"
-            );
+            // Every tool that DOES exist, named — otherwise the next thing to try is a guess.
+            // Read off the list the guard itself asks, so a name added there without being
+            // offered in the refusal fails here rather than shipping a sentence one short.
+            for governed in crate::classifier::WRITE_TOOLS {
+                assert!(detail.contains(&format!("`{governed}`")), "{detail}");
+            }
         }
 
         let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
         assert_eq!(listed.as_array().expect("an array").len(), 0);
+    }
+
+    /// Every tool the write chain governs can be named in a rule, and the column agrees.
+    ///
+    /// The other half of the refusal above, and it exists because the two lists cannot be one:
+    /// the guard asks `classifier::WRITE_TOOLS`, the column carries a `CHECK` written in SQL, and
+    /// SQL cannot read a Rust const. Nothing but a round trip can tell whether they still agree.
+    ///
+    /// The loop is over the const rather than over a literal list, so admitting the next write
+    /// tool fails HERE — with a 500 from the CHECK that a migration was not written — instead
+    /// of in a project six weeks later. That 500 is the failure mode `a_tool_nobody_can_deny` is
+    /// positioned to prevent for a REFUSED name; this is the same trap on the accepted side,
+    /// where no guard stands in front of the column at all.
+    ///
+    /// Read back rather than trusted: a 201 over a row that did not land is the mirror of the 422
+    /// over a row that did, and only the table can say which happened.
+    #[tokio::test]
+    async fn every_tool_the_write_chain_governs_can_carry_a_rule() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        for tool in crate::classifier::WRITE_TOOLS {
+            let (status, _) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(serde_json::json!({
+                    "prefix": format!("core/{tool}"),
+                    "tool": tool,
+                    "verdict": "deny",
+                })),
+            )
+            .await;
+            assert!(status.is_success(), "{tool}: {status}");
+        }
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        let listed = listed.as_array().expect("an array");
+        assert_eq!(listed.len(), crate::classifier::WRITE_TOOLS.len());
+        for tool in crate::classifier::WRITE_TOOLS {
+            assert!(
+                listed.iter().any(|rule| rule["tool"] == *tool),
+                "{tool} was accepted and is not in the table: {listed:?}"
+            );
+        }
     }
 
     /// A path prefix that the fold empties is refused BY NAME, and never by a 500.

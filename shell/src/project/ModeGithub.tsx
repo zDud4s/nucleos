@@ -918,11 +918,16 @@ function ShellRules({ projectId }: { projectId: string }) {
 
         One list holds two kinds of rule now, and a caption is read as a guarantee over all of it.
         "Never runs here, and never written to" sat over a list of command prefixes and promised
-        the second half about them — but a write rule is gated on `classifier::WRITE_TOOLS`, which
-        is `Edit` and `Write` and nothing else: it does not stop a `Bash` or `PowerShell` line
-        redirecting into the same directory, and `NotebookEdit` is outside that list entirely. An
-        owner who read the old sentence over `deny rm -rf` came away believing the directory was
-        closed to writes, which no rule on this page says.
+        the second half about them — but a write rule is gated on `classifier::WRITE_TOOLS`, and
+        that list holds the file-writing tools and nothing else: it does not stop a `Bash` or
+        `PowerShell` line redirecting into the same directory. An owner who read the old sentence
+        over `deny rm -rf` came away believing the directory was closed to writes, which no rule
+        on this page says.
+
+        `NotebookEdit` was named here as the example of a writing tool the list did not hold. It
+        holds it since 2026-09-08, so the example is gone and the caption is unchanged — which
+        is the test that the sentence was written about the right thing. A caption that had to
+        be edited because one tool moved was a caption making a claim about the roster.
 
         So the guarantee is a property of the ROW — the tool is on it, and the sentence beside it
         names what that tool may not do — and the caption is what remains true across the list.
@@ -1230,9 +1235,15 @@ function DeclareRule({
       <div className="flex flex-wrap gap-2">
         {/*
           What KIND of rule this is, asked before the prefix because it changes what the prefix
-          means: a command to run, or a path to write into. The two the núcleo can govern are
-          `classifier::WRITE_TOOLS`, and the route refuses anything else by name — a third option
-          here would be a control whose only answer is `unknown_tool`.
+          means: a command to run, or a path to write into. The tools the núcleo can govern are
+          `classifier::WRITE_TOOLS`, and the route refuses anything else by name — an option
+          here that is not on that list would be a control whose only answer is `unknown_tool`.
+
+          `NotebookEdit` joined the list on 2026-09-08, so it is offered here now. That it had
+          to be added by hand is the shape of this control: the list lives in Rust, this is a
+          third copy of it after the route guard and the column CHECK, and nothing compiles the
+          three together. A tool admitted to the classifier and not added here is enforceable
+          and unsayable, which reads to an owner as the feature simply not existing.
         */}
         <select
           aria-label="What this rule is about"
@@ -1243,6 +1254,7 @@ function DeclareRule({
           <option value="">a command</option>
           <option value="Edit">Edit writing to a path</option>
           <option value="Write">Write writing to a path</option>
+          <option value="NotebookEdit">NotebookEdit writing to a path</option>
         </select>
         <input
           /*
