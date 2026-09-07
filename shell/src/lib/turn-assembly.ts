@@ -13,7 +13,7 @@ export type TurnSignal =
 
 export type Segment = {
   text: string;
-  verdict: "continues" | "closes";
+  verdict: "continues" | "closes" | "discards" | "confirms";
   elapsedMs: number;
 };
 
@@ -29,6 +29,26 @@ export function onSegment(
   segment: Segment,
 ): { state: TurnState; signal: TurnSignal | null } {
   const hasText = segment.text.length > 0;
+
+  if (segment.verdict === "discards") {
+    return {
+      state: {
+        segments: state.segments,
+        speechMs: state.speechMs + (hasText ? segment.elapsedMs : 0),
+        idleMs: hasText ? 0 : state.idleMs + segment.elapsedMs,
+        pendingDiscard: true,
+      },
+      signal: { type: "confirmDiscard" },
+    };
+  }
+
+  if (segment.verdict === "confirms" && state.pendingDiscard) {
+    return {
+      state: EMPTY_TURN,
+      signal: { type: "discard" },
+    };
+  }
+
   const segments = hasText ? [...state.segments, segment.text] : state.segments;
 
   if (segment.verdict === "closes") {
@@ -43,7 +63,7 @@ export function onSegment(
       segments,
       speechMs: state.speechMs + (hasText ? segment.elapsedMs : 0),
       idleMs: hasText ? 0 : state.idleMs + segment.elapsedMs,
-      pendingDiscard: state.pendingDiscard,
+      pendingDiscard: false,
     },
     signal: null,
   };
