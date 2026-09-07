@@ -2404,7 +2404,7 @@ mod tests {
     ///
     /// **The three scopes below are not decoration, and `Scope::Run` alone would prove nothing.**
     /// That arm consults no table at all — it is a fixed `match` over two routes — so it would go on
-    /// passing with all nine of these in every table. `ApiTokenLevel::ReadOnly` and
+    /// passing with all twelve of these in every table. `ApiTokenLevel::ReadOnly` and
     /// `ApiTokenLevel::RunCreating` are the two that actually read `READ_ONLY_ROUTES`, which is
     /// where a tidying hand would put them.
     #[test]
@@ -2419,6 +2419,9 @@ mod tests {
             (Method::GET, "/projects/{id}/land-targets"),
             (Method::POST, "/projects/{id}/land-targets"),
             (Method::DELETE, "/projects/{id}/land-targets"),
+            (Method::GET, "/projects/{id}/git-ops"),
+            (Method::POST, "/projects/{id}/git-ops"),
+            (Method::DELETE, "/projects/{id}/git-ops"),
         ];
 
         for (method, pattern) in DECLARED_REACH {
@@ -2567,35 +2570,40 @@ mod tests {
     /// refuses, and the paragraph above is the argument it refuses it with.
     #[test]
     fn the_declarable_ops_catalogue_is_in_no_scope_table() {
-        const CATALOGUE: &str = "/github/declarable-ops";
+        // `/vcs/declarable-ops` is `/github/declarable-ops`'s git twin, in no table for the same
+        // reason: compiled constants, no project id, no database, no use to a scoped key that
+        // cannot reach a single one of the routes this catalogue explains.
+        const CATALOGUES: &[&str] = &["/github/declarable-ops", "/vcs/declarable-ops"];
 
-        assert!(
-            !route_is_listed(READ_ONLY_ROUTES, &Method::GET, CATALOGUE)
-                && !route_is_listed(RUN_CREATING_ROUTES, &Method::GET, CATALOGUE)
-                && !route_is_listed(TEAM_ROUTES, &Method::GET, CATALOGUE)
-                && !route_is_listed(EMAIL_ROUTES, &Method::GET, CATALOGUE)
-                && !route_is_listed(COUNCIL_ROUTES, &Method::GET, CATALOGUE),
-            "the catalogue explains routes no scoped key may reach, so no scoped key needs it"
-        );
-
-        for scope in [
-            Scope::Run(7),
-            Scope::ApiToken(ApiTokenLevel::ReadOnly),
-            Scope::ApiToken(ApiTokenLevel::RunCreating),
-        ] {
+        for catalogue in CATALOGUES {
             assert!(
-                !permits(&scope, &Method::GET, CATALOGUE),
-                "{scope:?} must not reach GET {CATALOGUE}"
+                !route_is_listed(READ_ONLY_ROUTES, &Method::GET, catalogue)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &Method::GET, catalogue)
+                    && !route_is_listed(TEAM_ROUTES, &Method::GET, catalogue)
+                    && !route_is_listed(EMAIL_ROUTES, &Method::GET, catalogue)
+                    && !route_is_listed(COUNCIL_ROUTES, &Method::GET, catalogue),
+                "the catalogue explains routes no scoped key may reach, so no scoped key needs it"
             );
-        }
 
-        // And the two that act for the person do reach it, which is the half that makes the
-        // exclusion a boundary rather than a route nobody can open.
-        for scope in [Scope::ApiToken(ApiTokenLevel::Admin), Scope::Control] {
-            assert!(
-                permits(&scope, &Method::GET, CATALOGUE),
-                "{scope:?} opens the page these constants are for"
-            );
+            for scope in [
+                Scope::Run(7),
+                Scope::ApiToken(ApiTokenLevel::ReadOnly),
+                Scope::ApiToken(ApiTokenLevel::RunCreating),
+            ] {
+                assert!(
+                    !permits(&scope, &Method::GET, catalogue),
+                    "{scope:?} must not reach GET {catalogue}"
+                );
+            }
+
+            // And the two that act for the person do reach it, which is the half that makes the
+            // exclusion a boundary rather than a route nobody can open.
+            for scope in [Scope::ApiToken(ApiTokenLevel::Admin), Scope::Control] {
+                assert!(
+                    permits(&scope, &Method::GET, catalogue),
+                    "{scope:?} opens the page these constants are for"
+                );
+            }
         }
     }
 

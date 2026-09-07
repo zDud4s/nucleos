@@ -271,6 +271,17 @@ pub fn build_router(state: AppState) -> Router {
                 .post(post_project_github_op)
                 .delete(delete_project_github_op),
         )
+        // The git queue's own declarable set, the same trio as the one above with `vcs::GIT_OP_KINDS`
+        // in place of `github::declarable_ops` — see that route's own doc for what stays true wholesale
+        // (the emergency stop on the POST only, the DELETE's body-carried `op_kind`, the 404 off
+        // `rows_affected`) and `GET /vcs/declarable-ops` for the one thing that does not: there is no
+        // ceiling to intersect, so every kind here is declarable, always.
+        .route(
+            "/projects/{id}/git-ops",
+            get(get_project_git_ops)
+                .post(post_project_git_op)
+                .delete(delete_project_git_op),
+        )
         .route(
             "/projects/{id}/land-targets",
             get(get_project_land_targets)
@@ -672,6 +683,21 @@ pub fn build_router(state: AppState) -> Router {
         // argument for its own absence. `the_declarable_ops_catalogue_is_in_no_scope_table` says it
         // where somebody tidying `auth.rs` will read it.
         .route("/github/declarable-ops", get(get_declarable_github_ops))
+        // The catalogue `POST /projects/{id}/git-ops` validates against, read out loud — the git
+        // twin of the route above.
+        //
+        // **No project id, for the same reason and more completely.** `declarable_github_ops` still
+        // intersects two compiled ceilings against a bigger catalogue; `vcs::GIT_OP_KINDS` IS the
+        // catalogue, so `vcs::declarable_git_ops` has nothing project-shaped to consult at all — the
+        // answer is compiled in, identical for every project on the roster, today and until this
+        // binary changes.
+        //
+        // **In no scope table, for `/github/declarable-ops`' reason:** the response is a function of
+        // the binary and discloses no project's configuration, so the grant would buy nobody
+        // anything — the caller who needs it is the shell, which already holds the control token,
+        // and the three routes it exists to explain are themselves in no table.
+        // `the_declarable_ops_catalogue_is_in_no_scope_table` covers both routes together.
+        .route("/vcs/declarable-ops", get(get_declarable_git_ops))
         .route("/worktrees/{run_id}/release", post(post_worktree_release))
         .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
@@ -7154,6 +7180,140 @@ async fn delete_project_github_op(
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "forgetting a project github op failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+    if !forgotten {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "refusal": "no_such_op",
+                "detail": format!("{id} has not declared `{op_kind}`"),
+            })),
+        ));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Every operation the shared git queue performs, and whether a project may declare it.
+///
+/// **The git twin of `get_declarable_github_ops`, and simpler by exactly the gap `vcs::DeclarableGitOp`'s
+/// own doc names.** The GitHub catalogue has to serve operations the ceilings refuse, so a caller can
+/// draw them as facts rather than as controls; the git queue has no ceiling narrower than
+/// `GIT_OP_KINDS` to intersect, so `declarable_git_ops` returns everything it performs and every row
+/// comes back `declarable: true`. Nothing here computes a `half` either — every operation in this
+/// family is a write the queue performs the same way, never a read in force.
+///
+/// No project id, for the reason the route comment gives: the answer is compiled into `GIT_OP_KINDS`
+/// and is the same for every project on the roster.
+async fn get_declarable_git_ops() -> Json<Vec<vcs::DeclarableGitOp>> {
+    Json(vcs::declarable_git_ops())
+}
+
+/// What the shared git queue may do on this project's repository, for an autonomous run, without
+/// asking.
+///
+/// `try_git_ops` and not `git_ops`, for `get_project_github_ops`'s reason: this is a DISPLAY, and
+/// `[]` has to mean "nothing declared" rather than stand in for a read that failed.
+async fn get_project_git_ops(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    crate::project_policy::try_git_ops(&state.pool, &id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading a project's git ops failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitOpTarget {
+    op_kind: String,
+}
+
+/// Refuses a blank op kind before anything else can name it — `named_op_kind`'s own reason, worded
+/// for this family instead of GitHub's: reusing that message verbatim would tell somebody declaring
+/// a git operation that their GitHub declaration was malformed.
+fn named_git_op_kind(op_kind: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if op_kind.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "empty_op_kind",
+                "detail": "a git declaration has to name an operation",
+            })),
+        ));
+    }
+    Ok(())
+}
+
+/// Grants one git operation to this project's autonomous runs without asking.
+///
+/// The git twin of `post_project_github_op`, and the checks run in the same order: the emergency
+/// stop first, because this widens exactly as a GitHub `allow` does; then the roster; then the
+/// length cap; then the blank-kind refusal; then the catalogue. Unlike its sibling there is no
+/// inert-until-elsewhere caveat to record — `GIT_OP_KINDS` is exactly what the shared git queue
+/// consults, with nothing standing between a declared row and the queue honouring it.
+async fn post_project_git_op(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitOpTarget>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    declaration_halted(&state, &id).await?;
+    project_is_on_the_roster(&state, &id).await?;
+
+    let op_kind = body.op_kind.trim();
+    within_length("op kind", op_kind)?;
+    named_git_op_kind(op_kind)?;
+
+    if !vcs::GIT_OP_KINDS.contains(&op_kind) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "undeclarable_op",
+                "detail": format!(
+                    "`{op_kind}` is not an operation a project may declare; the queue admits: {}",
+                    vcs::GIT_OP_KINDS.join(", ")
+                ),
+            })),
+        ));
+    }
+
+    crate::project_policy::declare_git_op(&state.pool, &id, op_kind)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "declaring a project git op failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Withdraws one git operation. 404 when it was never declared, off the DELETE's own
+/// `rows_affected` — `delete_project_github_op`'s reason, unchanged here: a presence check through
+/// `git_ops` would read an unreadable table as an empty list and report a false 404 while the row,
+/// and the operation, stand.
+///
+/// No kill switch: withdrawing narrows, and an operation declared before this route existed still
+/// has to be removable.
+async fn delete_project_git_op(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitOpTarget>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    project_is_on_the_roster(&state, &id).await?;
+
+    let op_kind = body.op_kind.trim();
+    within_length("op kind", op_kind)?;
+    named_git_op_kind(op_kind)?;
+
+    let forgotten = crate::project_policy::forget_git_op(&state.pool, &id, op_kind)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "forgetting a project git op failed");
             refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
         })?;
     if !forgotten {
@@ -22259,6 +22419,163 @@ mod tests {
 
         let (_, listed) = reach_request(state, "GET", "/projects/alpha/github-ops", None).await;
         assert_eq!(listed, serde_json::json!([]));
+    }
+
+    /// `GET /vcs/declarable-ops` names every operation the git queue performs, all six declarable.
+    ///
+    /// Unlike the GitHub catalogue, there is nothing here to exclude: `vcs::declarable_git_ops` says
+    /// its own doc that everything the queue performs is something a project may declare, in
+    /// lockstep, so this is an exact-set assertion rather than a `contains`.
+    #[tokio::test]
+    async fn the_git_op_catalogue_names_six_operations() {
+        let state = test_state().await;
+
+        let (status, listed) = reach_request(state, "GET", "/vcs/declarable-ops", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let served = listed.as_array().unwrap();
+        assert_eq!(served.len(), 6, "{listed}");
+
+        let mut names: Vec<&str> = served
+            .iter()
+            .map(|op| op["kind"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        let mut expected: Vec<&str> = crate::vcs::GIT_OP_KINDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+
+        for op in served {
+            assert_eq!(op["declarable"], serde_json::json!(true), "{op}");
+        }
+    }
+
+    /// Declared, listed, and withdrawn — the git twin of `a_declared_github_op_comes_back_and_then_goes`.
+    #[tokio::test]
+    async fn a_declared_git_op_is_listed_and_can_be_withdrawn() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "push" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/git-ops", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed, serde_json::json!(["push"]));
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "push" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/git-ops", None).await;
+        assert_eq!(listed, serde_json::json!([]));
+    }
+
+    /// An operation outside `GIT_OP_KINDS` is refused, and the refusal names all six.
+    #[tokio::test]
+    async fn an_unknown_git_op_kind_is_refused_naming_the_six() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, refused) = reach_request(
+            state,
+            "POST",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "bisect" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused["refusal"], "undeclarable_op");
+        let detail = refused["detail"].as_str().unwrap();
+        assert!(detail.contains("bisect"), "{detail}");
+        for kind in crate::vcs::GIT_OP_KINDS {
+            assert!(detail.contains(kind), "{detail} must name {kind}");
+        }
+    }
+
+    /// The emergency stop reaches this POST exactly as it reaches `POST /github-ops` — a widening,
+    /// refused while engaged. `the_emergency_stop_reaches_a_widening_and_never_a_narrowing` already
+    /// carries the full argument; this is the family's own pair of tests for the same behaviour.
+    #[tokio::test]
+    async fn declaring_a_git_op_is_refused_while_the_stop_is_engaged() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let (status, refused) = reach_request(
+            state,
+            "POST",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "push" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(refused["refusal"], "kill_switch");
+    }
+
+    /// A withdrawal narrows, so the stop never stands in its way.
+    #[tokio::test]
+    async fn withdrawing_a_git_op_is_not_refused_by_the_stop() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "push" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let (status, _) = reach_request(
+            state,
+            "DELETE",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "push" })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "narrowing must survive an engaged stop"
+        );
+    }
+
+    /// 404, off the DELETE's own `rows_affected` — `delete_project_github_op`'s reason, applied to
+    /// an operation this project never declared.
+    #[tokio::test]
+    async fn forgetting_a_git_op_never_declared_is_a_404() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, refused) = reach_request(
+            state,
+            "DELETE",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "push" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(refused["refusal"], "no_such_op");
     }
 
     /// Declared, listed, and withdrawn — for a branch that exists nowhere.
