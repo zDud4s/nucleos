@@ -54,7 +54,7 @@
   margin: 0 0 var(--space-3);
   font-size: var(--text-sm);
   font-weight: 600;
-  letter-spacing: 0.04em;
+  letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
   color: var(--text-muted);
 }
@@ -83,7 +83,7 @@
  * sideways.
  */
 .teams-table-scroller {
-  margin: var(--space-4) 0 0;
+  margin: var(--space-5) 0 0;
   overflow-x: auto;
 }
 
@@ -98,7 +98,7 @@
   border-bottom: 1px solid var(--border-strong);
   font-size: var(--text-xs);
   font-weight: 600;
-  letter-spacing: 0.04em;
+  letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
   text-align: left;
   white-space: nowrap;
@@ -130,6 +130,12 @@
 .teams-row-name a {
   font-size: var(--text-base);
   font-weight: 600;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.teams-row-name a:hover {
+  text-decoration: underline;
 }
 
 /*
@@ -157,6 +163,7 @@
 .teams-col-num {
   width: 1%;
   white-space: nowrap;
+  text-align: right !important;
 }
 
 .teams-figure {
@@ -306,10 +313,6 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--tone-active-border);
-  border-radius: var(--radius-md);
-  background: var(--surface-sunken);
 }
 
 .teams-task-head {
@@ -329,7 +332,7 @@
 .teams-task-dept {
   font-size: var(--text-xs);
   font-weight: 600;
-  letter-spacing: 0.04em;
+  letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
 }
 
@@ -538,7 +541,6 @@
 }
 
 .teams-input,
-.teams-select,
 .teams-textarea {
   width: 100%;
   padding: var(--space-2);
@@ -613,30 +615,11 @@
 
 /* ================================================================== runs == */
 
-.teams-runs {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.teams-run {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-}
-
 .teams-run-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
 }
 
 .teams-run-why {
@@ -972,7 +955,7 @@
 .teams-savebar {
   position: sticky;
   bottom: 0;
-  z-index: 1;
+  z-index: var(--z-sticky);
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -1082,36 +1065,17 @@
   color: var(--text-faint);
 }
 
-.teams-items {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.teams-item {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-}
-
-.teams-item-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-}
-
 .teams-item-agent {
-  font-family: var(--font-mono);
+  font-family: var(--font-body);
   font-size: var(--text-sm);
   color: var(--text);
+}
+
+.teams-item-row {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
 }
 
 .teams-item-what {
@@ -1131,6 +1095,7 @@
 
 /* ================================================================= acts == */
 
+/* Retained for the Decisions tab, which shares this stylesheet. */
 .teams-acts {
   display: flex;
   flex-direction: column;
@@ -1158,17 +1123,13 @@
 }
 
 .teams-act-kind {
-  font-family: var(--font-mono);
+  font-family: var(--font-body);
   font-size: var(--text-sm);
   color: var(--text);
 }
 
-.teams-act-why {
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
+.teams-select {
+  font-family: var(--font-mono);
 }
 
 .teams-act-payload {
@@ -1206,23 +1167,101 @@
   overflow-wrap: anywhere;
 }
 
-/* ================================================================= cost == */
+.teams-action-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
 
-.teams-cost {
+.teams-action-head {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-3);
-  margin: 0;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.teams-action-kind {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   color: var(--text);
 }
 
-.teams-cost-note {
-  margin: var(--space-1) 0 0;
+.teams-action-why {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.teams-action-payload {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.teams-action-field {
+  display: flex;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.teams-action-raw {
+  max-height: 12rem;
+  overflow: auto;
+  overscroll-behavior: none;
+  margin: 0;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ========================================================== the run's top == */
+
+/* Where the page sits, above its title. `--text-xs` because a crumb is orientation and
+   never content: it is read once, on arrival, by somebody deciding whether they are in
+   the right place. */
+.teams-crumb {
+  margin: 0 0 var(--space-2);
   font-size: var(--text-xs);
   color: var(--text-faint);
+}
+
+/**
+ * The four readings of a run, in a row.
+ *
+ * `auto-fit` at 11rem rather than a fixed four, so the strip folds to two-by-two in a
+ * narrow window instead of squeezing a state badge and a spend into 90px each. The same
+ * mechanism `.app-home-stats` uses, at the smaller minimum a four-card strip under a
+ * header needs.
+ */
+.teams-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+/* What the strip cannot put in a card: the daemon's own sentence about why a run
+   stopped, and where the run came from. Prose under instruments, in that order. */
+.teams-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
 }
 
 /* ============================================================== org chart == */
@@ -1268,8 +1307,8 @@
 /* A state changes on every poll. The box repaints; it must never slide while it does. */
 .teams-org-node .teams-org-box {
   transition:
-    fill 120ms ease,
-    stroke 120ms ease;
+    fill var(--dur-quick) var(--ease),
+    stroke var(--dur-quick) var(--ease);
 }
 
 .teams-org-box {

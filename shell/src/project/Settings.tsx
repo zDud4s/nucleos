@@ -189,7 +189,7 @@ function Ceiling({ project }: { project: ProjectSummary }) {
         >
           −
         </button>
-        <span className="min-w-16 text-center font-display text-xl text-text">
+        <span className="min-w-16 text-center font-display text-xl font-bold tabular-nums text-text">
           {/*
             `null` is the brake OFF and is not a ceiling of zero: the daemon compares
             `open >= limit`, so zero would mean "never start anything again" — the opposite end of

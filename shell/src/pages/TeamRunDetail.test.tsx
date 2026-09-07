@@ -251,9 +251,45 @@ describe("TeamRunDetail - cost", () => {
 
     await renderTeamRunDetail("/team-runs/run-2");
 
-    const costFigures = await screen.findAllByText((_, element) => element?.className === "teams-cost");
+    // `money()` and not a raw `toFixed(4)`: `$1.2400` was this page's own convention for
+    // a spend, and every other figure in the app is written by the one formatter — two
+    // conventions for money is how a reader learns to distrust both.
+    const costFigures = await screen.findAllByText(
+      (_, element) => element?.className === "ui-stat-value" && /1\.25/.test(element.textContent ?? ""),
+    );
     expect(costFigures).toHaveLength(1);
-    expect(costFigures[0].textContent).toContain("1.2500");
+    expect(costFigures[0].textContent).toBe("$1.25");
+  });
+});
+
+/* --------------------------------------------------------------- headline -- */
+
+describe("TeamRunDetail - what the page is about", () => {
+  /**
+   * A8's sibling, and the reason the whole packet exists: the heading rank belongs to
+   * the page's SUBJECT. Every team run answered to the heading "Team run", which is the
+   * one thing a reader already knew — they clicked a run to get here. What tells this run
+   * from the last one is the sentence somebody typed, and it was two ranks down in the
+   * muted headline.
+   */
+  it('the request is the heading and "Team run" is the crumb', async () => {
+    const run = teamRunView({ id: "run-1", request: "clear the backlog" });
+    daemon.apiFetch.mockImplementation(teamRunFetch({ "run-1": run }));
+
+    await renderTeamRunDetail("/team-runs/run-1");
+
+    const heading = await screen.findByRole("heading", { level: 1 });
+    expect(heading.textContent).toBe("clear the backlog");
+    expect(screen.queryByRole("heading", { level: 1, name: "Team run" })).toBeNull();
+
+    // The page's kind, and the way back out of it, above the title rather than under the
+    // last panel — which is where "Back to the departments" was, reachable only by
+    // somebody who had already read everything they came for.
+    const crumb = document.querySelector(".teams-crumb");
+    expect(crumb?.textContent).toContain("Team run");
+    expect(within(crumb as HTMLElement).getByRole("link", { name: "Departments" }).getAttribute("href")).toBe(
+      "/teams",
+    );
   });
 });
 
@@ -265,7 +301,7 @@ describe("TeamRunDetail - the run's cadence", () => {
     daemon.apiFetch.mockImplementation(teamRunFetch({ "run-1": liveRun }));
 
     const { queryClient } = await renderTeamRunDetail("/team-runs/run-1");
-    await screen.findByRole("heading", { level: 1, name: "Team run" });
+    await screen.findByRole("heading", { level: 1, name: "clear the backlog" });
 
     function computedInterval(): number | false {
       const query = queryClient.getQueryCache().find({ queryKey: keys.teams.run("run-1"), exact: true });

@@ -59,6 +59,23 @@
   padding: var(--space-5) var(--space-6) var(--space-8);
 }
 
+/**
+ * The air between two blocks of a page, decided once.
+ *
+ * It names `.app-page`, so it lives here rather than in `ui.css` — a rule about
+ * what the page does to its own children is not a rule about the primitive. Only
+ * adjacent siblings, so the first block still sits where the header's own margin
+ * put it, and only direct children, so a panel nested inside another keeps
+ * whatever its container decided. The section-to-section pair covers quiet
+ * Voice lists, which render as consecutive direct section children.
+ */
+.app-page > .ui-panel + .ui-panel,
+.app-page > .ui-panel + .ui-section,
+.app-page > .ui-section + .ui-panel,
+.app-page > .ui-section + .ui-section {
+  margin-top: var(--space-4);
+}
+
 /* ------------------------------------------------------------------- nav -- */
 
 /**
@@ -317,7 +334,7 @@
   position: absolute;
   top: calc(100% + var(--space-1));
   left: 0;
-  z-index: 50;
+  z-index: var(--z-top);
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1178,7 +1195,7 @@
   position: fixed;
   top: 0;
   right: 0;
-  z-index: 20;
+  z-index: var(--z-overlay);
   display: grid;
   grid-template-rows: auto 1fr;
   width: min(26rem, 100vw);
@@ -1253,23 +1270,22 @@
 .app-drawer-list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--hairline);
   margin: 0;
   padding: 0;
   list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--border);
+  overflow: hidden;
 }
 
 .app-drawer-row {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
-  padding-bottom: var(--space-3);
-  border-bottom: 1px solid var(--border);
-}
-
-.app-drawer-row:last-child {
-  padding-bottom: 0;
-  border-bottom: none;
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
 }
 
 .app-drawer-row-head {
@@ -1334,11 +1350,15 @@
  * every keyframe below is off for anyone who asked for that, and duplicating the
  * media query here would only create a second place to forget.
  */
+/* Aliases, not values. The rail's motion is the app's motion — these four names
+   exist so the keyframes below read as `--nav-slide` rather than as a duration,
+   and pointing them at the tokens is what keeps the rail from becoming the one
+   place in the app that moves at its own speed. */
 .nav {
-  --nav-ease: cubic-bezier(0.25, 1, 0.5, 1);
-  --nav-quick: 140ms;
-  --nav-settle: 220ms;
-  --nav-slide: 240ms;
+  --nav-ease: var(--ease);
+  --nav-quick: var(--dur-quick);
+  --nav-settle: var(--dur-settle);
+  --nav-slide: var(--dur-slide);
 }
 
 /**
@@ -1605,36 +1625,8 @@
   margin-bottom: var(--space-6);
 }
 
-.app-quicklinks {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
-  gap: var(--space-4);
-}
-
-.app-quicklink {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-4);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  color: var(--text-muted);
-  text-decoration: none;
-}
-
-.app-quicklink:hover {
-  border-color: var(--border-strong);
-  background: var(--surface-raised);
-}
-
-.app-quicklink-title {
-  font-family: var(--font-display);
-  font-size: var(--text-md);
-  font-weight: var(--weight-semibold);
-  color: var(--text);
-}
-
-.app-quicklink-text {
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-}
+/* The two quicklink CARDS were here — a bordered block per door, each with a display-face
+   title and a paragraph, drawn at the same weight as the four readings above them. Two
+   links do not need a frame each to be found, and the frames made the first screen read
+   as six things of equal importance when four of them are the news and two are doors.
+   What replaced them is a `Section` with two `ui-button-link`s and their sentences. */

@@ -51,7 +51,7 @@ beforeEach(() => {
 
 /* ------------------------------------------------------------- fixtures -- */
 
-/** The daemon's own subsystem order — `health.rs:142-183`. Render, never sort. */
+/** The fixture's daemon order — the page sorts by health, worst first, and stays in daemon order inside each group. */
 const DAEMON_ORDER = [
   "sqlite_pool",
   "cli_binary",
@@ -306,11 +306,18 @@ describe("System - health readout", () => {
 
     const list = await screen.findByRole("list", { name: "Subsystems" });
 
-    // Rendered in the daemon's own order, not re-sorted.
+    // Down comes first, then degraded, with daemon order preserved inside each group.
     const names = within(list)
       .getAllByRole("listitem")
       .map((row) => row.querySelector(".sy-subsystem-name")?.textContent);
-    expect(names).toEqual([...DAEMON_ORDER]);
+    const expectedOrder = [
+      ...world.readout.subsystems.filter((subsystem) => subsystem.status === "down"),
+      ...world.readout.subsystems.filter((subsystem) => subsystem.status === "degraded"),
+      ...world.readout.subsystems.filter(
+        (subsystem) => subsystem.status !== "down" && subsystem.status !== "degraded",
+      ),
+    ].map((subsystem) => subsystem.name);
+    expect(names).toEqual(expectedOrder);
 
     // Reasons render for the rows that have one.
     expect(within(list).getByText(/low-disk-space/)).toBeDefined();

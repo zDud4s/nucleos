@@ -208,7 +208,7 @@ function QueueList({ rows, filtered }: { rows: QueuedEmail[] | undefined; filter
 
   return (
     <>
-      <ul className="mail-list" aria-label="Mail queue">
+      <ul className="ui-rows" aria-label="Mail queue">
         {rows.map((row) => (
           <MailRow key={row.id} row={row} />
         ))}
@@ -224,23 +224,25 @@ function QueueList({ rows, filtered }: { rows: QueuedEmail[] | undefined; filter
 
 function MailRow({ row }: { row: QueuedEmail }) {
   return (
-    <li className="mail-row">
+    <li className="ui-rows-row mail-row">
       <div className="mail-row-head">
         {/* NULL and "noise" are two different facts and must read as two
             different badges — see this file's header. */}
-        <StateBadge domain="email_class" state={row.triage_class} />
+        <span className="mail-row-badges">
+          <StateBadge domain="email_class" state={row.triage_class} />
+          {/* `has_attachments` is an i64 0/1 over the wire, not a boolean. */}
+          {row.has_attachments === 1 && <span className="mail-attachment">attachment</span>}
+          {row.sender_verdict !== null && (
+            <span className={`mail-verdict mail-verdict-${row.sender_verdict}`}>{row.sender_verdict}</span>
+          )}
+        </span>
         <span className="mail-row-from">{row.from_name ?? row.from_addr}</span>
-        {/* `has_attachments` is an i64 0/1 over the wire, not a boolean. */}
-        {row.has_attachments === 1 && <span className="mail-attachment">attachment</span>}
-        {row.sender_verdict !== null && (
-          <span className={`mail-verdict mail-verdict-${row.sender_verdict}`}>{row.sender_verdict}</span>
-        )}
+        <Link to={`/mail/${row.id}`} className="mail-row-subject">
+          {row.subject ?? "(no subject)"}
+        </Link>
         <RelativeTime at={row.received_at} />
+        {row.triage_summary !== null && <p className="mail-row-summary">{row.triage_summary}</p>}
       </div>
-      <Link to={`/mail/${row.id}`} className="mail-row-subject">
-        {row.subject ?? "(no subject)"}
-      </Link>
-      {row.triage_summary !== null && <p className="mail-row-summary">{row.triage_summary}</p>}
     </li>
   );
 }

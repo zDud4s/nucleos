@@ -201,9 +201,9 @@ function SearchOutcome({ view }: { view: SearchView }) {
       {view.cached.length > 0 && (
         <>
           <p className="web-search-subhead">already in the archive</p>
-          <ul className="web-search-list" aria-label="Already read">
+          <ul className="ui-rows web-search-list" aria-label="Already read">
             {view.cached.map((hit) => (
-              <li className="web-search-row" key={hit.id}>
+              <li className="ui-rows-row web-search-row" key={hit.id}>
                 <Link to={`/web/pages/${hit.id}`}>{hit.title ?? hit.final_url}</Link>
                 <span className="web-search-snippet">{hit.snippet}</span>
               </li>
@@ -218,9 +218,9 @@ function SearchOutcome({ view }: { view: SearchView }) {
           {view.results.length === 0 ? (
             <p className="web-search-empty">nothing came back</p>
           ) : (
-            <ul className="web-search-list" aria-label="Search results">
+            <ul className="ui-rows web-search-list" aria-label="Search results">
               {view.results.map((result) => (
-                <li className="web-search-row" key={result.url}>
+                <li className="ui-rows-row web-search-row" key={result.url}>
                   <span className="web-search-title">{result.title}</span>
                   <span className="web-search-url">{result.url}</span>
                   <span className="web-search-snippet">{result.snippet}</span>
@@ -286,7 +286,7 @@ function ArchiveList({
         </Teach>
       )}
       {rows !== undefined && rows.length > 0 && (
-        <ul className="web-list" aria-label="Archive">
+        <ul className="ui-rows web-list" aria-label="Archive">
           {rows.map((row) => (
             <ArchiveRow key={row.id} row={row} active={row.id === selected} />
           ))}
@@ -298,7 +298,7 @@ function ArchiveList({
 
 function ArchiveRow({ row, active }: { row: Hit; active: boolean }) {
   return (
-    <li className={active ? "web-row web-row-active" : "web-row"}>
+    <li className={active ? "ui-rows-row web-row web-row-active" : "ui-rows-row web-row"}>
       <Link className="web-row-link" to={`/web/pages/${row.id}`} aria-current={active ? "page" : undefined}>
         <span className="web-row-title">{row.title ?? row.final_url}</span>
         <StateBadge domain="web_trust" state={row.trust_at_fetch} />

@@ -14,6 +14,7 @@ import {
   Badge,
   Button,
   ConfirmButton,
+  Count,
   ErrorNote,
   PageHeader,
   Panel,
@@ -66,28 +67,30 @@ export function Learned() {
       <PageHeader title="Learned" headline={headline(rows)} />
 
       {refinements.isError && (
-        <ErrorNote>the núcleo did not answer — nothing is known about what it has learned</ErrorNote>
+        <ErrorNote>
+          the núcleo did not answer — nothing is known about what it has learned
+        </ErrorNote>
       )}
       {refusal !== null && <DecisionRefusal error={refusal} />}
 
       {rows !== undefined && rows.length === 0 && (
-        <Panel>
-          <Teach title="Nothing has been learned yet">
-            This is where supplemental instructions, facts about a project, and reusable ways of
-            working are kept once you have approved them — and where you take one back. Nothing
-            reaches a prompt until you say so, so an empty layer means the agent is running on its
-            standing brief alone.
-          </Teach>
-        </Panel>
+        <Teach title="Nothing has been learned yet">
+          This is where supplemental instructions, facts about a project, and
+          reusable ways of working are kept once you have approved them — and
+          where you take one back. Nothing reaches a prompt until you say so,
+          so an empty layer means the agent is running on its standing brief
+          alone.
+        </Teach>
       )}
 
       {waiting.length > 0 && (
-        <Panel title="Waiting for you" aside={`${waiting.length}`}>
+        <Panel title="Waiting for you" aside={<Count n={waiting.length} />}>
           <p className="learned-lede">
-            Declared, and reaching nothing until you answer. Approving adds it to every later run in
-            its scope; refusing keeps the refusal on the record rather than erasing the question.
+            Declared, and reaching nothing until you answer. Approving adds it
+            to every later run in its scope; refusing keeps the refusal on the
+            record rather than erasing the question.
           </p>
-          <ul className="learned-list">
+          <ul className="ui-rows">
             {[...waiting]
               .sort((left, right) => left.id - right.id)
               .map((row) => (
@@ -99,18 +102,24 @@ export function Learned() {
                       // A proposed row whose question is gone cannot be decided from here, and a
                       // button that 404s is worse than none: it invites a click that teaches the
                       // person the app is broken when the daemon is merely inconsistent.
-                      <span className="learned-orphan">no question to answer — decide in the daemon</span>
+                      <span className="learned-orphan">
+                        no question to answer — decide in the daemon
+                      </span>
                     ) : (
                       <>
                         <Button
                           variant="approve"
-                          onClick={() => approve.mutate(row.proposal_id as number)}
+                          onClick={() =>
+                            approve.mutate(row.proposal_id as number)
+                          }
                           disabled={approve.isPending}
                         >
                           Approve
                         </Button>
                         <Button
-                          onClick={() => reject.mutate(row.proposal_id as number)}
+                          onClick={() =>
+                            reject.mutate(row.proposal_id as number)
+                          }
                           disabled={reject.isPending}
                         >
                           Refuse
@@ -125,38 +134,38 @@ export function Learned() {
       )}
 
       {inForce.length > 0 && (
-        <Panel title="In force" aside={`${inForce.length}`}>
+        <Panel title="In force" aside={<Count n={inForce.length} />}>
           <p className="learned-lede">
-            Appended to the brief of every node in scope — never replacing it. A machine-wide note
-            reaches every project; a project's note reaches only that project.
+            Appended to the brief of every node in scope — never replacing it. A
+            machine-wide note reaches every project; a project's note reaches
+            only that project.
           </p>
-          <ul className="learned-list">
-            {[...inForce]
-              .sort(byKindThenId)
-              .map((row) => (
-                <Row
-                  key={row.id}
-                  row={row}
-                  decisions={
-                    <ConfirmButton
-                      label="Revert"
-                      confirmLabel="It no longer applies"
-                      onConfirm={() => revert.mutate(row.id)}
-                      disabled={revert.isPending}
-                    />
-                  }
-                />
-              ))}
+          <ul className="ui-rows">
+            {[...inForce].sort(byKindThenId).map((row) => (
+              <Row
+                key={row.id}
+                row={row}
+                decisions={
+                  <ConfirmButton
+                    label="Revert"
+                    confirmLabel="It no longer applies"
+                    onConfirm={() => revert.mutate(row.id)}
+                    disabled={revert.isPending}
+                  />
+                }
+              />
+            ))}
           </ul>
         </Panel>
       )}
 
       {over.length > 0 && (
-        <Panel title="No longer in force" aside={`${over.length}`}>
+        <Panel title="No longer in force" aside={<Count n={over.length} />}>
           <p className="learned-lede">
-            Kept, not deleted. What was refused, what was taken back, and what a later text replaced.
+            Kept, not deleted. What was refused, what was taken back, and what a
+            later text replaced.
           </p>
-          <ul className="learned-list">
+          <ul className="ui-rows">
             {[...over]
               .sort((left, right) => right.id - left.id)
               .map((row) => (
@@ -187,10 +196,12 @@ function Row({ row, decisions }: { row: Refinement; decisions?: ReactNode }) {
   const [open, setOpen] = useState(false);
 
   return (
-    <li className="learned-row">
+    <li className="ui-rows-row learned-row">
       <div className="learned-head">
         <Badge tone={KIND_TONE[row.kind]}>{KIND_LABEL[row.kind]}</Badge>
-        <span className="learned-scope">{row.project_id ?? "this machine"}</span>
+        <span className="learned-scope">
+          {row.project_id ?? "this machine"}
+        </span>
         <span className="learned-when">
           <RelativeTime at={row.activated_at ?? row.created_at} />
         </span>
@@ -200,7 +211,11 @@ function Row({ row, decisions }: { row: Refinement; decisions?: ReactNode }) {
       <p className="learned-body">{row.body}</p>
 
       <div className="learned-foot">
-        <Button variant="ghost" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <Button
+          variant="quiet"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+        >
           {row.supersedes === null ? "History" : "What it replaced"}
         </Button>
         {decisions}
@@ -222,9 +237,14 @@ function Chain({ id }: { id: number }) {
   const history = useRefinementHistory(id);
 
   if (history.isError) {
-    return <ErrorNote>the núcleo did not answer — this one&apos;s history is not known</ErrorNote>;
+    return (
+      <ErrorNote>
+        the núcleo did not answer — this one&apos;s history is not known
+      </ErrorNote>
+    );
   }
-  if (history.data === undefined) return <p className="learned-chain-loading">reading…</p>;
+  if (history.data === undefined)
+    return <p className="learned-chain-loading">reading…</p>;
 
   const { events, replaced, replaced_by: replacedBy } = history.data;
 
@@ -237,7 +257,9 @@ function Chain({ id }: { id: number }) {
       )}
       {replaced.length > 0 && (
         <>
-          <p className="learned-chain-line">What it replaced, most recent first:</p>
+          <p className="learned-chain-line">
+            What it replaced, most recent first:
+          </p>
           <ul className="learned-chain-list">
             {replaced.map((older) => (
               <li key={older.id}>
@@ -249,7 +271,9 @@ function Chain({ id }: { id: number }) {
         </>
       )}
       {replaced.length === 0 && replacedBy === null && (
-        <p className="learned-chain-line">This one replaced nothing and nothing has replaced it.</p>
+        <p className="learned-chain-line">
+          This one replaced nothing and nothing has replaced it.
+        </p>
       )}
       {events.length > 0 && (
         <ul className="learned-events">
@@ -312,13 +336,17 @@ const DECISION_SENTENCES: Record<string, string> = {
   conflict:
     "this one was already decided, or is no longer in force — the list clears it on the next read",
   not_found: "that one is gone; there is nothing left to decide",
-  unprocessable: "the núcleo found nothing usable inside the proposal to act on",
-  internal: "the núcleo failed while carrying the decision out — nothing was changed",
+  unprocessable:
+    "the núcleo found nothing usable inside the proposal to act on",
+  internal:
+    "the núcleo failed while carrying the decision out — nothing was changed",
 };
 
 function DecisionRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — nothing was decided</ErrorNote>;
+    return (
+      <ErrorNote>the núcleo did not answer — nothing was decided</ErrorNote>
+    );
   }
   return <RefusalNote refusal={error} sentences={DECISION_SENTENCES} />;
 }
@@ -335,8 +363,10 @@ function headline(rows: Refinement[] | undefined): string | undefined {
   const waiting = rows.filter((row) => row.status === "proposed").length;
   const inForce = rows.filter((row) => row.status === "active").length;
 
-  if (rows.length === 0) return "the agent is running on its standing brief alone";
-  const held = inForce === 1 ? "one note is in force" : `${inForce} notes are in force`;
+  if (rows.length === 0)
+    return "the agent is running on its standing brief alone";
+  const held =
+    inForce === 1 ? "one note is in force" : `${inForce} notes are in force`;
   if (waiting === 0) return `${held}; nothing waiting on you`;
   return `${held}; ${waiting} waiting on you`;
 }

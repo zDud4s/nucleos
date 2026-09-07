@@ -89,6 +89,119 @@
   padding-right: 0;
 }
 
+/**
+ * A teach block is already inside the panel's padding; it must not add its own.
+ *
+ * `.ui-teach` carries `padding: var(--space-6) var(--space-5)` because it is
+ * usually the whole of an empty page, standing on nothing. Dropped into a panel
+ * body it inherits that body's `--space-5` too, and the result is a paragraph
+ * indented 40px from a heading 20px in — a double indent nobody chose, on every
+ * empty panel in the app.
+ */
+.ui-panel-body > .ui-teach {
+  padding-inline: 0;
+}
+
+/**
+ * A block inside a panel body that is one thing rather than part of the flow —
+ * a form, a readout, an editable copy of what is being decided.
+ *
+ * Raised rather than sunken: the panel is the page's surface, and this sits ON
+ * it. It is the one nesting the design allows, and it is allowed because the
+ * alternative — a bordered card inside a bordered panel inside a bordered page
+ * — is the three-frame pile that made every list read as a stack of boxes.
+ */
+.ui-panel-inset {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+}
+
+/* ------------------------------------------------------------------ rows -- */
+
+/**
+ * A list read by scanning down it: hairline rules, no cards.
+ *
+ * The mechanism is a `--border` ground showing through a `--hairline` gap, so
+ * the separators are drawn by the gaps themselves — one border around the whole
+ * list rather than one around every row. Fifty rows each carrying their own
+ * border is a pile; fifty rows sharing one is a table.
+ *
+ * Lifted out of `pages/feed.css`, where it was written for the feed and then
+ * wanted by six other pages. That is the whole test for whether something
+ * belongs here: the second page that needs it.
+ */
+.ui-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--hairline);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--border);
+  overflow: hidden;
+}
+
+.ui-rows-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+}
+
+/**
+ * Above a handful, the list is being *worked* rather than read.
+ *
+ * The padding comes in, and nothing else changes: the tenth row staying on the
+ * same screen as the first is what stops a queue being abandoned halfway.
+ */
+.ui-rows-row-dense {
+  padding: var(--space-2) var(--space-4);
+}
+
+/**
+ * Inside a panel, the list drops its own frame and its own margins.
+ *
+ * The panel is already the box. A second border 24px inside the first draws a
+ * frame around a frame — and with a `.ui-panel-inset` on a row, three of them
+ * around one thing. What a list contributes here is the *rules* between its
+ * rows, and those are the gaps over the `--border` ground, not the border.
+ *
+ * The inline padding goes with it so a row's first word sits under the panel's
+ * own heading rather than 16px to the right of it, which is the misalignment
+ * that makes a nested list read as a quotation.
+ */
+.ui-panel-body > .ui-rows {
+  border: none;
+  border-radius: 0;
+}
+
+.ui-panel-body > .ui-rows > .ui-rows-row {
+  padding-inline: 0;
+}
+
+/* ----------------------------------------------------------------- count -- */
+
+/**
+ * How many, in a heading's corner. Text, never a pill.
+ *
+ * Mono and tabular so a column of these is a column rather than a wobble, and
+ * `nowrap` because "12" broken over two lines is not a number. A pill here would
+ * put a count in the same shape as a state badge and a specialist's name, which
+ * is how a page ends up with three kinds of thing drawn identically.
+ */
+.ui-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
 /* ----------------------------------------------------------------- badge -- */
 
 .ui-badge {
@@ -179,9 +292,9 @@
   line-height: 1.4;
   cursor: pointer;
   transition:
-    background-color 120ms ease,
-    border-color 120ms ease,
-    color 120ms ease;
+    background-color var(--dur-quick) var(--ease),
+    border-color var(--dur-quick) var(--ease),
+    color var(--dur-quick) var(--ease);
 }
 
 .ui-button:hover:not(:disabled) {
@@ -634,7 +747,10 @@
   justify-content: space-between;
   gap: var(--space-5);
   padding-bottom: var(--space-3);
-  margin-bottom: var(--space-3);
+  /* More below the rule than above it. The rule belongs to the title, and a gap
+     equal on both sides makes it float between the heading and the page instead
+     of closing the one and opening the other. */
+  margin-bottom: var(--space-5);
   border-bottom: 1px solid var(--border);
 }
 

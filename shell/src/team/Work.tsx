@@ -10,7 +10,7 @@ import {
   type TeamRun,
   type TeamView,
 } from "../data/teams";
-import { Button, ErrorNote, Meter, Panel, RefusalNote, RelativeTime, StateBadge, usd } from "../ui";
+import { Button, ErrorNote, Meter, Panel, RefusalNote, RelativeTime, Section, StateBadge, usd } from "../ui";
 import { daemonProse } from "./prose";
 
 /**
@@ -50,19 +50,23 @@ export function Work({ team, runs }: WorkProps) {
       <Composer teamId={team.id} />
 
       {live.length > 0 && (
-        <Panel title="In flight">
-          {live.map((run) => (
-            <LiveTask key={run.id} run={run} ceiling={team.budget_usd} />
-          ))}
-        </Panel>
+        <Section label="In flight">
+          <ul className="ui-rows" aria-label="In flight">
+            {live.map((run) => (
+              <li className="ui-rows-row" key={run.id}>
+                <LiveTask run={run} ceiling={team.budget_usd} />
+              </li>
+            ))}
+          </ul>
+        </Section>
       )}
 
       <Panel title="Tasks">
         {runs.length === 0 && <p className="teams-empty">no task yet for this department.</p>}
         {done.length > 0 && (
-          <ul className="teams-runs" aria-label="Tasks">
+          <ul className="ui-rows" aria-label="Tasks">
             {done.map((run) => (
-              <li className="teams-run" key={run.id}>
+              <li className="ui-rows-row" key={run.id}>
                 <div className="teams-run-head">
                   <Link to={`/team-runs/${run.id}`}>{run.request}</Link>
                   <StateBadge domain="team_run" state={run.state} />

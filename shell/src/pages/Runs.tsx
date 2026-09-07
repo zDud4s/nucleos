@@ -25,8 +25,11 @@ import {
   ErrorNote,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
+  Section,
   RelativeTime,
+  money,
   StaleNote,
   StateBadge,
   Teach,
@@ -101,14 +104,21 @@ export function Runs() {
   const rows = runs.data;
 
   function applyFilters(patch: Partial<RunSearch>) {
-    void navigate({ to: "/runs", search: validateRunSearch({ ...filters, ...patch }) });
+    void navigate({
+      to: "/runs",
+      search: validateRunSearch({ ...filters, ...patch }),
+    });
   }
 
   return (
     <>
       <PageHeader title="Runs" headline={headline(rows, filters)} />
 
-      <RunFilterBar filters={filters} projects={projects.data} onChange={applyFilters} />
+      <RunFilterBar
+        filters={filters}
+        projects={projects.data}
+        onChange={applyFilters}
+      />
 
       {stale && <StaleNote dataUpdatedAt={runs.dataUpdatedAt} />}
       {runs.isError && rows === undefined && <ListError error={runs.error} />}
@@ -118,8 +128,13 @@ export function Runs() {
           <RunList rows={rows} filtered={isFiltered(filters)} />
         </div>
         <div className="runs-side">
-          <NewRunForm projects={projects.data} onStarted={(id) => void navigate({ to: `/runs/${id}` })} />
-          <PresetsRail onStarted={(id) => void navigate({ to: `/runs/${id}` })} />
+          <NewRunForm
+            projects={projects.data}
+            onStarted={(id) => void navigate({ to: `/runs/${id}` })}
+          />
+          <PresetsRail
+            onStarted={(id) => void navigate({ to: `/runs/${id}` })}
+          />
         </div>
       </div>
     </>
@@ -207,13 +222,25 @@ function RunFilterBar({
 
       <label className="runs-filter runs-filter-text">
         <span>Text</span>
-        <input name="q" defaultValue={filters.q ?? ""} key={filters.q ?? ""} aria-label="Search prompts" />
+        <input
+          name="q"
+          defaultValue={filters.q ?? ""}
+          key={filters.q ?? ""}
+          aria-label="Search prompts"
+        />
       </label>
 
       <Button type="submit">Search</Button>
       {isFiltered(filters) && (
         <Button
-          onClick={() => onChange({ project: undefined, status: undefined, mode: undefined, q: undefined })}
+          onClick={() =>
+            onChange({
+              project: undefined,
+              status: undefined,
+              mode: undefined,
+              q: undefined,
+            })
+          }
         >
           Clear filters
         </Button>
@@ -223,27 +250,38 @@ function RunFilterBar({
 }
 
 function isFiltered(filters: RunFilters): boolean {
-  return Object.values(filters).some((value) => value !== undefined && value !== "");
+  return Object.values(filters).some(
+    (value) => value !== undefined && value !== "",
+  );
 }
 
 /* ----------------------------------------------------------------- list -- */
 
-function RunList({ rows, filtered }: { rows: RunSearchResult[] | undefined; filtered: boolean }) {
-  if (rows === undefined) return <p className="runs-loading">reading the index…</p>;
+function RunList({
+  rows,
+  filtered,
+}: {
+  rows: RunSearchResult[] | undefined;
+  filtered: boolean;
+}) {
+  if (rows === undefined)
+    return <p className="runs-loading">reading the index…</p>;
 
   if (rows.length === 0) {
     return (
       <Teach title={filtered ? "Nothing matches those filters" : "No runs yet"}>
         {filtered ? (
           <p>
-            The núcleo has runs, but none of them match. Clear the filters above to see the whole
-            index — an empty filtered list is not an empty machine.
+            The núcleo has runs, but none of them match. Clear the filters above
+            to see the whole index — an empty filtered list is not an empty
+            machine.
           </p>
         ) : (
           <p>
-            A run is one call to the CLI. Start one with the form beside this list, or save a request
-            as a preset and start it from there. Jobs and the autopilot create runs too, and they
-            appear here alongside the ones you ask for.
+            A run is one call to the CLI. Start one with the form beside this
+            list, or save a request as a preset and start it from there. Jobs
+            and the autopilot create runs too, and they appear here alongside
+            the ones you ask for.
           </p>
         )}
       </Teach>
@@ -252,31 +290,33 @@ function RunList({ rows, filtered }: { rows: RunSearchResult[] | undefined; filt
 
   return (
     <>
-      <ul className="runs-list" aria-label="Runs">
+      <ul className="ui-rows" aria-label="Runs">
         {rows.map((row) => (
-          <li key={row.id} className="runs-row">
-            <div className="runs-row-head">
-              <Link to={`/runs/${row.id}`} className="runs-row-link">
-                run {row.id}
-              </Link>
-              <StateBadge domain="run" state={row.status} />
-              <span className="runs-row-mode">{row.mode}</span>
-              <span className="runs-row-project">{row.project_id ?? "no project"}</span>
-              <RelativeTime at={row.created_at} />
-              {/* Absent is not zero: a run the ledger never priced has no cost
+          <li key={row.id} className="ui-rows-row runs-row">
+            <Link to={`/runs/${row.id}`} className="runs-row-link">
+              run {row.id}
+            </Link>
+            <StateBadge domain="run" state={row.status} />
+            <span className="runs-row-mode">{row.mode}</span>
+            <span className="runs-row-project">
+              {row.project_id ?? "no project"}
+            </span>
+            <RelativeTime at={row.created_at} />
+            {/* Absent is not zero: a run the ledger never priced has no cost
                   recorded, which is a different fact from one that was free. */}
-              <span className="runs-row-cost">
-                {row.cost_usd === null ? "cost not recorded" : `$ ${row.cost_usd.toFixed(4)}`}
-              </span>
-            </div>
+            <span className="runs-row-cost">
+              {row.cost_usd === null
+                ? "cost not recorded"
+                : money(row.cost_usd)}
+            </span>
             <p className="runs-row-excerpt">{row.prompt_excerpt}</p>
           </li>
         ))}
       </ul>
       {rows.length >= RUN_LIST_LIMIT && (
         <p className="runs-ceiling">
-          showing the newest {RUN_LIST_LIMIT} — there may be more behind these; narrow the filters to
-          reach them
+          showing the newest {RUN_LIST_LIMIT} — there may be more behind these;
+          narrow the filters to reach them
         </p>
       )}
     </>
@@ -419,14 +459,17 @@ function NewRunForm({
           </Button>
         </div>
 
-        {create.isError && <StartRefusal error={create.error} what="the run was not started" />}
+        {create.isError && (
+          <StartRefusal error={create.error} what="the run was not started" />
+        )}
       </form>
 
       <form
         className="runs-save"
         onSubmit={(event) => {
           event.preventDefault();
-          if (draft.name.trim() === "" || body.prompt === "" || save.isPending) return;
+          if (draft.name.trim() === "" || body.prompt === "" || save.isPending)
+            return;
           save.mutate(
             { name: draft.name.trim(), ...body },
             { onSuccess: () => patch({ name: "" }) },
@@ -459,32 +502,41 @@ function PresetsRail({ onStarted }: { onStarted: (id: number) => void }) {
   const remove = useDeletePreset();
   const saved = presets.data;
 
+  if (saved !== undefined && saved.length === 0) {
+    return <Section label="Presets"><Quiet says="no saved requests"><p>A preset is a run request with a name — fill the form in and use <em>Save as preset</em> to keep one.</p></Quiet></Section>;
+  }
+
   return (
     <Panel title="Presets">
-      {saved === undefined && <p className="runs-loading">reading the saved requests…</p>}
-      {saved !== undefined && saved.length === 0 && (
-        <Teach title="No saved requests">
-          <p>
-            A preset is a run request with a name — the same prompt, project, directory and mode you
-            would type above. Fill the form in and use <em>Save as preset</em> to keep one.
-          </p>
-        </Teach>
+      {saved === undefined && (
+        <p className="runs-loading">reading the saved requests…</p>
       )}
       {saved !== undefined && saved.length > 0 && (
-        <ul className="runs-presets" aria-label="Presets">
+        <ul className="ui-rows" aria-label="Presets">
           {saved.map((preset) => (
             <PresetRow
               key={preset.id}
               preset={preset}
               busy={run.isPending}
-              onRun={() => run.mutate(preset.id, { onSuccess: (answer) => onStarted(answer.id) })}
+              onRun={() =>
+                run.mutate(preset.id, {
+                  onSuccess: (answer) => onStarted(answer.id),
+                })
+              }
               onDelete={() => remove.mutate(preset.id)}
             />
           ))}
         </ul>
       )}
-      {run.isError && <StartRefusal error={run.error} what="the preset was not started" />}
-      {remove.isError && <MutationNote error={remove.error} what="that preset could not be deleted" />}
+      {run.isError && (
+        <StartRefusal error={run.error} what="the preset was not started" />
+      )}
+      {remove.isError && (
+        <MutationNote
+          error={remove.error}
+          what="that preset could not be deleted"
+        />
+      )}
     </Panel>
   );
 }
@@ -501,11 +553,13 @@ function PresetRow({
   onDelete: () => void;
 }) {
   return (
-    <li className="runs-preset">
+    <li className="ui-rows-row runs-preset">
       <div className="runs-preset-head">
         <span className="runs-preset-name">{preset.name}</span>
         <span className="runs-preset-mode">{preset.mode}</span>
-        <span className="runs-preset-project">{preset.project_id ?? "no project"}</span>
+        <span className="runs-preset-project">
+          {preset.project_id ?? "no project"}
+        </span>
       </div>
       <p className="runs-preset-prompt">{preset.prompt}</p>
       <div className="runs-preset-actions">
@@ -544,8 +598,10 @@ const START_SENTENCES: Record<string, string> = {
     "the kill switch is engaged — nothing autonomous starts until it is released; a worktree run meets the same answer when its project is already full, and the núcleo sends no body that tells the two apart",
   unavailable:
     "the kill switch could not be read, so the núcleo refused rather than start something the switch may have forbidden",
-  bad_request: "the núcleo would not accept that request — check the mode against the directory",
-  internal: "the núcleo failed to prepare the run — a worktree or the database, not your request",
+  bad_request:
+    "the núcleo would not accept that request — check the mode against the directory",
+  internal:
+    "the núcleo failed to prepare the run — a worktree or the database, not your request",
 };
 
 function StartRefusal({ error, what }: { error: unknown; what: string }) {
@@ -558,37 +614,58 @@ function StartRefusal({ error, what }: { error: unknown; what: string }) {
 /** `POST /presets` has exactly one refusal worth a sentence of its own. */
 function PresetRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — the preset was not saved</ErrorNote>;
+    return (
+      <ErrorNote>
+        the núcleo did not answer — the preset was not saved
+      </ErrorNote>
+    );
   }
   return (
     <RefusalNote
       refusal={error}
-      sentences={{ conflict: "that name is taken — presets are named uniquely, so choose another" }}
+      sentences={{
+        conflict:
+          "that name is taken — presets are named uniquely, so choose another",
+      }}
     />
   );
 }
 
 function ListError({ error }: { error: unknown }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the index</ErrorNote>;
+  if (isApiRefusal(error))
+    return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
+  return (
+    <ErrorNote>
+      the núcleo did not answer — nothing is known about the index
+    </ErrorNote>
+  );
 }
 
 function MutationNote({ error, what }: { error: unknown; what: string }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
+  if (isApiRefusal(error))
+    return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
 }
 
 function daemonProse(refusal: ApiRefusal): Record<string, string> {
   const prose = refusal.detail.trim();
-  return prose === "" || prose === refusal.code ? {} : { [refusal.code]: prose };
+  return prose === "" || prose === refusal.code
+    ? {}
+    : { [refusal.code]: prose };
 }
 
 /** One derived sentence about what this list is showing. */
-function headline(rows: RunSearchResult[] | undefined, filters: RunFilters): string | undefined {
+function headline(
+  rows: RunSearchResult[] | undefined,
+  filters: RunFilters,
+): string | undefined {
   if (rows === undefined) return undefined;
-  const live = rows.filter((row) => row.status === "running" || row.status === "pending").length;
+  const live = rows.filter(
+    (row) => row.status === "running" || row.status === "pending",
+  ).length;
   const scope = isFiltered(filters) ? "matching these filters" : "in the index";
   if (rows.length === 0) return `nothing ${scope}`;
-  const moving = live === 0 ? "none of them still moving" : `${live} still moving`;
+  const moving =
+    live === 0 ? "none of them still moving" : `${live} still moving`;
   return `${rows.length} ${scope}; ${moving}`;
 }

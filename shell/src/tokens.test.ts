@@ -129,3 +129,66 @@ describe("the fixed scales in tailwind.css", () => {
     expect([...theme.keys()].filter((k) => !covered.has(k))).toEqual([]);
   });
 });
+
+/**
+ * The names that are facts about the layout rather than about the light.
+ *
+ * The header of `tokens.css` says only colour and shadow are redefined under
+ * `prefers-color-scheme: light`, and until this case that sentence was a promise
+ * nothing kept. It matters most for these four families: a duration or a
+ * `z-index` that differed between the themes would be a bug nobody could see
+ * without switching the room's lights on, and a measure that differed would
+ * reflow every paragraph in the app at the same moment.
+ *
+ * Deliberately NOT in the `PAIRS` table above. That table guards the scales
+ * Tailwind copies, and nothing in Tailwind needs any of these — adding them to
+ * the `@theme` block would create a second copy to keep honest for no caller.
+ */
+const BASE_ONLY: readonly string[] = [
+  "--ease",
+  "--dur-quick",
+  "--dur-settle",
+  "--dur-slide",
+
+  "--z-sticky",
+  "--z-cover",
+  "--z-overlay",
+  "--z-top",
+
+  "--opacity-disabled",
+  "--opacity-quiet",
+
+  "--measure",
+  "--measure-prose",
+  "--width-column",
+  "--hairline",
+];
+
+/**
+ * How many times a chunk of CSS declares one name.
+ *
+ * Counted rather than looked up, because the assertion is "exactly once": the
+ * `declarations` map above is last-wins, like CSS itself, so a name declared
+ * twice with different values reads there as a name declared once.
+ *
+ * `--measure` and `--measure-prose` are two names and not a prefix of each
+ * other, because what follows the stem in a declaration is `:` and not `-`. The
+ * left guard is for the other direction — a stem that is the *tail* of a longer
+ * name, which is the pair this list will grow before it grows the first.
+ */
+function declaredTimes(css: string, name: string): number {
+  return [...css.matchAll(new RegExp(`(^|[^\\w-])${name}\\s*:`, "g"))].length;
+}
+
+describe("the tokens that do not belong to a theme", () => {
+  const css = read("tokens.css");
+  const base = css.slice(css.indexOf(":root {"), css.indexOf("@media"));
+  const light = css.slice(css.indexOf("@media"));
+
+  it("declares the motion, stacking, opacity and measure tokens once, in :root only", () => {
+    for (const name of BASE_ONLY) {
+      expect(declaredTimes(base, name), `${name} in the base :root`).toBe(1);
+      expect(declaredTimes(light, name), `${name} under the light media query`).toBe(0);
+    }
+  });
+});

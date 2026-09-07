@@ -43,6 +43,22 @@ describe("KillSwitchControl", () => {
     expect(screen.getByRole("button", { name: /release kill switch/i })).toBeDefined();
   });
 
+  it("the resting control is the quiet one and the engaged control is the loud one", async () => {
+    daemon.apiFetch.mockImplementation(daemonFetch(daemonState({ kill: { engaged: false } })));
+
+    const { unmount } = renderWithQuery(<KillSwitchControl />);
+    expect((await screen.findByRole("button", { name: "Kill switch" })).classList).toContain(
+      "ui-button-danger",
+    );
+    unmount();
+
+    daemon.apiFetch.mockImplementation(daemonFetch(daemonState({ kill: { engaged: true } })));
+    renderWithQuery(<KillSwitchControl />);
+    expect((await screen.findByRole("button", { name: /release kill switch/i })).classList).toContain(
+      "ui-button-danger-solid",
+    );
+  });
+
   it("engages on a single click, because panic is fast", async () => {
     daemon.apiFetch.mockImplementation(daemonFetch(daemonState({ kill: { engaged: false } })));
 

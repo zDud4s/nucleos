@@ -321,11 +321,76 @@ describe("Waiting - each section reads the route that serves it", () => {
 
     await renderWaiting();
 
+    // The absence wears the page's own empty shape, so the paragraph is one
+    // click away like every other one — the section itself is on screen from the
+    // first paint, because it answers no route and waits for nothing.
+    const section = await screen.findByRole("region", { name: "Calendar events" });
+    fireEvent.click(within(section).getByRole("button", { name: "why?" }));
+
     const said = await screen.findByText(/mounts no route that lists the pending ones/);
     expect(said.textContent).toMatch(/what is missing is the door, not the record/);
     // Nothing was asked for on its behalf.
     const asked = daemon.apiFetch.mock.calls.map(([path]) => String(path));
     expect(asked.some((path) => path.includes("calendar"))).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------- the empty morning -- */
+
+describe("Waiting - a section with nothing in it", () => {
+  /**
+   * The shape of an empty queue, which is this page's *normal* state.
+   *
+   * Eleven panels each explaining an absence made the page longest on the
+   * morning nothing was wrong — 1900px of scrolling to learn that there was
+   * nothing to decide. An empty section is now one line under its own heading,
+   * and the paragraph that used to sit above the list is behind "why?": kept,
+   * because "nothing has asked for the wheel" alone reads as a list that failed
+   * to load, and costing nothing to whoever does not ask.
+   */
+  it("an empty section is one line under its heading, not a panel", async () => {
+    daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld()));
+
+    await renderWaiting();
+
+    // Waited for by the sentence and not by the landmark, deliberately: a section
+    // still *reading* is also one quiet line inside a region, so asserting the
+    // shape first would pass on a page that had not answered yet.
+    const line = await screen.findByText("nothing has asked for the wheel");
+    const section = screen.getByRole("region", { name: "Wheel requests" });
+    expect(line.closest("section")).toBe(section);
+    expect(section.className).toContain("ui-section");
+
+    // One quiet line, and no panel anywhere around it.
+    expect(section.querySelectorAll(".ui-quiet")).toHaveLength(1);
+    expect(section.querySelector(".ui-panel")).toBeNull();
+    expect(section.closest(".ui-panel")).toBeNull();
+
+    // The heading is still an `h2` carrying the section's own name, so the
+    // page's outline does not depend on whether a queue happens to be busy.
+    expect(within(section).getByRole("heading", { level: 2 }).textContent).toBe("Wheel requests");
+
+    // The reasoning is kept rather than cut — one click away, no pixels until then.
+    expect(within(section).queryByText(/asking for the window/)).toBeNull();
+    fireEvent.click(within(section).getByRole("button", { name: "why?" }));
+    expect(within(section).getByText(/asking for the window/)).toBeDefined();
+  });
+
+  /**
+   * The control on the case above. A section is a panel again the moment it has
+   * something in it, which is what makes the one line a statement about the data
+   * rather than about the page.
+   */
+  it("is a panel again as soon as one row arrives", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(waitingWorld({ approvals: [proposal({ id: 11 })] })),
+    );
+
+    await renderWaiting();
+
+    const list = await screen.findByRole("list", { name: "Action approvals" });
+    expect(list.closest(".ui-panel")).not.toBeNull();
+    expect(screen.queryByRole("region", { name: "Action approvals" })).toBeNull();
   });
 });
 

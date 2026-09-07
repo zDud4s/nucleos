@@ -2455,6 +2455,12 @@ describe("Chats - giving a conversation a project", () => {
     );
     await renderChats("/chats/c-1");
 
+    // Behind the `⋯` now. It is a fact about the conversation that never changes and is
+    // wanted about twice in its life, and it was a line of mono text above every reading
+    // of every chat that has a folder.
+    expect(screen.queryByText(/claude --resume sess-42/)).toBeNull();
+    await openConversationSettings();
+
     const carry = await screen.findByText(/claude --resume sess-42/);
     expect(carry.textContent).toContain("C:/Projects/nucleos");
   });
@@ -2716,7 +2722,55 @@ describe("Chats - the route and the sidebar badge", () => {
       await screen.findByRole("link", { name: /^hello there, cloud, .+, 2 unread$/ }),
     );
     await waitFor(() => expect(router.state.location.pathname).toBe("/chats/c-1"));
-    expect(await screen.findByRole("heading", { level: 1, name: "Chats" })).toBeDefined();
+    // And once a conversation is open, the heading is the conversation — see "the open
+    // conversation is the page's heading" below. These fixtures carry no title, and an
+    // unnamed conversation says so rather than borrowing the page's old one.
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "New conversation" }),
+    ).toBeDefined();
+  });
+});
+
+/* ---------------------------------------------------- the page's own subject -- */
+
+describe("Chats - what the page is about", () => {
+  /**
+   * The heading rank belongs to the page's SUBJECT.
+   *
+   * Every conversation in this app answered to the heading "Chats", which is the one
+   * thing the person who has just clicked a conversation already knows. What tells this
+   * conversation from the twenty above it is its name, and that was a `--text-lg` line
+   * two ranks down, under a heading that never changed.
+   *
+   * The name stays a control, which is the reason this header is composed out of the
+   * shared `ui-page-*` classes rather than through `PageHeader`: that component takes a
+   * `string`, and clicking the title to rename it is the affordance this page was built
+   * with.
+   */
+  it("the open conversation is the page's heading", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", title: "arranja o parser de datas" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const heading = await screen.findByRole("heading", {
+      level: 1,
+      name: "arranja o parser de datas",
+    });
+    expect(heading.className).toContain("chats-head-title");
+    // The band is the shared one, so this page's top is the same object as every other
+    // page's — the composition is local, the rules are not.
+    expect(heading.closest(".ui-page-header")).not.toBeNull();
+    // And the words the heading used to spend itself on are the crumb back to the list.
+    const crumb = document.querySelector(".chats-crumb");
+    expect(within(crumb as HTMLElement).getByRole("link", { name: "Chats" })).toBeDefined();
+
+    // Still a rename control, and the rename's own label has not become the heading's.
+    expect(
+      within(heading).getByRole("button", { name: /^Rename this conversation/ }),
+    ).toBeDefined();
   });
 });
 

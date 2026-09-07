@@ -115,7 +115,7 @@ function IdentityQuestions({ view }: { view: ReturnType<typeof useContactMerges>
         </Teach>
       )}
       {rows.length > 0 && (
-        <ul className="contacts-questions" aria-label="Identity questions">
+        <ul className="ui-rows contacts-questions" aria-label="Identity questions">
           {rows.map((suggestion) => (
             <IdentityQuestion key={suggestion.proposal_id} suggestion={suggestion} decide={decide} />
           ))}
@@ -139,7 +139,7 @@ function IdentityQuestion({
   decide: ReturnType<typeof useDecideContactMerge>;
 }) {
   return (
-    <li className="contacts-question">
+    <li className="ui-rows-row contacts-question">
       <div className="contacts-question-head">
         <span className="contacts-question-id">question #{suggestion.proposal_id}</span>
         <RelativeTime at={suggestion.created_at} />

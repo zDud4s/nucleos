@@ -110,7 +110,7 @@ export function Fleet() {
         />
         <StatCard
           label="Window spend"
-          value={budget.data === undefined ? undefined : `$ ${budget.data.window_spend_usd.toFixed(2)}`}
+          value={budget.data === undefined ? undefined : `$${budget.data.window_spend_usd.toFixed(2)}`}
           detail={ceiling(budget.data)}
         />
         <StatCard
@@ -376,7 +376,7 @@ function MutationNote({ error, what }: { error: unknown; what: string }) {
 function ceiling(spend: BudgetView | undefined): string | undefined {
   if (spend === undefined) return undefined;
   if (spend.limit_usd === null) return `no ceiling · ${spend.period}`;
-  return `of $ ${spend.limit_usd.toFixed(2)} · ${spend.period}`;
+  return `of $${spend.limit_usd.toFixed(2)} · ${spend.period}`;
 }
 
 /** One derived sentence about how full the house is. */

@@ -2,7 +2,7 @@ import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import { useConcurrency } from "../data/fleet";
 import { useProjects } from "../data/system";
 import { useProjectWorkflows } from "../data/workflows";
-import { StateBadge } from "../ui";
+import { Count, PageHeader, StateBadge } from "../ui";
 import { ModeState } from "./ModeState";
 import { ModeMap } from "./ModeMap";
 import { ModeCode } from "./ModeCode";
@@ -177,28 +177,41 @@ export function Workspace() {
   const holding = useHolding(projectId);
 
   return (
-    <div className="flex flex-col gap-6">
-      <header className="flex items-baseline gap-3">
-        <h1 className="font-display text-2xl font-semibold tracking-[-0.02em] text-text">
-          {projectId}
-        </h1>
-        {/*
+    <>
+      <PageHeader
+        title={projectId}
+        /*
           The mode through the one non-collapsing map, never a literal: off,
           shadow and active are three different promises about what happens here
           without being asked, and picking a tone locally is how that distinction
-          starts to drift page by page.
-        */}
-        <StateBadge domain="autopilot" state={project?.mode} />
-        {project?.project_root === null ? (
-          <span className="text-sm text-text-faint">no folder named</span>
-        ) : (
-          <span className="truncate font-mono text-xs text-text-faint">
-            {project?.project_root}
+          starts to drift page by page. The folder is the other half of the
+          sentence — what this project IS on this disk — and both belong on the
+          header's one derived line rather than beside the name as a second title.
+        */
+        headline={
+          <span className="inline-flex min-w-0 max-w-full items-baseline gap-2">
+            <StateBadge domain="autopilot" state={project?.mode} />
+            {project?.project_root === null ? (
+              <span>no folder named</span>
+            ) : (
+              <span className="truncate font-mono text-xs">{project?.project_root}</span>
+            )}
           </span>
-        )}
-      </header>
+        }
+      />
 
-      <nav aria-label="Project modes" className="flex gap-1 border-b border-border">
+      {/*
+        The five modes, dressed as the vendored `Tabs` and still links.
+
+        `ui-tab-list` and `ui-tab` are the shared classes Radix's Tabs wears, so this
+        strip is the same object on screen as the tabs in the Bench. What it is NOT is
+        Radix's `Tabs`, and that is deliberate: each mode is a URL, so a tab here has to
+        be an `<a href>` that can be copied, opened in a second window, and — the case
+        `Workspace.test.tsx` pins — carry an old Portuguese segment's replacement in its
+        `href` so the address canonicalises itself on the first press. A `role="tab"`
+        button has none of that. `pj-tabs` on the inspector is the same decision.
+      */}
+      <nav aria-label="Project modes" className="ui-tab-list mb-6">
         {MODES.map((candidate) => {
           const holds = holding[candidate];
           const quiet = holds !== undefined && holds.count === 0;
@@ -207,23 +220,18 @@ export function Workspace() {
               key={candidate}
               to={`/projects/${projectId}/${candidate}`}
               aria-current={candidate === mode ? "page" : undefined}
+              /* What the vendored trigger says about itself, said the same way, so one
+                 rule in `ui.css` draws the selected tab wherever it is. */
+              data-state={candidate === mode ? "active" : "inactive"}
               title={holds?.means}
-              className={
-                candidate === mode
-                  ? "-mb-px flex items-baseline gap-2 border-b-2 border-accent px-3 py-2 text-sm font-medium text-text"
-                  : quiet
-                    ? "-mb-px flex items-baseline gap-2 border-b-2 border-transparent px-3 py-2 text-sm text-text-faint hover:text-text"
-                    : "-mb-px flex items-baseline gap-2 border-b-2 border-transparent px-3 py-2 text-sm text-text-muted hover:text-text"
-              }
+              className={quiet ? "ui-tab opacity-[var(--opacity-quiet)]" : "ui-tab"}
             >
               {MODE_LABEL[candidate]}
               {/*
                 Said where the decision to press is taken rather than after the press. Absent until
                 the answer is in, so the strip never puts a nought on a tab it has not asked about.
               */}
-              {holds === undefined ? null : (
-                <span className="font-mono text-xs text-text-faint">{holds.count}</span>
-              )}
+              <Count n={holds?.count} />
             </Link>
           );
         })}
@@ -249,6 +257,6 @@ export function Workspace() {
       ) : null}
       {mode === "workflows" ? <ModeWorkflows projectId={projectId} /> : null}
       {mode === "github" ? <ModeGithub projectId={projectId} /> : null}
-    </div>
+    </>
   );
 }

@@ -45,9 +45,9 @@
 
 .calendar-subhead {
   margin: var(--space-4) 0 var(--space-2);
-  font-family: var(--font-mono);
+  font-family: var(--font-display);
   font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
+  letter-spacing: var(--tracking-wider);
   text-transform: uppercase;
   color: var(--text-faint);
 }
@@ -140,9 +140,9 @@
 }
 
 .calendar-weekday {
-  font-family: var(--font-mono);
+  font-family: var(--font-display);
   font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
+  letter-spacing: var(--tracking-wider);
   text-transform: uppercase;
   color: var(--text-faint);
 }
@@ -657,26 +657,18 @@
 /* ========================================================== occurrences == */
 
 .calendar-occurrence-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
   margin: 0;
-  padding: 0;
-  list-style: none;
 }
 
 .calendar-occurrence-actions {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: 5rem minmax(0, 1fr) auto auto auto;
+  align-items: center;
   gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
 }
 
 .calendar-occurrence-title {
-  display: flex;
+  display: contents;
   flex-wrap: wrap;
   align-items: baseline;
   gap: var(--space-2);
@@ -687,6 +679,7 @@
 }
 
 .calendar-occurrence-clock {
+  grid-column: 1;
   font-family: var(--font-mono);
   font-weight: var(--weight-regular);
   color: var(--text-muted);
@@ -703,16 +696,21 @@
 }
 
 .calendar-occurrence-controls {
+  display: contents;
+}
+
+.calendar-occurrence-name {
+  grid-column: 2;
   display: flex;
   flex-wrap: wrap;
-  align-items: flex-end;
+  align-items: baseline;
   gap: var(--space-2);
 }
 
 .calendar-move-field {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
+  align-items: baseline;
+  gap: var(--space-2);
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
@@ -729,6 +727,28 @@
   font-size: var(--text-sm);
 }
 
+.calendar-move {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.calendar-occurrence-more {
+  position: relative;
+}
+
+.calendar-occurrence-more summary {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.calendar-occurrence-more > .ui-button {
+  position: absolute;
+  top: calc(100% + var(--space-1));
+  right: 0;
+  z-index: var(--z-overlay);
+}
+
 /* ============================================================ draft form == */
 
 .calendar-draft {
@@ -741,7 +761,7 @@
 
 .calendar-draft-lead {
   margin: 0;
-  font-family: var(--font-mono);
+  font-family: var(--font-display);
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
@@ -789,22 +809,14 @@
 /* ==================================================== held notifications == */
 
 .calendar-notifications {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
   margin: 0;
-  padding: 0;
-  list-style: none;
 }
 
 .calendar-notification {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--space-2);
 }
 
 .calendar-notification-kind {

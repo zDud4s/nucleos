@@ -150,6 +150,19 @@ async function panelFor(headingText: string): Promise<HTMLElement> {
   return panel as HTMLElement;
 }
 
+/* --------------------------------------------------------- empty catalogue -- */
+
+describe("Council - the empty catalogue", () => {
+  it("an empty catalogue is the teach block alone", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}));
+
+    await renderCouncil("/council");
+
+    expect(await screen.findByRole("heading", { level: 3, name: "Choose a council" })).toBeDefined();
+    expect(screen.queryByRole("region", { name: "Councils" })).toBeNull();
+  });
+});
+
 /* --------------------------------------------------------- A10: abstained -- */
 
 describe("Council - a seat that abstained", () => {

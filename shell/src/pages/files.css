@@ -49,7 +49,7 @@
 .fi-drop-overlay {
   position: absolute;
   inset: 0;
-  z-index: 5;
+  z-index: var(--z-cover);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -427,7 +427,7 @@
 
 .fi-context-menu {
   position: fixed;
-  z-index: 20;
+  z-index: var(--z-overlay);
   display: flex;
   flex-direction: column;
   min-width: 9rem;

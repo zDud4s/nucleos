@@ -172,7 +172,7 @@ function Inspector({
           {node.role === "gate" ? "gate" : node.type}
         </span>
         {node.overridden ? (
-          <span className="rounded-pill border border-border px-1.5 text-[10px] text-text-muted">
+          <span className="rounded-pill border border-border px-1.5 text-xs text-text-muted">
             project
           </span>
         ) : null}
@@ -187,10 +187,10 @@ function Inspector({
       <dl className="flex flex-col gap-1.5">
         {node.fields.map((field) => (
           <div key={field.name} className="flex flex-col">
-            <dt className="text-[10px] uppercase tracking-wide text-text-faint">{field.name}</dt>
+            <dt className="text-xs uppercase tracking-wide text-text-faint">{field.name}</dt>
             <dd className="font-mono text-xs break-words text-text">{field.value}</dd>
             {field.origin === undefined ? null : (
-              <dd className="font-mono text-[10px] text-text-faint">
+              <dd className="font-mono text-xs text-text-faint">
                 {field.origin === "" ? "the bundle sets nothing here" : `the bundle says ${field.origin}`}
               </dd>
             )}
@@ -417,7 +417,7 @@ export function WorkflowChain({
         <li
           key={node.id}
           title={`${node.label} — ${nodeMeaning(node.type, node.role)}`}
-          className={`flex items-center gap-1 rounded-pill border px-2 py-0.5 text-[10px] ${
+          className={`flex items-center gap-1 rounded-pill border px-2 py-0.5 text-xs ${
             node.disabled ? "border-dotted opacity-50" : ""
           }`}
           style={{ borderColor: `var(--tone-${nodeTone(node.type, node.role)}-border)` }}

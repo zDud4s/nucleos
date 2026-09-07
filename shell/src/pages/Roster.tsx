@@ -6,10 +6,12 @@ import { folderOf, gateOf, headline, inAttentionOrder, type Folder, type Gate } 
 import { useProjects, type ProjectSummary } from "../data/system";
 import { Badge, type BadgeTone } from "../ui/Badge";
 import { Button } from "../ui/Button";
+import { Count } from "../ui/Count";
 import { ErrorNote } from "../ui/ErrorNote";
 import { PageHeader } from "../ui/PageHeader";
 import { RefusalNote } from "../ui/RefusalNote";
 import { StaleNote } from "../ui/StaleNote";
+import { StatCard } from "../ui/StatCard";
 import { RemoveProject } from "./RemoveProject";
 
 /**
@@ -61,17 +63,19 @@ export function Roster() {
       <PageHeader
         title="Projects"
         headline={projects.data === undefined ? undefined : headline(rows)}
+        /*
+          The door to adding one, in the header's own slot. It was a line of its own under
+          the header — a paragraph containing one link, costing a row of the page — and the
+          header has had a place for exactly this on every other screen in the app.
+        */
+        actions={
+          <Link className="text-sm" to="/projects/new">
+            Add a project…
+          </Link>
+        }
       />
 
-      {/*
-        The door to adding one, kept where it was: the rail is the design's fixed list of places,
-        and this is an action taken from the list of what exists.
-      */}
-      <p className="mb-4">
-        <Link className="text-sm underline underline-offset-2" to="/projects/new">
-          Add a project…
-        </Link>
-      </p>
+      {projects.data !== undefined && rows.length > 0 && <Readings rows={rows} />}
 
       {stale && <StaleNote dataUpdatedAt={projects.dataUpdatedAt} />}
       {projects.isError && projects.data === undefined && <RosterError error={projects.error} />}
@@ -95,6 +99,43 @@ function RosterError({ error }: { error: unknown }) {
   return <ErrorNote>the núcleo did not answer — nothing is known about the roster</ErrorNote>;
 }
 
+/* ------------------------------------------------------------- the strip -- */
+
+/**
+ * How the roster is doing, as four figures rather than as a sentence.
+ *
+ * The same arithmetic the headline above does — `data/roster.ts` owns it and both read
+ * the same rows, so the line and the strip cannot disagree. What the strip adds is
+ * *rank*: "3 failing the gate" inside a clause somebody has to read to the end is a
+ * number you find, and a number you find is a number you check less often than one you
+ * see. The line stays because it carries the two folder counts, which are the readings
+ * that need a noun to mean anything.
+ */
+function Readings({ rows }: { rows: ProjectSummary[] }) {
+  const acting = rows.filter((row) => row.mode === "active").length;
+  const failing = rows.filter((row) => gateOf(row) === "failed").length;
+  const waiting = rows.reduce((total, row) => total + row.open_proposals, 0);
+
+  return (
+      <div className="mb-6 grid gap-3 [grid-template-columns:repeat(auto-fit,minmax(11rem,1fr))]">
+      <StatCard label="Projects" value={rows.length} detail="on the roster" />
+      <StatCard
+        label="Acting on their own"
+        value={acting}
+        detail={acting === rows.length ? "all of them" : `${rows.length - acting} in shadow or off`}
+      />
+      {/* Zero is a real answer here and is drawn as one. An em dash would say the gate
+          was never read, which is what `none` means and is a different piece of news. */}
+      <StatCard label="Failing the gate" value={failing} detail="the last run said no" />
+      <StatCard
+        label="Waiting on you"
+        value={waiting}
+        detail={waiting === 0 ? "nothing has stopped to ask" : "open proposals across the roster"}
+      />
+    </div>
+  );
+}
+
 /* --------------------------------------------------------------- the table -- */
 
 /** How many columns a row spans, for the panel that opens underneath one. */
@@ -108,8 +149,13 @@ function Table({ rows }: { rows: ProjectSummary[] }) {
   */
   const [leaving, setLeaving] = useState<string | null>(null);
 
+  /*
+    A surface in the page column. The header, stat strip, and table share one right edge so
+    the roster reads as one page. `--width-column` is reserved for prose columns, where a
+    narrower reading measure helps.
+  */
   return (
-    <div className="overflow-x-auto rounded-lg border border-border">
+    <div className="overflow-x-auto rounded-lg border border-border bg-surface">
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-border text-left text-xs uppercase tracking-wide text-text-faint">
@@ -172,8 +218,11 @@ function Row({
             question, reached from inside the Código mode.
           */}
           <span className="inline-flex items-baseline gap-2">
+            {/* Not underlined at rest. Twenty-five underlined names down a column is a
+                column of rules, and the underline is telling somebody something they
+                already know — every name in a roster is the way into that project.
+                `base.css` puts it back on hover, which is where it answers a question. */}
             <Link
-              className="underline underline-offset-2"
               to="/projects/$projectId/$view"
               params={{ projectId: project.project_id, view: "state" }}
             >
@@ -192,16 +241,18 @@ function Row({
           </span>
         </th>
 
-        <td className="px-3 py-2 text-right tabular-nums">
+        <td className="px-3 py-2 text-right">
           {project.open_proposals === 0 ? (
             <Nothing />
           ) : (
+            /* `Count` and not a bare number: this is how many things are in a list, which
+               is the one reading the design system already draws — mono and tabular, so a
+               column of them lines up on the digit rather than wobbling. */
             <Link
-              className="underline underline-offset-2"
               to="/projects/$projectId/$view"
               params={{ projectId: project.project_id, view: "state" }}
             >
-              {project.open_proposals}
+              <Count n={project.open_proposals} />
             </Link>
           )}
         </td>

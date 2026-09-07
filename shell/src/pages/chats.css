@@ -72,6 +72,11 @@
 /* The transcript's own scroll. The head above it and the composer below it stay
    where they are, which is the whole point. */
 .chats-scroll {
+  /* A flex column so the transcript can be pushed to the bottom of it — see
+     `.chats-turns`. Everything in here was already a block laid out top to bottom, so the
+     column changes nothing about a full conversation and everything about a short one. */
+  display: flex;
+  flex-direction: column;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -331,19 +336,23 @@
   max-width: 42rem;
 }
 
+/* `--text-2xl`, which is the rank a page's own title has everywhere else in the app. At
+   `--text-3xl` the greeting on the front door was the largest type in the shell — larger
+   than any heading on any page — for a line that says the same thing every morning. */
 .chats-front-greeting {
   margin: 0;
   font-family: var(--font-display);
-  font-size: var(--text-3xl);
+  font-size: var(--text-2xl);
   font-weight: var(--weight-semibold);
   letter-spacing: -0.02em;
   text-align: center;
   color: var(--text);
 }
 
-.chats-front-box {
-  box-shadow: var(--shadow-md);
-}
+/* `.chats-front-box` carried `--shadow-md`, which lifted the composer off the page like a
+   dialog. Nothing else on the front door floats, and the box is the page rather than a
+   thing standing on it. The rule is gone; the element keeps its class in the markup and
+   nothing else styled it, so there is no rule left to keep. */
 
 .chats-front-note {
   margin: 0;
@@ -617,7 +626,7 @@
   overscroll-behavior: none;
   padding: var(--space-2);
   border-radius: var(--radius-sm);
-  background: var(--surface-sunken, rgba(0, 0, 0, 0.04));
+  background: var(--surface-sunken);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   line-height: 1.45;
@@ -625,11 +634,11 @@
 }
 
 .chats-diff-added {
-  color: var(--tone-go-text, #2f7d43);
+  color: var(--tone-active-fg);
 }
 
 .chats-diff-removed {
-  color: var(--tone-stop-text, #a33a3a);
+  color: var(--tone-danger-fg);
 }
 
 /* The lines that say WHERE rather than WHAT: file names and hunk headers, faint so the eye goes to
@@ -647,9 +656,9 @@
   gap: var(--space-2);
   margin: var(--space-2) 0;
   padding: var(--space-3);
-  border: 1px solid var(--tone-attention-border, var(--tone-paused-border));
+  border: 1px solid var(--tone-paused-border);
   border-radius: var(--radius-md);
-  background: var(--tone-attention-bg, var(--tone-paused-bg));
+  background: var(--tone-paused-bg);
   list-style: none;
 }
 
@@ -758,6 +767,67 @@
   align-items: baseline;
   gap: var(--space-1);
   margin-bottom: var(--space-3);
+}
+
+/* ------------------------------------------------ the open conversation's head -- */
+
+/**
+ * The way back to the list, above the conversation's name.
+ *
+ * Muted and unlined against the app's accent-coloured links, because a crumb is
+ * orientation rather than an invitation: it is read once, on arrival, by somebody
+ * checking they are where they meant to be. `a:hover` in `base.css` is unlayered, so the
+ * hover is turned off by a selector of its own weight rather than by a utility.
+ */
+.chats-crumb {
+  margin: 0;
+  font-size: var(--text-xs);
+}
+
+.chats-crumb a,
+.chats-crumb a:hover,
+.chats-crumb a:focus-visible {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.chats-crumb a:hover {
+  color: var(--text);
+}
+
+/**
+ * The conversation's name, at the rank of a page title, and still a rename control.
+ *
+ * It is an `h1` carrying `.chats-title-name`'s button, so the two facts the design wants
+ * are both true: the largest words on the screen are what this page is about, and
+ * clicking them is how the conversation gets a better name. The size is stated here
+ * rather than on `.chats-title-name`, because the editor door's fixed title uses that
+ * class too and is a heading inside a column, not the page's own.
+ */
+.chats-head-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0;
+}
+
+.chats-head-title .chats-title-name,
+.chats-head-title .chats-title-input {
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.015em;
+}
+
+/* Where it runs, in the header's headline slot. Mono because a path is a machine's word,
+   and truncated because a deep path must not push the `⋯` off the row. */
+.chats-where {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* An icon travelling with a word in the page header. Smaller than the composer's
@@ -1076,7 +1146,12 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-7);
-  margin: 0 0 var(--space-6);
+  /* Anchored to the bottom of the scrolling box. A conversation two turns old used to
+     start at the top with a screen of nothing between the last answer and the place you
+     type — so the two things a person is looking at, what was just said and where to say
+     the next thing, were as far apart as the window allowed. `auto` only does anything
+     while the content is shorter than the box; a long transcript is unaffected. */
+  margin: auto 0 var(--space-6);
   padding: 0;
   list-style: none;
 }
@@ -1203,7 +1278,7 @@
   color: var(--text-faint);
   opacity: 0;
   cursor: pointer;
-  transition: opacity 120ms ease;
+  transition: opacity var(--dur-quick) var(--ease);
 }
 
 .chats-turn-said:hover .chats-turn-again,
@@ -1350,7 +1425,7 @@
   width: 0.75rem;
   height: 0.75rem;
   align-self: center;
-  transition: transform 120ms ease;
+  transition: transform var(--dur-quick) var(--ease);
 }
 
 .chats-turn-did-caret-open {
@@ -1573,7 +1648,7 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface);
-  transition: border-color 120ms ease;
+  transition: border-color var(--dur-quick) var(--ease);
 }
 
 .chats-composer-box:focus-within {
@@ -2367,7 +2442,7 @@
   top: var(--space-1);
   right: var(--space-1);
   opacity: 0;
-  transition: opacity 120ms ease;
+  transition: opacity var(--dur-quick) var(--ease);
 }
 
 .chats-code-block:hover .chats-code-copy,
@@ -2798,7 +2873,7 @@
 .chats-picture-overlay {
   position: fixed;
   inset: 0;
-  z-index: 50;
+  z-index: var(--z-top);
   display: flex;
   flex-direction: column;
   align-items: center;

@@ -195,30 +195,11 @@
 
 /* =================================================================== list == */
 
-.runs-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
 .runs-row {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-}
-
-.runs-row-head {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: 9rem auto 10rem auto 6rem;
   align-items: baseline;
-  gap: var(--space-2);
+  gap: var(--space-3);
 }
 
 .runs-row-link {
@@ -239,11 +220,12 @@
 /* The money is the one figure worth reading down the column, so it sits at the
    end of the row rather than in the middle of the words. */
 .runs-row-cost {
-  margin-left: auto;
   font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .runs-row-excerpt {
+  grid-column: 1 / -1;
   margin: 0;
   font-size: var(--text-sm);
   line-height: var(--leading-snug);
@@ -286,6 +268,13 @@
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
   color: var(--text-faint);
+}
+
+.runs-field label {
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
 }
 
 .runs-field input,
@@ -338,23 +327,10 @@
 
 /* ================================================================ presets == */
 
-.runs-presets {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
 .runs-preset {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
 }
 
 .runs-preset-head {
@@ -471,8 +447,8 @@
   background: var(--surface-sunken);
   color: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  line-height: var(--leading-snug);
+  font-size: var(--text-sm);
+  line-height: 1.45;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -491,9 +467,9 @@
 
 .runs-stream-title {
   margin: var(--space-4) 0 0;
-  font-family: var(--font-mono);
+  font-family: var(--font-display);
   font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
+  letter-spacing: var(--tracking-wider);
   text-transform: uppercase;
   color: var(--text-faint);
 }

@@ -210,7 +210,7 @@ function AttachmentsPanel({ emailId, attachments }: { emailId: number; attachmen
         ) : undefined
       }
     >
-      <ul className="mail-detail-attachments">
+      <ul className="ui-rows mail-detail-attachments">
         {attachments.map((attachment) => (
           <AttachmentRow key={attachment.position} emailId={emailId} attachment={attachment} />
         ))}
@@ -237,24 +237,20 @@ function AttachmentRow({ emailId, attachment }: { emailId: number; attachment: E
   const senderName = attachment.filename ?? `attachment ${attachment.position}`;
 
   return (
-    <li className="mail-detail-attachment">
-      <div className="mail-detail-attachment-head">
-        <span className="mail-detail-attachment-name">{senderName}</span>
-        <span className="mail-detail-attachment-meta">
-          {attachment.mime_type ?? "unknown type"} · {formatBytes(attachment.size_bytes)}
-        </span>
-      </div>
-      <div className="mail-detail-attachment-actions">
-        <Button
-          disabled={download.isPending}
-          onClick={() => download.mutate({ position: attachment.position, suggestedName: senderName })}
-        >
-          Download
-        </Button>
-        <Button disabled={save.isPending} onClick={() => save.mutate(attachment.position)}>
-          Save to files
-        </Button>
-      </div>
+    <li className="ui-rows-row mail-detail-attachment">
+      <span className="mail-detail-attachment-name">{senderName}</span>
+      <span className="mail-detail-attachment-meta">
+        {attachment.mime_type ?? "unknown type"} · {formatBytes(attachment.size_bytes)}
+      </span>
+      <Button
+        disabled={download.isPending}
+        onClick={() => download.mutate({ position: attachment.position, suggestedName: senderName })}
+      >
+        Download
+      </Button>
+      <Button disabled={save.isPending} onClick={() => save.mutate(attachment.position)}>
+        Save to files
+      </Button>
       {/* The name shown here is the one the DAEMON wrote it under — sanitised
           and de-collided, and never assumed to be `senderName` above; the two
           can legitimately differ for the same attachment. */}

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Link } from "@tanstack/react-router";
+import { FeedEmbed } from "../app/FeedEmbed";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   READINESS_MIN_AGREE_PERCENT,
@@ -15,7 +16,6 @@ import {
   useShadowDecisions,
   type ClassTally,
 } from "../data/autopilot";
-import { readFeedKind, useRecentFeed, type FeedEntry } from "../data/feed";
 import { useCreateJob, useLiveJobs, type Job } from "../data/fleet";
 import {
   useBudget,
@@ -29,11 +29,14 @@ import {
 import {
   Badge,
   Button,
+  Count,
   ConfirmButton,
   ErrorNote,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
+  Section,
   RelativeTime,
   StatCard,
   StaleNote,
@@ -91,24 +94,45 @@ export function Autopilot() {
 
   return (
     <>
-      <PageHeader title="Autopilot" headline={headlineFor(rows, projects.data !== undefined)} />
+      <PageHeader
+        title="Autopilot"
+        headline={headlineFor(rows, projects.data !== undefined)}
+      />
 
       {kill.data?.engaged === true && <KillBanner />}
-      {budget.data?.paused === true && <BudgetPausedBanner budget={budget.data} />}
+      {budget.data?.paused === true && (
+        <BudgetPausedBanner budget={budget.data} />
+      )}
 
-      <Statusline projects={projects.data} budget={budget.data} pending={proposals.data?.length} />
+      <Statusline
+        projects={projects.data}
+        budget={budget.data}
+        pending={proposals.data?.length}
+      />
 
       {stale && <StaleNote dataUpdatedAt={projects.dataUpdatedAt} />}
-      {projects.isError && projects.data === undefined && <RosterError error={projects.error} />}
+      {projects.isError && projects.data === undefined && (
+        <RosterError error={projects.error} />
+      )}
 
       <div className="ap-sections">
-        <ProjectGovernanceList rows={rows} answered={projects.data !== undefined} selected={selected} onSelect={setChosen} />
-        <ShadowReviewPanel projectId={selected} />
-        <ScoreboardPanel projectId={selected} project={rows.find((row) => row.project_id === selected)} />
+        <ProjectGovernanceList
+          rows={rows}
+          answered={projects.data !== undefined}
+          selected={selected}
+          onSelect={setChosen}
+        />
+        <ShadowReviewPanel
+          projectId={selected}
+          project={rows.find((row) => row.project_id === selected)}
+        />
+        <ScoreboardPanel
+          projectId={selected}
+          project={rows.find((row) => row.project_id === selected)}
+        />
         <TriggerKills />
         <JobsPanel rows={rows} selected={selected} />
         <FeedEmbed />
-        <WaitingSummary pending={proposals.data?.length} />
       </div>
     </>
   );
@@ -117,13 +141,20 @@ export function Autopilot() {
 /* ------------------------------------------------------------- the reading -- */
 
 /** One derived sentence about who is allowed to act. */
-function headlineFor(rows: ProjectSummary[], answered: boolean): string | undefined {
+function headlineFor(
+  rows: ProjectSummary[],
+  answered: boolean,
+): string | undefined {
   if (!answered) return undefined;
   if (rows.length === 0) return "no project is under autopilot";
   const active = rows.filter((row) => row.mode === "active").length;
   const shadow = rows.filter((row) => row.mode === "shadow").length;
   const parts: string[] = [];
-  parts.push(active === 0 ? "nothing is acting on its own" : `${active} acting on its own`);
+  parts.push(
+    active === 0
+      ? "nothing is acting on its own"
+      : `${active} acting on its own`,
+  );
   if (shadow > 0) parts.push(`${shadow} watching in shadow`);
   const promotable = rows.filter((row) => row.promotable).length;
   if (promotable > 0) parts.push(`${promotable} ready to be let out of shadow`);
@@ -132,7 +163,11 @@ function headlineFor(rows: ProjectSummary[], answered: boolean): string | undefi
 
 function RosterError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the roster</ErrorNote>;
+  return (
+    <ErrorNote>
+      the núcleo did not answer — nothing is known about the roster
+    </ErrorNote>
+  );
 }
 
 /**
@@ -157,9 +192,9 @@ function KillBanner() {
     <p className="ap-banner ap-banner-kill" role="status">
       <span className="ap-banner-title">Emergency stop is engaged</span>
       <span className="ap-banner-text">
-        Nothing autonomous starts while this is on — no scheduled rule, no repo trigger, no job. The
-        switch is under the rail, on every page. Everything below is what *would* happen once it is
-        released.
+        Nothing autonomous starts while this is on — no scheduled rule, no repo
+        trigger, no job. The switch is under the rail, on every page. Everything
+        below is what *would* happen once it is released.
       </span>
     </p>
   );
@@ -168,12 +203,18 @@ function KillBanner() {
 function BudgetPausedBanner({ budget }: { budget: BudgetView }) {
   return (
     <p className="ap-banner ap-banner-budget" role="status">
-      <span className="ap-banner-title">Autonomous work is held by the budget</span>
+      <span className="ap-banner-title">
+        Autonomous work is held by the budget
+      </span>
       <span className="ap-banner-text">
-        {budget.reason ?? "the núcleo did not say which ceiling"} — ${budget.window_spend_usd.toFixed(2)}{" "}
-        spent this {budget.period.replace(/ly$/, "")}
-        {budget.limit_usd === null ? "" : ` against a ceiling of $${budget.limit_usd.toFixed(2)}`}. This
-        clears itself when the window rolls or the ceiling is raised; it is not a fault.
+        {budget.reason ?? "the núcleo did not say which ceiling"} — $
+        {budget.window_spend_usd.toFixed(2)} spent this{" "}
+        {budget.period.replace(/ly$/, "")}
+        {budget.limit_usd === null
+          ? ""
+          : ` against a ceiling of $${budget.limit_usd.toFixed(2)}`}
+        . This clears itself when the window rolls or the ceiling is raised; it
+        is not a fault.
       </span>
     </p>
   );
@@ -199,7 +240,11 @@ function Statusline({
       <StatCard
         label="Acting on their own"
         value={active}
-        detail={projects === undefined ? undefined : `${projects.length} projects on the roster`}
+        detail={
+          projects === undefined
+            ? undefined
+            : `${projects.length} projects on the roster`
+        }
       />
       <StatCard
         label="Watching in shadow"
@@ -209,17 +254,25 @@ function Statusline({
       <StatCard
         label="Waiting on you"
         value={pending}
-        detail={held === 0 ? "open proposals" : `open proposals — ${held} project queue full`}
+        detail={
+          held === 0
+            ? "open proposals"
+            : `open proposals — ${held} project queue full`
+        }
       />
       <StatCard
         label="Window spend"
-        value={budget === undefined ? undefined : `$ ${budget.window_spend_usd.toFixed(2)}`}
+        value={
+          budget === undefined
+            ? undefined
+            : `$${budget.window_spend_usd.toFixed(2)}`
+        }
         detail={
           budget === undefined
             ? undefined
             : budget.limit_usd === null
               ? "no ceiling set"
-              : `of $ ${budget.limit_usd.toFixed(2)} per ${budget.period.replace(/ly$/, "")}`
+              : `of $${budget.limit_usd.toFixed(2)} per ${budget.period.replace(/ly$/, "")}`
         }
       />
     </div>
@@ -241,33 +294,41 @@ function ProjectGovernanceList({
   onSelect: (projectId: string) => void;
 }) {
   return (
-    <Panel title="Projects" aside={<Count n={answered ? rows.length : undefined} />}>
-      <p className="ap-note">
-        Three settings and not two. <strong>Off</strong> means the núcleo never starts anything here.
-        <strong> Shadow</strong> means it decides and records what it would have done, and enforces
-        none of it — that record is what earns the third. <strong>Acting</strong> means it does the
-        thing.
-      </p>
+    <Panel
+      title="Projects"
+      aside={<Count n={answered ? rows.length : undefined} />}
+    >
       {answered && rows.length === 0 && (
         <Teach title="No project is under autopilot">
           <p>
-            A project appears here once the núcleo has been told where it lives. Nothing is broken and
-            nothing is hidden — there is simply no project to govern yet.
+            A project appears here once the núcleo has been told where it lives.
+            Nothing is broken and nothing is hidden — there is simply no project
+            to govern yet.
           </p>
         </Teach>
       )}
       {!answered && <p className="ap-loading">reading the roster…</p>}
       {rows.length > 0 && (
-        <ul className="ap-list" aria-label="Projects under autopilot">
-          {rows.map((project) => (
-            <GovernanceRow
-              key={project.project_id}
-              project={project}
-              selected={project.project_id === selected}
-              onSelect={onSelect}
-            />
-          ))}
-        </ul>
+        <>
+          <div className="ap-project-head" aria-hidden="true">
+            <span>Project</span>
+            <span>Mode</span>
+            <span className="ap-project-number">To review</span>
+            <span className="ap-project-number">Clearing the bar</span>
+            <span className="ap-project-number">Open</span>
+            <span />
+          </div>
+          <ul className="ui-rows" aria-label="Projects under autopilot">
+            {rows.map((project) => (
+              <GovernanceRow
+                key={project.project_id}
+                project={project}
+                selected={project.project_id === selected}
+                onSelect={onSelect}
+              />
+            ))}
+          </ul>
+        </>
       )}
     </Panel>
   );
@@ -305,7 +366,8 @@ function GovernanceRow({
    * something about. Guessing a single cause here would be wrong three times
    * out of four.
    */
-  const refused = setMode.isError && isApiRefusal(setMode.error) ? setMode.error : null;
+  const refused =
+    setMode.isError && isApiRefusal(setMode.error) ? setMode.error : null;
   const needsRoot = refused !== null && refused.status === 422;
 
   const withheld = project.withheld_classes_ready ?? 0;
@@ -321,35 +383,33 @@ function GovernanceRow({
   }
 
   return (
-    <li className={selected ? "ap-row ap-row-selected" : "ap-row"}>
-      <div className="ap-row-head">
+    <li
+      className={
+        selected
+          ? "ui-rows-row ap-project-row ap-project-row-selected"
+          : "ui-rows-row ap-project-row"
+      }
+    >
+      <div className="ap-project-name">
         <Button variant="link" onClick={() => onSelect(project.project_id)}>
           {project.project_id}
         </Button>
-        <Badge tone={MODE_TONE[project.mode]}>{MODE_LABEL[project.mode]}</Badge>
         {project.queue_full && <Badge tone="paused">queue full</Badge>}
-        <span className="ap-meta">{project.project_root ?? "no folder named"}</span>
       </div>
+      <Badge tone={MODE_TONE[project.mode]}>{MODE_LABEL[project.mode]}</Badge>
 
-      <dl className="ap-facts">
-        <div className="ap-fact">
-          <dt>shadow decisions to review</dt>
-          <dd>{project.pending}</dd>
-        </div>
-        <div className="ap-fact">
-          <dt>classes clearing the bar</dt>
-          <dd>
-            {project.classes_ready}/{project.classes_total}
-          </dd>
-        </div>
-        <div className="ap-fact">
-          <dt>open proposals</dt>
-          <dd>
-            {project.open_proposals}
-            {project.wip_limit === null ? " (no ceiling)" : ` of ${project.wip_limit}`}
-          </dd>
-        </div>
-      </dl>
+      <span className="ap-project-number" title="shadow decisions to review">
+        {project.pending}
+      </span>
+      <span className="ap-project-number" title="classes clearing the bar">
+        {project.classes_ready}/{project.classes_total}
+      </span>
+      <span className="ap-project-number" title="open proposals">
+        {project.open_proposals}
+        {project.wip_limit === null
+          ? " (no ceiling)"
+          : ` of ${project.wip_limit}`}
+      </span>
 
       <div className="ap-modes">
         <Button
@@ -363,7 +423,9 @@ function GovernanceRow({
         <Button
           variant="ghost"
           disabled={project.mode === "shadow" || setMode.isPending}
-          onClick={() => change("shadow", root === "" ? project.project_root : root)}
+          onClick={() =>
+            change("shadow", root === "" ? project.project_root : root)
+          }
         >
           Watch in shadow
         </Button>
@@ -371,23 +433,19 @@ function GovernanceRow({
           label="Let it act"
           confirmLabel="It may act on its own"
           variant="approve"
-          disabled={project.mode === "active" || !project.promotable || setMode.isPending}
-          title={project.promotable ? undefined : promotionBlocker(project, withheld)}
-          onConfirm={() => change("active", root === "" ? project.project_root : root)}
+          disabled={
+            project.mode === "active" ||
+            !project.promotable ||
+            setMode.isPending
+          }
+          title={
+            project.promotable ? undefined : promotionBlocker(project, withheld)
+          }
+          onConfirm={() =>
+            change("active", root === "" ? project.project_root : root)
+          }
         />
       </div>
-
-      {/* The gate, stated whether or not it is open. `promotable` is the daemon's
-          own arithmetic (`shadow.rs`) and is never recomputed here — a control
-          that unlocked on different numbers from the ones the núcleo enforces
-          would offer a button that always refuses. */}
-      {project.mode !== "active" && (
-        <p className={project.promotable ? "ap-gate" : "ap-gate ap-gate-locked"}>
-          {project.promotable
-            ? "every class it has exercised clears the bar, and at least one of them is a class the classifier withheld — it has earned this"
-            : promotionBlocker(project, withheld)}
-        </p>
-      )}
 
       {refused !== null && (
         <RefusalNote
@@ -399,17 +457,22 @@ function GovernanceRow({
         />
       )}
       {setMode.isError && !isApiRefusal(setMode.error) && (
-        <ErrorNote>the núcleo did not answer — this project&apos;s setting is unchanged</ErrorNote>
+        <ErrorNote>
+          the núcleo did not answer — this project&apos;s setting is unchanged
+        </ErrorNote>
       )}
 
       {needsRoot && (
-        <div className="ap-root">
-          <label className="ap-root-label" htmlFor={`root-${project.project_id}`}>
+        <div className="ui-panel-inset ap-project-root">
+          <label
+            className="ap-project-root-label"
+            htmlFor={`root-${project.project_id}`}
+          >
             Folder for {project.project_id}
           </label>
           <input
             id={`root-${project.project_id}`}
-            className="ap-root-input"
+            className="ap-project-root-input"
             type="text"
             value={root}
             spellCheck={false}
@@ -418,7 +481,9 @@ function GovernanceRow({
           />
           <Button
             variant="ghost"
-            disabled={root.trim() === "" || attempted === null || setMode.isPending}
+            disabled={
+              root.trim() === "" || attempted === null || setMode.isPending
+            }
             onClick={() => {
               if (attempted !== null) change(attempted, root);
             }}
@@ -433,31 +498,51 @@ function GovernanceRow({
 
 /* --------------------------------------------------------- shadow review -- */
 
-function ShadowReviewPanel({ projectId }: { projectId: string | null }) {
+function ShadowReviewPanel({
+  projectId,
+  project,
+}: {
+  projectId: string | null;
+  project: ProjectSummary | undefined;
+}) {
   const decisions = useShadowDecisions(projectId);
   const verdict = useSetShadowVerdict();
   const rows = decisions.data ?? [];
 
+  if (projectId !== null && decisions.data !== undefined && rows.length === 0) {
+    return (
+      <Section label="Shadow decisions">
+        <Quiet says="nothing is waiting for a verdict on this project.">
+          <p className="ap-note">What the classifier decided while enforcing nothing. Answering these is the only thing that moves a project toward acting on its own — agreeing says the classifier read the action the way you would, disagreeing says it did not, and both are evidence.</p>
+        </Quiet>
+      </Section>
+    );
+  }
+
   return (
     <Panel
       title="Shadow decisions"
-      aside={<Count n={projectId === null ? undefined : rows.length} />}
+      aside={
+        <>
+          {project !== undefined && <span className="ap-project-name">{project.project_id}</span>}
+          <Count n={projectId === null ? undefined : rows.length} />
+          <Link className="ap-link" to="/waiting">Go to the queue</Link>
+        </>
+      }
     >
-      <p className="ap-note">
-        What the classifier decided while enforcing nothing. Answering these is the only thing that
-        moves a project toward acting on its own — agreeing says the classifier read the action the
-        way you would, disagreeing says it did not, and both are evidence.
-      </p>
-      {projectId === null && <p className="ap-empty">choose a project above.</p>}
-      {projectId !== null && decisions.isError && decisions.data === undefined && (
-        <ListError error={decisions.error} what="the shadow decisions" />
+      {projectId === null && (
+        <p className="ap-empty">choose a project above.</p>
       )}
-      {projectId !== null && !decisions.isError && decisions.data === undefined && (
-        <p className="ap-loading">reading the shadow decisions…</p>
-      )}
-      {decisions.data !== undefined && rows.length === 0 && (
-        <p className="ap-empty">nothing is waiting for a verdict on this project.</p>
-      )}
+      {projectId !== null &&
+        decisions.isError &&
+        decisions.data === undefined && (
+          <ListError error={decisions.error} what="the shadow decisions" />
+        )}
+      {projectId !== null &&
+        !decisions.isError &&
+        decisions.data === undefined && (
+          <p className="ap-loading">reading the shadow decisions…</p>
+        )}
       {rows.length > 0 && (
         <ul className="ap-list" aria-label="Shadow decisions">
           {rows.map((decision) => (
@@ -468,12 +553,12 @@ function ShadowReviewPanel({ projectId }: { projectId: string | null }) {
                 <Badge tone="info">{decision.action_class}</Badge>
                 <RelativeTime at={decision.created_at} />
               </div>
-              <dl className="ap-facts">
-                <div className="ap-fact">
+              <dl className="ap-decision-facts">
+                <div className="ap-decision-fact">
                   <dt>the classifier</dt>
                   <dd>{readShadowDecision(decision.decision)}</dd>
                 </div>
-                <div className="ap-fact">
+                <div className="ap-decision-fact">
                   <dt>run</dt>
                   <dd>
                     <Link className="ap-link" to={`/runs/${decision.run_id}`}>
@@ -481,7 +566,7 @@ function ShadowReviewPanel({ projectId }: { projectId: string | null }) {
                     </Link>
                   </dd>
                 </div>
-                <div className="ap-fact">
+                <div className="ap-decision-fact">
                   <dt>classifier version</dt>
                   <dd>{decision.classifier_version}</dd>
                 </div>
@@ -499,14 +584,22 @@ function ShadowReviewPanel({ projectId }: { projectId: string | null }) {
                   variant="approve"
                   disabled={verdict.isPending}
                   onConfirm={() =>
-                    verdict.mutate({ decisionId: decision.id, verdict: "approve" })
+                    verdict.mutate({
+                      decisionId: decision.id,
+                      verdict: "approve",
+                    })
                   }
                 />
                 <ConfirmButton
                   label={`Block #${decision.id}`}
                   confirmLabel="This should have been stopped"
                   disabled={verdict.isPending}
-                  onConfirm={() => verdict.mutate({ decisionId: decision.id, verdict: "reject" })}
+                  onConfirm={() =>
+                    verdict.mutate({
+                      decisionId: decision.id,
+                      verdict: "reject",
+                    })
+                  }
                 />
               </div>
             </li>
@@ -520,7 +613,9 @@ function ShadowReviewPanel({ projectId }: { projectId: string | null }) {
 
 function VerdictError({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — nothing was recorded</ErrorNote>;
+    return (
+      <ErrorNote>the núcleo did not answer — nothing was recorded</ErrorNote>
+    );
   }
   return (
     <RefusalNote
@@ -565,46 +660,56 @@ function ScoreboardPanel({
   const evidence = rows.filter((row) => row.mode === SHADOW_EVIDENCE_MODE);
   const history = rows.filter((row) => row.mode !== SHADOW_EVIDENCE_MODE);
 
+  if (projectId !== null && scoreboard.data !== undefined && rows.length === 0) {
+    return (
+      <Section label="Scoreboard">
+        <Quiet says="this project has recorded no classified decision yet.">
+          <p className="ap-note">Read-only. The bar is {READINESS_MIN_REVIEWED} reviews at {READINESS_MIN_AGREE_PERCENT}% agreement per action class; the ready/total figure is the núcleo&apos;s own and gates the promote control.</p>
+        </Quiet>
+      </Section>
+    );
+  }
+
   return (
     <Panel
       title="Scoreboard"
       aside={
         project === undefined ? null : (
-          <span className="ap-count">
-            {project.classes_ready}/{project.classes_total} classes ready
-          </span>
+          <>
+            <span className="ap-project-name">{project.project_id}</span>
+            <span className="ui-count">
+              {`${project.classes_ready}/${project.classes_total} classes ready`}
+            </span>
+          </>
         )
       }
     >
-      <p className="ap-note">
-        Read-only. The bar is {READINESS_MIN_REVIEWED} reviews at{" "}
-        {READINESS_MIN_AGREE_PERCENT}% agreement per action class, and{" "}
-        <strong>the count that decides it is not the count below</strong>: the núcleo counts reviews
-        distinct by tool and arguments, so ten answers to the same command are ten here and one at
-        the bar. The ready/total figure in the corner is the núcleo&apos;s own and is what the
-        promote control gates on.
-      </p>
-      {projectId === null && <p className="ap-empty">choose a project above.</p>}
-      {projectId !== null && scoreboard.isError && scoreboard.data === undefined && (
-        <ListError error={scoreboard.error} what="the scoreboard" />
+      {projectId === null && (
+        <p className="ap-empty">choose a project above.</p>
       )}
-      {projectId !== null && !scoreboard.isError && scoreboard.data === undefined && (
-        <p className="ap-loading">reading the scoreboard…</p>
+      {projectId !== null &&
+        scoreboard.isError &&
+        scoreboard.data === undefined && (
+          <ListError error={scoreboard.error} what="the scoreboard" />
+        )}
+      {projectId !== null &&
+        !scoreboard.isError &&
+        scoreboard.data === undefined && (
+          <p className="ap-loading">reading the scoreboard…</p>
+        )}
+      {evidence.length > 0 && (
+        <TallyTable label="Shadow evidence" rows={evidence} />
       )}
-      {scoreboard.data !== undefined && rows.length === 0 && (
-        <p className="ap-empty">this project has recorded no classified decision yet.</p>
-      )}
-      {evidence.length > 0 && <TallyTable label="Shadow evidence" rows={evidence} />}
       {history.length > 0 && (
         <>
           <p className="ap-subhead">enforced, and not evidence for promotion</p>
-          <p className="ap-note">
-            Decisions taken outside shadow were acted on rather than recorded as hypotheses, so the
-            shadow-exit bar does not count them — the núcleo reads shadow-mode rows only. They are
-            here because they are still what this project has been doing.
-          </p>
           <TallyTable label="Enforced decisions" rows={history} />
         </>
+      )}
+      {rows.length > 0 && (
+        <p className="ap-note ap-note-foot">
+          the count that decides it is not the count below: the núcleo counts reviews distinct by tool and arguments, so ten answers to the same command are ten here and one at the bar.
+        </p>
       )}
     </Panel>
   );
@@ -666,7 +771,12 @@ function TallyTable({ label, rows }: { label: string; rows: ClassTally[] }) {
  * time, and deleting the check here would mean the next one arrives with
  * nothing to catch it before it does.
  */
-const TRIGGER_SCOPES: { id: string; label: string; what: string; reads: boolean }[] = [
+const TRIGGER_SCOPES: {
+  id: string;
+  label: string;
+  what: string;
+  reads: boolean;
+}[] = [
   {
     id: "scheduled",
     label: "Scheduled rules",
@@ -703,47 +813,48 @@ function TriggerKills() {
 
   return (
     <Panel title="Trigger brakes">
-      <p className="ap-note">
-        Narrower than the emergency stop: each of these holds one kind of trigger and leaves the rest
-        running. Engaging one stops nothing that has already started — it stops the next one from
-        starting.
-      </p>
       {kills.isError && kills.data === undefined && (
         <ListError error={kills.error} what="the trigger brakes" />
       )}
       {!kills.isError && kills.data === undefined && (
         <p className="ap-loading">reading the trigger brakes…</p>
       )}
-      <ul className="ap-switches" aria-label="Trigger brakes">
+      <ul className="ui-rows" aria-label="Trigger brakes">
         {TRIGGER_SCOPES.map((scope) => {
           const engaged = scopeEngaged(kills.data, "trigger", scope.id);
           return (
-            <li className="ap-switch" key={scope.id}>
-              <div className="ap-switch-head">
-                <span className="ap-switch-name">{scope.label}</span>
-                {scope.reads ? (
-                  <Badge tone={engaged ? "paused" : "active"}>{engaged ? "held" : "running"}</Badge>
-                ) : (
-                  <Badge tone="off">not read</Badge>
-                )}
-              </div>
-              <p className="ap-switch-note">{scope.what}</p>
+            <li className="ui-rows-row ap-trigger-row" key={scope.id}>
+              <span className="ap-trigger-name">{scope.label}</span>
+              {scope.reads ? (
+                <Badge tone={engaged ? "paused" : "active"}>
+                  {engaged ? "held" : "running"}
+                </Badge>
+              ) : (
+                <Badge tone="off">not read</Badge>
+              )}
               {scope.reads ? (
                 <Button
                   variant="ghost"
                   intent={engaged ? "go" : "stop"}
                   disabled={kills.data === undefined || setKill.isPending}
                   onClick={() =>
-                    setKill.mutate({ scope_type: "trigger", scope_id: scope.id, engaged: !engaged })
+                    setKill.mutate({
+                      scope_type: "trigger",
+                      scope_id: scope.id,
+                      engaged: !engaged,
+                    })
                   }
                 >
-                  {engaged ? `Release ${scope.label.toLowerCase()}` : `Hold ${scope.label.toLowerCase()}`}
+                  {engaged
+                    ? `Release ${scope.label.toLowerCase()}`
+                    : `Hold ${scope.label.toLowerCase()}`}
                 </Button>
               ) : (
-                <p className="ap-hedge">
-                  The núcleo will store this brake and nothing in it reads the value, so engaging it
-                  would stop nothing. It becomes a real switch when the Teams slice lands and team
-                  triggers exist to be held.
+                <p className="ap-trigger-note">
+                  The núcleo will store this brake and nothing in it reads the
+                  value, so engaging it would stop nothing. It becomes a real
+                  switch when the Teams slice lands and team triggers exist to
+                  be held.
                 </p>
               )}
             </li>
@@ -751,7 +862,9 @@ function TriggerKills() {
         })}
       </ul>
       {setKill.isError && (
-        <ErrorNote>that brake was not changed — the núcleo refused or did not answer</ErrorNote>
+        <ErrorNote>
+          that brake was not changed — the núcleo refused or did not answer
+        </ErrorNote>
       )}
     </Panel>
   );
@@ -759,18 +872,27 @@ function TriggerKills() {
 
 /* ---------------------------------------------------------------- the work -- */
 
-function JobsPanel({ rows, selected }: { rows: ProjectSummary[]; selected: string | null }) {
+function JobsPanel({
+  rows,
+  selected,
+}: {
+  rows: ProjectSummary[];
+  selected: string | null;
+}) {
   const jobs = useLiveJobs();
   const create = useCreateJob();
   const [prompt, setPrompt] = useState("");
   const live = jobs.data ?? [];
 
   const target = rows.find((row) => row.project_id === selected);
-  const blocked = target === undefined || target.queue_full || target.mode === "off";
+  const blocked =
+    target === undefined || target.queue_full || target.mode === "off";
 
   return (
     <Panel title="Jobs in flight" aside={<Count n={jobs.data?.length} />}>
-      {jobs.isError && jobs.data === undefined && <ListError error={jobs.error} what="the jobs" />}
+      {jobs.isError && jobs.data === undefined && (
+        <ListError error={jobs.error} what="the jobs" />
+      )}
       {jobs.data !== undefined && live.length === 0 && (
         <p className="ap-empty">nothing is running.</p>
       )}
@@ -823,12 +945,15 @@ function JobsPanel({ rows, selected }: { rows: ProjectSummary[]; selected: strin
           starts nothing, and one whose queue is full defers rather than refuses
           — two different reasons the button would not do what it says. */}
       {target !== undefined && target.mode === "off" && (
-        <p className="ap-hedge">{target.project_id} is off, so the núcleo would not start this.</p>
+        <p className="ap-hedge">
+          {target.project_id} is off, so the núcleo would not start this.
+        </p>
       )}
       {target !== undefined && target.queue_full && (
         <p className="ap-hedge">
-          {target.project_id} is holding {target.open_proposals} open proposals against its ceiling of{" "}
-          {target.wip_limit ?? "none"} — review something and the brake releases itself.
+          {target.project_id} is holding {target.open_proposals} open proposals
+          against its ceiling of {target.wip_limit ?? "none"} — review something
+          and the brake releases itself.
         </p>
       )}
       {create.isError && <JobError error={create.error} />}
@@ -839,10 +964,12 @@ function JobsPanel({ rows, selected }: { rows: ProjectSummary[]; selected: strin
 function JobRow({ job }: { job: Job }) {
   return (
     <li className="ap-job">
-      <div className="ap-row-head">
+      <div className="ap-card-head">
         <span className="ap-card-id">job {job.id}</span>
         <StateBadge domain="job" state={job.status} />
-        {job.wait_reason !== null && <StateBadge domain="wait_reason" state={job.wait_reason} />}
+        {job.wait_reason !== null && (
+          <StateBadge domain="wait_reason" state={job.wait_reason} />
+        )}
         <span className="ap-meta">{job.project_id}</span>
         <RelativeTime at={job.created_at} />
       </div>
@@ -860,12 +987,16 @@ function JobRow({ job }: { job: Job }) {
 }
 
 function JobError({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — no job was started</ErrorNote>;
+  if (!isApiRefusal(error))
+    return (
+      <ErrorNote>the núcleo did not answer — no job was started</ErrorNote>
+    );
   return (
     <RefusalNote
       refusal={error}
       sentences={{
-        kill_switch: "the emergency stop is engaged — nothing autonomous starts until it is released",
+        kill_switch:
+          "the emergency stop is engaged — nothing autonomous starts until it is released",
         conflict: "that project has no room right now",
         locked: "that project is held — nothing new starts here",
       }}
@@ -875,94 +1006,21 @@ function JobError({ error }: { error: unknown }) {
 
 /* -------------------------------------------------------------- the feed -- */
 
-/** How many lines the cockpit shows. Design §6.1: the last ten, and a way to the rest. */
-const EMBED_LINES = 10;
-
-/**
- * The last few lines, without freezing them.
- *
- * `useRecentFeed` rather than `useFeed({ limit: 10 })`, and the difference is
- * not cosmetic: `limit` is one of the daemon's *search* fields, so asking for it
- * flips `GET /feed` from a listing to a question about the past and the hook
- * turns its poll off. An embed that stopped refreshing the moment it was drawn
- * would be a cockpit showing this morning's news all afternoon.
- */
-function FeedEmbed() {
-  const feed = useRecentFeed();
-  const lines = (feed.data ?? []).slice(0, EMBED_LINES);
-
-  return (
-    <Panel
-      title="Lately"
-      aside={
-        <Link className="ap-link" to="/feed">
-          the whole feed
-        </Link>
-      }
-    >
-      {feed.isError && feed.data === undefined && <ListError error={feed.error} what="the feed" />}
-      {feed.data !== undefined && lines.length === 0 && (
-        <p className="ap-empty">the núcleo has not written a line yet.</p>
-      )}
-      {lines.length > 0 && (
-        <ul className="ap-feed" aria-label="Recent feed lines">
-          {lines.map((entry) => (
-            <FeedLine key={entry.id} entry={entry} />
-          ))}
-        </ul>
-      )}
-    </Panel>
-  );
-}
-
-function FeedLine({ entry }: { entry: FeedEntry }) {
-  const reading = readFeedKind(entry.kind);
-  return (
-    <li className="ap-feed-line">
-      <Badge tone={reading?.tone ?? "info"} title={reading === null ? `this shell has no reading for feed kind "${entry.kind}"` : undefined}>
-        {reading?.label ?? entry.kind}
-      </Badge>
-      <span className="ap-feed-summary">{entry.summary}</span>
-      <RelativeTime at={entry.created_at} />
-    </li>
-  );
-}
+/* `FeedEmbed` moved to `app/FeedEmbed.tsx`. Home shows the last five lines and this
+   cockpit the last ten, and a block two pages render cannot live inside one of them —
+   importing a page from another page is how a route ends up mounting a route. The `ap-`
+   rules it is drawn with stayed here, and it imports this stylesheet by name. */
 
 /* ------------------------------------------------------------ the queue -- */
 
-/**
- * How much is waiting, and the way to it — a count and a link, no buttons.
- *
- * The cockpit governs and the queue decides. A second set of approve controls
- * here would be a second place to answer one question, and the two would
- * disagree the first time somebody used the wrong one.
- */
-function WaitingSummary({ pending }: { pending: number | undefined }) {
-  return (
-    <Panel title="Waiting on you">
-      <p className="ap-note">
-        {pending === undefined
-          ? "the núcleo has not said how much is waiting."
-          : pending === 0
-            ? "nothing is waiting on a decision."
-            : `${pending} ${pending === 1 ? "decision is" : "decisions are"} waiting.`}{" "}
-        Answering them is on the queue, not here — one page decides, so there is one place to look.
-      </p>
-      <Link className="ap-link" to="/waiting">
-        Go to the queue
-      </Link>
-    </Panel>
-  );
-}
-
 /* -------------------------------------------------------------- shared -- */
 
-function Count({ n }: { n: number | undefined }) {
-  if (n === undefined) return null;
-  return <span className="ap-count">{n}</span>;
-}
-
 function ListError({ error, what }: { error: unknown; what: string }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about {what}</ErrorNote>;
+  if (isApiRefusal(error))
+    return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
+  return (
+    <ErrorNote>
+      the núcleo did not answer — nothing is known about {what}
+    </ErrorNote>
+  );
 }

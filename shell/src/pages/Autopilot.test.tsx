@@ -255,7 +255,8 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
     // Every class ready and none of them withheld: the case a shell that
     // recomputed the gate from `classes_ready === classes_total` would unlock.
     // `promotable` is the daemon's arithmetic and it says no.
-    expect(screen.getByText(/nothing yet shows it holds back/)).toBeDefined();
+    // The daemon's gate sentence is the disabled button's title now.
+    expect((promote as HTMLButtonElement).title).toMatch(/nothing yet shows it holds back/);
   });
 });
 

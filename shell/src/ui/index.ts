@@ -10,6 +10,7 @@ export { Button, type ButtonIntent, type ButtonProps, type ButtonVariant } from 
 export { ConfirmButton, type ConfirmButtonProps } from "./ConfirmButton";
 export { CopyButton, type CopyButtonProps } from "./CopyButton";
 export { CopyOnce, type CopyOnceProps } from "./CopyOnce";
+export { Count, type CountProps } from "./Count";
 export { ErrorNote, type ErrorNoteProps } from "./ErrorNote";
 /**
  * Two primitives in one module — the second recorded exception to one

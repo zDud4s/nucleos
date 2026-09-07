@@ -336,7 +336,7 @@ describe("the project workspace", () => {
     });
 
     expect(await screen.findByText("84k")).toBeTruthy();
-    expect(screen.getByText("$ 128.40")).toBeTruthy();
+    expect(screen.getByText("$128.40")).toBeTruthy();
 
     // 26 of 30 judged — the twelve ungated runs are NOT in the denominator, so this is 87% and not
     // 62%. Getting that wrong is the whole reason `gateShare` exists.

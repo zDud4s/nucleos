@@ -86,12 +86,7 @@
 /* =================================================================== list == */
 
 .errands-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
   margin: 0;
-  padding: 0;
-  list-style: none;
 }
 
 .errands-row {
@@ -99,25 +94,21 @@
 }
 
 .errands-row-link {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
+  display: grid;
+  grid-template-columns: minmax(0, 14rem) auto auto minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+  padding: 0;
   color: var(--text);
   text-decoration: none;
 }
 
-.errands-row-active .errands-row-link {
-  border-color: var(--accent);
-  background: var(--accent-quiet);
+.errands-row-active {
+  border-left: 2px solid var(--border-strong);
+  background: var(--surface-raised);
 }
 
 .errands-row-name {
-  flex: 1 1 10rem;
   min-width: 0;
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
@@ -134,7 +125,6 @@
 }
 
 .errands-row-investigation {
-  flex: 1 1 100%;
   font-size: var(--text-xs);
   color: var(--text-muted);
   overflow-wrap: anywhere;
@@ -213,6 +203,7 @@
 .errands-notebook-body {
   margin: 0;
   padding: var(--space-3);
+  max-width: var(--measure-prose);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
   color: var(--text);
@@ -274,22 +265,13 @@
 /* ----------------------------------------------------------------- rules -- */
 
 .errands-rules {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
   margin: 0 0 var(--space-3);
-  padding: 0;
-  list-style: none;
 }
 
 .errands-rule {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
 }
 
 .errands-rule-head {

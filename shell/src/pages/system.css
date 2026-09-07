@@ -15,7 +15,6 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  max-width: 64rem;
 }
 
 .sy-loading,
@@ -89,24 +88,11 @@
   color: var(--text-muted);
 }
 
-.sy-subsystems {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.sy-subsystem {
-  display: flex;
-  flex-wrap: wrap;
+.sy-subsystem-row {
+  display: grid;
+  grid-template-columns: minmax(0, 12rem) 8rem minmax(0, 1fr);
   align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
+  gap: var(--space-3);
 }
 
 .sy-subsystem-name {
@@ -195,31 +181,17 @@
 
 /* ---------------------------------------------------------- project brakes == */
 
-.sy-kills {
+.sy-project-brake-row {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.sy-kill {
-  display: flex;
-  flex-wrap: wrap;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
+  gap: var(--space-3);
 }
 
-.sy-kill-name {
+.sy-project-brake-name {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   color: var(--text);
-  flex: 1 1 auto;
 }
 
 /* ------------------------------------------------------------------ budget == */
@@ -257,6 +229,7 @@
 }
 
 .sy-field label {
+  font-family: var(--font-body);
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;

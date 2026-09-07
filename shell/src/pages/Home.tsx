@@ -1,13 +1,16 @@
 import { Link } from "@tanstack/react-router";
+import { FeedEmbed } from "../app/FeedEmbed";
 import {
   useBudget,
   useProjects,
   useProposals,
+  useSystemHealth,
   type BudgetView,
   type ProjectSummary,
   type Proposal,
 } from "../data/system";
-import { PageHeader, Panel, StatCard } from "../ui";
+import { PageHeader, Section, StatCard } from "../ui";
+import { headlineFor as systemHeadline } from "./System";
 
 /**
  * The first screen: four numbers and two doors.
@@ -26,10 +29,13 @@ export function Home() {
   const projects = useProjects();
   const proposals = useProposals();
   const budget = useBudget();
+  const health = useSystemHealth();
 
   const roster = projects.data;
   const queue = proposals.data;
   const spend = budget.data;
+  const subsystems = health.data?.subsystems;
+  const healthy = subsystems?.filter((row) => row.status === "ok").length;
 
   const active = roster?.filter((project) => project.mode === "active").length;
   const shadow = roster?.filter((project) => project.mode === "shadow").length;
@@ -62,28 +68,55 @@ export function Home() {
         />
         <StatCard
           label="Window spend"
-          value={spend === undefined ? undefined : `$ ${spend.window_spend_usd.toFixed(2)}`}
+          value={spend === undefined ? undefined : `$${spend.window_spend_usd.toFixed(2)}`}
           detail={ceiling(spend)}
+        />
+        {/*
+          The fifth, and the one that is not about the autopilot: whether the machine
+          under it is well. `headlineFor` is System's own sentence, imported rather than
+          rewritten — the first screen is where somebody finds out a subsystem is down,
+          and two screens describing one readout in two ways is how a person learns to
+          check both.
+        */}
+        <StatCard
+          label="Subsystems healthy"
+          value={
+            subsystems === undefined || healthy === undefined
+              ? undefined
+              : `${healthy}/${subsystems.length}`
+          }
+          detail={systemHeadline(health.data)}
         />
       </div>
 
-      <Panel title="Where to look next">
-        <div className="app-quicklinks">
-          <Link to="/autopilot" className="app-quicklink">
-            <span className="app-quicklink-title">Autopilot</span>
-            <span className="app-quicklink-text">
-              The mode of every project, the bar a project has to clear to leave shadow, and the ceilings
-              that hold work back.
-            </span>
-          </Link>
-          <Link to="/waiting" className="app-quicklink">
-            <span className="app-quicklink-title">Waiting</span>
-            <span className="app-quicklink-text">
-              Everything that stopped to ask you something, of every kind, in one queue.
-            </span>
-          </Link>
+      {/*
+        Two doors, and no cards around them. They were bordered blocks with a title and a
+        paragraph each — the same weight as the four readings above, for two links that
+        say where a link goes. A `Section` puts them under a heading with no frame, which
+        is what a list of two places is.
+      */}
+      <Section label="Where to look next">
+        <div className="flex flex-col gap-2">
+          <p className="text-sm text-text-muted">
+            <Link to="/autopilot" className="ui-button ui-button-link">
+              Autopilot
+            </Link>{" "}
+            — the mode of every project, the bar one has to clear to leave shadow, and the
+            ceilings that hold work back.
+          </p>
+          <p className="text-sm text-text-muted">
+            <Link to="/waiting" className="ui-button ui-button-link">
+              Waiting
+            </Link>{" "}
+            — everything that stopped to ask you something, of every kind, in one queue.
+          </p>
         </div>
-      </Panel>
+      </Section>
+
+      {/* What has actually happened, which is the question the four figures above raise
+          and none of them answers. Five lines, not the cockpit's ten: this is the last
+          block of the first screen, not a feed reader. */}
+      <FeedEmbed lines={5} />
     </>
   );
 }
@@ -99,7 +132,7 @@ export function Home() {
 function ceiling(spend: BudgetView | undefined): string | undefined {
   if (spend === undefined) return undefined;
   if (spend.limit_usd === null) return `no ceiling · ${spend.period}`;
-  return `of $ ${spend.limit_usd.toFixed(2)} · ${spend.period}`;
+  return `of $${spend.limit_usd.toFixed(2)} · ${spend.period}`;
 }
 
 /**

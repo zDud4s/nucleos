@@ -388,14 +388,14 @@ function DiffView({ projectId, run, path }: { projectId: string; run: number; pa
   if (diff.data.trim() === "") {
     return <p className="text-sm text-text-muted">No difference from the branch point.</p>;
   }
-  return <pre className="whitespace-pre font-mono text-xs text-text-muted">{diff.data}</pre>;
+  return <pre className="whitespace-pre font-mono text-sm leading-[1.45] text-text-muted">{diff.data}</pre>;
 }
 
 function FileView({ projectId, run, path }: { projectId: string; run: number; path: string }) {
   const file = useRunFile(projectId, run, path);
   if (file.isError) return <Refusal what="file" error={file.error} />;
   if (file.data === undefined) return <p className="text-sm text-text-faint">Reading…</p>;
-  return <pre className="whitespace-pre font-mono text-xs text-text-muted">{file.data}</pre>;
+  return <pre className="whitespace-pre font-mono text-sm leading-[1.45] text-text-muted">{file.data}</pre>;
 }
 
 function BlameView({ projectId, run, path }: { projectId: string; run: number; path: string }) {

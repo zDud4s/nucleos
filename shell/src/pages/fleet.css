@@ -150,6 +150,7 @@
   gap: var(--space-1);
   min-width: 0;
   flex: 1 1 0;
+  font-family: var(--font-body);
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
@@ -582,12 +583,12 @@
 
 .jp-label {
   fill: var(--text);
-  font-size: 11px;
+  font-size: var(--text-xs);
 }
 
 .jp-ordinal {
   fill: var(--text-muted);
-  font-size: 9px;
+  font-size: var(--text-xs);
 }
 
 .jp-done .jp-box {

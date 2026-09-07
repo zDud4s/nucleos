@@ -9,9 +9,11 @@
  * spelled out in full.
  *
  * Only colour and shadow are redefined under `prefers-color-scheme: light`.
- * Spacing, type and radii are facts about the layout, not about the light in
- * the room, and duplicating them into the light block is how the two themes
- * start to drift apart.
+ * Spacing, type, radii, motion, stacking, opacity and the reading measures are
+ * facts about the layout, not about the light in the room, and duplicating them
+ * into the light block is how the two themes start to drift apart. `tokens.test.ts`
+ * holds that line: every one of those names is declared once, in the base `:root`,
+ * and never again under the media query.
  *
  * The seven state tones are the app's whole colour vocabulary for *state*.
  * Interaction does not get a hue of its own — a primary button is expressed by
@@ -72,6 +74,64 @@
   --radius-md: 6px;
   --radius-lg: 10px;
   --radius-pill: 999px;
+
+  /* ------------------------------------------------------------- motion -- */
+  /**
+   * One curve and three durations, for the whole app.
+   *
+   * The curve leaves fast and arrives slowly, which is what makes a movement
+   * read as a thing settling rather than as a thing being animated. The three
+   * durations are the only ones anybody may reach for: `quick` is a colour or a
+   * border under the pointer, `settle` is something arriving or leaving, `slide`
+   * is the rail's own width. A fourth duration is a fourth opinion about how
+   * fast this app feels.
+   *
+   * `prefers-reduced-motion` is answered once, in `base.css`, where a `*` rule
+   * cuts every duration to 0.01ms — so nothing here needs a second answer.
+   */
+  --ease: cubic-bezier(0.25, 1, 0.5, 1);
+  --dur-quick: 140ms;
+  --dur-settle: 220ms;
+  --dur-slide: 240ms;
+
+  /* ----------------------------------------------------------- stacking -- */
+  /**
+   * Four layers, named by what is on them.
+   *
+   * A `z-index` written as a literal is a number argued with by the next
+   * literal, and the argument is won by whoever typed the larger one. These are
+   * the whole ladder: a heading that stays put while its list scrolls, a thing
+   * drawn over the page, an overlay with a scrim, and the top — a toast, a
+   * command palette, the things that must never be under anything.
+   */
+  --z-sticky: 1;
+  --z-cover: 5;
+  --z-overlay: 20;
+  --z-top: 50;
+
+  /* ------------------------------------------------------------ opacity -- */
+  /* Half-visible because it cannot be used, and dimmed because it is not the
+     thing you came for. Two states, two numbers, no third. */
+  --opacity-disabled: 0.5;
+  --opacity-quiet: 0.7;
+
+  /* ----------------------------------------------------------- measures -- */
+  /**
+   * How wide text is allowed to get, and the thinnest line the app draws.
+   *
+   * `--measure` is a label, a note, an empty-state paragraph — short prose read
+   * once. `--measure-prose` is running text somebody actually reads through, a
+   * model's reasoning most often. `--width-column` is a form or a single column
+   * of controls, which stops long before either measure does.
+   *
+   * `--hairline` is 1px and is a *rule*, not a border: it is the gap between two
+   * rows over a `--border` ground, and naming it is what stops the next list
+   * drawing its separators at 2px because nobody could see the first one.
+   */
+  --measure: 52ch;
+  --measure-prose: 70ch;
+  --width-column: 64rem;
+  --hairline: 1px;
 
   /* ---------------------------------------------------- surfaces & text -- */
   --bg: #0c0e12;

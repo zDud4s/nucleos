@@ -73,9 +73,9 @@ export function DaySheet({ slot, occurrences, now, config }: DaySheetProps) {
       {occurrences.length === 0 ? (
         <p className="calendar-empty">nothing on this day.</p>
       ) : (
-        <ul className="calendar-occurrence-list">
+        <ul className="ui-rows calendar-occurrence-list">
           {occurrences.map((occurrence) => (
-            <li key={occurrenceKey(occurrence.event_id, occurrence.occurrence_local)}>
+            <li className="ui-rows-row" key={occurrenceKey(occurrence.event_id, occurrence.occurrence_local)}>
               <OccurrenceActions occurrence={occurrence} />
             </li>
           ))}
@@ -260,42 +260,50 @@ export function OccurrenceActions({ occurrence }: { occurrence: EventOccurrence 
     <div className="calendar-occurrence-actions">
       <p className="calendar-occurrence-title">
         <span className="calendar-occurrence-clock">{placement.clock}</span>
-        {occurrence.title}
-        {occurrence.source === "proposal" && <Badge tone="shadow">proposed</Badge>}
-        {placement.moved && (
-          <span className="calendar-occurrence-moved">
-            moved from {occurrence.occurrence_local.replace("T", " ").slice(0, 16)}
-          </span>
-        )}
+        <span className="calendar-occurrence-name">
+          {occurrence.title}
+          {occurrence.source === "proposal" && <Badge tone="shadow">proposed</Badge>}
+          {placement.moved && (
+            <span className="calendar-occurrence-moved">
+              moved from {occurrence.occurrence_local.replace("T", " ").slice(0, 16)}
+            </span>
+          )}
+        </span>
       </p>
       <div className="calendar-occurrence-controls">
         <ConfirmButton
           label="Skip this occurrence"
           confirmLabel="Skip it"
+          variant="quiet"
           disabled={cancel.isPending}
           onConfirm={() =>
             cancel.mutate({ eventId: occurrence.event_id, occurrenceLocal: occurrence.occurrence_local })
           }
         />
-        <label className="calendar-move-field">
-          <span>Move to</span>
-          <input
-            type="datetime-local"
-            value={moveTo}
-            onChange={(event) => setMoveTo(event.target.value)}
-            aria-label={`Move ${occurrence.title} to`}
+        <div className="calendar-move">
+          <label className="calendar-move-field">
+            <span>Move to</span>
+            <input
+              type="datetime-local"
+              value={moveTo}
+              onChange={(event) => setMoveTo(event.target.value)}
+              aria-label={`Move ${occurrence.title} to`}
+            />
+          </label>
+          <Button disabled={move.isPending} onClick={submitMove}>
+            Move
+          </Button>
+        </div>
+        <details className="calendar-occurrence-more">
+          <summary aria-label="More occurrence actions">…</summary>
+          <ConfirmButton
+            label="Delete whole series"
+            confirmLabel="Delete every occurrence"
+            variant="danger"
+            disabled={deleteSeries.isPending}
+            onConfirm={() => deleteSeries.mutate(occurrence.event_id)}
           />
-        </label>
-        <Button disabled={move.isPending} onClick={submitMove}>
-          Move
-        </Button>
-        <ConfirmButton
-          label="Delete whole series"
-          confirmLabel="Delete every occurrence"
-          variant="danger"
-          disabled={deleteSeries.isPending}
-          onConfirm={() => deleteSeries.mutate(occurrence.event_id)}
-        />
+        </details>
       </div>
       {cancel.isError && <OccurrenceError error={cancel.error} what="not skipped" />}
       {move.isError && <OccurrenceError error={move.error} what="not moved" />}

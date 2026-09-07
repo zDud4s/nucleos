@@ -20,15 +20,18 @@ import {
 import {
   Badge,
   Button,
+  Count,
   ConfirmButton,
   ErrorNote,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
   StaleNote,
   StateBadge,
   Teach,
+  Section,
 } from "../ui";
 import "./voice.css";
 
@@ -509,11 +512,6 @@ function ConfigError({ error }: { error: unknown }) {
 
 /* ------------------------------------------------------------------ lists -- */
 
-function Count({ n }: { n: number | undefined }) {
-  if (n === undefined) return null;
-  return <span className="voice-count">{n}</span>;
-}
-
 function MemoList({
   memos,
   deleteMemo,
@@ -525,15 +523,18 @@ function MemoList({
   const stale = memos.isError && rows !== undefined;
 
   return (
+    <>
+      {rows !== undefined && rows.length === 0 ? (
+        <Section label="Memos">
+          <Quiet says="no memos yet">
+            <p>A memo is a capture that stays a note — start one above, or press the memo hotkey from anywhere.</p>
+          </Quiet>
+        </Section>
+      ) : (
     <Panel title="Memos" aside={<Count n={rows?.length} />}>
       {stale && <StaleNote dataUpdatedAt={memos.dataUpdatedAt} />}
       {memos.isError && rows === undefined && <MemosError error={memos.error} />}
       {rows === undefined && !memos.isError && <p className="voice-loading">reading the memos…</p>}
-      {rows !== undefined && rows.length === 0 && (
-        <Teach title="No memos yet">
-          <p>A memo is a capture that stays a note — start one above, or press the memo hotkey from anywhere.</p>
-        </Teach>
-      )}
       {rows !== undefined && rows.length > 0 && (
         <ul className="voice-list" aria-label="Memos">
           {rows.map((row) => (
@@ -548,6 +549,8 @@ function MemoList({
       )}
       {deleteMemo.isError && <DeleteMemoError error={deleteMemo.error} />}
     </Panel>
+      )}
+    </>
   );
 }
 
@@ -566,22 +569,18 @@ function DictationList({ dictations }: { dictations: ReturnType<typeof useDictat
   const stale = dictations.isError && rows !== undefined;
 
   return (
+    <>
+      {rows !== undefined && rows.length === 0 ? (
+        <Section label="Dictations">
+          <Quiet says="no dictations yet">
+            <p className="voice-note">A dictation is a capture that gets pasted where you were typing — start one above, or press the dictation hotkey from anywhere.</p>
+          </Quiet>
+        </Section>
+      ) : (
     <Panel title="Dictations" variant="dim" aside={<Count n={rows?.length} />}>
-      <p className="voice-note">
-        Read by hand for prompt tuning, not by the shell — there is no delete here; dictations expire
-        on their own by retention.
-      </p>
       {stale && <StaleNote dataUpdatedAt={dictations.dataUpdatedAt} />}
       {dictations.isError && rows === undefined && <DictationsError error={dictations.error} />}
       {rows === undefined && !dictations.isError && <p className="voice-loading">reading the dictations…</p>}
-      {rows !== undefined && rows.length === 0 && (
-        <Teach title="No dictations yet">
-          <p>
-            A dictation is a capture that gets pasted where you were typing — start one above, or press
-            the dictation hotkey from anywhere.
-          </p>
-        </Teach>
-      )}
       {rows !== undefined && rows.length > 0 && (
         <ul className="voice-list" aria-label="Dictations">
           {rows.map((row) => (
@@ -590,6 +589,8 @@ function DictationList({ dictations }: { dictations: ReturnType<typeof useDictat
         </ul>
       )}
     </Panel>
+      )}
+    </>
   );
 }
 

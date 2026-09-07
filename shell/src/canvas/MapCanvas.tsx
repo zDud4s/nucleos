@@ -181,7 +181,7 @@ export function MapCanvas({
                 </button>
                 {claimed.has(path) ? null : (
                   <span
-                    className="ml-2 text-[10px] text-text-faint"
+                    className="ml-2 text-xs text-text-faint"
                     title="No approved decision names this file. Derived from the junction, and not a verdict about the code."
                   >
                     nothing asked for it
@@ -368,7 +368,7 @@ function Rail({
       */}
       {open === null ? null : (
         <>
-          <h3 className="px-2 pb-1 font-display text-[10px] font-medium uppercase tracking-wider text-text-faint">
+          <h3 className="px-2 pb-1 font-display text-xs font-medium uppercase tracking-wider text-text-faint">
             {open}
           </h3>
           <ul className="flex list-none flex-col">
@@ -394,7 +394,7 @@ function Rail({
       )}
       <h3
         className={
-          "px-2 pb-1 font-display text-[10px] font-medium uppercase tracking-wider text-text-faint" +
+          "px-2 pb-1 font-display text-xs font-medium uppercase tracking-wider text-text-faint" +
           (open === null ? "" : " pt-3")
         }
       >
@@ -455,7 +455,7 @@ function Traffic({
     "rounded-pill border border-border px-2 py-0.5 font-mono text-[11px] text-text-muted hover:border-border-strong hover:text-text";
   const row = (label: string, traffic: ReturnType<typeof trafficFor>["uses"]) => (
     <div className="flex flex-wrap items-baseline gap-1">
-      <span className="w-16 text-[10px] uppercase tracking-wide text-text-faint">{label}</span>
+      <span className="w-16 text-xs uppercase tracking-wide text-text-faint">{label}</span>
       {traffic.length === 0 ? (
         <span className="text-xs text-text-faint">nothing</span>
       ) : (
@@ -828,7 +828,7 @@ function Matrix({
           matrix.order.reduce((longest, title) => Math.max(longest, title.length), 0),
         )}
       >
-        <table className="m-3 border-collapse font-mono text-[10px]">
+        <table className="m-3 border-collapse font-mono text-xs">
           <thead>
             <tr>
               <th />

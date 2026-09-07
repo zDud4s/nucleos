@@ -45,9 +45,13 @@ describe("Home", () => {
     // news as seven projects holding one.
     expect(within(await card("Shadow decisions pending")).getByText("7")).toBeDefined();
     expect(within(await card("Approval queue")).getByText("2")).toBeDefined();
-    expect(within(await card("Window spend")).getByText("$ 1.42")).toBeDefined();
+    expect(within(await card("Window spend")).getByText("$1.42")).toBeDefined();
 
-    expect(screen.getAllByRole("article")).toHaveLength(4);
+    // Five now, and the fifth is not a fifth reading of §6.1: "Subsystems healthy" is
+    // System's own headline, on the first screen because that is where somebody finds out
+    // a subsystem is down. The four above are still the four, and still say what §6.1
+    // says they say.
+    expect(screen.getAllByRole("article")).toHaveLength(5);
   });
 
   it("reads an absent ceiling as no ceiling, never as zero", async () => {

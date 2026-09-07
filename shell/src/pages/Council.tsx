@@ -172,12 +172,13 @@ function CouncilList({
   answered: boolean;
   selected: string | null;
 }) {
+  if (answered && rows.length === 0) return null;
+
   return (
     <Panel title="Councils" aside={<Count n={answered ? rows.length : undefined} />}>
       {!answered && <p className="council-loading">reading the councils…</p>}
-      {answered && rows.length === 0 && <p className="council-empty">no council has been convened yet.</p>}
       {rows.length > 0 && (
-        <ul className="council-list" aria-label="Councils">
+        <ul className="ui-rows council-list" aria-label="Councils">
           {rows.map((row) => (
             <CouncilRow key={row.id} row={row} active={row.id === selected} />
           ))}
@@ -189,7 +190,7 @@ function CouncilList({
 
 function CouncilRow({ row, active }: { row: CouncilSummary; active: boolean }) {
   return (
-    <li className={active ? "council-row council-row-active" : "council-row"}>
+    <li className={active ? "ui-rows-row council-row council-row-active" : "ui-rows-row council-row"}>
       <Link className="council-row-link" to={`/council/${row.id}`} aria-current={active ? "page" : undefined}>
         <span className="council-row-question">{row.question}</span>
         <StateBadge domain="council" state={row.status} />
@@ -283,7 +284,7 @@ function SeatGrid({ seats }: { seats: SeatView[] }) {
       {seats.length === 0 ? (
         <p className="council-empty">no seat has been recorded for this council yet.</p>
       ) : (
-        <ul className="council-seats" aria-label="Seats">
+        <ul className="ui-rows council-seats" aria-label="Seats">
           {seats.map((seat) => (
             <SeatCard key={seat.seat_idx} seat={seat} />
           ))}
@@ -317,7 +318,7 @@ function SeatCard({ seat }: { seat: SeatView }) {
   const abstained = seat.stage2_status === "ok" && seat.rankings.length === 0;
 
   return (
-    <li className="council-seat">
+    <li className="ui-rows-row council-seat">
       <div className="council-seat-head">
         <span className="council-seat-name">{seatName(seat.kind)}</span>
         <span className="council-seat-idx">seat {seat.seat_idx}</span>
@@ -334,6 +335,12 @@ function SeatCard({ seat }: { seat: SeatView }) {
         </p>
       )}
       <p className="council-seat-answer">{answerText(seat)}</p>
+      {seat.answer !== null && (
+        <details className="council-seat-more">
+          <summary className="ui-quiet">more</summary>
+          <p>{seat.answer}</p>
+        </details>
+      )}
 
       <div className="council-seat-stage">
         <span className="council-seat-stage-label">stage 2</span>
@@ -362,17 +369,22 @@ function Leaderboard({ leaderboard }: { leaderboard: LeaderboardEntry[] }) {
           that does not stop the chairman from writing a synthesis.
         </p>
       ) : (
-        <ul className="council-leaderboard" aria-label="Leaderboard">
-          {leaderboard.map((entry) => (
-            <li className="council-leaderboard-row" key={entry.seat_idx}>
-              <span className="council-leaderboard-seat">seat {entry.seat_idx}</span>
-              <span className="council-leaderboard-rank">avg rank {entry.avg_rank.toFixed(2)}</span>
-              {/* n travels with the average always: one vote and five votes are
-                  not the same claim, and dropping this would present them as one. */}
-              <span className="council-leaderboard-n">n = {entry.n}</span>
-            </li>
-          ))}
-        </ul>
+        <div role="list" aria-label="Leaderboard">
+          <table className="council-leaderboard">
+            <thead>
+              <tr><th scope="col">Seat</th><th scope="col">Average rank</th><th scope="col">Votes</th></tr>
+            </thead>
+            <tbody>
+              {leaderboard.map((entry) => (
+                <tr key={entry.seat_idx}>
+                  <th scope="row" className="council-leaderboard-seat">seat {entry.seat_idx}</th>
+                  <td className="council-leaderboard-rank">{entry.avg_rank.toFixed(2)}</td>
+                  <td className="council-leaderboard-n">{entry.n}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </Panel>
   );

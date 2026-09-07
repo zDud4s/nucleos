@@ -75,7 +75,7 @@ export function Boundary({ modules, imports, unread, foreign, seam }: BoundaryPr
             className="flex min-w-[150px] flex-col gap-0.5 rounded-lg border border-border bg-surface px-3 py-2"
           >
             <span className="font-display text-sm text-text">{side.folder}</span>
-            <span className="text-[10px] uppercase tracking-wide text-text-faint">{side.reader}</span>
+            <span className="text-xs uppercase tracking-wide text-text-faint">{side.reader}</span>
             <span className="mt-1 text-xs text-text-muted">
               <span className="font-display text-sm text-text">{side.files}</span> file
               {side.files === 1 ? "" : "s"} · {side.imports} import{side.imports === 1 ? "" : "s"}{" "}

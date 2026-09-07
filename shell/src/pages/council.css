@@ -82,13 +82,9 @@
 
 /* =================================================================== list == */
 
-.council-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
+.council-list,
+.council-seats {
   margin: 0;
-  padding: 0;
-  list-style: none;
 }
 
 .council-row {
@@ -96,21 +92,18 @@
 }
 
 .council-row-link {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+  padding: 0;
   color: var(--text);
   text-decoration: none;
 }
 
-.council-row-active .council-row-link {
-  border-color: var(--accent);
-  background: var(--accent-quiet);
+.council-row-active {
+  border-left: 2px solid var(--border-strong);
+  background: var(--surface-raised);
 }
 
 .council-row-question {
@@ -154,23 +147,10 @@
 
 /* =================================================================== seats == */
 
-.council-seats {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
 .council-seat {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
 }
 
 .council-seat-head {
@@ -233,6 +213,21 @@
   line-height: var(--leading-normal);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+
+.council-seat-more summary {
+  cursor: pointer;
+}
+
+.council-seat-more p {
+  margin: var(--space-2) 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .council-seat-abstained {
@@ -245,24 +240,24 @@
 /* ============================================================= leaderboard == */
 
 .council-leaderboard {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
+  width: 100%;
+  border-collapse: collapse;
+  max-width: var(--measure-prose);
+  font-size: var(--text-base);
 }
 
-.council-leaderboard-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-3);
+.council-leaderboard th,
+.council-leaderboard td {
   padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  font-size: var(--text-sm);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+
+.council-leaderboard thead th {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
 }
 
 .council-leaderboard-seat {
@@ -273,19 +268,22 @@
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
+  text-align: right !important;
 }
 
 .council-leaderboard-n {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--text-faint);
+  text-align: right !important;
 }
 
 /* =============================================================== synthesis == */
 
 .council-synthesis {
   margin: 0;
-  font-size: var(--text-sm);
+  max-width: var(--measure-prose);
+  font-size: var(--text-base);
   line-height: var(--leading-normal);
   color: var(--text);
   overflow-wrap: anywhere;

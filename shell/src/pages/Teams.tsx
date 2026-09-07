@@ -222,9 +222,9 @@ function InFlight({ teams, runs }: { teams: TeamView[]; runs: TeamRun[] }) {
       <h2 className="teams-flight-title">
         In flight <span className="teams-flight-count">{live.length}</span>
       </h2>
-      <ul className="teams-flight-list">
+      <ul className="ui-rows teams-flight-list">
         {live.map((run) => (
-          <li key={run.id}>
+          <li key={run.id} className="ui-rows-row">
             <LiveTask run={run} team={teams.find((row) => row.id === run.team_id) ?? null} />
           </li>
         ))}

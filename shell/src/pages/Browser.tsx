@@ -55,11 +55,16 @@ import "./browser.css";
  */
 export function Browser() {
   const sessions = useBrowserSessions();
+  const health = useBrowserHealth();
   const [chainDialogue, setChainDialogue] = useState<{ sessionId: number; chain: string[] } | null>(null);
 
   return (
     <>
-      <PageHeader title="Browser" headline={headline(sessions.data)} />
+      <PageHeader
+        title="Browser"
+        headline={headline(sessions.data)}
+        actions={health.data?.subsystem == null ? undefined : <StateBadge domain="pillar" state={health.data.subsystem.status} />}
+      />
 
       <LiveSessions
         view={sessions}
@@ -78,7 +83,7 @@ export function Browser() {
 
       <SiteGrants />
 
-      <BrowserHealth />
+      <BrowserHealth health={health} />
     </>
   );
 }
@@ -139,7 +144,7 @@ function LiveSessions({
       {view.data === undefined && !view.isError && <p className="browser-loading">reading the open sessions…</p>}
       {view.data !== undefined && rows.length === 0 && <p className="browser-empty">nothing is open right now.</p>}
       {rows.length > 0 && (
-        <ul className="browser-list" aria-label="Live sessions">
+        <ul className="ui-rows" aria-label="Live sessions">
           {rows.map((session) => (
             <SessionRow
               key={session.id}
@@ -178,7 +183,7 @@ function SessionRow({
   const redirected = session.final_url !== session.requested_url && session.final_url !== "";
 
   return (
-    <li className="browser-card">
+    <li className="ui-rows-row browser-session">
       <div className="browser-card-head">
         <span className="browser-card-mode">{MODE_COPY[session.mode]}</span>
         <span className="browser-meta">{session.project_id ?? "no project"}</span>
@@ -451,7 +456,7 @@ function SiteGrants() {
             <p className="browser-empty">{projectId} has not logged into anything yet.</p>
           )}
           {rows.length > 0 && (
-            <ul className="browser-list" aria-label="Site grants">
+            <ul className="ui-rows" aria-label="Site grants">
               {rows.map((site) => (
                 <SiteRow
                   key={site.origin}
@@ -511,7 +516,7 @@ function SiteRow({
   pending: boolean;
 }) {
   return (
-    <li className="browser-row">
+    <li className="ui-rows-row browser-row">
       <div className="browser-row-head">
         <span className="browser-url">{site.origin}</span>
         <Badge tone={site.kind === "destination" ? "info" : "shadow"}>{site.kind}</Badge>
@@ -561,7 +566,7 @@ function WriteRecord({ projectId }: { projectId: string }) {
         <p className="browser-empty">nothing has been submitted from this profile.</p>
       )}
       {rows.length > 0 && (
-        <ul className="browser-list" aria-label="Submitted forms">
+        <ul className="ui-rows" aria-label="Submitted forms">
           {rows.map((wrote) => (
             <WriteRow key={wrote.id} wrote={wrote} />
           ))}
@@ -578,7 +583,7 @@ function WriteRow({ wrote }: { wrote: Written }) {
   const more = wrote.field_count - wrote.fields.length;
 
   return (
-    <li className="browser-row">
+    <li className="ui-rows-row browser-row">
       <div className="browser-row-head">
         <span className="browser-url">{wrote.action}</span>
         <Badge tone="info">{wrote.method}</Badge>
@@ -610,8 +615,7 @@ function WriteRow({ wrote }: { wrote: Written }) {
 
 /* ------------------------------------------------------------- 5. health -- */
 
-function BrowserHealth() {
-  const health = useBrowserHealth();
+function BrowserHealth({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
   const subsystem = health.data?.subsystem ?? null;
   const sidecar = health.data?.sidecar ?? null;
 

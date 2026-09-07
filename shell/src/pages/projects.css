@@ -28,7 +28,6 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  max-width: 64rem;
 }
 
 .pj-note {
@@ -115,7 +114,6 @@
  */
 .pj-concerns {
   margin: 0 0 var(--space-4);
-  max-width: 64rem;
 }
 
 .pj-concern-list {
@@ -390,8 +388,8 @@
 .pj-file-text {
   margin: 0;
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  line-height: var(--leading-snug);
+  font-size: var(--text-sm);
+  line-height: 1.45;
   white-space: pre;
   tab-size: 4;
 }
@@ -448,7 +446,7 @@
    than the number field and narrower than a path, because the longest row here is a model label. */
 .pj-field-select {
   max-width: 26rem;
-  font-family: var(--font-sans);
+  font-family: var(--font-body);
 }
 
 .pj-field-input:focus-visible {
@@ -541,8 +539,8 @@
   overflow: auto;
   overscroll-behavior: none;
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  line-height: var(--leading-snug);
+  font-size: var(--text-sm);
+  line-height: 1.45;
   color: var(--text-muted);
   background: var(--surface-sunken);
   border: 1px solid var(--border);

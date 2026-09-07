@@ -48,14 +48,30 @@ export function RunDetail() {
   return <KnownRun id={id} />;
 }
 
+/**
+ * The way back to the index, above the title.
+ *
+ * "Back to the index" was the last line of the page, under the stored output — so the
+ * way out was reachable only by scrolling past everything somebody had come to read,
+ * and it was drawn three times over the page's three states. One crumb, at the top,
+ * where a person looks when they realise they are in the wrong run.
+ */
+function Crumb() {
+  return (
+    <p className="mb-2 text-xs">
+      <Link to="/runs">Runs</Link>
+    </p>
+  );
+}
+
 function UnknownRun({ raw }: { raw: string | undefined }) {
   return (
     <>
+      <Crumb />
       <PageHeader title="Run" />
       <ErrorNote>
         <code>{raw ?? "(nothing)"}</code> is not a run id — runs are numbered.
       </ErrorNote>
-      <Link to="/runs">Back to the index</Link>
     </>
   );
 }
@@ -69,17 +85,39 @@ function KnownRun({ id }: { id: number }) {
   if (detail === undefined) {
     return (
       <>
+        <Crumb />
         <PageHeader title={`Run ${id}`} />
         {run.isError ? <DetailError error={run.error} /> : <p className="runs-loading">reading run {id}…</p>}
-        <Link to="/runs">Back to the index</Link>
       </>
     );
   }
 
   const alive = runIsAlive(detail.status);
 
+  /*
+    Keyed, and in an array, because the order changes with `alive` and `RunTail` holds
+    the text it has accumulated in state. Reordered as bare JSX, React would reconcile
+    by position: the moment a run ended, the tail would unmount and everything a person
+    was reading would be replaced by "recorded — this run has no live tail". With keys
+    it moves and keeps what it has.
+  */
+  const blocks = [
+    <FactsPanel key="facts" run={detail} />,
+    <GateBlock key="gate" run={detail} />,
+    /* After the deterministic gate and before the output, which is the order a person
+       reads them in: what the suite said, then why the run ended, then what it printed
+       on the way. */
+    <StopBlock key="stop" id={id} alive={alive} />,
+    <RunTail key="tail" id={id} alive={alive} recorded={detail.stdout} />,
+    <StdStreams key="streams" run={detail} />,
+  ];
+  /* While the run is going, what it is writing right now is the only block on this page
+     that is changing, and it was fourth. A live run is watched, not read. */
+  if (alive) blocks.unshift(...blocks.splice(3, 1));
+
   return (
     <>
+      <Crumb />
       <PageHeader
         title={`Run ${id}`}
         headline={headline(detail)}
@@ -110,21 +148,52 @@ function KnownRun({ id }: { id: number }) {
       {cancel.isError && <MutationNote error={cancel.error} what="that run could not be cancelled" />}
       {release.isError && <MutationNote error={release.error} what="that worktree could not be released" />}
 
-      <FactsPanel run={detail} />
-      <GateBlock run={detail} />
-      {/* After the deterministic gate and before the output, which is the order
-          a person reads them in: what the suite said, then why the run ended,
-          then what it printed on the way. */}
-      <StopBlock id={id} alive={alive} />
-      <RunTail id={id} alive={alive} recorded={detail.stdout} />
-      <StdStreams run={detail} />
+      <Instruments run={detail} />
+
+      {blocks}
+
       {/* Absent, not disabled. `steerable` was decided when the run was created
           and cannot change, so nothing a person could do here would make this
           run listen — a greyed-out box would be an invitation to try. */}
       {detail.steerable && <SteeringBox id={id} running={detail.status === "running"} />}
-
-      <Link to="/runs">Back to the index</Link>
     </>
+  );
+}
+
+/* ----------------------------------------------------------- instruments -- */
+
+/**
+ * The four readings of a run, on one line under the header.
+ *
+ * They were spread over a headline that said them as prose and a panel that said them
+ * again as a definition list — "still going; $0.0310 spent; gate passed" above, a badge
+ * and a bar below. Prose is the wrong shape for a figure that changes every three
+ * seconds: it cannot be compared with the same figure on the run before it, and it puts
+ * a number in the middle of a sentence where the eye has to parse to find it.
+ *
+ * So the figures are drawn as themselves, in one row, in the order the questions are
+ * asked: is it going, did the gate pass, what has it cost, how full is it.
+ */
+function Instruments({ run }: { run: Run }) {
+  return (
+    <div className="mb-4">
+      <div className="runs-gate-line">
+        <StateBadge domain="run" state={run.status} />
+        <StateBadge domain="gate" state={run.gate_status} />
+        <CostLine
+          costUsd={run.cost_usd}
+          inputTokens={run.input_tokens}
+          outputTokens={run.output_tokens}
+          cachedTokens={run.cache_read_tokens}
+        />
+        {/* A bar needs a width to be a bar. It takes the slack rather than a fixed
+            column, so on a wide window it is a readable gauge and on a narrow one it
+            wraps whole instead of collapsing to a dash. */}
+        <div className="min-w-[14rem] flex-1">
+          <ContextMeter fill={run.context_fill} />
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -133,10 +202,11 @@ function KnownRun({ id }: { id: number }) {
 function FactsPanel({ run }: { run: Run }) {
   return (
     <Panel title="This run">
+      {/* Status, cost and context fill were here and are now the strip under the header:
+          they are the readings somebody arrives asking for, and they were four scrolls
+          into a definition list. What is left is what a definition list is for — the
+          fixed facts of a run, read once. */}
       <dl className="runs-facts">
-        <Fact label="Status">
-          <StateBadge domain="run" state={run.status} />
-        </Fact>
         <Fact label="Project">{run.project_id ?? "no project"}</Fact>
         <Fact label="Session">{run.session_id ?? "none recorded"}</Fact>
         {/* Absent is not zero. A run killed before it reported has no exit code,
@@ -145,14 +215,6 @@ function FactsPanel({ run }: { run: Run }) {
         <Fact label="Turns">{run.num_turns === null ? "none recorded" : String(run.num_turns)}</Fact>
         <Fact label="Steerable">{run.steerable ? "yes — it accepts more turns" : "no"}</Fact>
       </dl>
-
-      <CostLine
-        costUsd={run.cost_usd}
-        inputTokens={run.input_tokens}
-        outputTokens={run.output_tokens}
-        cachedTokens={run.cache_read_tokens}
-      />
-      <ContextMeter fill={run.context_fill} />
 
       {/*
         The handoff link. The núcleo has recorded it since handoffs existed and
@@ -195,14 +257,17 @@ function GateBlock({ run }: { run: Run }) {
   const measured = run.gate_status !== null && run.gate_status.trim() !== "";
   return (
     <Panel title="Gate">
-      <p className="runs-gate-line">
-        <StateBadge domain="gate" state={run.gate_status} />
-        {measured && (
+      {/* The VERDICT is the second instrument in the strip above — it is a reading, and a
+          reading belongs where the other three are. What stays here is the evidence
+          behind it, which is not a badge: the exit code, the sentence for a run nothing
+          measured, and whatever the suite printed. */}
+      {measured && (
+        <p className="runs-gate-line">
           <span className="runs-gate-exit">
             {run.gate_exit_code === null ? "no exit code recorded" : `exit ${run.gate_exit_code}`}
           </span>
-        )}
-      </p>
+        </p>
+      )}
       {!measured && (
         <p className="runs-gate-note">
           Nothing measured this run. There is no gate configured for it, so there is nothing that
@@ -517,13 +582,17 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
   return prose === "" || prose === refusal.code ? {} : { [refusal.code]: prose };
 }
 
-/** One derived sentence about where this run got to. */
+/**
+ * One derived sentence about where this run got to.
+ *
+ * **No figures.** It used to read "still going; $0.0310 spent; gate passed", and all
+ * three of those are readings that belong in the strip below it, drawn as themselves:
+ * a spend written into a sentence cannot be compared with the spend on the run before,
+ * and a semicolon list of three states is a table somebody typed out. What is left is
+ * the one thing that is genuinely prose — what this run was for, and where it ran.
+ */
 function headline(run: Run): string {
   const state = runIsAlive(run.status) ? "still going" : `ended ${run.status}`;
-  const spend = run.cost_usd === null ? "no cost recorded" : `$ ${run.cost_usd.toFixed(4)} spent`;
-  const gate =
-    run.gate_status === null || run.gate_status.trim() === ""
-      ? "no gate measured it"
-      : `gate ${run.gate_status}`;
-  return `${state}; ${spend}; ${gate}`;
+  const where = run.project_id === null ? "no project" : `in ${run.project_id}`;
+  return `${state}, ${where}`;
 }

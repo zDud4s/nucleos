@@ -134,12 +134,13 @@ function ErrandList({
   answered: boolean;
   selected: string | null;
 }) {
+  if (answered && rows.length === 0) return null;
+
   return (
     <Panel title="Errands" aside={<Count n={answered ? rows.length : undefined} />}>
       {!answered && <p className="errands-loading">reading the errands…</p>}
-      {answered && rows.length === 0 && <p className="errands-empty">no errand has been opened yet.</p>}
       {rows.length > 0 && (
-        <ul className="errands-list" aria-label="Errands">
+        <ul className="ui-rows errands-list" aria-label="Errands">
           {rows.map((row) => (
             <ErrandRow key={row.id} errand={row} active={String(row.id) === selected} />
           ))}
@@ -168,7 +169,7 @@ function investigationText(errand: Errand): string {
 
 function ErrandRow({ errand, active }: { errand: Errand; active: boolean }) {
   return (
-    <li className={active ? "errands-row errands-row-active" : "errands-row"}>
+    <li className={active ? "ui-rows-row errands-row errands-row-active" : "ui-rows-row errands-row"}>
       <Link
         className="errands-row-link"
         to={`/errands/${errand.id}`}
@@ -562,7 +563,7 @@ function RulesPanel({ errandId }: { errandId: number }) {
         <p className="errands-empty">no rule is armed on this errand.</p>
       )}
       {rows.length > 0 && (
-        <ul className="errands-rules" aria-label="Rules">
+        <ul className="ui-rows errands-rules" aria-label="Rules">
           {rows.map((rule) => (
             <RuleRow key={rule.id} errandId={errandId} rule={rule} />
           ))}
@@ -585,7 +586,7 @@ function RuleRow({ errandId, rule }: { errandId: number; rule: ErrandRule }) {
   const del = useDeleteErrandRule();
 
   return (
-    <li className="errands-rule">
+    <li className="ui-rows-row errands-rule">
       <div className="errands-rule-head">
         <span className="errands-rule-name">{rule.name}</span>
         <code className="errands-rule-cron">{rule.cron}</code>

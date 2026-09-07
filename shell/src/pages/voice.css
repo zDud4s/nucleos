@@ -25,16 +25,6 @@
   font-style: italic;
 }
 
-.voice-count {
-  padding: 0.1em var(--space-2);
-  border-radius: var(--radius-pill);
-  background: var(--tone-pending-bg);
-  color: var(--tone-pending-fg);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-variant-numeric: tabular-nums;
-}
-
 /* ---------------------------------------------------------------- capture -- */
 
 .voice-capture-buttons {

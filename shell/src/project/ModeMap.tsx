@@ -253,20 +253,22 @@ function Headline({ data }: { data: ProjectMap }) {
 
   return (
     <div>
-      <p className="mt-1 font-display text-3xl text-text">
+      <p className="mt-1 font-display text-3xl font-bold tabular-nums text-text">
         {modules.length}
-        <span className="ml-2 text-sm text-text-faint">
-          module{modules.length === 1 ? "" : "s"} this reader could read
-        </span>
+      </p>
+      <p className="mt-1 text-xs uppercase tracking-wide text-text-faint">
+        module{modules.length === 1 ? "" : "s"} this reader could read
       </p>
       {declared.citing > 0 ? (
-        <p className="mt-2 font-display text-3xl text-text">
-          {declared.saying}
-          <span className="ml-2 text-sm text-text-faint">
+        <>
+          <p className="mt-2 font-display text-3xl font-bold tabular-nums text-text">
+            {declared.saying}
+          </p>
+          <p className="mt-1 text-xs uppercase tracking-wide text-text-faint">
             of {declared.citing} file{declared.citing === 1 ? "" : "s"} naming a section say which
             document it belongs to
-          </span>
-        </p>
+          </p>
+        </>
       ) : null}
       <p className="mt-1 text-xs text-text-muted">
         joined by {links} link{links === 1 ? "" : "s"}

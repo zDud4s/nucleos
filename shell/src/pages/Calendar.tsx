@@ -299,16 +299,22 @@ export function Calendar() {
 
   return (
     <>
+      {/* The page's kind, not a link: this IS the calendar, and a crumb that points at
+          the page you are on is a door to the room you are standing in. It is here so
+          that the heading can be spent on the period, which is the thing that changes. */}
+      <p className="mb-2 text-xs text-text-faint">Calendar</p>
       <PageHeader
-        title="Calendar"
-        headline={headline(rows, anchor, view, config.data)}
-        actions={<BusyIndicator busy={busy.data?.busy} />}
-      />
-
-      <Panel
+        /*
+          "August 2026" and not "Calendar". Paging is the gesture this page is used
+          through — Prev, Next, Month, Week — and after every one of them the largest
+          words on the screen said the same thing they said before the press. The period
+          is what the press changed, so the period takes the rank.
+        */
         title={label}
-        aside={
+        headline={headline(rows, anchor, view, config.data)}
+        actions={
           <div className="calendar-nav">
+            <BusyIndicator busy={busy.data?.busy} />
             <div className="calendar-views" role="group" aria-label="Calendar view">
               <button
                 type="button"
@@ -341,7 +347,9 @@ export function Calendar() {
             </Button>
           </div>
         }
-      >
+      />
+
+      <Panel>
         {events.isError && rows.length === 0 && <EventsError error={events.error} />}
         {events.data === undefined && !events.isError && <p className="calendar-loading">reading the month…</p>}
         {events.data !== undefined &&
@@ -369,7 +377,11 @@ export function Calendar() {
         {move.isError && <MoveError error={move.error} />}
       </Panel>
 
-      <Panel title="Selected day">
+      {/* Untitled, because the sheet inside already names the day it is showing — with
+          the marks that qualify it — as its own heading. "Selected day" above that was a
+          label for a thing the next line said better, and it was the same label on every
+          day of the year. */}
+      <Panel>
         <DaySheet
           slot={selected}
           occurrences={byDay.get(dateKeyOf(selected.day)) ?? []}
@@ -444,7 +456,7 @@ export function HeldNotifications() {
   return (
     <Panel title="Held notifications" variant="dim">
       <p className="calendar-note">
-        `calendar.rs` fails OPEN by design — a database it cannot read answers "not busy" rather than
+        calendar.rs fails OPEN by design — a database it cannot read answers "not busy" rather than
         staying silent, since silence here is a message that never arrived.
       </p>
       {pending.isError && rows.length === 0 && <NotificationsError error={pending.error} />}
@@ -452,7 +464,7 @@ export function HeldNotifications() {
       {held.length > 0 && (
         <>
           <p className="calendar-subhead">held right now</p>
-          <ul className="calendar-notifications" aria-label="Held notifications">
+          <ul className="ui-rows calendar-notifications" aria-label="Held notifications">
             {held.map((row) => (
               <NotificationRow key={row.id} row={row} />
             ))}
@@ -462,7 +474,7 @@ export function HeldNotifications() {
       {released.length > 0 && (
         <>
           <p className="calendar-subhead">held, then let through</p>
-          <ul className="calendar-notifications" aria-label="Released notifications">
+          <ul className="ui-rows calendar-notifications" aria-label="Released notifications">
             {released.map((row) => (
               <NotificationRow key={row.id} row={row} />
             ))}
@@ -480,7 +492,7 @@ function NotificationsError({ error }: { error: unknown }) {
 
 function NotificationRow({ row }: { row: PendingNotification }) {
   return (
-    <li className="calendar-notification">
+    <li className="ui-rows-row calendar-notification">
       <span className="calendar-notification-kind">{row.kind}</span>
       <p className="calendar-notification-summary">{row.summary}</p>
       <RelativeTime at={row.queued_at} />
