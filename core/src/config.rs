@@ -1259,8 +1259,40 @@ pub struct CouncilConfig {
     /// over `load_models_config`'s on purpose: the operator is told, and nothing is spent guessing.
     #[serde(default = "default_council_rounds")]
     pub rounds: u32,
+    /// Which of the daemon's own decisions get the council's opinion before a person sees them.
+    ///
+    /// Absent means none of them, which is what every roster written before this field already
+    /// meant. `#[serde(default)]` on the struct AND on each flag, so `consumers: { job_review:
+    /// true }` is a legal half-answer: an operator turning one on should not have to write the
+    /// other down to leave it alone.
+    #[serde(default)]
+    pub consumers: CouncilConsumers,
     pub chairman: SeatSpec,
     pub members: Vec<SeatSpec>,
+}
+
+/// The internal callers a configured council is allowed to advise.
+///
+/// **Both false by default, and both are advice rather than authority.** A consumer costs minutes
+/// of paid deliberation in front of something that was going to happen anyway, so neither is
+/// inherited — and neither decides anything: the job's `review` node still runs and still writes
+/// its own opinion, and a proposal gets a NOTE on its event log while the human keeps the verdict.
+/// `.ai/decisions.md` fixed that second half — the arbiter of an ambiguity is the person, and the
+/// council gates nothing — so a flag here that approved anything would contradict a standing
+/// decision rather than extend a feature.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CouncilConsumers {
+    /// Before a job's `review` node starts, put the job's task to the council and leave the
+    /// synthesis in the job's artifacts directory for the node to read. The job waits while the
+    /// council deliberates.
+    #[serde(default)]
+    pub job_review: bool,
+    /// When a run is stopped for an approval, put the refused action to the council and write the
+    /// synthesis onto the proposal as a note. Best-effort and out of band: the proposal is created
+    /// and the run is parked exactly as they were, whatever the council does or fails to do.
+    #[serde(default)]
+    pub proposal_advice: bool,
 }
 
 fn default_council_timeout() -> u64 {
@@ -2942,6 +2974,45 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         // parse branch reports it. Asserted because the OUTCOME has to be the same either way —
         // there is no council, and the daemon still boots.
         assert!(council_config_from(&format!("rounds: -1\n{A_GOOD_ROSTER}"), true).is_none());
+    }
+
+    /// The default is the one that matters here: every roster ever written predates this field, and
+    /// each consumer spends minutes of paid deliberation in front of something that was going to
+    /// happen anyway. Inheriting either by upgrading is the failure this test exists to catch.
+    #[test]
+    fn a_roster_that_says_nothing_about_consumers_advises_nobody() {
+        let silent = council_config_from(A_GOOD_ROSTER, true).unwrap();
+        assert!(!silent.consumers.job_review);
+        assert!(!silent.consumers.proposal_advice);
+
+        // And a half-answer leaves the other half alone rather than being refused for being
+        // incomplete: turning one consumer on must not require writing the other one down.
+        let half = council_config_from(
+            &format!("consumers: {{ job_review: true }}\n{A_GOOD_ROSTER}"),
+            true,
+        )
+        .expect("naming one consumer is a complete roster");
+        assert!(half.consumers.job_review);
+        assert!(!half.consumers.proposal_advice);
+
+        let both = council_config_from(
+            &format!("consumers: {{ job_review: true, proposal_advice: true }}\n{A_GOOD_ROSTER}"),
+            true,
+        )
+        .unwrap();
+        assert!(both.consumers.job_review && both.consumers.proposal_advice);
+
+        // `deny_unknown_fields` on the nested struct too. A misspelt consumer that parsed into a
+        // silent `false` would be the worst kind of failure here: the operator believes they have
+        // turned advice on, the daemon boots, and nothing ever says otherwise.
+        assert!(
+            council_config_from(
+                &format!("consumers: {{ job_reviews: true }}\n{A_GOOD_ROSTER}"),
+                true
+            )
+            .is_none(),
+            "a misspelt consumer is an arrest, not a consumer that quietly stays off"
+        );
     }
 
     #[test]

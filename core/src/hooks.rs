@@ -2281,7 +2281,7 @@ async fn pause_for_approval(
         return;
     }
 
-    if let Err(error) = crate::proposals::create_action_approval(
+    let recorded = crate::proposals::create_action_approval(
         &state.pool,
         run_id,
         session_id.as_deref(),
@@ -2290,8 +2290,13 @@ async fn pause_for_approval(
         &reason,
         Some(&tool_input),
     )
-    .await
-    {
+    .await;
+
+    if let Ok(proposal_id) = &recorded {
+        advise_on_proposal(&state, *proposal_id, &tool_name, &reason, &tool_input);
+    }
+
+    if let Err(error) = recorded {
         tracing::warn!(
             run_id,
             %error,
@@ -2336,6 +2341,149 @@ async fn pause_for_approval(
                 "pretooluse-decision: could not roll back an unapprovable pause — this project is blocked until restart"
             ),
         }
+    }
+}
+
+/// How often the advice looks to see whether the council has settled.
+///
+/// Fifteen seconds against a deliberation measured in minutes: the poll costs one indexed lookup by
+/// primary key, and the alternative — a channel the council signals — would mean `council.rs`
+/// knowing that proposals exist, which is a dependency in the wrong direction for a feature that is
+/// best-effort by design.
+const PROPOSAL_ADVICE_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long the advice waits before giving up on a council.
+///
+/// Longer than any roster's `timeout_seconds` may be (`MAX_COUNCIL_TIMEOUT_SECONDS` is an hour, per
+/// SEAT, and a council runs its seats in parallel), so this is a backstop against a driver that
+/// died rather than a second clock racing the first one. `council::reconcile` settles an abandoned
+/// council at the next daemon startup, so the usual end of a stuck council is a terminal status
+/// arriving late, not this ceiling — but a daemon that never restarts would otherwise leave this
+/// task alive for the process's whole life.
+const PROPOSAL_ADVICE_CEILING: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
+/// The question the council is asked about a refused action.
+///
+/// Deliberately phrased as "what should the person weigh", not "should this be allowed". The
+/// council is not the arbiter here and must not be invited to behave like one — `.ai/decisions.md`
+/// fixed that the arbiter of an ambiguity is the human, and a synthesis written as a verdict is one
+/// a tired person approves without reading.
+fn proposal_advice_question(tool_name: &str, reason: &str, tool_input: &str) -> String {
+    format!(
+        "An autonomous agent was stopped mid-task because it tried to do something the daemon would \
+         not let it do unsupervised. A person is going to decide whether to allow it. You are NOT \
+         that person and you are not deciding: say what they should weigh.\n\n\
+         The tool it reached for: {tool_name}\n\
+         Why it was stopped: {reason}\n\
+         What it asked for: {tool_input}\n\n\
+         What could this do that is not obvious from reading it? What would make it safe, and what \
+         would make it a mistake? If it is plainly routine, say so plainly — a long answer to an \
+         easy question wastes the reader's attention on the one that is not."
+    )
+}
+
+/// Puts a council behind a proposal, so the person deciding it has an opinion to read.
+///
+/// **A NOTE, never a verdict.** `proposals::note` writes a `proposal_events` row whose `from_status`
+/// and `to_status` are both the status the proposal already has — it decides nothing, and it exists
+/// for exactly this. `transition` is not called here and must not be: `.ai/decisions.md` records
+/// that the arbiter of an ambiguity is the human and that the council gates nothing, so a council
+/// approving its own advice would contradict a standing decision rather than extend a feature.
+///
+/// **Best-effort, exactly like `record_refused_action` beside it.** Detached into its own task and
+/// returning nothing: the proposal is already written and the run is already parked by the time
+/// this starts, and failing to advise must not change what happens to either. Off unless the owner
+/// asked — `advises_proposals` is false with no roster, which is the shipped state.
+fn advise_on_proposal(
+    state: &AppState,
+    proposal_id: i64,
+    tool_name: &str,
+    reason: &str,
+    tool_input: &str,
+) {
+    if !state.council.advises_proposals() {
+        return;
+    }
+    let state = state.clone();
+    let question = proposal_advice_question(tool_name, reason, tool_input);
+    tokio::spawn(async move {
+        let council_id = match crate::council::start(&state, &question, None).await {
+            Ok(id) => id,
+            // Unreachable while `advises_proposals` implies a roster, and silent anyway: "there is
+            // no council" is not a failure of the proposal.
+            Err(crate::council::StartError::NotConfigured) => return,
+            Err(error) => {
+                tracing::warn!(
+                    proposal_id,
+                    %error,
+                    "a proposal's council would not start; the proposal stands unadvised"
+                );
+                return;
+            }
+        };
+        note_the_council_on(
+            &state,
+            proposal_id,
+            &council_id,
+            PROPOSAL_ADVICE_POLL,
+            PROPOSAL_ADVICE_CEILING,
+        )
+        .await;
+    });
+}
+
+/// Waits for one council to settle and writes its synthesis onto a proposal as a note.
+///
+/// The clock is a parameter rather than the constants above, so the tests can walk both endings —
+/// a council that answers and one that never does — without spending the real ceiling on the second
+/// one.
+///
+/// Every ending except "settled with a synthesis" leaves the proposal untouched: a council that
+/// errored, one that was cancelled, one whose row vanished, one whose chairman left no transcript,
+/// and one that outran the ceiling. The proposal is a thing a person will decide either way, and a
+/// note saying the council failed would be a line of noise in the one place attention is scarce.
+async fn note_the_council_on(
+    state: &AppState,
+    proposal_id: i64,
+    council_id: &str,
+    poll: std::time::Duration,
+    ceiling: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + ceiling;
+    loop {
+        match crate::council::get_council_row(&state.pool, council_id).await {
+            Ok(Some(row)) if row.is_settled() => {
+                let Some(synthesis) = crate::council::synthesis_of(&state.pool, &row).await else {
+                    return;
+                };
+                if let Err(error) = crate::proposals::note(
+                    &state.pool,
+                    proposal_id,
+                    &format!("a council was asked about this action and said:\n\n{synthesis}"),
+                )
+                .await
+                {
+                    tracing::warn!(proposal_id, council_id, %error, "could not note a council on a proposal");
+                }
+                return;
+            }
+            Ok(Some(_)) => {}
+            // Gone: pruned, or deleted. Nothing to wait for.
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(proposal_id, council_id, %error, "could not read a proposal's council");
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                proposal_id,
+                council_id,
+                "a proposal's council did not settle within the ceiling; the proposal stands unadvised"
+            );
+            return;
+        }
+        tokio::time::sleep(poll).await;
     }
 }
 
@@ -2597,6 +2745,202 @@ mod tests {
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    // -- The council behind a proposal -------------------------------------------------------
+
+    /// A council row written by hand, plus the run whose transcript is its synthesis.
+    ///
+    /// The synthesis is not a column. It is the transcript of the run in `chairman_run_id`, so a
+    /// test that wrote it onto `council_runs` would be testing a shape the daemon does not have.
+    async fn seed_council(
+        pool: &sqlx::SqlitePool,
+        id: &str,
+        status: &str,
+        synthesis: Option<&str>,
+    ) {
+        let chairman_run_id = match synthesis {
+            Some(text) => Some(
+                sqlx::query(
+                    "INSERT INTO runs (project_id, prompt, status, mode, created_at, stdout)
+                     VALUES ('project-a', 'synthesize', 'completed', 'assistant', ?, ?)",
+                )
+                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(text)
+                .execute(pool)
+                .await
+                .expect("insert the chairman's run")
+                .last_insert_rowid(),
+            ),
+            None => None,
+        };
+        sqlx::query(
+            "INSERT INTO council_runs
+               (id, created_at, question, status, stage, anon_seed, chairman_kind, chairman_ref,
+                chairman_run_id)
+             VALUES (?, ?, 'what should the person weigh', ?, 3, ?, 'cloud', 'the-chairman', ?)",
+        )
+        .bind(id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(status)
+        .bind(id)
+        .bind(chairman_run_id)
+        .execute(pool)
+        .await
+        .expect("insert a council");
+    }
+
+    /// A run and the action-approval proposal it was stopped for.
+    async fn seed_proposal(pool: &sqlx::SqlitePool) -> i64 {
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-a', 'do the thing', 'awaiting_approval', 'worktree', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .expect("insert a run")
+        .last_insert_rowid();
+        proposals::create_action_approval(
+            pool,
+            run_id,
+            None,
+            Some("project-a"),
+            "Bash",
+            "unrecognized command",
+            Some("rm -rf build"),
+        )
+        .await
+        .expect("record the proposal")
+    }
+
+    async fn events_of(pool: &sqlx::SqlitePool, id: i64) -> Vec<(String, String, String)> {
+        sqlx::query_as(
+            "SELECT from_status, to_status, note FROM proposal_events
+             WHERE proposal_id = ? ORDER BY id",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The shape of the whole feature, in one assertion: the council's answer arrives as an EVENT
+    /// on a proposal that is still `pending`.
+    ///
+    /// `from_status` and `to_status` are both the status the proposal already had, which is what
+    /// makes this a note rather than a decision. `.ai/decisions.md` fixed that the arbiter of an
+    /// ambiguity is the human and that the council gates nothing, so a `transition` call here would
+    /// contradict a standing decision rather than extend a feature.
+    #[tokio::test]
+    async fn an_advised_proposal_gets_a_note_and_no_verdict() {
+        let state = test_state().await;
+        let proposal_id = seed_proposal(&state.pool).await;
+        seed_council(
+            &state.pool,
+            "council-1",
+            crate::council::STATUS_DONE,
+            Some("this deletes a build directory and nothing else"),
+        )
+        .await;
+
+        note_the_council_on(
+            &state,
+            proposal_id,
+            "council-1",
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let events = events_of(&state.pool, proposal_id).await;
+        assert_eq!(events.len(), 2, "creation, then the note: {events:?}");
+        let (from, to, note) = &events[1];
+        assert_eq!(from, "pending");
+        assert_eq!(to, "pending", "a note moves nothing");
+        assert!(note.contains("this deletes a build directory and nothing else"));
+
+        // And the proposal itself is exactly where the person left it.
+        let proposal = proposals::get(&state.pool, proposal_id)
+            .await
+            .unwrap()
+            .expect("the proposal still exists");
+        assert_eq!(proposal.status, "pending");
+        assert_eq!(proposal.decided_at, None);
+    }
+
+    /// Every ending that is not "settled with a synthesis" leaves the proposal untouched: a council
+    /// that runs past the ceiling, one that errored, one whose row has gone, and one that finished
+    /// with no transcript to read.
+    ///
+    /// Untouched rather than annotated, deliberately. A note saying the council failed would be a
+    /// line of noise in the one place a person's attention is scarce, and the person was always
+    /// going to decide this without help.
+    #[tokio::test]
+    async fn a_council_that_never_answers_leaves_the_proposal_as_it_was() {
+        for (label, status, synthesis) in [
+            ("still running", Some(crate::council::STATUS_RUNNING), None),
+            ("errored", Some(crate::council::STATUS_ERROR), None),
+            (
+                "done with no transcript",
+                Some(crate::council::STATUS_DONE),
+                None,
+            ),
+            ("pruned", None, None),
+        ] {
+            let state = test_state().await;
+            let proposal_id = seed_proposal(&state.pool).await;
+            if let Some(status) = status {
+                seed_council(&state.pool, "council-1", status, synthesis).await;
+            }
+
+            // A ceiling already passed, so the "still running" case walks the give-up path in one
+            // look rather than in two hours of it.
+            note_the_council_on(
+                &state,
+                proposal_id,
+                "council-1",
+                Duration::from_millis(1),
+                Duration::from_millis(0),
+            )
+            .await;
+
+            let events = events_of(&state.pool, proposal_id).await;
+            assert_eq!(
+                events.len(),
+                1,
+                "a council that {label} writes nothing onto the proposal: {events:?}"
+            );
+            let proposal = proposals::get(&state.pool, proposal_id)
+                .await
+                .unwrap()
+                .expect("the proposal still exists");
+            assert_eq!(proposal.status, "pending", "{label}");
+        }
+    }
+
+    /// The consumer ships off, and off means the council is never even asked. Asserted on the
+    /// runtime rather than through the spawn, because the spawn is a detached task with nothing to
+    /// await -- the guard is the only thing that can be checked deterministically, and it is also
+    /// the only thing standing between a shipped daemon and a deliberation nobody asked for.
+    #[tokio::test]
+    async fn a_daemon_with_no_roster_advises_no_proposal() {
+        let state = test_state().await;
+        assert!(
+            !state.council.advises_proposals(),
+            "no roster is the shipped state and it must advise nobody"
+        );
+
+        // A proposal recorded through the real path writes exactly its own creation event.
+        let proposal_id = seed_proposal(&state.pool).await;
+        advise_on_proposal(
+            &state,
+            proposal_id,
+            "Bash",
+            "unrecognized command",
+            "rm -rf build",
+        );
+        assert_eq!(events_of(&state.pool, proposal_id).await.len(), 1);
     }
 
     /// The real middleware, not a stand-in that inserts the extension directly: the handler now

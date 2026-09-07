@@ -327,6 +327,19 @@ nobody agreed to pay for. The reads stay open — a council already run is still
 roster is removed — and `config::load_council_config` warns and falls back rather than erroring, so a
 typo in a list of model names cannot stop the daemon and take mail, autopilot and the API with it.
 
+**Two of the daemon's own paths may now convene one, and both are opt-in and off by default.**
+`consumers: { job_review, proposal_advice }` in the same roster file is what turns them on, so the
+sentence above still holds in its stronger form: nothing convenes a council until the owner writes
+a file, and nothing convenes one *without a person asking each time* until the owner writes two
+more words in it. Neither consumer decides anything. A job's `review` node still runs and the
+project's deterministic gate still holds ship/no-ship — the council's synthesis only lands in the
+job's artifacts directory as `council.md` for the node to read. A proposal receives a
+`proposal_events` **note** whose `from_status` and `to_status` are both the status it already had;
+`proposals::transition` is never called, because the arbiter of an ambiguity is the human. The spend
+is bounded by the same `budget_permits_new_run` read every council makes at `start`, and both
+consumers fail open in the direction of *less* autonomy: a council that will not start, errors, is
+cancelled, is pruned or leaves no synthesis is walked past, never waited on.
+
 ## Existing barriers
 
 - `core/src/classifier.rs` is a pure deterministic lexical classifier. `CLASSIFIER_VERSION = 2`; it returns `allow`, `deny`, or `pending_approval` together with an `action_class`. It performs no I/O, makes no database access, and has no knowledge of run state.

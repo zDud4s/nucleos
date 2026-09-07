@@ -613,6 +613,25 @@ impl CouncilRuntime {
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
     }
+
+    /// Whether a job's review node should be given a council's synthesis to read first.
+    ///
+    /// Asked of the runtime rather than of `config().consumers` at the call site, so "there is no
+    /// council at all" and "the council was not asked to advise this" collapse into one answer. A
+    /// consumer reading the flag itself would have to remember the `is_some_and`, and forgetting it
+    /// is a panic on the shipped configuration — no roster is the state this daemon ships in.
+    pub fn advises_job_review(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| config.consumers.job_review)
+    }
+
+    /// Whether a proposal the daemon writes should carry a council's opinion as a note.
+    pub fn advises_proposals(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| config.consumers.proposal_advice)
+    }
 }
 
 /// One seat as it is stored and read back.
@@ -734,6 +753,30 @@ pub async fn get_council_row(
         .bind(id)
         .fetch_optional(pool)
         .await
+}
+
+impl CouncilRow {
+    /// Whether this council is over, however it ended.
+    ///
+    /// The positive list, for the reason [`TERMINAL_COUNCIL_STATUSES`] gives: spelled as
+    /// `!= running`, a status added later and forgotten would read as SETTLED, and an internal
+    /// consumer waiting on one would walk on with no synthesis while the council was still
+    /// deliberating. This way the same oversight only makes it wait.
+    pub fn is_settled(&self) -> bool {
+        TERMINAL_COUNCIL_STATUSES.contains(&self.status.as_str())
+    }
+}
+
+/// The chairman's synthesis, or `None` when there is not one to read.
+///
+/// The same read `get_council` does to fill `CouncilView::synthesis`, lifted out because it is now
+/// asked for off the HTTP path too — a job's review node and a proposal's note both want the text
+/// and neither is a client. **The synthesis is not a column**: it is the transcript of the run in
+/// `chairman_run_id`, so a council that ended `error` before phase 3, or one whose transcript has
+/// since been pruned by `runs::prune_transcripts`, answers `None` rather than an empty string. A
+/// caller must treat that as "no advice", never as "the council advised nothing".
+pub async fn synthesis_of(pool: &sqlx::SqlitePool, row: &CouncilRow) -> Option<String> {
+    transcript_of(pool, row.chairman_run_id?).await
 }
 
 pub async fn get_seat_rows(pool: &sqlx::SqlitePool, id: &str) -> sqlx::Result<Vec<SeatRow>> {
@@ -3334,6 +3377,7 @@ mod tests {
             // One second, so a hung seat is a fast test rather than a ten-minute one.
             timeout_seconds: 1,
             rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+            consumers: crate::config::CouncilConsumers::default(),
             chairman: spec(SeatKind::Cloud, "the-chairman"),
             members: (0..members)
                 .map(|index| spec(SeatKind::Cloud, &format!("model-{index}")))
@@ -4007,6 +4051,7 @@ mod tests {
         let config = CouncilConfig {
             timeout_seconds: 1,
             rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+            consumers: crate::config::CouncilConsumers::default(),
             chairman: spec(SeatKind::Cloud, "the-chairman"),
             members: vec![
                 spec(SeatKind::Cloud, "a-cloud-model"),
@@ -4421,6 +4466,7 @@ mod tests {
             Some(CouncilConfig {
                 timeout_seconds: 1,
                 rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+                consumers: crate::config::CouncilConsumers::default(),
                 chairman: spec(SeatKind::Cloud, "the-chairman"),
                 members: vec![agent_spec("cetico"), spec(SeatKind::Cloud, "a-plain-model")],
             }),
@@ -4534,6 +4580,7 @@ mod tests {
             Some(CouncilConfig {
                 timeout_seconds: 1,
                 rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+                consumers: crate::config::CouncilConsumers::default(),
                 chairman: spec(SeatKind::Cloud, "the-chairman"),
                 members: vec![agent_spec("cetico")],
             }),
@@ -4604,6 +4651,7 @@ mod tests {
             Some(CouncilConfig {
                 timeout_seconds: 1,
                 rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+                consumers: crate::config::CouncilConsumers::default(),
                 chairman: spec(SeatKind::Cloud, "the-chairman"),
                 members: vec![agent_spec("cetico")],
             }),
@@ -4653,6 +4701,7 @@ mod tests {
             Some(CouncilConfig {
                 timeout_seconds: 1,
                 rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+                consumers: crate::config::CouncilConsumers::default(),
                 chairman: spec(SeatKind::Cloud, "the-chairman"),
                 members: vec![agent_spec("cetico"), agent_spec("economista")],
             }),
@@ -4755,6 +4804,7 @@ mod tests {
             Some(CouncilConfig {
                 timeout_seconds: 1,
                 rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+                consumers: crate::config::CouncilConsumers::default(),
                 chairman: spec(SeatKind::Cloud, "the-chairman"),
                 members: vec![agent_spec("cetico")],
             }),
