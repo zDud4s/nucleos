@@ -12,16 +12,21 @@ import {
   declaredRule,
   foldPathPrefix,
   foldPrefix,
+  useDeclarableGitOps,
   useDeclarableGithubOps,
+  useDeclareGitOp,
   useDeclareGithubOp,
   useDeclareLandTarget,
   useDeclareShellRule,
+  useForgetGitOp,
   useForgetGithubOp,
   useForgetLandTarget,
   useForgetShellRule,
+  useProjectGitOps,
   useProjectGithubOps,
   useProjectLandTargets,
   useProjectShellRules,
+  type DeclarableGitOp,
   type DeclarableOp,
   type Note,
   type ShellRule,
@@ -33,10 +38,11 @@ import { Button, Quiet, RefusalNote, Section } from "../ui";
  * "What may this project do without asking?"
  *
  * The fifth mode, and it earns the tab by the rule the other four are held to: it has a subject of
- * its own — this project's authority, which is three tables and not a setting — and a shape of its
- * own, four sections read top to bottom rather than a grid of panels. §5 of the design fixes the
- * order and the reason for it: the remote first, because that is what somebody arrives to look at,
- * and the government under it.
+ * its own — this project's authority, which is four tables and not a setting — and a shape of its
+ * own, five sections read top to bottom rather than a grid of panels. §5 of
+ * `.ai/specs/2026-09-03-alcada-por-projecto-design.md` and §7 of
+ * `.ai/specs/2026-09-06-git-ops-declaraveis-design.md` fix the order and the reason for it: the
+ * remote first, because that is what somebody arrives to look at, and the government under it.
  *
  * **Everything below the first section is a live autonomy control and not a configuration edit.**
  * `hooks.rs` reads the shell table per tool call, with no cache and no restart, so a rule declared
@@ -68,6 +74,10 @@ export function ModeGithub({ projectId }: ModeGithubProps) {
 
       <Section label="What runs on its own">
         <AutonomousOps projectId={projectId} />
+      </Section>
+
+      <Section label="What the queue may do on its own">
+        <GitOps projectId={projectId} />
       </Section>
 
       <Section label="What the worktrees may run">
@@ -626,7 +636,190 @@ const OUTSIDE_THE_CEILING = "outside the compiled ceiling — nothing on this ma
 const OUTSIDE_AND_DECLARED =
   "declared here, and outside the compiled ceiling — it does not run, and the row is still yours to withdraw";
 
-/* -------------------------------------- 3. what the worktrees may run -- */
+/* -------------------------------- 3. what the queue may do on its own -- */
+
+/**
+ * The git operations an autonomous run may hand to the shared queue as already consented.
+ *
+ * **One list and no GitHub halves.** Every row is a write the queue performs in the same way; a
+ * `half` would suggest the live-read versus inert-action distinction that belongs only to GitHub.
+ * The project list is still served raw, so a declaration this build no longer constructs is drawn
+ * below the catalogue and remains withdrawable instead of disappearing from its owner's view.
+ *
+ * **The paragraph is part of the control.** A tick changes who the queue waits for, not who runs the
+ * command, and only after both parsing and shell-rule precedence have admitted that path. The
+ * spellings and rebase caveat are written beside the boxes because they are the cases most likely
+ * to make a truthful grant look broken when an autonomous run meets one.
+ */
+function GitOps({ projectId }: { projectId: string }) {
+  const catalogue = useDeclarableGitOps();
+  const mine = useProjectGitOps(projectId);
+  const declare = useDeclareGitOp();
+  const forget = useForgetGitOp();
+
+  const refused =
+    (declare.isError && isApiRefusal(declare.error) ? declare.error : null) ??
+    (forget.isError && isApiRefusal(forget.error) ? forget.error : null);
+
+  if (catalogue.isPending || mine.isPending) {
+    return <p className="text-sm text-text-faint">Reading what the queue may do…</p>;
+  }
+
+  if (catalogue.data === undefined || mine.data === undefined) {
+    return (
+      <ReadFailed
+        read={catalogue.data === undefined ? catalogue : mine}
+        says="what this project's queue may do on its own"
+      />
+    );
+  }
+
+  const declared = new Set(mine.data);
+  const pending = declare.isPending || forget.isPending;
+  const built = new Set(catalogue.data.map((operation) => operation.kind));
+  const stranded = mine.data.filter((kind) => !built.has(kind)).sort();
+
+  function toggle(kind: string, on: boolean) {
+    if (on) declare.mutate({ projectId, opKind: kind });
+    else forget.mutate({ projectId, opKind: kind });
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+        <p className="max-w-3xl text-xs text-text-muted">
+          Ticking a box never lets the agent run the command. For autonomous runs only, the shared
+          queue executes the declared operation while the agent's tool call still comes back denied
+          with a ticket id; a person never waited for approval, so these grants do not change
+          person-run commands. A matching shell rule <span className="font-mono">deny</span> wins and
+          makes the tick do nothing. A grant covers only spellings the queue can build: bare{" "}
+          <span className="font-mono">git push</span>, <span className="font-mono">-u</span>,{" "}
+          <span className="font-mono">--force</span>, and{" "}
+          <span className="font-mono">git branch -D</span> still stop and ask. A{" "}
+          <span className="font-mono">rebase</span> requested by a run comes back as a blocked ticket
+          because that run holds the branch, and the ticket says which worktree holds it.
+        </p>
+
+        <GitOpList
+          ops={catalogue.data}
+          declared={declared}
+          pending={pending}
+          onToggle={toggle}
+        />
+      </div>
+
+      {stranded.length === 0 ? null : (
+        <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+          <p className="text-xs uppercase tracking-wide text-text-faint">No longer built</p>
+          <p className="max-w-3xl text-xs text-text-muted">
+            This project's table names git operations this daemon does not build. They grant
+            nothing, and the rows remain here so they can be withdrawn.
+          </p>
+          <ul className="flex flex-col gap-1">
+            {stranded.map((kind) => (
+              <li
+                key={kind}
+                aria-label={`git operation ${kind}`}
+                className="flex flex-wrap items-baseline gap-2 text-sm"
+              >
+                <span className="rounded-pill border border-border bg-surface-sunken px-2 py-0.5 font-mono text-xs text-text-muted">
+                  {kind}
+                </span>
+                <button
+                  type="button"
+                  disabled={pending}
+                  onClick={() => toggle(kind, false)}
+                  className="ml-auto text-xs text-text-faint underline-offset-2 hover:underline disabled:opacity-40"
+                >
+                  withdraw
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {refused === null ? null : <RefusalNote refusal={refused} sentences={GIT_OP_SENTENCES} />}
+    </div>
+  );
+}
+
+/**
+ * Draw the machine's single git-operation catalogue without inventing GitHub-style halves.
+ *
+ * `declarable: false` is still handled even though this build's six rows are all true: the route's
+ * shape makes the ceiling explicit, and a future build may narrow it. Such a row is a fact rather
+ * than a disabled control, while a declaration already stored for it keeps the one legal gesture
+ * that narrows authority again.
+ */
+function GitOpList({
+  ops,
+  declared,
+  pending,
+  onToggle,
+}: {
+  ops: DeclarableGitOp[];
+  declared: Set<string>;
+  pending: boolean;
+  onToggle: (kind: string, on: boolean) => void;
+}) {
+  if (ops.length === 0) {
+    return <p className="text-xs text-text-faint">This daemon builds no queue operations.</p>;
+  }
+
+  return (
+    <ul className="flex flex-col gap-1">
+      {ops.map((operation) => (
+        <li
+          key={operation.kind}
+          aria-label={`git operation ${operation.kind}`}
+          className="flex flex-wrap items-baseline gap-2 text-sm"
+        >
+          {operation.declarable ? (
+            <label className="flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={declared.has(operation.kind)}
+                disabled={pending}
+                onChange={(event) => onToggle(operation.kind, event.target.checked)}
+              />
+              <span className="font-mono text-xs text-text">{operation.kind}</span>
+            </label>
+          ) : (
+            <>
+              <span className="rounded-pill border border-border bg-surface-sunken px-2 py-0.5 font-mono text-xs text-text-muted">
+                {operation.kind}
+              </span>
+              <span className="text-xs text-text-faint">
+                {declared.has(operation.kind) ? OUTSIDE_AND_DECLARED : OUTSIDE_THE_CEILING}
+              </span>
+              {declared.has(operation.kind) ? (
+                <button
+                  type="button"
+                  disabled={pending}
+                  onClick={() => onToggle(operation.kind, false)}
+                  className="ml-auto text-xs text-text-faint underline-offset-2 hover:underline disabled:opacity-40"
+                >
+                  withdraw
+                </button>
+              ) : null}
+            </>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+const GIT_OP_SENTENCES: Record<string, string> = {
+  kill_switch:
+    "the emergency stop is engaged, and granting a queue operation widens what autonomous runs may do. Withdrawing one is never blocked by it.",
+  no_such_project: "the núcleo has no project by this name.",
+  no_such_op: "this project had not declared that git operation.",
+  internal: "the núcleo hit an error of its own writing it down.",
+};
+
+/* -------------------------------------- 4. what the worktrees may run -- */
 
 /**
  * The two lists, `allow` and `deny`, with the rule that orders them written on the page.
@@ -1138,7 +1331,7 @@ function DeclareRule({
   );
 }
 
-/* -------------------------------------------- 4. where the work lands -- */
+/* -------------------------------------------- 5. where the work lands -- */
 
 /**
  * The integration branch, and the branches a `--land` may name besides it.
