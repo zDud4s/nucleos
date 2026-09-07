@@ -80,6 +80,73 @@
   outline-offset: 1px;
 }
 
+/* The roster control, which is shut on most visits and is laid out as part of
+   the form rather than as a panel of its own: a card inside a card is the
+   nesting this shell already has too much of, and the hairline says "still the
+   same form, one step further in" without spending a second surface on it. */
+
+.council-roster-open {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.council-roster {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.council-roster-seats {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* The row's control and its Remove sit on one line, aligned at the bottom so
+   the button lines up with the select and not with the label above it. */
+.council-roster-seat {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+}
+
+.council-roster-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+/* Same recipe as the textarea above, including the two resets: the field's
+   label is uppercase and faint, and a control that inherited those would be
+   shouting its own value back at the reader. */
+.council-select {
+  width: 100%;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.council-select:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
 /* =================================================================== list == */
 
 .council-list {
