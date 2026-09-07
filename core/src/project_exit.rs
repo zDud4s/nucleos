@@ -44,6 +44,11 @@ const PROJECT_SCOPED: &[&str] = &[
     "jobs",
     "map_decisions",
     "project_commands",
+    // The same species as its neighbours, and the resurrection argument below bites hardest here:
+    // a row in this table is a standing grant to perform a git operation — a push, a merge — for an
+    // autonomous run without asking anybody. Forgetting a project and adding the folder back must
+    // not hand its runs that authority again on the strength of a decision nobody remembers making.
+    "project_git_ops",
     "project_github_ops",
     // Per-project configuration, the same species as its three neighbours here: which brain judges
     // what the rules did not recognise, on this project. It is history in the sense this list means

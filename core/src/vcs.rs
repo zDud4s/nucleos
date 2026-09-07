@@ -467,6 +467,48 @@ impl Op {
     }
 }
 
+/// Every operation kind this queue can construct, as `Op::kind()` spells them.
+///
+/// A list rather than an `Op::all()`, because the variants carry data and a catalogue has no
+/// arguments to invent. What keeps the two honest is
+/// `every_op_kind_is_in_the_declarable_catalogue`, which builds one of each variant and asks: a
+/// seventh operation that never reached this list would be one the queue performs and no project
+/// can declare, and nothing else in the tree would say so.
+pub const GIT_OP_KINDS: [&str; 6] = ["merge", "push", "tag", "fetch", "rebase", "branch-delete"];
+
+/// One operation a project may declare, with the flag the shell draws it by.
+///
+/// `declarable` is always `true` today and the field is not decoration: the GitHub catalogue's
+/// `false` rows are how an operation this build refuses is drawn as a FACT rather than as a
+/// checkbox that cannot be ticked. Serving the shape now means the day a ceiling arrives is a
+/// change of value and not a change of wire.
+///
+/// **Not a reuse of `github::OpStanding`/`DeclarableOpView`**: those carry `half`, which separates
+/// a read that is in force from an action that is recorded and inert. These six are all writes the
+/// queue performs the same way, and a `half` here would be a field with no meaning.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeclarableGitOp {
+    pub kind: &'static str,
+    pub declarable: bool,
+}
+
+/// PURE: `GIT_OP_KINDS`, wrapped for the wire a picker draws its checkboxes from.
+///
+/// The GitHub analogue, `github::every_op`, has to consult two ceilings and stamp a `half` per
+/// operation because its catalogue is bigger than what a project may ask for. This queue has no
+/// such gap: everything in `GIT_OP_KINDS` is something the queue performs and something a project
+/// may declare, in lockstep, so there is nothing here to compute — every row comes back
+/// `declarable: true`, and the day that stops being true is the day this stops being a `map`.
+pub fn declarable_git_ops() -> Vec<DeclarableGitOp> {
+    GIT_OP_KINDS
+        .iter()
+        .map(|kind| DeclarableGitOp {
+            kind,
+            declarable: true,
+        })
+        .collect()
+}
+
 /// Who is asking, which decides whether the request needs a human's sign-off before it may queue.
 ///
 /// A human's order in an interactive session already is the approval — asking again two seconds
@@ -1226,9 +1268,9 @@ pub fn unqueueable_but_shared(command: &str) -> Option<String> {
     }
 }
 
-/// Admits a request into the queue and returns its row id. Provenance alone decides the initial
-/// status: `Human`/`Shell` already carry their approval and start `queued`; `Run`/`Job` are
-/// autonomous and start `awaiting_approval`.
+/// Admits a request into the queue and returns its row id. Provenance and the project's declaration
+/// decide the initial status: through this ordinary door, `Human`/`Shell` already carry their
+/// approval and start `queued`; `Run`/`Job` are autonomous and start `awaiting_approval`.
 ///
 /// **Nothing writes the transition out of `awaiting_approval`, and that is settled rather than
 /// pending.** This said it belonged to Chunk 4 "alongside the `proposals.rs` wiring that grants it".
@@ -1246,6 +1288,27 @@ pub async fn submit(
     origin: Origin,
 ) -> sqlx::Result<i64> {
     submit_on(pool, repo, op, origin).await
+}
+
+/// `submit`, for an operation kind the project declared in advance.
+///
+/// This is a door of its own rather than a branch inside `submit`, because the truth it asserts is
+/// different: consent was given earlier and elsewhere, before this command existed. `Origin` must
+/// still record who asked, so a run remains `Origin::Run(id)` rather than being rewritten as
+/// `Origin::Human`. The latter would be the same kind of audit lie this module refuses for
+/// `Origin::Shell`.
+///
+/// `Origin::needs_approval` answers whether the provenance brings its own approval. A human or
+/// shell order does; a run or job request does not. Here the project's declaration brings the
+/// approval instead, so the request starts `queued`. This does not wake or transition a row out of
+/// `awaiting_approval`; it steps past that state when the row is created.
+pub async fn submit_declared(
+    pool: &sqlx::SqlitePool,
+    repo: &ResolvedRepo,
+    op: &Op,
+    origin: Origin,
+) -> sqlx::Result<i64> {
+    admit(pool, repo, op, origin, "queued", false).await
 }
 
 /// `submit`, against a caller's own executor, so an admission can be part of a larger transaction.
@@ -1268,7 +1331,12 @@ pub async fn submit_on<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    admit(executor, repo, op, origin, false).await
+    let status = if origin.needs_approval() {
+        "awaiting_approval"
+    } else {
+        "queued"
+    };
+    admit(executor, repo, op, origin, status, false).await
 }
 
 /// `submit`, for the landing that comes OUT of a conflict resolution.
@@ -1289,7 +1357,12 @@ pub async fn submit_resolution(
     op: &Op,
     origin: Origin,
 ) -> sqlx::Result<i64> {
-    admit(pool, repo, op, origin, true).await
+    let status = if origin.needs_approval() {
+        "awaiting_approval"
+    } else {
+        "queued"
+    };
+    admit(pool, repo, op, origin, status, true).await
 }
 
 async fn admit<'e, E>(
@@ -1297,16 +1370,12 @@ async fn admit<'e, E>(
     repo: &ResolvedRepo,
     op: &Op,
     origin: Origin,
+    status: &str,
     from_resolution: bool,
 ) -> sqlx::Result<i64>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let status = if origin.needs_approval() {
-        "awaiting_approval"
-    } else {
-        "queued"
-    };
     let created_at = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
         "INSERT INTO vcs_requests (op, args, project_id, project_root, repo_key, origin, run_id, status, created_at, from_resolution)
@@ -1348,6 +1417,16 @@ pub struct ClaimedRequest {
     /// would either skip the check that exists to catch a flattened resolution, or apply it to every
     /// branch anybody ever asked to land.
     pub from_resolution: bool,
+    /// Which run asked for this, if any — `None` for a human, a shell order, or a job.
+    ///
+    /// **This field deliberately lowers the bar above.** No executor branches on it — an audit field
+    /// carries no behavioural difference for anything to differ ON — so by that bar alone it would
+    /// not belong here. It is admitted anyway because the alternative is worse: the only other place
+    /// to find it is the row itself, and `claim_next`'s own doc comment already warns what re-reading
+    /// a row after the fact gets you — "whatever won a race" rather than what this claim actually
+    /// held. `run_id` travels with the claim so the feed entry `drain_once` writes for it reports the
+    /// run this operation was really performed for, not a row that may since have moved on.
+    pub run_id: Option<i64>,
 }
 
 /// How a claimed request ended.
@@ -1499,7 +1578,11 @@ pub async fn claim_next(
 ) -> sqlx::Result<Option<ClaimedRequest>> {
     let started_at = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
-    let claimed: Option<(i64, String, String, String, String, bool)> = sqlx::query_as(
+    // The tuple is the `RETURNING` clause's own shape and lives exactly as long as the next few
+    // lines, which turn it into `ClaimedRequest`. Naming a struct for it would put the column order
+    // in two places and invite them to drift; carrying `run_id` is what pushed it past the lint.
+    #[allow(clippy::type_complexity)]
+    let claimed: Option<(i64, String, String, String, String, bool, Option<i64>)> = sqlx::query_as(
         "UPDATE vcs_requests
             SET status = 'running', started_at = ?1
           WHERE id = (
@@ -1510,14 +1593,14 @@ pub async fn claim_next(
             AND NOT EXISTS (
               SELECT 1 FROM vcs_requests WHERE repo_key = ?2 AND status = 'running'
             )
-         RETURNING id, op, args, project_id, project_root, from_resolution",
+         RETURNING id, op, args, project_id, project_root, from_resolution, run_id",
     )
     .bind(started_at)
     .bind(repo_key)
     .fetch_optional(&mut *transaction)
     .await?;
 
-    let Some((id, op, args, project_id, project_root, from_resolution)) = claimed else {
+    let Some((id, op, args, project_id, project_root, from_resolution, run_id)) = claimed else {
         // Nothing was changed, so the rollback this drop performs is the same as a commit.
         return Ok(None);
     };
@@ -1537,6 +1620,7 @@ pub async fn claim_next(
                 project_id,
                 project_root,
                 from_resolution,
+                run_id,
             }))
         }
         Err(error) => {
@@ -2432,34 +2516,25 @@ pub async fn drain_once(
         // row — the row is what the feed is reporting on, and reading it back would report whatever
         // won a race rather than what this operation did.
         //
-        // `None` for `run_id`: `ClaimedRequest` does not carry one and `claim_next` does not return
-        // one, and widening its `RETURNING` to supply it would buy nothing today.
+        // `claimed.run_id` for `run_id`, not a re-read of the row: same argument as the line above,
+        // and the same reason `ClaimedRequest.run_id`'s own doc comment gives for carrying the field
+        // at all — this claim is the one true account of what was executed and for whom, and the row
+        // could have moved on by the time anyone went back to look at it.
         //
-        // **What that rests on is that nothing in production builds a `Run` request at all today.**
-        // The only mapping from a caller to `Origin::Run` is `http.rs`'s `vcs_origin`, and a run
-        // token opens exactly one route — `POST /hooks/pretooluse-decision` (`auth.rs`) — which is
-        // not the one that reaches `submit`; `vcs_origin`'s own doc comment says as much seven lines
-        // above that arm. Every `submit(.., Origin::Run(..))` in the tree is inside a
-        // `#[cfg(test)] mod tests`. So `run_id` is NULL on every row this table holds, claimable or
-        // not, and this `None` throws nothing away.
-        //
-        // **This paragraph used to promise that Chunk 4 would open the route to a run scope, and
-        // that promise contradicted `auth.rs`.** Chunk 4 has since landed and did the opposite, on
-        // purpose: `auth.rs` argues at length that `POST /vcs/requests` is a sibling of
-        // `/email/send` rather than of `/runs` — *"Queueing is Admin's"* — and `Scope::Run` still
-        // reaches exactly one route. What Chunk 4 opened instead is the door a human already stood
-        // at: `runs::resume_approved_run` translates an approved action and admits it in the same
-        // transaction, as `Origin::Human`, because a person just authorised it.
-        //
-        // So `run_id` is NULL on every row in production and this `None` still throws nothing away.
-        // Two consequences worth stating rather than leaving to be rediscovered: `Origin::Run`,
-        // `needs_approval`, `cancel_for_run` and `reap_requests_of_ended_runs` are correct and
-        // DORMANT — they have nothing to match, because no production row carries a `run_id` — and
-        // they are kept rather than deleted because they are what the design needs the day a scope
-        // is invented that may queue on its own behalf. Whoever invents it changes `auth.rs` first,
-        // and this comment second.
-        // (`reconcile_interrupted` and `reap_requests_of_ended_runs` do attach one, because they
-        // read whole rows rather than a claim.)
+        // **`Origin::Run`, `needs_approval`, `cancel_for_run` and `reap_requests_of_ended_runs` are no
+        // longer dormant in the way this comment used to mean it.** `submit_declared` is a real,
+        // production-shaped door for a `Run`-origin row: it admits straight to `queued` on the
+        // strength of a project's PRIOR declaration (`project_policy::declare_git_op`, listed and
+        // withdrawn through `/projects/{id}/git-ops`), and it is called from inside the
+        // PreToolUse hook — the moment a session's own git command is classified — on the strength of
+        // what the PROJECT declared in advance, not on the run's behalf. That is the shape `auth.rs`
+        // is left untouched for: no route opens to `Scope::Run`, because the daemon submitting a
+        // declared operation is never the run asking for itself — it is the hook honouring a consent
+        // Admin already gave, exactly as `runs::resume_approved_run`'s door is a human giving one in
+        // the moment. `auth.rs`'s own argument — `POST /vcs/requests` is a sibling of `/email/send`
+        // rather than of `/runs`, *"Queueing is Admin's"* — holds for the declared door for the same
+        // reason it holds for the ordinary one: it was Admin who authorised this, whichever moment
+        // that authorisation was actually given in.
         Ok(()) => {
             // **An escalation carries its reason into the summary; nothing else does.** The other
             // statuses are answers to a question somebody asked and is waiting on, so the id and
@@ -2479,7 +2554,7 @@ pub async fn drain_once(
                 Some(claimed.project_id.as_str()),
                 "vcs_request_finished",
                 &summary,
-                None,
+                claimed.run_id,
             )
             .await;
         }
@@ -3042,6 +3117,44 @@ mod tests {
     }
 
     #[test]
+    fn every_op_kind_is_in_the_declarable_catalogue() {
+        // One of each variant, so adding a seventh to `Op` fails here rather than shipping an
+        // operation the queue performs and no project can declare.
+        let one_of_each = [
+            Op::Merge {
+                source: Branch::new("a").unwrap(),
+                target: Branch::new("b").unwrap(),
+            },
+            Op::Push {
+                remote: Remote::new("origin").unwrap(),
+                branch: Branch::new("a").unwrap(),
+            },
+            Op::Tag {
+                name: TagName::new("v1").unwrap(),
+                at: Branch::new("a").unwrap(),
+            },
+            Op::Fetch {
+                remote: Remote::new("origin").unwrap(),
+            },
+            Op::BranchDelete {
+                branch: Branch::new("a").unwrap(),
+            },
+            Op::Rebase {
+                branch: Branch::new("a").unwrap(),
+                onto: Branch::new("b").unwrap(),
+            },
+        ];
+        for op in &one_of_each {
+            assert!(
+                GIT_OP_KINDS.contains(&op.kind()),
+                "{} is not declarable",
+                op.kind()
+            );
+        }
+        assert_eq!(GIT_OP_KINDS.len(), one_of_each.len());
+    }
+
+    #[test]
     fn an_unknown_operation_is_refused_rather_than_guessed() {
         assert!(Op::from_stored("rm_rf", "{}").is_err());
     }
@@ -3125,6 +3238,141 @@ mod tests {
 
         assert_eq!(run_id_of(&pool, from_run).await, Some(7));
         assert_eq!(run_id_of(&pool, from_job).await, None);
+    }
+
+    /// The contrast `submit_declared` exists to draw: through the ORDINARY door, `Origin::Run` still
+    /// waits for a human, exactly as `an_autonomous_request_waits_for_approval_before_it_can_queue`
+    /// above already pins. What follows is the declared door landing the same origin somewhere else.
+    #[tokio::test]
+    async fn a_declared_git_op_from_a_run_is_queued_rather_than_awaiting_approval() {
+        // The row records that a RUN asked — `Origin::Human` would be a lie of the kind this module
+        // already refuses for `Shell` — and it starts `queued`, because the project consented before
+        // the command existed.
+        let pool = test_pool().await;
+        let repo = repo_for("alpha");
+        let op = Op::Push {
+            remote: Remote::new("origin").unwrap(),
+            branch: Branch::new("feat/x").unwrap(),
+        };
+        let id = submit_declared(&pool, &repo, &op, Origin::Run(7))
+            .await
+            .unwrap();
+
+        assert_eq!(status_of(&pool, id).await, "queued");
+        let origin: String = sqlx::query_scalar("SELECT origin FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(origin, "run");
+        assert_eq!(run_id_of(&pool, id).await, Some(7));
+    }
+
+    /// `run_id` now travels from the claim into the feed row `drain_once` writes for it — the point
+    /// of this task. Before it, `drain_once` hard-coded `None` there (see this file's own account of
+    /// why that used to be safe, on `finish`'s `Ok(())` arm above), so a declared git op finished
+    /// leaving no trace of which run it was for anywhere a person actually looks.
+    #[tokio::test]
+    async fn a_finished_git_op_names_its_run_in_the_feed() {
+        let pool = test_pool().await;
+        // A live run, or `reap_requests_of_ended_runs` — `drain_once`'s own pull-half sweep, run
+        // before every claim — reaps this request as belonging to a run whose row does not exist,
+        // exactly as `a_deleted_runs_queued_git_op_is_reaped_with_the_already_ended_reason` pins.
+        // This test is about what a request that DOES get claimed and finished carries, so the run
+        // has to still be alive when the drain runs.
+        insert_run(&pool, 7, "running").await;
+        let repo = repo_for("alpha");
+        submit_declared(&pool, &repo, &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+
+        drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
+
+        let feed_run_id: Option<i64> =
+            sqlx::query_scalar("SELECT run_id FROM feed WHERE kind = 'vcs_request_finished'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            feed_run_id,
+            Some(7),
+            "the feed row for a declared git op must name the run that asked for it"
+        );
+    }
+
+    /// The declared door's own version of `cancelling_a_run_cancels_the_requests_it_had_not_started`
+    /// — pinned separately because that test does not check the exact reason a reader sees, and the
+    /// reason is the whole point of a cancellation nobody watched happen.
+    #[tokio::test]
+    async fn a_timed_out_runs_queued_git_op_is_cancelled_with_the_run_ended_reason() {
+        let pool = test_pool().await;
+        insert_run(&pool, 7, "timed_out").await;
+        let repo = repo_for("alpha");
+        let id = submit_declared(&pool, &repo, &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+
+        assert_eq!(cancel_for_run(&pool, 7).await.unwrap(), 1);
+        assert_eq!(status_of(&pool, id).await, "cancelled");
+        assert_eq!(
+            failure_reason_of(&pool, id).await,
+            "the run that asked for this ended before it started"
+        );
+    }
+
+    /// The declared door's version of `a_request_whose_run_row_is_gone_is_reaped_rather_than_kept_for_ever`
+    /// — pinned separately for the same reason the cancellation twin above is: the exact reason is
+    /// what a person reads, and nothing else here checks it.
+    #[tokio::test]
+    async fn a_deleted_runs_queued_git_op_is_reaped_with_the_already_ended_reason() {
+        let pool = test_pool().await;
+        insert_run(&pool, 7, "running").await;
+        let repo = repo_for("alpha");
+        let id = submit_declared(&pool, &repo, &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM runs WHERE id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reap_requests_of_ended_runs(&pool, "alpha").await.unwrap(),
+            1
+        );
+        assert_eq!(status_of(&pool, id).await, "cancelled");
+        assert_eq!(
+            failure_reason_of(&pool, id).await,
+            "the run that asked for this had already ended when the queue reached it"
+        );
+    }
+
+    /// `completed` is deliberately absent from `runs::ENDED_RUN_STATUSES` — a run that finished its
+    /// work normally asked for this git op and should have it, exactly as this constant's own doc
+    /// comment argues. The reaper is what proves that in code, because it is the one of the two
+    /// retirement paths that reads run status at all: `cancel_for_run` takes no status and is never
+    /// called for a `completed` run in the first place — `runs.rs` gates that call on `ends_the_run`,
+    /// which shares this same list — so there is nothing for a `completed`-run test to exercise there.
+    #[tokio::test]
+    async fn a_completed_runs_declared_git_op_is_not_reaped() {
+        assert!(
+            !crate::runs::ENDED_RUN_STATUSES.contains(&"completed"),
+            "a run that finished normally asked for this merge and should have it — that is why \
+             `completed` is deliberately excluded from the list the reaper reads"
+        );
+
+        let pool = test_pool().await;
+        insert_run(&pool, 7, "completed").await;
+        let repo = repo_for("alpha");
+        let id = submit_declared(&pool, &repo, &merge_op(), Origin::Run(7))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reap_requests_of_ended_runs(&pool, "alpha").await.unwrap(),
+            0
+        );
+        assert_eq!(status_of(&pool, id).await, "queued");
     }
 
     #[tokio::test]

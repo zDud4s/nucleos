@@ -10,16 +10,21 @@ import {
   declaredVerdict,
   foldPathPrefix,
   foldPrefix,
+  useDeclarableGitOps,
   useDeclarableGithubOps,
+  useDeclareGitOp,
   useDeclareGithubOp,
   useDeclareLandTarget,
   useDeclareShellRule,
+  useForgetGitOp,
   useForgetGithubOp,
   useForgetLandTarget,
   useForgetShellRule,
+  useProjectGitOps,
   useProjectGithubOps,
   useProjectLandTargets,
   useProjectShellRules,
+  type DeclarableGitOp,
   type DeclarableOp,
   type ShellRule,
   type IntegrationBranch,
@@ -73,6 +78,21 @@ const ADMITTED = CATALOGUE.filter((operation) => operation.declarable).map(
   (operation) => operation.kind,
 );
 
+/**
+ * The compiled git operations this fake's shared queue knows how to build.
+ *
+ * All six are writes with the same queue semantics, so there is deliberately no `half`: importing
+ * the GitHub split here would make the fixture promise a distinction the daemon does not make.
+ */
+const GIT_CATALOGUE: DeclarableGitOp[] = [
+  { kind: "merge", declarable: true },
+  { kind: "push", declarable: true },
+  { kind: "tag", declarable: true },
+  { kind: "fetch", declarable: true },
+  { kind: "rebase", declarable: true },
+  { kind: "branch-delete", declarable: true },
+];
+
 /** The day a rule the fixture declares was written down. Any day that is not today will do. */
 const DECLARED_ON = "2026-03-14 09:41:00";
 
@@ -96,7 +116,7 @@ function ruleKey(tool: string | null, prefix: string): string {
 }
 
 /**
- * The three tables, behind the nine routes.
+ * The four tables, behind the twelve routes.
  *
  * Stateful, because the assertions that matter are about a write and then a read: a POST answering
  * 204 proves only that the request was well formed. What is under test is whether the list the
@@ -106,6 +126,7 @@ function fakeDaemon(project = "alpha") {
   /** Keyed by {@link ruleKey}, holding the whole row the GET serves. */
   const rules = new Map<string, ShellRule>();
   const ops = new Set<string>();
+  const gitOps = new Set<string>();
   const targets = new Set<string>();
   /*
     Where a landing goes with no argument. `declared`, from `autopilot_state.integration_branch` —
@@ -124,8 +145,9 @@ function fakeDaemon(project = "alpha") {
     // The one route here that names no project: the declarable set is compiled into the daemon, so
     // it is the same answer whichever project a page is showing.
     if (path === "/github/declarable-ops") return CATALOGUE;
+    if (path === "/vcs/declarable-ops") return GIT_CATALOGUE;
 
-    const route = /^\/projects\/([^/]+)\/(shell-rules|github-ops|land-targets)$/.exec(path);
+    const route = /^\/projects\/([^/]+)\/(shell-rules|github-ops|git-ops|land-targets)$/.exec(path);
     if (route === null) throw new Error(`the fake daemon has no route for ${method} ${path}`);
     const [, id, table] = route;
 
@@ -199,6 +221,26 @@ function fakeDaemon(project = "alpha") {
       return undefined;
     }
 
+    if (table === "git-ops") {
+      if (method === "GET") return [...gitOps].sort();
+      const opKind = String(body?.op_kind ?? "");
+      if (method === "POST") {
+        if (!GIT_CATALOGUE.some((operation) => operation.kind === opKind)) {
+          throw new ApiRefusal(
+            422,
+            "undeclarable_op",
+            `\`${opKind}\` is not a git operation this queue can build`,
+          );
+        }
+        gitOps.add(opKind);
+        return undefined;
+      }
+      if (!gitOps.delete(opKind)) {
+        throw new ApiRefusal(404, "no_such_op", `${id} has not declared \`${opKind}\``);
+      }
+      return undefined;
+    }
+
     // Two halves, because the route answers both: where a landing goes by default, and the extra
     // places it may be sent. The default is never in `targets` — it is admissible with no row, so a
     // fake that listed it there would make it look closeable.
@@ -236,6 +278,7 @@ function fakeDaemon(project = "alpha") {
       });
     },
     declareOp: (opKind: string) => ops.add(opKind),
+    declareGitOp: (opKind: string) => gitOps.add(opKind),
     declareTarget: (branch: string) => targets.add(branch),
     setIntegration: (arm: IntegrationBranch) => {
       integration = arm;
@@ -309,6 +352,18 @@ describe("the three reads", () => {
 
     // Names, not `gh` command lines — a name is what tells `run_status` from `run_logs`.
     expect(result.current.data).toEqual(["pr_view", "run_list"]);
+  });
+
+  it("reads the declared git ops as a flat list of queue operation names", async () => {
+    fake.declareGitOp("push");
+    fake.declareGitOp("merge");
+
+    const { result } = renderHook(() => useProjectGitOps("alpha"), { wrapper: mount() });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // These are queue operation kinds, not command lines: the route records `push`, not every
+    // spelling of `git push` the parser could recognize.
+    expect(result.current.data).toEqual(["merge", "push"]);
   });
 
   /** Empty is a real answer: it means "nowhere but the integration branch", which needs no row. */
@@ -492,14 +547,32 @@ describe("declaring", () => {
     await waitFor(() => expect(result.current.ops.data).toEqual(["run_list"]));
     expect(result.current.targets.data?.targets).toEqual(["release/next"]);
   });
+
+  it("declares a git op and refreshes the project's raw declaration list", async () => {
+    const { result } = renderHook(
+      () => ({ ops: useProjectGitOps("alpha"), declare: useDeclareGitOp() }),
+      { wrapper: mount() },
+    );
+    await waitFor(() => expect(result.current.ops.isSuccess).toBe(true));
+
+    await act(async () => {
+      await result.current.declare.mutateAsync({ projectId: "alpha", opKind: "push" });
+    });
+
+    await waitFor(() => expect(result.current.ops.data).toEqual(["push"]));
+    expect(fake.sent.find((call) => call.method === "POST")?.body).toEqual({ op_kind: "push" });
+    expect(fake.sent.find((call) => call.method === "POST")?.path).toBe(
+      "/projects/alpha/git-ops",
+    );
+  });
 });
 
 describe("withdrawing", () => {
   /**
    * **The prefix travels in the body**, which is the shape a caller is most likely to get wrong:
    * every other `forget` in this data layer names its subject in the path. A prefix carries spaces
-   * and slashes and is not a safe path segment, so the route takes it in the body — and its two
-   * siblings follow rather than splitting one shape three ways.
+   * and slashes and is not a safe path segment, so the route takes it in the body — and its three
+   * siblings follow rather than splitting one shape four ways.
    */
   it("takes the rule away and names it in the body rather than in the path", async () => {
     fake.declareRule("npm ci", "allow");
@@ -596,6 +669,25 @@ describe("withdrawing", () => {
       branch: "release/next",
     });
   });
+
+  it("withdraws a git op by kind in the request body", async () => {
+    fake.declareGitOp("push");
+
+    const { result } = renderHook(
+      () => ({ ops: useProjectGitOps("alpha"), forget: useForgetGitOp() }),
+      { wrapper: mount() },
+    );
+    await waitFor(() => expect(result.current.ops.data).toEqual(["push"]));
+
+    await act(async () => {
+      await result.current.forget.mutateAsync({ projectId: "alpha", opKind: "push" });
+    });
+
+    await waitFor(() => expect(result.current.ops.data).toEqual([]));
+    const remove = fake.sent.find((call) => call.method === "DELETE");
+    expect(remove?.path).toBe("/projects/alpha/git-ops");
+    expect(remove?.body).toEqual({ op_kind: "push" });
+  });
 });
 
 describe("a refusal reaches the caller with its sentence", () => {
@@ -643,7 +735,7 @@ describe("a refusal reaches the caller with its sentence", () => {
   });
 
   /**
-   * **The second shape, and the one that is not these routes' doing.** Everything the nine handlers
+   * **The second shape, and the one that is not these routes' doing.** Everything the twelve handlers
    * refuse is `{refusal, detail}` JSON; a body axum cannot deserialize at all — a misspelled field,
    * now that all four structs carry `deny_unknown_fields` — is rejected by the extractor before any
    * handler runs, and arrives as axum's own `text/plain`. Both have to reach a page as something it
@@ -941,6 +1033,15 @@ describe("what a project MAY declare", () => {
 
     expect(result.current.mine.data).toEqual(["run_list"]);
     expect(result.current.every.data?.length).toBeGreaterThan(1);
+  });
+
+  it("reads the machine-wide git queue catalogue without a project id or a GitHub half", async () => {
+    const { result } = renderHook(() => useDeclarableGitOps(), { wrapper: mount() });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual(GIT_CATALOGUE);
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/vcs/declarable-ops");
+    expect(result.current.data?.every((operation) => !("half" in operation))).toBe(true);
   });
 });
 

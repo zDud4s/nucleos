@@ -11,6 +11,8 @@ import {
   shellRule,
   type DaemonState,
 } from "../test/harness";
+import { ApiRefusal } from "../data/client";
+import type { DeclarableGitOp } from "../data/project-policy";
 import { ModeGithub } from "./ModeGithub";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -20,11 +22,66 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
+/**
+ * The six queue writes compiled into this daemon build.
+ *
+ * Kept as catalogue rows rather than a string list because the component consumes the route's
+ * actual shape, including the declaration flag. Unlike the GitHub fixture there is no `half`:
+ * every one of these operations is a write the queue performs by the same path.
+ */
+const GIT_CATALOGUE: DeclarableGitOp[] = [
+  { kind: "merge", declarable: true },
+  { kind: "push", declarable: true },
+  { kind: "tag", declarable: true },
+  { kind: "fetch", declarable: true },
+  { kind: "rebase", declarable: true },
+  { kind: "branch-delete", declarable: true },
+];
+
+type ModeGithubState = DaemonState & {
+  gitOps: string[];
+  declarableGitOps: DeclarableGitOp[];
+};
+
 /** Mount the mode over a daemon holding exactly these declarations. */
-function open(overrides: Partial<DaemonState> = {}): DaemonState {
-  const state = daemonState(overrides);
+function open(overrides: Partial<ModeGithubState> = {}): ModeGithubState {
+  const state = Object.assign(daemonState(overrides), {
+    gitOps: overrides.gitOps ?? [],
+    declarableGitOps: overrides.declarableGitOps ?? GIT_CATALOGUE,
+  });
+  const fetch = daemonFetch(state);
   daemon.apiFetch.mockReset();
-  daemon.apiFetch.mockImplementation(daemonFetch(state));
+  daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+    if (path === "/vcs/declarable-ops") return state.declarableGitOps;
+
+    if (/^\/projects\/[^/]+\/git-ops$/.test(path)) {
+      const method = init?.method ?? "GET";
+      if (method === "GET") {
+        if (state.policyReadRefusal !== null) {
+          const { status, code, detail } = state.policyReadRefusal;
+          throw new ApiRefusal(status, code, detail);
+        }
+        return [...state.gitOps].sort();
+      }
+
+      const body =
+        typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null;
+      state.policyWrites.push({ path, method, body });
+      if (state.policyRefusal !== null) {
+        const { status, code, detail } = state.policyRefusal;
+        throw new ApiRefusal(status, code, detail);
+      }
+
+      const kind = String(body?.op_kind ?? "");
+      state.gitOps =
+        method === "DELETE"
+          ? state.gitOps.filter((operation) => operation !== kind)
+          : [...state.gitOps.filter((operation) => operation !== kind), kind];
+      return undefined;
+    }
+
+    return fetch(path, init);
+  });
   renderWithQuery(<ModeGithub projectId="nucleos" />);
   return state;
 }
@@ -165,6 +222,62 @@ describe("what runs on its own", () => {
     const reads = screen.getByText(/consulted at the next decision/i);
     expect(reads.textContent).toMatch(/only while the GitHub pillar is on/i);
     expect(reads.textContent).toContain(".ai/github.yaml");
+  });
+});
+
+describe("what the queue may do on its own", () => {
+  it("renders one checkbox for each of the six git operation kinds", async () => {
+    open();
+
+    const section = await screen.findByRole("region", { name: "What the queue may do on its own" });
+    const boxes = await within(section).findAllByRole("checkbox");
+
+    expect(boxes).toHaveLength(6);
+    expect(
+      GIT_CATALOGUE.map((operation) =>
+        within(section).getByRole("listitem", { name: `git operation ${operation.kind}` }),
+      ),
+    ).toHaveLength(6);
+  });
+
+  it("ticks with POST and unticks with DELETE", async () => {
+    const state = open({ gitOps: ["merge"] });
+    const section = await screen.findByRole("region", { name: "What the queue may do on its own" });
+    const push = await within(section).findByRole("listitem", { name: "git operation push" });
+
+    fireEvent.click(within(push).getByRole("checkbox"));
+    await waitFor(() => expect(state.gitOps).toEqual(["merge", "push"]));
+
+    fireEvent.click(
+      within(within(section).getByRole("listitem", { name: "git operation merge" })).getByRole(
+        "checkbox",
+      ),
+    );
+    await waitFor(() => expect(state.gitOps).toEqual(["push"]));
+
+    expect(state.policyWrites).toEqual([
+      {
+        path: "/projects/nucleos/git-ops",
+        method: "POST",
+        body: { op_kind: "push" },
+      },
+      {
+        path: "/projects/nucleos/git-ops",
+        method: "DELETE",
+        body: { op_kind: "merge" },
+      },
+    ]);
+  });
+
+  it("renders a declared kind absent from the catalogue as stranded and withdrawable", async () => {
+    open({ gitOps: ["cherry-pick"] });
+
+    const section = await screen.findByRole("region", { name: "What the queue may do on its own" });
+    const row = await within(section).findByRole("listitem", { name: "git operation cherry-pick" });
+
+    expect(row.textContent).toContain("cherry-pick");
+    expect(within(row).queryByRole("checkbox")).toBeNull();
+    expect(within(row).getByRole("button", { name: "withdraw" })).toBeDefined();
   });
 });
 
@@ -1032,7 +1145,7 @@ describe("the page as a whole", () => {
     expect(said).toContain("nucleos");
   });
 
-  it("draws the four sections in the order the design fixes", async () => {
+  it("draws the five sections in the order the designs fix", async () => {
     open();
 
     await screen.findByRole("region", { name: "The remote" });
@@ -1040,6 +1153,7 @@ describe("the page as a whole", () => {
       [
         "The remote",
         "What runs on its own",
+        "What the queue may do on its own",
         "What the worktrees may run",
         "Where the work lands",
       ],

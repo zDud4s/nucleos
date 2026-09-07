@@ -183,6 +183,7 @@ export const keys = {
      */
     shellRules: (projectId: string) => ["projects", projectId, "shell-rules"] as const,
     githubOps: (projectId: string) => ["projects", projectId, "github-ops"] as const,
+    gitOps: (projectId: string) => ["projects", projectId, "git-ops"] as const,
     landTargets: (projectId: string) => ["projects", projectId, "land-targets"] as const,
     /**
      * Which repository on GitHub this project is — `GET /projects/{id}/github-repo`.
@@ -273,6 +274,18 @@ export const keys = {
      * ticked a checkbox.
      */
     listing: (op: string, repo: string) => ["github", "listing", op, repo] as const,
+  },
+
+  /**
+   * What any project MAY declare about the shared git queue — `GET /vcs/declarable-ops`.
+   *
+   * Its own root, and pointedly NOT under `projects`, for the same reason as the GitHub catalogue:
+   * this is the machine's answer, identical for every project and fixed for the life of the daemon.
+   * A declaration write must not throw away a compiled catalogue that it cannot have changed.
+   */
+  vcs: {
+    all: ["vcs"] as const,
+    declarableOps: ["vcs", "declarable-ops"] as const,
   },
 
   /**

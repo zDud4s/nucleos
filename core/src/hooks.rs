@@ -726,19 +726,102 @@ pub async fn pretooluse_decision(
             }
         }
 
-        // **Not while the project's refusals are unreadable.** A grant is an authorization derived
-        // from a decision about a command, and it outlives that decision by the whole length of the
-        // resume run; while the list that decided it cannot be read, there is no way to know the
-        // decision still stands. Without this gate `downgrade_if_unreadable` is defeated for the
-        // rest of the run by one earlier approval: it hands the grant lookup a `pending_approval`
-        // carrying an allow-only class, and `read-local` covers `ls`, `cat`, `git status` and
-        // `cargo test` between them. Measured — an outage, one grant of class `read-local`, and
-        // `ls -la` came back `allow` under a project that denies `ls`.
+        // **Not while the project's refusals are unreadable.** A saved grant and a declared git
+        // operation are both authorizations derived from a decision about a command; while the list
+        // that constrains either one cannot be read, there is no way to know that decision still
+        // stands. Without this gate `downgrade_if_unreadable` is defeated for the rest of a resume
+        // run by one earlier approval: it hands the grant lookup a `pending_approval` carrying an
+        // allow-only class, and `read-local` covers `ls`, `cat`, `git status` and `cargo test`
+        // between them. Measured — an outage, one grant of class `read-local`, and `ls -la` came
+        // back `allow` under a project that denies `ls`. The declared-operation branch below has
+        // the same failure in a sharper form: without this gate it would queue the forbidden push.
         //
         // `matching_queued_request` above is deliberately NOT gated. It answers a run that is
         // retrying something the queue already took over, which is a fact about a request that
         // exists and is true whatever the project's list says — and its answer is a refusal.
         if rules.were_read() {
+            // **A declaration admits the operation; it never lets the shell perform it.** The
+            // classifier has already said this call needs approval, and readable project rules
+            // have had their chance to make that verdict a refusal. What the project declared in
+            // advance replaces the pause and the question, not the queue: the run still receives a
+            // `deny`, names the ticket now carrying its work, and must leave the operation alone.
+            //
+            // The declared list is deliberately the first I/O in this branch. A project that
+            // granted nothing pays no git subprocess on every shell command that was going to ask,
+            // which is the common case and the reason `session_git_decision`'s unavoidable probes
+            // are not simply copied in front of every run. Every later failure falls through to the
+            // existing approval path. That direction withholds autonomy without refusing an action
+            // a person could still approve, and a failed submission leaves no ticket to name.
+            let declared_git_decision: Option<Decision> = async {
+                let project_id = project_id.as_deref()?;
+                let declared = crate::project_policy::git_ops(&state.pool, project_id).await;
+                if declared.is_empty() {
+                    return None;
+                }
+
+                let cwd = cwd.as_deref()?;
+                let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+                let root = crate::git_exec::toplevel(Path::new(cwd), deadline)
+                    .await
+                    .ok()?;
+                let branch = crate::git_exec::current_branch(&root, deadline)
+                    .await
+                    .ok()?;
+
+                let worktree_project =
+                    crate::vcs::project_for_worktree(&state.pool, &root, deadline)
+                        .await
+                        .ok()?;
+                if worktree_project != project_id {
+                    return None;
+                }
+                let repo = crate::vcs::resolve_repo(&state.pool, project_id)
+                    .await
+                    .ok()?;
+
+                let command = payload.tool_input.get("command").and_then(Value::as_str)?;
+                let op = crate::vcs::shell_segments(command)
+                    .into_iter()
+                    .find_map(|segment| {
+                        crate::vcs::merge_from_command(segment, &branch)
+                            .or_else(|| crate::vcs::push_from_command(segment, &branch))
+                            .or_else(|| crate::vcs::tag_from_command(segment, &branch))
+                            .or_else(|| crate::vcs::fetch_from_command(segment))
+                            .or_else(|| crate::vcs::branch_delete_from_command(segment))
+                            .or_else(|| crate::vcs::rebase_from_command(segment, &branch))
+                    })?;
+                if !declared.iter().any(|kind| kind == op.kind()) {
+                    return None;
+                }
+
+                let request_id = crate::vcs::submit_declared(
+                    &state.pool,
+                    &repo,
+                    &op,
+                    crate::vcs::Origin::Run(run_id),
+                )
+                .await
+                .ok()?;
+                Some(Decision {
+                    decision: "deny".to_owned(),
+                    reason: format!(
+                        "this action was handed to the daemon's git queue as request {request_id} \
+                         because {project_id} declared {} in advance, and will be carried out \
+                         there — do not attempt it again",
+                        op.kind()
+                    ),
+                })
+            }
+            .await;
+            if let Some(decision) = declared_git_decision {
+                tracing::info!(
+                    run_id,
+                    reason = %decision.reason,
+                    "pretooluse-decision: admitted a project-declared git operation"
+                );
+                return Json(decision);
+            }
+
             match crate::proposals::grant_covers_class(
                 &state.pool,
                 run_id,
@@ -7669,6 +7752,292 @@ mod tests {
             .fetch_all(&state.pool)
             .await
             .unwrap()
+    }
+
+    async fn queued_run_rows(state: &AppState) -> Vec<(i64, String, String, String, Option<i64>)> {
+        sqlx::query_as("SELECT id, op, origin, status, run_id FROM vcs_requests ORDER BY id")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn run_git_decision(app: &Router, run_id: i64, command: &str) -> Decision {
+        decide(
+            app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            })
+            .to_string(),
+        )
+        .await
+    }
+
+    /// The declaration takes effect at the tool-call door without moving the git operation around
+    /// it: the command is still refused, the queue owns the operation, and the run remains alive to
+    /// carry on with other work. The ticket in the refusal is the bridge between those two facts.
+    #[tokio::test]
+    async fn a_declared_git_op_is_queued_instead_of_stopping_the_run() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-run-declared-push").await;
+        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+            .await
+            .unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            repo.path().to_str(),
+            Some("declared-push"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let decision = run_git_decision(&app, run_id, "git push origin feature").await;
+
+        assert_eq!(decision.decision, "deny", "{}", decision.reason);
+        assert!(
+            decision.reason.contains("request 1"),
+            "the refusal has to name the ticket the run should leave alone: {}",
+            decision.reason
+        );
+        assert_eq!(
+            queued_run_rows(&state).await,
+            vec![(
+                1,
+                "push".to_owned(),
+                "run".to_owned(),
+                "queued".to_owned(),
+                Some(run_id),
+            )]
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    /// No declaration preserves the old question exactly. In particular, merely recognising a
+    /// spelling the queue could perform must not turn the queue's vocabulary into permission.
+    #[tokio::test]
+    async fn an_undeclared_git_op_still_stops_the_run() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-run-undeclared-push").await;
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            repo.path().to_str(),
+            Some("undeclared-push"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let decision = run_git_decision(&app, run_id, "git push origin feature").await;
+
+        assert_eq!(decision.decision, "pending_approval");
+        assert!(queued_run_rows(&state).await.is_empty());
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "awaiting_approval");
+    }
+
+    /// A declaration grants one queue operation; it does not erase a shell refusal. The classifier
+    /// decides the refusal before this admission path is even eligible to inspect the declaration.
+    #[tokio::test]
+    async fn a_denied_prefix_beats_a_declared_git_op() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-run-denied-push").await;
+        crate::project_policy::declare_shell_rule(
+            &state.pool,
+            "p",
+            None,
+            "git push",
+            crate::project_policy::Verdict::Deny,
+            None,
+        )
+        .await
+        .unwrap();
+        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+            .await
+            .unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            repo.path().to_str(),
+            Some("denied-push"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let decision = run_git_decision(&app, run_id, "git push origin feature").await;
+
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, "this project denies this command");
+        assert!(queued_run_rows(&state).await.is_empty());
+    }
+
+    /// A declaration cannot be spent while the list that may contain a stronger refusal is
+    /// unreadable. Emptying the declaration on its own would fail safely too, but would not prove
+    /// this separate, load-bearing gate around the admission branch.
+    #[tokio::test]
+    async fn unreadable_rules_stop_a_declared_git_op() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-run-unreadable-rules").await;
+        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+            .await
+            .unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            repo.path().to_str(),
+            Some("unreadable-rules"),
+        )
+        .await;
+        sqlx::query("DROP TABLE project_shell_rules")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        let decision = run_git_decision(&app, run_id, "git push origin feature").await;
+
+        assert_eq!(decision.decision, "pending_approval");
+        assert!(queued_run_rows(&state).await.is_empty());
+    }
+
+    /// Queue parsers judge one shell segment at a time. A harmless directory-changing segment in
+    /// front of a declared merge must not hide the operation that follows it.
+    #[tokio::test]
+    async fn a_declared_git_op_is_found_per_segment() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-run-segmented-merge").await;
+        crate::project_policy::declare_git_op(&state.pool, "p", "merge")
+            .await
+            .unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            repo.path().to_str(),
+            Some("segmented-merge"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let decision = run_git_decision(&app, run_id, "cd repo && git merge master").await;
+
+        assert_eq!(decision.decision, "deny", "{}", decision.reason);
+        assert_eq!(
+            queued_run_rows(&state).await,
+            vec![(
+                1,
+                "merge".to_owned(),
+                "run".to_owned(),
+                "queued".to_owned(),
+                Some(run_id),
+            )]
+        );
+    }
+
+    /// A kind declaration covers only spellings the queue can reconstruct. A bare push omits the
+    /// remote, so recognising its broad action class must not stretch the narrower queue grant.
+    #[tokio::test]
+    async fn a_git_op_spelling_the_queue_cannot_build_still_stops_the_run() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-run-bare-push").await;
+        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+            .await
+            .unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            repo.path().to_str(),
+            Some("bare-push"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let decision = run_git_decision(&app, run_id, "git push").await;
+
+        assert_eq!(decision.decision, "pending_approval");
+        assert!(queued_run_rows(&state).await.is_empty());
+    }
+
+    /// The project that granted the operation must be the project whose repository the run stands
+    /// in. Two real rostered repositories make the mismatch observable rather than reducing it to
+    /// an absent roster row.
+    #[tokio::test]
+    async fn a_declared_git_op_in_another_projects_tree_stops_the_run() {
+        let state = test_state().await;
+        let own_repo = rostered_repo(&state, "hook-run-own-project").await;
+        sqlx::query("UPDATE autopilot_state SET project_id = 'other' WHERE project_id = 'p'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let another_repo = rostered_repo(&state, "hook-run-another-project").await;
+        crate::project_policy::declare_git_op(&state.pool, "other", "push")
+            .await
+            .unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("other"),
+            another_repo.path().to_str(),
+            Some("wrong-project-tree"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let decision = run_git_decision(&app, run_id, "git push origin feature").await;
+
+        assert_eq!(decision.decision, "pending_approval");
+        assert!(queued_run_rows(&state).await.is_empty());
+        drop(own_repo);
+    }
+
+    /// Admission and execution answer different questions. The row is admitted here even when the
+    /// operation will later be blocked by another branch holder; the executor-side contract is
+    /// pinned by `git_exec::tests::a_rebase_of_a_branch_somebody_holds_is_blocked_before_anything_is_computed`.
+    #[tokio::test]
+    async fn a_declared_git_op_that_blocks_is_still_admitted() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-run-declared-rebase").await;
+        crate::project_policy::declare_git_op(&state.pool, "p", "rebase")
+            .await
+            .unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            repo.path().to_str(),
+            Some("declared-rebase"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let _decision = run_git_decision(&app, run_id, "git rebase master").await;
+
+        assert_eq!(
+            queued_run_rows(&state).await,
+            vec![(
+                1,
+                "rebase".to_owned(),
+                "run".to_owned(),
+                "queued".to_owned(),
+                Some(run_id),
+            )]
+        );
     }
 
     /// **The whole point, and the behaviour that was missing.** A session nobody launched asked for

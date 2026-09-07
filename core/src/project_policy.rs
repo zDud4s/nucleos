@@ -1,7 +1,8 @@
 //! §spec alcada-por-projecto
 //!
-//! The three lists a project keeps about itself: what its worktrees may run, what the GitHub
-//! manager may do on its remote, and where a landing may be sent.
+//! The four lists a project keeps about itself: what its worktrees may run, what the GitHub
+//! manager may do on its remote, what the shared git queue may do on its repository, and where a
+//! landing may be sent.
 //!
 //! **Not `project_commands.rs`.** That module holds commands a project declares ABOUT itself —
 //! `gate`, `fmt`, `typecheck` — things somebody presses a button to run. These are not commands,
@@ -9,20 +10,20 @@
 //! the same first word, and the filename is the only place the difference can be stated before
 //! somebody opens the wrong one.
 //!
-//! One module for four tables because the four answer ONE question — what may this project do
-//! without asking — and splitting them would put the same `project_id` resolution in four places.
+//! One module for five tables because the five answer ONE question — what may this project do
+//! without asking — and splitting them would put the same `project_id` resolution in five places.
 //!
-//! The fourth is the judge, and it is the only one that does not name an OPERATION. The other three
+//! The fifth is the judge, and it is the only one that does not name an OPERATION. The other four
 //! say what may be done; this one says WHO may say yes when a conversation on `auto` would
 //! otherwise stop and ask a person. Same question, answered one step further back — which is why it
 //! belongs here and not beside the conversation settings, where the mode that consults it lives: a
 //! judge is a property of the codebase being worked in, not of the chat window open on it.
 //!
 //! **Every read here fails in the safe direction, and the direction is not the same for all
-//! three.** An unreadable GitHub list or land-target list yields nothing, which withholds autonomy
-//! — safe. An unreadable shell list cannot do that: yielding an empty `deny` would LOSE a refusal
-//! somebody wrote down. So `shell_rules` returns a `Result` and its caller treats the error as
-//! "I cannot say this is safe", which is an approval prompt and never an allow.
+//! four.** An unreadable GitHub list, git list or land-target list yields nothing, which withholds
+//! autonomy — safe. An unreadable shell list cannot do that: yielding an empty `deny` would LOSE a
+//! refusal somebody wrote down. So `shell_rules` returns a `Result` and its caller treats the error
+//! as "I cannot say this is safe", which is an approval prompt and never an allow.
 
 use sqlx::SqlitePool;
 
@@ -485,6 +486,94 @@ pub async fn forget_github_op(
     op_kind: &str,
 ) -> Result<bool, String> {
     sqlx::query("DELETE FROM project_github_ops WHERE project_id = ? AND op_kind = ?")
+        .bind(project_id)
+        .bind(op_kind.trim())
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected() > 0)
+        .map_err(|error| format!("could not forget {op_kind} for {project_id}: {error}"))
+}
+
+/// The git operations the queue may perform for this project's autonomous runs without stopping to
+/// ask a person, with a read failure still in hand. `try_github_ops`' twin, for the same two
+/// callers: the display half — `GET /projects/{id}/git-ops` — needs the error raised, because to an
+/// owner checking what their project may do on its own, `[]` is a positive claim that nothing is
+/// declared, and serving that claim out of a database error tells them something false in the one
+/// place they go to look.
+///
+/// Serves the table RAW, with no narrowing against the operation catalogue. A row naming an
+/// operation this build no longer constructs is exactly what the page must be able to draw — as
+/// stranded, so somebody can withdraw it — and a read that quietly dropped it would hide the only
+/// evidence that it is there.
+pub async fn try_git_ops(pool: &SqlitePool, project_id: &str) -> Result<Vec<String>, String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT op_kind FROM project_git_ops WHERE project_id = ? ORDER BY op_kind",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("could not read {project_id}'s git ops: {error}"))
+}
+
+/// The deciding half's answer, and the swallow is the whole point: an unreadable table yields
+/// nothing, so the run declares nothing and every operation goes back to asking a person. That is
+/// the safe direction — withholding autonomy costs an approval prompt, whereas the other direction
+/// spends a grant nobody wrote down.
+///
+/// **Do not "fix" this into a `Result`.** `shell_rules` returns one, and it is the OPPOSITE case
+/// for the opposite reason: there an empty answer would lose a `deny` somebody recorded, so the
+/// error must survive to the caller. Here an empty answer loses only permission, which is where a
+/// failure should land. A `Result` on this side would push the error to a caller that has no safer
+/// thing to do with it than refuse anyway — and the likelier outcome, judging by every handler that
+/// already treats an error as "carry on", is that a database blip becomes an autonomy grant.
+pub async fn git_ops(pool: &SqlitePool, project_id: &str) -> Vec<String> {
+    try_git_ops(pool, project_id).await.unwrap_or_else(|error| {
+        tracing::warn!(%error, project_id, "git ops: unreadable; this project asks about every git operation");
+        Vec::new()
+    })
+}
+
+/// Grants one git operation without asking, in this project. Presence in the table IS the grant —
+/// there is no verdict to attach, because there is nothing to say beyond yes — so a repeat
+/// declaration finds a row already saying what it came to say. `DO NOTHING` leaves that row and its
+/// original `created_at` alone, for `declare_github_op`'s reason: `DO UPDATE` would turn "when this
+/// was declared" into "when it was last redeclared", which nothing reads today and would mislead
+/// whoever later takes the column's name at face value.
+pub async fn declare_git_op(
+    pool: &SqlitePool,
+    project_id: &str,
+    op_kind: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO project_git_ops (project_id, op_kind, created_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT (project_id, op_kind)
+         DO NOTHING",
+    )
+    .bind(project_id)
+    .bind(op_kind.trim())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("could not declare {op_kind} for {project_id}: {error}"))
+}
+
+/// Withdraws one git operation from the project's autonomous set. After this the queue goes back to
+/// asking about it — the safe direction, and the only one a forget can take here.
+///
+/// `Ok(false)` for an operation that was never declared, so the route can answer 404. Reading
+/// presence through `git_ops` instead could never say this honestly: that function swallows a read
+/// failure into an empty `Vec`, so an unreadable table would look like "never declared" and the
+/// route would report a clean 404 while the row stands and the operation goes on running unattended.
+///
+/// Trims like `declare_git_op` does, so the two agree on what a key is; a declare that folded and a
+/// forget that did not would leave a row nobody could reach by the name they typed.
+pub async fn forget_git_op(
+    pool: &SqlitePool,
+    project_id: &str,
+    op_kind: &str,
+) -> Result<bool, String> {
+    sqlx::query("DELETE FROM project_git_ops WHERE project_id = ? AND op_kind = ?")
         .bind(project_id)
         .bind(op_kind.trim())
         .execute(pool)
@@ -1285,9 +1374,9 @@ mod tests {
         assert!(shell_rules(&pool, "alpha").await.unwrap().is_empty());
     }
 
-    /// One project's rules are not another's, in ANY of the three tables. Stated as a test because
+    /// One project's rules are not another's, in ANY of the four tables. Stated as a test because
     /// the `project_id` is a bind parameter and a missing `WHERE` is the cheapest possible way to
-    /// leak a whole machine's policy — all three tables share the same shape, and nothing pins
+    /// leak a whole machine's policy — all four tables share the same shape, and nothing pins
     /// `github_ops`'s and `land_targets`'s own `WHERE` beyond this.
     #[tokio::test]
     async fn one_projects_rules_do_not_reach_another() {
@@ -1353,6 +1442,48 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    /// The git-ops family is `github_ops`' twin, and its four tests stay separate rather than
+    /// folding into one round-trip like the pair above: each names the single property it pins, so
+    /// a failure reads as which guarantee broke rather than as "the git ops test".
+    #[tokio::test]
+    async fn a_declared_git_op_comes_back() {
+        let pool = pool().await;
+        declare_git_op(&pool, "alpha", "push").await.unwrap();
+        assert_eq!(git_ops(&pool, "alpha").await, vec!["push".to_owned()]);
+    }
+
+    /// `declare_git_op`'s `ON CONFLICT ... DO NOTHING`. Without this a regression to a bare
+    /// `INSERT` would surface only as `UNIQUE constraint failed`, and nothing else here would
+    /// catch it.
+    #[tokio::test]
+    async fn declaring_the_same_git_op_twice_is_one_row() {
+        let pool = pool().await;
+        declare_git_op(&pool, "alpha", "push").await.unwrap();
+        declare_git_op(&pool, "alpha", "push").await.unwrap();
+        assert_eq!(git_ops(&pool, "alpha").await.len(), 1);
+    }
+
+    /// The second forget answering `false` is what the route turns into a 404, asserted here rather
+    /// than only through HTTP because this is where `rows_affected` is read.
+    #[tokio::test]
+    async fn a_forgotten_git_op_is_gone_and_forgetting_it_twice_says_so() {
+        let pool = pool().await;
+        declare_git_op(&pool, "alpha", "merge").await.unwrap();
+        assert!(forget_git_op(&pool, "alpha", "merge").await.unwrap());
+        assert!(git_ops(&pool, "alpha").await.is_empty());
+        assert!(!forget_git_op(&pool, "alpha", "merge").await.unwrap());
+    }
+
+    /// `project_git_ops` shares its shape with the tables above, so a missing `WHERE` would leak one
+    /// project's declared operations to every other — the same cheap mistake
+    /// `one_projects_rules_do_not_reach_another` pins for the three that came first.
+    #[tokio::test]
+    async fn one_projects_git_ops_are_not_anothers() {
+        let pool = pool().await;
+        declare_git_op(&pool, "alpha", "push").await.unwrap();
+        assert!(git_ops(&pool, "beta").await.is_empty());
     }
 
     /// `shell_rules`' `None` arm and this module's header both lean on the migration's `CHECK`s
