@@ -355,8 +355,7 @@ pub fn segment_verdict(
     confirm: &[String],
 ) -> Verdict {
     let tokens: Vec<String> = segment.split_whitespace().map(fold_control).collect();
-    let discard_tokens: Vec<String> =
-        discard.split_whitespace().map(fold_control).collect();
+    let discard_tokens: Vec<String> = discard.split_whitespace().map(fold_control).collect();
     if !discard_tokens.is_empty() && tokens.ends_with(&discard_tokens) {
         return Verdict::Discards;
     }
@@ -379,9 +378,11 @@ pub fn segment_verdict(
 /// was ever called on by mistake.
 pub fn strip_control_tail(segment: &str, closing: &[String]) -> String {
     let mut tokens: Vec<&str> = segment.split_whitespace().collect();
-    let ends_with_control = tokens
-        .last()
-        .is_some_and(|last| closing.iter().any(|w| fold_control(w) == fold_control(last)));
+    let ends_with_control = tokens.last().is_some_and(|last| {
+        closing
+            .iter()
+            .any(|w| fold_control(w) == fold_control(last))
+    });
     if ends_with_control {
         tokens.pop();
     }
@@ -1376,7 +1377,10 @@ mod tests {
     #[test]
     fn the_closing_word_never_reaches_the_delivered_text() {
         let closing = vec!["câmbio".to_string()];
-        assert_eq!(strip_control_tail("está feito Câmbio.", &closing), "está feito");
+        assert_eq!(
+            strip_control_tail("está feito Câmbio.", &closing),
+            "está feito"
+        );
         // Nothing to strip: the text is returned whole rather than losing its last word.
         assert_eq!(strip_control_tail("está feito", &closing), "está feito");
         // A segment that was only the word delivers nothing of its own.
