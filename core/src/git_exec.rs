@@ -2896,6 +2896,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: true,
+                run_id: None,
             })
             .await
     }
@@ -3009,6 +3010,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -3154,6 +3156,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await
     }
@@ -4007,6 +4010,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -4370,6 +4374,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: project_root.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -4687,6 +4692,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -4748,6 +4754,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -4818,6 +4825,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -4899,6 +4907,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -4947,6 +4956,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -4993,6 +5003,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -5033,6 +5044,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -5071,6 +5083,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -5117,6 +5130,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -5156,6 +5170,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
@@ -5257,6 +5272,7 @@ pub(crate) mod tests {
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
+                run_id: None,
             })
             .await;
 
