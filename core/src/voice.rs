@@ -96,6 +96,11 @@ pub enum Kind {
     /// conversation turn is a question addressed to the agent. Every difference below follows from
     /// that one — no cleanup, no row of its own, and an answer.
     Conversation,
+    /// One segment of a turn somebody has not finished: transcribed, judged, and delivered nowhere.
+    ///
+    /// The fourth `Kind` and not a flag because it changes what the recording IS: part of a sentence
+    /// whose speaker has not finished, so it gets no answer, no row, and no cleanup.
+    Segment,
 }
 
 impl Kind {
@@ -104,6 +109,7 @@ impl Kind {
             Kind::Dictation => "dictation",
             Kind::Memo => "memo",
             Kind::Conversation => "conversation",
+            Kind::Segment => "segment",
         }
     }
 }
@@ -854,6 +860,31 @@ pub async fn converse(
     }
 }
 
+#[derive(serde::Serialize)]
+pub struct SegmentTranscribed {
+    /// Already stripped of the control word — the shell joins what it is given and never edits it.
+    pub text: String,
+    pub verdict: Verdict,
+}
+
+/// One segment of a turn somebody has not finished: transcribed, judged, and delivered nowhere.
+pub async fn segment(
+    state: &AppState,
+    wav: &[u8],
+    extension: &str,
+    duration: Duration,
+) -> Result<SegmentTranscribed, CaptureError> {
+    let text = heard(&state.voice, wav, extension, duration).await?;
+    let verdict = segment_verdict(
+        &text,
+        &state.voice.closing_words,
+        &state.voice.discard_phrase,
+        &state.voice.confirm_words,
+    );
+    let text = strip_control_tail(&text, &state.voice.closing_words);
+    Ok(SegmentTranscribed { text, verdict })
+}
+
 #[derive(Deserialize)]
 pub struct CaptureQuery {
     pub kind: Kind,
@@ -863,7 +894,7 @@ pub struct CaptureQuery {
     /// Resolved through `transcribe::extension_for`, which answers from an allowlist rather than
     /// echoing this string — the value names a file this process creates.
     pub format: Option<String>,
-    /// Which conversation a `kind=conversation` recording belongs to. Ignored by the other two kinds,
+    /// Which conversation a `kind=conversation` recording belongs to. Ignored by the other kinds,
     /// and required by that one — see `CaptureError::NoChat` for why it has no default.
     pub chat_id: Option<String>,
 }
@@ -914,6 +945,15 @@ pub async fn post_capture(
             Err(error) => capture_error(error).into_response(),
         };
     }
+    // A segment is an unfinished part of a turn, so it is judged and returned without cleanup,
+    // storage, or delivery. It is cancellable: nobody wants the transcript of a half-sentence they
+    // walked away from.
+    if query.kind == Kind::Segment {
+        return match segment(&state, &wav, extension, duration).await {
+            Ok(transcribed) => axum::Json(transcribed).into_response(),
+            Err(error) => capture_error(error).into_response(),
+        };
+    }
 
     let work = capture_and_record(
         state.pool.clone(),
@@ -939,11 +979,11 @@ pub async fn post_capture(
             Ok(outcome) => outcome,
             Err(status) => return status.into_response(),
         },
-        // A dictation dies with its request. A conversation turn would too — but none reaches here:
-        // `Kind::Conversation` returned above, before `work` was built. The arm is written out rather
-        // than folded into a `_` so that a fourth kind is a compile error here instead of silently
-        // inheriting a cancellation policy nobody chose for it.
-        Kind::Dictation | Kind::Conversation => work.await,
+        // A dictation dies with its request. Conversation turns and unfinished segments do too — but
+        // neither reaches here, because both returned above before `work` was built. The arm is
+        // written out rather than folded into a `_` so that a new kind is a compile error here instead
+        // of silently inheriting a cancellation policy nobody chose for it.
+        Kind::Dictation | Kind::Conversation | Kind::Segment => work.await,
     };
 
     match outcome {
@@ -2037,6 +2077,43 @@ mod tests {
             ))),
             ..VoiceRuntime::default()
         }
+    }
+
+    #[test]
+    fn the_segment_kind_has_the_wire_spelling_the_shell_sends() {
+        assert_eq!(Kind::Segment.as_str(), "segment");
+        assert_eq!(
+            serde_json::from_str::<Kind>("\"segment\"").unwrap(),
+            Kind::Segment
+        );
+    }
+
+    #[tokio::test]
+    async fn a_segment_comes_back_stripped_and_nothing_is_recorded() {
+        // `hearing(text)` (:1862) builds a runtime whose `FakeTranscriber` returns exactly `text`;
+        // `conversing_state` (:1830) wraps it in an `AppState`, and it is async.
+        let state = conversing_state(hearing("muda o ficheiro câmbio")).await;
+        let heard = segment(&state, b"fake wav", "wav", Duration::from_secs(3))
+            .await
+            .unwrap();
+
+        assert_eq!(heard.text, "muda o ficheiro"); // the control word never reaches the caller
+        assert_eq!(heard.verdict, Verdict::Closes);
+        // Nothing was delivered and nothing was stored — the same pair the conversation tests use at
+        // :1894-1895, and here it is what pins the fourth kind's whole reason for existing.
+        assert!(list(&state.pool, Kind::Dictation).await.unwrap().is_empty());
+        assert!(list(&state.pool, Kind::Memo).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_segment_the_transcriber_heard_nothing_in_is_not_an_error() {
+        let state = conversing_state(hearing("")).await;
+        // `NothingHeard`, which `capture_error` answers with 204 — the shell maps that to an empty
+        // `continues` (Task 9), because a cough between two sentences must not end a thought.
+        assert!(matches!(
+            segment(&state, b"fake wav", "wav", Duration::from_secs(1)).await,
+            Err(CaptureError::NothingHeard)
+        ));
     }
 
     /// The turn goes to the chat, and NOTHING is written to `voice_captures`.
