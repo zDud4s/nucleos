@@ -116,7 +116,7 @@ function ruleKey(tool: string | null, prefix: string): string {
 }
 
 /**
- * The three tables, behind the nine routes.
+ * The four tables, behind the twelve routes.
  *
  * Stateful, because the assertions that matter are about a write and then a read: a POST answering
  * 204 proves only that the request was well formed. What is under test is whether the list the
@@ -571,8 +571,8 @@ describe("withdrawing", () => {
   /**
    * **The prefix travels in the body**, which is the shape a caller is most likely to get wrong:
    * every other `forget` in this data layer names its subject in the path. A prefix carries spaces
-   * and slashes and is not a safe path segment, so the route takes it in the body — and its two
-   * siblings follow rather than splitting one shape three ways.
+   * and slashes and is not a safe path segment, so the route takes it in the body — and its three
+   * siblings follow rather than splitting one shape four ways.
    */
   it("takes the rule away and names it in the body rather than in the path", async () => {
     fake.declareRule("npm ci", "allow");
@@ -735,7 +735,7 @@ describe("a refusal reaches the caller with its sentence", () => {
   });
 
   /**
-   * **The second shape, and the one that is not these routes' doing.** Everything the nine handlers
+   * **The second shape, and the one that is not these routes' doing.** Everything the twelve handlers
    * refuse is `{refusal, detail}` JSON; a body axum cannot deserialize at all — a misspelled field,
    * now that all four structs carry `deny_unknown_fields` — is rejected by the extractor before any
    * handler runs, and arrives as axum's own `text/plain`. Both have to reach a page as something it

@@ -1,7 +1,8 @@
 //! §spec alcada-por-projecto
 //!
-//! The three lists a project keeps about itself: what its worktrees may run, what the GitHub
-//! manager may do on its remote, and where a landing may be sent.
+//! The four lists a project keeps about itself: what its worktrees may run, what the GitHub
+//! manager may do on its remote, what the shared git queue may do on its repository, and where a
+//! landing may be sent.
 //!
 //! **Not `project_commands.rs`.** That module holds commands a project declares ABOUT itself —
 //! `gate`, `fmt`, `typecheck` — things somebody presses a button to run. These are not commands,
@@ -9,20 +10,20 @@
 //! the same first word, and the filename is the only place the difference can be stated before
 //! somebody opens the wrong one.
 //!
-//! One module for four tables because the four answer ONE question — what may this project do
-//! without asking — and splitting them would put the same `project_id` resolution in four places.
+//! One module for five tables because the five answer ONE question — what may this project do
+//! without asking — and splitting them would put the same `project_id` resolution in five places.
 //!
-//! The fourth is the judge, and it is the only one that does not name an OPERATION. The other three
+//! The fifth is the judge, and it is the only one that does not name an OPERATION. The other four
 //! say what may be done; this one says WHO may say yes when a conversation on `auto` would
 //! otherwise stop and ask a person. Same question, answered one step further back — which is why it
 //! belongs here and not beside the conversation settings, where the mode that consults it lives: a
 //! judge is a property of the codebase being worked in, not of the chat window open on it.
 //!
 //! **Every read here fails in the safe direction, and the direction is not the same for all
-//! three.** An unreadable GitHub list or land-target list yields nothing, which withholds autonomy
-//! — safe. An unreadable shell list cannot do that: yielding an empty `deny` would LOSE a refusal
-//! somebody wrote down. So `shell_rules` returns a `Result` and its caller treats the error as
-//! "I cannot say this is safe", which is an approval prompt and never an allow.
+//! four.** An unreadable GitHub list, git list or land-target list yields nothing, which withholds
+//! autonomy — safe. An unreadable shell list cannot do that: yielding an empty `deny` would LOSE a
+//! refusal somebody wrote down. So `shell_rules` returns a `Result` and its caller treats the error
+//! as "I cannot say this is safe", which is an approval prompt and never an allow.
 
 use sqlx::SqlitePool;
 
@@ -1373,9 +1374,9 @@ mod tests {
         assert!(shell_rules(&pool, "alpha").await.unwrap().is_empty());
     }
 
-    /// One project's rules are not another's, in ANY of the three tables. Stated as a test because
+    /// One project's rules are not another's, in ANY of the four tables. Stated as a test because
     /// the `project_id` is a bind parameter and a missing `WHERE` is the cheapest possible way to
-    /// leak a whole machine's policy — all three tables share the same shape, and nothing pins
+    /// leak a whole machine's policy — all four tables share the same shape, and nothing pins
     /// `github_ops`'s and `land_targets`'s own `WHERE` beyond this.
     #[tokio::test]
     async fn one_projects_rules_do_not_reach_another() {

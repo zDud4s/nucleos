@@ -3,17 +3,17 @@ import { apiFetch } from "./client";
 import { keys } from "./keys";
 
 /**
- * The three lists a project declares about itself: what its worktrees may run without asking, what
- * the GitHub manager may do on its remote, and where a landing may be sent. And, because a form
- * offering a choice has to know what the choices are, the machine-wide catalogue of what MAY be
- * declared of the second one.
+ * The four lists a project declares about itself: what its worktrees may run without asking, what
+ * the GitHub manager may do on its remote, what the shared git queue may do on its repository, and
+ * where a landing may be sent. And, because a form offering a choice has to know what the choices
+ * are, the machine-wide catalogues of what MAY be declared of the second and third ones.
  *
  * **Not `project-commands.ts`.** That one holds commands somebody presses a button to run — `gate`,
  * `fmt`, `typecheck`. Nothing here is ever executed. These are permissions, and the two modules
  * share a first word and nothing else. `core/src/project_policy.rs` makes the same distinction in
  * the same words, and this is the shell's half of it.
  *
- * Ten routes, read off `core/src/http.rs` rather than inferred from the names:
+ * Fourteen routes, read off `core/src/http.rs` rather than inferred from the names:
  *
  * | what                          | route                                     |
  * |-------------------------------|-------------------------------------------|
@@ -26,16 +26,22 @@ import { keys } from "./keys";
  * | the extra landing targets     | `GET /projects/{id}/land-targets`         |
  * | open one                      | `POST /projects/{id}/land-targets`        |
  * | close one                     | `DELETE /projects/{id}/land-targets`      |
- * | what MAY be declared          | `GET /github/declarable-ops`              |
+ * | what MAY be declared remotely | `GET /github/declarable-ops`              |
+ * | the autonomous git ops        | `GET /projects/{id}/git-ops`              |
+ * | grant one                     | `POST /projects/{id}/git-ops`             |
+ * | withdraw one                  | `DELETE /projects/{id}/git-ops`           |
+ * | what MAY be declared locally  | `GET /vcs/declarable-ops`                 |
  *
- * **The tenth hangs off no project, and that is a fact about the answer rather than about the URL.**
- * The declarable set is compiled into the daemon — two ceilings intersected with the operations it
- * can build — so it is the same for every project on the roster and changes only when the daemon is
- * rebuilt. A route under `/projects/{id}/…` would have taken an id that changed nothing.
+ * **The tenth and fourteenth hang off no project, and that is a fact about the answer rather than
+ * about the URL.** The declarable sets are compiled into the daemon — two ceilings intersected with
+ * the operations it can build remotely, and every operation the shared git queue can build locally
+ * — so they are the same for every project on the roster and change only when the daemon is rebuilt.
+ * A route under `/projects/{id}/…` would have taken an id that changed nothing.
  *
- * **The three DELETEs carry what they delete in the BODY.** A shell prefix contains spaces, slashes
- * and dots and is not a safe path segment; the other two follow it rather than splitting one shape
- * three ways. That is unusual enough that every `forget` hook below says so again at its own door.
+ * **The four DELETEs carry what they delete in the BODY.** A shell prefix contains spaces, slashes
+ * and dots and is not a safe path segment; the other three follow it rather than splitting one
+ * shape four ways. That is unusual enough that every `forget` hook below says so again at its own
+ * door.
  *
  * **Not polled.** A declaration list changes when a person edits it and at no other time — the same
  * reading `useProjectCommands` takes about its own rows, minus the running command that makes it
@@ -294,7 +300,7 @@ export function useProjectGitOps(projectId: string | null) {
  * that cannot be ticked, which is a lie about who decides. `declarable: false` is how it gets drawn
  * as what it is.
  *
- * **Machine-wide, so it takes no project id and is keyed apart from the three lists.** A declaration
+ * **Machine-wide, so it takes no project id and is keyed apart from the four lists.** A declaration
  * write invalidates `keys.projects.all` and must not throw this away — it cannot have changed, and
  * it cannot change while the daemon is running.
  *
@@ -380,17 +386,17 @@ export function useProjectLandTargets(projectId: string | null) {
 /**
  * Every declaration write settles the same way, so it is written once.
  *
- * **The three lists by name, and NOT the `keys.projects.all` prefix they share.** It used to be the
- * prefix, on the argument that the three live under it and one form can move more than one of them —
+ * **The four lists by name, and NOT the `keys.projects.all` prefix they share.** It used to be the
+ * prefix, on the argument that the four live under it and one form can move more than one of them —
  * which was true while they were the only things there. `keys.projects.githubRepo` is under it now,
  * and that read spawns `git remote get-url` against the project root; a prefix invalidation made
  * every tick of a checkbox re-run a subprocess for a fact no declaration can change. Naming the
- * three is also the honest statement of what these writes touch.
+ * four is also the honest statement of what these writes touch.
  *
  * `onSettled` rather than `onSuccess` because a 404 or a 423 means the picture on screen is wrong
  * either way.
  *
- * `retry: false`, and here it is not merely the house default restated. Every refusal these nine
+ * `retry: false`, and here it is not merely the house default restated. Every refusal these twelve
  * routes give is settled — the stop is engaged, the project is not on the roster, the prefix could
  * never fire, the rule was never declared — and asking again gets the same sentence one second
  * later. The one thing a retry would change is the record: a POST that half-landed and was sent

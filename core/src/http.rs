@@ -224,32 +224,34 @@ pub fn build_router(state: AppState) -> Router {
             post(post_project_command_run),
         )
         // The reach this project declares for itself: what its worktrees may run unattended, what
-        // the GitHub manager may do on its remote, and where a landing may be sent.
-        // `project_policy.rs` holds all three tables and says why they are one module; until these
-        // routes there was no way into them but SQL typed by hand.
+        // the GitHub manager may do on its remote, what the shared git queue may do on its
+        // repository, and where a landing may be sent. `project_policy.rs` holds all four tables
+        // and says why they are one module; until these routes there was no way into them but SQL
+        // typed by hand.
         //
         // **In no table in `auth.rs`, the GETs included, and that absence is the boundary.** These
         // are not a configuration edit that takes effect at the next start — the hook reads the
         // shell table per decision and caches nothing, so one `allow` row binds the very next tool
         // call of every in-flight run of this project. `a_projects_declared_reach_is_in_no_scope_table`
-        // carries the argument, and is what stops the three GETs being filed beside the
+        // carries the argument, and is what stops the four GETs being filed beside the
         // `/projects/{id}/…` reads they share a prefix with.
         //
         // **The DELETEs carry what they delete in the BODY.** A shell prefix is not a safe path
         // segment: it contains spaces, slashes and dots, and encoding one into a route only to
         // decode it again buys nothing — the same reason `POST /contacts/verdict` takes the address
-        // in the body. The other two follow it rather than splitting the shape three ways, since a
+        // in the body. The other three follow it rather than splitting the shape four ways, since a
         // branch name carries slashes too.
         //
-        // **The emergency stop reaches two of these nine, and that is the one place in this file
+        // **The emergency stop reaches three of these twelve, and that is the one place in this file
         // where `post_project_command`'s argument does not transfer.** It says a route that writes a
         // database row "starts nothing", which holds because every reader of ITS rows is a start
         // point and the stop guards every start point. The rows written here are read by `hooks.rs`,
         // per decision, and `hooks.rs` calls `kill_switch_engaged` nowhere; `set_kill_switch` flips
         // a flag and cancels nothing already running. So `POST shell-rules` with `allow` and `POST
-        // github-ops` are gated — they widen what in-flight runs may do, immediately — while a
-        // `deny`, `POST land-targets` and all three DELETEs stay open, because a stop that stopped
-        // somebody NARROWING autonomy would be holding the door open on the way out.
+        // github-ops` and `POST git-ops` are gated — they widen what in-flight runs may do,
+        // immediately — while a `deny`, `POST land-targets` and all four DELETEs stay open, because
+        // a stop that stopped somebody NARROWING autonomy would be holding the door open on the way
+        // out.
         // `declaration_halted` carries the argument in full.
         //
         // **Two refusal shapes reach a caller here, and the page will need both.** Everything these
@@ -257,7 +259,7 @@ pub fn build_router(state: AppState) -> Router {
         // malformed JSON, a missing field, an unknown one now that all four structs carry
         // `deny_unknown_fields` — is rejected by the extractor before any of this runs, and arrives
         // as axum's own `text/plain`. That is true of every JSON route in this file rather than
-        // something these nine introduce, and it is written down here because these are the routes
+        // something these twelve introduce, and it is written down here because these are the routes
         // whose refusals a person is meant to read.
         .route(
             "/projects/{id}/shell-rules",
@@ -676,7 +678,7 @@ pub fn build_router(state: AppState) -> Router {
         // configuration, no repository and no secret — the response is a function of the binary, so
         // two callers on the same version get the same bytes. What keeps it out is that the grant
         // would buy nobody anything: the page that needs it is the shell, which holds the control
-        // token, and the nine routes it exists to explain are themselves in no table. A key that
+        // token, and the twelve routes it exists to explain are themselves in no table. A key that
         // cannot read what a project HAS declared has no use for the list of what MAY be declared —
         // and handing it that list is a map of exactly which capability names to try. An unneeded
         // grant is one more thing to be wrong about later, which is `GET /vcs/requests/{id}/wait`'s
@@ -6459,7 +6461,7 @@ async fn project_is_on_the_roster(
 /// stop engaged an `allow` declared here still binds the very next tool call of every in-flight run
 /// of this project. That is a widening the stop was supposed to make impossible.
 ///
-/// **Only the widenings.** A `deny`, and all three DELETEs, stay open with the stop engaged: an
+/// **Only the widenings.** A `deny`, and all four DELETEs, stay open with the stop engaged: an
 /// emergency stop that stopped somebody NARROWING autonomy would be holding the door open on the
 /// way out. It is the asymmetry `hooks::downgrade_if_unreadable` already takes, where only the
 /// `allow` is touched.
@@ -21336,7 +21338,7 @@ mod tests {
         .unwrap();
     }
 
-    /// One request to the nine, body and all.
+    /// One request to the twelve, body and all.
     ///
     /// One helper for the DELETEs as well as the POSTs, because a DELETE here carries what it
     /// deletes in the body — a shell prefix is not a safe path segment.

@@ -2387,9 +2387,10 @@ mod tests {
 
     /// The reach a project declares for itself is the owner's, and nobody else's.
     ///
-    /// These nine routes are the only way into the three tables `project_policy.rs` holds: what a
+    /// These twelve routes are the only way into the four tables `project_policy.rs` holds: what a
     /// project's worktrees may run unattended, what the GitHub manager may do on its remote, and
-    /// where a landing may be sent. **They are a live autonomy control, not a configuration edit.**
+    /// what the shared git queue may do on its repository, and where a landing may be sent. **They
+    /// are a live autonomy control, not a configuration edit.**
     /// The hook reads those tables per decision and caches nothing, so a single `allow` row written
     /// through `POST /projects/{id}/shell-rules` binds the very next tool call of every in-flight
     /// run of that project — no restart, no second confirmation, and no moment at which a person is
@@ -2399,7 +2400,7 @@ mod tests {
     /// Asserted as membership rather than through a request, like `POST /projects/{id}/write` and
     /// `POST /projects/{id}/commands` above and for the same reason: `permits` is default-deny, so
     /// these routes are safe TODAY by being in no table. What that does not survive is somebody
-    /// filing the three GETs beside the `/projects/{id}/…` reads that share their URL prefix, which
+    /// filing the four GETs beside the `/projects/{id}/…` reads that share their URL prefix, which
     /// would read as tidying up rather than as a decision. This is the test that says no.
     ///
     /// **The three scopes below are not decoration, and `Scope::Run` alone would prove nothing.**
@@ -2464,7 +2465,7 @@ mod tests {
     ///
     /// `GET /projects/{id}/github-repo` turns a project id into `owner/name`. It is not a secret —
     /// it is written in the repository's own `.git/config` — but it does disclose WHICH repository a
-    /// registered project is, which is one sentence away from the class the nine routes above are
+    /// registered project is, which is one sentence away from the class the twelve routes above are
     /// excluded under.
     ///
     /// **The honest case for the other answer, first, because it is a strong one.** The
@@ -2493,7 +2494,7 @@ mod tests {
     /// in `READ_ONLY_ROUTES` — joining either would have made this grant by accident, as a side
     /// effect of saving a round trip. The placement decision and this one are the same decision.
     ///
-    /// Membership rather than a request, like the nine and the catalogue: `permits` is default-deny,
+    /// Membership rather than a request, like the twelve and the catalogue: `permits` is default-deny,
     /// so this is safe today by being nowhere, and what that does not survive is somebody filing it
     /// beside the `/projects/{id}/…` reads it shares a prefix with — on exactly the `cat` reasoning
     /// above, which is true and is not the point. That is the edit this test refuses.
@@ -2542,11 +2543,11 @@ mod tests {
     }
 
     /// The catalogue of DECLARABLE operations is in no scope table either, and the reason is not
-    /// the one its nine neighbours have.
+    /// the one its twelve neighbours have.
     ///
     /// `GET /github/declarable-ops` is a read of compiled constants. It takes no project id, it
     /// touches no database, and its answer is a function of the binary — two callers on the same
-    /// build get the same bytes. So the argument the nine are excluded under does NOT transfer:
+    /// build get the same bytes. So the argument the twelve are excluded under does NOT transfer:
     /// nothing here decides what a project's runs may do unattended, and nothing here discloses one
     /// project's configuration, one repository, or one secret. On confidentiality alone this could
     /// be filed beside `/fleet/exclusions`, which is listed as describing the shape of the fleet
@@ -2555,7 +2556,7 @@ mod tests {
     ///
     /// What settles it is that the grant would buy nobody anything. The caller this route was added
     /// for is the app, which holds `Scope::Control` and never consults these tables; no scoped key
-    /// has asked for it. And its only use is the nine routes above, every one of which a scoped key
+    /// has asked for it. And its only use is the twelve routes above, every one of which a scoped key
     /// is refused — a key that cannot read what a project HAS declared has no use for the list of
     /// what MAY be declared, while what the list does give a holder is the exact vocabulary to aim
     /// at those routes with. Between a grant with a use and a grant without one, this table's own
@@ -2564,7 +2565,7 @@ mod tests {
     /// same least-privilege reading, and `GET /assistant/tools` — compiled constants served for a
     /// picker, which is this route's twin in every respect — is in no table today.
     ///
-    /// Membership rather than a request, like the nine: `permits` is default-deny, so this is safe
+    /// Membership rather than a request, like the twelve: `permits` is default-deny, so this is safe
     /// today by being nowhere, and what that does not survive is somebody filing a GET of constants
     /// in `READ_ONLY_ROUTES` because it plainly discloses nothing. That is the edit this test
     /// refuses, and the paragraph above is the argument it refuses it with.
