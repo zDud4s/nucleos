@@ -2521,7 +2521,7 @@ pub async fn drain_once(
         // longer dormant in the way this comment used to mean it.** `submit_declared` is a real,
         // production-shaped door for a `Run`-origin row: it admits straight to `queued` on the
         // strength of a project's PRIOR declaration (`project_policy::declare_git_op`, listed and
-        // withdrawn through `/projects/{id}/git-ops`), and it is meant to be called from inside the
+        // withdrawn through `/projects/{id}/git-ops`), and it is called from inside the
         // PreToolUse hook — the moment a session's own git command is classified — on the strength of
         // what the PROJECT declared in advance, not on the run's behalf. That is the shape `auth.rs`
         // is left untouched for: no route opens to `Scope::Run`, because the daemon submitting a
@@ -2531,13 +2531,6 @@ pub async fn drain_once(
         // rather than of `/runs`, *"Queueing is Admin's"* — holds for the declared door for the same
         // reason it holds for the ordinary one: it was Admin who authorised this, whichever moment
         // that authorisation was actually given in.
-        //
-        // What has not landed yet is the other half: the PreToolUse hook itself does not call
-        // `submit_declared`. `session_git` (`hooks.rs:186`) still submits every queueable git command
-        // as `Origin::Shell`, unconditionally, and consults no declared-ops table before doing it. So
-        // no row in this table carries a `run_id` in production today, same as before — what changed
-        // is that the door is now real and correct rather than theoretical, and this function forwards
-        // what it admits rather than discarding it.
         Ok(()) => {
             // **An escalation carries its reason into the summary; nothing else does.** The other
             // statuses are answers to a question somebody asked and is waiting on, so the id and
