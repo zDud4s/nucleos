@@ -513,6 +513,18 @@ export const keys = {
     backups: ["system", "backups"] as const,
     tokens: ["system", "tokens"] as const,
     pii: ["system", "pii"] as const,
+    /**
+     * Which feed kinds still reach Telegram — `GET /notifications/policy` — and
+     * which kinds this machine has actually written — `GET /notifications/kinds`.
+     *
+     * Two keys and not one, because they are two different things that happen to
+     * be drawn on one screen: the first is a PREFERENCE the owner edits and a
+     * save invalidates, the second an OBSERVATION of the feed that a save cannot
+     * change. Sharing a key would make every save refetch the kind list for
+     * nothing.
+     */
+    notifyPolicy: ["system", "notify-policy"] as const,
+    notifyKinds: ["system", "notify-kinds"] as const,
     config: (area: string) => ["system", "config", area] as const,
     /**
      * This machine's settings files — `GET /config/machine`.

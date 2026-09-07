@@ -18,6 +18,7 @@ use crate::feed::{self, FeedEntry};
 use crate::health;
 use crate::hooks::pretooluse_decision;
 use crate::inspect;
+use crate::notify_policy;
 use crate::presets;
 use crate::runs::{self, AwaitingRun, CreateRunError, cancel_run, create_run, get_run};
 use crate::shadow::{self, ClassTally, ShadowDecision};
@@ -825,6 +826,16 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::council::post_council_cancel),
         )
         .route("/notifications/pending", get(crate::notify::list_pending))
+        // Which feed kinds may reach a channel — stored, validated and observed here; RESOLVED in
+        // the Telegram sidecar (spec §4, §6), never here. In no scope table in `auth.rs`, so admin
+        // by omission (§5.3): the two callers already hold the daemon's full token — the shell from
+        // the Credential Manager, the sidecar as `NUCLEOS_DAEMON_TOKEN` — and a read-only key buys
+        // no reason to learn which notifications the owner chose to silence.
+        .route(
+            "/notifications/policy",
+            get(get_notify_policy).put(put_notify_policy),
+        )
+        .route("/notifications/kinds", get(get_notify_kinds))
         // The measurement the shadow pass exists to produce. Without somewhere to read it, the
         // table is write-only and the pass becomes the thing it was designed not to be: data
         // accumulating with nobody able to decide anything from it.
@@ -2856,6 +2867,79 @@ async fn get_pii_observations(
             })
             .collect(),
     ))
+}
+
+/// `GET /notifications/policy` — the stored selection policy, verbatim (spec §5.3). A fresh
+/// database has no rows, so this answers `{"families": [], "kinds": []}` rather than 404: absence
+/// of a rule is the resolution's own "passes" default, not an error.
+async fn get_notify_policy(State(state): State<AppState>) -> impl IntoResponse {
+    match notify_policy::load(&state.pool).await {
+        Ok(policy) => Json(policy).into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "notify_policy: reading the stored policy failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
+/// The refusal name `PUT /notifications/policy` reports for each `ValidationError` variant, kept
+/// beside the status/reason split `create_run_status`/`create_run_reason` already use for
+/// `CreateRunError`: one place decides what a refusal is CALLED, so the name and the message
+/// cannot drift apart.
+fn notify_policy_refusal_name(error: &notify_policy::ValidationError) -> &'static str {
+    match error {
+        notify_policy::ValidationError::EmptySelector { .. } => "empty_selector",
+        notify_policy::ValidationError::MalformedSelector { .. } => "malformed_selector",
+        notify_policy::ValidationError::SelectorTooLong { .. } => "selector_too_long",
+        notify_policy::ValidationError::DuplicateSelector { .. } => "duplicate_selector",
+        notify_policy::ValidationError::TooManyRules { .. } => "too_many_rules",
+    }
+}
+
+/// `PUT /notifications/policy` — replaces the whole policy (spec §5.3). Validates BEFORE writing;
+/// `notify_policy::replace` itself never calls `validate`, so a rejected shape and a database
+/// error cannot share a code path. A `400` names the refusal and the selector in question, so the
+/// shell can point at the offending row instead of saying "invalid" (§7.4). A `500` means the
+/// transaction never committed, so the table is exactly as it was.
+async fn put_notify_policy(
+    State(state): State<AppState>,
+    Json(policy): Json<notify_policy::Policy>,
+) -> impl IntoResponse {
+    if let Err(error) = notify_policy::validate(&policy) {
+        return (
+            StatusCode::BAD_REQUEST,
+            // `detail`, not `message`: the shell's `refusalFrom` reads `body.detail` beside a
+            // `refusal` and never looks at `message`, so naming it wrong throws the selector away
+            // and leaves the page showing the code twice. Same pair every refusal in this file
+            // sends.
+            Json(serde_json::json!({
+                "refusal": notify_policy_refusal_name(&error),
+                "detail": error.to_string(),
+            })),
+        )
+            .into_response();
+    }
+
+    match notify_policy::replace(&state.pool, &policy).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "notify_policy: writing the new policy failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
+/// `GET /notifications/kinds` — the kinds THIS machine has written, deduplicated and ordered
+/// (spec §4.2, §5.2). Only an observation of the feed's retention window; the union with kinds
+/// that only exist as a stored rule is the shell's job (§7.2), not this route's.
+async fn get_notify_kinds(State(state): State<AppState>) -> impl IntoResponse {
+    match notify_policy::observed_kinds(&state.pool).await {
+        Ok(kinds) => Json(kinds).into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "notify_policy: reading observed kinds failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -31275,5 +31359,105 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(origin, None, "no run declared it, so no run is named");
+    }
+
+    /// The whole life of a `PUT /notifications/policy`, at the route level: it replaces (never
+    /// merges), a refusal names the offending selector, and — the property `replace` not calling
+    /// `validate` exists for — a rejected payload leaves the stored policy exactly as it was.
+    #[tokio::test]
+    async fn a_policy_put_replaces_and_a_refusal_writes_nothing() {
+        let state = test_state().await;
+
+        async fn put_policy(
+            state: &AppState,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/notifications/policy")
+                        .header("Authorization", "Bearer test-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = if status == StatusCode::NO_CONTENT {
+                serde_json::Value::Null
+            } else {
+                json_body(response).await
+            };
+            (status, body)
+        }
+
+        // A brand-new install answers empty arrays, not 404.
+        let fresh = get_json(&state, "/notifications/policy").await;
+        assert_eq!(fresh, serde_json::json!({"families": [], "kinds": []}));
+
+        // Write a first policy.
+        let (status, _) = put_policy(
+            &state,
+            serde_json::json!({
+                "families": [{"selector": "job_", "enabled": false}],
+                "kinds": []
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let after_first = get_json(&state, "/notifications/policy").await;
+        assert_eq!(
+            after_first,
+            serde_json::json!({
+                "families": [{"selector": "job_", "enabled": false}],
+                "kinds": []
+            })
+        );
+
+        // A refusal: an empty selector. Names the scope, and writes nothing.
+        let (status, body) = put_policy(
+            &state,
+            serde_json::json!({
+                "families": [{"selector": "", "enabled": true}],
+                "kinds": []
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["refusal"], "empty_selector");
+        // Under `detail`, because that is the key the shell reads beside a `refusal`. Named
+        // `message` this field is silently dropped and the page shows the code twice.
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("family"),
+            "the refusal must name what it objected to: {body}"
+        );
+        assert_eq!(
+            get_json(&state, "/notifications/policy").await,
+            after_first,
+            "the refused write left the stored policy untouched"
+        );
+
+        // A second, different policy REPLACES rather than merges: the family rule above is gone.
+        let (status, _) = put_policy(
+            &state,
+            serde_json::json!({
+                "families": [],
+                "kinds": [{"selector": "job_failed", "enabled": true}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            get_json(&state, "/notifications/policy").await,
+            serde_json::json!({
+                "families": [],
+                "kinds": [{"selector": "job_failed", "enabled": true}]
+            })
+        );
     }
 }
