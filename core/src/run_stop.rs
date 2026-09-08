@@ -203,6 +203,28 @@ pub struct RunStopResponse {
 /// without making a `leading_up` list of a hundred of them heavy.
 const TOOL_INPUT_PREVIEW_CHARS: usize = 2000;
 
+/// How much of a failed run's `stderr` the report keeps, counted from the END (spec §5.1: "cauda do
+/// `stderr`"). Nothing upstream bounds this field — `runner.rs` drains the child's stderr pipe with
+/// `read_to_string`, so what a subprocess wrote is what the `runs` row holds — and this route is a
+/// summary, not the detail view: `GET /runs/{id}` is where the whole of it stays readable.
+///
+/// The same ceiling as `TOOL_INPUT_PREVIEW_CHARS` beside it, deliberately. Both answer the same
+/// question — how much raw text one field of a summary may carry — and a second number here would
+/// be a second thing to justify, with nothing to justify it from: neither is spec-fixed.
+const STDERR_TAIL_CHARS: usize = TOOL_INPUT_PREVIEW_CHARS;
+
+/// PURE: the last [`STDERR_TAIL_CHARS`] characters of `value`, or all of it when it is already
+/// shorter. Counted in `chars` and not bytes, like the `tool_input` cut above: a byte-indexed slice
+/// of arbitrary subprocess output lands mid-character sooner or later, and the panic it raises would
+/// be reported as the stop route failing rather than as the encoding trap it is.
+fn tail_of(value: String) -> String {
+    let total = value.chars().count();
+    if total <= STDERR_TAIL_CHARS {
+        return value;
+    }
+    value.chars().skip(total - STDERR_TAIL_CHARS).collect()
+}
+
 /// PURE: builds one [`GateDecisionView`] from a `shadow_decisions` row's own columns, applying the
 /// §5.2 truncation. The HTTP handler reads the row; this is the shaping of it into the response.
 #[allow(clippy::too_many_arguments)]
@@ -309,7 +331,7 @@ pub(crate) fn build_response(
             None
         },
         stderr_tail: if kind == Kind::Failed {
-            stderr_tail
+            stderr_tail.map(tail_of)
         } else {
             None
         },
@@ -650,6 +672,81 @@ mod tests {
         assert_eq!(superseded.exit_code, None);
         assert_eq!(superseded.stderr_tail, None);
         assert_eq!(superseded.successor_run_id, Some(2));
+    }
+
+    /// Spec §5.1 calls this field "cauda do `stderr`", and a run's `stderr` has no ceiling anywhere
+    /// before it: `runner.rs` drains the child's pipe with `read_to_string` into a `String` that
+    /// grows to whatever the subprocess wrote. A summary report that hands that back whole is a log
+    /// viewer wearing the wrong field name, so what survives the cut is the END — where a failure
+    /// says what it was.
+    #[test]
+    fn a_stderr_past_the_ceiling_keeps_its_tail_and_not_its_head() {
+        let huge = format!("{}THE ACTUAL ERROR", "x".repeat(STDERR_TAIL_CHARS * 2));
+
+        let response = build_response(
+            1,
+            "failed".to_owned(),
+            Kind::Failed,
+            "real",
+            0,
+            Some(1),
+            Some(huge.clone()),
+            None,
+            vec![],
+        );
+
+        let tail = response.stderr_tail.expect("kind: failed carries it");
+        assert_eq!(tail.chars().count(), STDERR_TAIL_CHARS);
+        assert!(
+            tail.ends_with("THE ACTUAL ERROR"),
+            "the end is what was kept"
+        );
+        assert!(
+            huge.ends_with(&tail),
+            "the cut must keep a suffix, verbatim"
+        );
+    }
+
+    /// The cut is a ceiling, not a reshaping: anything already short enough comes back untouched,
+    /// which is what every real `stderr` in this database is today.
+    #[test]
+    fn a_stderr_within_the_ceiling_is_handed_back_whole() {
+        let response = build_response(
+            1,
+            "failed".to_owned(),
+            Kind::Failed,
+            "real",
+            0,
+            Some(1),
+            Some("boom".to_owned()),
+            None,
+            vec![],
+        );
+        assert_eq!(response.stderr_tail.as_deref(), Some("boom"));
+    }
+
+    /// A cut that landed mid-character would produce bytes no JSON encoder can emit. Counting in
+    /// `chars` rather than bytes is what makes that unrepresentable, and this holds it: the ceiling
+    /// is reached with multi-byte characters only.
+    #[test]
+    fn a_multibyte_stderr_is_cut_on_a_character_and_never_mid_byte() {
+        let huge = "é".repeat(STDERR_TAIL_CHARS * 2);
+
+        let response = build_response(
+            1,
+            "failed".to_owned(),
+            Kind::Failed,
+            "real",
+            0,
+            Some(1),
+            Some(huge.clone()),
+            None,
+            vec![],
+        );
+
+        let tail = response.stderr_tail.expect("kind: failed carries it");
+        assert_eq!(tail.chars().count(), STDERR_TAIL_CHARS);
+        assert!(huge.ends_with(&tail));
     }
 
     #[test]
