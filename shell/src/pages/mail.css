@@ -150,7 +150,7 @@
 
 /* A link to `/mail/$emailId` — block and undecorated so it reads as the row's
    subject line first and a link second, the same posture `.runs-row-name`
-   takes for a run id. */
+   takes for a run's excerpt. */
 .mail-row-subject {
   grid-column: 3;
   margin: 0;
