@@ -422,11 +422,18 @@
 
 /* The chairman never wrote one, and why. Hand-rolled for the same single
    reason as `.council-seat-error` above — `.ui-note` cannot wrap an unbroken
-   daemon string, and this one is whatever the chairman failed with. */
+   daemon string, and this one is whatever the chairman failed with.
+
+   No left border, deliberately, and the sibling above is the argument: the two
+   rules report the same kind of thing — a stage that failed and the daemon's
+   sentence about it — and `.council-seat-error` says so with the danger tone
+   alone. A 3px bar on one of them was the only thing separating them, and it
+   made the chairman's failure read as a different category of event rather
+   than the same one at the top of the page. Both still go when `.ui-note`
+   can wrap. */
 .council-chairman-failed {
   margin: 0;
   padding: var(--space-2) var(--space-3);
-  border-left: 3px solid var(--tone-danger-border);
   border-radius: var(--radius-sm);
   background: var(--tone-danger-bg);
   color: var(--tone-danger-fg);
