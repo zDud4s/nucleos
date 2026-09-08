@@ -195,19 +195,57 @@
 
 /* =================================================================== list == */
 
+/* A row is a state, then the request, then the facts about it. The badge holds
+   its own column so the excerpts of twelve rows start on one left edge; the
+   name and the metadata share the second, one above the other.
+
+   8rem and not 6rem for the badge: `.ui-badge` is `white-space: nowrap`, so the
+   longest run state — "awaiting approval" — does not wrap. At 6rem it overran
+   its track and painted itself over the first word of the excerpt. */
 .runs-row {
   display: grid;
-  grid-template-columns: 9rem auto 10rem auto 6rem;
+  grid-template-columns: 8rem minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+}
+
+.runs-row-state {
+  justify-self: start;
+}
+
+/* The excerpt is what the run IS, so it is the link — an id is a handle, not a
+   name. Two lines, because a prompt can be a paragraph and a list of twelve
+   runs must stay a list. */
+.runs-row-name {
+  grid-column: 2;
+  max-width: var(--measure-prose);
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  text-decoration: none;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+.runs-row-name:hover {
+  text-decoration: underline;
+}
+
+/* One metadata line under the name, on fixed columns so id, mode, project, time
+   and cost line up down the list instead of moving with every excerpt. */
+.runs-row-meta {
+  grid-column: 2;
+  display: grid;
+  grid-template-columns: 4.5rem 5.5rem 7rem 7rem minmax(0, 1fr);
   align-items: baseline;
   gap: var(--space-3);
+  margin: 0;
 }
 
-.runs-row-link {
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  color: var(--accent);
-}
-
+.runs-row-id,
 .runs-row-mode,
 .runs-row-project,
 .runs-row-cost {
@@ -217,20 +255,11 @@
   white-space: nowrap;
 }
 
-/* The money is the one figure worth reading down the column, so it sits at the
-   end of the row rather than in the middle of the words. */
+/* The money is the one figure worth reading down the column, so it ends the
+   metadata line rather than sitting in the middle of the words. */
 .runs-row-cost {
   font-variant-numeric: tabular-nums;
   text-align: right;
-}
-
-.runs-row-excerpt {
-  grid-column: 1 / -1;
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
 }
 
 /* A list that arrived at the ceiling may have been cut, and says so rather than

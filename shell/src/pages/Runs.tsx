@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
@@ -293,23 +293,27 @@ function RunList({
       <ul className="ui-rows" aria-label="Runs">
         {rows.map((row) => (
           <li key={row.id} className="ui-rows-row runs-row">
-            <Link to={`/runs/${row.id}`} className="runs-row-link">
-              run {row.id}
+            <span className="runs-row-state">
+              <StateBadge domain="run" state={row.status} />
+            </span>
+            <Link to={`/runs/${row.id}`} className="runs-row-name">
+              {row.prompt_excerpt}
             </Link>
-            <StateBadge domain="run" state={row.status} />
-            <span className="runs-row-mode">{row.mode}</span>
-            <span className="runs-row-project">
-              {row.project_id ?? "no project"}
-            </span>
-            <RelativeTime at={row.created_at} />
-            {/* Absent is not zero: a run the ledger never priced has no cost
+            <p className="runs-row-meta">
+              <span className="runs-row-id">run {row.id}</span>
+              <span className="runs-row-mode">{row.mode}</span>
+              <span className="runs-row-project">
+                {row.project_id ?? "no project"}
+              </span>
+              <RelativeTime at={row.created_at} />
+              {/* Absent is not zero: a run the ledger never priced has no cost
                   recorded, which is a different fact from one that was free. */}
-            <span className="runs-row-cost">
-              {row.cost_usd === null
-                ? "cost not recorded"
-                : money(row.cost_usd)}
-            </span>
-            <p className="runs-row-excerpt">{row.prompt_excerpt}</p>
+              <span className="runs-row-cost">
+                {row.cost_usd === null
+                  ? "cost not recorded"
+                  : money(row.cost_usd)}
+              </span>
+            </p>
           </li>
         ))}
       </ul>
@@ -658,14 +662,25 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
 function headline(
   rows: RunSearchResult[] | undefined,
   filters: RunFilters,
-): string | undefined {
+): ReactNode | undefined {
   if (rows === undefined) return undefined;
   const live = rows.filter(
     (row) => row.status === "running" || row.status === "pending",
+  ).length;
+  const waiting = rows.filter(
+    (row) => row.status === "awaiting_approval",
   ).length;
   const scope = isFiltered(filters) ? "matching these filters" : "in the index";
   if (rows.length === 0) return `nothing ${scope}`;
   const moving =
     live === 0 ? "none of them still moving" : `${live} still moving`;
-  return `${rows.length} ${scope}; ${moving}`;
+  const said = `${rows.length} ${scope}; ${moving}`;
+  // A run waiting on a person is not moving, and the header must not hide it
+  // either: it is the one count on this page somebody can act on.
+  if (waiting === 0) return said;
+  return (
+    <>
+      {said}; <Link to="/waiting">{waiting} waiting on you</Link>
+    </>
+  );
 }

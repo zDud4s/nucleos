@@ -149,7 +149,7 @@
 }
 
 /* A link to `/mail/$emailId` — block and undecorated so it reads as the row's
-   subject line first and a link second, the same posture `.runs-row-link`
+   subject line first and a link second, the same posture `.runs-row-name`
    takes for a run id. */
 .mail-row-subject {
   grid-column: 3;

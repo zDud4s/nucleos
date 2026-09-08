@@ -14,6 +14,7 @@ import { ApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
 import type { Preset } from "../data/presets";
 import type { RunDetail, RunSearchResult } from "../data/runs";
+import { money } from "../ui";
 import { daemonFetch, daemonState, project, renderApp, renderWithRouter } from "../test/harness";
 
 beforeEach(() => {
@@ -220,6 +221,79 @@ describe("Runs - the index", () => {
 
     expect(await screen.findByText(/Nothing matches those filters/)).toBeDefined();
     expect(screen.queryByText(/No runs yet/)).toBeNull();
+  });
+
+  it("the excerpt is the row's link and the run id is not one", async () => {
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [row()] })));
+
+    await renderRuns();
+
+    // What a run IS is the request it was given; the id is a handle you use
+    // once you already know which run you want.
+    const link = await screen.findByRole("link", { name: "tidy the imports" });
+    expect(link.getAttribute("href")).toBe("/runs/7");
+    expect(screen.queryByRole("link", { name: /run 7/ })).toBeNull();
+    // The id is still on the row — demoted to metadata, not dropped.
+    const list = screen.getByRole("list", { name: "Runs" });
+    expect(list.textContent).toContain("run 7");
+  });
+
+  it("every row states id, mode, project, time and cost on one metadata line", async () => {
+    const rows = [row({ id: 7 }), row({ id: 8, status: "failed" })];
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows })));
+
+    await renderRuns();
+
+    const list = await screen.findByRole("list", { name: "Runs" });
+    expect(list.children.length).toBe(2);
+    for (const item of Array.from(list.children)) {
+      const metas = item.querySelectorAll(".runs-row-meta");
+      // Exactly one: two metadata lines on one row is how a column stops
+      // lining up with the row above it.
+      expect(metas.length).toBe(1);
+      const cells = Array.from(metas[0].children).map((cell) => cell.className);
+      expect(cells).toEqual([
+        "runs-row-id",
+        "runs-row-mode",
+        "runs-row-project",
+        "ui-reading-time",
+        "runs-row-cost",
+      ]);
+    }
+  });
+
+  it("a run the ledger never priced says so, and a priced one is money", async () => {
+    const rows = [row({ id: 7, cost_usd: null }), row({ id: 8, cost_usd: 0.0123 })];
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows })));
+
+    await renderRuns();
+
+    const list = await screen.findByRole("list", { name: "Runs" });
+    const costs = Array.from(list.querySelectorAll(".runs-row-cost")).map(
+      (cell) => cell.textContent,
+    );
+    // Absent is not zero: "$0.00" would claim the run was free, which is a
+    // different fact from nobody having priced it.
+    expect(costs).toEqual(["cost not recorded", money(0.0123)]);
+  });
+
+  it("the header names the run waiting on a person, and links to it", async () => {
+    const rows = [
+      row({ id: 7, status: "running" }),
+      row({ id: 8, status: "pending" }),
+      row({ id: 9, status: "awaiting_approval" }),
+    ];
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows })));
+
+    await renderRuns();
+
+    // Read through the link: `getByText` matches direct text-node children
+    // only, and the clause the header must not hide is inside an anchor.
+    const link = await screen.findByRole("link", { name: "1 waiting on you" });
+    expect(link.getAttribute("href")).toBe("/waiting");
+    expect(link.closest("p")?.textContent).toBe(
+      "3 in the index; 2 still moving; 1 waiting on you",
+    );
   });
 });
 
