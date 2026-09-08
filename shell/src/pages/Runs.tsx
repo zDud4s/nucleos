@@ -6,6 +6,7 @@ import {
   RUN_MODES,
   RUN_MODE_FILTERS,
   RUN_STATUSES,
+  runIsAlive,
   useCreateRun,
   useRuns,
   type RunFilters,
@@ -664,9 +665,7 @@ function headline(
   filters: RunFilters,
 ): ReactNode | undefined {
   if (rows === undefined) return undefined;
-  const live = rows.filter(
-    (row) => row.status === "running" || row.status === "pending",
-  ).length;
+  const live = rows.filter((row) => runIsAlive(row.status)).length;
   const waiting = rows.filter(
     (row) => row.status === "awaiting_approval",
   ).length;
@@ -680,7 +679,10 @@ function headline(
   if (waiting === 0) return said;
   return (
     <>
-      {said}; <Link to="/waiting">{waiting} waiting on you</Link>
+      {said};{" "}
+      <Link to="/waiting">
+        {waiting} run{waiting === 1 ? "" : "s"} awaiting approval
+      </Link>
     </>
   );
 }

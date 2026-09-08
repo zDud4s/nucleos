@@ -12,6 +12,7 @@ import {
 } from "../data/teams";
 import {
   VCS_LIST_LIMIT,
+  countWaitingDecisions,
   useActionApprovals,
   useApproveProposal,
   useAwaitingRuns,
@@ -147,14 +148,14 @@ export function Waiting() {
   const vcs = onlyProject(reading(useVcsRequests()), project);
   const parked = onlyProject(reading(useAwaitingRuns()), project);
 
-  const decisions = countOf(
-    wheel.rows,
-    approvals.rows,
-    teamActions.rows,
-    recruits.rows,
-    merges.rows,
-    exclusions.rows,
-  );
+  const decisions = countWaitingDecisions({
+    wheel: wheel.rows,
+    approvals: approvals.rows,
+    teamActions: teamActions.rows,
+    recruits: recruits.rows,
+    merges: merges.rows,
+    exclusions: exclusions.rows,
+  });
   const records = countOf(skipped.rows, refused.rows);
 
   /**

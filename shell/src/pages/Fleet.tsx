@@ -114,9 +114,9 @@ export function Fleet() {
           detail={ceiling(budget.data)}
         />
         <StatCard
-          label="Waiting on you"
+          label="Proposals open"
           value={waiting}
-          detail="proposals open across the roster"
+          detail="across the roster"
         />
       </div>
 
@@ -389,5 +389,7 @@ function headline(capacity: Concurrency | undefined, waiting: number | undefined
       : `${capacity.house.held} in flight of ${capacity.house.limit}`;
   const left = room <= 0 ? "the house is full" : `room for ${room} more`;
   if (waiting === undefined) return `${held}; ${left}`;
-  return waiting === 0 ? `${held}; ${left}` : `${held}; ${left}; ${waiting} waiting on you`;
+  return waiting === 0
+    ? `${held}; ${left}`
+    : `${held}; ${left}; ${waiting} proposal${waiting === 1 ? "" : "s"} open across the roster`;
 }

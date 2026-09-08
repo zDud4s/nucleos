@@ -53,6 +53,31 @@ describe("StateBadge — run", () => {
     expect(cancelled?.className).not.toContain("ui-badge-danger");
     expect(cancelled?.text).not.toMatch(/fail/i);
   });
+
+  it("keeps all eight run states apart and calls none of them unknown", () => {
+    const states = ["running", "awaiting_approval", "completed", "failed", "cancelled", "interrupted", "timed_out", "superseded"];
+    assertAllDistinct("run", states);
+    for (const state of states) {
+      expect(badge("run", state)?.className).not.toContain("ui-state-unmapped");
+    }
+  });
+
+  it("does not dress a run that hit a ceiling as one that failed", () => {
+    const timedOut = badge("run", "timed_out");
+    const failed = badge("run", "failed");
+    expect(timedOut?.className).not.toContain("ui-badge-danger");
+    expect(timedOut?.text).not.toMatch(/fail/i);
+    expect(timedOut?.className).not.toBe(failed?.className);
+    expect(timedOut?.text).not.toBe(failed?.text);
+  });
+
+  it("a superseded run is neither a failure nor a summons", () => {
+    const superseded = badge("run", "superseded");
+    const cancelled = badge("run", "cancelled");
+    expect(superseded?.className).not.toContain("ui-badge-danger");
+    expect(superseded?.className).not.toContain("ui-badge-pending");
+    expect(superseded?.text).not.toBe(cancelled?.text);
+  });
 });
 
 describe("StateBadge — job", () => {

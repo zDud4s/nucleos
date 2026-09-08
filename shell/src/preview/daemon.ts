@@ -10,7 +10,7 @@ import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
 import type { PendingNotification } from "../data/feed";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
-import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary } from "../data/system";
+import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary, Proposal } from "../data/system";
 import type { VoiceConfigView } from "../data/voice";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
@@ -475,6 +475,42 @@ export const RECRUITS = [
     decided_at: null,
   },
 ];
+
+export const PROPOSALS: Proposal[] = [
+  ...["alpha", "alpha", "alpha", "bravo", "bravo"].map((project_id, index) => ({
+    id: 101 + index,
+    kind: "action-approval",
+    status: "pending",
+    run_id: null,
+    session_id: null,
+    project_id,
+    errand_id: null,
+    errand_name: null,
+    tool_name: "Bash",
+    reasoning: "The next action needs an owner's approval.",
+    tool_input: JSON.stringify({ command: "git status" }),
+    read_from: null,
+    created_at: ago((index + 1) * 60 * 1000),
+    decided_at: null,
+  })),
+];
+
+export const TEAM_ACTION_PROPOSALS: Proposal[] = ACTIONS.map((action) => ({
+  id: action.proposal_id ?? action.id,
+  kind: "team-action",
+  status: action.state === "pending" ? "pending" : "approved",
+  run_id: null,
+  session_id: null,
+  project_id: "alpha",
+  errand_id: null,
+  errand_name: null,
+  tool_name: action.kind,
+  reasoning: action.why,
+  tool_input: action.payload,
+  read_from: null,
+  created_at: action.created_at,
+  decided_at: action.executed_at,
+}));
 
 /* ------------------------------------------------------------- the agents -- */
 
@@ -1443,14 +1479,14 @@ const RUN_INDEX: RunSearchResult[] = [
   { id: 1, project_id: "alpha", status: "completed", mode: "real", created_at: ago(5 * 60_000), completed_at: ago(60_000), cost_usd: 0.0412, prompt_excerpt: "Check the changed files, run the selected gate, and summarise the result for the release note." },
   { id: 2, project_id: "bravo", status: "running", mode: "real", created_at: ago(10 * 60_000), completed_at: null, cost_usd: null, prompt_excerpt: "Trace the approval queue delay and prepare a small, reversible fix." },
   { id: 3, project_id: "charlie", status: "awaiting_approval", mode: "shadow", created_at: ago(18 * 60_000), completed_at: null, cost_usd: null, prompt_excerpt: "Review the proposed dependency update before it changes the build image." },
-  { id: 4, project_id: "delta", status: "pending", mode: "worktree", created_at: ago(32 * 60_000), completed_at: null, cost_usd: 0.0084, prompt_excerpt: "Map the incoming request to the owning team and queue the first safe step." },
+  { id: 4, project_id: "delta", status: "superseded", mode: "worktree", created_at: ago(32 * 60_000), completed_at: ago(30 * 60_000), cost_usd: 0.0084, prompt_excerpt: "Map the incoming request to the owning team and queue the first safe step." },
   { id: 5, project_id: null, status: "failed", mode: "real", created_at: ago(3 * 3_600_000), completed_at: ago(2 * 3_600_000), cost_usd: 0.0167, prompt_excerpt: "Reproduce the sidecar handshake failure with the production-shaped configuration." },
   { id: 6, project_id: null, status: "cancelled", mode: "real", created_at: ago(7 * 3_600_000), completed_at: ago(6 * 3_600_000), cost_usd: 0.0031, prompt_excerpt: "Stop the duplicate migration review after the owner chose the newer branch." },
   { id: 7, project_id: null, status: "timed_out", mode: "real", created_at: ago(13 * 3_600_000), completed_at: ago(11 * 3_600_000), cost_usd: null, prompt_excerpt: "Investigate why the preview service keeps returning an empty list to otherwise healthy screens." },
   { id: 8, project_id: "alpha", status: "completed", mode: "real", created_at: ago(26 * 3_600_000), completed_at: ago(25 * 3_600_000), cost_usd: 0.0289, prompt_excerpt: "Add the missing status label to the activity summary." },
   { id: 9, project_id: "bravo", status: "failed", mode: "shadow", created_at: ago(2 * DAY), completed_at: ago(47 * 3_600_000), cost_usd: 0.0195, prompt_excerpt: "Compare the changed policy with the current queue limits and report conflicts." },
   { id: 10, project_id: "charlie", status: "cancelled", mode: "real", created_at: ago(3 * DAY), completed_at: ago(71 * 3_600_000), cost_usd: 0.0062, prompt_excerpt: "Prepare a recovery checklist for the paused integration." },
-  { id: 11, project_id: "delta", status: "completed", mode: "worktree", created_at: ago(4 * DAY), completed_at: ago(95 * 3_600_000), cost_usd: null, prompt_excerpt: "Refine the dashboard hierarchy so the queue state remains legible when several teams are blocked at once and the operator needs the cause before the chronology." },
+  { id: 11, project_id: "delta", status: "interrupted", mode: "worktree", created_at: ago(4 * DAY), completed_at: ago(95 * 3_600_000), cost_usd: null, prompt_excerpt: "Refine the dashboard hierarchy so the queue state remains legible when several teams are blocked at once and the operator needs the cause before the chronology." },
   { id: 12, project_id: null, status: "completed", mode: "real", created_at: ago(5 * DAY), completed_at: ago(119 * 3_600_000), cost_usd: 0.0528, prompt_excerpt: "Document the observed retry pattern, including the handoff signals that distinguish a delayed worker from a run that has silently stopped making progress." },
 ];
 
@@ -1531,7 +1567,7 @@ export function answer(path: string, init?: RequestInit): unknown {
     const [, query] = splitQuery(path);
     let runs = RUN_INDEX;
     if (query.get("live") === "true") {
-      runs = runs.filter((run) => ["pending", "running", "awaiting_approval"].includes(run.status));
+      runs = runs.filter((run) => ["running", "awaiting_approval"].includes(run.status));
     }
     for (const key of ["status", "project_id", "mode"] as const) {
       const value = query.get(key);
@@ -1849,6 +1885,8 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/team-runs") return RUNS;
   if (path === "/team-triggers") return TRIGGERS;
   if (path === "/team-actions") return ACTIONS;
+  if (path === "/proposals") return PROPOSALS;
+  if (path === "/proposals/team-actions") return TEAM_ACTION_PROPOSALS;
   if (path === "/proposals/recruits") return RECRUITS;
   if (path === "/agents") return AGENTS;
   if (path === "/autopilot/budget") {

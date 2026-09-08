@@ -250,6 +250,18 @@ function orderIn(listName: string, pattern: RegExp): string[] {
 /* ------------------------------------------------------- A13: the sources -- */
 
 describe("Waiting - each section reads the route that serves it", () => {
+  it("the headline is the number the rail shows", async () => {
+    const world = waitingWorld({
+      approvals: [proposal({ id: 1 })],
+      teamActions: [proposal({ id: 2, kind: "team-action" })],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    expect(await screen.findByText("2 waiting on a decision")).toBeDefined();
+  });
+
   it("asks eight routes and shows a card from each", async () => {
     const world = waitingWorld({
       sessions: [

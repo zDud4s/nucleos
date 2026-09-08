@@ -514,6 +514,45 @@ describe("Fleet — columns", () => {
     // rather than disabled — it fails before the click instead of after it.
     expect(screen.queryByRole("button", { name: "New job" })).toBeNull();
   });
+
+  /**
+   * The headline names what the five are.
+   *
+   * "5 waiting on you" was this page borrowing the one queue's phrase for a number that is
+   * not that queue: these are open proposals across the roster, and the bare phrase belongs
+   * to `/waiting` alone. Two projects and not one, so the sentence is proving the sum rather
+   * than echoing a single row.
+   */
+  it("the headline names what the five are", async () => {
+    const fleet = fleetFetch(
+      fleetState({ concurrency: { house: { limit: 5, held: 2 }, projects: [] } }),
+    );
+    const roster = daemonFetch(
+      daemonState({
+        projects: [
+          project({ project_id: "alpha", open_proposals: 3 }),
+          project({ project_id: "beta", open_proposals: 2 }),
+        ],
+      }),
+    );
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/projects" ? await roster(path, init) : await fleet(path, init),
+    );
+
+    await renderWithRouter(<Fleet />);
+
+    const said = await screen.findByText(/proposals open across the roster/);
+    expect(said.textContent).toBe(
+      "2 in flight of 5; room for 3 more; 5 proposals open across the roster",
+    );
+    expect(said.textContent).not.toContain("waiting on you");
+
+    // The card is the same fact in the same words, so the two cannot drift apart.
+    const card = screen.getByRole("article", { name: "Proposals open" });
+    expect(within(card).getByText("5")).toBeDefined();
+    expect(within(card).getByText("across the roster")).toBeDefined();
+    expect(screen.queryByRole("article", { name: "Waiting on you" })).toBeNull();
+  });
 });
 
 /* -------------------------------------------------------------- new job -- */

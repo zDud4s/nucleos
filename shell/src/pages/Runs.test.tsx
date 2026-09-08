@@ -277,10 +277,10 @@ describe("Runs - the index", () => {
     expect(costs).toEqual(["cost not recorded", money(0.0123)]);
   });
 
-  it("the header names the run waiting on a person, and links to it", async () => {
+  it("the third clause names runs and links to waiting", async () => {
     const rows = [
       row({ id: 7, status: "running" }),
-      row({ id: 8, status: "pending" }),
+      row({ id: 8, status: "completed" }),
       row({ id: 9, status: "awaiting_approval" }),
     ];
     daemon.apiFetch.mockImplementation(runsFetch(world({ rows })));
@@ -289,10 +289,31 @@ describe("Runs - the index", () => {
 
     // Read through the link: `getByText` matches direct text-node children
     // only, and the clause the header must not hide is inside an anchor.
-    const link = await screen.findByRole("link", { name: "1 waiting on you" });
+    const link = await screen.findByRole("link", {
+      name: "1 run awaiting approval",
+    });
     expect(link.getAttribute("href")).toBe("/waiting");
     expect(link.closest("p")?.textContent).toBe(
-      "3 in the index; 2 still moving; 1 waiting on you",
+      "3 in the index; 1 still moving; 1 run awaiting approval",
+    );
+  });
+
+  it("only a running run is still moving", async () => {
+    const rows = [
+      row({ id: 7, status: "running" }),
+      row({ id: 8, status: "completed" }),
+      row({ id: 9, status: "superseded" }),
+      row({ id: 10, status: "awaiting_approval" }),
+    ];
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows })));
+
+    await renderRuns();
+
+    const link = await screen.findByRole("link", {
+      name: "1 run awaiting approval",
+    });
+    expect(link.closest("p")?.textContent).toBe(
+      "4 in the index; 1 still moving; 1 run awaiting approval",
     );
   });
 });

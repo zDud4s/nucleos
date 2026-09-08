@@ -260,12 +260,12 @@ function Statusline({
         detail="deciding without enforcing, to earn the promotion"
       />
       <StatCard
-        label="Waiting on you"
+        label="Proposals open"
         value={pending}
         detail={
           held === 0
-            ? "open proposals"
-            : `open proposals — ${held} project queue full`
+            ? "across the roster"
+            : `across the roster — ${held} project queue full`
         }
       />
       <StatCard

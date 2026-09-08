@@ -36,7 +36,7 @@ import "./learned.css";
  * where nothing is ever decided, and what was waiting to be decided here is
  * what every later run gets told.
  *
- * **Three lists and not one, in this order.** What is waiting on you comes
+ * **Three lists and not one, in this order.** What is proposed comes
  * first because it is the only part that is a task. What is in force comes
  * second because it is the answer to "why did the agent do that". What is over
  * comes last and is read rarely — but it is never deleted, because "what did it
@@ -367,6 +367,6 @@ function headline(rows: Refinement[] | undefined): string | undefined {
     return "the agent is running on its standing brief alone";
   const held =
     inForce === 1 ? "one note is in force" : `${inForce} notes are in force`;
-  if (waiting === 0) return `${held}; nothing waiting on you`;
-  return `${held}; ${waiting} waiting on you`;
+  if (waiting === 0) return `${held}; nothing proposed`;
+  return `${held}; ${waiting} refinement${waiting === 1 ? "" : "s"} proposed`;
 }

@@ -159,4 +159,39 @@ describe("Learned", () => {
     expect(await screen.findByText(/nothing has been learned yet/i)).toBeDefined();
     expect(screen.queryByRole("heading", { level: 2, name: "In force" })).toBeNull();
   });
+
+  it("the headline names refinements", async () => {
+    // "waiting on you" is the one queue's phrase, and this page counts one kind
+    // of thing: a refinement somebody proposed. Naming it is what lets a reader
+    // hold Home's number and this one at the same time without adding them up.
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        refinement({ id: 1, status: "active", title: "in force" }),
+        refinement({ id: 2, status: "proposed", title: "one", proposal_id: 9 }),
+        refinement({ id: 3, status: "proposed", title: "two", proposal_id: 10 }),
+        refinement({ id: 4, status: "proposed", title: "three", proposal_id: 11 }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+
+    expect(
+      (await screen.findByText(/refinements proposed/)).textContent,
+    ).toBe("one note is in force; 3 refinements proposed");
+  });
+
+  it("says nothing proposed when every refinement is settled", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        refinement({ id: 1, status: "active", title: "in force" }),
+        refinement({ id: 2, status: "reverted", title: "taken back" }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+
+    expect((await screen.findByText(/nothing proposed/)).textContent).toBe(
+      "one note is in force; nothing proposed",
+    );
+  });
 });

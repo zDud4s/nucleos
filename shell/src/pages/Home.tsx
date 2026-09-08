@@ -5,14 +5,13 @@ import {
   isAggregateTimeout,
   useBudget,
   useProjects,
-  useProposals,
   useSystemHealth,
   type BudgetView,
   type HealthReadout,
   type ProjectSummary,
-  type Proposal,
   type SubsystemReadout,
 } from "../data/system";
+import { useWaitingCount } from "../data/waiting";
 import { PageHeader, Section, StatCard } from "../ui";
 import { headlineFor as systemHeadline } from "./System";
 
@@ -31,12 +30,11 @@ import { headlineFor as systemHeadline } from "./System";
  */
 export function Home() {
   const projects = useProjects();
-  const proposals = useProposals();
+  const waiting = useWaitingCount();
   const budget = useBudget();
   const health = useSystemHealth();
 
   const roster = projects.data;
-  const queue = proposals.data;
   const spend = budget.data;
   const subsystems = health.data?.subsystems;
   const healthy = subsystems?.filter((row) => row.status === "ok").length;
@@ -50,7 +48,7 @@ export function Home() {
 
   return (
     <>
-      <PageHeader title="Home" headline={headline(roster, queue, spend, health.data)} />
+      <PageHeader title="Home" headline={headline(roster, waiting, spend, health.data)} />
 
       {/*
         Five cards, always five. They do not recede when everything is well, and that is a
@@ -77,9 +75,9 @@ export function Home() {
           detail="what the autopilot would have done, waiting to be read"
         />
         <StatCard
-          label="Approval queue"
-          value={queue?.length}
-          detail={queue === undefined ? undefined : queue.length === 0 ? "nothing waiting on you" : "waiting on you"}
+          label="Waiting on you"
+          value={waiting}
+          detail={waiting === undefined ? undefined : waiting === 0 ? "nothing waiting on you" : "decisions of every kind, in one queue"}
         />
         <StatCard
           label="Window spend"
@@ -177,11 +175,10 @@ function ceiling(spend: BudgetView | undefined): string | undefined {
  */
 function headline(
   roster: ProjectSummary[] | undefined,
-  queue: Proposal[] | undefined,
+  waiting: number | undefined,
   spend: BudgetView | undefined,
   health: HealthReadout | undefined,
 ): ReactNode {
-  const waiting = queue?.length;
   const tail =
     waiting === undefined
       ? ""

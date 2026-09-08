@@ -44,7 +44,7 @@ describe("Home", () => {
     // Summed, not counted: one project holding seven decisions is not the same
     // news as seven projects holding one.
     expect(within(await card("Shadow decisions pending")).getByText("7")).toBeDefined();
-    expect(within(await card("Approval queue")).getByText("2")).toBeDefined();
+    expect(within(await card("Waiting on you")).getByText("2")).toBeDefined();
     expect(within(await card("Window spend")).getByText("$1.42")).toBeDefined();
 
     // Five now, and the fifth is not a fifth reading of §6.1: "Subsystems healthy" is
@@ -52,6 +52,18 @@ describe("Home", () => {
     // a subsystem is down. The four above are still the four, and still say what §6.1
     // says they say.
     expect(screen.getAllByRole("article")).toHaveLength(5);
+  });
+
+  it("the headline counts the whole waiting queue", async () => {
+    const answer = daemonFetch(daemonState({ proposals: [proposal({ id: 1 })] }));
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/proposals/team-actions" ? [proposal({ id: 2, kind: "team-action" })] : answer(path, init),
+    );
+
+    await renderWithRouter(<Home />);
+
+    expect(within(await card("Waiting on you")).getByText("2")).toBeDefined();
+    expect((await screen.findByText(/2 waiting on you/)).textContent).toMatch(/; 2 waiting on you$/);
   });
 
   it("reads an absent ceiling as no ceiling, never as zero", async () => {
@@ -75,7 +87,7 @@ describe("Home", () => {
 
     await renderWithRouter(<Home />);
 
-    for (const label of ["Projects", "Shadow decisions pending", "Approval queue", "Window spend"]) {
+    for (const label of ["Projects", "Shadow decisions pending", "Waiting on you", "Window spend"]) {
       expect(within(await card(label)).getByText("—")).toBeDefined();
     }
   });

@@ -2,7 +2,8 @@ import { Outlet } from "@tanstack/react-router";
 import { useChats } from "../data/chats";
 import { untriagedCount, useMailQueue } from "../data/mail";
 import { POLL } from "../data/poll";
-import { useProjects, useProposals, useSystemHealth, wantsAttention } from "../data/system";
+import { useProjects, useSystemHealth, wantsAttention } from "../data/system";
+import { useWaitingCount } from "../data/waiting";
 import { unreadTotal } from "../lib/turns";
 import { AttentionHeartbeat } from "./AttentionHeartbeat";
 import { ConnectionGate } from "./ConnectionGate";
@@ -54,15 +55,11 @@ function Frame() {
    * it, off the same cache entry.
    */
   const health = useSystemHealth(POLL.slow);
-  /**
-   * `GET /proposals` is `list_pending` in the núcleo — the route serves the
-   * queue, not the archive — so its length *is* the badge. Filtering by status
-   * here would be the shell second-guessing a decision the route already made.
-   */
-  const proposals = useProposals();
+  /** The six decision lists share one count, so the rail cannot drift from Waiting. */
+  const waiting = useWaitingCount();
   /**
    * Unread turns, summed across every conversation. `undefined` until the
-   * list has answered once — the same honest-absence rule as `proposals`
+   * list has answered once — the same honest-absence rule as `waiting`
    * above, read through `unreadTotal` rather than a bare `.length` because a
    * chat's badge is `waiting`, not a row count.
    */
@@ -94,7 +91,7 @@ function Frame() {
       <AttentionHeartbeat />
       <Sidebar
         badges={{
-          proposals: proposals.data?.length,
+          proposals: waiting,
           chats: chats.data === undefined ? undefined : unreadTotal(chats.data),
           mail: mail.data === undefined ? undefined : untriagedCount(mail.data),
         }}

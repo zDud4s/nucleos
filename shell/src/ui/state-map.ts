@@ -70,18 +70,28 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     active: { tone: "active", label: "active" },
   },
   /**
-   * Run outcomes. The four that §7 forbids merging.
+   * Run outcomes. `concurrency.rs`'s `LIVE_RUN_STATUSES` and `runs.rs`'s
+   * `TERMINAL_RUN_STATUSES` name all eight; `run_stop.rs` counts the same set.
    *
    * `interrupted` is the núcleo dying underneath a run — a defect in *us*, and
    * the run may well have been fine. It gets the held tone, not the failure
    * tone, so that a screen full of interruptions reads as "the daemon
-   * restarted" and sends you to look at the daemon.
+   * restarted" and sends you to look at the daemon. `completed` follows the
+   * job domain's label for the same literal. `timed_out` is a ceiling, not a
+   * verdict: `run_stop.rs` keeps `Kind::Timeout` apart from `Kind::Failed`, so
+   * it gets Held Ember like `council_seat.timeout` and `team_run.expired` and
+   * never says "fail". `superseded` is quiet because work continues in its
+   * successor; it asks nothing of the reader, so it is off rather than paused.
    */
   run: {
+    running: { tone: "active", label: "running" },
+    awaiting_approval: { tone: "pending", label: "awaiting approval" },
+    completed: { tone: "active", label: "completed" },
     interrupted: { tone: "paused", label: "interrupted" },
     failed: { tone: "danger", label: "failed" },
     cancelled: { tone: "off", label: "cancelled" },
-    awaiting_approval: { tone: "pending", label: "awaiting approval" },
+    timed_out: { tone: "paused", label: "timed out" },
+    superseded: { tone: "off", label: "superseded" },
   },
 
   /**

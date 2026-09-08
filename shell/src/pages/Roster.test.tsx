@@ -72,6 +72,36 @@ describe("the roster", () => {
   });
 
   /**
+   * The card names proposals.
+   *
+   * `Waiting on you` over `open proposals across the roster` made the label a promise the
+   * detail then took back. The bare phrase counts the six decision lists at `/waiting`; this
+   * number is `open_proposals` summed over the rows, so the label says that and the detail is
+   * left to say only where they are.
+   */
+  it("the card names proposals", async () => {
+    await openRoster([
+      fine("alpha", { open_proposals: 3 }),
+      fine("beta", { open_proposals: 2 }),
+    ]);
+    await screen.findByRole("table");
+
+    const card = screen.getByRole("article", { name: "Proposals open" });
+    expect(within(card).getByText("5")).toBeDefined();
+    expect(within(card).getByText("across the roster")).toBeDefined();
+    expect(screen.queryByRole("article", { name: "Waiting on you" })).toBeNull();
+  });
+
+  /** Zero keeps the sentence it already had: nothing has stopped to ask, not `across` nothing. */
+  it("says nothing has stopped to ask when no proposal is open", async () => {
+    await openRoster([fine("alpha"), fine("beta")]);
+    await screen.findByRole("table");
+
+    const card = screen.getByRole("article", { name: "Proposals open" });
+    expect(within(card).getByText("nothing has stopped to ask")).toBeDefined();
+  });
+
+  /**
    * **The rule the table wrote down for itself and applied to half a column.**
    *
    * *A column of identical badges is a column of noise* is why `Mode` drew the word `shadow` in

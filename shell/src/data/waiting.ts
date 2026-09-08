@@ -3,6 +3,11 @@ import { apiFetch } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
 import type { Proposal } from "./system";
+import { useProposals } from "./system";
+import { useWheelRequests } from "./browser";
+import { useContactMerges } from "./contacts";
+import { useExclusionRequests } from "./fleet";
+import { useRecruitProposals, useTeamActionProposals } from "./teams";
 
 /**
  * The single decision queue, as hooks — one per list that actually exists.
@@ -145,6 +150,49 @@ export { useContactMerges, type MergeSide, type MergeSuggestion } from "./contac
  * here from leaving a stale row there.
  */
 export { useOpenTeamActions, useRecruitProposals, useTeamActionProposals } from "./teams";
+
+/**
+ * Counts the six decision lists that own the bare phrase "waiting on you".
+ *
+ * A partial count is preferred to a blank: a failed route contributes zero as
+ * the existing page arithmetic does, so one broken route cannot hide every
+ * answered decision.
+ */
+export function countWaitingDecisions(lists: {
+  wheel: unknown[] | undefined;
+  approvals: unknown[] | undefined;
+  teamActions: unknown[] | undefined;
+  recruits: unknown[] | undefined;
+  merges: unknown[] | undefined;
+  exclusions: unknown[] | undefined;
+}): number | undefined {
+  const values = Object.values(lists);
+  if (values.every((list) => list === undefined)) return undefined;
+  return values.reduce<number>((total, list) => total + (list?.length ?? 0), 0);
+}
+
+/**
+ * Reads the six decision lists for the one shared "waiting on you" arithmetic.
+ *
+ * The partial count remains more useful than a blank when one route fails;
+ * `countWaitingDecisions` is the sole owner of the bare phrase's number.
+ */
+export function useWaitingCount(): number | undefined {
+  const wheel = useWheelRequests();
+  const approvals = useProposals();
+  const teamActions = useTeamActionProposals();
+  const recruits = useRecruitProposals();
+  const merges = useContactMerges();
+  const exclusions = useExclusionRequests();
+  return countWaitingDecisions({
+    wheel: wheel.data,
+    approvals: approvals.data,
+    teamActions: teamActions.data,
+    recruits: recruits.data,
+    merges: merges.data,
+    exclusions: exclusions.data,
+  });
+}
 
 /** §8 — what the night put down without doing. A record to read, not a queue to work. */
 export function useSkippedItems() {

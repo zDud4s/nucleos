@@ -15,7 +15,7 @@ import type { ClassTally, ScopedKill, ShadowDecision } from "../data/autopilot";
 import type { FeedEntry } from "../data/feed";
 import type { Job } from "../data/fleet";
 import type { AutopilotMode, ProjectSummary, Proposal } from "../data/system";
-import { daemonState, project, renderApp, renderWithRouter } from "../test/harness";
+import { daemonState, project, proposal, renderApp, renderWithRouter } from "../test/harness";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -480,6 +480,35 @@ describe("Autopilot - the scoreboard is read-only and says what it is not", () =
     expect(screen.getByText(/the count that decides it is not the count below/)).toBeDefined();
     // The authority stays the daemon's own figure.
     expect(screen.getByText("1/2 classes ready")).toBeDefined();
+  });
+});
+
+/* -------------------------------------------------------- the stat cards -- */
+
+describe("Autopilot - the stat cards name what they count", () => {
+  it("the card names proposals", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({ project_id: "alpha", mode: "active" }),
+        project({ project_id: "beta", mode: "shadow" }),
+      ],
+      proposals: [1, 2, 3, 4, 5].map((id) => proposal({ id })),
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    // "Waiting on you" is the one queue's phrase, and it belongs to Home and
+    // the rail. This card counts open proposals across the roster, which is a
+    // different number from the queue's six decision lists, so it says which.
+    const card = await screen.findByRole("article", { name: "Proposals open" });
+    expect(within(card).getByText("5")).toBeDefined();
+    expect(within(card).getByText("across the roster")).toBeDefined();
+    expect(screen.queryByRole("article", { name: "Waiting on you" })).toBeNull();
+
+    // What changed is the card no longer promising to BE the queue; the link
+    // that actually goes there is untouched.
+    expect(screen.getByRole("link", { name: "Go to the queue" })).toBeDefined();
   });
 });
 

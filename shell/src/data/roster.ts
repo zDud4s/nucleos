@@ -134,7 +134,7 @@ export function headline(rows: ProjectSummary[]): string {
   if (missing > 0) parts.push(`${missing} with the folder gone`);
   if (unset > 0) parts.push(`${unset} with no folder named`);
   if (failing > 0) parts.push(`${failing} failing the gate`);
-  if (waiting > 0) parts.push(`${waiting} waiting on you`);
+  if (waiting > 0) parts.push(`${waiting} proposal${waiting === 1 ? "" : "s"} open`);
 
   return parts.join(" · ");
 }

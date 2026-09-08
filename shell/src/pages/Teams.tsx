@@ -171,7 +171,7 @@ function headlineFor(
   // "waiting", never a count presented as the daemon's own — see the module header.
   const known = new Set(runs.map((run) => run.team_id));
   const waiting = actions.filter((action) => known.has(runTeam(action, runs) ?? "")).length;
-  if (waiting > 0) parts.push(`${waiting} waiting on you`);
+  if (waiting > 0) parts.push(`${waiting} team action${waiting === 1 ? "" : "s"} waiting`);
 
   return parts.join(" · ");
 }
@@ -419,7 +419,7 @@ function DepartmentRow({
  */
 function RowState({ live, waiting }: { live: number; waiting: number }) {
   if (live > 0) return <Badge tone="active">at work</Badge>;
-  if (waiting > 0) return <Badge tone="pending">waiting on you</Badge>;
+  if (waiting > 0) return <Badge tone="pending">waiting</Badge>;
   return <Badge tone="off">idle</Badge>;
 }
 

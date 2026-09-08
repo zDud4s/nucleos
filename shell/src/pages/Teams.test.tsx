@@ -80,6 +80,24 @@ function teamRun(overrides: Partial<TeamRun> = {}): TeamRun {
   };
 }
 
+/** One open action of `run-1`. Its team comes back through the run list, never off the action. */
+function teamAction(overrides: Partial<TeamAction> = {}): TeamAction {
+  return {
+    id: 1,
+    team_run_id: "run-1",
+    ordinal: 0,
+    kind: "send_email",
+    payload: "{}",
+    why: "the customer asked for the invoice",
+    proposal_id: 9,
+    state: "pending",
+    error: null,
+    created_at: "2026-08-24T09:00:00Z",
+    executed_at: null,
+    ...overrides,
+  };
+}
+
 function teamTrigger(overrides: Partial<TeamTrigger> = {}): TeamTrigger {
   return {
     id: 1,
@@ -511,6 +529,43 @@ describe("Teams - the headline", () => {
     // card, and even that is a rule rather than a total. See the module header.
     expect(headline.textContent).not.toMatch(/\$/);
     expect(screen.queryByText(/spent/i)).toBeNull();
+  });
+
+  /**
+   * The headline and the badge name team actions.
+   *
+   * Both said `waiting on you`, which is the one queue's phrase for the six decision lists at
+   * `/waiting`. What this page has is open team actions, so the sentence says so and the badge
+   * — already inside a column headed `Waiting`, on a row that names the team — says only the
+   * one word it still needs to add.
+   */
+  it("the headline and the badge name team actions", async () => {
+    const financas = teamView({
+      id: "financas",
+      name: "Finan\u00e7as",
+      director_agent_id: "controller",
+      members: ["controller", "auditor"],
+    });
+    // Finished, so the row is not `at work`: working beats waiting, and this is about waiting.
+    const finished = teamRun({ id: "run-1", team_id: "financas", state: "done" });
+    daemon.apiFetch.mockImplementation(
+      teamsFetch({
+        teams: [financas],
+        runs: [finished],
+        actions: [teamAction({ id: 1 }), teamAction({ id: 2 })],
+      }),
+    );
+
+    await renderTeams();
+
+    const headline = await screen.findByText(/team actions? waiting/);
+    expect(headline.textContent).toContain("2 team actions waiting");
+    expect(headline.textContent).not.toContain("waiting on you");
+
+    const table = await departments();
+    const row = within(table).getAllByRole("row")[1];
+    expect(within(row).getByText("waiting").textContent).toBe("waiting");
+    expect(within(row).queryByText("waiting on you")).toBeNull();
   });
 
   it("keeps the create form closed until it is asked for", async () => {

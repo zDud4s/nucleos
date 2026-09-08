@@ -128,9 +128,9 @@ function Readings({ rows }: { rows: ProjectSummary[] }) {
           was never read, which is what `none` means and is a different piece of news. */}
       <StatCard label="Failing the gate" value={failing} detail="the last run said no" />
       <StatCard
-        label="Waiting on you"
+        label="Proposals open"
         value={waiting}
-        detail={waiting === 0 ? "nothing has stopped to ask" : "open proposals across the roster"}
+        detail={waiting === 0 ? "nothing has stopped to ask" : "across the roster"}
       />
     </div>
   );
