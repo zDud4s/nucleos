@@ -314,7 +314,7 @@ function Catalogue({
         </tbody>
       </table>
       <p className="agents-key">
-        ◉ directs a team · ● on a team&rsquo;s roster · ● has tools · ○ no tools · ? this shell has no
+        ◉ directs a team · ● on a team&rsquo;s roster · ■ has tools · □ no tools · ? this shell has no
         reading for that policy · ≠ renamed since the núcleo learned its id
       </p>
     </div>
@@ -453,7 +453,7 @@ function toolsOf(agent: Agent): ToolsReading {
   return agent.tool_policy === "none" ? "none" : "unmapped";
 }
 
-const TOOLS_MARK: Record<ToolsReading, string> = { tools: "●", none: "○", unmapped: "?" };
+const TOOLS_MARK: Record<ToolsReading, string> = { tools: "■", none: "□", unmapped: "?" };
 
 const TOOLS_SAID: Record<ToolsReading, string> = {
   tools: "has tools",

@@ -178,6 +178,16 @@ describe("Agents - the shape of the page", () => {
     expect(key.textContent).toContain("renamed since");
   });
 
+  it("the key spends one glyph per meaning", async () => {
+    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
+    renderWithQuery(<Agents />);
+
+    const key = await screen.findByText(/directs a team/);
+    expect(key.textContent).toContain("■ has tools");
+    expect(key.textContent).toContain("□ no tools");
+    expect(key.textContent).not.toContain("● has tools");
+  });
+
   it("keeps one editor, below the table, and swaps it rather than stacking a second", async () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "one", name: "one" }), agent({ id: "two", name: "two", speciality: "second" })]),

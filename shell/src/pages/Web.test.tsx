@@ -131,6 +131,14 @@ describe("Web — search", () => {
     expect(screen.getByText("Search", { selector: ".ui-field-label" }).classList.contains("ui-field-said")).toBe(true);
   });
 
+  it("the search box says what it searches", async () => {
+    daemon.apiFetch.mockImplementation(async () => []);
+
+    await renderWeb("/web");
+
+    expect(screen.getByRole("textbox", { name: "Search query" }).getAttribute("placeholder")).toContain("search");
+  });
+
   it("reads an unavailable provider as search not configured, not as a failure", async () => {
     daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
       if (path === "/web/pages") return [];

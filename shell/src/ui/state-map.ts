@@ -377,9 +377,10 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * (`:2669, :2852, :3229, :3265, :3813, :3842`) and writes nothing else into
    * `team_items.state`. `working`, `planned` and `skipped` were this shell's own invention —
    * see `state-map-completeness.test.ts`, which reads the Rust rather than trusting this line.
+   * Awaiting-You Amber asks something of the reader; unstarted work is queued, not a summons.
    */
   team_item: {
-    pending: { tone: "pending", label: "not started" },
+    pending: { tone: "off", label: "not started" },
     running: { tone: "active", label: "running" },
     done: { tone: "active", label: "done" },
     failed: { tone: "danger", label: "failed" },

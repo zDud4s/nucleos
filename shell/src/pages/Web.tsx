@@ -171,6 +171,7 @@ function WebSearchPanel() {
           <input
             value={query}
             aria-label="Search query"
+            placeholder="search the web…"
             onChange={(event) => setQuery(event.target.value)}
           />
         </Field>

@@ -338,7 +338,7 @@
      leaves no trace of what is missing. The exception is deliberate elsewhere —
      an action that would act on stale data is removed, not disabled, because
      there the answer is "not now" rather than "not for you". */
-  opacity: 0.45;
+  opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }
 
@@ -1127,7 +1127,7 @@
 
 .ui-tab:disabled {
   pointer-events: none;
-  opacity: 0.5;
+  opacity: var(--opacity-disabled);
 }
 
 .ui-tab-panel {
@@ -1183,7 +1183,7 @@
 }
 
 .ui-switch-seg:disabled:not([aria-pressed="true"]) {
-  opacity: 0.45;
+  opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }
 

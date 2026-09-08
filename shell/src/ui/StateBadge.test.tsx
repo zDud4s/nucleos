@@ -347,6 +347,10 @@ describe("StateBadge — team_item", () => {
   it("keeps pending, running, done and failed apart", () => {
     assertAllDistinct("team_item", ["pending", "running", "done", "failed"]);
   });
+
+  it("an item nobody has started asks nothing of the reader", () => {
+    expect(badge("team_item", "pending")?.className).not.toContain("ui-badge-pending");
+  });
 });
 
 describe("StateBadge — team_action", () => {
