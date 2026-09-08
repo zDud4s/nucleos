@@ -347,9 +347,9 @@ function GovernanceRow({
           </dd>
         </div>
         <div className="ap-fact">
-          <dt>open proposals</dt>
+          <dt>items waiting for review</dt>
           <dd>
-            {project.open_proposals}
+            {project.open_review_items}
             {project.wip_limit === null ? " (no ceiling)" : ` of ${project.wip_limit}`}
           </dd>
         </div>
@@ -838,8 +838,8 @@ function JobsPanel({ rows, selected }: { rows: ProjectSummary[]; selected: strin
       )}
       {target !== undefined && target.queue_full && (
         <p className="ap-hedge">
-          {target.project_id} is holding {target.open_proposals} open proposals against its ceiling of{" "}
-          {target.wip_limit ?? "none"} — review something and the brake releases itself.
+          {target.project_id} is holding {target.open_review_items} items waiting for review against its
+          ceiling of {target.wip_limit ?? "none"} — review something and the brake releases itself.
         </p>
       )}
       {create.isError && <JobError error={create.error} />}

@@ -52,7 +52,7 @@ describe("inAttentionOrder", () => {
   it("puts a broken folder above a failing gate, and both above what is merely waiting", () => {
     const rows = [
       project({ project_id: "quiet", ...ok, last_gate: "passed" }),
-      project({ project_id: "waiting", ...ok, open_proposals: 4, last_gate: "passed" }),
+      project({ project_id: "waiting", ...ok, open_review_items: 4, last_gate: "passed" }),
       project({ project_id: "failing", ...ok, last_gate: "failed" }),
       project({ project_id: "gone", mode: "shadow", project_root: "C:/x", root_exists: false }),
     ];
@@ -78,7 +78,7 @@ describe("inAttentionOrder", () => {
   it("does not let a switched-off project outrank one that needs somebody", () => {
     const rows = [
       project({ project_id: "asleep", mode: "off", project_root: null, root_exists: null }),
-      project({ project_id: "acting", ...ok, mode: "active", open_proposals: 2, last_gate: "failed" }),
+      project({ project_id: "acting", ...ok, mode: "active", open_review_items: 2, last_gate: "failed" }),
     ];
 
     expect(inAttentionOrder(rows).map((row) => row.project_id)).toEqual(["acting", "asleep"]);
@@ -91,16 +91,16 @@ describe("inAttentionOrder", () => {
    * the failed gate and the two decisions in the columns it always drew them in.
    */
   it("ranks a switched-off project below everything, whatever else it says", () => {
-    expect(rankOf(project({ ...ok, mode: "off", last_gate: "failed", open_proposals: 9 }))).toBe(4);
+    expect(rankOf(project({ ...ok, mode: "off", last_gate: "failed", open_review_items: 9 }))).toBe(4);
     expect(rankOf(project({ mode: "off", project_root: "C:/x", root_exists: false }))).toBe(4);
   });
 
   /** Within one rank, the bigger pile first: 736 decisions outstanding is not 2. */
   it("orders equals by how much is waiting, then by name", () => {
     const rows = [
-      project({ project_id: "b", ...ok, open_proposals: 2 }),
-      project({ project_id: "a", ...ok, open_proposals: 700 }),
-      project({ project_id: "c", ...ok, open_proposals: 2 }),
+      project({ project_id: "b", ...ok, open_review_items: 2 }),
+      project({ project_id: "a", ...ok, open_review_items: 700 }),
+      project({ project_id: "c", ...ok, open_review_items: 2 }),
     ];
 
     expect(inAttentionOrder(rows).map((row) => row.project_id)).toEqual(["a", "b", "c"]);
@@ -180,7 +180,7 @@ describe("headline", () => {
         mode: "shadow",
         project_root: "C:/b",
         root_exists: true,
-        open_proposals: 171,
+        open_review_items: 171,
         last_gate: "failed",
       }),
     ];

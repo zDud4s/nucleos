@@ -9075,7 +9075,7 @@ mod tests {
             classes_total: 0,
             withheld_classes_ready: 0,
             promotable: false,
-            open_proposals: 0,
+            open_review_items: 0,
             wip_limit: None,
             queue_full: false,
             last_gate: None,

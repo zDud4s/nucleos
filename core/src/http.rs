@@ -3350,7 +3350,7 @@ struct ProjectRules {
     /// The effective open-proposal ceiling: the project's own, else the global default. `null` means
     /// the brake is off.
     wip_limit: Option<i64>,
-    open_proposals: i64,
+    open_review_items: i64,
     /// Whether that ceiling is currently refusing new autonomous work.
     queue_full: bool,
 }
@@ -3468,7 +3468,7 @@ async fn get_project_rules(
     let wip_limit = crate::wip::wip_limit(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let open_proposals = crate::wip::open_proposals(&state.pool, &id)
+    let open_review_items = crate::wip::open_proposals(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -3487,8 +3487,8 @@ async fn get_project_rules(
         schedules,
         repo_triggers,
         wip_limit,
-        open_proposals,
-        queue_full: crate::wip::queue_full(open_proposals, wip_limit),
+        open_review_items,
+        queue_full: crate::wip::queue_full(open_review_items, wip_limit),
     }))
 }
 

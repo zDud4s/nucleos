@@ -78,7 +78,7 @@ export function rankOf(project: ProjectSummary): number {
   if (project.mode === "off") return 4;
   if (folderOf(project) !== "ok") return 0;
   if (gateOf(project) === "failed") return 1;
-  if (project.open_proposals > 0) return 2;
+  if (project.open_review_items > 0) return 2;
   return 3;
 }
 
@@ -96,7 +96,7 @@ export function inAttentionOrder(rows: ProjectSummary[]): ProjectSummary[] {
   return [...rows].sort((a, b) => {
     const rank = rankOf(a) - rankOf(b);
     if (rank !== 0) return rank;
-    const waiting = b.open_proposals - a.open_proposals;
+    const waiting = b.open_review_items - a.open_review_items;
     if (waiting !== 0) return waiting;
     return a.project_id.localeCompare(b.project_id);
   });
@@ -128,7 +128,7 @@ export function headline(rows: ProjectSummary[]): string {
   const missing = rows.filter((row) => folderOf(row) === "missing").length;
   const unset = rows.filter((row) => folderOf(row) === "unset").length;
   const failing = rows.filter((row) => gateOf(row) === "failed").length;
-  const waiting = rows.reduce((total, row) => total + row.open_proposals, 0);
+  const waiting = rows.reduce((total, row) => total + row.open_review_items, 0);
 
   if (active > 0) parts.push(`${active} acting`);
   if (missing > 0) parts.push(`${missing} with the folder gone`);

@@ -33,7 +33,7 @@ pub struct ProjectSummary {
     /// WIP brake (§8.4): proposals waiting on the human, the effective ceiling (`None` = brake off),
     /// and whether the project is currently deferring new work because of it. A project can be idle
     /// purely because its queue is full, so the UI has to be able to say so.
-    pub open_proposals: i64,
+    pub open_review_items: i64,
     pub wip_limit: Option<i64>,
     pub queue_full: bool,
     /// The last thing this project's gate said, and when it said it.
@@ -191,7 +191,7 @@ pub async fn autopilot_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, 
         .collect()
 }
 
-/// One raw roster row: `(project_id, mode, project_root, pending, open_proposals, wip_override)`.
+/// One raw roster row: `(project_id, mode, project_root, pending, open_review_items, wip_override)`.
 /// Named because the tuple carries six positional fields and is only readable at the destructure.
 type RosterRow = (String, String, Option<String>, i64, i64, Option<i64>);
 
@@ -280,7 +280,7 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
     projects
         .into_iter()
         .map(
-            |(project_id, mode, project_root, pending, open_proposals, wip_override)| {
+            |(project_id, mode, project_root, pending, open_review_items, wip_override)| {
                 let mode = Mode::from_db_str(&mode).ok_or_else(|| {
                     sqlx::Error::Protocol(format!("invalid autopilot mode in database: {mode}"))
                 })?;
@@ -304,9 +304,9 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                         classes_total,
                         withheld_classes_ready,
                     ),
-                    open_proposals,
+                    open_review_items,
                     wip_limit,
-                    queue_full: crate::wip::queue_full(open_proposals, wip_limit),
+                    queue_full: crate::wip::queue_full(open_review_items, wip_limit),
                     last_gate,
                     last_gate_at,
                 })
@@ -705,7 +705,7 @@ mod tests {
                     classes_total: 0,
                     withheld_classes_ready: 0,
                     promotable: false,
-                    open_proposals: 0,
+                    open_review_items: 0,
                     wip_limit: Some(3),
                     queue_full: false,
                     last_gate: None,
@@ -720,7 +720,7 @@ mod tests {
                     classes_total: 0,
                     withheld_classes_ready: 0,
                     promotable: false,
-                    open_proposals: 0,
+                    open_review_items: 0,
                     wip_limit: Some(3),
                     queue_full: false,
                     last_gate: None,
@@ -735,7 +735,7 @@ mod tests {
                     classes_total: 0,
                     withheld_classes_ready: 0,
                     promotable: false,
-                    open_proposals: 0,
+                    open_review_items: 0,
                     wip_limit: Some(3),
                     queue_full: false,
                     last_gate: None,
@@ -773,7 +773,7 @@ mod tests {
                     classes_total: 0,
                     withheld_classes_ready: 0,
                     promotable: false,
-                    open_proposals: 0,
+                    open_review_items: 0,
                     wip_limit: Some(3),
                     queue_full: false,
                     last_gate: None,
@@ -788,7 +788,7 @@ mod tests {
                     classes_total: 0,
                     withheld_classes_ready: 0,
                     promotable: false,
-                    open_proposals: 0,
+                    open_review_items: 0,
                     wip_limit: Some(3),
                     queue_full: false,
                     last_gate: None,
@@ -954,9 +954,9 @@ mod tests {
                 // The one unreviewed shadow decision seeded above. It counts here as well as in
                 // `pending`, because the WIP brake throttles on everything waiting for a human and
                 // a shadow run mints no proposal to stand for it. The overlap is deliberate:
-                // `pending` is what the person is shown, `open_proposals` is what the brake
+                // `pending` is what the person is shown, `open_review_items` is what the brake
                 // measures, and both have to see the same backlog.
-                open_proposals: 1,
+                open_review_items: 1,
                 wip_limit: Some(3),
                 queue_full: false,
                 last_gate: None,
@@ -986,7 +986,7 @@ mod tests {
                 classes_total: 0,
                 withheld_classes_ready: 0,
                 promotable: false,
-                open_proposals: 0,
+                open_review_items: 0,
                 wip_limit: Some(3),
                 queue_full: false,
                 last_gate: None,
@@ -1036,7 +1036,7 @@ mod tests {
         // project-a overrides the ceiling to 2 and has exactly 2 waiting.
         assert_eq!(
             (
-                roster[0].open_proposals,
+                roster[0].open_review_items,
                 roster[0].wip_limit,
                 roster[0].queue_full
             ),
@@ -1045,7 +1045,7 @@ mod tests {
         // project-b inherits the global default of 3 and is nowhere near it.
         assert_eq!(
             (
-                roster[1].open_proposals,
+                roster[1].open_review_items,
                 roster[1].wip_limit,
                 roster[1].queue_full
             ),
@@ -1053,7 +1053,7 @@ mod tests {
         );
     }
 
-    /// The roster's `open_proposals` and `wip::open_proposals` are two hand-written copies of the
+    /// The roster's `open_review_items` and `wip::open_proposals` are two hand-written copies of the
     /// same query — nothing else stops them drifting apart. Compares the two NUMBERS, not two
     /// hardcoded literals, so a change to one copy that is not mirrored in the other fails this
     /// test rather than silently making the shell disagree with the daemon.
@@ -1123,8 +1123,8 @@ mod tests {
 
         assert_eq!(roster.len(), 1);
         assert_eq!(
-            roster[0].open_proposals, gate,
-            "the roster's open_proposals must never disagree with the daemon's wip gate"
+            roster[0].open_review_items, gate,
+            "the roster's open_review_items must never disagree with the daemon's wip gate"
         );
         assert_eq!(
             gate, 2,

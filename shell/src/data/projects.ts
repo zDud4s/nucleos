@@ -10,7 +10,7 @@ import { keys } from "./keys";
  * **The rules are read on open and not polled.** `get_project_rules` loads
  * `.ai/autopilot.yaml` off the disk and stats it on every call; putting that on
  * a three-second timer would be a file read per tick for a document somebody
- * edits once a week. The *live* numbers a rules panel needs — `open_proposals`,
+ * edits once a week. The *live* numbers a rules panel needs — `open_review_items`,
  * `wip_limit`, `queue_full` — are already on the roster row from
  * `useProjects()`, which does poll, so the panel takes its moving parts from
  * there and its file facts from here.
@@ -79,7 +79,7 @@ export interface ProjectRules {
   repo_triggers: RepoTriggerView[];
   /** The effective ceiling. `null` means the brake is **off**, which is not a ceiling of zero. */
   wip_limit: number | null;
-  open_proposals: number;
+  open_review_items: number;
   queue_full: boolean;
 }
 
@@ -799,10 +799,10 @@ export function headlineFor(rules: ProjectRules): string {
   }
 
   if (rules.wip_limit === null) {
-    parts.push(`${rules.open_proposals} open, no ceiling`);
+    parts.push(`${rules.open_review_items} open, no ceiling`);
   } else {
     parts.push(
-      `${rules.open_proposals} of ${rules.wip_limit} open${rules.queue_full ? ", holding" : ""}`,
+      `${rules.open_review_items} of ${rules.wip_limit} open${rules.queue_full ? ", holding" : ""}`,
     );
   }
 

@@ -43,7 +43,7 @@ export interface ProjectSummary {
    */
   withheld_classes_ready?: number;
   promotable: boolean;
-  open_proposals: number;
+  open_review_items: number;
   wip_limit: number | null;
   queue_full: boolean;
   /**

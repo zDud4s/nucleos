@@ -1373,7 +1373,7 @@ function WipPanel({ projectId, rules }: { projectId: string; rules: ProjectRules
 
       <Meter
         label="open and unreviewed"
-        value={rules.open_proposals}
+        value={rules.open_review_items}
         ceiling={rules.wip_limit}
         tone={rules.queue_full ? "pending" : "active"}
       />

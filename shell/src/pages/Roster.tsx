@@ -193,7 +193,7 @@ function Row({
         </th>
 
         <td className="px-3 py-2 text-right tabular-nums">
-          {project.open_proposals === 0 ? (
+          {project.open_review_items === 0 ? (
             <Nothing />
           ) : (
             <Link
@@ -201,7 +201,7 @@ function Row({
               to="/projects/$projectId/$view"
               params={{ projectId: project.project_id, view: "state" }}
             >
-              {project.open_proposals}
+              {project.open_review_items}
             </Link>
           )}
         </td>

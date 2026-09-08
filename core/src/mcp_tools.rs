@@ -441,7 +441,7 @@ impl NucleosTools {
         description = "List projects known to the NucleOS daemon. Each entry carries its autopilot \
                        mode, how far it is from leaving shadow (`classes_ready` of \
                        `classes_total`, `withheld_classes_ready`, and `promotable`) and whether \
-                       its WIP brake is currently holding new work back (`open_proposals`, \
+                       its WIP brake is currently holding new work back (`open_review_items`, \
                        `wip_limit`, `queue_full`). Start here: a project in `shadow` mode can plan \
                        but cannot act, so work dispatched to one produces a plan and nothing else."
     )]

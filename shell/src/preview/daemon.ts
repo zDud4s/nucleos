@@ -639,7 +639,7 @@ function project(overrides: Partial<ProjectSummary>): ProjectSummary {
     classes_ready: 0,
     classes_total: 0,
     promotable: false,
-    open_proposals: 0,
+    open_review_items: 0,
     wip_limit: null,
     queue_full: false,
     root_exists: null,
@@ -655,7 +655,7 @@ export const PROJECTS: ProjectSummary[] = [
     mode: "shadow",
     project_root: "C:/repos/alpha",
     root_exists: true,
-    open_proposals: 3,
+    open_review_items: 3,
     wip_limit: 4,
     classes_ready: 2,
     classes_total: 5,
@@ -668,7 +668,7 @@ export const PROJECTS: ProjectSummary[] = [
     project_root: "C:/repos/bravo-servicos-partilhados",
     root_exists: true,
     // At the ceiling: the brake is holding, which is one of the five findings.
-    open_proposals: 2,
+    open_review_items: 2,
     wip_limit: 2,
     queue_full: true,
     last_gate: "failed",
@@ -709,7 +709,7 @@ function rules(overrides: Partial<ProjectRules>): ProjectRules {
     schedules: [],
     repo_triggers: [],
     wip_limit: null,
-    open_proposals: 0,
+    open_review_items: 0,
     queue_full: false,
     ...overrides,
   };
@@ -722,7 +722,7 @@ const ALPHA_RULES: ProjectRules = rules({
   gate_command: "cargo test -p nucleos-core --all-features",
   gate_before_publish: true,
   wip_limit: 4,
-  open_proposals: 3,
+  open_review_items: 3,
   schedules: [
     {
       name: "nightly-tidy",
@@ -795,7 +795,7 @@ const BRAVO_RULES: ProjectRules = rules({
   gate_command: null,
   gate_before_publish: true,
   wip_limit: 2,
-  open_proposals: 2,
+  open_review_items: 2,
   queue_full: true,
 });
 
