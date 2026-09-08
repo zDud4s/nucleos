@@ -148,6 +148,7 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     failures="$failures  hooks: python not installed"$'\n'
   else
     run "hooks: filter"   . "$py" scripts/test-hook-filter.py
+    run "hooks: evidence" . "$py" scripts/test-evidence-gate.py
     run "eval: approver"  . "$py" scripts/eval/test-auto-approve.py
     run "usage: split"    . "$py" scripts/test-usage-split.py
     run "usage: statusline" . "$py" scripts/test-statusline-context.py
