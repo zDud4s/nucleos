@@ -1,5 +1,5 @@
 import type { Agent } from "../data/agents";
-import type { Concurrency, Job, JobDetail, JobItem } from "../data/fleet";
+import type { Concurrency, Job, JobDetail, JobItem, RunSearchResult } from "../data/fleet";
 import type { MapImport, MapModule, ProjectMap } from "../data/project-map";
 import type {
   InspectEntry,
@@ -1434,6 +1434,26 @@ const RUN_DETAIL = {
   successor_run_id: null,
 } satisfies RunDetail;
 
+/*
+ * Four costs are deliberately absent, including two finished runs: recording a
+ * cost is not guaranteed. Two excerpts are long enough to wrap, because a list
+ * that only sees short prompts has not been asked about its reading width.
+ */
+const RUN_INDEX: RunSearchResult[] = [
+  { id: 1, project_id: "alpha", status: "completed", mode: "real", created_at: ago(5 * 60_000), completed_at: ago(60_000), cost_usd: 0.0412, prompt_excerpt: "Check the changed files, run the selected gate, and summarise the result for the release note." },
+  { id: 2, project_id: "bravo", status: "running", mode: "real", created_at: ago(10 * 60_000), completed_at: null, cost_usd: null, prompt_excerpt: "Trace the approval queue delay and prepare a small, reversible fix." },
+  { id: 3, project_id: "charlie", status: "awaiting_approval", mode: "shadow", created_at: ago(18 * 60_000), completed_at: null, cost_usd: null, prompt_excerpt: "Review the proposed dependency update before it changes the build image." },
+  { id: 4, project_id: "delta", status: "pending", mode: "worktree", created_at: ago(32 * 60_000), completed_at: null, cost_usd: 0.0084, prompt_excerpt: "Map the incoming request to the owning team and queue the first safe step." },
+  { id: 5, project_id: null, status: "failed", mode: "real", created_at: ago(3 * 3_600_000), completed_at: ago(2 * 3_600_000), cost_usd: 0.0167, prompt_excerpt: "Reproduce the sidecar handshake failure with the production-shaped configuration." },
+  { id: 6, project_id: null, status: "cancelled", mode: "real", created_at: ago(7 * 3_600_000), completed_at: ago(6 * 3_600_000), cost_usd: 0.0031, prompt_excerpt: "Stop the duplicate migration review after the owner chose the newer branch." },
+  { id: 7, project_id: null, status: "timed_out", mode: "real", created_at: ago(13 * 3_600_000), completed_at: ago(11 * 3_600_000), cost_usd: null, prompt_excerpt: "Investigate why the preview service keeps returning an empty list to otherwise healthy screens." },
+  { id: 8, project_id: "alpha", status: "completed", mode: "real", created_at: ago(26 * 3_600_000), completed_at: ago(25 * 3_600_000), cost_usd: 0.0289, prompt_excerpt: "Add the missing status label to the activity summary." },
+  { id: 9, project_id: "bravo", status: "failed", mode: "shadow", created_at: ago(2 * DAY), completed_at: ago(47 * 3_600_000), cost_usd: 0.0195, prompt_excerpt: "Compare the changed policy with the current queue limits and report conflicts." },
+  { id: 10, project_id: "charlie", status: "cancelled", mode: "real", created_at: ago(3 * DAY), completed_at: ago(71 * 3_600_000), cost_usd: 0.0062, prompt_excerpt: "Prepare a recovery checklist for the paused integration." },
+  { id: 11, project_id: "delta", status: "completed", mode: "worktree", created_at: ago(4 * DAY), completed_at: ago(95 * 3_600_000), cost_usd: null, prompt_excerpt: "Refine the dashboard hierarchy so the queue state remains legible when several teams are blocked at once and the operator needs the cause before the chronology." },
+  { id: 12, project_id: null, status: "completed", mode: "real", created_at: ago(5 * DAY), completed_at: ago(119 * 3_600_000), cost_usd: 0.0528, prompt_excerpt: "Document the observed retry pattern, including the handoff signals that distinguish a delayed worker from a run that has silently stopped making progress." },
+];
+
 const RUN_STOP = {
   run_id: 1,
   status: "completed",
@@ -1507,6 +1527,22 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (/^\/jobs\/\d+$/.test(path)) return JOB_VIEW;
   if (/^\/runs\/\d+\/stop$/.test(path)) return RUN_STOP;
   if (/^\/runs\/\d+\/tail/.test(path)) return RUN_TAIL;
+  if ((path === "/runs" || path.startsWith("/runs?")) && init?.method === undefined) {
+    const [, query] = splitQuery(path);
+    let runs = RUN_INDEX;
+    if (query.get("live") === "true") {
+      runs = runs.filter((run) => ["pending", "running", "awaiting_approval"].includes(run.status));
+    }
+    for (const key of ["status", "project_id", "mode"] as const) {
+      const value = query.get(key);
+      if (value !== null) runs = runs.filter((run) => run[key] === value);
+    }
+    const q = query.get("q");
+    if (q !== null) runs = runs.filter((run) => run.prompt_excerpt.toLowerCase().includes(q.toLowerCase()));
+    const rawLimit = query.get("limit");
+    const limit = rawLimit === null ? Number.NaN : Number(rawLimit);
+    return Number.isFinite(limit) ? runs.slice(0, limit) : runs;
+  }
   if (/^\/runs\/\d+$/.test(path) && init?.method === undefined) return RUN_DETAIL;
   if (/^\/email\/\d+$/.test(path) && init?.method === undefined) return EMAIL_DETAIL;
 
