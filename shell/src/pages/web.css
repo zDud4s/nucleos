@@ -43,36 +43,6 @@
   font-style: italic;
 }
 
-/* A field label over its own input — every form on this page shares it. */
-.web-field {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  min-width: 0;
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.web-field input {
-  min-width: 16rem;
-  padding: var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--text-sm);
-  text-transform: none;
-  letter-spacing: normal;
-}
-
-.web-field input:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
-}
-
 /* ---------------------------------------------------------------- forms == */
 
 .web-read-form,

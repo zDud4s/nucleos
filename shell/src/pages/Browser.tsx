@@ -15,6 +15,7 @@ import {
   useReturnWheel,
   type BrowserSession,
   type Site,
+  type SubsystemReadout,
   type Written,
 } from "../data/browser";
 import { useProjects } from "../data/system";
@@ -62,7 +63,7 @@ export function Browser() {
     <>
       <PageHeader
         title="Browser"
-        headline={headline(sessions.data)}
+        headline={headline(sessions.data, health.data?.subsystem ?? null)}
         actions={health.data?.subsystem == null ? undefined : <StateBadge domain="pillar" state={health.data.subsystem.status} />}
       />
 
@@ -88,7 +89,13 @@ export function Browser() {
   );
 }
 
-function headline(rows: BrowserSession[] | undefined): string | undefined {
+function headline(rows: BrowserSession[] | undefined, subsystem: SubsystemReadout | null): string | undefined {
+  // The pillar being down outranks how many sessions are open: none of them can be doing
+  // anything. The reason travels with it — it was in a panel at the bottom of the page.
+  if (subsystem !== null && subsystem.status !== "ok" && subsystem.status !== "disabled") {
+    const why = subsystem.reason === undefined ? "" : ` — ${subsystem.reason}`;
+    return `the browser sidecar is ${subsystem.status}${why}`;
+  }
   if (rows === undefined) return undefined;
   if (rows.length === 0) return "nothing is open right now";
   const asking = rows.filter((row) => row.mode === "wheel-requested").length;

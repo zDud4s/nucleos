@@ -344,7 +344,7 @@ describe("Teams - the table", () => {
     expect(said).toEqual(["2 runs on 2026-09-05", "1 run on 2026-09-06"]);
   });
 
-  it("marks a team with nobody on it, because it cannot start a task", async () => {
+  it("nobody yet is a mark, not a fault", async () => {
     const empty = teamView({
       id: "operacoes",
       name: "Operações",
@@ -356,7 +356,7 @@ describe("Teams - the table", () => {
     await renderTeams();
 
     const table = await departments();
-    expect(table.querySelector(".teams-figure-none")).not.toBeNull();
+    expect(table.querySelector(".teams-figure-none")?.textContent).toContain("0");
     expect(within(table).getByText(/nobody yet, so no task can start/)).toBeDefined();
   });
 
@@ -378,6 +378,18 @@ describe("Teams - the table", () => {
     expect(within(table).getByText("file_document: asks first")).toBeDefined();
     // No grant row at all IS the denial — there is no `deny` mode in the núcleo.
     expect(within(table).getByText("calendar_event: asks you")).toBeDefined();
+  });
+
+  it("the glyph column says what its glyphs mean", async () => {
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [teamView()] }));
+
+    await renderTeams();
+
+    const header = within(await departments()).getByRole("columnheader", { name: /On its own/ });
+    expect(header.textContent).toContain("does it");
+    expect(header.textContent).toContain("asks first");
+    expect(header.textContent).toContain("asks you");
+    expect(header.textContent).toContain("routines armed");
   });
 
   it("reads a grant mode this shell does not know as its own gap, not as a decision", async () => {

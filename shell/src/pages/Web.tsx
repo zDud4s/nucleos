@@ -12,7 +12,7 @@ import {
   type ReadView,
   type SearchView,
 } from "../data/web";
-import { Button, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime, StateBadge, Teach } from "../ui";
+import { Button, ErrorNote, Field, PageHeader, Panel, RefusalNote, RelativeTime, StateBadge, Teach } from "../ui";
 import "./web.css";
 
 /**
@@ -102,15 +102,14 @@ function ReadForm() {
           read.mutate(url.trim(), { onSuccess: () => setUrl("") });
         }}
       >
-        <label className="web-field">
-          <span>URL</span>
+        <Field label="URL">
           <input
             value={url}
             aria-label="URL to read"
             placeholder="https://…"
             onChange={(event) => setUrl(event.target.value)}
           />
-        </label>
+        </Field>
         <Button type="submit" intent="go" disabled={url.trim() === "" || read.isPending}>
           Read
         </Button>
@@ -168,14 +167,13 @@ function WebSearchPanel() {
           search.mutate({ query: query.trim() });
         }}
       >
-        <label className="web-field">
-          <span>Search</span>
+        <Field label="Search" labelHidden>
           <input
             value={query}
             aria-label="Search query"
             onChange={(event) => setQuery(event.target.value)}
           />
-        </label>
+        </Field>
         <Button type="submit" disabled={query.trim() === "" || search.isPending}>
           Search
         </Button>
@@ -267,10 +265,9 @@ function ArchiveList({
           onSearch(text === "" ? undefined : text);
         }}
       >
-        <label className="web-field">
-          <span>Filter</span>
+        <Field label="Filter">
           <input name="q" defaultValue={q ?? ""} key={q ?? ""} aria-label="Filter the archive" />
-        </label>
+        </Field>
         <Button type="submit">Filter</Button>
         {q !== undefined && <Button onClick={() => onSearch(undefined)}>Clear</Button>}
       </form>

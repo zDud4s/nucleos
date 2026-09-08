@@ -161,6 +161,14 @@ describe("Council - the empty catalogue", () => {
     expect(await screen.findByRole("heading", { level: 3, name: "Choose a council" })).toBeDefined();
     expect(screen.queryByRole("region", { name: "Councils" })).toBeNull();
   });
+
+  it("explains the three phases once", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}));
+
+    await renderCouncil("/council");
+
+    expect(await screen.findAllByText(/ranks the others blind/)).toHaveLength(1);
+  });
 });
 
 /* --------------------------------------------------------- A10: abstained -- */

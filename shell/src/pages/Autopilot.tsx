@@ -32,6 +32,7 @@ import {
   Count,
   ConfirmButton,
   ErrorNote,
+  ModeSwitch,
   PageHeader,
   Panel,
   Quiet,
@@ -418,35 +419,23 @@ function GovernanceRow({
           : ` of ${project.wip_limit}`}
       </span>
 
+      {/* The wrapper stays: it is this row's sixth grid cell, and it is what puts the
+          control at the end of it. `.ap-modes` is layout, `ModeSwitch` is the control. */}
       <div className="ap-modes">
-        <Button
-          variant="ghost"
-          intent="stop"
-          disabled={project.mode === "off" || setMode.isPending}
-          onClick={() => change("off", null)}
-        >
-          Turn off
-        </Button>
-        <Button
-          variant="ghost"
-          disabled={project.mode === "shadow" || setMode.isPending}
-          onClick={() =>
-            change("shadow", root === "" ? project.project_root : root)
-          }
-        >
-          Watch in shadow
-        </Button>
-        <ConfirmButton
-          label="Let it act"
-          confirmLabel="It may act on its own"
-          variant="approve"
-          disabled={
-            project.mode === "active" ||
-            !project.promotable ||
-            setMode.isPending
-          }
-          onConfirm={() =>
-            change("active", root === "" ? project.project_root : root)
+        <ModeSwitch
+          value={project.mode}
+          actAllowed={project.promotable}
+          actBlocker={promotionBlocker(project, withheld)}
+          busy={setMode.isPending}
+          onChoose={(mode) =>
+            change(
+              mode,
+              mode === "off"
+                ? null
+                : root === ""
+                  ? project.project_root
+                  : root,
+            )
           }
         />
       </div>
@@ -811,7 +800,7 @@ const TRIGGER_SCOPES: {
   {
     id: "team",
     label: "Team triggers",
-    what: "the rules that start a department on a clock, on another team ending, or on triaged mail",
+    what: "the rules that start a team on a clock, on another team ending, or on triaged mail",
     // `team_trigger.rs`, before any rule is considered.
     reads: true,
   },

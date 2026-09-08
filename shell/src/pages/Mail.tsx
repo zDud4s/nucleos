@@ -62,10 +62,7 @@ export function Mail() {
     <>
       <PageHeader title="Mail" headline={headline(rows)} />
 
-      <ConfigPanel config={config} />
-
-      <TriagePanel />
-
+      {/* Mail opens on what arrived; configuration is filled in once, not read first. */}
       <Panel title="Queue" aside={<UntriagedCount rows={rows} />}>
         <MailSearchBar q={q} onSearch={setQ} />
         {stale && <StaleNote dataUpdatedAt={queue.dataUpdatedAt} />}
@@ -73,9 +70,13 @@ export function Mail() {
         <QueueList rows={rows} filtered={q !== undefined} />
       </Panel>
 
+      <TriagePanel />
+
       <CursorPanel mailbox={mailbox} cursor={cursor.data} loading={cursor.data === undefined && !cursor.isError} />
 
       <SkippedAbsence />
+
+      <ConfigPanel config={config} />
     </>
   );
 }

@@ -13,6 +13,7 @@ export { CopyOnce, type CopyOnceProps } from "./CopyOnce";
 export { Count, type CountProps } from "./Count";
 export { Crumb, type CrumbProps } from "./Crumb";
 export { ErrorNote, type ErrorNoteProps } from "./ErrorNote";
+export { Field, type FieldProps } from "./Field";
 /**
  * Two primitives in one module — the second recorded exception to one
  * primitive per file. See the header of `Meter.tsx`: the pair exists for the
@@ -20,6 +21,7 @@ export { ErrorNote, type ErrorNoteProps } from "./ErrorNote";
  * and splitting them is how the next ceiling gets drawn as the wrong one.
  */
 export { LimitChip, Meter, usd, type LimitChipProps, type MeterProps, type MeterTone } from "./Meter";
+export { ModeSwitch, type ModeSwitchProps, type SwitchMode } from "./ModeSwitch";
 export { PageHeader, type PageHeaderProps } from "./PageHeader";
 export { Panel, type PanelProps, type PanelVariant } from "./Panel";
 export { Quiet, type QuietProps } from "./Quiet";

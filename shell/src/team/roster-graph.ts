@@ -31,7 +31,7 @@ export type RosterLayer = 0 | 1 | 2 | 3;
  * One box.
  *
  * `state` is a `string` and not a union on purpose, for the reason `Work.tsx:253` is written the
- * way it is: the daemon's five item states (`done`, `working`, `planned`, `failed`, `skipped`) are
+ * way it is: the daemon's four item states (`done`, `running`, `pending`, `failed`) are
  * what the drawing has tones and glyphs for, plus the three this module synthesises — `holds` for
  * the department, `directs` for the one at the top and `idle` for everybody else. Anything the
  * daemon adds later arrives here as its own word, renders untoned, and is not silently reported as

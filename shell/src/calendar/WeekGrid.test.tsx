@@ -160,6 +160,16 @@ describe("overlap lanes", () => {
 });
 
 describe("the working day", () => {
+  it("opens scrolled to the working hours", () => {
+    const offsetHeight = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(768);
+    const { container } = week([]);
+
+    const scroller = container.querySelector(".calendar-week-scroll") as HTMLDivElement;
+    expect(scroller.scrollTop).toBeGreaterThan(0);
+    expect(scroller.scrollTop).toBeCloseTo(768 * 0.375 - 12);
+    offsetHeight.mockRestore();
+  });
+
   it("washes the working hours, positioned by the same function that places the events", () => {
     const { container } = week([]);
     const washes = [...container.querySelectorAll(".calendar-work-wash")] as HTMLElement[];

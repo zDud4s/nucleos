@@ -104,6 +104,19 @@ function renderMail() {
   return renderWithRouter(<Mail />, { initialPath: "/mail" });
 }
 
+describe("Mail — panel order", () => {
+  it("puts the queue first and configuration last", async () => {
+    daemon.apiFetch.mockImplementation(mailFetch(mailWorld()));
+
+    await renderMail();
+
+    await screen.findByRole("heading", { level: 2, name: "Queue" });
+    const headings = [...document.querySelectorAll("h2")].map((heading) => heading.textContent);
+    expect(headings[0]).toBe("Queue");
+    expect(headings[headings.length - 1]).toBe("Configuration");
+  });
+});
+
 /* -------------------------------------------------- an untriaged message -- */
 
 describe("Mail — an untriaged message", () => {

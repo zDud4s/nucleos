@@ -898,9 +898,9 @@ describe("Chats - what a department said", () => {
 
     await renderChats("/chats/c-1");
 
-    expect(await screen.findByRole("link", { name: /1 from a department/ })).toBeDefined();
+    expect(await screen.findByRole("link", { name: /1 from a team/ })).toBeDefined();
     // The count of turns is untouched by it: two unread answers are still two, not three.
-    expect(screen.getByRole("link", { name: /aqui, cloud, .+, 2 unread, 1 from a department$/ })).toBeDefined();
+    expect(screen.getByRole("link", { name: /aqui, cloud, .+, 2 unread, 1 from a team$/ })).toBeDefined();
     expect(screen.getByRole("link", { name: /ali, cloud, .+, 2 unread$/ })).toBeDefined();
   });
 });
@@ -4269,6 +4269,22 @@ describe("Chats - the list, cut into days", () => {
 });
 
 describe("Chats - a turn while it is running", () => {
+  it("gives a reduced-motion reader a mark, not a frozen spinner", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 7, status: "running", answer: null })],
+      }, { live: { 7: { text: "", doing: null } } }),
+    );
+
+    await renderChats("/chats/c-1");
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    const live = (await within(transcript).findByText("thinking…")).closest(".chats-turn-live");
+    const spinner = live?.querySelector(".chats-turn-spinner");
+
+    expect(spinner?.getAttribute("aria-hidden")).toBe("true");
+    expect(live?.textContent).toContain("thinking…");
+  });
+
   it("names the tool it is in and keeps a clock on it", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(

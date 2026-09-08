@@ -455,6 +455,22 @@ describe("Waiting - the ordering freeze", () => {
 /* ------------------------------------------- A14: what is deliberately absent -- */
 
 describe("Waiting - the sections that are not there", () => {
+  it("the queue calls a team a team", async () => {
+    daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld()));
+
+    await renderWaiting();
+
+    await screen.findByText("no team is waiting on an action");
+    const actions = screen.getByRole("region", { name: "Team actions" });
+    const recruitment = screen.getByRole("region", { name: "Recruitment" });
+    fireEvent.click(within(actions).getByRole("button", { name: "why?" }));
+    fireEvent.click(within(recruitment).getByRole("button", { name: "why?" }));
+
+    expect(screen.getByText("no team is waiting on an action")).toBeDefined();
+    expect(screen.getByText("no team has asked for a specialist")).toBeDefined();
+    expect(screen.queryByText(/no department/)).toBeNull();
+  });
+
   it("renders a team action's payload as readable fields, never as JSON", async () => {
     const world = waitingWorld({
       teamActions: [

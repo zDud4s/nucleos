@@ -792,10 +792,10 @@ function TeamActionSection({
       view={view}
       what="the team's action requests"
       count={items.length}
-      says="no department is waiting on an action"
+      says="no team is waiting on an action"
       why={
         <>
-          An action a department asked the núcleo to carry out under a propose grant. Approving
+          An action a team asked the núcleo to carry out under a propose grant. Approving
           does not do the thing — it lets the núcleo do it on its next tick, about ten seconds
           later.
         </>
@@ -961,11 +961,11 @@ function RecruitmentSection({ view }: { view: Reading<Proposal> }) {
       view={view}
       what="the recruitment requests"
       count={items.length}
-      says="no department has asked for a specialist"
+      says="no team has asked for a specialist"
       why={
         <>
           A director asked for a specialist by name. The request is editable here before it is
-          granted; saying not now leaves nothing behind — the department may ask again.
+          granted; saying not now leaves nothing behind — the team may ask again.
         </>
       }
     >

@@ -42,7 +42,7 @@
 .teams-flight {
   margin: var(--space-4) 0 0;
   padding: var(--space-4);
-  border: 1px solid var(--tone-active-border);
+  border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface);
 }
@@ -196,9 +196,9 @@
   color: var(--tone-pending-fg);
 }
 
-/* Nobody on the roster — not a low number, a department that cannot start a task. */
+/* Nobody on the roster is an ordinary first state; the mark and sentence say why work cannot start. */
 .teams-figure-none {
-  color: var(--tone-danger-fg);
+  color: var(--text-faint);
 }
 
 /*
@@ -348,6 +348,7 @@
   font-weight: 600;
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
+  color: var(--text);
 }
 
 /*
@@ -813,7 +814,7 @@
   color: var(--tone-active-fg);
 }
 
-.teams-round-working {
+.teams-round-running {
   border-color: var(--tone-active-border);
   background: var(--tone-active-bg);
   color: var(--tone-active-fg);
@@ -824,14 +825,17 @@
   color: var(--tone-danger-fg);
 }
 
-.teams-round-skipped {
+/* A planned item has no tone of its own: not started is the resting state. */
+.teams-round-pending {
   border-style: dashed;
-  color: var(--text-faint);
 }
 
-/* A planned item has no tone of its own: not started is the resting state. */
-.teams-round-planned {
-  border-style: dashed;
+.teams-rounds-key {
+  display: flex;
+  gap: var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  margin: 0 0 var(--space-1);
 }
 
 /* ============================================================== routines == */
@@ -1389,7 +1393,7 @@
   stroke: var(--tone-active-border);
 }
 
-.teams-org-working .teams-org-box {
+.teams-org-running .teams-org-box {
   fill: var(--tone-active-bg);
   stroke: var(--tone-active-border);
 }
@@ -1398,9 +1402,8 @@
   stroke: var(--tone-danger-border);
 }
 
-/* Not started and not going to start are both resting states, and neither has a tone. */
-.teams-org-planned .teams-org-box,
-.teams-org-skipped .teams-org-box {
+/* Not started is a resting state and has no tone. */
+.teams-org-pending .teams-org-box {
   stroke-dasharray: 3 3;
 }
 

@@ -216,30 +216,14 @@
   gap: var(--space-2);
   padding: var(--space-3);
   border: 1px solid var(--border);
-  border-left: 3px solid var(--border-strong);
   border-radius: var(--radius-md);
   background: var(--surface-raised);
   box-shadow: none;
 }
 
-/* The kind of owner, said in the left edge as well as in words. */
-.fleet-card-job {
-  border-left-color: var(--tone-active-border);
-}
-
-.fleet-card-run {
-  border-left-color: var(--tone-info-border);
-}
-
 /* Nothing described this owner — ordinary, and drawn as recessive. */
 .fleet-card-unknown {
-  border-left-color: var(--border);
   background: var(--surface);
-}
-
-/* A leaked slot. It is a defect, and it is allowed to look like one. */
-.fleet-card-orphaned {
-  border-left-color: var(--tone-danger-border);
 }
 
 .fleet-card-head {

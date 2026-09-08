@@ -1,13 +1,17 @@
 import { Link } from "@tanstack/react-router";
+import type { ReactNode } from "react";
 import { FeedEmbed } from "../app/FeedEmbed";
 import {
+  isAggregateTimeout,
   useBudget,
   useProjects,
   useProposals,
   useSystemHealth,
   type BudgetView,
+  type HealthReadout,
   type ProjectSummary,
   type Proposal,
+  type SubsystemReadout,
 } from "../data/system";
 import { PageHeader, Section, StatCard } from "../ui";
 import { headlineFor as systemHeadline } from "./System";
@@ -46,8 +50,19 @@ export function Home() {
 
   return (
     <>
-      <PageHeader title="Home" headline={headline(roster, queue, spend)} />
+      <PageHeader title="Home" headline={headline(roster, queue, spend, health.data)} />
 
+      {/*
+        Five cards, always five. They do not recede when everything is well, and that is a
+        decision rather than an omission: the four autopilot readings are standing readings, not
+        exceptions, and a card that appeared only when something was wrong would teach the reader
+        that an absent card is an absent fact — the opposite of the honesty this page is being
+        fixed for. What was lying here was the headline; the cards were already right.
+
+        A conditional card would also change the page's shape under the eyes of somebody halfway
+        down it, which is the invariant `project/ModeState.tsx:31-34` already defends for a
+        project page.
+      */}
       <div className="app-home-stats">
         <StatCard
           label="Projects"
@@ -136,17 +151,56 @@ function ceiling(spend: BudgetView | undefined): string | undefined {
 }
 
 /**
- * One derived sentence about the state of the autopilot.
+ * One derived sentence about the state of the machine — the worst thing first.
  *
- * Not a description of the page — the title already says what this is. This is
- * the line that changes, and it is the reason the shell can be glanced at
- * rather than read.
+ * Not a description of the page: the title already says what this is. This is the
+ * line that changes, and it is the reason the shell can be glanced at rather than
+ * read. Which is why the order it picks in is a ladder and not a preference:
+ *
+ *   1. the worst live fact about the machine — a subsystem down, or degraded;
+ *   2. a ceiling holding autonomous work;
+ *   3. the modes the projects are in.
+ *
+ * A subsystem being down outranks a ceiling holding work because one says the
+ * machine is broken and the other says it is being restrained, and both outrank a
+ * count of who is acting, which is only news while nothing is wrong.
+ *
+ * The wrong-fact clause is a **link**, and that is the substance of it rather than
+ * decoration. `/system` is where the answer to *which one, and why* is kept, so a
+ * sentence that names a problem and then goes nowhere leaves the reader to carry
+ * the fact across the window by hand — and a reader who has had to do that twice
+ * stops reading the sentence. Naming a problem with no door to it is the exact
+ * failure this page is being repaired for.
+ *
+ * `ReactNode` and not `string` because of that link; this is the only headline in
+ * the app that is not a string.
  */
 function headline(
   roster: ProjectSummary[] | undefined,
   queue: Proposal[] | undefined,
   spend: BudgetView | undefined,
-): string | undefined {
+  health: HealthReadout | undefined,
+): ReactNode {
+  const waiting = queue?.length;
+  const tail =
+    waiting === undefined
+      ? ""
+      : waiting === 0
+        ? "; nothing waiting on you"
+        : `; ${String(waiting)} waiting on you`;
+
+  // The worst live fact leads, and it is a door. A subsystem being down outranks a ceiling
+  // holding work: one says the machine is broken, the other says it is being restrained.
+  const wrong = wrongClause(health);
+  if (wrong !== null) {
+    return (
+      <>
+        <Link to="/system">{wrong}</Link>
+        {tail}
+      </>
+    );
+  }
+
   if (spend?.paused === true) {
     return `autonomous work is held — ${spend.reason ?? "a ceiling is holding it"}`;
   }
@@ -154,7 +208,6 @@ function headline(
 
   const active = roster.filter((project) => project.mode === "active").length;
   const shadow = roster.filter((project) => project.mode === "shadow").length;
-  const waiting = queue?.length;
 
   const modes =
     active === 0 && shadow === 0
@@ -162,5 +215,31 @@ function headline(
       : `${active} acting, ${shadow} in shadow`;
 
   if (waiting === undefined) return modes;
-  return waiting === 0 ? `${modes}; nothing waiting on you` : `${modes}; ${waiting} waiting on you`;
+  return `${modes}${tail}`;
+}
+
+/**
+ * The worst live fact about the machine, or nothing when there is none.
+ *
+ * `down` before `degraded`, both named, and the down ones named BY NAME: "1 subsystem down"
+ * sends somebody to /system to find out which, and the answer is three words long. `disabled`
+ * is deliberately absent — a subsystem nobody configured is not a fault, which is the same
+ * rule `wantsAttention` already follows for the rail's dot.
+ */
+function wrongClause(readout: HealthReadout | undefined): string | null {
+  if (readout === undefined) return null;
+  if (isAggregateTimeout(readout))
+    return "the health readout timed out before it measured anything";
+  const down: SubsystemReadout[] = readout.subsystems.filter((row) => row.status === "down");
+  const degraded: SubsystemReadout[] = readout.subsystems.filter(
+    (row) => row.status === "degraded",
+  );
+  if (down.length === 0 && degraded.length === 0) return null;
+  const parts: string[] = [];
+  if (down.length > 0) {
+    const named = down.map((row) => row.name).join(", ");
+    parts.push(`${String(down.length)} subsystem${down.length === 1 ? "" : "s"} down (${named})`);
+  }
+  if (degraded.length > 0) parts.push(`${String(degraded.length)} degraded`);
+  return parts.join(", ");
 }

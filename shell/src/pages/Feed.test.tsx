@@ -236,3 +236,13 @@ describe("Feed - the route", () => {
     expect(screen.queryByText("Feed is not built yet")).toBeNull();
   });
 });
+
+describe("Feed - date bounds", () => {
+  it("the date bounds declare the shell's locale", async () => {
+    daemon.apiFetch.mockImplementation(feedFetch([]));
+    renderFeed();
+
+    expect((await screen.findByLabelText("Only lines after")).getAttribute("lang")).toBe("en-GB");
+    expect(screen.getByLabelText("Only lines before").getAttribute("lang")).toBe("en-GB");
+  });
+});

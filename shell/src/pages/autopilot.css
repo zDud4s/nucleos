@@ -35,9 +35,10 @@
  * A page-wide statement about what is currently suspended.
  *
  * Deliberately not a `ui-note`: the notes are said next to the control that
- * produced them, and these two are said about the whole page. They carry a
- * heavy left rule rather than a fill, so a screen with both of them on it is
- * still readable — two saturated blocks stacked would be a wall.
+ * produced them, and these two are said about the whole page. A plain hairline
+ * in the tone's own border colour carries that, and nothing more: a coloured
+ * left stripe on a card is a named anti-reference, and the tone triple already
+ * says which of the two this is.
  */
 .ap-banner {
   display: flex;
@@ -47,7 +48,6 @@
   padding: var(--space-3) var(--space-4);
   border-radius: var(--radius-md);
   border: 1px solid var(--border);
-  border-left-width: 3px;
   background: var(--surface);
 }
 
@@ -67,14 +67,12 @@
 /* The emergency stop: the only thing on this page that suspends everything. */
 .ap-banner-kill {
   border-color: var(--tone-danger-border);
-  border-left-color: var(--tone-danger-fg);
   background: var(--tone-danger-bg);
 }
 
 /* A ceiling holding work is not a fault — warm, and never red. */
 .ap-banner-budget {
   border-color: var(--tone-paused-border);
-  border-left-color: var(--tone-paused-fg);
   background: var(--tone-paused-bg);
 }
 
@@ -173,10 +171,11 @@
   color: var(--text-faint);
 }
 
-/* The project the shadow panels below are about. Marked with the brand rule
-   rather than a fill: it is a pointer, not a state. */
+/* The project the shadow panels below are about. A rung on the ladder plus a strong hairline:
+   a pointer, not a state, and not the brand colour. */
 .ap-project-row-selected {
-  box-shadow: inset 3px 0 0 var(--accent);
+  background: var(--surface-raised);
+  box-shadow: inset 3px 0 0 var(--border-strong);
 }
 
 .ap-project-blocker {

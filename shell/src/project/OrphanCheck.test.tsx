@@ -120,6 +120,18 @@ describe("whether a decision with no code lost the comment that anchored it", ()
     expect(said.textContent).toContain("2a4d4af1a332feec8f0f4fba1fe81ea4cca8b28d");
   });
 
+  it("the commit date is in the shell's locale", async () => {
+    const known = loss();
+    daemon.apiFetch.mockResolvedValue({ state: "lost", losses: [known] } satisfies Orphan);
+
+    open();
+    press();
+
+    expect((await screen.findByRole("listitem")).textContent).toContain(
+      new Date(known.at * 1000).toLocaleDateString("en-GB"),
+    );
+  });
+
   /**
    * A loss is a fact about git, and the surface may not let it read as a verdict.
    *

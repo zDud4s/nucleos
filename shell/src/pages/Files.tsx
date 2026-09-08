@@ -25,7 +25,7 @@ import {
   type SortColumn,
   type SortDirection,
 } from "../data/files";
-import { Button, ConfirmButton, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime, StaleNote, Teach } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Field, PageHeader, Panel, RefusalNote, RelativeTime, StaleNote, Teach } from "../ui";
 import "./files.css";
 
 /**
@@ -296,15 +296,14 @@ export function Files() {
             <Breadcrumbs path={path} onGo={setPath} />
 
             <div className="fi-toolbar">
-              <label className="fi-search">
-                <span>Search under this folder</span>
+              <Field label="Search under this folder">
                 <input
                   value={qInput}
                   aria-label="Search files by name"
                   placeholder="find by name…"
                   onChange={(event) => setQInput(event.target.value)}
                 />
-              </label>
+              </Field>
               <NewFolderForm path={path} create={create} />
             </div>
 
@@ -642,10 +641,9 @@ function NewFolderForm({ path, create }: { path: string; create: ReturnType<type
         create.mutate(joinPath(path, trimmed), { onSuccess: () => setName("") });
       }}
     >
-      <label className="fi-field">
-        <span>New folder</span>
+      <Field label="New folder">
         <input value={name} aria-label="New folder name" onChange={(event) => setName(event.target.value)} />
-      </label>
+      </Field>
       <Button type="submit" disabled={name.trim() === "" || create.isPending}>
         Create folder
       </Button>
@@ -1023,10 +1021,9 @@ function MoveForm({
         move.mutate({ from, to: to.trim() }, { onSuccess: onClose });
       }}
     >
-      <label className="fi-field">
-        <span>Move {entry.name} to</span>
+      <Field label={`Move ${entry.name} to`}>
         <input value={to} aria-label="Destination path" onChange={(event) => setTo(event.target.value)} />
-      </label>
+      </Field>
       <Button type="submit" disabled={move.isPending}>
         Move
       </Button>

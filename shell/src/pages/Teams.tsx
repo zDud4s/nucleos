@@ -326,7 +326,9 @@ function DepartmentTable({
             <th scope="col" className="teams-col-num">
               Waiting
             </th>
-            <th scope="col">On its own</th>
+            <th scope="col">
+              On its own<span className="teams-col-key">● does it · ◐ asks first · ○ asks you · ◆ routines armed</span>
+            </th>
             {/* What the marks are, said once in the header rather than nowhere. A pulse
                 with no key is a shape a reader has to guess the unit of; the guess is
                 free to be wrong and nothing on the page corrects it. */}

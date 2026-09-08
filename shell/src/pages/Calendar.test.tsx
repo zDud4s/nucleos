@@ -166,6 +166,13 @@ describe("headline", () => {
 /* ------------------------------------------------------------------ busy -- */
 
 describe("BusyIndicator", () => {
+  it("treats busy as a fact, not a summons", () => {
+    render(<BusyIndicator busy />);
+    const badge = screen.getByText("busy right now");
+    expect(badge.className).toContain("ui-badge-info");
+    expect(badge.className).not.toContain("ui-badge-pending");
+  });
+
   it("says which of the two states this machine is in", () => {
     const { rerender } = render(<BusyIndicator busy={true} />);
     expect(screen.getByText("busy right now")).toBeDefined();

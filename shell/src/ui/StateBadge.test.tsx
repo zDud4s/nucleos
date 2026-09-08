@@ -57,7 +57,12 @@ describe("StateBadge — run", () => {
 
 describe("StateBadge — job", () => {
   it("keeps completed, stopped and expired apart", () => {
-    assertAllDistinct("job", ["completed", "stopped", "expired"]);
+    assertAllDistinct("job", ["implementing", "completed", "stopped", "expired"]);
+  });
+
+  it("a job that is running is not an unknown word", () => {
+    expect(badge("job", "implementing")?.className).not.toContain("ui-state-unmapped");
+    assertAllDistinct("job", ["implementing", "completed", "stopped", "expired", "gate_errored", "gate_failed"]);
   });
 
   it("never reads a cancelled job as a failure", () => {

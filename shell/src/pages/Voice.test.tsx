@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -165,6 +165,10 @@ describe("Voice — hotkey registration", () => {
     renderWithQuery(<Voice />);
 
     expect(await screen.findByText("armed, but the hotkeys did not register — use the buttons below")).toBeDefined();
+    const capture = screen.getByRole("heading", { level: 2, name: "Capture" }).closest("section");
+    expect(capture).not.toBeNull();
+    expect(within(capture as HTMLElement).getByText("hotkeys failed")).toBeDefined();
+    expect(within(capture as HTMLElement).queryByText("idle")).toBeNull();
   });
 });
 

@@ -756,7 +756,7 @@ describe("the settings this app authors", () => {
     const locked = await openState(
       settingsState({ promotable: false, classes_ready: 2, classes_total: 5 }),
     );
-    const active = await screen.findByRole("button", { name: "active" });
+    const active = await screen.findByRole("button", { name: "Let it act" });
     expect(active.hasAttribute("disabled")).toBe(true);
     expect(screen.getByText(/3 of 5 action classes are still short of the bar/)).toBeTruthy();
 
@@ -770,9 +770,33 @@ describe("the settings this app authors", () => {
         withheld_classes_ready: 1,
       }),
     );
-    expect((await screen.findByRole("button", { name: "active" })).hasAttribute("disabled")).toBe(
-      false,
-    );
+    expect(
+      (await screen.findByRole("button", { name: "Let it act" })).hasAttribute("disabled"),
+    ).toBe(false);
+  });
+
+  /**
+   * The same control the roster draws, saying the same three things.
+   *
+   * This block used to render the daemon's own words — `off`, `shadow`, `active` — as three
+   * buttons, while the Autopilot page offered the same decision in verbs. One decision said in two
+   * vocabularies is a decision a reader has to translate, so there is one control now
+   * (`ui/ModeSwitch`) and the nouns are gone from the controls.
+   */
+  it("the mode block offers the three verbs", async () => {
+    await openState(settingsState({ promotable: false, classes_ready: 2, classes_total: 5 }));
+
+    const group = await screen.findByRole("group", { name: "Autopilot mode" });
+    expect(within(group).getByRole("button", { name: "Turn off" })).toBeTruthy();
+    expect(within(group).getByRole("button", { name: "Watch in shadow" })).toBeTruthy();
+    expect(within(group).getByRole("button", { name: "Let it act" })).toBeTruthy();
+
+    // What is set now is said by which segment is pressed, not by a word beside them.
+    expect(
+      within(group).getByRole("button", { name: "Watch in shadow" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(screen.queryByRole("button", { name: "active" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "off" })).toBeNull();
   });
 
   /**

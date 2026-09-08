@@ -2,6 +2,7 @@
 
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
+import { UI_LOCALE } from "../lib/locale";
 import {
   FEED_KIND_NAMES,
   FEED_LIMIT_MAX,
@@ -272,6 +273,8 @@ function FeedFilterBar({
         <span>Since</span>
         <input
           type="datetime-local"
+          /** The browser's date placeholder follows the element language, for both bounds. */
+          lang={UI_LOCALE}
           value={rfc3339ToBoundInput(filters.since)}
           aria-label="Only lines after"
           onChange={(event) => onChange({ since: boundToRfc3339(event.target.value) })}
@@ -282,6 +285,7 @@ function FeedFilterBar({
         <span>Until</span>
         <input
           type="datetime-local"
+          lang={UI_LOCALE}
           value={rfc3339ToBoundInput(filters.until)}
           aria-label="Only lines before"
           onChange={(event) => onChange({ until: boundToRfc3339(event.target.value) })}

@@ -856,7 +856,6 @@
   gap: var(--space-2);
   padding: var(--space-3);
   border: 1px solid var(--tone-danger-border);
-  border-left-width: 3px;
   border-radius: var(--radius-sm);
   background: var(--tone-danger-bg);
 }

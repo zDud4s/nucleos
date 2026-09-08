@@ -94,6 +94,74 @@ describe("Home", () => {
     expect(await screen.findByText(/the daily ceiling is spent/)).toBeDefined();
   });
 
+  it("the headline names the worst live fact and links to system", async () => {
+    // The harness's `daemonFetch` has no `/health/readout` case and falls through to
+    // `undefined`, so the readout is wrapped AROUND it rather than passed through it.
+    const answer = daemonFetch(daemonState({ proposals: [] }));
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/health/readout"
+        ? {
+            status: "degraded",
+            subsystems: [
+              { name: "sqlite_pool", status: "ok" },
+              { name: "worktree_disk", status: "degraded", reason: "low-disk-space" },
+              { name: "browser_sidecar", status: "down", reason: "not-running" },
+            ],
+          }
+        : answer(path, init),
+    );
+
+    await renderWithRouter(<Home />);
+
+    // Named, and a door. "1 subsystem down" would send somebody to /system to find out
+    // which one, and the answer is three words long — so the sentence says it, and the
+    // sentence is the way there.
+    const door = await screen.findByRole("link", {
+      name: /1 subsystem down \(browser_sidecar\), 1 degraded/,
+    });
+    expect(door.getAttribute("href")).toBe("/system");
+
+    // The waiting clause is still appended to it: the worst fact leads the sentence, it
+    // does not replace it.
+    expect(door.closest("p")?.textContent).toBe(
+      "1 subsystem down (browser_sidecar), 1 degraded; nothing waiting on you",
+    );
+  });
+
+  it("an all-clear keeps the mode sentence and all five cards", async () => {
+    const answer = daemonFetch(
+      daemonState({
+        projects: [
+          project({ project_id: "alpha", mode: "active" }),
+          project({ project_id: "beta", mode: "shadow" }),
+          project({ project_id: "gamma", mode: "shadow" }),
+        ],
+        proposals: [],
+      }),
+    );
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/health/readout"
+        ? {
+            status: "ok",
+            subsystems: [
+              { name: "sqlite_pool", status: "ok" },
+              { name: "worktree_disk", status: "ok" },
+              { name: "browser_sidecar", status: "ok" },
+            ],
+          }
+        : answer(path, init),
+    );
+
+    await renderWithRouter(<Home />);
+
+    expect(await screen.findByText("1 acting, 2 in shadow; nothing waiting on you")).toBeDefined();
+    expect(screen.queryByRole("link", { name: /subsystem/ })).toBeNull();
+
+    // And the cards do not recede. A card that appeared only when something was wrong
+    // would teach the reader that an absent card is an absent fact.
+    expect(screen.getAllByRole("article")).toHaveLength(5);
+  });
+
   it("mutates nothing — the first screen is a reading, not a console", async () => {
     daemon.apiFetch.mockImplementation(daemonFetch(daemonState({ projects: [project()] })));
 

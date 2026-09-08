@@ -58,11 +58,7 @@ export function Council() {
 
       {councilId === null && (
         <Teach title="Choose a council">
-          <p>
-            Pick a question from the list, or convene a new one above. Every seat answers on its
-            own, ranks the others blind, and a chairman writes a synthesis — three phases, in
-            order, and this page shows all three whichever one a council has reached.
-          </p>
+          <p>Pick a question from the list, or convene a new one above.</p>
         </Teach>
       )}
 

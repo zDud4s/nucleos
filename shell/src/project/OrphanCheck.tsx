@@ -2,6 +2,7 @@
 import { isApiRefusal } from "../data/client";
 import type { Anchored, Loss, Orphan } from "../data/project-map";
 import { useOrphanCheck, useRecordAnchor } from "../data/project-map";
+import { UI_LOCALE } from "../lib/locale";
 
 /**
  * §14's guard, on one row of *declared, with no code*.
@@ -248,7 +249,7 @@ function Went({ loss }: { loss: Loss }) {
     <li className="max-w-prose text-xs text-text-muted">
       <span className="font-mono text-text">{loss.path}</span> named it until{" "}
       <span className="font-mono">{loss.commit}</span> — “{loss.subject}”, on{" "}
-      {new Date(loss.at * 1000).toLocaleDateString()}
+      {new Date(loss.at * 1000).toLocaleDateString(UI_LOCALE)}
       {loss.renamed_to === null ? null : (
         <>
           {" "}

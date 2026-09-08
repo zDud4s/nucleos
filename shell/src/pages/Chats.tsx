@@ -835,7 +835,7 @@ function chatRowLabel(row: ChatSummary, live: boolean): string {
   // Said as its own clause and not added to the number above it, because it IS its own axis: a
   // department speaking is not the conversation answering, and nothing ran for it.
   const said = row.notices_waiting ?? 0;
-  if (said > 0) parts.push(`${said} from a department`);
+  if (said > 0) parts.push(`${said} from a team`);
   return parts.join(", ");
 }
 
@@ -896,7 +896,7 @@ function ChatRow({
           <span
             className="chats-row-said"
             aria-hidden="true"
-            title={`${row.notices_waiting} said by a department you set going`}
+            title={`${row.notices_waiting} said by a team you set going`}
           >
             {row.notices_waiting}
           </span>

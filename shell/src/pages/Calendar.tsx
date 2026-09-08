@@ -435,7 +435,8 @@ function MoveError({ error }: { error: unknown }) {
  */
 export function BusyIndicator({ busy }: { busy: boolean | undefined }) {
   if (busy === undefined) return null;
-  return <Badge tone={busy ? "pending" : "off"}>{busy ? "busy right now" : "free right now"}</Badge>;
+  // Being busy is a fact with no verdict attached, not an Awaiting-You Amber summons.
+  return <Badge tone={busy ? "info" : "off"}>{busy ? "busy right now" : "free right now"}</Badge>;
 }
 
 /* ----------------------------------------------------- held notifications -- */

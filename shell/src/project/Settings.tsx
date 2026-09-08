@@ -12,6 +12,7 @@ import {
   MODE_SENTENCES,
   promotionBlocker,
 } from "../lib/mode";
+import { ModeSwitch } from "../ui";
 
 /**
  * The settings this app is the author of — the ones that live in the database.
@@ -72,8 +73,6 @@ function Block({
   );
 }
 
-const MODES: AutopilotMode[] = ["off", "shadow", "active"];
-
 /**
  * The biggest lever on the page, with the one setting that has to be earned.
  *
@@ -106,30 +105,13 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
 
   return (
     <Block label="Mode">
-      <div className="flex flex-wrap gap-2" role="group" aria-label="Autopilot mode">
-        {MODES.map((mode) => {
-          const current = project.mode === mode;
-          const locked = mode === "active" && !project.promotable;
-          return (
-            <button
-              key={mode}
-              type="button"
-              aria-pressed={current}
-              disabled={current || locked || setMode.isPending}
-              title={locked ? blocker : undefined}
-              onClick={() => change(mode)}
-              className={
-                current
-                  ? `rounded-md border px-3 py-1.5 text-sm text-tone-${mode}-fg`
-                  : "rounded-md border border-border px-3 py-1.5 text-sm text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
-              }
-              style={current ? { borderColor: `var(--tone-${mode}-border)`, background: `var(--tone-${mode}-bg)` } : undefined}
-            >
-              {mode}
-            </button>
-          );
-        })}
-      </div>
+      <ModeSwitch
+        value={project.mode}
+        actAllowed={project.promotable}
+        actBlocker={blocker}
+        busy={setMode.isPending}
+        onChoose={change}
+      />
 
       <p className="text-xs text-text-muted">{MODE_MEANING[project.mode]}.</p>
 

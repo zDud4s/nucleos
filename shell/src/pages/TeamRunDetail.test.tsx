@@ -260,6 +260,17 @@ describe("TeamRunDetail - cost", () => {
     expect(costFigures).toHaveLength(1);
     expect(costFigures[0].textContent).toBe("$1.25");
   });
+
+  it("keeps stat cards non-clickable", async () => {
+    const run = teamRunView({ id: "run-2", parent_id: "run-1", root_id: "run-1", cost_usd: 1.25 });
+    daemon.apiFetch.mockImplementation(teamRunFetch({ "run-2": run }));
+
+    await renderTeamRunDetail("/team-runs/run-2");
+
+    const costCard = await screen.findByRole("article", { name: "Cost" });
+    expect(within(costCard).queryByRole("link")).toBeNull();
+    expect(screen.getAllByRole("link", { name: "see the root" })).toHaveLength(1);
+  });
 });
 
 /* --------------------------------------------------------------- headline -- */

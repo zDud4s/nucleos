@@ -320,15 +320,15 @@ export const RUN_VIEWS: Record<string, TeamRunView> = {
     items: [
       { ordinal: 1, round: 1, agent_id: "auditor", description: "pull the bank export", state: "done", run_id: 11, output_path: null },
       { ordinal: 2, round: 1, agent_id: "researcher", description: "pull the ledger", state: "done", run_id: 12, output_path: null },
-      { ordinal: 3, round: 2, agent_id: "controller", description: "match them line by line", state: "working", run_id: 13, output_path: null },
-      { ordinal: 4, round: 2, agent_id: "reviewer", description: "check the exceptions", state: "planned", run_id: null, output_path: null },
+      { ordinal: 3, round: 2, agent_id: "controller", description: "match them line by line", state: "running", run_id: 13, output_path: null },
+      { ordinal: 4, round: 2, agent_id: "reviewer", description: "check the exceptions", state: "pending", run_id: null, output_path: null },
     ],
   },
   "run-live-2": {
     ...RUNS[1],
     cost_usd: 0.08,
     items: [
-      { ordinal: 1, round: 1, agent_id: "writer", description: "draft it", state: "working", run_id: 21, output_path: null },
+      { ordinal: 1, round: 1, agent_id: "writer", description: "draft it", state: "running", run_id: 21, output_path: null },
     ],
   },
 };

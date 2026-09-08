@@ -251,12 +251,66 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
 
     const promote = await screen.findByRole("button", { name: "Let it act" });
     expect((promote as HTMLButtonElement).disabled).toBe(true);
-    expect(promote.getAttribute("title")).toBeNull();
+    // The segment carries the daemon's reason as its title. The row still says
+    // it in words below — a `title` is a hover, and a hover is not an answer.
+    expect(promote.getAttribute("title")).toMatch(
+      /nothing has been recorded in shadow yet/,
+    );
     expect(
       screen.getByText(
         /nothing has been recorded in shadow yet.*no evidence is not the same as good evidence/,
       ),
     ).toBeDefined();
+  });
+
+  /**
+   * One decision, one control — and one of it per row, because the roster sets the mode per
+   * project.
+   *
+   * The three verbs used to be three loose buttons here and three different words (`off`,
+   * `shadow`, `active`) on the project's own page. They are one segmented control now, and which
+   * segment is pressed is how a row says what it is set to.
+   */
+  it("the roster offers one segmented control per project", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({
+          project_id: "alpha",
+          mode: "shadow",
+          project_root: "C:/repos/alpha",
+          promotable: true,
+          classes_ready: 2,
+          classes_total: 2,
+          withheld_classes_ready: 1,
+        }),
+        project({
+          project_id: "beta",
+          mode: "off",
+          project_root: "C:/repos/beta",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const groups = await screen.findAllByRole("group", { name: "Autopilot mode" });
+    expect(groups).toHaveLength(2);
+    for (const group of groups) {
+      expect(within(group).getByRole("button", { name: "Turn off" })).toBeDefined();
+      expect(within(group).getByRole("button", { name: "Watch in shadow" })).toBeDefined();
+      expect(within(group).getByRole("button", { name: "Let it act" })).toBeDefined();
+    }
+
+    const row = screen.getByText("beta").closest("li");
+    if (row === null) throw new Error("no row for beta");
+    const group = within(row).getByRole("group", { name: "Autopilot mode" });
+    expect(
+      within(group).getByRole("button", { name: "Turn off" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(
+      within(group).getByRole("button", { name: "Watch in shadow" }).getAttribute("aria-pressed"),
+    ).toBe("false");
   });
 
   it("the budget period is a word and not a stem", async () => {

@@ -53,6 +53,12 @@
   overflow-x: auto;
 }
 
+.agents-key {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
 .agents-table {
   width: 100%;
   border-collapse: collapse;

@@ -15,12 +15,11 @@ import type { BadgeTone } from "./Badge";
  * makes those distinctions testable without rendering anything, and what stops
  * the fourteenth page from quietly picking a different colour for `expired`.
  *
- * **This table covers every domain whose states have been verified against
- * the núcleo.** Every §7 row landed across the slices that built each page,
- * each with its literals checked against the core rather than guessed — team
- * run, the last of them, lands with this slice, and the table is complete. An
- * unmapped state is rendered as itself — see `StateBadge` — because showing
- * the literal admits ignorance, while assigning it a tone would be a claim.
+ * Every domain backed by Rust literals is checked by
+ * `state-map-completeness.test.ts`, which reads those literals rather than
+ * trusting this file's claim. An unmapped state is rendered as itself — see
+ * `StateBadge` — because showing the literal admits ignorance, while assigning
+ * it a tone would be a claim.
  */
 export type StateDomain =
   | "run"
@@ -94,7 +93,24 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * borrows either tone.
    */
   job: {
+    // The six live statuses (`core/src/job.rs`, `LIVE_STATUSES`). A job that is running is not
+    // an unknown word — firing the unmapped badge on the one job actually working teaches the
+    // reader to ignore the device that exists to admit ignorance.
+    planning: { tone: "active", label: "planning" },
+    implementing: { tone: "active", label: "implementing" },
+    gating: { tone: "active", label: "running the gate" },
+    reviewing: { tone: "active", label: "reviewing" },
+    awaiting_approval: { tone: "pending", label: "awaiting approval" },
+    // Held by a brake — budget, a slot, or an exclusion. `wait_reason` says which.
+    waiting: { tone: "paused", label: "held" },
     completed: { tone: "active", label: "completed" },
+    failed: { tone: "danger", label: "failed" },
+    gate_failed: { tone: "danger", label: "the gate failed" },
+    // The `gate` domain's rule, and for the same reason: a gate that could not run measured
+    // nothing, and red would say the code is broken when the measurement is.
+    gate_errored: { tone: "info", label: "gate not measured" },
+    // The núcleo died underneath it — the `run` domain's reading, unchanged.
+    interrupted: { tone: "paused", label: "interrupted" },
     stopped: { tone: "off", label: "stopped" },
     expired: { tone: "paused", label: "expired" },
     cancelled: { tone: "off", label: "cancelled" },
@@ -344,7 +360,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * danger tone, and neither says the word.
    */
   team_run: {
-    planning: { tone: "pending", label: "planning" },
+    // Awaiting-You Amber asks something of the reader; a director planning a round asks nothing.
+    planning: { tone: "active", label: "planning" },
     working: { tone: "active", label: "working" },
     delivering: { tone: "active", label: "delivering" },
     done: { tone: "active", label: "delivered" },
@@ -354,7 +371,13 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     cancelled: { tone: "off", label: "cancelled" },
   },
 
-  /** One item of one round — the four states `team.rs` writes for `team_items`. */
+  /**
+   * One item of one round. Exactly four, and these four: `core/src/team.rs` writes
+   * `'pending'` (`:3398`), `'running'` (`:2890`), `'done'` (`:3253`) and `'failed'`
+   * (`:2669, :2852, :3229, :3265, :3813, :3842`) and writes nothing else into
+   * `team_items.state`. `working`, `planned` and `skipped` were this shell's own invention —
+   * see `state-map-completeness.test.ts`, which reads the Rust rather than trusting this line.
+   */
   team_item: {
     pending: { tone: "pending", label: "not started" },
     running: { tone: "active", label: "running" },
@@ -421,4 +444,9 @@ export function readState(domain: StateDomain, state: string | null | undefined)
     return ABSENT[domain] ?? null;
   }
   return READINGS[domain][state.trim().toLowerCase()] ?? null;
+}
+
+/** Every literal this table has a reading for, in one domain. For the completeness test. */
+export function statesOf(domain: StateDomain): string[] {
+  return Object.keys(READINGS[domain]);
 }

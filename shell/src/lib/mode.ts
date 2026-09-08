@@ -3,16 +3,19 @@ import type { AutopilotMode, ProjectSummary } from "../data/system";
 /**
  * The rules about a project's three settings, shared by every surface that shows them.
  *
- * Two pages now offer the same choice — the Autopilot page, which governs the whole roster, and a
- * project's own workspace, where the setting is the biggest lever on the page. **What is shared is
- * the rules, not the pixels.** The two are drawn in different design languages (one predates the
- * Tailwind migration and is not being migrated for this), and a component configurable enough to
- * be both would be worse than two renderings of one rule.
+ * Two pages offer the same choice — the Autopilot page, which governs the whole roster, and a
+ * project's own workspace, where the setting is the biggest lever on the page. This header used to
+ * argue that what was shared were the rules and not the pixels, and that a component configurable
+ * enough to be both would be worse than two renderings of one rule. **That has been reversed: the
+ * pixels are shared too, through `ui/ModeSwitch`.** Two renderings had become two vocabularies —
+ * `off / shadow / active` on one page against `Turn off / Watch in shadow / Let it act` on the
+ * other — and a reader had to learn that they were the same decision.
  *
- * What must never diverge is what the words mean and when the third setting is offered — because a
- * control that unlocked on different arithmetic from the one the núcleo enforces would offer a
- * button that always refuses, and two copies of a sentence about restraint would eventually say
- * two different things about it.
+ * What this module still owns is what the words MEAN and when the third setting is offered, and
+ * that is why it is still a module rather than three constants inside the control: something that
+ * unlocked on different arithmetic from the one the núcleo enforces would offer a button that
+ * always refuses, and two copies of a sentence about restraint would eventually say two different
+ * things about it.
  */
 
 export const MODE_TONE: Record<AutopilotMode, "active" | "shadow" | "off"> = {

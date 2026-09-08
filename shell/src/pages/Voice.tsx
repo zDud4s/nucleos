@@ -293,7 +293,7 @@ export function Voice() {
     <>
       <PageHeader title="Voice" headline={headline(config.data, memos.data, dictations.data, hotkeyConflicts, hotkeyRegisterFailed)} />
 
-      <Panel title="Capture" aside={<PhaseBadge phase={phase} />}>
+      <Panel title="Capture" aside={<PhaseBadge phase={phase} registerFailed={hotkeyRegisterFailed} />}>
         <HotkeyConflictNote failed={hotkeyConflicts} registerFailed={hotkeyRegisterFailed} />
         <CaptureButtons
           phase={phase}
@@ -324,7 +324,10 @@ export function Voice() {
  * enums, and this one is a fact this page's reducer invents, not one the
  * daemon sends over the wire.
  */
-function PhaseBadge({ phase }: { phase: VoicePhase }) {
+function PhaseBadge({ phase, registerFailed }: { phase: VoicePhase; registerFailed: boolean }) {
+  // `idle` above an error is two readings of one moment. When the hotkeys did not register,
+  // the head says the thing the note underneath is about.
+  if (phase === "idle" && registerFailed) return <Badge tone="danger">hotkeys failed</Badge>;
   if (phase === "idle") return <Badge tone="off">idle</Badge>;
   if (phase === "recording") return <Badge tone="pending">recording</Badge>;
   return <Badge tone="info">transcribing</Badge>;

@@ -313,6 +313,10 @@ function Catalogue({
           ))}
         </tbody>
       </table>
+      <p className="agents-key">
+        ◉ directs a team · ● on a team&rsquo;s roster · ● has tools · ○ no tools · ? this shell has no
+        reading for that policy · ≠ renamed since the núcleo learned its id
+      </p>
     </div>
   );
 }
@@ -511,9 +515,9 @@ function Employed({ employment, known }: { employment: Employment; known: boolea
 
   if (unemployed(employment)) {
     return (
-      <span className="agents-figure agents-figure-none" title="no department names this one">
+      <span className="agents-figure agents-figure-none" title="no team names this one">
         <span aria-hidden="true">—</span>
-        <span className="agents-said">no department names this one</span>
+        <span className="agents-said">no team names this one</span>
       </span>
     );
   }
@@ -835,7 +839,7 @@ function holdSentence(agent: Agent, employment: Employment, known: boolean): str
   }
 
   if (unemployed(employment)) {
-    return `No department names ${agent.name}. Work it is already holding — ${work}.`;
+    return `No team names ${agent.name}. Work it is already holding — ${work}.`;
   }
 
   const standings = [

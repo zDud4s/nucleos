@@ -220,7 +220,9 @@ function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
   const rounds = [...new Set(items.map((item) => item.round))].sort((a, b) => a - b);
 
   return (
-    <ol className="teams-rounds" aria-label="Rounds">
+    <>
+      <p className="teams-rounds-key"><span>✓ done</span><span>⋯ running</span><span>· not started</span><span>✗ failed</span></p>
+      <ol className="teams-rounds" aria-label="Rounds">
       {rounds.map((number) => (
         <li className="teams-round-line" key={number}>
           <span className="teams-round-no">round {number}</span>
@@ -249,15 +251,15 @@ function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
           <span className="teams-empty">not planned yet</span>
         </span>
       </li>
-    </ol>
+      </ol>
+    </>
   );
 }
 
 /** A glyph per item state. The word travels beside it for anything that does not render. */
 const MARK: Record<string, string> = {
   done: "✓",
-  working: "⋯",
-  planned: "·",
+  running: "⋯",
+  pending: "·",
   failed: "✗",
-  skipped: "–",
 };

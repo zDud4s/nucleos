@@ -191,6 +191,13 @@ describe("MapCanvas", () => {
 /* ---------------------------------------------- along the structure -- */
 
 describe("what a community touches", () => {
+  it("the drawing is an image with a name", () => {
+    draw(twoGroups.modules, twoGroups.imports);
+    openFirstCommunity();
+
+    expect(screen.getByRole("img", { name: /file|neighbour|declaration/ })).toBeTruthy();
+  });
+
   it("names both directions, and never one number over the pair", () => {
     draw(twoGroups.modules, twoGroups.imports);
     openFirstCommunity();

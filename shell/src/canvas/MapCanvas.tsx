@@ -1029,7 +1029,7 @@ function Graph({
 }: {
   drawn: Layout;
   /** What this drawing is of — carried into the frame, which keeps it in full screen. */
-  title: ReactNode;
+  title: string;
   full: boolean;
   onFull: (full: boolean) => void;
   onOpen?: (id: string) => void;
@@ -1042,6 +1042,9 @@ function Graph({
   return (
     <Stage title={title} natural={drawn.width + PAD * 2} full={full} onFull={onFull}>
       <svg
+        // This is a picture; “Every community” is its text alternative, and its name lets a reader decide to skip it.
+        role="img"
+        aria-label={title}
         width={drawn.width + PAD * 2}
         height={drawn.height + PAD * 2}
         viewBox={`${-PAD} ${-PAD + NODE_H / 2} ${drawn.width + PAD * 2} ${drawn.height + PAD * 2}`}

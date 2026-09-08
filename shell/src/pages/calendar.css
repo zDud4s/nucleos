@@ -453,7 +453,18 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--border);
-  overflow: hidden;
+}
+
+/*
+  The day is drawn whole (48rem, two rem an hour) and looked at through a window. It used to
+  be looked at from the top, so the week opened at 01:00 with eight empty rows above the hours
+  anybody works — the panel was showing the part of the day the config says is not the day.
+*/
+.calendar-week-scroll {
+  max-height: 32rem;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
 
 .calendar-gutter {

@@ -374,6 +374,29 @@ describe("Bench - Work", () => {
     expect(within(panel).getByText(/newest 100 runs across all teams/)).toBeDefined();
   });
 
+  it("the rounds strip says what its marks mean", async () => {
+    const live = teamRun({ id: "run-1", state: "working" });
+    await renderBench({
+      team: teamView(),
+      runs: [live],
+      runViews: {
+        "run-1": {
+          ...live,
+          cost_usd: 0,
+          items: [{ ordinal: 1, round: 1, agent_id: "auditor", description: "pull the ledger", state: "done", run_id: 11, output_path: null }],
+        },
+      },
+    });
+
+    const panel = await openTab("Work");
+    const key = panel.querySelector(".teams-rounds-key");
+    expect(key?.textContent).toContain("✓ done");
+    expect(key?.textContent).toContain("⋯ running");
+    expect(key?.textContent).toContain("· not started");
+    expect(key?.textContent).toContain("✗ failed");
+    expect(within(panel).getByRole("list", { name: "Rounds" })).toBeDefined();
+  });
+
   it("keeps the composer to one line until it is being used", async () => {
     await renderBench({ team: teamView() });
 
