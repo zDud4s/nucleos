@@ -951,6 +951,63 @@ pub async fn pretooluse_decision(
         });
     }
 
+    // **The rung that asks nobody, on the side of the house where nobody was ever going to be
+    // asked.** `dont_ask` has governed a CONVERSATION since `0132`: it permits precisely what
+    // `auto` permits and refuses everything `auto` would have stopped to ask about. Every word
+    // of that describes an unattended run better than it describes a chat, and until now the
+    // column was read on this path and never consulted — `permission` was bound at the top of
+    // this function and reached only `rooted_decision`.
+    //
+    // What it replaces is not an approval. It is a park nobody answers: `finalize_termination`
+    // kills the CLI, the row sits in `awaiting_approval`, and `concurrency::LIVE_RUN_STATUSES`
+    // holds that project's slot for as long as it sits there — the orphaned-slot sweep spares
+    // the status by name, and `reconcile_stranded_approvals` spares a row whose proposal is
+    // pending, which this one's is. If the run belongs to a job, `node_awaiting_approval` pauses
+    // the whole job behind it. So the choice this rung offers is not "ask or refuse"; it is
+    // "refuse one call and finish the work" against "stop everything until somebody looks".
+    //
+    // The three positions are the rooted rung's, for the rooted rung's reasons, and they are
+    // load-bearing:
+    //
+    // - **After both `deny` returns above**, so this can only ever convert a `pending_approval`.
+    //   Moved above them it would restate their refusals with a weaker reason and lose the
+    //   sentence each of them exists to say.
+    // - **After every allow**, which on this path means after `classify` itself: an allow never
+    //   reaches here, so the promise "exactly what `auto` runs" holds without a line of code.
+    // - **Before the pause**, which is the whole of the change: nothing is terminated, no
+    //   `action-approval` is minted, no slot is held and no job stops.
+    //
+    // Deliberately NOT scoped to `runs_unattended`. The two refusals above are, because both
+    // infer that nobody is watching from the run's shape; this one was TOLD, by whoever created
+    // the run, and a `real`-mode run whose author asked for this rung asked for it knowingly.
+    // Inferring over an explicit instruction is how a control comes to mean nothing.
+    //
+    // The refusal is recorded for the same reason `a_park_here_would_only_destroy` records one:
+    // a call refused with nobody present leaves no other trace, and an owner reading back has to
+    // be able to see what their run was stopped from doing.
+    if classification.decision.decision == "pending_approval"
+        && permission == crate::chats::PermissionMode::DontAsk
+    {
+        tracing::info!(
+            run_id,
+            tool_name = %payload.tool_name,
+            action_class = classification.action_class,
+            "pretooluse-decision: refused rather than parked — this run asks nobody"
+        );
+        record_refused_action(
+            &state,
+            &payload,
+            &payload.tool_name,
+            None,
+            &classification.reason,
+        )
+        .await;
+        return Json(Decision {
+            decision: "deny".to_owned(),
+            reason: format!("{}{DONT_ASK_CLAUSE}", classification.reason),
+        });
+    }
+
     if classification.decision.decision == "pending_approval" {
         // Only for a genuinely in-flight run_id — an unknown/stale one must not terminate anything.
         if is_in_flight {
@@ -5151,6 +5208,120 @@ mod tests {
             proposals, 0,
             "nobody is awake to answer a proposal about a tool name"
         );
+    }
+
+    /// A run told to ask nobody refuses the call and carries on, where the same run parks.
+    ///
+    /// The PAIR is the test, and the pair is against the test directly below this one: same
+    /// mode, same project, same `git push origin main`, one column different. That one parks
+    /// into `awaiting_approval` and mints a proposal; this one denies and is still `running`.
+    /// Asserted apart, either could be satisfied by a rule that stopped parking altogether.
+    ///
+    /// `still running` is the half worth naming. A park here is not merely a question nobody
+    /// answers: it kills the CLI, holds the project's concurrency slot for as long as the row
+    /// sits there, and pauses the whole job if the run belongs to one. So what this rung buys
+    /// is not a faster refusal, it is the rest of the work.
+    ///
+    /// The reason carries the classifier's own sentence AND the clause, in that order, for the
+    /// reason `rooted_decision` gives: a refusal saying only "this run asks nobody" tells the
+    /// model the rung and not the fact, and its next attempt would be a guess.
+    #[tokio::test]
+    async fn a_run_that_asks_nobody_refuses_instead_of_parking() {
+        let state = test_state().await;
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("proj"),
+            Some("C:\\work\\repo"),
+            Some("sess-dont-ask"),
+        )
+        .await;
+        sqlx::query("UPDATE runs SET permission_mode = ? WHERE id = ?")
+            .bind(crate::chats::PermissionMode::DontAsk.as_str())
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny");
+        assert!(
+            decision.reason.ends_with(DONT_ASK_CLAUSE),
+            "the clause is appended, not substituted: {}",
+            decision.reason
+        );
+        assert!(
+            decision.reason.len() > DONT_ASK_CLAUSE.len(),
+            "the classifier's own reason was replaced rather than kept: {}",
+            decision.reason
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running", "the run was parked anyway");
+
+        let pending = proposals::list_pending(&state.pool).await.unwrap();
+        assert!(
+            pending.is_empty(),
+            "a proposal nobody will ever answer was minted: {pending:?}"
+        );
+    }
+
+    /// The rung refuses what `auto` would ASK about, and never what `auto` ALLOWS.
+    ///
+    /// The promise `dont_ask` makes is "exactly `auto`'s permission", and on this path it is
+    /// kept by position rather than by code: the block sits after `classify`, so an `allow` has
+    /// already been returned and never reaches it. A test, because that is a property of WHERE
+    /// the block is, and the next person to move it will not be able to tell from the diff.
+    #[tokio::test]
+    async fn a_run_that_asks_nobody_still_runs_everything_auto_runs() {
+        let state = test_state().await;
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("proj"),
+            Some("C:\\work\\repo"),
+            Some("sess-dont-ask-allows"),
+        )
+        .await;
+        sqlx::query("UPDATE runs SET permission_mode = ? WHERE id = ?")
+            .bind(crate::chats::PermissionMode::DontAsk.as_str())
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        for (tool_name, tool_input) in [
+            ("Read", serde_json::json!({"file_path": "C:\\work\\repo\\src\\main.rs"})),
+            ("Bash", serde_json::json!({"command": "git status"})),
+        ] {
+            let decision = decide(
+                &app,
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(decision.decision, "allow", "{tool_name}: {}", decision.reason);
+        }
     }
 
     /// The narrowing, asserted. Only `unrecognized` became a refusal; an action a person genuinely

@@ -186,6 +186,7 @@ mod tests {
             cwd: Some("C:/repo/project-a".to_owned()),
             mode: "real".to_owned(),
             steerable: false,
+            permission_mode: None,
         }
     }
 

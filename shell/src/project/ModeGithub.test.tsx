@@ -674,10 +674,14 @@ describe("what the worktrees may run", () => {
    *
    * "Never runs here, and never written to — whatever the compiled lists would have said" sat over
    * a list holding both kinds of rule, and the second half is not a property of the list. A write
-   * rule is gated on `classifier::WRITE_TOOLS` — `Edit` and `Write`, nothing else — so it does not
-   * stop a `Bash` line redirecting into the same directory, and `NotebookEdit` is outside that list
-   * entirely. An owner reading `deny rm -rf` under "and never written to" came away believing the
-   * path was closed to writes, which nothing on this page had said.
+   * rule is gated on `classifier::WRITE_TOOLS`, the file-writing tools and nothing else, so it
+   * does not stop a `Bash` line redirecting into the same directory. An owner reading
+   * `deny rm -rf` under "and never written to" came away believing the path was closed to writes,
+   * which nothing on this page had said.
+   *
+   * `NotebookEdit` stood here as the example of a writing tool the list did not hold, until it
+   * joined the list on 2026-09-08. The example went and the assertions did not move, which is
+   * the evidence that this test was written about the caption and not about the roster.
    *
    * So the guarantee moved onto the row, where the tool is, and the caption keeps what survives
    * across the list. The wording is pinned because it is the whole of the fix: a caption is the one

@@ -1876,12 +1876,38 @@ mod tests {
     /// Paths resolve through `CARGO_MANIFEST_DIR` because cargo runs tests with the working directory
     /// set to the PACKAGE root (`core/`), while the daemon reads `.ai/voice.yaml` relative to wherever
     /// it was launched. A bare relative path here would look for `core/.ai/voice.yaml`.
+    ///
+    /// **And a baked path is a claim about a different checkout whenever the target directory is
+    /// shared.** `CARGO_HOME/config.toml` on this machine points every crate at one
+    /// `build.target-dir`, so a binary compiled inside a worktree is reused by the main checkout and
+    /// the other way round, while `env!` still answers with wherever it was BUILT. The same hole was
+    /// found open in `tests/module_map.rs` on 2026-08-26, reporting PASS having checked nothing;
+    /// `redact.rs` was closed with it, and this was the third reader and the one left.
+    ///
+    /// The damage here is a different shape from those two, which is why the guard is worth having
+    /// even on a test nobody runs by accident. This reads CONFIGURATION rather than sources: aimed
+    /// at another checkout it would arm itself from that checkout's `.ai/voice.yaml` and then
+    /// measure this machine's engine against it. That is a green run about a question nobody asked,
+    /// and green is exactly what somebody deliberately running this wants to see.
+    ///
+    /// An assertion and not a fallback, for the reason the other two give: a test quietly reading
+    /// another checkout's files is worse than one that refuses to run. `current_dir` is the honest
+    /// answer to which checkout this is, because cargo sets it to the package root.
     #[tokio::test]
     #[ignore = "needs a CUDA whisper build, a running Ollama, and a probe recording"]
     async fn real_pipeline_transcribes_and_cleans_an_actual_recording() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("core/ has a parent");
+        let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let running_in = std::env::current_dir().expect("the working directory must be readable");
+        assert_eq!(
+            built_in,
+            running_in.as_path(),
+            "this test binary was compiled in {} and is running in {} — a shared target \
+             directory handed this checkout a binary built somewhere else, so the config below \
+             would arm this run from the other checkout. Touch this file to force a rebuild.",
+            built_in.display(),
+            running_in.display(),
+        );
+        let repo = running_in.parent().expect("core/ has a parent");
         let config = crate::config::load_voice_config(&repo.join(".ai/voice.yaml"));
         assert!(
             config.armed(),
