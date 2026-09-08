@@ -511,7 +511,8 @@ function ShadowReviewPanel({
   if (projectId !== null && decisions.data !== undefined && rows.length === 0) {
     return (
       <Section label="Shadow decisions">
-        <Quiet says="nothing is waiting for a verdict on this project.">
+        {/* The selected row is the subject; name it because its light-theme mark has no fill weight, while "this project" is only for the first render. */}
+        <Quiet says={`nothing is waiting for a verdict on ${project?.project_id ?? "this project"}.`}>
           <p className="ap-note">What the classifier decided while enforcing nothing. Answering these is the only thing that moves a project toward acting on its own — agreeing says the classifier read the action the way you would, disagreeing says it did not, and both are evidence.</p>
         </Quiet>
       </Section>
@@ -662,7 +663,7 @@ function ScoreboardPanel({
   if (projectId !== null && scoreboard.data !== undefined && rows.length === 0) {
     return (
       <Section label="Scoreboard">
-        <Quiet says="this project has recorded no classified decision yet.">
+        <Quiet says={`${project?.project_id ?? "this project"} has recorded no classified decision yet.`}>
           <p className="ap-note">Read-only. The bar is {READINESS_MIN_REVIEWED} reviews at {READINESS_MIN_AGREE_PERCENT}% agreement per action class; the ready/total figure is the núcleo&apos;s own and gates the promote control.</p>
         </Quiet>
       </Section>

@@ -436,6 +436,25 @@ describe("Autopilot - the trigger brakes say which of them the núcleo reads", (
   });
 });
 
+/* --------------------------------------------------------- the empty panels -- */
+
+describe("Autopilot - the empty panels", () => {
+  it("names the selected project in both empty sentences", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      decisions: [],
+      scoreboard: [],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByText("nothing is waiting for a verdict on alpha.")).toBeDefined();
+    expect(screen.getByText("alpha has recorded no classified decision yet.")).toBeDefined();
+    expect(screen.queryByText(/on this project/)).toBeNull();
+  });
+});
+
 /* --------------------------------------------------- the scoreboard's honesty -- */
 
 describe("Autopilot - the scoreboard is read-only and says what it is not", () => {
