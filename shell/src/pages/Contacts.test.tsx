@@ -68,6 +68,21 @@ function afterDwell(): Promise<void> {
 /* --------------------------------------------------------------- roster -- */
 
 describe("Contacts — the roster", () => {
+  it("renders empty panels as one line under their headings", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/contacts" || path === "/contacts/merges") return [];
+      return undefined;
+    });
+
+    renderWithQuery(<Contacts />);
+
+    for (const name of ["Identity questions", "People"]) {
+      const section = await screen.findByRole("region", { name });
+      expect(section.querySelectorAll(".ui-quiet")).toHaveLength(1);
+      expect(section.querySelector(".ui-panel")).toBeNull();
+    }
+  });
+
   it("shows one row per address and offers unmerge only for a human link", async () => {
     const rows = [
       // Merged with the next row (shared contact_id 1) — this address's OWN

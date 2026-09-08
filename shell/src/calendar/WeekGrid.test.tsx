@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { WeekGrid } from "./WeekGrid";
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
+import { UI_LOCALE } from "../lib/locale";
 import type { DragHandlers, Slot } from "./slot";
 
 /**
@@ -255,7 +256,7 @@ describe("dragging a block", () => {
       onDrop: (day, hour) => dropped.push({ day, hour }),
     });
 
-    const friday = new Date(2026, 7, 21).toLocaleDateString(undefined, {
+    const friday = new Date(2026, 7, 21).toLocaleDateString(UI_LOCALE, {
       weekday: "long",
       day: "numeric",
       month: "long",
@@ -326,7 +327,7 @@ describe("dragging a block", () => {
     );
 
     const named = (day: Date) =>
-      day.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" });
+      day.toLocaleDateString(UI_LOCALE, { weekday: "long", day: "numeric", month: "long" });
 
     expect(screen.queryByLabelText(`${named(new Date(2026, 2, 29))} at 01:00`)).toBeNull();
     // The bands either side of the hole are both there, and only one hour is missing.
@@ -343,7 +344,7 @@ describe("selecting", () => {
     const chosen: Slot[] = [];
     week([], (slot) => chosen.push(slot));
 
-    const thursday = new Date(2026, 7, 20).toLocaleDateString(undefined, {
+    const thursday = new Date(2026, 7, 20).toLocaleDateString(UI_LOCALE, {
       weekday: "long",
       day: "numeric",
       month: "long",

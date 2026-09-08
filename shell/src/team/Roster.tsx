@@ -105,7 +105,7 @@ export function Roster({ team, runs }: RosterProps) {
         <svg
           className="teams-org-svg"
           role="group"
-          aria-label={`${team.name} — how this department is put together`}
+          aria-label={`${team.name} — how this team is put together`}
           viewBox={`0 0 ${view.width} ${view.height}`}
           width={view.width}
           height={view.height}
@@ -159,7 +159,7 @@ export function Roster({ team, runs }: RosterProps) {
       */}
       {headless ? (
         <p className="teams-org-empty">
-          nobody is in charge of this department yet — it will refuse every task until somebody is.
+          nobody is in charge of this team yet — it will refuse every task until somebody is.
         </p>
       ) : alone ? (
         <p className="teams-org-empty">nobody on the roster yet</p>

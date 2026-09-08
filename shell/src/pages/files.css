@@ -207,6 +207,14 @@
   outline-offset: 1px;
 }
 
+.fi-upload-chosen {
+  margin: 0;
+  max-width: 20rem;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
 .fi-upload-note {
   margin: 0;
   max-width: 20rem;

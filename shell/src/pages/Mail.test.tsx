@@ -181,6 +181,42 @@ describe("Mail — the untriaged count", () => {
   });
 });
 
+describe("Mail — an unconfigured account", () => {
+  it("says so instead of rendering empty configuration facts", async () => {
+    const absentConfig: Partial<EmailConfigView> = emailConfig();
+    delete absentConfig.username;
+    delete absentConfig.host;
+    delete absentConfig.mailbox;
+    const world = mailWorld({ config: absentConfig as EmailConfigView });
+    daemon.apiFetch.mockImplementation(mailFetch(world));
+
+    await renderMail();
+
+    expect(await screen.findByText("no account configured")).toBeDefined();
+    expect(screen.getByText("no mailbox named")).toBeDefined();
+    expect(screen.getByText("nothing is wrong")).toBeDefined();
+    const facts = document.querySelectorAll(".mail-config dd");
+    expect([...facts].some((fact) => fact.textContent?.includes("undefined"))).toBe(false);
+  });
+
+  it("renders the local triage disable reason and calls an absent value unknown", async () => {
+    const reasonConfig = emailConfig({ local_triage_disabled: "the local model is unavailable" });
+    daemon.apiFetch.mockImplementation(mailFetch(mailWorld({ config: reasonConfig })));
+
+    await renderMail();
+
+    expect(await screen.findByText("disabled: the local model is unavailable")).toBeDefined();
+
+    const absentConfig: Partial<EmailConfigView> = emailConfig();
+    delete absentConfig.local_triage_disabled;
+    daemon.apiFetch.mockImplementation(mailFetch(mailWorld({ config: absentConfig as EmailConfigView })));
+
+    await renderMail();
+
+    expect(await screen.findByText("unknown")).toBeDefined();
+  });
+});
+
 /* ---------------------------------------------- the pillar key migration -- */
 
 /**

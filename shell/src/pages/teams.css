@@ -166,6 +166,20 @@
   text-align: right !important;
 }
 
+/*
+  A column's unit, under its name. Its own line and out of the uppercase the header
+  is set in, so it reads as a key to the marks below rather than as a second header:
+  the header says what the column is, this says what one mark in it counts.
+*/
+.teams-col-key {
+  display: block;
+  font-size: var(--text-xs);
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-faint);
+}
+
 .teams-figure {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
@@ -411,9 +425,15 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* The director. Accent is identity here, exactly as it is on `.ui-who-leads`. */
+/*
+  The director. Carried by weight and not by hue: accent is the app's one pointer and
+  a matrix that spends it on every director spends it dozens of times per screen, at
+  which point it points at nothing. Semibold against the staff's regular says the same
+  thing and says it in a chart printed in grey.
+*/
 .teams-matrix-leads {
-  color: var(--accent);
+  color: var(--text);
+  font-weight: var(--weight-semibold);
 }
 
 .teams-matrix-staff {
@@ -594,8 +614,14 @@
   color: var(--text);
 }
 
+/*
+  Chosen, on the achromatic ladder: a raised surface and a rule down the leading edge,
+  which is the same way a selected row is said everywhere else here. Accent stays the
+  one pointer rather than the paint on every picked option.
+*/
 .teams-select[multiple] option:checked {
-  background: var(--accent-quiet);
+  background: var(--surface-raised);
+  border-left: 2px solid var(--border-strong);
   color: var(--text);
 }
 
@@ -637,20 +663,15 @@
 
 /* ================================================================= bench == */
 
-/**
- * `/teams/$teamId` — one department, with the page to itself.
- *
- * No `PageHeader` here: the bench's own head carries a name, a derived state
- * and the one destructive control, and the shared header has no slot for the
- * middle one. The breadcrumb above it is what makes this a place you came
- * *into* rather than a page that replaced the console.
- */
-.teams-crumb {
-  margin: 0 0 var(--space-3);
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
+/*
+  `/teams/$teamId` — one team, with the page to itself.
 
+  No `PageHeader` here: the bench's own head carries a name, a derived state and the
+  one destructive control, and the shared header has no slot for the middle one. The
+  crumb above it — `.ui-crumb`, the app's one, no longer a rule of this sheet — is
+  what makes this a place you came *into* rather than a page that replaced the
+  console.
+*/
 .teams-bench-head {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -1231,14 +1252,8 @@
 
 /* ========================================================== the run's top == */
 
-/* Where the page sits, above its title. `--text-xs` because a crumb is orientation and
-   never content: it is read once, on arrival, by somebody deciding whether they are in
-   the right place. */
-.teams-crumb {
-  margin: 0 0 var(--space-2);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
+/* Where the page sits, above its title, is `.ui-crumb` in `ui.css` — one rule for the
+   three surfaces that each used to draw their own. */
 
 /**
  * The four readings of a run, in a row.

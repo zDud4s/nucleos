@@ -10,6 +10,8 @@
  * to run under a particular `TZ` to exercise a 23-hour day.
  */
 
+import { UI_LOCALE } from "./locale";
+
 const HOUR_MS = 3_600_000;
 
 /** Where a block sits inside its day, as fractions of that day's own height. */
@@ -211,7 +213,7 @@ export function weekOf(anchor: Date): Date[] {
  * form is what fits the column, and the long form is what a screen reader
  * should say instead of "Wed".
  */
-export function weekdayLabels(locale?: string): { short: string; long: string }[] {
+export function weekdayLabels(locale: string = UI_LOCALE): { short: string; long: string }[] {
   const MONDAY = new Date(2024, 0, 1);
   return Array.from({ length: 7 }, (_, index) => {
     const day = new Date(MONDAY.getFullYear(), MONDAY.getMonth(), MONDAY.getDate() + index);

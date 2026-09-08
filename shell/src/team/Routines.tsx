@@ -77,7 +77,7 @@ export function Routines({ team, rules }: RoutinesProps) {
           A rule cannot be edited — the núcleo has no route for it. Duplicate one to write a
           variant, then delete the original.
         </p>
-        {rules.length === 0 && <p className="teams-empty">no rule is written for this department.</p>}
+        {rules.length === 0 && <p className="teams-empty">no rule is written for this team.</p>}
         {rules.length > 0 && (
           <ul className="teams-rules" aria-label="Rules">
             {rules.map((rule) => (

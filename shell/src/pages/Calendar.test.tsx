@@ -21,6 +21,7 @@ import {
 } from "./Calendar";
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
 import type { PendingNotification } from "../data/feed";
+import { UI_LOCALE } from "../lib/locale";
 import { renderWithQuery, renderWithRouter } from "../test/harness";
 
 /**
@@ -261,6 +262,17 @@ describe("the page", () => {
     const sheet = await screen.findByRole("heading", { level: 3 });
     expect(sheet.textContent).toContain("20");
     expect(await screen.findByRole("button", { name: "Skip this occurrence" })).toBeDefined();
+  });
+
+  it("renders the period label in the shell's own locale", async () => {
+    answering([]);
+    await page();
+
+    const expected = new Date(2026, 7, 20).toLocaleDateString(UI_LOCALE, {
+      month: "long",
+      year: "numeric",
+    });
+    expect(await screen.findByRole("heading", { level: 1, name: expected })).toBeDefined();
   });
 
   it("switches to the week and keeps the day it was showing", async () => {

@@ -231,7 +231,7 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
     });
   });
 
-  it("keeps the promote control locked while the núcleo says the project is not ready", async () => {
+  it("a project that cannot be promoted says why in the row", async () => {
     const world = cockpitWorld({
       projects: [
         project({
@@ -239,8 +239,8 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
           mode: "shadow",
           project_root: "C:/repos/beta",
           promotable: false,
-          classes_ready: 2,
-          classes_total: 2,
+          classes_ready: 0,
+          classes_total: 0,
           withheld_classes_ready: 0,
         }),
       ],
@@ -251,12 +251,22 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
 
     const promote = await screen.findByRole("button", { name: "Let it act" });
     expect((promote as HTMLButtonElement).disabled).toBe(true);
+    expect(promote.getAttribute("title")).toBeNull();
+    expect(
+      screen.getByText(
+        /nothing has been recorded in shadow yet.*no evidence is not the same as good evidence/,
+      ),
+    ).toBeDefined();
+  });
 
-    // Every class ready and none of them withheld: the case a shell that
-    // recomputed the gate from `classes_ready === classes_total` would unlock.
-    // `promotable` is the daemon's arithmetic and it says no.
-    // The daemon's gate sentence is the disabled button's title now.
-    expect((promote as HTMLButtonElement).title).toMatch(/nothing yet shows it holds back/);
+  it("the budget period is a word and not a stem", async () => {
+    const world = cockpitWorld();
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByText(/of \$5\.00 per day/)).toBeDefined();
+    expect(screen.queryByText(/per dai/)).toBeNull();
   });
 });
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Link } from "@tanstack/react-router";
+import { Link, useSearch } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import type { AgentRequest } from "../data/agents";
 import type { Proposal } from "../data/system";
@@ -109,18 +109,43 @@ function reading<T>(query: {
   };
 }
 
+/** The one filter this page's location carries. Empty and absent are the same claim. */
+export function validateWaitingSearch(search: Record<string, unknown>) {
+  const raw = search.project;
+  return { project: typeof raw === "string" && raw !== "" ? raw : undefined };
+}
+
+/**
+ * One project's share of a queue.
+ *
+ * A row whose shape carries no `project_id` is dropped and not kept: a contact merge is not
+ * about a project, and showing it under a heading that says otherwise would be a wrong claim
+ * rather than a generous one. The narrowing note below says what is being left out.
+ */
+function onlyProject<T>(view: Reading<T>, projectId: string | undefined): Reading<T> {
+  if (projectId === undefined || view.rows === undefined) return view;
+  const rows = view.rows.filter(
+    (row) => (row as { project_id?: string | null }).project_id === projectId,
+  );
+  return { ...view, rows };
+}
+
 export function Waiting() {
-  const wheel = reading(useWheelRequests());
-  const approvals = reading(useActionApprovals());
-  const teamActions = reading(useTeamActionProposals());
-  const recruits = reading(useRecruitProposals());
+  const { project } = useSearch({ strict: false }) as { project?: string };
+
+  const wheel = onlyProject(reading(useWheelRequests()), project);
+  const approvals = onlyProject(reading(useActionApprovals()), project);
+  const teamActions = onlyProject(reading(useTeamActionProposals()), project);
+  const recruits = onlyProject(reading(useRecruitProposals()), project);
+  // A lookup and not a section: `openActions` answers a question about a row that is already
+  // on screen, so narrowing it would only hide the answer.
   const openActions = useOpenTeamActions();
-  const merges = reading(useContactMerges());
-  const exclusions = reading(useExclusionRequests());
-  const skipped = reading(useSkippedItems());
-  const refused = reading(useRefusedActions());
-  const vcs = reading(useVcsRequests());
-  const parked = reading(useAwaitingRuns());
+  const merges = onlyProject(reading(useContactMerges()), project);
+  const exclusions = onlyProject(reading(useExclusionRequests()), project);
+  const skipped = onlyProject(reading(useSkippedItems()), project);
+  const refused = onlyProject(reading(useRefusedActions()), project);
+  const vcs = onlyProject(reading(useVcsRequests()), project);
+  const parked = onlyProject(reading(useAwaitingRuns()), project);
 
   const decisions = countOf(
     wheel.rows,
@@ -169,6 +194,12 @@ export function Waiting() {
   return (
     <>
       <PageHeader title="Waiting" headline={headlineFor(decisions, records)} />
+
+      {project !== undefined ? (
+        <p className="waiting-narrowed" role="status">
+          Only {project}. <Link to="/waiting">Show everything</Link>
+        </p>
+      ) : null}
 
       <div className="waiting-sections">
         {[...sections]

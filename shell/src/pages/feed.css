@@ -40,6 +40,8 @@
   flex-direction: column;
   gap: var(--space-1);
   font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
   color: var(--text-faint);
 }
 
@@ -53,6 +55,8 @@
   color: var(--text);
   font-family: inherit;
   font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
 }
 
 .feed-filter-text input {

@@ -62,7 +62,7 @@ export function Work({ team, runs }: WorkProps) {
       )}
 
       <Panel title="Tasks">
-        {runs.length === 0 && <p className="teams-empty">no task yet for this department.</p>}
+        {runs.length === 0 && <p className="teams-empty">no task yet for this team.</p>}
         {done.length > 0 && (
           <ul className="ui-rows" aria-label="Tasks">
             {done.map((run) => (
@@ -84,8 +84,8 @@ export function Work({ team, runs }: WorkProps) {
           hundred.
         */}
         <p className="teams-cap">
-          showing this department&apos;s tasks from the newest {TEAM_RUN_LIST_LIMIT} runs across all
-          departments — there is no paging past that cap.
+          showing this team&apos;s tasks from the newest {TEAM_RUN_LIST_LIMIT} runs across all teams
+          — there is no paging past that cap.
         </p>
       </Panel>
     </div>
@@ -116,7 +116,7 @@ function Composer({ teamId }: { teamId: string }) {
       }}
     >
       <label className="teams-composer-field">
-        <span className="teams-label">Ask this department for something</span>
+        <span className="teams-label">Ask this team for something</span>
         <textarea
           className={grown ? "teams-textarea teams-composer-grown" : "teams-textarea"}
           rows={grown ? 3 : 1}

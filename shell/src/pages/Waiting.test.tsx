@@ -732,3 +732,38 @@ describe("Waiting - the route", () => {
     expect(screen.queryByText("Waiting is not built yet")).toBeNull();
   });
 });
+
+/* ------------------------------------------------ a project in the location -- */
+
+/**
+ * The queue, narrowed by the location and saying so.
+ *
+ * A project page's loudest sentence links here with its own name in the search, so this page
+ * has to be able to show one project's share of the queue. Two things are under test and the
+ * second is the one that is easy to forget: rows belonging to another project are gone, AND
+ * the page admits that it is withholding them. A silently filtered queue reads as an empty
+ * one, which is the wrong claim to make to somebody deciding whether they are done.
+ */
+describe("Waiting - a project in the location", () => {
+  it("a project in the location narrows the queue and says so", async () => {
+    const world = waitingWorld({
+      approvals: [
+        proposal({ id: 11, project_id: "nucleos", tool_name: "Bash" }),
+        proposal({ id: 12, project_id: "other", tool_name: "Bash" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWithRouter(<Waiting />, { initialPath: "/waiting?project=nucleos" });
+
+    expect(await screen.findByText("approval #11")).toBeDefined();
+    expect(screen.queryByText("approval #12")).toBeNull();
+
+    // The admission, and the way back out of it.
+    const note = screen.getByRole("status");
+    expect(note.textContent).toBe("Only nucleos. Show everything");
+    expect(within(note).getByRole("link", { name: "Show everything" }).getAttribute("href")).toBe(
+      "/waiting",
+    );
+  });
+});

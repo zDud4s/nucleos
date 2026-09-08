@@ -51,6 +51,13 @@ import {
 } from "../lib/mode";
 import "./autopilot.css";
 
+/** The three periods the núcleo writes, as the noun each one is: `daily` becomes `day`, not `dai`. */
+const PERIOD_NOUN: Record<string, string> = {
+  daily: "day",
+  weekly: "week",
+  monthly: "month",
+};
+
 /**
  * Autopilot — the governance cockpit.
  *
@@ -209,7 +216,7 @@ function BudgetPausedBanner({ budget }: { budget: BudgetView }) {
       <span className="ap-banner-text">
         {budget.reason ?? "the núcleo did not say which ceiling"} — $
         {budget.window_spend_usd.toFixed(2)} spent this{" "}
-        {budget.period.replace(/ly$/, "")}
+        {PERIOD_NOUN[budget.period] ?? budget.period}
         {budget.limit_usd === null
           ? ""
           : ` against a ceiling of $${budget.limit_usd.toFixed(2)}`}
@@ -272,7 +279,7 @@ function Statusline({
             ? undefined
             : budget.limit_usd === null
               ? "no ceiling set"
-              : `of $${budget.limit_usd.toFixed(2)} per ${budget.period.replace(/ly$/, "")}`
+              : `of $${budget.limit_usd.toFixed(2)} per ${PERIOD_NOUN[budget.period] ?? budget.period}`
         }
       />
     </div>
@@ -438,14 +445,17 @@ function GovernanceRow({
             !project.promotable ||
             setMode.isPending
           }
-          title={
-            project.promotable ? undefined : promotionBlocker(project, withheld)
-          }
           onConfirm={() =>
             change("active", root === "" ? project.project_root : root)
           }
         />
       </div>
+
+      {project.mode !== "active" && !project.promotable ? (
+        <div className="ap-project-blocker">
+          <Quiet says={promotionBlocker(project, withheld)} />
+        </div>
+      ) : null}
 
       {refused !== null && (
         <RefusalNote

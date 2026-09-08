@@ -35,6 +35,7 @@ import { useProjects } from "../data/system";
 import {
   Badge,
   Button,
+  Crumb,
   ErrorNote,
   Meter,
   PageHeader,
@@ -206,15 +207,15 @@ export function Projects() {
       {/*
         Both ways back, because they are different places: the workspace is this project seen
         through the app's own readings, and the roster is every project. Somebody who arrived here
-        from the Código mode wants the first.
+        from the Código mode wants the first, which is why it is the one the arrow points at; the
+        roster sits in the crumb's second slot rather than in a second paragraph.
       */}
-      <p className="pj-back">
-        <Link to="/projects/$projectId/$view" params={{ projectId, view: "code" }}>
-          ‹ back to {projectId}
-        </Link>
-        {" · "}
-        <Link to="/projects">all projects</Link>
-      </p>
+      <Crumb
+        to={`/projects/${projectId}/code`}
+        here={<Link to="/projects">all projects</Link>}
+      >
+        {projectId}
+      </Crumb>
 
       <Concerns
         projectId={projectId}

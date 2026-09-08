@@ -80,6 +80,34 @@ describe("Sparkline", () => {
     expect(container.querySelector(".ui-spark-rail")).not.toBeNull();
   });
 
+  it("each bar says which day it is", () => {
+    const { container } = render(
+      <Sparkline
+        values={[2, 1]}
+        label="the 3 runs in the window"
+        titles={["2 runs on 2026-09-05", "1 run on 2026-09-06"]}
+      />,
+    );
+
+    // One `<title>` per bar, in the order the values are in — the chart has no
+    // axis to read the day off, so the mark has to carry it.
+    const said = [...container.querySelectorAll("svg title")].map((node) => node.textContent);
+    expect(said).toEqual(["2 runs on 2026-09-05", "1 run on 2026-09-06"]);
+
+    // First child of its group, or the format does not treat it as the tooltip.
+    for (const title of container.querySelectorAll("svg title")) {
+      expect(title.parentElement?.tagName.toLowerCase()).toBe("g");
+      expect(title.parentElement?.firstElementChild).toBe(title);
+    }
+  });
+
+  it("draws no title at all when the caller has nothing to say about a bar", () => {
+    const { container } = render(<Sparkline values={[1, 2, 3]} label="the 6 runs in the window" />);
+
+    expect(container.querySelectorAll("svg title")).toHaveLength(0);
+    expect(bars(container)).toHaveLength(3);
+  });
+
   it("keeps the label as the accessible name when it is hidden", () => {
     const { container } = render(
       <Sparkline values={[1, 2]} label="Finanças: the 2 runs in the window" labelHidden />,

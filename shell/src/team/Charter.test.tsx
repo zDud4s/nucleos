@@ -232,7 +232,7 @@ describe("Charter - the drift guard", () => {
     expect(screen.queryByRole("alert", { name: "Changed while you were editing" })).toBeNull();
   });
 
-  it("sends nothing at all when the department cannot be re-read", async () => {
+  it("sends nothing at all when the team cannot be re-read", async () => {
     await renderCharter(teamView());
     fireEvent.change(await screen.findByLabelText("Mission"), { target: { value: "and file them" } });
 

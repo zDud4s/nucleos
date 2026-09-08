@@ -580,12 +580,14 @@ function Breadcrumbs({ path, onGo }: { path: string; onGo: (path: string) => voi
 /* -------------------------------------------------------------- upload -- */
 
 function UploadButton({ path, upload }: { path: string; upload: ReturnType<typeof useUpload> }) {
+  const [chosen, setChosen] = useState<string[]>([]);
   const [oversized, setOversized] = useState<string[]>([]);
   const [savedAs, setSavedAs] = useState<string[]>([]);
 
   async function handleFiles(fileList: FileList | null) {
     if (fileList === null) return;
     const files = Array.from(fileList);
+    setChosen(files.map((file) => file.name));
     const tooBig = files.filter((file) => file.size > MAX_UPLOAD_BYTES).map((file) => file.name);
     setOversized(tooBig);
     setSavedAs([]);
@@ -605,11 +607,12 @@ function UploadButton({ path, upload }: { path: string; upload: ReturnType<typeo
         <span>Upload</span>
         <input
           type="file"
+          className="sr-only"
           multiple
-          aria-label="Upload files"
           onChange={(event) => void handleFiles(event.target.files)}
         />
       </label>
+      {chosen.length > 0 && <p className="fi-upload-chosen">{chosen.join(", ")}</p>}
       {oversized.length > 0 && (
         <p className="fi-upload-note" role="alert">
           not sent — larger than the {String(MAX_UPLOAD_BYTES / (1024 * 1024))} MB the daemon will accept in one

@@ -219,7 +219,7 @@
   border-left: 3px solid var(--border-strong);
   border-radius: var(--radius-md);
   background: var(--surface-raised);
-  box-shadow: var(--shadow-sm);
+  box-shadow: none;
 }
 
 /* The kind of owner, said in the left edge as well as in words. */

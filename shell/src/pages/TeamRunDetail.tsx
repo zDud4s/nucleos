@@ -15,11 +15,13 @@ import {
 import {
   Button,
   ConfirmButton,
+  Crumb,
   ErrorNote,
   PageHeader,
   Panel,
   RefusalNote,
   RelativeTime,
+  Section,
   StatCard,
   StateBadge,
   money,
@@ -51,7 +53,7 @@ export function TeamRunDetail() {
   if (detail === undefined) {
     return (
       <>
-        <Crumb />
+        <RunCrumb />
         <PageHeader title="Team run" />
         {run.isError ? <DetailError error={run.error} /> : <p className="teams-loading">reading the run…</p>}
       </>
@@ -60,7 +62,7 @@ export function TeamRunDetail() {
 
   return (
     <>
-      <Crumb />
+      <RunCrumb />
       <PageHeader
         /*
           The request, because the request is what this page is about. "Team run" was the
@@ -75,32 +77,29 @@ export function TeamRunDetail() {
             {detail.team_id} · started <RelativeTime at={detail.created_at} />
           </>
         }
+        /*
+          Cancel, alone. The state badge is NOT here, and that is a decision rather than
+          an omission: it is the first instrument in the strip below, and a reading drawn
+          twice on one screen is two things that can disagree.
+
+          Deleting used to stand beside it, both `intent="stop"` and both a click away —
+          two red buttons in one corner, one of which ends the work and one of which ends
+          the record of it. They are now different distances away: this is the live
+          control and belongs where a live control belongs, and the other is at the foot
+          of the page, past everything a reader would want before destroying it.
+
+          Only while live: a run that has already ended has nothing left to stop.
+        */
         actions={
-          <div className="teams-actions">
-            {/* The state badge is NOT here, and that is a decision rather than an
-                omission: it is the first instrument in the strip below, and a reading
-                drawn twice on one screen is two things that can disagree. Beside two
-                destructive buttons it would also be the one thing in the row that is not
-                a control. */}
-            {/* Only while live: a run that has already ended has nothing left to stop. */}
-            {alive && (
-              <Button intent="stop" disabled={cancel.isPending} onClick={() => cancel.mutate(id)}>
-                Cancel
-              </Button>
-            )}
-            <ConfirmButton
-              label="Delete run"
-              confirmLabel="Delete it, and its folder"
-              intent="stop"
-              disabled={del.isPending}
-              onConfirm={() => del.mutate(id, { onSuccess: () => void navigate({ to: "/teams" }) })}
-            />
-          </div>
+          alive ? (
+            <Button intent="stop" disabled={cancel.isPending} onClick={() => cancel.mutate(id)}>
+              Cancel
+            </Button>
+          ) : undefined
         }
       />
 
       {cancel.isError && <CancelNote error={cancel.error} />}
-      {del.isError && <DeleteNote error={del.error} />}
 
       <Instruments run={detail} alive={alive} />
 
@@ -119,6 +118,22 @@ export function TeamRunDetail() {
         isError={actions.isError}
         error={actions.isError ? actions.error : undefined}
       />
+
+      {/* Last on the page, under a heading that says what it is for. A destructive
+          write is not a page action here — it is the end of the thing the page is
+          about, and it is reached by scrolling past the run rather than by aiming at
+          the same corner as Cancel. `DeleteNote` stays with the control that produced
+          it. */}
+      <Section label="Ending this run">
+        <ConfirmButton
+          label="Delete run"
+          confirmLabel="Delete it, and its folder"
+          intent="stop"
+          disabled={del.isPending}
+          onConfirm={() => del.mutate(id, { onSuccess: () => void navigate({ to: "/teams" }) })}
+        />
+        {del.isError && <DeleteNote error={del.error} />}
+      </Section>
     </>
   );
 }
@@ -126,17 +141,17 @@ export function TeamRunDetail() {
 /**
  * Where this page sits, and the way back out of it.
  *
- * Above the title rather than under the last panel, which is where "Back to the
- * departments" used to be: a way out reached only by reading the whole run is a way out
- * for whoever no longer needs one. It carries the page's KIND — "Team run", the words
- * this page used to spend its heading on — so that giving the heading to the request
- * costs nothing a reader had.
+ * Above the title rather than under the last panel, which is where "Back to the teams"
+ * used to be: a way out reached only by reading the whole run is a way out for whoever
+ * no longer needs one. It carries the page's KIND — "Team run", the words this page used
+ * to spend its heading on — so that giving the heading to the request costs nothing a
+ * reader had.
  */
-function Crumb() {
+function RunCrumb() {
   return (
-    <p className="teams-crumb">
-      <Link to="/teams">Departments</Link> · Team run
-    </p>
+    <Crumb to="/teams" here="Team run">
+      Teams
+    </Crumb>
   );
 }
 
@@ -367,7 +382,7 @@ function ActionCard({ action }: { action: TeamAction }) {
       <p className="teams-note">
         {action.ordinal === null ? "the director asked" : "a specialist asked"}
         {" — "}
-        {action.proposal_id === null ? "this department may do that without asking" : "waiting on a decision"}
+        {action.proposal_id === null ? "this team may do that without asking" : "waiting on a decision"}
       </p>
     </li>
   );

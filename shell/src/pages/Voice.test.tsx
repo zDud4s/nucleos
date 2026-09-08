@@ -153,6 +153,21 @@ describe("Voice — not armed", () => {
   });
 });
 
+describe("Voice — hotkey registration", () => {
+  it("says the hotkeys failed when they did", async () => {
+    daemon.apiFetch.mockImplementation(daemonBaseline(voiceConfig()));
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "voice_phase") return "idle";
+      if (cmd === "voice_register_hotkeys") throw new Error("host unavailable");
+      return undefined;
+    });
+
+    renderWithQuery(<Voice />);
+
+    expect(await screen.findByText("armed, but the hotkeys did not register — use the buttons below")).toBeDefined();
+  });
+});
+
 /* --------------------------------------------------------------- capture -- */
 
 describe("Voice — capture outcomes", () => {

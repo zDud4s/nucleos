@@ -178,7 +178,7 @@ async function panelFor(heading: string): Promise<HTMLElement> {
 /* ------------------------------------------------------------ recruits -- */
 
 describe("Decisions - recruitment", () => {
-  it("shows only the recruitments this department asked for, by team_id inside tool_input", async () => {
+  it("shows only the recruitments this team asked for, by team_id inside tool_input", async () => {
     // `GET /proposals/recruits` answers every pending recruitment across the
     // house; the department is inside the JSON payload and there is no query
     // parameter for it, so the filter is the shell's.
@@ -226,7 +226,7 @@ describe("Decisions - recruitment", () => {
     expect(body.hire.name).toBe("tax analyst");
   });
 
-  it("reads no department out of a payload that has none, rather than guessing one", () => {
+  it("reads no team out of a payload that has none, rather than guessing one", () => {
     expect(recruitTeam(recruit("financas"))).toBe("financas");
     expect(recruitTeam(recruit("financas", { tool_input: null }))).toBeNull();
     expect(recruitTeam(recruit("financas", { tool_input: "not json" }))).toBeNull();
@@ -237,7 +237,7 @@ describe("Decisions - recruitment", () => {
 /* ------------------------------------------------------------- actions -- */
 
 describe("Decisions - actions", () => {
-  it("shows only the actions belonging to this department's runs", async () => {
+  it("shows only the actions belonging to this team's runs", async () => {
     // `GET /team-actions` carries `team_run_id` and no department, so the link
     // back is through the run list — and an action whose run has fallen off
     // the newest-hundred window is shown nowhere rather than shown wrongly.

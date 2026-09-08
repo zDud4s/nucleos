@@ -17,6 +17,7 @@ import {
 import { moveFromDrop } from "../calendar/drag";
 import { isHeld, usePendingNotifications, type PendingNotification } from "../data/feed";
 import { dayBounds, monthMatrix, weekOf } from "../lib/calendar-grid";
+import { UI_LOCALE } from "../lib/locale";
 import { Badge, Button, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime } from "../ui";
 import "./calendar.css";
 
@@ -295,7 +296,7 @@ export function Calendar() {
   const label =
     view === "week"
       ? weekLabel(weekOf(anchor))
-      : anchor.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+      : anchor.toLocaleDateString(UI_LOCALE, { month: "long", year: "numeric" });
 
   return (
     <>
@@ -400,10 +401,10 @@ function weekLabel(days: Date[]): string {
   const first = days[0];
   const last = days[days.length - 1];
   const sameMonth = first.getMonth() === last.getMonth() && first.getFullYear() === last.getFullYear();
-  const tail = last.toLocaleDateString(undefined, { day: "numeric", month: "long", year: "numeric" });
+  const tail = last.toLocaleDateString(UI_LOCALE, { day: "numeric", month: "long", year: "numeric" });
   const head = sameMonth
     ? String(first.getDate())
-    : first.toLocaleDateString(undefined, { day: "numeric", month: "long" });
+    : first.toLocaleDateString(UI_LOCALE, { day: "numeric", month: "long" });
   return `${head}–${tail}`;
 }
 

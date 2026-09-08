@@ -260,23 +260,21 @@ function ConfigPanel({ config }: { config: { data: EmailConfigView | undefined; 
           <div className="mail-config-fact">
             <dt>account</dt>
             <dd>
-              {data.username}@{data.host}
+              {configAccount(data)}
             </dd>
           </div>
           <div className="mail-config-fact">
             <dt>mailbox</dt>
-            <dd>{data.mailbox}</dd>
+            <dd>{configMailbox(data)}</dd>
           </div>
           <div className="mail-config-fact">
             <dt>state</dt>
             <dd>{configState(data)}</dd>
           </div>
-          {data.local_triage_disabled !== null && (
-            <div className="mail-config-fact">
-              <dt>local triage</dt>
-              <dd>{data.local_triage_disabled}</dd>
-            </div>
-          )}
+          <div className="mail-config-fact">
+            <dt>local triage</dt>
+            <dd>{configLocalTriage(data)}</dd>
+          </div>
         </dl>
       )}
     </Panel>
@@ -292,6 +290,23 @@ function configState(data: EmailConfigView): string {
   if (!data.enabled) return "not enabled — nothing is fetched";
   if (!data.armed) return "enabled but not armed — mail arrives, triage does not run";
   return "enabled and armed";
+}
+
+function configAccount(data: EmailConfigView): string {
+  if (!data.username && !data.host) return "no account configured";
+  return [data.username, data.host].filter(Boolean).join("@");
+}
+
+function configMailbox(data: EmailConfigView): string {
+  if (!data.mailbox) return "no mailbox named";
+  return data.mailbox;
+}
+
+function configLocalTriage(data: EmailConfigView): string {
+  const disabled = (data as { local_triage_disabled?: unknown }).local_triage_disabled;
+  if (disabled === null) return "nothing is wrong";
+  if (typeof disabled === "string") return `disabled: ${disabled}`;
+  return "unknown";
 }
 
 function ConfigError({ error }: { error: unknown }) {

@@ -1782,11 +1782,12 @@
   cursor: pointer;
 }
 
-/* An open microphone is worth a colour. This control is the only one in the row whose "on" state
-   means something is being recorded, and it must not be mistakable for the "off" state at a glance. */
+/* The open microphone must be unmistakable at a glance: its fill and left rule, rather than hue,
+   distinguish recording from the off state. */
 .chats-handsfree-on {
-  color: var(--accent);
-  background: var(--accent-quiet);
+  color: var(--text);
+  background: var(--surface-raised);
+  box-shadow: inset 2px 0 0 var(--border-strong);
 }
 
 .chats-handsfree-phase {

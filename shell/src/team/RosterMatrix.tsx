@@ -100,8 +100,8 @@ export function RosterMatrix({ teams }: RosterMatrixProps) {
     return (
       <p className="teams-empty">
         {teams.length === 0
-          ? "no department has been created yet."
-          : "no department has anybody in it yet — a task cannot start without a roster."}
+          ? "no team has been created yet."
+          : "no team has anybody in it yet — a task cannot start without a roster."}
       </p>
     );
   }
@@ -116,7 +116,7 @@ export function RosterMatrix({ teams }: RosterMatrixProps) {
       <table className="teams-matrix">
         <caption className="teams-matrix-caption">
           {specialists.length} {specialists.length === 1 ? "specialist" : "specialists"} across{" "}
-          {teams.length} {teams.length === 1 ? "department" : "departments"}. ◉ directs · ● on staff
+          {teams.length} {teams.length === 1 ? "team" : "teams"}. ◉ directs · ● on staff
         </caption>
         <thead>
           <tr>

@@ -349,7 +349,7 @@ describe("Agents - how much of an agent is spoken for", () => {
     expect(screen.getByText(/1 nobody uses/)).toBeDefined();
   });
 
-  it("never says nobody uses an agent while the department list has not answered", async () => {
+  it("never says nobody uses an agent while the team list has not answered", async () => {
     daemon.apiFetch.mockImplementation(async (path: string) => {
       if (path === "/teams") return await new Promise(() => {});
       if (path === "/agents") return [agent({ id: "spare", name: "spare", model: "sonnet" })];
@@ -357,7 +357,7 @@ describe("Agents - how much of an agent is spoken for", () => {
     });
     renderWithQuery(<Agents />);
 
-    expect(await screen.findByText(/the department list has not answered/)).toBeDefined();
+    expect(await screen.findByText(/the team list has not answered/)).toBeDefined();
     expect(screen.queryByText("no department names this one")).toBeNull();
     expect(screen.queryByText(/nobody uses/)).toBeNull();
   });

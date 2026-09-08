@@ -68,9 +68,15 @@ function headline(
   config: VoiceConfigView | undefined,
   memos: Capture[] | undefined,
   dictations: Capture[] | undefined,
+  conflicts: string[] | null,
+  registerFailed: boolean,
 ): string | undefined {
   if (config === undefined) return undefined;
   if (!config.armed) return "not armed — no transcriber is configured";
+  if (registerFailed) return "armed, but the hotkeys did not register — use the buttons below";
+  if (conflicts !== null && conflicts.length > 0) {
+    return `armed — ${conflicts.length} hotkey${conflicts.length === 1 ? "" : "s"} is taken by another app`;
+  }
   if (memos === undefined || dictations === undefined) return "armed";
   const memoNoun = memos.length === 1 ? "memo" : "memos";
   const dictationNoun = dictations.length === 1 ? "dictation" : "dictations";
@@ -285,7 +291,7 @@ export function Voice() {
 
   return (
     <>
-      <PageHeader title="Voice" headline={headline(config.data, memos.data, dictations.data)} />
+      <PageHeader title="Voice" headline={headline(config.data, memos.data, dictations.data, hotkeyConflicts, hotkeyRegisterFailed)} />
 
       <Panel title="Capture" aside={<PhaseBadge phase={phase} />}>
         <HotkeyConflictNote failed={hotkeyConflicts} registerFailed={hotkeyRegisterFailed} />

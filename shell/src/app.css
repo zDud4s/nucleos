@@ -76,6 +76,59 @@
   margin-top: var(--space-4);
 }
 
+/* ----------------------------------------------------------- route error -- */
+
+/**
+ * The page that could not be drawn, drawn where the page would have been.
+ *
+ * It lives here and not in `ui.css` because it is not a primitive: it is one
+ * specific thing the app renders in one specific slot, `AppShell`'s outlet, and
+ * the whole reason it has a box at all is so the header, the sentence, the stack
+ * and the way out are spaced like a page rather than piled like a dump.
+ */
+.app-route-error {
+  display: flex;
+  flex-direction: column;
+  /* A column with a gap rather than margins on the children, because one of the
+     four children is absent whenever what was thrown carried no stack — and a
+     gap closes over a missing child where a margin would leave its hole. */
+  gap: var(--space-4);
+}
+
+/*
+  The stack, expanded, and the only monospaced block on this surface.
+
+  `pre-wrap` and not `pre`: a stack frame is a path plus a call, and on this
+  machine those paths are long enough that `pre` alone would push the whole
+  thing sideways past the fold with the interesting end off-screen. Wrapping
+  keeps the frame numbers on the left where they can be counted. `overflow-x`
+  is still there for the one line that cannot wrap — a minified frame with no
+  spaces in it — and `max-height` is there because a React stack is fifty frames
+  and the actions row below has to stay reachable without scrolling the page.
+*/
+.app-route-error-stack {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-x: auto;
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  max-height: 24rem;
+}
+
+/* `baseline` and not `center`: the two children are a link and a button with an
+   icon in it, and aligning their boxes would sit the words at two different
+   heights. The words are what is being read. */
+.app-route-error-actions {
+  display: flex;
+  flex-direction: row;
+  gap: var(--space-3);
+  align-items: baseline;
+}
+
 /* ------------------------------------------------------------------- nav -- */
 
 /**
@@ -465,25 +518,47 @@
   mask-image: var(--scroll-fade);
   -webkit-mask-image: var(--scroll-fade);
   /*
-    No scrollbar, and the fade above is what replaces it.
+    A thin scrollbar, and the fade above still does the other half of the job.
 
-    Worth being exact about, because hiding a scrollbar is how the pasted design
-    lost eight destinations: it hid the bar AND had nothing else to say there was
-    more list. Here the mask cuts the last row mid-height at the fold, which is
-    the oldest signal there is for "this continues" and the one this rail already
-    used. The region is still scrollable by wheel, by touch, by keyboard and by
-    the arrow keys the rail binds — only the furniture is gone.
+    This region used to have no scrollbar at all. The argument for that was
+    real and is kept here, because it is the argument this 4px bar has to
+    answer rather than contradict: a classic scrollbar is ~15px of the 40px
+    inside a collapsed rail, taken from the right, which pushed every icon five
+    pixels off the centre it was supposed to sit on. That is a genuine cost and
+    it is why the default bar is not what is here.
 
-    It also buys back the width. A classic scrollbar is ~15px of the 40px inside
-    a collapsed rail, and it takes that from the right, which pushed every icon
-    five pixels left of the centre it was supposed to sit on. The two complaints
-    were one complaint.
+    What the no-bar version got wrong is the other half. Hiding the furniture is
+    how the pasted design lost eight destinations, and the mask alone does not
+    replace it: the fade says "this continues", which is the oldest signal there
+    is, but it says nothing about HOW MUCH continues or where in the list you
+    are. On a rail of twenty destinations that is the difference between one more
+    row below the fold and twelve.
+
+    4px is the width at which both are true. It is a quarter of the ~15px the old
+    comment objected to, so a collapsed rail keeps 36 of its 40 and the icons stay
+    where the axis puts them; and it is a real thumb, sized to the list, so the
+    depth of the list is visible. The mask stays exactly as it was — the two are
+    not alternatives, they answer different questions.
   */
-  scrollbar-width: none;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
 
+/* WebKit says the same thing in its own vocabulary — this is the same 4px bar
+   the two `scrollbar-*` properties above declare, not a second decision. The
+   track is transparent so the rail's own surface runs under it: a track with a
+   colour would read as a second edge beside the one the rail already has. */
 .nav-scroll::-webkit-scrollbar {
-  display: none;
+  width: 4px;
+}
+
+.nav-scroll::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 2px;
+}
+
+.nav-scroll::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .nav-group + .nav-group {

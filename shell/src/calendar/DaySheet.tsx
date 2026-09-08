@@ -14,6 +14,7 @@ import {
   type EventOccurrence,
 } from "../data/calendar";
 import { inputFromStamp, occurrenceMinutes, stampFromInput } from "../lib/calendar-grid";
+import { UI_LOCALE } from "../lib/locale";
 import { Badge, Button, ConfirmButton, ErrorNote, RefusalNote } from "../ui";
 import { placementOf, slotStamp, type Slot } from "./slot";
 
@@ -55,7 +56,7 @@ export function DaySheet({ slot, occurrences, now, config }: DaySheetProps) {
     <div className="calendar-sheet">
       <div className="calendar-sheet-head">
         <h3 className="calendar-sheet-title">
-          {slot.day.toLocaleDateString(undefined, {
+          {slot.day.toLocaleDateString(UI_LOCALE, {
             weekday: "long",
             day: "numeric",
             month: "long",
@@ -295,7 +296,7 @@ export function OccurrenceActions({ occurrence }: { occurrence: EventOccurrence 
           </Button>
         </div>
         <details className="calendar-occurrence-more">
-          <summary aria-label="More occurrence actions">…</summary>
+          <summary>Delete series</summary>
           <ConfirmButton
             label="Delete whole series"
             confirmLabel="Delete every occurrence"

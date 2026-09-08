@@ -739,7 +739,12 @@
 
 .calendar-occurrence-more summary {
   cursor: pointer;
-  color: var(--text-muted);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.calendar-occurrence-more summary:hover {
+  text-decoration: underline;
 }
 
 .calendar-occurrence-more > .ui-button {

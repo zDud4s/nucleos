@@ -26,13 +26,6 @@
   font-style: italic;
 }
 
-.contacts-count {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-variant-numeric: tabular-nums;
-  color: var(--text-faint);
-}
-
 .contacts-meta {
   margin: 0;
   font-family: var(--font-mono);

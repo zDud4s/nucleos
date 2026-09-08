@@ -7,6 +7,7 @@ import {
   createRouter,
 } from "@tanstack/react-router";
 import { AppShell } from "./app/AppShell";
+import { RouteError } from "./app/RouteError";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
 import { Agents } from "./pages/Agents";
 import { Autopilot } from "./pages/Autopilot";
@@ -35,7 +36,7 @@ import { TeamRunDetail } from "./pages/TeamRunDetail";
 import { Teams } from "./pages/Teams";
 import { Bench } from "./team/Bench";
 import { Voice } from "./pages/Voice";
-import { Waiting } from "./pages/Waiting";
+import { Waiting, validateWaitingSearch } from "./pages/Waiting";
 import { Web } from "./pages/Web";
 
 /**
@@ -97,6 +98,7 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
   "/runs": validateRunSearch,
   "/feed": validateFeedSearch,
   "/calendar": validateCalendarSearch,
+  "/waiting": validateWaitingSearch,
 };
 
 /**
@@ -248,6 +250,14 @@ export function createAppRouter(initialPath = "/") {
    * `createRouter` initialises the route objects in place, so two routers
    * sharing one tree would be two routers fighting over the same instances.
    * Every test that mounts the app gets its own tree.
+   *
+   * No `errorComponent` here, and that is the decision rather than the omission.
+   * This route's component IS the shell — the rail, the connection line, the
+   * kill switch, the `<Outlet />`. An error boundary at this level would have
+   * nothing left to render inside, so it would draw `RouteError` bare on the
+   * window; and `RouteError` renders a `<Link>`, which resolves against the
+   * router whose root just failed. The child routes below carry the boundary
+   * instead, which is what keeps the shell standing around a page that threw.
    */
   const rootRoute = createRootRoute({ component: AppShell });
 
@@ -265,6 +275,10 @@ export function createAppRouter(initialPath = "/") {
       getParentRoute: () => rootRoute,
       path: item.path,
       component: PAGES[item.path] ?? placeholderFor(item),
+      // Declared per route rather than only on the router, so the boundary sits
+      // as deep as it can: inside `AppShell`'s outlet, where the page that threw
+      // is the only thing replaced.
+      errorComponent: RouteError,
       // Spread rather than passed as `undefined`: the router treats the key's
       // presence as the declaration, and a route that declares a validator and
       // has none would strip every search param it is given.
@@ -277,6 +291,10 @@ export function createAppRouter(initialPath = "/") {
       getParentRoute: () => rootRoute,
       path: detail.path,
       component: detail.component,
+      // For the reason the nav routes above give. It matters most here: a detail
+      // route is the one reached with an id in hand, and an id the daemon has
+      // nothing for is the commonest way one of these throws.
+      errorComponent: RouteError,
       // Spread rather than passed as `undefined`, for the reason the nav routes above give: the
       // router treats the key's presence as the declaration, and a route that declares a validator
       // and has none strips every search param it is given.
@@ -295,6 +313,13 @@ export function createAppRouter(initialPath = "/") {
      * firing twenty route loads on a machine that is already polling.
      */
     defaultPreload: false,
+    /**
+     * The belt under the braces. Every child route above names `RouteError`
+     * explicitly; this catches the one somebody adds without it, which is the
+     * only way a blank window comes back. The library's own default here is a
+     * bare pre-formatted dump with no shell around it.
+     */
+    defaultErrorComponent: RouteError,
   });
 }
 

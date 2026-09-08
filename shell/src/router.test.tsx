@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { RouterProvider } from "@tanstack/react-router";
 import { NAV_PATHS } from "./app/nav";
+import { createAppQueryClient } from "./app/queryClient";
 import { PAGES, createAppRouter } from "./router";
 import { Bench } from "./team/Bench";
 import { daemonFetch, daemonState, renderApp } from "./test/harness";
@@ -54,6 +57,51 @@ describe("the app router", () => {
     expect(screen.getByRole("navigation", { name: "Sections" })).toBeDefined();
     expect(screen.getByRole("button", { name: /kill switch/i })).toBeDefined();
     expect(screen.queryByRole("heading", { level: 1, name: "Fleet" })).toBeNull();
+  });
+
+  /**
+   * The invariant the error boundary exists for, asserted at the router rather
+   * than at the component.
+   *
+   * `RouteError.test.tsx` proves the boundary renders what it should when it is
+   * handed an error. It cannot prove the thing that actually mattered: that the
+   * boundary is mounted *below* the shell, so a page that throws takes the page
+   * and nothing else. Wired one level too high — on the root route — every one
+   * of these assertions fails while the component's own test stays green.
+   */
+  it("keeps the rail and the kill switch when a page throws", async () => {
+    const router = createAppRouter("/files");
+    // The same loose view the cases above use, for the same reason: the tree is
+    // built from an array, so the library's inference has nothing literal to
+    // hand back and a direct reach into `routesById` is a type error about a
+    // value that is really there.
+    const byId = router.routesById as unknown as Record<
+      string,
+      { options: { component: unknown } }
+    >;
+    byId["/files"].options.component = () => {
+      throw new Error("boom in the page");
+    };
+
+    // React writes the caught error to the console on its way to the boundary.
+    // That is correct of React and noise here — the throw is the fixture.
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await router.load();
+      render(
+        <QueryClientProvider client={createAppQueryClient()}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>,
+      );
+
+      expect((await screen.findByRole("alert")).textContent).toContain("boom in the page");
+      // And the shell around it, asserted with the same two queries the case
+      // above uses for a page that did NOT throw.
+      expect(screen.getByRole("navigation", { name: "Sections" })).toBeDefined();
+      expect(screen.getByRole("button", { name: /kill switch/i })).toBeDefined();
+    } finally {
+      quiet.mockRestore();
+    }
   });
 
   it("has a real page for every navigation item, with no placeholder left", () => {

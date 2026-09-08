@@ -502,9 +502,9 @@ function Tools({ agent }: { agent: Agent }) {
 function Employed({ employment, known }: { employment: Employment; known: boolean }) {
   if (!known) {
     return (
-      <span className="agents-figure agents-figure-unknown" title="the department list has not answered yet">
+      <span className="agents-figure agents-figure-unknown" title="the team list has not answered yet">
         <span aria-hidden="true">·</span>
-        <span className="agents-said">the department list has not answered — this is not zero</span>
+        <span className="agents-said">the team list has not answered — this is not zero</span>
       </span>
     );
   }
@@ -831,7 +831,7 @@ function holdSentence(agent: Agent, employment: Employment, known: boolean): str
     "an item of a team run, or of a job, is not something this page can see, and it is the other half of what the núcleo checks";
 
   if (!known) {
-    return `The department list has not answered, so what stands on ${agent.name} is not known here. The núcleo refuses a delete on four grounds: it directs a team, it is on a roster, or it holds an item of a team run or of a job.`;
+    return `The team list has not answered, so what stands on ${agent.name} is not known here. The núcleo refuses a delete on four grounds: it directs a team, it is on a roster, or it holds an item of a team run or of a job.`;
   }
 
   if (unemployed(employment)) {

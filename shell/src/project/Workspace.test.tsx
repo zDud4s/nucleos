@@ -243,6 +243,32 @@ describe("the project workspace", () => {
   });
 
   /**
+   * The loudest sentence on the page is the one with somewhere to go.
+   *
+   * Those two proposals are rows in the Waiting queue, and a page that names them without
+   * offering the way there makes somebody find the queue by hand and then find this project
+   * inside it. The destination carries the project, so what opens is this project's share of
+   * the queue and not the whole of it.
+   *
+   * Two further things are asserted here rather than in cases of their own, because they are
+   * properties of this same box under the same poll: the section announces itself, since its
+   * sentence changes underneath a reader with nothing else to say so; and it carries no
+   * `shadow-float`, which DESIGN.md’s shadow vocabulary calls “applied to nothing” — this box
+   * was the one place applying it, so DESIGN.md was describing a tree it did not have.
+   */
+  it("the decisions sentence is a link to that project's queue", async () => {
+    const { container } = await openWorkspace({ openProposals: 2 });
+
+    const link = await screen.findByRole("link", { name: /2 decisions waiting on you/ });
+    expect(link.getAttribute("href")).toBe("/waiting?project=nucleos");
+
+    const leading = container.querySelector('section[aria-label="Leading"]');
+    expect(leading?.getAttribute("aria-live")).toBe("polite");
+    expect(leading?.contains(link)).toBe(true);
+    expect(leading?.querySelector(".shadow-float")).toBeNull();
+  });
+
+  /**
    * The ladder, seen from the page rather than from the module. The kill switch
    * is machine-wide and outranks a project's own queue: telling somebody to go
    * and approve two things, while nothing can start, would send them to do work

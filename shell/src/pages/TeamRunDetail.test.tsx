@@ -152,7 +152,7 @@ async function renderTeamRunDetail(initialPath: string) {
 /* ------------------------------------------------------------------ rounds -- */
 
 describe("TeamRunDetail - rounds and actions", () => {
-  it("draws each round with its items and the actions the department asked for", async () => {
+  it("draws each round with its items and the actions the team asked for", async () => {
     const run = teamRunView({
       id: "run-1",
       items: [
@@ -283,13 +283,54 @@ describe("TeamRunDetail - what the page is about", () => {
     expect(screen.queryByRole("heading", { level: 1, name: "Team run" })).toBeNull();
 
     // The page's kind, and the way back out of it, above the title rather than under the
-    // last panel — which is where "Back to the departments" was, reachable only by
-    // somebody who had already read everything they came for.
-    const crumb = document.querySelector(".teams-crumb");
+    // last panel — which is where "Back to the teams" was, reachable only by somebody who
+    // had already read everything they came for.
+    const crumb = document.querySelector(".ui-crumb");
     expect(crumb?.textContent).toContain("Team run");
-    expect(within(crumb as HTMLElement).getByRole("link", { name: "Departments" }).getAttribute("href")).toBe(
-      "/teams",
-    );
+  });
+
+  /**
+   * One noun, and one glyph. The rail calls this place Teams; the crumb called it
+   * Departments, and the arrow it drew was a `·` that a screen reader read out.
+   */
+  it("the crumb says Teams and links to the console", async () => {
+    const run = teamRunView({ id: "run-1", request: "clear the backlog" });
+    daemon.apiFetch.mockImplementation(teamRunFetch({ "run-1": run }));
+
+    await renderTeamRunDetail("/team-runs/run-1");
+    await screen.findByRole("heading", { level: 1, name: "clear the backlog" });
+
+    const crumb = document.querySelector(".ui-crumb") as HTMLElement;
+    // The accessible name is the word alone: the arrow is `aria-hidden`, so this fails
+    // the moment somebody folds a glyph back into the link's text.
+    const back = within(crumb).getByRole("link", { name: "Teams" });
+    expect(back.getAttribute("href")).toBe("/teams");
+    expect(crumb.textContent).not.toContain("Departments");
+  });
+
+  /**
+   * Cancel ends the work; Delete ends the record of it, and its folder with it. They
+   * were the same red, the same size and one corner apart, which made the difference
+   * between them a matter of aim. They are now a page apart.
+   */
+  it("cancel and delete do not sit side by side", async () => {
+    const run = teamRunView({ id: "run-1", state: "working" });
+    daemon.apiFetch.mockImplementation(teamRunFetch({ "run-1": run }));
+
+    await renderTeamRunDetail("/team-runs/run-1");
+
+    const cancel = await screen.findByRole("button", { name: "Cancel" });
+    const remove = await screen.findByRole("button", { name: "Delete run" });
+
+    // The live control is in the header, where a page's own actions live.
+    expect(cancel.closest("header.ui-page-header")).not.toBeNull();
+
+    // The destructive one is not — it is in a region of its own, at the foot of the
+    // page, under a heading that says what it is for.
+    expect(remove.closest("header.ui-page-header")).toBeNull();
+    const ending = remove.closest("section");
+    expect(ending?.getAttribute("aria-label")).toBe("Ending this run");
+    expect(ending?.contains(cancel)).toBe(false);
   });
 });
 

@@ -17,6 +17,7 @@ import {
   sameDay,
   weekOf,
 } from "../lib/calendar-grid";
+import { UI_LOCALE } from "../lib/locale";
 import { dateKeyOf, groupByLocalDay, placementOf, type DragHandlers, type Slot } from "./slot";
 
 /**
@@ -149,7 +150,7 @@ function DayHead({
       onClick={() => onSelect({ day, hour: null })}
     >
       <span className="calendar-week-head-name">
-        {day.toLocaleDateString(undefined, { weekday: "short" })}
+        {day.toLocaleDateString(UI_LOCALE, { weekday: "short" })}
       </span>
       <span className="calendar-week-head-number">{day.getDate()}</span>
       {(hours.short || hours.long) && (
@@ -243,7 +244,7 @@ function DayColumn({
             key={`${slot.hour}-${index}`}
             className={classes.join(" ")}
             style={{ top: `${slot.top * 100}%`, height: `${slot.height * 100}%` }}
-            aria-label={`${day.toLocaleDateString(undefined, {
+            aria-label={`${day.toLocaleDateString(UI_LOCALE, {
               weekday: "long",
               day: "numeric",
               month: "long",

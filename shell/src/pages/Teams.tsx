@@ -105,7 +105,7 @@ export function Teams() {
         headline={headlineFor(rows, allRuns, openActions, teams.data !== undefined)}
         actions={
           <Button intent="go" onClick={() => setCreating((open) => !open)} aria-expanded={creating}>
-            {creating ? "Close" : "New department"}
+            {creating ? "Close" : "New team"}
           </Button>
         }
       />
@@ -116,7 +116,7 @@ export function Teams() {
       {/* Closed by default, and that is the point: the old page opened an
           eleven-field form above a list you had not read yet. */}
       {creating && (
-        <Panel title="New department">
+        <Panel title="New team">
           {/* The very form the Charter tab is, minus the drift guard — there is
               nothing to have drifted from yet. One editor, one place. */}
           <NewDepartment />
@@ -124,9 +124,9 @@ export function Teams() {
       )}
 
       {rows.length === 0 ? (
-        <Teach title="No department yet">
+        <Teach title="No team yet">
           <p>
-            A department is a permanent unit — Finance, Marketing, Security — not a task. It has a
+            A team is a permanent unit — Finance, Marketing, Security — not a task. It has a
             director, a roster of specialists, what it may do on its own, and the ceilings every
             task of its runs under. Tasks and routines belong to it and are set up inside it.
           </p>
@@ -159,9 +159,9 @@ function headlineFor(
   answered: boolean,
 ): string | undefined {
   if (!answered) return undefined;
-  if (rows.length === 0) return "no department yet";
+  if (rows.length === 0) return "no team yet";
 
-  const parts = [`${rows.length} ${rows.length === 1 ? "department" : "departments"}`];
+  const parts = [`${rows.length} ${rows.length === 1 ? "team" : "teams"}`];
   const people = specialistsOf(rows).length;
   parts.push(`${people} ${people === 1 ? "specialist" : "specialists"}`);
 
@@ -194,7 +194,7 @@ function waitingFor(teamId: string, actions: TeamAction[], runs: TeamRun[]): num
 
 function ListError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the departments</ErrorNote>;
+  return <ErrorNote>the núcleo did not answer — nothing is known about the teams</ErrorNote>;
 }
 
 /* ------------------------------------------------------------ in flight -- */
@@ -255,7 +255,7 @@ function LiveTask({ run, team }: { run: TeamRun; team: TeamView | null }) {
     <article className="teams-task">
       <div className="teams-task-head">
         {team === null ? (
-          <span className="teams-task-dept teams-task-orphan">no department</span>
+          <span className="teams-task-dept teams-task-orphan">no team</span>
         ) : (
           <Link className="teams-task-dept" to={`/teams/${team.id}`}>
             {team.name}
@@ -312,10 +312,10 @@ function DepartmentTable({
   return (
     <div className="teams-table-scroller">
       <table className="teams-table">
-        <caption className="teams-said">Every department, with what it is doing now</caption>
+        <caption className="teams-said">Every team, with what it is doing now</caption>
         <thead>
           <tr>
-            <th scope="col">Department</th>
+            <th scope="col">Team</th>
             <th scope="col">State</th>
             <th scope="col" className="teams-col-num">
               Staff
@@ -327,7 +327,12 @@ function DepartmentTable({
               Waiting
             </th>
             <th scope="col">On its own</th>
-            <th scope="col">Pulse</th>
+            {/* What the marks are, said once in the header rather than nowhere. A pulse
+                with no key is a shape a reader has to guess the unit of; the guess is
+                free to be wrong and nothing on the page corrects it. */}
+            <th scope="col">
+              Pulse<span className="teams-col-key">per day</span>
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -394,6 +399,7 @@ function DepartmentRow({
           values={pulseOf(runs)}
           label={`${team.name}: ${pulseLabel(runs.length)}`}
           labelHidden
+          titles={pulseTitles(runs)}
           width={96}
           height={20}
         />
@@ -586,12 +592,32 @@ function Routines({ armed, total }: { armed: number; total: number }) {
  * says how many runs it is drawn from rather than naming a period.
  */
 export function pulseOf(runs: TeamRun[]): number[] {
+  return pulseDays(runs).map(([, count]) => count);
+}
+
+/**
+ * What each bar of the pulse is, one string per bar.
+ *
+ * The same buckets, said in words: the chart is drawn without an axis on purpose —
+ * there is no fixed span to label — so the only honest way to answer "which day is
+ * that mark" is per mark, where the pointer already is.
+ *
+ * Off the same `pulseDays` the heights come from, and not a second copy of the
+ * bucketing. Two loops that must agree on an ORDER are two loops free to stop
+ * agreeing, and nothing on the screen would say which bar had been mislabelled.
+ */
+export function pulseTitles(runs: TeamRun[]): string[] {
+  return pulseDays(runs).map(([day, count]) => `${count} run${count === 1 ? "" : "s"} on ${day}`);
+}
+
+/** The days this department has a run in, oldest first, with how many. */
+function pulseDays(runs: TeamRun[]): [string, number][] {
   const perDay = new Map<string, number>();
   for (const run of runs) {
     const day = run.created_at.slice(0, 10);
     perDay.set(day, (perDay.get(day) ?? 0) + 1);
   }
-  return [...perDay.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, count]) => count);
+  return [...perDay.entries()].sort(([a], [b]) => a.localeCompare(b));
 }
 
 export function pulseLabel(count: number): string {

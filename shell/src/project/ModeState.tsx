@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { Link } from "@tanstack/react-router";
 import {
   compactTokens,
   efficiencyTrend,
@@ -161,7 +162,7 @@ function Leading({
   const tone = toneFor(concern.kind);
 
   return (
-    <section aria-label="Leading" className="min-h-16">
+    <section aria-label="Leading" aria-live="polite" className="min-h-16">
       {concern.kind === "unknown" ? (
         <p className="font-display text-lg text-text-faint">Reading {project}…</p>
       ) : concern.kind === "calm" ? (
@@ -176,14 +177,29 @@ function Leading({
         </p>
       ) : (
         <div
-          className="rounded-lg border bg-surface-raised p-5 shadow-float"
+          role="status"
+          className="rounded-lg border bg-surface-raised p-5"
           style={{ borderColor: `var(--tone-${tone}-border)` }}
         >
-          <p className="font-display text-xl font-medium leading-snug text-text">
-            {concern.count === null
-              ? CONCERN_TEXT[concern.kind]
-              : `${concern.count} ${concern.count === 1 ? "decision" : "decisions"} waiting on you.`}
-          </p>
+          {/*
+            A count is the one concern with somewhere to go: those proposals are rows in the
+            Waiting queue, and the sentence naming them should be the way there, narrowed to
+            this project. A kill switch or a budget hold has no queue behind it, so it stays a
+            paragraph — a link that led nowhere would be a promise the page cannot keep.
+          */}
+          {concern.count === null ? (
+            <p className="font-display text-xl font-medium leading-snug text-text">
+              {CONCERN_TEXT[concern.kind]}
+            </p>
+          ) : (
+            <Link
+              to="/waiting"
+              search={{ project }}
+              className="font-display text-xl font-medium leading-snug"
+            >
+              {concern.count} {concern.count === 1 ? "decision" : "decisions"} waiting on you.
+            </Link>
+          )}
           {concern.kind === "budget-paused" && budgetReason !== null ? (
             <p className="mt-2 text-sm text-text-muted">{budgetReason}</p>
           ) : null}

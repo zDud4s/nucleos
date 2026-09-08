@@ -56,12 +56,9 @@
   color: var(--text-faint);
 }
 
-/* The way back out, under the headline. Two links, because the workspace and the
-   roster are different places — not a door to a wizard, which is the Roster's. */
-.pj-back {
-  margin: 0 0 var(--space-4);
-  font-size: var(--text-sm);
-}
+/* The way back out, under the headline, is `.ui-crumb` in `ui.css`. Still two places,
+   because the workspace and the roster are different ones — the arrow points at the
+   workspace and the roster sits in the crumb's second slot. */
 
 /**
  * A mark's meaning in words, for anything that does not render — a screen

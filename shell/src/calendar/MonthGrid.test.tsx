@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MonthGrid, NowLine } from "./MonthGrid";
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
+import { UI_LOCALE } from "../lib/locale";
 import type { DragHandlers } from "./slot";
 
 /**
@@ -75,7 +76,7 @@ function august(occurrences: EventOccurrence[], overrides: Partial<Parameters<ty
  * while the component was perfectly correct.
  */
 function said(day: Date): string {
-  return day.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" });
+  return day.toLocaleDateString(UI_LOCALE, { weekday: "long", day: "numeric", month: "long" });
 }
 
 function cellFor(day: Date): HTMLElement {
@@ -107,8 +108,8 @@ describe("the heading row", () => {
     // strings would be asserting the locale rather than the order.
     const shown = [...headings.children].map((child) => child.textContent);
     expect(shown).toHaveLength(7);
-    expect(shown[0]).toBe(new Date(2024, 0, 1).toLocaleDateString(undefined, { weekday: "short" }));
-    expect(shown[6]).toBe(new Date(2024, 0, 7).toLocaleDateString(undefined, { weekday: "short" }));
+    expect(shown[0]).toBe(new Date(2024, 0, 1).toLocaleDateString(UI_LOCALE, { weekday: "short" }));
+    expect(shown[6]).toBe(new Date(2024, 0, 7).toLocaleDateString(UI_LOCALE, { weekday: "short" }));
   });
 });
 

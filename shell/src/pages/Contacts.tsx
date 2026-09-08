@@ -11,7 +11,7 @@ import {
   type MergeSuggestion,
 } from "../data/contacts";
 import { useDecideContactMerge, type ApprovalOutcome } from "../data/waiting";
-import { Badge, Button, ConfirmButton, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime, StaleNote, Teach } from "../ui";
+import { Badge, Button, ConfirmButton, Count, ErrorNote, PageHeader, Panel, Quiet, RefusalNote, RelativeTime, Section, StaleNote } from "../ui";
 import "./contacts.css";
 
 /**
@@ -51,19 +51,22 @@ export function Contacts() {
 
       <IdentityQuestions view={merges} />
 
-      <Panel title="People" aside={<Count n={rows?.length} />}>
-        {stale && <StaleNote dataUpdatedAt={contacts.dataUpdatedAt} />}
-        {contacts.isError && rows === undefined && <RosterError error={contacts.error} />}
-        {rows === undefined && !contacts.isError && <p className="contacts-loading">reading the roster…</p>}
-        {rows !== undefined && <PeopleRoster rows={rows} />}
-      </Panel>
+      {rows !== undefined && rows.length === 0 ? (
+        <Section label="People">
+          <Quiet says="no one has written in yet">
+            <p>Every address that has sent or received mail lands here, one row per address.</p>
+          </Quiet>
+        </Section>
+      ) : (
+        <Panel title="People" aside={<Count n={rows?.length} />}>
+          {stale && <StaleNote dataUpdatedAt={contacts.dataUpdatedAt} />}
+          {contacts.isError && rows === undefined && <RosterError error={contacts.error} />}
+          {rows === undefined && !contacts.isError && <p className="contacts-loading">reading the roster…</p>}
+          {rows !== undefined && <PeopleRoster rows={rows} />}
+        </Panel>
+      )}
     </>
   );
-}
-
-function Count({ n }: { n: number | undefined }) {
-  if (n === undefined) return null;
-  return <span className="contacts-count">{n}</span>;
 }
 
 /** Which contact ids appear more than once in this listing — the merged pairs. */
@@ -98,6 +101,19 @@ function IdentityQuestions({ view }: { view: ReturnType<typeof useContactMerges>
   const decide = useDecideContactMerge();
   const rows = view.data ?? [];
 
+  if (view.data !== undefined && rows.length === 0) {
+    return (
+      <Section label="Identity questions">
+        <Quiet says="nothing looks like the same person">
+          <p>
+            The heuristic sweeps the roster on its own; an empty list is it finding no match, not a
+            sign anything here is stuck.
+          </p>
+        </Quiet>
+      </Section>
+    );
+  }
+
   return (
     <Panel title="Identity questions" aside={<Count n={view.data?.length} />}>
       <p className="contacts-note">
@@ -106,14 +122,6 @@ function IdentityQuestions({ view }: { view: ReturnType<typeof useContactMerges>
         the same transaction as the answer, so this exact question is never asked again.
       </p>
       {view.isError && rows.length === 0 && <MergesError error={view.error} />}
-      {view.data !== undefined && rows.length === 0 && (
-        <Teach title="Nothing looks like the same person">
-          <p>
-            The heuristic sweeps the roster on its own; an empty list is it finding no match, not a
-            sign anything here is stuck.
-          </p>
-        </Teach>
-      )}
       {rows.length > 0 && (
         <ul className="ui-rows contacts-questions" aria-label="Identity questions">
           {rows.map((suggestion) => (
@@ -240,14 +248,6 @@ function IdentityRefusal({ error }: { error: unknown }) {
 /* --------------------------------------------------------------- roster -- */
 
 function PeopleRoster({ rows }: { rows: Correspondent[] }) {
-  if (rows.length === 0) {
-    return (
-      <Teach title="No one has written in yet">
-        <p>Every address that has sent or received mail lands here, one row per address.</p>
-      </Teach>
-    );
-  }
-
   const merged = mergedContactIds(rows);
   return (
     <ul className="contacts-roster" aria-label="People">

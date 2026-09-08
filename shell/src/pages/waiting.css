@@ -16,6 +16,19 @@
 /* =============================================================== the page == */
 
 /**
+ * The note that says rows are being withheld.
+ *
+ * Muted and small on purpose: it is a caption on the queue below it, not a heading of its
+ * own. The margin is the same `--space-4` that separates the sections, so the queue starts
+ * where it would have started without it.
+ */
+.waiting-narrowed {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  margin: 0 0 var(--space-4);
+}
+
+/**
  * The column, at the page's own width.
  *
  * No `max-width` of its own, deliberately. It had 60rem while the page header

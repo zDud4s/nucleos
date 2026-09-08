@@ -179,6 +179,11 @@
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
+.ap-project-blocker {
+  grid-column: 1 / -1;
+  padding-inline: var(--space-4);
+}
+
 .ap-project-name {
   display: flex;
   flex-wrap: wrap;

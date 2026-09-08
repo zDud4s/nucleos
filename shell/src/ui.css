@@ -184,6 +184,38 @@
   padding-inline: 0;
 }
 
+/* ----------------------------------------------------------------- crumb -- */
+
+/**
+ * Where this page sits, above its title.
+ *
+ * `--text-xs` and `--text-faint` because a crumb is orientation and never content:
+ * it is read once, on arrival, by somebody deciding whether they are in the right
+ * place. `color: inherit` on the link so the whole line is one faint sentence — the
+ * underline on hover is what says it is a door, and `base.css` already draws it.
+ *
+ * Three pages had three of these, with three glyphs and three sizes. One rule now,
+ * and the pages carry no crumb CSS of their own.
+ */
+.ui-crumb {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.ui-crumb a {
+  color: inherit;
+}
+
+.ui-crumb-mark {
+  margin-right: var(--space-1);
+}
+
+.ui-crumb-here {
+  margin-left: var(--space-2);
+  color: var(--text-faint);
+}
+
 /* ----------------------------------------------------------------- count -- */
 
 /**
