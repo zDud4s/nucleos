@@ -3201,6 +3201,7 @@ function ContextControls({ chatId }: { chatId: string }) {
       <ConfirmButton
         label="Clear"
         confirmLabel="Clear — the turns stay, the model stops seeing them"
+        variant="ghost"
         onConfirm={() => clear.mutate(chatId)}
       />
       <p className="chats-context-why">and this one tells it nothing at all</p>
@@ -3507,6 +3508,7 @@ function ArchiveControl({ chatId }: { chatId: string }) {
       <ConfirmButton
         label="Archive"
         confirmLabel="Archive — every turn stays readable"
+        variant="quiet"
         onConfirm={() =>
           archive.mutate(chatId, {
             onSuccess: () => void navigate({ to: "/chats" }),

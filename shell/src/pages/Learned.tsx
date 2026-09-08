@@ -149,6 +149,7 @@ export function Learned() {
                   <ConfirmButton
                     label="Revert"
                     confirmLabel="It no longer applies"
+                    variant="quiet"
                     onConfirm={() => revert.mutate(row.id)}
                     disabled={revert.isPending}
                   />

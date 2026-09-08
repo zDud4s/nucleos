@@ -11,6 +11,7 @@ import {
   MODE_MEANING,
   MODE_SENTENCES,
   promotionBlocker,
+  promotionConsequence,
 } from "../lib/mode";
 import { ModeSwitch } from "../ui";
 
@@ -108,7 +109,7 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
       <ModeSwitch
         value={project.mode}
         actAllowed={project.promotable}
-        actBlocker={blocker}
+        actConfirmLabel={promotionConsequence(project)}
         busy={setMode.isPending}
         onChoose={change}
       />

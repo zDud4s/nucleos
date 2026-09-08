@@ -812,6 +812,7 @@ function AgentEditor({
         <ConfirmButton
           label="Delete"
           confirmLabel={`Delete ${agent.name}`}
+          variant="danger"
           intent="stop"
           disabled={del.isPending}
           onConfirm={() => del.mutate(agent.id, { onSuccess: onClose })}

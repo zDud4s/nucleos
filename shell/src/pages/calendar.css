@@ -249,7 +249,7 @@
    cursor rather than arguing with the copy left behind. */
 .calendar-chip-held,
 .calendar-block-held {
-  opacity: 0.4;
+  opacity: var(--opacity-disabled);
 }
 
 .calendar-chip[draggable="true"] {
@@ -573,7 +573,7 @@
      exactly, and this inset is the gutter between two lanes. */
   padding: 1px var(--space-1);
   border: 1px solid var(--border-strong);
-  border-left: 3px solid var(--border-strong);
+  /* The card is the box, not a card plus a side tab. */
   border-radius: var(--radius-sm);
   background: var(--surface-raised);
   color: var(--text);

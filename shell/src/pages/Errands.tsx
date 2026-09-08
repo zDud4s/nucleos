@@ -207,6 +207,7 @@ function ErrandDetail({ errand }: { errand: Errand }) {
             <ConfirmButton
               label="Close"
               confirmLabel="Close this errand — nothing is deleted"
+              variant="quiet"
               intent="stop"
               disabled={close.isPending}
               onConfirm={() => close.mutate(errand.id)}
@@ -594,6 +595,7 @@ function RuleRow({ errandId, rule }: { errandId: number; rule: ErrandRule }) {
         <ConfirmButton
           label="Delete"
           confirmLabel="Delete this rule"
+          variant="danger"
           intent="stop"
           disabled={del.isPending}
           onConfirm={() => del.mutate({ id: errandId, ruleId: rule.id })}

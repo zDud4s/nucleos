@@ -128,6 +128,7 @@ export function TeamRunDetail() {
         <ConfirmButton
           label="Delete run"
           confirmLabel="Delete it, and its folder"
+          variant="danger"
           intent="stop"
           disabled={del.isPending}
           onConfirm={() => del.mutate(id, { onSuccess: () => void navigate({ to: "/teams" }) })}

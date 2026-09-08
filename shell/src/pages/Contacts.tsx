@@ -175,6 +175,7 @@ function IdentityQuestion({
         <ConfirmButton
           label="No, different people"
           confirmLabel="Refuse permanently"
+          variant="ghost"
           disabled={decide.isPending}
           onConfirm={() => decide.mutate({ proposalId: suggestion.proposal_id, verdict: "reject" })}
         />
@@ -338,6 +339,7 @@ function UnmergeButton({ address, linkedBy }: { address: string; linkedBy: strin
       <ConfirmButton
         label="Not the same person"
         confirmLabel="Pull this address back apart"
+        variant="quiet"
         disabled={unmerge.isPending}
         onConfirm={() => unmerge.mutate(address)}
       />

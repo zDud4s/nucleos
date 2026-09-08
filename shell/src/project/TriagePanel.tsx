@@ -229,7 +229,7 @@ function Run({ projectId }: { projectId: string }) {
             onClick={() => setBrain(candidate)}
             className={
               candidate === brain
-                ? "rounded-md border border-accent bg-surface-raised px-3 py-1.5 text-sm text-text"
+                ? "rounded-md border border-border-strong bg-surface-raised px-3 py-1.5 text-sm text-text"
                 : "rounded-md border border-border px-3 py-1.5 text-sm text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
             }
           >

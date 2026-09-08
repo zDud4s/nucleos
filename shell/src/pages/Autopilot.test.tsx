@@ -196,10 +196,13 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
     // Clicks inside the 300 ms dwell are swallowed and leave the control armed,
     // so retrying until it disarms is safe. The mutation lands a tick later, so
     // it is a separate wait.
+    // Armed, the segment names the project and its ceiling — `alpha` carries a null
+    // `wip_limit` here, which is no ceiling and is never written as a zero.
+    const ARMED = "alpha acts on its own — no ceiling on proposals, no approval";
     await waitFor(() => {
-      const armed = screen.queryByRole("button", { name: "It may act on its own" });
+      const armed = screen.queryByRole("button", { name: ARMED });
       if (armed !== null) fireEvent.click(armed);
-      expect(screen.queryByRole("button", { name: "It may act on its own" })).toBeNull();
+      expect(screen.queryByRole("button", { name: ARMED })).toBeNull();
     });
 
     const input = await screen.findByLabelText("Folder for alpha");
@@ -251,11 +254,10 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
 
     const promote = await screen.findByRole("button", { name: "Let it act" });
     expect((promote as HTMLButtonElement).disabled).toBe(true);
-    // The segment carries the daemon's reason as its title. The row still says
-    // it in words below — a `title` is a hover, and a hover is not an answer.
-    expect(promote.getAttribute("title")).toMatch(
-      /nothing has been recorded in shadow yet/,
-    );
+    // And it carries no title. The reason used to ride here as a tooltip as well as in
+    // the row below, which made the hover a third copy of one sentence — and the only
+    // copy you had to find with a mouse. The row saying it in words is the answer.
+    expect(promote.getAttribute("title")).toBeNull();
     expect(
       screen.getByText(
         /nothing has been recorded in shadow yet.*no evidence is not the same as good evidence/,

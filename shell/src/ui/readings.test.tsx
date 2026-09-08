@@ -1,6 +1,12 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { CostLine, money } from "./readings";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const sheet = (...parts: string[]): string => readFileSync(join(here, ...parts), "utf8");
 
 /**
  * What a spend is allowed to read as.
@@ -46,5 +52,36 @@ describe("CostLine", () => {
     render(<CostLine costUsd={undefined as unknown as number | null} />);
 
     expect(screen.getByText("cost not recorded")).toBeDefined();
+  });
+});
+
+/**
+ * Where the rules for these components are allowed to live.
+ *
+ * `readings.tsx` is a design system primitive, so its rules belong in `src/ui.css` with
+ * the rest of the `ui-` prefix. They spent several rounds housed in `pages/runs.css`
+ * under a heading that said "on loan", which is the kind of debt nothing can see: `tsc`
+ * and vitest both pass on a class no sheet has ever heard of, and the second page to
+ * render a `ContextMeter` would get an unstyled one with no failure anywhere. This is
+ * the assertion that keeps the loan repaid.
+ */
+describe("where the reading rules live", () => {
+  it("the reading and meter rules live in the design system sheet", () => {
+    const ui = sheet("..", "ui.css");
+    expect(ui).toContain(".ui-reading-time");
+    expect(ui).toContain(".ui-cost-money");
+    expect(ui).toContain(".ui-meter-track");
+    expect(ui).toContain(".ui-meter-mark");
+
+    // And no raw opacity travelled with them: `tokens.css` owns the two there are.
+    expect(ui).toContain("opacity: var(--opacity-quiet)");
+  });
+
+  it("the runs sheet defines no ui- rule and keeps the house breakpoint", () => {
+    const runs = sheet("..", "pages", "runs.css");
+    expect(runs).not.toMatch(/^\.ui-/m);
+
+    // 68rem was this sheet's alone; every other sheet folds at 60rem.
+    expect(runs).not.toContain("68rem");
   });
 });

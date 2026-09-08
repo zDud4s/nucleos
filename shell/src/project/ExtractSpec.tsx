@@ -134,7 +134,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
             */
             className={
               slug === chosen
-                ? "shrink-0 truncate rounded-sm border border-accent bg-surface-raised px-2 py-1 text-left font-mono text-xs text-text"
+                ? "shrink-0 truncate rounded-sm border border-border-strong bg-surface-raised px-2 py-1 text-left font-mono text-xs text-text"
                 : "shrink-0 truncate rounded-sm px-2 py-1 text-left font-mono text-xs text-text-muted enabled:hover:text-text disabled:opacity-40"
             }
           >
@@ -153,7 +153,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
             onClick={() => setBrain(candidate)}
             className={
               candidate === brain
-                ? "rounded-md border border-accent bg-surface-raised px-3 py-1.5 text-sm text-text"
+                ? "rounded-md border border-border-strong bg-surface-raised px-3 py-1.5 text-sm text-text"
                 : "rounded-md border border-border px-3 py-1.5 text-sm text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
             }
           >

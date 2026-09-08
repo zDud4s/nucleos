@@ -29,6 +29,7 @@ describe("ConfirmButton", () => {
       <ConfirmButton
         label="Delete series"
         confirmLabel="Really delete"
+        variant="danger"
         onConfirm={onConfirm}
         onArmedChange={onArmedChange}
       />,
@@ -125,5 +126,24 @@ describe("ConfirmButton", () => {
 
     fireEvent.click(button);
     expect(screen.getByRole("button", { name: "Really delete" }).getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("arming swaps only danger to danger-solid", () => {
+    setup();
+    render(
+      <ConfirmButton
+        label="Archive"
+        confirmLabel="Archive it"
+        variant="quiet"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
+    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+
+    expect(screen.getByRole("button", { name: "Really delete" }).className).toContain("ui-button-danger-solid");
+    expect(screen.getByRole("button", { name: "Archive it" }).className).toContain("ui-button-quiet");
+    expect(screen.getByRole("button", { name: "Archive it" }).className).not.toContain("ui-button-danger-solid");
   });
 });

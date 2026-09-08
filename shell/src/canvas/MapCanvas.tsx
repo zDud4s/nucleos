@@ -539,7 +539,7 @@ function Around({
             onClick={() => setCentre(one.path)}
             className={
               one.path === at
-                ? "rounded-pill border border-accent bg-surface-raised px-2 py-0.5 font-mono text-[11px] text-text"
+                ? "rounded-pill border border-border-strong bg-surface-raised px-2 py-0.5 font-mono text-[11px] text-text"
                 : "rounded-pill border border-border px-2 py-0.5 font-mono text-[11px] text-text-muted hover:border-border-strong hover:text-text"
             }
           >
@@ -661,7 +661,7 @@ function Claims({
               <span className="font-mono text-[11px] text-text-faint">
                 {claim.spec_slug} §{claim.section}
               </span>{" "}
-              <span className={isSettled(standing) ? "text-accent" : "text-text-faint"}>
+              <span className={isSettled(standing) ? "text-text" : "text-text-faint"}>
                 {standingLabel(standing)}
               </span>
               <span className="ml-1 text-text">{claim.text}</span>
@@ -748,7 +748,7 @@ function FileDrawing({
             if (!item.exported && !reached.has(item.id)) {
               return "fill-surface-sunken stroke-border-subtle";
             }
-            return item.exported ? "fill-surface stroke-accent" : "fill-surface stroke-border";
+            return item.exported ? "fill-surface stroke-border-strong" : "fill-surface stroke-border";
           }}
         />
       )}
@@ -765,7 +765,7 @@ function FileDrawing({
         {found.items.map((item) => (
           <li key={item.id} className="font-mono text-[11px] text-text-muted">
             <span className="text-text-faint">{item.line}</span> {item.id}
-            {item.exported ? <span className="text-accent"> ·pub</span> : null}
+            {item.exported ? <span className="text-text-muted"> ·pub</span> : null}
             {item.documented ? null : <span className="text-text-faint"> ·undocumented</span>}
           </li>
         ))}
@@ -866,8 +866,9 @@ function Matrix({
                       : weight === undefined
                         ? ""
                         : j > i
-                          ? "bg-accent/30"
-                          : "bg-danger/30";
+                          ? "bg-text/20"
+                          // `danger` is not a theme token; this live state tone paints backward edges.
+                          : "bg-tone-danger-fg/30";
                   return (
                     <td
                       key={column}

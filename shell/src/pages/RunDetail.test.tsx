@@ -442,3 +442,14 @@ describe("RunDetail — absent readings", () => {
     expect(screen.getByText("context fill not reported")).toBeDefined();
   });
 });
+
+describe("RunDetail headline", () => {
+  it("uses the state map label for an ended timed-out run", async () => {
+    daemon.apiFetch.mockImplementation(detailFetch(detail({ status: "timed_out" }), NO_TAIL, []));
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(await screen.findByText(/ended timed out/)).toBeDefined();
+    expect(screen.queryByText(/ended timed_out/)).toBeNull();
+  });
+});

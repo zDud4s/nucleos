@@ -96,7 +96,7 @@ export function ModeCode({ projectId, run, onPickRun }: ModeCodeProps) {
               aria-current={candidate === selected ? "true" : undefined}
               className={
                 candidate === selected
-                  ? "rounded-md border border-accent bg-surface-raised px-3 py-1 font-mono text-xs text-text"
+                  ? "rounded-md border border-border-strong bg-surface-raised px-3 py-1 font-mono text-xs text-text"
                   : "rounded-md border border-border px-3 py-1 font-mono text-xs text-text-muted hover:text-text"
               }
             >

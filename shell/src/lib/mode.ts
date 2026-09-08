@@ -64,6 +64,26 @@ export function promotionBlocker(project: ProjectSummary, withheld: number): str
 }
 
 /**
+ * What letting a project act on its own actually means, said before it is done.
+ *
+ * The armed half of the interlock used to say "It may act on its own", which is the same sentence
+ * as the button it replaces and names neither the project nor the ceiling that will govern it. A
+ * confirmation whose two states say the same thing is a second click, not a second thought.
+ *
+ * The arithmetic is the roster row's and is never recomputed here — `open_proposals` and
+ * `wip_limit` come from the daemon. A null `wip_limit` is the ABSENCE of a ceiling and is never
+ * written as a zero: "0 proposal slots" would read as a project that may do nothing, which is the
+ * opposite of what no ceiling means. Same rule the spend line already follows on Home.
+ */
+export function promotionConsequence(project: ProjectSummary): string {
+  const ceiling =
+    project.wip_limit === null
+      ? "no ceiling on proposals"
+      : `${String(project.open_proposals)} of ${String(project.wip_limit)} proposal slots`;
+  return `${project.project_id} acts on its own — ${ceiling}, no approval`;
+}
+
+/**
  * What the mode door says when it says no.
  *
  * The 422 is the one worth writing copy for, and the copy is deliberately a *list* rather than a

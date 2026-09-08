@@ -26,6 +26,7 @@ import {
   RefusalNote,
   StateBadge,
 } from "../ui";
+import { readState } from "../ui/state-map";
 import "./runs.css";
 
 /**
@@ -127,6 +128,7 @@ function KnownRun({ id }: { id: number }) {
               <ConfirmButton
                 label="Cancel run"
                 confirmLabel="Cancel it now"
+                variant="ghost"
                 intent="stop"
                 onConfirm={() => cancel.mutate(id)}
               />
@@ -138,6 +140,7 @@ function KnownRun({ id }: { id: number }) {
               <ConfirmButton
                 label="Release worktree"
                 confirmLabel="Give the tree back"
+                variant="quiet"
                 onConfirm={() => release.mutate()}
               />
             )}
@@ -592,7 +595,9 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
  * the one thing that is genuinely prose — what this run was for, and where it ran.
  */
 function headline(run: Run): string {
-  const state = runIsAlive(run.status) ? "still going" : `ended ${run.status}`;
+  const state = runIsAlive(run.status)
+    ? "still going"
+    : `ended ${readState("run", run.status)?.label ?? run.status}`;
   const where = run.project_id === null ? "no project" : `in ${run.project_id}`;
   return `${state}, ${where}`;
 }

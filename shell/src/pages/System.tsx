@@ -709,6 +709,7 @@ function BackupRow({ backup }: { backup: BackupInfo }) {
       <ConfirmButton
         label="Stage a restore"
         confirmLabel={`Restore ${backup.name} on next start`}
+        variant="ghost"
         disabled={stageRestore.isPending}
         onConfirm={() => stageRestore.mutate(backup.name)}
       />

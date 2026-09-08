@@ -2,6 +2,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn() }));
 vi.mock("../data/client", async (original) => ({
@@ -185,6 +187,24 @@ describe("MapCanvas", () => {
   it("says so plainly when nothing imports anything", () => {
     draw([mod("core/src/lonely.rs")], []);
     expect(screen.getByText(/Nothing here imports anything else/)).toBeTruthy();
+  });
+});
+
+describe("MapCanvas theme utilities", () => {
+  const moduleUrl = import.meta.url.startsWith("file:") ? import.meta.url : `file://${import.meta.url}`;
+  const source = readFileSync(fileURLToPath(new URL("./MapCanvas.tsx", moduleUrl)), "utf8");
+  const theme = readFileSync(fileURLToPath(new URL("../tailwind.css", moduleUrl)), "utf8");
+
+  it("uses only live theme tokens for background utilities", () => {
+    const backgrounds = source.match(/\bbg-([a-z][a-z0-9-]*)(?:\/\d+)?\b/g) ?? [];
+    for (const utility of backgrounds) {
+      const name = /^bg-([a-z][a-z0-9-]*)/.exec(utility)?.[1];
+      expect(theme, `${utility} has no --color token`).toContain(`--color-${name}:`);
+    }
+  });
+
+  it("uses a neutral density ramp above the DSM diagonal", () => {
+    expect(source).toContain('? "bg-text/20"');
   });
 });
 

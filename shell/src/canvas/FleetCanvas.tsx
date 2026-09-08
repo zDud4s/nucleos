@@ -264,6 +264,7 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
         <ConfirmButton
           label="Cancel"
           confirmLabel={`Cancel ${slot.owner_kind} ${slot.owner_id}?`}
+          variant="ghost"
           onConfirm={() => actions.cancel(cancellable)}
         />
       )}

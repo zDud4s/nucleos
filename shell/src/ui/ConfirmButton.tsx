@@ -36,7 +36,23 @@ export interface ConfirmButtonProps {
    * row under the finger that is about to confirm.
    */
   onArmedChange?: (armed: boolean) => void;
-  variant?: ButtonVariant;
+  /**
+   * Which of the four this action is. Not optional, deliberately.
+   *
+   * `quiet` when it is reversible or recoverable — skip, requeue, archive,
+   * close, release, put away, revert a note the ledger keeps. `ghost` when it
+   * is neutral and not the point of the screen — cancel, refuse, reject, block,
+   * read-only. `approve` when it is affirmative — approve, hire, merge, send,
+   * allow. `danger` ONLY where data is destroyed or an irreversible end is made
+   * — delete, revoke, forget, end the turns.
+   *
+   * `calendar/DaySheet.tsx` is the reference: "Skip this occurrence" is quiet
+   * and "Delete whole series" is danger, on the same row. There is no default
+   * because there was one: 33 of 53 sites inherited `danger` by saying nothing,
+   * and once red also means "this control has an interlock" it stops meaning
+   * danger anywhere.
+   */
+  variant: ButtonVariant;
   intent?: ButtonIntent;
   disabled?: boolean;
   title?: string;
@@ -55,7 +71,7 @@ export function ConfirmButton({
   confirmLabel,
   onConfirm,
   onArmedChange,
-  variant = "danger",
+  variant,
   intent,
   disabled,
   title,

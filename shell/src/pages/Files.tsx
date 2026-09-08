@@ -1060,6 +1060,7 @@ function NotEmptyNote({
         <ConfirmButton
           label="Delete with everything inside"
           confirmLabel="Really delete everything inside"
+          variant="danger"
           disabled={busy}
           onConfirm={onConfirm}
         />

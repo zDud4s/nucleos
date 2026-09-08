@@ -225,6 +225,7 @@ function CouncilDetail({ id }: { id: string }) {
             <ConfirmButton
               label="Cancel"
               confirmLabel="Cancel this council"
+              variant="ghost"
               intent="stop"
               disabled={cancel.isPending}
               onConfirm={() => cancel.mutate(id)}

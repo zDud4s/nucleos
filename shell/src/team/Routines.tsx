@@ -141,6 +141,7 @@ function RuleRow({
           <ConfirmButton
             label="Arm with no ceiling"
             confirmLabel="Arm it anyway"
+            variant="approve"
             intent="go"
             disabled={setEnabled.isPending}
             onConfirm={() => setEnabled.mutate({ id: rule.id, enabled: true })}
@@ -159,6 +160,7 @@ function RuleRow({
         <ConfirmButton
           label="Delete"
           confirmLabel="Delete this rule"
+          variant="danger"
           intent="stop"
           disabled={del.isPending}
           onConfirm={() => del.mutate(rule.id)}

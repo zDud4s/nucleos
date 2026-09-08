@@ -667,6 +667,7 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
               <ConfirmButton
                 label={`Refuse wheel #${session.proposal_id}`}
                 confirmLabel="Refuse and close the session"
+                variant="ghost"
                 disabled={reject.isPending}
                 onArmedChange={onArmedChange}
                 onConfirm={() => reject.mutate(session.proposal_id)}
@@ -755,6 +756,7 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
               <ConfirmButton
                 label={`Reject #${proposal.id}`}
                 confirmLabel="Refuse and end the run"
+                variant="ghost"
                 disabled={reject.isPending}
                 onArmedChange={onArmedChange}
                 onConfirm={() => reject.mutate(proposal.id)}
@@ -929,6 +931,7 @@ function TeamActionCard({
         <ConfirmButton
           label={`Reject #${proposal.id}`}
           confirmLabel="Refuse and close the action"
+          variant="ghost"
           disabled={reject.isPending}
           onArmedChange={onArmedChange}
           onConfirm={() => reject.mutate(proposal.id)}
@@ -1231,6 +1234,7 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
               <ConfirmButton
                 label={`Keep #${suggestion.proposal_id} apart`}
                 confirmLabel="They are different people"
+                variant="quiet"
                 disabled={decide.isPending}
                 onArmedChange={onArmedChange}
                 onConfirm={() =>
@@ -1375,6 +1379,7 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                 <ConfirmButton
                   label={`Reject request #${proposal.id}`}
                   confirmLabel="Let them run together"
+                  variant="ghost"
                   disabled={reject.isPending}
                   onArmedChange={onArmedChange}
                   onConfirm={() => reject.mutate(proposal.id)}
@@ -1438,6 +1443,7 @@ function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
               <ConfirmButton
                 label={`Put item #${proposal.id} away`}
                 confirmLabel="I have read it"
+                variant="quiet"
                 disabled={dismiss.isPending}
                 onArmedChange={onArmedChange}
                 onConfirm={() => dismiss.mutate(proposal.id)}

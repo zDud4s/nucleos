@@ -574,6 +574,7 @@ function PresetRow({
         <ConfirmButton
           label={`Delete ${preset.name}`}
           confirmLabel={`Delete ${preset.name} for good`}
+          variant="danger"
           onConfirm={onDelete}
         />
       </div>

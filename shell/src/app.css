@@ -827,7 +827,7 @@
  * nobody a way to find out how to switch the thing on.
  */
 .nav-item-disabled {
-  opacity: 0.5;
+  opacity: var(--opacity-disabled);
 }
 
 /**

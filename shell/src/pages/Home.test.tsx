@@ -138,6 +138,25 @@ describe("Home", () => {
     expect(door.closest("p")?.textContent).toBe(
       "1 subsystem down (browser_sidecar), 1 degraded; nothing waiting on you",
     );
+
+    /*
+      And it is the wrong colour for a wrong fact.
+
+      A bare `<Link>` here rendered Signal Cyan — the wordmark's colour, which the design
+      spends on identity and navigation and on nothing that is a state. The worst live fact
+      about the machine was being reported in the one colour that means "nothing is
+      happening". `.ui-wrong` carries the tone and `.ui-wrong-door` takes it from the clause
+      around it, because `base.css` styles `a` unlayered and a Tailwind utility cannot beat
+      that. Both are classes rather than paint, because jsdom applies no stylesheet.
+    */
+    expect(door.className).toContain("ui-wrong-door");
+    expect(door.parentElement?.className).toContain("ui-wrong");
+
+    // And the card that counts the same fact wears the same tone. The figure reads
+    // "2/3" whether or not anything is wrong; the tone is what says which it is.
+    expect(screen.getByRole("article", { name: "Subsystems healthy" }).className).toContain(
+      "ui-stat-danger",
+    );
   });
 
   it("an all-clear keeps the mode sentence and all five cards", async () => {
@@ -172,6 +191,12 @@ describe("Home", () => {
     // And the cards do not recede. A card that appeared only when something was wrong
     // would teach the reader that an absent card is an absent fact.
     expect(screen.getAllByRole("article")).toHaveLength(5);
+
+    // Nor does the healthy card wear the tone. A figure that is always red says nothing
+    // when something actually goes wrong.
+    expect(screen.getByRole("article", { name: "Subsystems healthy" }).className).not.toContain(
+      "ui-stat-danger",
+    );
   });
 
   it("mutates nothing — the first screen is a reading, not a console", async () => {

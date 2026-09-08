@@ -6,6 +6,16 @@ import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { ModeSwitch } from "./ModeSwitch";
 
 /**
+ * What the armed segment says on a project called `alpha` holding three of four slots.
+ *
+ * Spelled out here rather than obtained by calling `promotionConsequence`: this file
+ * asserts that the control SHOWS what it is given, and a test that composed the string
+ * with the same function the page uses would agree with itself whatever either one said.
+ * `lib/mode.test.ts` is where the sentence itself is pinned.
+ */
+const LABEL = "alpha acts on its own — 3 of 4 proposal slots, no approval";
+
+/**
  * The one control both surfaces that set a project's autonomy now use.
  *
  * Fake timers, and `fireEvent` rather than `userEvent`, for the reason
@@ -24,7 +34,9 @@ describe("ModeSwitch", () => {
 
   it("three segments, verbs, and the current one pressed", () => {
     const onChoose = vi.fn();
-    render(<ModeSwitch value="shadow" actAllowed onChoose={onChoose} />);
+    render(
+      <ModeSwitch value="shadow" actAllowed actConfirmLabel={LABEL} onChoose={onChoose} />,
+    );
 
     const group = screen.getByRole("group", { name: "Autopilot mode" });
     const off = within(group).getByRole("button", { name: "Turn off" });
@@ -52,18 +64,20 @@ describe("ModeSwitch", () => {
   it("letting it act takes two presses and is not green when locked", () => {
     const onChoose = vi.fn();
     const locked = render(
-      <ModeSwitch
-        value="shadow"
-        actAllowed={false}
-        actBlocker="nothing recorded in shadow yet"
-        onChoose={onChoose}
-      />,
+      <ModeSwitch value="shadow" actAllowed={false} actConfirmLabel={LABEL} onChoose={onChoose} />,
     );
 
     const blocked = screen.getByRole("button", { name: "Let it act" });
     expect((blocked as HTMLButtonElement).disabled).toBe(true);
-    // The daemon's own terms, carried on the control that is refusing.
-    expect(blocked.getAttribute("title")).toBe("nothing recorded in shadow yet");
+    /*
+      And it refuses without a tooltip.
+
+      The blocker used to ride here as a `title`, which made it the third copy of one
+      sentence: both callers already print it, visibly, under exactly the condition that
+      locks this segment. A copy you have to hover to read, on a disabled control that
+      does not reliably receive hover, is the copy nobody reads.
+    */
+    expect(blocked.getAttribute("title")).toBeNull();
     fireEvent.click(blocked);
     expect(onChoose).not.toHaveBeenCalled();
 
@@ -84,12 +98,16 @@ describe("ModeSwitch", () => {
 
     locked.unmount();
 
-    render(<ModeSwitch value="shadow" actAllowed onChoose={onChoose} />);
+    render(
+      <ModeSwitch value="shadow" actAllowed actConfirmLabel={LABEL} onChoose={onChoose} />,
+    );
 
     // One press arms and says what the second one will do. It does not act.
     fireEvent.click(screen.getByRole("button", { name: "Let it act" }));
     expect(onChoose).not.toHaveBeenCalled();
-    const armed = screen.getByRole("button", { name: "It may act on its own" });
+    // Armed, it names the project and the ceiling. "It may act on its own" said neither,
+    // and was the same sentence as the button it had just replaced.
+    const armed = screen.getByRole("button", { name: LABEL });
 
     // Past the dwell, the second press is the decision.
     act(() => {
@@ -101,6 +119,31 @@ describe("ModeSwitch", () => {
   });
 
   /**
+   * Unlocked, the segment that has been earned looks like it.
+   *
+   * The pair to the locked case above, and the reason that one says anything: `ui.css`
+   * takes the green off a disabled `.ui-button-approve`, which is only a rule about
+   * refusing if the enabled one still HAS the green. Read out of the sheet for the same
+   * reason — jsdom applies no stylesheet, so the class on the element and the paint behind
+   * the class are two claims and both have to be made.
+   */
+  it("unlocked, the third segment keeps the approve tone", () => {
+    const onChoose = vi.fn();
+    render(
+      <ModeSwitch value="shadow" actAllowed actConfirmLabel={LABEL} onChoose={onChoose} />,
+    );
+
+    const offer = screen.getByRole("button", { name: "Let it act" });
+    expect((offer as HTMLButtonElement).disabled).toBe(false);
+    expect(offer.className).toContain("ui-button-approve");
+
+    const ui = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "ui.css"), "utf8");
+    const rule = /\.ui-button-approve\s*\{([^}]*)\}/.exec(ui);
+    expect(rule).not.toBeNull();
+    expect(rule?.[1]).toMatch(/background:\s*var\(--tone-active-bg\)/);
+  });
+
+  /**
    * A project that is already acting has nothing to confirm.
    *
    * The interlock is about the crossing, not about the state: offering "It may
@@ -109,7 +152,9 @@ describe("ModeSwitch", () => {
    */
   it("the third segment stops being an interlock once it is the setting", () => {
     const onChoose = vi.fn();
-    render(<ModeSwitch value="active" actAllowed onChoose={onChoose} />);
+    render(
+      <ModeSwitch value="active" actAllowed actConfirmLabel={LABEL} onChoose={onChoose} />,
+    );
 
     const acting = screen.getByRole("button", { name: "Let it act" });
     expect(acting.getAttribute("aria-pressed")).toBe("true");
@@ -121,7 +166,9 @@ describe("ModeSwitch", () => {
   /** A write in flight makes every segment inert, including the interlock. */
   it("is inert while a write is in flight", () => {
     const onChoose = vi.fn();
-    render(<ModeSwitch value="shadow" actAllowed busy onChoose={onChoose} />);
+    render(
+      <ModeSwitch value="shadow" actAllowed busy actConfirmLabel={LABEL} onChoose={onChoose} />,
+    );
 
     for (const name of ["Turn off", "Watch in shadow", "Let it act"]) {
       const seg = screen.getByRole("button", { name });

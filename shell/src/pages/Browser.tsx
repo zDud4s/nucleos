@@ -237,6 +237,7 @@ function SessionRow({
           <ConfirmButton
             label="Close session"
             confirmLabel="Close it now"
+            variant="quiet"
             disabled={closePending}
             onConfirm={onClose}
           />
@@ -310,6 +311,7 @@ function ChainDialogue({
         <ConfirmButton
           label="Keep none"
           confirmLabel="Discard the chain"
+          variant="ghost"
           disabled={keepChain.isPending}
           onConfirm={() =>
             keepChain.mutate({ sessionId, keep: false, writable: false }, { onSuccess: onSettled })
@@ -486,6 +488,7 @@ function SiteGrants() {
             <ConfirmButton
               label="Forget this profile"
               confirmLabel="Forget everything — every site, every session"
+              variant="danger"
               disabled={forget.isPending}
               onConfirm={() => forget.mutate(projectId)}
             />
@@ -532,11 +535,12 @@ function SiteRow({
       </div>
       {site.granted_for !== null && <p className="browser-meta">brought in by {site.granted_for}</p>}
       <div className="browser-actions">
-        <ConfirmButton label="Revoke" confirmLabel="Revoke this origin" disabled={pending} onConfirm={onRevoke} />
+        <ConfirmButton label="Revoke" confirmLabel="Revoke this origin" variant="danger" disabled={pending} onConfirm={onRevoke} />
         {site.writable && (
           <ConfirmButton
             label="Read-only"
             confirmLabel="Stop agents submitting forms here"
+            variant="ghost"
             disabled={pending}
             onConfirm={onReadonly}
           />

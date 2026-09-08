@@ -114,6 +114,7 @@ function FactsPanel({ email }: { email: EmailDetail }) {
           <ConfirmButton
             label="Requeue for triage"
             confirmLabel="Requeue it now"
+            variant="quiet"
             disabled={requeue.isPending}
             onConfirm={() => requeue.mutate()}
           />
@@ -382,6 +383,7 @@ function ReplyForm({ to, subject }: { to: string; subject: string | null }) {
         <ConfirmButton
           label="Send"
           confirmLabel="Send it now"
+          variant="approve"
           intent="go"
           disabled={body.trim() === "" || send.isPending}
           onConfirm={() =>

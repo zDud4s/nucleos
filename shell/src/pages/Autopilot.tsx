@@ -49,6 +49,7 @@ import {
   MODE_SENTENCES,
   MODE_TONE,
   promotionBlocker,
+  promotionConsequence,
 } from "../lib/mode";
 import "./autopilot.css";
 
@@ -425,7 +426,7 @@ function GovernanceRow({
         <ModeSwitch
           value={project.mode}
           actAllowed={project.promotable}
-          actBlocker={promotionBlocker(project, withheld)}
+          actConfirmLabel={promotionConsequence(project)}
           busy={setMode.isPending}
           onChoose={(mode) =>
             change(
@@ -593,6 +594,7 @@ function ShadowReviewPanel({
                 <ConfirmButton
                   label={`Block #${decision.id}`}
                   confirmLabel="This should have been stopped"
+                  variant="ghost"
                   disabled={verdict.isPending}
                   onConfirm={() =>
                     verdict.mutate({

@@ -14,6 +14,16 @@ export interface StatCardProps {
   value: ReactNode | undefined;
   /** The line under the figure: a split, a ceiling, a trend. */
   detail?: ReactNode;
+  /**
+   * The figure is bad news, and should say so.
+   *
+   * A union with one member rather than `danger?: boolean`, so the second tone
+   * this eventually needs arrives as a value and not as a second flag that can
+   * contradict the first. Absent is the normal card, and normal is the default
+   * because a page of readings where every figure is toned is a page where none
+   * of them is.
+   */
+  tone?: "danger";
 }
 
 /**
@@ -23,9 +33,12 @@ export interface StatCardProps {
  * first screen is a *reading*, not a console. Nothing on a stat card is
  * clickable and nothing behind one mutates.
  */
-export function StatCard({ label, value, detail }: StatCardProps) {
+export function StatCard({ label, value, detail, tone }: StatCardProps) {
   return (
-    <article className="ui-stat" aria-label={label}>
+    <article
+      className={tone === undefined ? "ui-stat" : `ui-stat ui-stat-${tone}`}
+      aria-label={label}
+    >
       <p className="ui-stat-value">{value === undefined ? "—" : value}</p>
       <p className="ui-stat-label">{label}</p>
       {detail === undefined ? null : <p className="ui-stat-detail">{detail}</p>}

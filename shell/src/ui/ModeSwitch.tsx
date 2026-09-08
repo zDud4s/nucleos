@@ -7,8 +7,12 @@ export interface ModeSwitchProps {
   value: SwitchMode;
   /** Whether the third segment has been earned — the daemon's arithmetic, never recomputed. */
   actAllowed: boolean;
-  /** Why it has not, in the daemon's own terms. Rendered by the caller, carried here as a title. */
-  actBlocker?: string;
+  /**
+   * What the armed segment says: the consequence, the project and the ceiling, composed by
+   * `lib/mode.ts`. Required, because a confirmation that does not name what it is confirming is
+   * only a second click.
+   */
+  actConfirmLabel: string;
   /** A write is in flight; every segment is inert. */
   busy?: boolean;
   onChoose: (mode: SwitchMode) => void;
@@ -35,7 +39,7 @@ export interface ModeSwitchProps {
  * nothing left to confirm. What it never is, is green while locked: see `.ui-button-approve:disabled`
  * in `ui.css`. A control that cannot be pressed does not advertise the consequence of pressing it.
  */
-export function ModeSwitch({ value, actAllowed, actBlocker, busy, onChoose }: ModeSwitchProps) {
+export function ModeSwitch({ value, actAllowed, actConfirmLabel, busy, onChoose }: ModeSwitchProps) {
   return (
     <div className="ui-switch" role="group" aria-label="Autopilot mode">
       <button
@@ -63,13 +67,17 @@ export function ModeSwitch({ value, actAllowed, actBlocker, busy, onChoose }: Mo
       ) : (
         // Wrapped rather than classed: `ConfirmButton` takes no `className`, and it is not this
         // packet's file to change. The wrapper is the segment as far as the track is concerned.
+        //
+        // No `title` on the locked segment: both callers already render the blocker visibly, under
+        // exactly the condition that locks this button (`Autopilot.tsx`'s `Quiet`, `Settings.tsx`'s
+        // paragraph). The tooltip was a third copy of one sentence, and the only copy you had to
+        // hover to read.
         <span className="ui-switch-seg-wrap">
           <ConfirmButton
             label="Let it act"
-            confirmLabel="It may act on its own"
+            confirmLabel={actConfirmLabel}
             variant="approve"
             disabled={!actAllowed || busy}
-            title={actAllowed ? undefined : actBlocker}
             onConfirm={() => onChoose("active")}
           />
         </span>

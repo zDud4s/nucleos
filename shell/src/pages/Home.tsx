@@ -99,6 +99,7 @@ export function Home() {
               : `${healthy}/${subsystems.length}`
           }
           detail={systemHeadline(health.data)}
+          tone={wrongClause(health.data) === null ? undefined : "danger"}
         />
       </div>
 
@@ -192,7 +193,15 @@ function headline(
   if (wrong !== null) {
     return (
       <>
-        <Link to="/system">{wrong}</Link>
+        {/* The clause is red and the tail is not: "; 2 waiting on you" is the queue doing its
+            job, not a fault, and colouring it with the fault would make the page report two
+            problems where there is one. The door keeps the clause's colour rather than the
+            accent — see `.ui-wrong-door` in `ui.css` for why that cannot be a utility. */}
+        <span className="ui-wrong">
+          <Link to="/system" className="ui-wrong-door">
+            {wrong}
+          </Link>
+        </span>
         {tail}
       </>
     );

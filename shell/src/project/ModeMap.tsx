@@ -207,7 +207,7 @@ function Views({
             title={means}
             className={
               candidate === view
-                ? "inline-flex items-baseline gap-2 rounded-md border border-accent bg-surface-raised px-3 py-1.5 text-xs text-text"
+                ? "inline-flex items-baseline gap-2 rounded-md border border-border-strong bg-surface-raised px-3 py-1.5 text-xs text-text"
                 : "inline-flex items-baseline gap-2 rounded-md border border-border px-3 py-1.5 text-xs text-text-muted hover:text-text"
             }
           >

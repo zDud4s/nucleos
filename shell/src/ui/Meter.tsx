@@ -19,9 +19,9 @@
  * ceiling finds one of them and draws a bar for a rule.
  *
  * The classes are `ui-gauge-*` and not `ui-meter-*`: `ContextMeter` in
- * `readings.tsx` already owns that prefix, and its rules live in
- * `pages/runs.css` rather than in `ui.css`. Reusing the name would have this
- * component inherit a stylesheet it has never seen.
+ * `readings.tsx` already owns that prefix, and its rules live in `ui.css` too,
+ * directly above the gauge's own. Reusing the name would have every rule
+ * written for either one silently reach both.
  */
 
 /** How full a ceiling is drawn. Absent is the seventh tone's job, not a colour. */

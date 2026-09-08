@@ -161,6 +161,7 @@ function BenchHead({ team, live, waiting }: { team: TeamView; live: number; wait
         <ConfirmButton
           label="Delete team"
           confirmLabel="Delete it now"
+          variant="danger"
           intent="stop"
           disabled={del.isPending}
           onConfirm={() => del.mutate(team.id, { onSuccess: () => void navigate({ to: "/teams" }) })}
