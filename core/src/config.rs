@@ -1725,6 +1725,18 @@ pub struct AutopilotRules {
     pub repo_triggers: Vec<RepoTrigger>,
     #[serde(default)]
     pub gate_command: Option<String>,
+    /// Whether a breached health readout should be written as a new intent record.
+    ///
+    /// **Absent and off by default**: a repository that says nothing behaves exactly as it did
+    /// before this key existed. `deny_unknown_fields` above means a misspelling is a startup error,
+    /// rather than a silently ignored line.
+    ///
+    /// Turning this on records the breach in `.ai/local/ledgers/intents.jsonl` for an operator to
+    /// review; it does not enqueue a job, start a run, or touch the approval queue. The
+    /// `schedules` and `repo_triggers` lists stay empty because the file's own doctrine is
+    /// "Creating this file must not start anything"; this key does not overrule that doctrine.
+    #[serde(default)]
+    pub health_breach_intent: bool,
     /// Whether the VCS queue measures a merge before it publishes it.
     ///
     /// **Off by default, and the default is the whole of the compatibility story**: a repository
@@ -3359,6 +3371,20 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         let dir = tempfile::tempdir().unwrap();
         assert!(load_schedule_rules(dir.path()).unwrap().attention_brake());
         assert!(AutopilotRules::default().attention_brake());
+    }
+
+    #[test]
+    fn health_breach_intent_is_absent_and_off_by_default() {
+        let rules = AutopilotRules::default();
+        assert!(!rules.health_breach_intent);
+        assert!(!rules_from("schedules: []\n").unwrap().health_breach_intent);
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_rules_block_is_a_startup_error() {
+        let error = rules_from("health_breach_intnt: true\n")
+            .expect_err("a misspelled rules key must be rejected at startup");
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
