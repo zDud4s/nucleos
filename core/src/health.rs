@@ -18,8 +18,9 @@
 use serde::Serialize;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::future::Future;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -79,6 +80,101 @@ pub struct SubsystemReadout {
 pub struct HealthReadout {
     pub status: HealthState,
     pub subsystems: Vec<SubsystemReadout>,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct HealthBreachIntent {
+    task_id: &'static str,
+    problem: String,
+    outcome: &'static str,
+    constraints: &'static str,
+    open_questions: &'static str,
+    accepted_by: &'static str,
+    accepted_at: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl HealthReadout {
+    /// A degraded or down aggregate is the health signal's breach; disabled is not a breach.
+    pub fn is_breach(&self) -> bool {
+        matches!(self.status, HealthState::Degraded | HealthState::Down)
+    }
+}
+
+/// Records one breached health signal without starting any autonomous work.
+///
+/// This is deliberately a seam rather than a call from [`readout`]: health polling has no project
+/// rules, and wiring this recorder into a trigger is an owner-approved follow-up. When enabled by
+/// the caller, one JSONL record matching the intent packet's fields is appended to the project's
+/// local ledger.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn record_breach_intent(
+    project_root: &Path,
+    rules: &crate::config::AutopilotRules,
+    readout: &HealthReadout,
+) -> io::Result<bool> {
+    if !rules.health_breach_intent || !readout.is_breach() {
+        return Ok(false);
+    }
+
+    let ledger = project_root.join(".ai/local/ledgers/intents.jsonl");
+    if let Some(parent) = ledger.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let problem = format!(
+        "Health signal breached: status={}; {}",
+        health_state_name(readout.status),
+        readout
+            .subsystems
+            .iter()
+            .filter(|entry| matches!(entry.status, HealthState::Degraded | HealthState::Down))
+            .map(|entry| {
+                format!(
+                    "{} ({})",
+                    entry.name,
+                    entry.reason.map(failure_category_name).unwrap_or("unknown")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let record = HealthBreachIntent {
+        task_id: "health-breach",
+        problem,
+        outcome: "Review the breached health signal before taking action.",
+        constraints: "Recording only; do not enqueue a job, start a run, or touch the approval queue.",
+        open_questions: "none",
+        accepted_by: "health-monitor",
+        accepted_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let mut file = OpenOptions::new().create(true).append(true).open(ledger)?;
+    let serialized = serde_json::to_string(&record).map_err(io::Error::other)?;
+    file.write_all(serialized.as_bytes())?;
+    file.write_all(b"\n")?;
+    Ok(true)
+}
+
+fn health_state_name(state: HealthState) -> &'static str {
+    match state {
+        HealthState::Ok => "ok",
+        HealthState::Degraded => "degraded",
+        HealthState::Down => "down",
+        HealthState::Disabled => "disabled",
+    }
+}
+
+fn failure_category_name(category: FailureCategory) -> &'static str {
+    match category {
+        FailureCategory::Timeout => "timeout",
+        FailureCategory::NotConfigured => "not-configured",
+        FailureCategory::Unreachable => "unreachable",
+        FailureCategory::PermissionDenied => "permission-denied",
+        FailureCategory::Missing => "missing",
+        FailureCategory::NotRunning => "not-running",
+        FailureCategory::LowDiskSpace => "low-disk-space",
+        FailureCategory::Unknown => "unknown",
+    }
 }
 
 impl HealthReadout {
@@ -741,6 +837,54 @@ fn classify_error<E>(_error: E) -> FailureCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn breached_readout() -> HealthReadout {
+        HealthReadout {
+            status: HealthState::Down,
+            subsystems: vec![SubsystemReadout::down(
+                "cli_binary",
+                FailureCategory::Missing,
+            )],
+        }
+    }
+
+    #[test]
+    fn health_breach_intent_is_inert_when_the_rule_is_off() {
+        let root = tempfile::tempdir().unwrap();
+        let result = record_breach_intent(
+            root.path(),
+            &crate::config::AutopilotRules::default(),
+            &breached_readout(),
+        )
+        .unwrap();
+
+        assert!(!result);
+        assert!(!root.path().join(".ai/local/ledgers/intents.jsonl").exists());
+    }
+
+    #[test]
+    fn an_enabled_health_breach_writes_one_intent_packet_record() {
+        let root = tempfile::tempdir().unwrap();
+        let rules = crate::config::AutopilotRules {
+            health_breach_intent: true,
+            ..Default::default()
+        };
+        let readout = breached_readout();
+
+        assert!(record_breach_intent(root.path(), &rules, &readout).unwrap());
+
+        let ledger =
+            std::fs::read_to_string(root.path().join(".ai/local/ledgers/intents.jsonl")).unwrap();
+        assert_eq!(ledger.lines().count(), 1);
+        let record: serde_json::Value = serde_json::from_str(ledger.trim()).unwrap();
+        assert_eq!(record["task_id"], "health-breach");
+        assert_eq!(
+            record["outcome"],
+            "Review the breached health signal before taking action."
+        );
+        assert!(record["problem"].as_str().unwrap().contains("cli_binary"));
+        assert!(record["accepted_at"].as_str().unwrap().contains('T'));
+    }
 
     #[test]
     fn disabled_subsystems_do_not_drag_the_aggregate_down() {
