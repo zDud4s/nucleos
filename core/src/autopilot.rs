@@ -252,10 +252,21 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                 -- an unfiltered count would either double-count or count enforced work as backlog.
                 -- Both copies of this subquery must carry the same filter, or this display number
                 -- and the number the daemon enforces (`wip::open_proposals`) would disagree.
+                --
+                -- They did disagree, and the warning above guarded the wrong half of the sum. The
+                -- sentence is about the shadow-decisions subquery; the drift arrived in the
+                -- proposals one beside it, which counted every `kind` while `wip.rs` had already
+                -- excluded `skipped-item` and `fleet-exclusion`. Measured 2026-09-08 on `nucleos`:
+                -- the roster displayed 19 and the daemon's own log refused work at 13, the six
+                -- between them being skipped items that are deliberately not review work. So the
+                -- exclusion is repeated here rather than left implied -- the same filter, spelled
+                -- the same way, in both copies.
                 (SELECT COUNT(*)
                  FROM proposals
                  WHERE proposals.project_id = state.project_id
-                   AND proposals.status = 'pending')
+                   AND proposals.status = 'pending'
+                   AND proposals.kind <> 'skipped-item'
+                   AND proposals.kind <> 'fleet-exclusion')
                 +
                 (SELECT COUNT(*)
                  FROM shadow_decisions
@@ -1075,6 +1086,22 @@ mod tests {
         .await
         .unwrap();
 
+        // Two proposals of the kinds `wip.rs` excludes: must count in NEITHER reader.
+        //
+        // This is the dimension the test was missing, and the omission is why the drift survived
+        // the guard written to stop it. Every fixture above varies `runs.mode`, which both copies
+        // of the sum already filtered identically; none varied `proposals.kind`, which is the one
+        // the copies disagreed about. A test that only exercises the axis where two queries agree
+        // reports that they agree.
+        sqlx::query(
+            "INSERT INTO proposals (kind, status, run_id, project_id, reasoning, created_at)
+             VALUES ('skipped-item', 'pending', 1, 'project-a', 'test', '2026-08-24T00:00:00Z'),
+                    ('fleet-exclusion', 'pending', 1, 'project-a', 'test', '2026-08-24T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
         // A shadow-mode unreviewed decision: must count in both readers.
         let shadow_run_id = sqlx::query(
             "INSERT INTO runs (project_id, prompt, status, mode, created_at)
@@ -1128,7 +1155,7 @@ mod tests {
         );
         assert_eq!(
             gate, 2,
-            "1 pending proposal + 1 shadow decision; the 5 worktree decisions must not count"
+            "1 pending proposal + 1 shadow decision; neither the 5 worktree decisions nor the 2              excluded-kind proposals may count"
         );
     }
 
