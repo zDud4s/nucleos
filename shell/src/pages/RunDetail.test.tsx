@@ -427,3 +427,18 @@ describe("RunDetail — the handoff", () => {
     expect(screen.getByText(/at the handoff mark/)).toBeDefined();
   });
 });
+
+describe("RunDetail — absent readings", () => {
+  it("draws a run whose cost and context the daemon never sent", async () => {
+    const run = detail();
+    delete (run as { cost_usd?: unknown }).cost_usd;
+    delete (run as { context_fill?: unknown }).context_fill;
+    const asked: string[] = [];
+    daemon.apiFetch.mockImplementation(detailFetch(run, NO_TAIL, asked, stopReport()));
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(await screen.findByText("cost not recorded")).toBeDefined();
+    expect(screen.getByText("context fill not reported")).toBeDefined();
+  });
+});

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { money } from "./readings";
+import { render, screen } from "@testing-library/react";
+import { CostLine, money } from "./readings";
 
 /**
  * What a spend is allowed to read as.
@@ -37,5 +38,13 @@ describe("money", () => {
     // be the exact lie the four-decimal rule was written to prevent.
     expect(money(0.00004)).toBe("< $0.0001");
     expect(money(0.00000001)).toBe("< $0.0001");
+  });
+});
+
+describe("CostLine", () => {
+  it("reads an absent cost as not recorded, exactly as a null one does", () => {
+    render(<CostLine costUsd={undefined as unknown as number | null} />);
+
+    expect(screen.getByText("cost not recorded")).toBeDefined();
   });
 });

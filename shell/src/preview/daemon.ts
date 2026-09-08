@@ -13,6 +13,8 @@ import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary } from "../data/system";
 import type { VoiceConfigView } from "../data/voice";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
+import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
+import type { EmailDetail } from "../data/mail";
 
 /**
  * A núcleo made of fixtures, for looking at pages with.
@@ -1411,6 +1413,59 @@ export const CHAT_MODELS = {
   efforts: ["low", "medium", "high", "xhigh", "max"],
 };
 
+const RUN_DETAIL = {
+  id: 1,
+  project_id: "alpha",
+  status: "completed",
+  gate_status: "passed",
+  gate_exit_code: 0,
+  gate_output: null,
+  exit_code: 0,
+  stdout: "Checked the changed files.\nThe gate passed.",
+  stderr: null,
+  session_id: "s-preview",
+  cost_usd: 0.0412,
+  input_tokens: 18_400,
+  output_tokens: 2_100,
+  cache_read_tokens: 96_000,
+  num_turns: 7,
+  context_fill: 132_000,
+  steerable: false,
+  successor_run_id: null,
+} satisfies RunDetail;
+
+const RUN_STOP = {
+  run_id: 1,
+  status: "completed",
+  kind: "completed",
+  summary: "The run completed after the gate passed.",
+  decisions_recorded: true,
+  gate: null,
+  timeout: null,
+  leading_up: [],
+  exit_code: 0,
+  stderr_tail: null,
+  successor_run_id: null,
+} satisfies RunStop;
+
+const RUN_TAIL = { text: "", next: 0, live: false } satisfies RunTailChunk;
+
+const EMAIL_DETAIL = {
+  id: 1,
+  from_addr: "mira.chen@example.com",
+  from_name: "Mira Chen",
+  subject: "Tuesday planning notes",
+  received_at: ago(18 * 60 * 1000),
+  triage_class: "action",
+  triage_summary: "The team needs a reply with the agreed delivery date.",
+  triaged_at: ago(14 * 60 * 1000),
+  model_class: "action",
+  priority_rule: null,
+  body_text: "Hi team,\n\nCould you confirm the delivery date from today's planning session?\n\nThanks,\nMira",
+  has_attachments: 0,
+  attachments: [],
+} satisfies EmailDetail;
+
 export function answer(path: string, init?: RequestInit): unknown {
   /*
     The house's capacity, with nobody holding a slot. It is here so the Codigo
@@ -1450,6 +1505,10 @@ export function answer(path: string, init?: RequestInit): unknown {
 
   if (path === "/jobs" || path.startsWith("/jobs?")) return [JOB];
   if (/^\/jobs\/\d+$/.test(path)) return JOB_VIEW;
+  if (/^\/runs\/\d+\/stop$/.test(path)) return RUN_STOP;
+  if (/^\/runs\/\d+\/tail/.test(path)) return RUN_TAIL;
+  if (/^\/runs\/\d+$/.test(path) && init?.method === undefined) return RUN_DETAIL;
+  if (/^\/email\/\d+$/.test(path) && init?.method === undefined) return EMAIL_DETAIL;
 
   if (path === "/projects") return PROJECTS;
 

@@ -111,6 +111,7 @@ export function money(costUsd: number): string {
  * are the cheap part, and a run whose input is mostly cache is a different fact
  * about cost than one that paid full price for the same window.
  */
+// The type promises a present nullable field; a lying source should not take down the reading.
 export function CostLine({
   costUsd,
   inputTokens = null,
@@ -121,7 +122,7 @@ export function CostLine({
   return (
     <p className="ui-cost">
       <span className="ui-cost-money">
-        {costUsd === null ? "cost not recorded" : money(costUsd)}
+      {typeof costUsd !== "number" ? "cost not recorded" : money(costUsd)}
       </span>
       {counted && (
         <>
@@ -136,7 +137,7 @@ export function CostLine({
 
 /** A token count, short. An em dash for absent, which is not the same as `0`. */
 export function tokenCount(count: number | null): string {
-  if (count === null) return "—";
+  if (typeof count !== "number") return "—";
   return count < 1000 ? String(count) : `${(count / 1000).toFixed(1)}k`;
 }
 
@@ -167,7 +168,7 @@ export interface ContextMeterProps {
  * render.
  */
 export function ContextMeter({ fill }: ContextMeterProps) {
-  if (fill === null) return <p className="ui-meter-absent">context fill not reported</p>;
+  if (typeof fill !== "number") return <p className="ui-meter-absent">context fill not reported</p>;
   const share = Math.min(fill / CONTEXT_WINDOW_TOKENS, 1);
   const percent = Math.round(share * 100);
   const past = share >= HANDOFF_SHARE;

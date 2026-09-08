@@ -86,7 +86,7 @@ function KnownEmail({ id }: { id: number }) {
 /** One derived sentence about who this is from and where triage got to. */
 function headline(email: EmailDetail): string {
   const from = email.from_name ?? email.from_addr;
-  const state = email.triage_class === null ? "not triaged yet" : `triaged as ${email.triage_class}`;
+  const state = typeof email.triage_class !== "string" ? "not triaged yet" : `triaged as ${email.triage_class}`;
   return `from ${from} — ${state}`;
 }
 
@@ -183,7 +183,7 @@ function RequeueError({ error }: { error: unknown }) {
 function BodyPanel({ email }: { email: EmailDetail }) {
   return (
     <Panel title="Body">
-      {email.body_text === null ? (
+      {typeof email.body_text !== "string" ? (
         <p className="mail-detail-pruned">
           this message's body was pruned by retention — only the facts above remain
         </p>
@@ -352,7 +352,8 @@ function VerdictError({ error }: { error: unknown }) {
 function ReplyForm({ to, subject }: { to: string; subject: string | null }) {
   const send = useSendReply();
   const [body, setBody] = useState("");
-  const replySubject = subject === null ? "Re:" : subject.startsWith("Re:") ? subject : `Re: ${subject}`;
+  // The daemon may omit a field the type says is always present; absent is not null.
+  const replySubject = typeof subject !== "string" ? "Re:" : subject.startsWith("Re:") ? subject : `Re: ${subject}`;
 
   return (
     <Panel title="Reply">
