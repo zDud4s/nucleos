@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiFetch, apiText, isApiRefusal } from "./client";
 import { keys } from "./keys";
+// `roster.ts` imports only TYPES from this file, which are erased — so there is no runtime cycle.
+import { whereWaiting } from "./roster";
 
 /**
  * A project's rules, and the read-only window onto its tree.
@@ -80,6 +82,9 @@ export interface ProjectRules {
   /** The effective ceiling. `null` means the brake is **off**, which is not a ceiling of zero. */
   wip_limit: number | null;
   open_review_items: number;
+  /** The two queues the total is made of. Optional: the shell can be newer than the daemon. */
+  open_proposals?: number;
+  open_shadow_decisions?: number;
   queue_full: boolean;
 }
 
@@ -798,11 +803,15 @@ export function headlineFor(rules: ProjectRules): string {
     parts.push(inert === 0 ? said : `${said}, ${inert} never firing`);
   }
 
+  // Where they are, not just how many. See `whereWaiting` — a full queue and an empty proposals
+  // list were both true at once, and the total alone could not say so.
+  const where = whereWaiting(rules);
+  const suffix = where === null ? "" : ` (${where})`;
   if (rules.wip_limit === null) {
-    parts.push(`${rules.open_review_items} open, no ceiling`);
+    parts.push(`${rules.open_review_items} open${suffix}, no ceiling`);
   } else {
     parts.push(
-      `${rules.open_review_items} of ${rules.wip_limit} open${rules.queue_full ? ", holding" : ""}`,
+      `${rules.open_review_items} of ${rules.wip_limit} open${suffix}${rules.queue_full ? ", holding" : ""}`,
     );
   }
 

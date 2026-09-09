@@ -139,6 +139,30 @@ export function headline(rows: ProjectSummary[]): string {
   return parts.join(" · ");
 }
 
+/**
+ * Where a project's waiting items actually are, as a phrase, or `null` when it cannot be said.
+ *
+ * **The total was the whole bug report.** A project whose brake was holding showed a full queue and
+ * an empty proposals list, and both were right: every waiting item was an unreviewed shadow
+ * decision, which lives on another screen. Measured on `nucleos` — 0 proposals, 13 shadow
+ * decisions. The word "review" pointed at the one page that could never clear it.
+ *
+ * `null` when the daemon is older than this shell and served no split, so the caller keeps saying
+ * only the total rather than claiming a zero it was not told.
+ */
+export function whereWaiting(project: {
+  open_proposals?: number;
+  open_shadow_decisions?: number;
+}): string | null {
+  const { open_proposals: proposals, open_shadow_decisions: shadow } = project;
+  if (proposals === undefined || shadow === undefined) return null;
+  const parts: string[] = [];
+  if (proposals > 0) parts.push(`${proposals} ${proposals === 1 ? "proposal" : "proposals"}`);
+  if (shadow > 0) parts.push(`${shadow} shadow ${shadow === 1 ? "decision" : "decisions"}`);
+  if (parts.length === 0) return null;
+  return parts.join(" and ");
+}
+
 /* ------------------------------------------------------------------ the exit -- */
 
 /**

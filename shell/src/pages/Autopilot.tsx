@@ -44,6 +44,7 @@ import {
   StateBadge,
   Teach,
 } from "../ui";
+import { whereWaiting } from "../data/roster";
 import {
   MODE_LABEL,
   MODE_SENTENCES,
@@ -313,6 +314,7 @@ function GovernanceRow({
   const needsRoot = refused !== null && refused.status === 422;
 
   const withheld = project.withheld_classes_ready ?? 0;
+  const waitingWhere = whereWaiting(project);
 
   function change(mode: AutopilotMode, withRoot: string | null) {
     setAttempted(mode);
@@ -351,6 +353,10 @@ function GovernanceRow({
           <dd>
             {project.open_review_items}
             {project.wip_limit === null ? " (no ceiling)" : ` of ${project.wip_limit}`}
+            {/* Which queue, not just how many. A person reading this number went to the proposals
+                list and found it empty, because on this project all of it was shadow decisions —
+                a screen the word "review" never named. */}
+            {waitingWhere !== null && <span className="ap-meta"> — {waitingWhere}</span>}
           </dd>
         </div>
       </dl>
@@ -775,6 +781,8 @@ function JobsPanel({ rows, selected }: { rows: ProjectSummary[]; selected: strin
   const live = jobs.data ?? [];
 
   const target = rows.find((row) => row.project_id === selected);
+  // Which queue is holding it, not just how many items. Same reason as `waitingWhere` above.
+  const targetWaitingWhere = target === undefined ? null : whereWaiting(target);
   const blocked = target === undefined || target.queue_full || target.mode === "off";
 
   return (
@@ -838,8 +846,9 @@ function JobsPanel({ rows, selected }: { rows: ProjectSummary[]; selected: strin
       )}
       {target !== undefined && target.queue_full && (
         <p className="ap-hedge">
-          {target.project_id} is holding {target.open_review_items} items waiting for review against its
-          ceiling of {target.wip_limit ?? "none"} — review something and the brake releases itself.
+          {target.project_id} is holding {target.open_review_items} items waiting for review
+          {targetWaitingWhere === null ? "" : ` (${targetWaitingWhere})`} against its ceiling of{" "}
+          {target.wip_limit ?? "none"} — review something and the brake releases itself.
         </p>
       )}
       {create.isError && <JobError error={create.error} />}
