@@ -179,7 +179,7 @@
 .browser-check input {
   width: 1rem;
   height: 1rem;
-  accent-color: var(--accent);
+  accent-color: var(--text);
 }
 
 /* ========================================================= open a window == */

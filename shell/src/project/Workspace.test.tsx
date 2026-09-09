@@ -776,6 +776,46 @@ describe("the settings this app authors", () => {
   });
 
   /**
+   * Arming it says what it would mean, under the switch — where nothing above the button moves.
+   *
+   * The sentence used to be the armed LABEL, and on the roster that was measurable damage: 52
+   * characters inside a fixed track wrapped and grew the row from 90.6 to 125.0 pixels, sliding
+   * the button out from under a pointer that has four seconds left to press it a second time.
+   * Here the block is a column, so the sentence goes immediately under the switch and above the
+   * standing copy: arming pushes what is below it down and moves the control itself not at all.
+   *
+   * The segment says a short line that names the project, because on a page reached by project
+   * the name is what says which one is about to be let loose.
+   */
+  it("the mode block says the consequence while the third segment is armed", async () => {
+    await openState(
+      settingsState({
+        promotable: true,
+        classes_ready: 5,
+        classes_total: 5,
+        withheld_classes_ready: 1,
+        wip_limit: 4,
+        open_proposals: 3,
+      }),
+    );
+
+    // Nothing says it before it is armed: it is what confirming would do, not a standing fact.
+    expect(screen.queryByText(/nucleos acts on its own/)).toBeNull();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Let it act" }));
+
+    const armed = await screen.findByRole("button", { name: "Let nucleos act" });
+    // The interlock claims no pressed state: in this group `aria-pressed` means "this IS the
+    // setting", and armed is the one moment nothing has been set.
+    expect(armed.getAttribute("aria-pressed")).toBeNull();
+
+    // And the count reads as a count already taken, not as an allowance being granted.
+    const said = await screen.findByText(/nucleos acts on its own/);
+    expect(said.textContent).toContain("3 of its 4 proposal slots already in use");
+    expect(said.tagName).toBe("P");
+  });
+
+  /**
    * The same control the roster draws, saying the same three things.
    *
    * This block used to render the daemon's own words — `off`, `shadow`, `active` — as three

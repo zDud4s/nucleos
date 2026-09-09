@@ -595,9 +595,13 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
  * the one thing that is genuinely prose — what this run was for, and where it ran.
  */
 function headline(run: Run): string {
+  // "ended completed" was the commonest state describing itself twice.
   const state = runIsAlive(run.status)
     ? "still going"
-    : `ended ${readState("run", run.status)?.label ?? run.status}`;
+    : (() => {
+        const label = readState("run", run.status)?.label ?? run.status;
+        return run.status === "completed" ? "finished" : `ended ${label}`;
+      })();
   const where = run.project_id === null ? "no project" : `in ${run.project_id}`;
   return `${state}, ${where}`;
 }

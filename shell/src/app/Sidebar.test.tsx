@@ -53,12 +53,13 @@ describe("Sidebar", () => {
     expect(screen.getByRole("link", { name: "All projects" })).toBeTruthy();
   });
 
-  it("says a project's pending count out loud, since the badge is only drawn", async () => {
+  it("says a project's open-proposal count out loud, since the badge is only drawn", async () => {
     await renderWithRouter(<Sidebar projects={[{ id: "sidecar", mode: "shadow", pending: 2 }]} />, {
       initialPath: "/projects",
     });
 
-    expect(screen.getByRole("link", { name: "sidecar, 2 waiting" })).toBeTruthy();
+    // A roster badge is open proposals, not the Waiting queue's arithmetic.
+    expect(screen.getByRole("link", { name: "sidecar, 2 proposals open" })).toBeTruthy();
   });
 
   /**
@@ -160,6 +161,13 @@ describe("Sidebar", () => {
     // And when there is a count it is part of the name, not decoration a screen
     // reader steps over — a summons only some people get is not a summons.
     expect(screen.getByRole("link", { name: "Waiting, 7 waiting" })).toBeDefined();
+  });
+
+  it("names chat and mail badges by their own arithmetic", async () => {
+    await renderWithRouter(<Sidebar badges={{ chats: 2, mail: 3 }} />);
+
+    expect(screen.getByRole("link", { name: "Chats, 2 unread" })).toBeDefined();
+    expect(screen.getByRole("link", { name: "Mail, 3 untriaged" })).toBeDefined();
   });
 
   it("renders no badge at all for a count the shell has no source for", async () => {

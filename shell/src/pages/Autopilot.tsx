@@ -49,6 +49,7 @@ import {
   MODE_SENTENCES,
   MODE_TONE,
   promotionBlocker,
+  promotionConfirmLabel,
   promotionConsequence,
 } from "../lib/mode";
 import "./autopilot.css";
@@ -363,6 +364,14 @@ function GovernanceRow({
   const [root, setRoot] = useState(project.project_root ?? "");
   /** Which change was refused, so the retry with a root sends the same one. */
   const [attempted, setAttempted] = useState<AutopilotMode | null>(null);
+  /**
+   * Whether the third mode segment is armed, so the row can say what confirming it would do.
+   *
+   * Held here rather than inside the switch because the sentence does not fit inside the switch:
+   * as the armed label it wrapped in the row's last track and grew the row from 90.6 to 125.0
+   * pixels, moving the button out from under the pointer that has four seconds to press it again.
+   */
+  const [armed, setArmed] = useState(false);
 
   /**
    * A 422 is the *only* refusal that opens the root input.
@@ -426,7 +435,8 @@ function GovernanceRow({
         <ModeSwitch
           value={project.mode}
           actAllowed={project.promotable}
-          actConfirmLabel={promotionConsequence(project)}
+          actArmedLabel={promotionConfirmLabel(project)}
+          onArmedChange={setArmed}
           busy={setMode.isPending}
           onChoose={(mode) =>
             change(
@@ -440,6 +450,30 @@ function GovernanceRow({
           }
         />
       </div>
+
+      {/*
+        What confirming would do, on a line of its own.
+
+        The same full-width slot the blocker uses, and exclusive with it BY ARGUMENT rather
+        than by construction — the distinction is worth writing down, because the two are
+        rendered from two independent conditions and nothing here enforces the pairing. The
+        argument: a row can only arm what it is allowed to promote, so a promotable row shows
+        no blocker and a blocked row can never be armed.
+
+        Where the argument stops being airtight: `armed` is this component's state and
+        `promotable` is a prop refreshed by a poll, so a roster tick that flipped `promotable`
+        to false inside the 4 s window would render both lines at once. It does not happen —
+        the núcleo does not withdraw a promotion it has just offered — but it is a race and not
+        a guarantee, which is exactly why this says "by argument".
+
+        Full width because the last track is `minmax(0, 1fr)` — the sentence inside the
+        segment is what grew the row.
+      */}
+      {armed ? (
+        <div className="ap-project-consequence">
+          <Quiet says={promotionConsequence(project)} />
+        </div>
+      ) : null}
 
       {project.mode !== "active" && !project.promotable ? (
         <div className="ap-project-blocker">

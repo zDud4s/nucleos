@@ -58,6 +58,14 @@ export interface VcsRequestSummary {
   created_at: string;
 }
 
+/**
+ * Git outcomes that need a person: escalated is a normal outcome that keeps
+ * the queue working, and blocked is terminal without being a failure. Neither
+ * is red; `ui/state-map.ts` holds the tones. This serves both the page and the
+ * shared waiting count.
+ */
+export const VCS_WANTS_A_PERSON = ["escalated", "blocked"];
+
 /** A worktree run parked on `awaiting_approval`, as `runs::AwaitingRun` serialises. */
 export interface AwaitingRun {
   id: number;
@@ -152,11 +160,19 @@ export { useContactMerges, type MergeSide, type MergeSuggestion } from "./contac
 export { useOpenTeamActions, useRecruitProposals, useTeamActionProposals } from "./teams";
 
 /**
- * Counts the six decision lists that own the bare phrase "waiting on you".
+ * Counts the seven decision lists that own the bare phrase "waiting on you":
+ * wheel requests, action approvals, team actions, recruits, contact merges,
+ * exclusion requests, and git rows that want a person.
  *
  * A partial count is preferred to a blank: a failed route contributes zero as
  * the existing page arithmetic does, so one broken route cannot hide every
  * answered decision.
+ *
+ * A run parked on `awaiting_approval` is the run side of an action approval
+ * already counted in §2, so `useAwaitingRuns` is not read here.
+ * `runs::reconcile_stranded_approvals` sweeps a parked run whose pending
+ * `action-approval` proposal is gone; it either has a proposal already counted
+ * or is not a decision anybody can take. Every decision is counted once.
  */
 export function countWaitingDecisions(lists: {
   wheel: unknown[] | undefined;
@@ -165,14 +181,23 @@ export function countWaitingDecisions(lists: {
   recruits: unknown[] | undefined;
   merges: unknown[] | undefined;
   exclusions: unknown[] | undefined;
+  git: { status: string }[] | undefined;
 }): number | undefined {
   const values = Object.values(lists);
   if (values.every((list) => list === undefined)) return undefined;
-  return values.reduce<number>((total, list) => total + (list?.length ?? 0), 0);
+  return (
+    (lists.wheel?.length ?? 0) +
+    (lists.approvals?.length ?? 0) +
+    (lists.teamActions?.length ?? 0) +
+    (lists.recruits?.length ?? 0) +
+    (lists.merges?.length ?? 0) +
+    (lists.exclusions?.length ?? 0) +
+    (lists.git?.filter((row) => VCS_WANTS_A_PERSON.includes(row.status)).length ?? 0)
+  );
 }
 
 /**
- * Reads the six decision lists for the one shared "waiting on you" arithmetic.
+ * Reads the seven decision lists for the one shared "waiting on you" arithmetic.
  *
  * The partial count remains more useful than a blank when one route fails;
  * `countWaitingDecisions` is the sole owner of the bare phrase's number.
@@ -184,6 +209,7 @@ export function useWaitingCount(): number | undefined {
   const recruits = useRecruitProposals();
   const merges = useContactMerges();
   const exclusions = useExclusionRequests();
+  const git = useVcsRequests();
   return countWaitingDecisions({
     wheel: wheel.data,
     approvals: approvals.data,
@@ -191,6 +217,7 @@ export function useWaitingCount(): number | undefined {
     recruits: recruits.data,
     merges: merges.data,
     exclusions: exclusions.data,
+    git: git.data,
   });
 }
 

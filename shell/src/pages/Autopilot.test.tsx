@@ -193,17 +193,40 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
     expect(screen.queryByLabelText("Folder for alpha")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Let it act" }));
+    /*
+      Armed, the segment says a short line that names the project — and the consequence
+      is a line of its own, under the row.
+
+      It used to be the armed LABEL: "alpha acts on its own — no ceiling on proposals, no
+      approval", 52 characters inside `.ap-project-row`'s last track (`minmax(0, 1fr)`). It
+      wrapped, and the row grew from 90.6 to 125.0 pixels — the button sliding out from under
+      a pointer that has four seconds left to press it a second time. So the segment says
+      `Let alpha act` and the sentence goes on `.ap-project-consequence`, full width, where
+      it costs the row a line it was going to need anyway and moves nothing above it.
+
+      `alpha` carries a null `wip_limit` here, which is no ceiling and is never written as a
+      zero — the reason the sentence is worth putting anywhere at all.
+    */
+    const ARMED = "Let alpha act";
+    const consequence = await screen.findByText(/alpha acts on its own/);
+    expect(consequence.textContent).toContain("no ceiling on proposals");
+    expect(consequence.closest(".ap-project-consequence")).not.toBeNull();
+
+    // And the interlock claims no pressed state while it is still an offer: in this group
+    // `aria-pressed` means "this IS the setting", and nothing has been set yet.
+    expect(screen.getByRole("button", { name: ARMED }).getAttribute("aria-pressed")).toBeNull();
+
     // Clicks inside the 300 ms dwell are swallowed and leave the control armed,
     // so retrying until it disarms is safe. The mutation lands a tick later, so
     // it is a separate wait.
-    // Armed, the segment names the project and its ceiling — `alpha` carries a null
-    // `wip_limit` here, which is no ceiling and is never written as a zero.
-    const ARMED = "alpha acts on its own — no ceiling on proposals, no approval";
     await waitFor(() => {
       const armed = screen.queryByRole("button", { name: ARMED });
       if (armed !== null) fireEvent.click(armed);
       expect(screen.queryByRole("button", { name: ARMED })).toBeNull();
     });
+
+    // And the sentence goes away with the interlock it belonged to.
+    expect(screen.queryByText(/alpha acts on its own/)).toBeNull();
 
     const input = await screen.findByLabelText("Folder for alpha");
 

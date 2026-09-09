@@ -264,3 +264,19 @@ describe("Mail — the pillar key migration", () => {
     });
   });
 });
+
+describe("Mail search field", () => {
+  it("the search label is the field primitive", async () => {
+    daemon.apiFetch.mockImplementation(mailFetch(mailWorld()));
+
+    await renderMail();
+
+    expect(await screen.findByRole("search", { name: "Search the mail queue" })).toBeDefined();
+    const input = screen.getByLabelText("Search sender, subject or summary");
+    const label = input.closest("label");
+    expect(label?.className).toContain("ui-field");
+    const labelText = label?.querySelector("span");
+    expect(labelText?.className).toContain("ui-field-label");
+    expect(labelText?.textContent).toBe("Search");
+  });
+});

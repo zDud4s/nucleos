@@ -183,6 +183,26 @@
   padding-inline: var(--space-4);
 }
 
+/* What arming the third mode segment would do, said while it is armed.
+
+   Its own row rather than the switch's cell, and that is the whole point: the sentence used to be
+   the armed LABEL, inside the last track (`minmax(0, 1fr)`, 362px at 1440px). It wrapped, and the
+   row grew from 90.6 to 125.0 pixels — the button sliding out from under a pointer that has four
+   seconds left to press it a second time. Full width, it costs the row a line it was going to need
+   anyway, and nothing above it moves.
+
+   Same slot as `.ap-project-blocker`, and the two are exclusive BY ARGUMENT rather than by
+   construction: a row can only arm what it is allowed to promote, so a promotable row shows no
+   blocker and a blocked row can never be armed. Not structural, though — `armed` is component
+   state while `promotable` is a polled prop, so a roster tick that withdrew the promotion inside
+   the 4 s window would put both lines in the same row. They would stack rather than overlap, so
+   the failure is a row one line taller and not a collision; the claim is still an argument and is
+   written as one. */
+.ap-project-consequence {
+  grid-column: 1 / -1;
+  padding-inline: var(--space-4);
+}
+
 .ap-project-name {
   display: flex;
   flex-wrap: wrap;

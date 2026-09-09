@@ -803,7 +803,7 @@ function Matrix({
         each. No arrangement of boxes and arrows survives that, so this is a matrix: each row uses
         the columns marked in it. The files were grouped into {matrix.order.length} communities found
         from the imports themselves. <span className="text-text">A mark above the diagonal is a
-        dependency that goes down. One below points backwards</span> — and no reordering removes it.
+        dependency that goes down. A heavier mark below it points backwards</span> — and no reordering removes it.
       </p>
       <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-text-muted">
         <span>
@@ -866,9 +866,9 @@ function Matrix({
                       : weight === undefined
                         ? ""
                         : j > i
-                          ? "bg-text/20"
-                          // `danger` is not a theme token; this live state tone paints backward edges.
-                          : "bg-tone-danger-fg/30";
+                          ? "bg-text/10"
+                          // Both triangles are the same hue at two weights: a back edge is a structural fact, not a fault.
+                          : "bg-text/30";
                   return (
                     <td
                       key={column}
@@ -1063,7 +1063,7 @@ function Graph({
                 key={`${segment.from}>${segment.to}`}
                 d={`M${a.x} ${y1} C${a.x} ${mid} ${b.x} ${mid} ${b.x} ${y2}`}
                 fill="none"
-                className={segment.reversed ? "stroke-danger" : "stroke-border"}
+                className={segment.reversed ? "stroke-border-strong" : "stroke-border"}
                 strokeWidth={1.2}
                 strokeDasharray={segment.reversed ? "4 3" : undefined}
               />

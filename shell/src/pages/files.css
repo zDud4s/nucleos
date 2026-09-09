@@ -54,9 +54,9 @@
   align-items: center;
   justify-content: center;
   margin: 0;
-  border: 2px dashed var(--accent);
+  border: 2px dashed var(--border-strong);
   border-radius: var(--radius-lg);
-  background: var(--accent-quiet);
+  background: var(--surface-raised);
   font-size: var(--text-md);
   font-weight: var(--weight-semibold);
   color: var(--text);
@@ -88,7 +88,7 @@
 }
 
 .fi-tree-row-active {
-  background: var(--accent-quiet);
+  background: var(--surface-raised);
 }
 
 .fi-tree-toggle {
@@ -336,7 +336,7 @@
 
 .fi-row-focus,
 .fi-row-focus:hover {
-  background: var(--accent-quiet);
+  background: var(--surface-raised);
 }
 
 .fi-entry-name {

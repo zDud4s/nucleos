@@ -94,12 +94,24 @@ function isActive(pathname: string, path: string): boolean {
  * screen. It is only when the item carries something the eye reads and the ear
  * would not that the name is written out.
  */
-function spokenName(label: string, count: number | undefined, alert: boolean): string | undefined {
+function spokenName(
+  label: string,
+  count: number | undefined,
+  noun: string,
+  alert: boolean,
+): string | undefined {
   const extras: string[] = [];
-  if (count !== undefined) extras.push(`${count} waiting`);
+  if (count !== undefined) extras.push(`${count} ${noun}`);
   if (alert) extras.push("needs attention");
   return extras.length === 0 ? undefined : `${label}, ${extras.join(", ")}`;
 }
+
+const BADGE_NOUN: Record<NavBadge, string> = {
+  proposals: "waiting",
+  chats: "unread",
+  mail: "untriaged",
+};
+const PROJECT_BADGE_NOUN = "proposals open";
 
 /**
  * One project, as the rail needs it.
@@ -614,6 +626,8 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
       entry.badge === undefined
         ? projects?.find((project) => `project:${project.id}` === entry.id)?.pending
         : badges?.[entry.badge];
+    // Roster counts are open proposals, the other arithmetic from the Waiting count.
+    const noun = entry.badge === undefined ? PROJECT_BADGE_NOUN : BADGE_NOUN[entry.badge];
     const counted = count !== undefined && count > 0;
     const classes = ["nav-item"];
     if (active) classes.push("nav-item-active");
@@ -636,7 +650,7 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
           and would announce this item as "Waiting7". A count that is on screen
           and not in the accessible name is a summons only some people get.
         */
-        aria-label={spokenName(entry.label, counted ? count : undefined, alert)}
+        aria-label={spokenName(entry.label, counted ? count : undefined, noun, alert)}
         title={entry.disabled ?? (iconsOnly ? entry.label : undefined)}
       >
         {monogram !== undefined ? (

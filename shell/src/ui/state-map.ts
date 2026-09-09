@@ -76,8 +76,12 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * `interrupted` is the núcleo dying underneath a run — a defect in *us*, and
    * the run may well have been fine. It gets the held tone, not the failure
    * tone, so that a screen full of interruptions reads as "the daemon
-   * restarted" and sends you to look at the daemon. `completed` follows the
-   * job domain's label for the same literal. `timed_out` is a ceiling, not a
+   * restarted" and sends you to look at the daemon. Acting Green means the núcleo is executing
+   * right now, so terminal success takes Stated Blue: a fact with no verdict attached, not `off`,
+   * which means switched off on purpose. A measurement's good outcome (`gate.passed`,
+   * `collision.clean`, `council_seat.ok`, `voice_cleanup.cleaned`, `web_trust.raw`,
+   * `web_extract.article`, `pillar.ok`) keeps Acting Green because it is the verdict; blueing it
+   * would erase the difference from "not measured". `timed_out` is a ceiling, not a
    * verdict: `run_stop.rs` keeps `Kind::Timeout` apart from `Kind::Failed`, so
    * it gets Held Ember like `council_seat.timeout` and `team_run.expired` and
    * never says "fail". `superseded` is quiet because work continues in its
@@ -86,7 +90,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
   run: {
     running: { tone: "active", label: "running" },
     awaiting_approval: { tone: "pending", label: "awaiting approval" },
-    completed: { tone: "active", label: "completed" },
+    completed: { tone: "info", label: "completed" },
     interrupted: { tone: "paused", label: "interrupted" },
     failed: { tone: "danger", label: "failed" },
     cancelled: { tone: "off", label: "cancelled" },
@@ -100,7 +104,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * `stopped` is a person or a rule halting the chain; `expired` is the window
    * closing on it; `cancelled` is the request being withdrawn. None of the
    * three is a failure and none of the three is a completion, so none of them
-   * borrows either tone.
+   * borrows either tone. Its completed state follows the terminal-success rule: Stated Blue is a
+   * fact, while Acting Green is work happening now.
    */
   job: {
     // The six live statuses (`core/src/job.rs`, `LIVE_STATUSES`). A job that is running is not
@@ -113,7 +118,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     awaiting_approval: { tone: "pending", label: "awaiting approval" },
     // Held by a brake — budget, a slot, or an exclusion. `wait_reason` says which.
     waiting: { tone: "paused", label: "held" },
-    completed: { tone: "active", label: "completed" },
+    completed: { tone: "info", label: "completed" },
     failed: { tone: "danger", label: "failed" },
     gate_failed: { tone: "danger", label: "the gate failed" },
     // The `gate` domain's rule, and for the same reason: a gate that could not run measured
@@ -204,10 +209,11 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * submit again — so it takes the held tone rather than the red one. And
    * `escalated` is a *normal outcome*: a person owns the conflict now, which is
    * the queue working, not the queue breaking. Dressing either as `failed`
-   * sends somebody to debug a merge that behaved exactly as designed.
+   * sends somebody to debug a merge that behaved exactly as designed. `succeeded` is terminal
+   * success, so it is Stated Blue rather than Acting Green.
    */
   vcs: {
-    succeeded: { tone: "active", label: "landed" },
+    succeeded: { tone: "info", label: "landed" },
     failed: { tone: "danger", label: "failed" },
     blocked: { tone: "paused", label: "blocked — submit it again" },
     escalated: { tone: "pending", label: "escalated to you" },
@@ -239,12 +245,13 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * `running` gets the pending tone rather than an active one: nothing has been
    * decided yet, and drawing a deliberation in progress the same colour as a
    * settled one would tell a person to stop watching a card that still has
-   * something to say. `cancelled` is withdrawn work, not a verdict, so it takes
+   * something to say. `done` is terminal success, so it is Stated Blue rather than work in
+   * flight. `cancelled` is withdrawn work, not a verdict, so it takes
    * the same quiet `off` every other cancellation in this table does.
    */
   council: {
     running: { tone: "pending", label: "deliberating" },
-    done: { tone: "active", label: "settled" },
+    done: { tone: "info", label: "settled" },
     error: { tone: "danger", label: "failed" },
     cancelled: { tone: "off", label: "cancelled" },
   },
@@ -280,7 +287,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * stay. It takes neither the failure tone nor the completion tone, because
    * closing is an ending and not a verdict — an errand can be closed the
    * moment it starts and closed after months of real work, and both are the
-   * same status.
+   * same status. Closing is a decision to stop asking, so it remains `off`.
    */
   errand: {
     active: { tone: "active", label: "answering" },
@@ -367,14 +374,15 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * wrote the states: `stopped` and `expired` are not failures. One is a money
    * ceiling reached, the other the run's four-hour one, and "an owner shown
    * `failed` goes looking for an error that does not exist". Neither takes the
-   * danger tone, and neither says the word.
+   * danger tone, and neither says the word. `done` is terminal success, so it is Stated Blue
+   * rather than Acting Green.
    */
   team_run: {
     // Awaiting-You Amber asks something of the reader; a director planning a round asks nothing.
     planning: { tone: "active", label: "planning" },
     working: { tone: "active", label: "working" },
     delivering: { tone: "active", label: "delivering" },
-    done: { tone: "active", label: "delivered" },
+    done: { tone: "info", label: "delivered" },
     stopped: { tone: "paused", label: "stopped at a ceiling" },
     expired: { tone: "paused", label: "ran out of time" },
     failed: { tone: "danger", label: "failed" },
@@ -388,11 +396,12 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * `team_items.state`. `working`, `planned` and `skipped` were this shell's own invention —
    * see `state-map-completeness.test.ts`, which reads the Rust rather than trusting this line.
    * Awaiting-You Amber asks something of the reader; unstarted work is queued, not a summons.
+   * `done` is a terminal fact, not work in flight, so it is Stated Blue.
    */
   team_item: {
     pending: { tone: "off", label: "not started" },
     running: { tone: "active", label: "running" },
-    done: { tone: "active", label: "done" },
+    done: { tone: "info", label: "done" },
     failed: { tone: "danger", label: "failed" },
   },
 
@@ -405,12 +414,13 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * half of §7's team row, that a human decision is not an execution result.
    * `pending` is deliberately neutral: an action may be pending because
    * somebody has not answered, or because the grant was `allow` and nobody has
-   * to. Which of the two it is comes from `proposal_id`, not from here.
+   * to. Which of the two it is comes from `proposal_id`, not from here. `done` is terminal
+   * success, so it is Stated Blue rather than Acting Green.
    */
   team_action: {
     pending: { tone: "pending", label: "not carried out yet" },
     working: { tone: "active", label: "being carried out" },
-    done: { tone: "active", label: "carried out" },
+    done: { tone: "info", label: "carried out" },
     failed: { tone: "danger", label: "failed" },
     rejected: { tone: "off", label: "refused by you" },
   },

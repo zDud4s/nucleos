@@ -76,7 +76,7 @@
 .contacts-question-id {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
-  color: var(--accent);
+  color: var(--text);
   white-space: nowrap;
 }
 

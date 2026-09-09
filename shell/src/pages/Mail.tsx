@@ -13,7 +13,7 @@ import {
   type QueuedEmail,
   type TriageOutcome,
 } from "../data/mail";
-import { Button, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime, StaleNote, StateBadge, Teach } from "../ui";
+import { Button, ErrorNote, Field, PageHeader, Panel, RefusalNote, RelativeTime, StaleNote, StateBadge, Teach } from "../ui";
 import "./mail.css";
 
 /**
@@ -168,8 +168,7 @@ function MailSearchBar({ q, onSearch }: { q: string | undefined; onSearch: (q: s
         onSearch(text === "" ? undefined : text);
       }}
     >
-      <label className="mail-search-field">
-        <span>Search</span>
+      <Field label="Search">
         <input
           name="q"
           defaultValue={q ?? ""}
@@ -177,7 +176,7 @@ function MailSearchBar({ q, onSearch }: { q: string | undefined; onSearch: (q: s
           aria-label="Search sender, subject or summary"
           placeholder="sender, subject or summary"
         />
-      </label>
+      </Field>
       <Button type="submit">Search</Button>
       {q !== undefined && <Button onClick={() => onSearch(undefined)}>Clear</Button>}
     </form>

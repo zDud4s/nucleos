@@ -15,6 +15,7 @@ import type { VoiceConfigView } from "../data/voice";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
 import type { EmailDetail } from "../data/mail";
+import type { VcsRequestSummary } from "../data/waiting";
 
 /**
  * A núcleo made of fixtures, for looking at pages with.
@@ -667,6 +668,19 @@ export const AGENTS: Agent[] = [
  * `alpha` works and is busy, `bravo` is broken in the two ways that stop a
  * project silently, `charlie` has never been given a folder, and `delta` has a
  * folder and no rules at all — which is ordinary and must not read as a fault.
+ *
+ * **`alpha` is `promotable`, and it is the only one.** Until it was, no fixture
+ * here had ever earned the third mode segment, so no shot had ever photographed
+ * that segment enabled — and none could photograph what it says once armed. The
+ * consequence sentence rode inside the segment as its armed label, wrapped, and
+ * grew the roster row from 90.6 to 125.0 pixels under the pointer about to press
+ * it again: a regression that shipped precisely because the state it broke had
+ * no picture. It is `shadow` with every class clearing the bar and two of them
+ * withheld, which is what the núcleo asks for, and it keeps `3 of 4` proposal
+ * slots so the armed sentence in the shot is the sentence the tests pin. `delta`
+ * took over the 2-of-5 classes, so the "still short of the bar" blocker is still
+ * photographed somewhere — a folder with no RULES is not contradicted by having
+ * shadow classes short of the bar.
  */
 function project(overrides: Partial<ProjectSummary>): ProjectSummary {
   return {
@@ -695,8 +709,13 @@ export const PROJECTS: ProjectSummary[] = [
     root_exists: true,
     open_proposals: 3,
     wip_limit: 4,
-    classes_ready: 2,
+    // Every class clears the bar and two are classes the classifier withheld — the daemon's
+    // own conditions for offering promotion. `promotable` is still carried, never derived:
+    // the shell prints the row's numbers and does not recompute the núcleo's arithmetic.
+    classes_ready: 5,
     classes_total: 5,
+    withheld_classes_ready: 2,
+    promotable: true,
     last_gate: "passed",
     last_gate_at: ago(3 * 3600_000),
   }),
@@ -718,7 +737,57 @@ export const PROJECTS: ProjectSummary[] = [
     project_root: "C:/repos/delta",
     root_exists: true,
     wip_limit: null,
+    // alpha's old numbers, so the "3 of 5 action classes are still short of the bar" blocker
+    // keeps a row to be photographed in. delta's story is a folder with no rules file, which
+    // shadow classes short of the bar do not contradict.
+    classes_ready: 2,
+    classes_total: 5,
   }),
+];
+
+/* ------------------------------------------------------- the queue of pushes -- */
+
+/**
+ * Three rows through the queue that serialises every push, merge and rebase.
+ *
+ * There was no branch for this route at all, so every GET fell through to `[]` and the
+ * queue photographed as "nothing has been through" on every surface that reads it. That is
+ * the worst kind of missing fixture: an empty list is a legitimate state, so the picture
+ * looked fine and simply showed a panel nobody had ever seen do anything.
+ *
+ * Two of the three want a person and one does not, which is the whole shape of the panel:
+ * `escalated` means somebody owns a conflict now (the queue working, not breaking),
+ * `blocked` is terminal without being a failure, and `succeeded` is the history kept behind
+ * them. Nothing prunes the table, so a listing is a record and not a backlog.
+ */
+export const VCS_REQUESTS: VcsRequestSummary[] = [
+  {
+    id: 412,
+    op: "merge",
+    project_id: "alpha",
+    repo_key: "C:/repos/alpha",
+    origin: "run",
+    status: "escalated",
+    created_at: ago(40 * 60 * 1000),
+  },
+  {
+    id: 409,
+    op: "push",
+    project_id: "bravo",
+    repo_key: "C:/repos/bravo-servicos-partilhados",
+    origin: "run",
+    status: "blocked",
+    created_at: ago(5 * 3600_000),
+  },
+  {
+    id: 404,
+    op: "rebase",
+    project_id: "alpha",
+    repo_key: "C:/repos/alpha",
+    origin: "owner",
+    status: "succeeded",
+    created_at: ago(1 * DAY),
+  },
 ];
 
 /**
@@ -1885,6 +1954,7 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/team-runs") return RUNS;
   if (path === "/team-triggers") return TRIGGERS;
   if (path === "/team-actions") return ACTIONS;
+  if (path === "/vcs/requests") return VCS_REQUESTS;
   if (path === "/proposals") return PROPOSALS;
   if (path === "/proposals/team-actions") return TEAM_ACTION_PROPOSALS;
   if (path === "/proposals/recruits") return RECRUITS;

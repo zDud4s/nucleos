@@ -429,20 +429,26 @@
    same colour as the wordmark and the focus ring, which the design gives to
    nothing that is a state or an action. The roster's `remove` is an action, and
    four of them in accent down the right edge were the loudest thing on a page
-   whose whole job is to say which project needs somebody. */
+   whose whole job is to say which project needs somebody.
+
+   A control needs an affordance at rest. Hue is not available: cyan is reserved
+   for links, and a tone would make an action look like a state. The affordance is
+   a hairline underline. */
 .ui-button-quiet {
   padding: 0;
   background: none;
   border-color: transparent;
   color: var(--text-faint);
   font-weight: var(--weight-regular);
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 0.2em;
 }
 
 .ui-button-quiet:hover:not(:disabled) {
   border-color: transparent;
   color: var(--text);
-  text-decoration: underline;
-  text-underline-offset: 0.2em;
+  text-decoration-color: currentColor;
 }
 
 /* Direction, as a glyph rather than as a colour — it reads the same to someone
@@ -1332,9 +1338,19 @@
   display: inline-flex;
 }
 
+/*
+  And it stays one line whatever it is given.
+
+  `white-space: nowrap` is the property the two sibling `.ui-switch-seg` already carry, and it was
+  the one difference between them and the third segment. Without it a long armed label wrapped
+  inside `.ap-project-row`'s last track and grew the row from 90.6 to 125.0 pixels — the button
+  moving out from under a pointer that has four seconds left to press it again. The label is short
+  now, and this is the guarantee that a longer one cannot bring the row back.
+*/
 .ui-switch-seg-wrap > .ui-confirm > .ui-button {
   border: 0;
   border-radius: 0;
+  white-space: nowrap;
 }
 
 /*

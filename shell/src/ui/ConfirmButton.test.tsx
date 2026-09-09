@@ -118,14 +118,28 @@ describe("ConfirmButton", () => {
     expect(onArmedChange.mock.calls.map(([armed]) => armed)).toEqual([true, false]);
   });
 
-  it("exposes armed as a pressed state, not only as a label", () => {
+  it("arming is a label swap, not a pressed state", () => {
     setup();
 
+    /*
+      This used to assert the opposite — `aria-pressed="false"` at rest, `"true"` armed.
+
+      It was wrong in the one place the attribute mattered most. Inside `ModeSwitch`'s
+      `role="group"` the two setting segments carry `aria-pressed` to mean "this is the
+      setting now", so an armed third segment announcing "pressed" told a screen reader that
+      the project was acting on its own at the exact moment it was not — the moment the
+      interlock exists to hold open. An interlock halfway through is not a state anything is
+      in, so it claims none: what is armed is said by the label, and by `.ui-confirm-armed`
+      for the eye.
+    */
     const button = screen.getByRole("button", { name: "Delete series" });
-    expect(button.getAttribute("aria-pressed")).toBe("false");
+    expect(button.getAttribute("aria-pressed")).toBeNull();
 
     fireEvent.click(button);
-    expect(screen.getByRole("button", { name: "Really delete" }).getAttribute("aria-pressed")).toBe("true");
+    const armed = screen.getByRole("button", { name: "Really delete" });
+    expect(armed.getAttribute("aria-pressed")).toBeNull();
+    // And the swap itself is still the whole signal: a different word, and the armed ring.
+    expect(armed.closest("span")?.className).toContain("ui-confirm-armed");
   });
 
   it("arming swaps only danger to danger-solid", () => {

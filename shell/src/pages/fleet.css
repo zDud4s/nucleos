@@ -472,7 +472,7 @@
   --xy-node-border: none;
   --xy-node-boxshadow-selected: 0 0 0 2px var(--focus-ring);
   --xy-edge-stroke: var(--border-strong);
-  --xy-edge-stroke-selected: var(--accent);
+  --xy-edge-stroke-selected: var(--text);
   --xy-controls-button-background-color: var(--surface-raised);
   --xy-controls-button-background-color-hover: var(--surface);
   --xy-controls-button-color: var(--text-muted);
@@ -499,7 +499,7 @@
   width: 10px;
   height: 10px;
   border: 1px solid var(--bg);
-  background: var(--accent);
+  background: var(--border-strong);
 }
 
 /* A rule in force is solid; a request still waiting is dashed and quieter,

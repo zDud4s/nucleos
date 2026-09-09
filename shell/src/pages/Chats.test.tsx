@@ -2707,9 +2707,8 @@ describe("Chats - the route and the sidebar badge", () => {
     expect(router.state.location.pathname).toBe("/chats");
     expect(screen.queryByText("Chats is not built yet")).toBeNull();
 
-    // The badge sums `waiting` across every conversation, not a row count —
-    // two chats waiting on 2 and 3 answers read as 5, not as 2.
-    expect(await screen.findByRole("link", { name: "Chats, 5 waiting" })).toBeDefined();
+    // The badge names what it counts: unread chats, not the Waiting queue.
+    expect(await screen.findByRole("link", { name: "Chats, 5 unread" })).toBeDefined();
 
     // The detail route is reached by clicking into the real page, proving it
     // too is in the real tree rather than only in a test's own two-route

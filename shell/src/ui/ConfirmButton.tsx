@@ -137,12 +137,25 @@ export function ConfirmButton({
 
   return (
     <span className={armed ? "ui-confirm ui-confirm-armed" : "ui-confirm"}>
+      {/*
+        No `aria-pressed`. Armed is a label swap plus `.ui-confirm-armed`, not a toggle.
+
+        This button used to carry `aria-pressed={armed}`, and inside `ModeSwitch`'s
+        `role="group"` that is a lie at the worst possible moment: the two setting segments
+        beside it use `aria-pressed` to mean "this IS the setting now", so an armed interlock
+        announcing "pressed" tells a screen reader the project is acting — at the one moment
+        nothing has happened yet and the whole point is that it still has to be confirmed.
+        Everywhere else the attribute was equally wrong for the same reason: an interlock
+        halfway through is not a state anything is in.
+
+        The interlock itself is untouched — arm, 300 ms dwell, 4 s window, `onArmedChange`.
+        What is armed is said by the label, which is where a caller can also read it.
+      */}
       <Button
         variant={armed && variant === "danger" ? "danger-solid" : variant}
         intent={intent}
         disabled={disabled}
         title={title}
-        aria-pressed={armed}
         onClick={handleClick}
       >
         {armed ? confirmLabel : label}

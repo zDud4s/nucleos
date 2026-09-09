@@ -77,7 +77,8 @@ export function Home() {
         <StatCard
           label="Waiting on you"
           value={waiting}
-          detail={waiting === undefined ? undefined : waiting === 0 ? "nothing waiting on you" : "decisions of every kind, in one queue"}
+          // "Every kind" was wrong: skipped items, refused actions, and calendar events are records, not held decisions.
+          detail={waiting === undefined ? undefined : waiting === 0 ? "nothing waiting on you" : "the Waiting page's seven decision lists, records aside"}
         />
         <StatCard
           label="Window spend"

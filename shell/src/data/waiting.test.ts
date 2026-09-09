@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { countWaitingDecisions } from "./waiting";
 
 describe("countWaitingDecisions", () => {
-  it("the queue's arithmetic is the six decision lists", () => {
+  it("the queue's arithmetic is the seven decision lists", () => {
     expect(
       countWaitingDecisions({
         wheel: undefined,
@@ -11,6 +11,7 @@ describe("countWaitingDecisions", () => {
         recruits: undefined,
         merges: undefined,
         exclusions: undefined,
+        git: undefined,
       }),
     ).toBeUndefined();
     expect(
@@ -21,6 +22,7 @@ describe("countWaitingDecisions", () => {
         recruits: undefined,
         merges: undefined,
         exclusions: undefined,
+        git: undefined,
       }),
     ).toBe(0);
     expect(
@@ -31,7 +33,25 @@ describe("countWaitingDecisions", () => {
         recruits: [{}],
         merges: [],
         exclusions: [{}],
+        git: [{ status: "escalated" }, { status: "blocked" }, { status: "succeeded" }],
       }),
-    ).toBe(5);
+    ).toBe(7);
+  });
+
+  it("counts only git rows that want a person", () => {
+    expect(
+      countWaitingDecisions({
+        wheel: [], approvals: [], teamActions: [], recruits: [], merges: [], exclusions: [],
+        git: [{ status: "escalated" }, { status: "blocked" }, { status: "succeeded" }, { status: "failed" }],
+      }),
+    ).toBe(2);
+  });
+
+  it("does not add parked runs, which are the run side of an action approval", () => {
+    expect(
+      countWaitingDecisions({
+        wheel: [], approvals: [{}], teamActions: [], recruits: [], merges: [], exclusions: [], git: [],
+      }),
+    ).toBe(1);
   });
 });

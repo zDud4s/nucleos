@@ -74,13 +74,43 @@ export function promotionBlocker(project: ProjectSummary, withheld: number): str
  * `wip_limit` come from the daemon. A null `wip_limit` is the ABSENCE of a ceiling and is never
  * written as a zero: "0 proposal slots" would read as a project that may do nothing, which is the
  * opposite of what no ceiling means. Same rule the spend line already follows on Home.
+ *
+ * The count is spelled "already in use" because of where the sentence is read. In a sentence about
+ * what is ABOUT to happen, "3 of 4 proposal slots" reads as an allowance being granted — as though
+ * pressing this were what hands the project three of its four slots. It is the opposite: three are
+ * spent before the decision is taken, and one is what is left. The clause has to say which of the
+ * two it is, because the tense around it cannot.
+ *
+ * Where this sentence GOES is the caller's problem and deliberately so: it is 52 characters, and
+ * inside a switch segment it wraps and grows the row under a pointer that has four seconds left to
+ * press the same button. `promotionConfirmLabel` is what the segment says; this is what the caller
+ * prints under the control.
  */
 export function promotionConsequence(project: ProjectSummary): string {
   const ceiling =
     project.wip_limit === null
       ? "no ceiling on proposals"
-      : `${String(project.open_proposals)} of ${String(project.wip_limit)} proposal slots`;
+      : `${String(project.open_proposals)} of its ${String(project.wip_limit)} proposal slots already in use`;
   return `${project.project_id} acts on its own — ${ceiling}, no approval`;
+}
+
+/**
+ * What the armed segment says: short, one line, and it names the project.
+ *
+ * The armed half of an interlock has two jobs and they pull against each other — it must not
+ * repeat the offer it replaced ("It may act on its own" was the same sentence as the button that
+ * had just been pressed), and it must fit where it is drawn. `promotionConsequence` does the first
+ * and fails the second: rendered as the label it wrapped inside `.ap-project-row`'s last track and
+ * grew the row from 90.6 to 125.0 pixels, moving the button out from under the finger about to
+ * confirm it.
+ *
+ * So the label names the project and nothing else, and the consequence is printed under the
+ * control where it has a full-width line to live on. "Let alpha act" is still not the words of the
+ * button it replaced — "Let it act" — and the difference is the one word that matters when four
+ * rows offer the same button.
+ */
+export function promotionConfirmLabel(project: ProjectSummary): string {
+  return `Let ${project.project_id} act`;
 }
 
 /**

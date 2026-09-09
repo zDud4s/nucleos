@@ -203,8 +203,17 @@ describe("MapCanvas theme utilities", () => {
     }
   });
 
-  it("uses a neutral density ramp above the DSM diagonal", () => {
-    expect(source).toContain('? "bg-text/20"');
+  it("the DSM draws both triangles on the neutral ladder and says which is heavier", () => {
+    expect(source).toContain('? "bg-text/10"');
+    expect(source).toContain('"bg-text/30"');
+    expect(source).not.toMatch(/bg-tone-danger/);
+    draw(twoGroups.modules, twoGroups.imports);
+    expect(screen.getByText(/heavier mark below/)).toBeTruthy();
+  });
+
+  it("a reversed arc is dashed and neutral, never red", () => {
+    expect(source).toContain("stroke-border-strong");
+    expect(source).not.toMatch(/stroke-danger\b/);
   });
 });
 

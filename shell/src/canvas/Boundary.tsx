@@ -105,7 +105,7 @@ export function Boundary({ modules, imports, unread, foreign, seam }: BoundaryPr
           </>
         ) : (
           <>
-            <span className="text-danger">{sides.crossing}</span> import
+            <span className="text-tone-danger-fg">{sides.crossing}</span> import
             {sides.crossing === 1 ? "" : "s"} cross between sides. Nothing here should be able to do
             that, so the walk and this drawing disagree about what a side is.
           </>
@@ -113,7 +113,7 @@ export function Boundary({ modules, imports, unread, foreign, seam }: BoundaryPr
         {sides.loose > 0 ? (
           <>
             {" "}
-            <span className="text-danger">{sides.loose}</span> import
+            <span className="text-tone-danger-fg">{sides.loose}</span> import
             {sides.loose === 1 ? " ends" : "s end"} on no file this map lists.
           </>
         ) : null}
@@ -183,7 +183,7 @@ function Routes({ seam }: { seam: Seam }) {
         <span className="text-text">{seam.matched}</span> match a route exactly.
       </p>
       {seam.unmatched.length > 0 ? (
-        <div className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2">
+        <div className="rounded-lg border border-tone-danger-border bg-tone-danger-bg px-3 py-2">
           <p className="text-sm text-text">
             {seam.unmatched.length} call{seam.unmatched.length === 1 ? "" : "s"} ask for a route this
             daemon does not serve.

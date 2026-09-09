@@ -45,6 +45,9 @@ describe("Home", () => {
     // news as seven projects holding one.
     expect(within(await card("Shadow decisions pending")).getByText("7")).toBeDefined();
     expect(within(await card("Waiting on you")).getByText("2")).toBeDefined();
+    expect((await card("Waiting on you")).textContent).toContain(
+      "the Waiting page's seven decision lists, records aside",
+    );
     expect(within(await card("Window spend")).getByText("$1.42")).toBeDefined();
 
     // Five now, and the fifth is not a fifth reading of §6.1: "Subsystems healthy" is

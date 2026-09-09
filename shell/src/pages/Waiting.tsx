@@ -12,6 +12,7 @@ import {
 } from "../data/teams";
 import {
   VCS_LIST_LIMIT,
+  VCS_WANTS_A_PERSON,
   countWaitingDecisions,
   useActionApprovals,
   useApproveProposal,
@@ -155,6 +156,7 @@ export function Waiting() {
     recruits: recruits.rows,
     merges: merges.rows,
     exclusions: exclusions.rows,
+    git: vcs.rows,
   });
   const records = countOf(skipped.rows, refused.rows);
 
@@ -1524,8 +1526,6 @@ function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
  * tree and submit again. Both need a person; neither is red. `ui/state-map.ts`
  * holds the tones.
  */
-const VCS_WANTS_A_PERSON = ["escalated", "blocked"];
-
 /** How much history to show behind the rows that want a person. */
 const VCS_RECENT = 5;
 

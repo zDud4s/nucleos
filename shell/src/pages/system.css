@@ -71,7 +71,7 @@
 
 .sy-tab-active {
   color: var(--text);
-  border-bottom-color: var(--accent);
+  border-bottom-color: var(--border-strong);
 }
 
 /* ------------------------------------------------------------------ health == */

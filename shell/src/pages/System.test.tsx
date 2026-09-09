@@ -282,6 +282,33 @@ function rowFor(list: HTMLElement, name: string): HTMLElement {
 /* ---------------------------------------------------------------- health -- */
 
 describe("System - health readout", () => {
+  it("the headline says what is wrong in the tone for wrong", async () => {
+    const world = systemWorld({
+      readout: {
+        status: "degraded",
+        subsystems: [
+          { name: "sqlite_pool", status: "down" },
+          { name: "cli_binary", status: "degraded" },
+        ],
+      },
+    });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystem();
+
+    expect((await screen.findByText("1 down, 1 degraded")).className).toContain("ui-wrong");
+  });
+
+  it("leaves a healthy headline untoned", async () => {
+    daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
+
+    await renderSystem();
+
+    expect((await screen.findByText("every configured subsystem is healthy")).className).not.toContain(
+      "ui-wrong",
+    );
+  });
+
   it("renders the daemon's subsystems in order with reason and keeps disabled apart from down", async () => {
     const world = systemWorld({
       readout: {

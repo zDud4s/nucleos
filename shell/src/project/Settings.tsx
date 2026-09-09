@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
   SHADOW_EVIDENCE_MODE,
@@ -11,6 +12,7 @@ import {
   MODE_MEANING,
   MODE_SENTENCES,
   promotionBlocker,
+  promotionConfirmLabel,
   promotionConsequence,
 } from "../lib/mode";
 import { ModeSwitch } from "../ui";
@@ -92,6 +94,14 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
   const refused = setMode.isError && isApiRefusal(setMode.error) ? setMode.error : null;
   const withheld = project.withheld_classes_ready ?? 0;
   const blocker = promotionBlocker(project, withheld);
+  /**
+   * Whether the third segment is armed, so this block can say what confirming it would do.
+   *
+   * The sentence is not the armed label any more: 52 characters inside a switch segment wrap,
+   * and a control that grows while you are deciding moves the button away from the pointer that
+   * has four seconds to press it again. It goes under the switch, where nothing above it moves.
+   */
+  const [armed, setArmed] = useState(false);
 
   function change(mode: AutopilotMode) {
     setMode.mutate({
@@ -109,10 +119,17 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
       <ModeSwitch
         value={project.mode}
         actAllowed={project.promotable}
-        actConfirmLabel={promotionConsequence(project)}
+        actArmedLabel={promotionConfirmLabel(project)}
+        onArmedChange={setArmed}
         busy={setMode.isPending}
         onChoose={change}
       />
+
+      {/* Immediately under the switch and above everything else this block says, so arming
+          pushes the standing copy down rather than moving the button itself. */}
+      {armed ? (
+        <p className="text-xs text-text-muted">{promotionConsequence(project)}</p>
+      ) : null}
 
       <p className="text-xs text-text-muted">{MODE_MEANING[project.mode]}.</p>
 

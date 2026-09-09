@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
@@ -100,7 +100,7 @@ export function System() {
 
   return (
     <>
-      <PageHeader title="System" headline={headlineFor(health.data)} />
+      <PageHeader title="System" headline={headlineNodeFor(health.data)} />
       <ViewTabs view={view} />
       <div className="sy-sections">
         {view === "health" && (
@@ -135,6 +135,22 @@ export function headlineFor(readout: HealthReadout | undefined): string | undefi
   if (down > 0) parts.push(`${String(down)} down`);
   if (degraded > 0) parts.push(`${String(degraded)} degraded`);
   return parts.join(", ");
+}
+
+export function headlineNodeFor(readout: HealthReadout | undefined): ReactNode {
+  if (readout === undefined) return undefined;
+  if (isAggregateTimeout(readout))
+    return "the health readout timed out before it measured anything";
+  const down = readout.subsystems.filter((row) => row.status === "down").length;
+  const degraded = readout.subsystems.filter(
+    (row) => row.status === "degraded",
+  ).length;
+  if (down === 0 && degraded === 0)
+    return "every configured subsystem is healthy";
+  const parts: string[] = [];
+  if (down > 0) parts.push(`${String(down)} down`);
+  if (degraded > 0) parts.push(`${String(degraded)} degraded`);
+  return <span className="ui-wrong">{parts.join(", ")}</span>;
 }
 
 function ViewTabs({ view }: { view: SystemView }) {

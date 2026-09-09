@@ -1170,7 +1170,7 @@
  */
 .chats-turn-lit {
   border-radius: var(--radius-md);
-  outline: 2px solid var(--accent-quiet);
+  outline: 2px solid var(--border-strong);
   outline-offset: var(--space-3);
   animation: chats-turn-lit-out 2500ms ease-out both;
 }
