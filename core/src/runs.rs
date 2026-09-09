@@ -440,13 +440,15 @@ pub async fn create_run(
         // which is what every run they have ever made carried.
         create_run_with(
             &state,
-            req.prompt,
-            req.project_id,
-            req.cwd,
-            &req.mode,
-            req.steerable,
-            None,
-            req.permission_mode,
+            NewRun {
+                prompt: req.prompt,
+                project_id: req.project_id,
+                cwd: req.cwd,
+                mode: &req.mode,
+                steerable: req.steerable,
+                provisioning: None,
+                permission_mode: req.permission_mode,
+            },
         )
         .await
     })
@@ -2107,17 +2109,27 @@ pub async fn create_run_inner(
     mode: &str,
     steerable: bool,
 ) -> Result<i64, CreateRunError> {
-    create_run_with(state, prompt, project_id, cwd, mode, steerable, None, None).await
+    create_run_with(
+        state,
+        NewRun {
+            prompt,
+            project_id,
+            cwd,
+            mode,
+            steerable,
+            provisioning: None,
+            permission_mode: None,
+        },
+    )
+    .await
 }
 
 /// Starts the one run that is given its work already staged: a merge conflict, put there by the
 /// daemon, in a worktree born on the branch the merge was going into.
 ///
-/// `mode = "worktree"` and nothing else, like every other autonomous run that touches code — it
-/// carries the tool policy, the gate, and migration 0009's exclusivity, none of which a fourth mode
-/// would inherit. Never steerable, for `create_job_node_run`'s reason and one of its own: the work
-/// is a conflict the queue found, and text typed into it mid-flight would change what gets published
-/// with nothing recording the substitution.
+/// Shape and shared reasoning in [`NewRun::provisioned`]. Its "never steerable" holds here for one
+/// reason of its own besides: the work is a conflict the queue found, and text typed into it
+/// mid-flight would change what gets published with nothing recording the substitution.
 pub async fn create_resolution_run(
     state: &AppState,
     prompt: String,
@@ -2127,27 +2139,22 @@ pub async fn create_resolution_run(
 ) -> Result<i64, CreateRunError> {
     create_run_with(
         state,
-        prompt,
-        Some(project_id),
-        Some(project_root),
-        "worktree",
-        false,
-        Some(Provisioning::Resolution(resolution)),
-        // No rung asked for. A job's node and item, and the queue's conflict resolution, are
-        // started by the daemon rather than by a caller who could have an opinion — and the
-        // park is the RIGHT answer for them: `a_park_here_would_only_destroy` already refuses
-        // the cases where it is not, on evidence, and a blanket rung here would take that
-        // judgement away from it.
-        None,
+        NewRun::provisioned(
+            prompt,
+            project_id,
+            project_root,
+            Provisioning::Resolution(resolution),
+        ),
     )
     .await
 }
 
 /// Starts one node of a job inside that job's existing worktree.
 ///
-/// Deliberately `mode = "worktree"` rather than a mode of its own: `plan_only`, the tool policy,
-/// `max_attempts` and migration 0009's exclusivity index all branch on `mode`, and a fourth value
-/// would have to be excluded from each of them. Missing one would be silent.
+/// Shape and shared reasoning in [`NewRun::provisioned`]. Its `mode = "worktree"` is deliberate
+/// rather than a mode of its own: `plan_only`, the tool policy, `max_attempts` and migration 0009's
+/// exclusivity index all branch on `mode`, and a fourth value would have to be excluded from each
+/// of them. Missing one would be silent.
 pub async fn create_job_node_run(
     state: &AppState,
     prompt: String,
@@ -2157,22 +2164,7 @@ pub async fn create_job_node_run(
 ) -> Result<i64, CreateRunError> {
     create_run_with(
         state,
-        prompt,
-        Some(project_id),
-        Some(project_root),
-        "worktree",
-        // Never steerable. A node is one step of a plan the job is executing, and text typed into it
-        // mid-flight would change what that step does with nothing recording the substitution — the
-        // queue would still claim the item it was given. Steering belongs to a run somebody started
-        // and is watching.
-        false,
-        Some(Provisioning::Node(node)),
-        // No rung asked for. A job's node and item, and the queue's conflict resolution, are
-        // started by the daemon rather than by a caller who could have an opinion — and the
-        // park is the RIGHT answer for them: `a_park_here_would_only_destroy` already refuses
-        // the cases where it is not, on evidence, and a blanket rung here would take that
-        // judgement away from it.
-        None,
+        NewRun::provisioned(prompt, project_id, project_root, Provisioning::Node(node)),
     )
     .await
 }
@@ -2193,18 +2185,7 @@ pub async fn create_job_item_run(
 ) -> Result<i64, CreateRunError> {
     create_run_with(
         state,
-        prompt,
-        Some(project_id),
-        Some(project_root),
-        "worktree",
-        false,
-        Some(Provisioning::Item(item)),
-        // No rung asked for. A job's node and item, and the queue's conflict resolution, are
-        // started by the daemon rather than by a caller who could have an opinion — and the
-        // park is the RIGHT answer for them: `a_park_here_would_only_destroy` already refuses
-        // the cases where it is not, on evidence, and a blanket rung here would take that
-        // judgement away from it.
-        None,
+        NewRun::provisioned(prompt, project_id, project_root, Provisioning::Item(item)),
     )
     .await
 }
@@ -2329,16 +2310,68 @@ async fn no_room_on_disk(project_root: &std::path::Path) -> Option<String> {
     })
 }
 
-async fn create_run_with(
-    state: &AppState,
+/// Everything a new run IS, apart from the daemon it is created in.
+///
+/// **One argument and not seven, and the lint that asked for this was right about more than
+/// counting.** Four of the callers below pass the same five values in the same order, three of
+/// them pass a literal `"worktree"`, `false`, and a `None` carrying six lines of explanation
+/// apiece — repeated verbatim, three times, because there was nowhere else to put it. A struct
+/// gives the shared shape a name ([`NewRun::provisioned`]) and the shared reasoning one home.
+struct NewRun<'a> {
     prompt: String,
     project_id: Option<String>,
     cwd: Option<String>,
-    mode: &str,
+    mode: &'a str,
     steerable: bool,
     provisioning: Option<Provisioning>,
     permission_mode: Option<crate::chats::PermissionMode>,
-) -> Result<i64, CreateRunError> {
+}
+
+impl NewRun<'static> {
+    /// The shape the daemon starts its OWN work in: a job's node, a job's item, and the queue's
+    /// conflict resolution. All three agree on every field but the provisioning, and the agreement
+    /// is not a coincidence -- each one is the daemon acting on a plan it already holds.
+    ///
+    /// `mode = "worktree"` and nothing else, like every other autonomous run that touches code: it
+    /// carries the tool policy, the gate, and migration 0009's exclusivity, none of which a fourth
+    /// mode would inherit.
+    ///
+    /// Never steerable. Each is one step of a plan already agreed, and text typed into it mid-flight
+    /// would change what that step does with nothing recording the substitution -- the queue would
+    /// still claim the item it was given. Steering belongs to a run somebody started and is watching.
+    ///
+    /// No rung asked for. These are started by the daemon rather than by a caller who could have an
+    /// opinion -- and the park is the RIGHT answer for them: `a_park_here_would_only_destroy`
+    /// already refuses the cases where it is not, on evidence, and a blanket rung here would take
+    /// that judgement away from it.
+    fn provisioned(
+        prompt: String,
+        project_id: String,
+        project_root: String,
+        provisioning: Provisioning,
+    ) -> Self {
+        Self {
+            prompt,
+            project_id: Some(project_id),
+            cwd: Some(project_root),
+            mode: "worktree",
+            steerable: false,
+            provisioning: Some(provisioning),
+            permission_mode: None,
+        }
+    }
+}
+
+async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, CreateRunError> {
+    let NewRun {
+        prompt,
+        project_id,
+        cwd,
+        mode,
+        steerable,
+        provisioning,
+        permission_mode,
+    } = run;
     let node = provisioning.as_ref().and_then(Provisioning::node);
     let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
     let item = provisioning.as_ref().and_then(Provisioning::item);
