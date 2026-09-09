@@ -6,12 +6,17 @@ const moduleUrl = import.meta.url.startsWith("file:") ? import.meta.url : `file:
 const css = readFileSync(fileURLToPath(new URL("../ui.css", moduleUrl)), "utf8");
 const start = css.indexOf(".ui-button-quiet {");
 const block = css.slice(start, css.indexOf("}", start) + 1);
+const askStart = css.indexOf(".ui-quiet-ask {");
+const askBlock = css.slice(askStart, css.indexOf("}", askStart) + 1);
 
 describe("ui-button-quiet", () => {
-  it("the quiet variant has an affordance at rest and it is not a hue", () => {
-    expect(block).toContain("text-decoration: underline");
-    expect(block).toContain("var(--border-strong)");
-    expect(block).not.toContain("var(--accent");
-    expect(block).not.toContain("var(--tone-");
+  it("one quiet treatment", () => {
+    for (const treatment of [block, askBlock]) {
+      expect(treatment).toContain("text-decoration: underline");
+      expect(treatment).toContain("var(--border-strong)");
+      expect(treatment).toContain("var(--text-muted)");
+      expect(treatment).not.toContain("var(--accent");
+      expect(treatment).not.toContain("var(--tone-");
+    }
   });
 });

@@ -424,11 +424,12 @@
   outline-offset: -2px;
 }
 
-/* Where you already are. The same accent the rail's current row uses, so "here"
-   looks like one thing in both places rather than two. */
+/* Where you already are. The same quiet fill the rail's current row uses, so "here"
+   looks like one thing in both places rather than two. The fill is identity and stays;
+   the label, glyph, and bar are structure and come off the cyan ladder. */
 .nav-switch-item[aria-current] {
   background: var(--accent-quiet);
-  color: var(--accent);
+  color: var(--text);
   font-weight: var(--weight-medium);
 }
 
@@ -811,6 +812,7 @@
  *
  * The bar itself is drawn in the motion section at the end of this file — it used
  * to be `box-shadow: inset 2px 0 0`, and a shadow has no geometry to grow from.
+ * The quiet fill is identity and stays; label, glyph, and bar are neutral structure.
  */
 .nav-item-active {
   background: var(--accent-quiet);
@@ -869,7 +871,7 @@
 
 .nav-item-active .nav-glyph,
 .nav-item-active .nav-icon {
-  color: var(--accent);
+  color: var(--text);
 }
 
 .nav-label {
@@ -1557,12 +1559,15 @@
   }
 }
 
+/* `--text`, not `--border-strong`: this is the "you are here" edge, which has to read
+   at the edge of vision. The row already lifts its label to `--text`; a marker dimmer
+   than the row it marks is not a marker. */
 .nav-item-active::before {
   content: "";
   position: absolute;
   inset: 0 auto 0 0;
   width: 2px;
-  background: var(--accent);
+  background: var(--text);
   animation: nav-here var(--nav-settle) var(--nav-ease);
 }
 

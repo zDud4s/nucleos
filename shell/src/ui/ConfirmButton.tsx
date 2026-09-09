@@ -56,6 +56,14 @@ export interface ConfirmButtonProps {
   intent?: ButtonIntent;
   disabled?: boolean;
   title?: string;
+  /**
+   * An element that says what confirming would do, named for a screen reader.
+   *
+   * The interlock's own label is short by construction — inside `ModeSwitch` it is a segment
+   * of a fixed track — so the consequence is the caller's to render and the caller's to point
+   * at. Passed straight through as `aria-describedby`.
+   */
+  describedBy?: string;
 }
 
 /**
@@ -75,6 +83,7 @@ export function ConfirmButton({
   intent,
   disabled,
   title,
+  describedBy,
 }: ConfirmButtonProps) {
   const [armed, setArmed] = useState(false);
   // A ref rather than state: the dwell must not cause a render, and the click
@@ -83,6 +92,16 @@ export function ConfirmButton({
   const dwelling = useRef(false);
   const dwellTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disarmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // What a screen reader is told, and the only channel that carries it: the label swap is
+  // silent to anyone not looking at the button, and the 4 s window used to expire without a
+  // word. Prefixed rather than bare so it is not a second copy of the label on the page —
+  // `getByText` matches on the whole string, and two exact matches would be ambiguous.
+  const [said, setSaid] = useState("");
+  const armedSaid =
+    typeof confirmLabel === "string"
+      ? `armed: ${confirmLabel} — press again to confirm`
+      : "armed — press again to confirm";
 
   function clearTimers() {
     if (dwellTimer.current !== null) {
@@ -110,12 +129,14 @@ export function ConfirmButton({
     clearTimers();
     setArmed(false);
     onArmedChange?.(false);
+    setSaid("disarmed — nothing changed");
   }
 
   function handleClick() {
     if (!armed) {
       setArmed(true);
       onArmedChange?.(true);
+      setSaid(armedSaid);
       dwelling.current = true;
       dwellTimer.current = setTimeout(() => {
         dwellTimer.current = null;
@@ -132,6 +153,10 @@ export function ConfirmButton({
     clearTimers();
     setArmed(false);
     onArmedChange?.(false);
+    // A confirm is not an expiry: the action is about to happen, so there is nothing to
+    // report about it not happening. Clearing rather than announcing keeps the region for
+    // the one event that is otherwise silent.
+    setSaid("");
     onConfirm();
   }
 
@@ -156,10 +181,21 @@ export function ConfirmButton({
         intent={intent}
         disabled={disabled}
         title={title}
+        aria-describedby={describedBy}
         onClick={handleClick}
       >
         {armed ? confirmLabel : label}
       </Button>
+      {/*
+        Said, not shown. `base.css`'s `.sr-only` rather than a `.ui-*` twin: `ui.css` already
+        carries one copy of those ten lines (`.ui-field-said`, owned by `Field`) and a third
+        would be the duplication this app keeps paying for. `role="status"` is the house idiom
+        for a polite region — 58 sites use it — and it is absolutely positioned, so it cannot
+        move the button it belongs to.
+      */}
+      <span className="sr-only" role="status">
+        {said}
+      </span>
     </span>
   );
 }

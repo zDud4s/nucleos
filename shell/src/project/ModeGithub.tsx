@@ -497,14 +497,11 @@ function AutonomousOps({ projectId }: { projectId: string }) {
                 <span className="rounded-pill border border-border bg-surface-sunken px-2 py-0.5 font-mono text-xs text-text-muted">
                   {kind}
                 </span>
-                <button
-                  type="button"
-                  disabled={pending}
-                  onClick={() => toggle(kind, false)}
-                  className="ml-auto text-xs text-text-faint underline-offset-2 hover:underline disabled:opacity-40"
-                >
-                  withdraw
-                </button>
+                <span className="ml-auto">
+                  <Button variant="quiet" disabled={pending} onClick={() => toggle(kind, false)}>
+                    withdraw
+                  </Button>
+                </span>
               </li>
             ))}
           </ul>
@@ -594,14 +591,11 @@ function OpHalf({
                     and, worse, captioned as though nothing were stored.
                   */}
                   {declared.has(op.kind) ? (
-                    <button
-                      type="button"
-                      disabled={pending}
-                      onClick={() => onToggle(op.kind, false)}
-                      className="ml-auto text-xs text-text-faint underline-offset-2 hover:underline disabled:opacity-40"
-                    >
-                      withdraw
-                    </button>
+                    <span className="ml-auto">
+                      <Button variant="quiet" disabled={pending} onClick={() => onToggle(op.kind, false)}>
+                        withdraw
+                      </Button>
+                    </span>
                   ) : null}
                 </>
               )}
@@ -798,22 +792,14 @@ function RuleList({
                 */}
                 declared {declaredDay(rule.created_at)}
               </span>
-              <button
-                type="button"
-                disabled={pending}
-                onClick={() => onFlip(rule)}
-                className="ml-auto text-xs text-text-faint underline-offset-2 hover:underline disabled:opacity-40"
-              >
+              <span className="ml-auto">
+                <Button variant="quiet" disabled={pending} onClick={() => onFlip(rule)}>
                 {rule.verdict === "allow" ? "refuse it instead" : "allow it instead"}
-              </button>
-              <button
-                type="button"
-                disabled={pending}
-                onClick={() => onForget(rule.prefix)}
-                className="text-xs text-text-faint underline-offset-2 hover:underline disabled:opacity-40"
-              >
+                </Button>
+              </span>
+              <Button variant="quiet" disabled={pending} onClick={() => onForget(rule.prefix)}>
                 forget
-              </button>
+              </Button>
             </li>
           ))}
         </ul>
@@ -1045,14 +1031,15 @@ function LandTargets({ projectId }: { projectId: string }) {
             className="flex flex-wrap items-baseline gap-2 text-sm"
           >
             <span className="font-mono text-xs text-text">{target}</span>
-            <button
-              type="button"
-              disabled={close.isPending}
-              onClick={() => close.mutate({ projectId, branch: target })}
-              className="ml-auto text-xs text-text-faint underline-offset-2 hover:underline disabled:opacity-40"
-            >
-              close
-            </button>
+            <span className="ml-auto">
+              <Button
+                variant="quiet"
+                disabled={close.isPending}
+                onClick={() => close.mutate({ projectId, branch: target })}
+              >
+                close
+              </Button>
+            </span>
           </li>
         ))}
       </ul>

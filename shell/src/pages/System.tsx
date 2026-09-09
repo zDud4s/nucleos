@@ -374,9 +374,7 @@ function ScopedKillsPanel() {
                 <span className="sy-project-brake-name">
                   {project.project_id}
                 </span>
-                <Badge tone={engaged ? "paused" : "active"}>
-                  {engaged ? "held" : "running"}
-                </Badge>
+                <StateBadge domain="brake" state={engaged ? "held" : "released"} />
                 <Button
                   variant="ghost"
                   intent={engaged ? "go" : "stop"}
@@ -1056,12 +1054,8 @@ function EmailConfigFacts({ config }: { config: EmailConfig }) {
   return (
     <>
       <div className="sy-config-flags">
-        <Badge tone={config.enabled ? "active" : "off"}>
-          {config.enabled ? "enabled" : "disabled"}
-        </Badge>
-        <Badge tone={config.armed ? "active" : "paused"}>
-          {config.armed ? "armed" : "unarmed"}
-        </Badge>
+        <StateBadge domain="setting" state={config.enabled ? "enabled" : "disabled"} />
+        <StateBadge domain="setting" state={config.armed ? "armed" : "unarmed"} />
       </div>
       <dl className="sy-config-facts">
         <ConfigFact term="host" value={config.host} />
@@ -1116,9 +1110,7 @@ function VoiceConfigFacts({ config }: { config: VoiceConfig }) {
   return (
     <>
       <div className="sy-config-flags">
-        <Badge tone={config.armed ? "active" : "paused"}>
-          {config.armed ? "armed" : "unarmed"}
-        </Badge>
+        <StateBadge domain="setting" state={config.armed ? "armed" : "unarmed"} />
       </div>
       <dl className="sy-config-facts">
         <ConfigFact term="hotkey" value={config.hotkey} />

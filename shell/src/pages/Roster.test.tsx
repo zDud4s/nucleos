@@ -371,3 +371,13 @@ describe("a project leaving the roster", () => {
     expect(screen.getByRole("group", { name: "Remove two from NucleOS" })).toBeTruthy();
   });
 });
+
+describe("Roster - map-authored readings", () => {
+  it("the mode mark on the name comes from the map", async () => {
+    await openRoster([fine("alpha", { mode: "active" })]);
+    const row = await screen.findByRole("rowheader", { name: /alpha/ });
+    const badge = within(row).getByText("active");
+    expect(badge.textContent).toBe("active");
+    expect(badge.className).toContain("ui-badge-active");
+  });
+});

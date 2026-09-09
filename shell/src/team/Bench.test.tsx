@@ -430,3 +430,23 @@ describe("Bench - Work", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 });
+
+describe("Bench - map-authored readings", () => {
+  it("an armed routine is a setting, not work in flight", async () => {
+    await renderBench({ team: teamView(), triggers: [teamTrigger({ enabled: 1 })] });
+    const badge = within(await openTab("Routines")).getByText("armed");
+    expect(badge.className).toContain("ui-badge-info");
+    expect(badge.className).not.toContain("ui-badge-active");
+  });
+
+  it("the bench head says waiting, the one word Teams says", async () => {
+    const run = teamRun({ state: "done" });
+    const action: TeamAction = { id: 1, team_run_id: run.id, ordinal: null, kind: "send_email", payload: "{}", why: "needs a reply", proposal_id: 1, state: "pending", error: null, created_at: "2026-08-24T09:10:00Z", executed_at: null };
+    await renderBench({ team: teamView(), runs: [run], actions: [action] });
+    const head = (await screen.findByRole("heading", { level: 1 })).closest("header");
+    if (head === null) throw new Error("no bench head");
+    const badge = within(head).getByText("waiting");
+    expect(badge.textContent).toBe("waiting");
+    expect(within(head).queryByText("waiting on you")).toBeNull();
+  });
+});

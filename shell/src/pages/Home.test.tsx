@@ -46,7 +46,7 @@ describe("Home", () => {
     expect(within(await card("Shadow decisions pending")).getByText("7")).toBeDefined();
     expect(within(await card("Waiting on you")).getByText("2")).toBeDefined();
     expect((await card("Waiting on you")).textContent).toContain(
-      "the Waiting page's seven decision lists, records aside",
+      "decisions held for you — not records, and not the calendar",
     );
     expect(within(await card("Window spend")).getByText("$1.42")).toBeDefined();
 
@@ -67,6 +67,21 @@ describe("Home", () => {
 
     expect(within(await card("Waiting on you")).getByText("2")).toBeDefined();
     expect((await screen.findByText(/2 waiting on you/)).textContent).toMatch(/; 2 waiting on you$/);
+  });
+
+  it("the waiting card says what the number is", async () => {
+    daemon.apiFetch.mockImplementation(daemonFetch(daemonState({ proposals: [proposal({ id: 1 })] })));
+
+    await renderWithRouter(<Home />);
+
+    expect((await card("Waiting on you")).textContent).toContain(
+      "decisions held for you — not records, and not the calendar",
+    );
+    const door = screen
+      .getAllByRole("link", { name: "Waiting" })
+      .find((link) => link.closest("p") !== null)
+      ?.closest("p");
+    expect(door?.textContent).toContain("every decision that stopped to ask you something, in one queue");
   });
 
   it("reads an absent ceiling as no ceiling, never as zero", async () => {

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
   SHADOW_EVIDENCE_MODE,
@@ -102,6 +102,8 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
    * has four seconds to press it again. It goes under the switch, where nothing above it moves.
    */
   const [armed, setArmed] = useState(false);
+  /** The id the armed switch points at, so the sentence is read as the button's description. */
+  const consequenceId = useId();
 
   function change(mode: AutopilotMode) {
     setMode.mutate({
@@ -121,6 +123,7 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
         actAllowed={project.promotable}
         actArmedLabel={promotionConfirmLabel(project)}
         onArmedChange={setArmed}
+        actDescribedBy={armed ? consequenceId : undefined}
         busy={setMode.isPending}
         onChoose={change}
       />
@@ -128,7 +131,9 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
       {/* Immediately under the switch and above everything else this block says, so arming
           pushes the standing copy down rather than moving the button itself. */}
       {armed ? (
-        <p className="text-xs text-text-muted">{promotionConsequence(project)}</p>
+        <p className="text-xs text-text-muted" id={consequenceId}>
+          {promotionConsequence(project)}
+        </p>
       ) : null}
 
       <p className="text-xs text-text-muted">{MODE_MEANING[project.mode]}.</p>
@@ -139,7 +144,7 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
         about something that is not happening.
       */}
       {project.mode !== "active" ? (
-        <p className={project.promotable ? "text-xs text-tone-active-fg" : "text-xs text-text-faint"}>
+        <p className={project.promotable ? "text-xs text-text-muted" : "text-xs text-text-faint"}>
           {project.promotable
             ? "every class it has exercised clears the bar, and at least one is a class the classifier withheld — it has earned this"
             : blocker}

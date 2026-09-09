@@ -591,17 +591,18 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
  * **No figures.** It used to read "still going; $0.0310 spent; gate passed", and all
  * three of those are readings that belong in the strip below it, drawn as themselves:
  * a spend written into a sentence cannot be compared with the spend on the run before,
- * and a semicolon list of three states is a table somebody typed out. What is left is
- * the one thing that is genuinely prose — what this run was for, and where it ran.
+ * and a semicolon list of three states is a table somebody typed out. Terminal states use the
+ * map's label with no verb in front; only a live run needs the prose "still going". What is left
+ * is the one thing that is genuinely prose — what this run was for, and where it ran.
  */
 function headline(run: Run): string {
-  // "ended completed" was the commonest state describing itself twice.
+  // One vocabulary for one state: the map's label, with no verb in front of it.
+  // "ended completed" described itself twice and "finished" was a second word for
+  // a state the badge two lines below already names. A terminal state IS the
+  // sentence; a run still going is the only one that needs a verb.
   const state = runIsAlive(run.status)
     ? "still going"
-    : (() => {
-        const label = readState("run", run.status)?.label ?? run.status;
-        return run.status === "completed" ? "finished" : `ended ${label}`;
-      })();
+    : (readState("run", run.status)?.label ?? run.status);
   const where = run.project_id === null ? "no project" : `in ${run.project_id}`;
   return `${state}, ${where}`;
 }

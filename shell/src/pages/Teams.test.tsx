@@ -607,3 +607,28 @@ describe("Teams - the real route", () => {
     expect(screen.queryByText(/not yet wired/i)).toBeNull();
   });
 });
+
+describe("Teams - map-authored readings", () => {
+  it("a department's state is one word from the map", async () => {
+    const team = teamView({ id: "financas", name: "FinanÃ§as" });
+    const done = teamRun({ id: "run-1", team_id: "financas", state: "done" });
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [team], runs: [done], actions: [teamAction()] }));
+    await renderTeams();
+    const row = within(await departments()).getAllByRole("row")[1];
+    const badge = within(row).getByText("waiting");
+    expect(badge.textContent).toBe("waiting");
+    expect(badge.className).toContain("ui-badge-pending");
+    expect(within(row).queryByText("waiting on you")).toBeNull();
+  });
+
+  it("the spend meter does not ask anything of you", async () => {
+    const team = teamView({ budget_usd: 5, max_live_runs: 1 });
+    const live = teamRun({ id: "run-1", state: "working" });
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [team], runs: [live], runViews: { "run-1": { ...live, items: [], cost_usd: 1.2 } } }));
+    await renderTeams();
+    const meter = await screen.findByRole("img", { name: "spent on this task: $1.20 of $5.00" });
+    const gauge = meter.closest(".ui-gauge");
+    expect(gauge?.className).toContain("ui-gauge-active");
+    expect(gauge?.className).not.toContain("ui-gauge-pending");
+  });
+});

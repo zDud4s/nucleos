@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { ModeSwitch } from "./ModeSwitch";
@@ -229,5 +230,88 @@ describe("ModeSwitch", () => {
     fireEvent.click(screen.getByRole("button", { name: LABEL }));
     expect(onArmedChange.mock.calls.map(([armed]) => armed)).toEqual([true, false]);
     expect(onChoose).toHaveBeenCalledWith("active");
+  });
+
+  /**
+   * And the sentence it prints is the armed button's description.
+   *
+   * `onArmedChange` puts the consequence on the page; this is the other half — the armed
+   * segment naming it, so a screen reader hears what confirming would do instead of a
+   * two-word label and a paragraph it has no reason to associate with the button.
+   *
+   * Rendered through a caller rather than by passing `actDescribedBy` directly, because the
+   * conditionality is the caller's: the element only exists while armed, and an
+   * `aria-describedby` pointing at an id that is not in the document describes nothing.
+   */
+  it("the armed segment is described only while armed", () => {
+    function Caller() {
+      const [armed, setArmed] = useState(false);
+      return (
+        <>
+          <ModeSwitch
+            value="shadow"
+            actAllowed
+            actArmedLabel={LABEL}
+            onArmedChange={setArmed}
+            actDescribedBy={armed ? "consequence" : undefined}
+            onChoose={vi.fn()}
+          />
+          {armed ? <p id="consequence">alpha acts on its own — 3 of 4 proposal slots</p> : null}
+        </>
+      );
+    }
+
+    render(<Caller />);
+
+    // At rest there is nothing to point at, and the attribute is absent rather than empty.
+    const offer = screen.getByRole("button", { name: "Let it act" });
+    expect(offer.getAttribute("aria-describedby")).toBeNull();
+
+    fireEvent.click(offer);
+
+    const armed = screen.getByRole("button", { name: LABEL });
+    expect(armed.getAttribute("aria-describedby")).toBe("consequence");
+    // And the id resolves: a description that names a missing element is worse than none,
+    // because it reads as a control that was described and cannot be.
+    expect(document.getElementById("consequence")?.textContent).toContain(
+      "alpha acts on its own",
+    );
+
+    // The window closes, the sentence goes, and the attribute goes with it.
+    act(() => {
+      vi.advanceTimersByTime(4000);
+    });
+    expect(
+      screen.getByRole("button", { name: "Let it act" }).getAttribute("aria-describedby"),
+    ).toBeNull();
+    expect(document.getElementById("consequence")).toBeNull();
+  });
+
+  /**
+   * The armed ring is drawn INSIDE the button, because the track it sits in clips.
+   *
+   * `.ui-confirm-armed > .ui-button` puts a 3px ring outside the button, and `.ui-switch`
+   * carries `overflow: hidden` so that three segments read as one box — so in here the outer
+   * ring was cut off entirely and the armed segment looked exactly like the green segment it
+   * had been a moment earlier. jsdom applies no stylesheet, so the sheet is the only place
+   * this claim can be made; the `overflow: hidden` half is asserted too, because an inset
+   * ring is only the right answer while the track still clips.
+   */
+  it("the armed ring is inset, because the track clips", () => {
+    const ui = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "ui.css"), "utf8");
+
+    const inside =
+      /\.ui-switch-seg-wrap\s*>\s*\.ui-confirm-armed\s*>\s*\.ui-button\s*\{([^}]*)\}/.exec(ui);
+    expect(inside).not.toBeNull();
+    expect(inside?.[1]).toMatch(/box-shadow:\s*inset\s+0\s+0\s+0\s+2px\s+var\(--text\)/);
+
+    const track = /\.ui-switch\s*\{([^}]*)\}/.exec(ui);
+    expect(track).not.toBeNull();
+    expect(track?.[1]).toMatch(/overflow:\s*hidden/);
+
+    // The outer ring is untouched — everywhere that is not a track, it is still the one
+    // that draws.
+    const outside = /\.ui-confirm-armed\s*>\s*\.ui-button\s*\{([^}]*)\}/.exec(ui);
+    expect(outside?.[1]).toMatch(/box-shadow:\s*0\s+0\s+0\s+3px/);
   });
 });

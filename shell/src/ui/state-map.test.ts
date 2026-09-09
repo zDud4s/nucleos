@@ -32,4 +32,18 @@ describe("state tones", () => {
     }
     expect(readState("errand", "done")?.tone).toBe("off");
   });
+
+  it("a brake, a setting and a department read as facts, never as work in flight", () => {
+    for (const [domain, state, tone, label] of [
+      ["brake", "held", "paused", "held"], ["brake", "released", "off", "released"], ["brake", "not_read", "off", "not read"],
+      ["setting", "enabled", "info", "enabled"], ["setting", "disabled", "off", "disabled"], ["setting", "armed", "info", "armed"],
+      ["setting", "unarmed", "off", "unarmed"], ["setting", "disarmed", "off", "disarmed"],
+      ["department", "working", "active", "at work"], ["department", "waiting", "pending", "waiting"], ["department", "idle", "off", "idle"],
+    ] as const) {
+      const reading = readState(domain, state);
+      expect(reading?.tone, `${domain}.${state}`).toBe(tone);
+      expect(reading?.label, `${domain}.${state}`).toBe(label);
+    }
+    expect(readState("department", "waiting")?.label).not.toContain("on you");
+  });
 });

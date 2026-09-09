@@ -1277,7 +1277,8 @@ function CalendarEventAbsence() {
           The núcleo can propose a calendar event and can decide one, but it mounts no route that
           lists the pending ones — so this queue cannot show them. Nothing is being hidden: what is
           missing is the door, not the record, and opening it is a change to the núcleo rather than
-          to this page.
+          to this page. Nothing here is in the count above: with no route that lists them, there is
+          nothing to count.
         </p>
       </Quiet>
     </Section>
@@ -1413,7 +1414,8 @@ function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
         <>
           Work a job put down overnight because it needed a decision, and carried on without.
           Nothing resumes from here — the tree moved on hours ago — so the only thing left is to
-          read it and put it away.
+          read it and put it away. Which is why none of it is in the count above: this is a record
+          of a decision the night already took, not one held for you.
         </>
       }
       notes={
@@ -1486,7 +1488,8 @@ function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
           nothing here to allow: what they were going to do is written out so you can decide
           whether to do it yourself, and under it what the turn had read when it decided to — which
           is usually the half that answers whether the idea was the agent&apos;s or a
-          stranger&apos;s.
+          stranger&apos;s. None of it is in the count above: the barrier already answered these, and
+          what is left is a record to read.
         </>
       }
     >
@@ -1597,8 +1600,11 @@ function VcsRow({ row, count }: { row: VcsRequestSummary; count: number }) {
         <span className="waiting-meta">{row.project_id}</span>
         <RelativeTime at={row.created_at} />
       </div>
+      {/* The badge says the state in one word; what to do about it is the row's
+          job, and this is where a row's detail goes. */}
       <p className="waiting-meta">
         {row.repo_key} — {row.origin}
+        {row.status === "blocked" ? " — submit it again" : ""}
       </p>
     </li>
   );
@@ -1619,7 +1625,9 @@ function ParkedRunsPanel({ view }: { view: Reading<AwaitingRun> }) {
       why={
         <>
           Worktree runs holding a tree while they wait. The decision that frees one is its approval
-          above; giving the tree back without deciding is on the run&apos;s own page.
+          above; giving the tree back without deciding is on the run&apos;s own page. A parked run is
+          not in the count above either — the approval that frees it is, and counting both would
+          count one decision twice.
         </>
       }
     >

@@ -204,8 +204,8 @@ describe("MapCanvas theme utilities", () => {
   });
 
   it("the DSM draws both triangles on the neutral ladder and says which is heavier", () => {
-    expect(source).toContain('? "bg-text/10"');
-    expect(source).toContain('"bg-text/30"');
+    expect(source).toContain('? "bg-text/15"');
+    expect(source).toContain('"bg-text/35"');
     expect(source).not.toMatch(/bg-tone-danger/);
     draw(twoGroups.modules, twoGroups.imports);
     expect(screen.getByText(/heavier mark below/)).toBeTruthy();

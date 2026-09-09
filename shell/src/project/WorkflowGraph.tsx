@@ -10,6 +10,7 @@ import {
   type WorkflowGraph as Graph,
 } from "../data/workflow-graph";
 import { openInVscode } from "../lib/vscode";
+import { Button } from "../ui";
 
 /**
  * The canvas, its inspector, and the guard that stands between an overlay and an eject.
@@ -232,23 +233,24 @@ function Inspector({
           onSave={(tool) => overlay.mutate({ projectId, name, node: node.id, tool })}
         />
         {node.overridden ? (
-          <button
-            type="button"
-            onClick={() =>
-              overlay.mutate({
-                projectId,
-                name,
-                node: node.id,
-                disabled: null,
-                model: null,
-                tool: null,
-                command: null,
-              })
-            }
-            className="self-start text-xs text-text-faint underline-offset-2 hover:underline"
-          >
-            follow the bundle again
-          </button>
+          <span className="self-start">
+            <Button
+              variant="quiet"
+              onClick={() =>
+                overlay.mutate({
+                  projectId,
+                  name,
+                  node: node.id,
+                  disabled: null,
+                  model: null,
+                  tool: null,
+                  command: null,
+                })
+              }
+            >
+              follow the bundle again
+            </Button>
+          </span>
         ) : null}
         {overlay.isError && isApiRefusal(overlay.error) ? (
           <p className="rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
@@ -374,13 +376,11 @@ function EditGuard({
         >
           edit in the library
         </button>
-        <button
-          type="button"
-          onClick={onCancel}
-          className="px-2 py-1.5 text-xs text-text-faint underline-offset-2 hover:underline"
-        >
-          cancel
-        </button>
+        <span className="inline-flex px-2 py-1.5">
+          <Button variant="quiet" onClick={onCancel}>
+            cancel
+          </Button>
+        </span>
       </div>
       <p className="text-xs text-text-faint">
         To diverge instead, eject the workflow above — that is where the sentence about losing

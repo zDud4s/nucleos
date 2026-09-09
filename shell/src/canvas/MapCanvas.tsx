@@ -866,9 +866,9 @@ function Matrix({
                       : weight === undefined
                         ? ""
                         : j > i
-                          ? "bg-text/10"
-                          // Both triangles are the same hue at two weights: a back edge is a structural fact, not a fault.
-                          : "bg-text/30";
+                          ? "bg-text/15"
+                          // Both triangles are the same hue at two weights: a back edge is a structural fact, not a fault. At the default 50% zoom the lighter mark was close to invisible, even though the 358 forward marks are the primary signal.
+                          : "bg-text/35";
                   return (
                     <td
                       key={column}

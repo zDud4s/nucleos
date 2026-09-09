@@ -10,7 +10,7 @@ import {
   useRunProjectCommand,
   type ProjectCommand,
 } from "../data/project-commands";
-import { Quiet } from "../ui";
+import { Button, Quiet } from "../ui";
 import {
   CommandDialog,
   CommandEmpty,
@@ -75,13 +75,9 @@ export function Commands({ projectId }: CommandsProps) {
   const refused = run.isError && isApiRefusal(run.error) ? run.error : null;
 
   const declare = (
-    <button
-      type="button"
-      onClick={() => setManaging(!managing)}
-      className="text-xs text-text-faint underline-offset-2 hover:underline"
-    >
+    <Button variant="quiet" onClick={() => setManaging(!managing)}>
       {managing ? "done" : "declare a command"}
-    </button>
+    </Button>
   );
 
   /*
@@ -198,7 +194,7 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
             <li key={row.id} className="flex flex-wrap items-baseline gap-2 text-sm">
               <span className="text-text">{row.name}</span>
               <span className="font-mono text-xs text-text-faint">{row.command}</span>
-              {row.is_gate ? <span className="text-xs text-tone-active-fg">gate</span> : null}
+              {row.is_gate ? <span className="text-xs text-text-muted">gate</span> : null}
               {row.runnable_by === "agent" ? (
                 <span className="text-xs text-tone-shadow-fg">agents may run this</span>
               ) : null}
@@ -209,13 +205,11 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
                 a worse answer than offering none.
               */}
               {row.source === "project" ? (
-                <button
-                  type="button"
-                  onClick={() => forget.mutate({ projectId, id: row.id })}
-                  className="ml-auto text-xs text-text-faint underline-offset-2 hover:underline"
-                >
-                  forget
-                </button>
+                <span className="ml-auto">
+                  <Button variant="quiet" onClick={() => forget.mutate({ projectId, id: row.id })}>
+                    forget
+                  </Button>
+                </span>
               ) : (
                 <span className="ml-auto text-xs text-text-faint">the workflow's</span>
               )}

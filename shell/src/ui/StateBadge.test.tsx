@@ -176,13 +176,12 @@ describe("StateBadge — slot", () => {
 
 describe("StateBadge — vcs", () => {
   it("does not dress a blocked request as a failure", () => {
-    // Terminal, but the answer is to fix the tree and submit again — which is
-    // not what a person does about a failure.
+    // Since round 9, the instruction lives on the Waiting row, not in this badge.
     assertAllDistinct("vcs", ["succeeded", "failed", "blocked", "escalated"]);
     const blocked = badge("vcs", "blocked");
     expect(blocked?.className).not.toContain("ui-badge-danger");
     expect(blocked?.text).not.toMatch(/fail/i);
-    expect(blocked?.text).toMatch(/again/i);
+    expect(blocked?.text).toBe("blocked");
   });
 
   it("presents an escalated request as a normal outcome, not a fault", () => {
@@ -419,10 +418,13 @@ describe("StateBadge — autopilot mode", () => {
 });
 
 describe("StateBadge — states with no reading", () => {
-  it("shows an unmapped state as itself rather than guessing a tone", () => {
+  it("a state with no reading admits ignorance in Switched Off Grey, not in Stated Blue", () => {
     const unknown = badge("run", "hibernating");
     expect(unknown?.text).toBe("hibernating");
     expect(unknown?.className).toContain("ui-state-unmapped");
+    // Ignorance must not borrow the tone that says a completed fact.
+    expect(unknown?.className).toContain("ui-badge-off");
+    expect(unknown?.className).not.toContain("ui-badge-info");
   });
 
   it("renders nothing when there is no state and the domain gives absence no meaning", () => {

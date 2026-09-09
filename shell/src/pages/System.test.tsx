@@ -372,9 +372,14 @@ describe("System - health readout", () => {
 
     await renderSystem();
 
-    // Scoped to the panel's own status text: the page headline also says
-    // "timed out", and a bare `findByText` throws on the two matches.
-    const notice = await screen.findByRole("status");
+    // Found by its own opening words, and then checked to BE a live region.
+    //
+    // It used to be `findByRole("status")`, on the argument that the page headline also says
+    // "timed out" and a bare `findByText` would throw on two matches. Both halves still hold;
+    // what changed is that `ConfirmButton` now renders a polite region of its own — empty at
+    // rest — so "the only status on the page" is no longer a way to name anything.
+    const notice = await screen.findByText(/^The readout timed out before it could measure/);
+    expect(notice.getAttribute("role")).toBe("status");
     expect(notice.textContent).toMatch(/timed out/i);
     expect(screen.queryByText(/missing/i)).toBeNull();
 
@@ -655,7 +660,10 @@ describe("System - backups", () => {
     await afterDwell();
     fireEvent.click(within(snap1Row).getByRole("button", { name: "Restore snap-1 on next start" }));
 
-    const notice = await within(snap1Row).findByRole("status");
+    // By its words, not by being the row's only live region: the row's own interlock
+    // ("Stage a restore") now carries one too, so that arming it is announced.
+    const notice = await within(snap1Row).findByText(/^Nothing has changed yet/);
+    expect(notice.getAttribute("role")).toBe("status");
     expect(notice.textContent).toMatch(/applies on the núcleo's next start/i);
     expect(notice.textContent).toMatch(/nothing has changed yet/i);
   });
@@ -805,5 +813,35 @@ describe("System - the route", () => {
     const healthTab = await screen.findByRole("link", { name: "Health" });
     expect(healthTab.getAttribute("aria-current")).toBe("page");
     expect(await screen.findByRole("heading", { level: 2, name: "Subsystems" })).toBeDefined();
+  });
+});
+
+describe("System - map-authored readings", () => {
+  it("a project brake reads held or released, and neither is Acting Green", async () => {
+    const world = systemWorld({ projects: [project({ project_id: "alpha" })] });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+    await renderSystem();
+    const alphaRow = rowFor(await screen.findByRole("list", { name: "Project brakes" }), "alpha");
+    const released = within(alphaRow).getByText("released");
+    expect(released.className).toContain("ui-badge-off");
+    expect(released.className).not.toContain("ui-badge-active");
+    fireEvent.click(within(alphaRow).getByRole("button", { name: "Hold alpha" }));
+    await waitFor(() => {
+      const held = within(alphaRow).getByText("held");
+      expect(held.className).toContain("ui-badge-paused");
+      expect(held.className).not.toContain("ui-badge-active");
+    });
+  });
+
+  it("an enabled mailbox and an armed one are facts, not work in flight", async () => {
+    daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
+    await renderSystemAt("/system/tokens");
+    const panel = (await screen.findByRole("heading", { level: 2, name: "Email configuration" })).closest("section");
+    if (panel === null) throw new Error("no email configuration panel");
+    for (const label of ["enabled", "armed"]) {
+      const badge = within(panel).getByText(label);
+      expect(badge.className).toContain("ui-badge-info");
+      expect(badge.className).not.toContain("ui-badge-active");
+    }
   });
 });

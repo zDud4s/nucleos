@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { PROJECTS, VCS_REQUESTS } from "./daemon";
+import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED } from "../data/autopilot";
+import { PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
 
 /**
  * The states the preview must be able to photograph, pinned as facts about the fixtures.
@@ -57,6 +58,26 @@ describe("the preview fixtures", () => {
     );
     expect(short.length).toBeGreaterThan(0);
     expect(short.every((project) => !project.promotable)).toBe(true);
+  });
+
+  it("alpha's scoreboard agrees with its roster figures", () => {
+    const alpha = PROJECTS.find((project) => project.project_id === "alpha");
+    const alphaRows = SCOREBOARD.alpha;
+    expect(alphaRows).toHaveLength(5);
+    expect(alphaRows.every((row) => row.mode === "shadow")).toBe(true);
+    expect(alphaRows.every((row) => row.reviewed >= READINESS_MIN_REVIEWED)).toBe(true);
+    expect(
+      alphaRows.every((row) => (row.agree / row.reviewed) * 100 >= READINESS_MIN_AGREE_PERCENT),
+    ).toBe(true);
+    expect(alphaRows.filter((row) => row.would_allow === 0).length).toBeGreaterThanOrEqual(2);
+    expect(alphaRows).toHaveLength(alpha?.classes_total ?? 0);
+
+    const deltaClearing = SCOREBOARD.delta.filter(
+      (row) =>
+        row.reviewed >= READINESS_MIN_REVIEWED &&
+        (row.agree / row.reviewed) * 100 >= READINESS_MIN_AGREE_PERCENT,
+    );
+    expect(deltaClearing).toHaveLength(2);
   });
 
   /*

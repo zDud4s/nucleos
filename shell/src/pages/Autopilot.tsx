@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { FeedEmbed } from "../app/FeedEmbed";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
@@ -45,9 +45,7 @@ import {
   Teach,
 } from "../ui";
 import {
-  MODE_LABEL,
   MODE_SENTENCES,
-  MODE_TONE,
   promotionBlocker,
   promotionConfirmLabel,
   promotionConsequence,
@@ -150,7 +148,15 @@ export function Autopilot() {
 
 /* ------------------------------------------------------------- the reading -- */
 
-/** One derived sentence about who is allowed to act. */
+/**
+ * One derived sentence about who is allowed to act.
+ *
+ * The clauses PARTITION the roster: `AutopilotMode` has exactly three values, so
+ * active + shadow + off is every project once. The promotable count is a
+ * sub-clause of the shadow one and is counted only among projects in shadow —
+ * standing alone it counted a project twice, once as watching and once as
+ * ready, and the sentence still added up because the numbers happened to.
+ */
 function headlineFor(
   rows: ProjectSummary[],
   answered: boolean,
@@ -158,16 +164,25 @@ function headlineFor(
   if (!answered) return undefined;
   if (rows.length === 0) return "no project is under autopilot";
   const active = rows.filter((row) => row.mode === "active").length;
-  const shadow = rows.filter((row) => row.mode === "shadow").length;
+  const shadow = rows.filter((row) => row.mode === "shadow");
+  const off = rows.filter((row) => row.mode === "off").length;
+  const ready = shadow.filter((row) => row.promotable).length;
   const parts: string[] = [];
   parts.push(
     active === 0
       ? "nothing is acting on its own"
       : `${active} acting on its own`,
   );
-  if (shadow > 0) parts.push(`${shadow} watching in shadow`);
-  const promotable = rows.filter((row) => row.promotable).length;
-  if (promotable > 0) parts.push(`${promotable} ready to be let out of shadow`);
+  if (shadow.length > 0) {
+    const tail =
+      ready === 0
+        ? ""
+        : ready === shadow.length
+          ? ", ready to leave it"
+          : `, ${ready} of them ready to leave it`;
+    parts.push(`${shadow.length} watching in shadow${tail}`);
+  }
+  if (off > 0) parts.push(`${off} off`);
   return parts.join("; ");
 }
 
@@ -372,6 +387,13 @@ function GovernanceRow({
    * pixels, moving the button out from under the pointer that has four seconds to press it again.
    */
   const [armed, setArmed] = useState(false);
+  /**
+   * The id the armed switch points at, so the sentence is read as the button's description.
+   *
+   * `useId` and not a literal: this row is one of four on the page, and four elements sharing
+   * one id would send every switch to the first row's sentence.
+   */
+  const consequenceId = useId();
 
   /**
    * A 422 is the *only* refusal that opens the root input.
@@ -414,7 +436,7 @@ function GovernanceRow({
         </Button>
         {project.queue_full && <Badge tone="paused">queue full</Badge>}
       </div>
-      <Badge tone={MODE_TONE[project.mode]}>{MODE_LABEL[project.mode]}</Badge>
+      <StateBadge domain="autopilot" state={project.mode} />
 
       <span className="ap-project-number" title="shadow decisions to review">
         {project.pending}
@@ -437,6 +459,7 @@ function GovernanceRow({
           actAllowed={project.promotable}
           actArmedLabel={promotionConfirmLabel(project)}
           onArmedChange={setArmed}
+          actDescribedBy={armed ? consequenceId : undefined}
           busy={setMode.isPending}
           onChoose={(mode) =>
             change(
@@ -470,7 +493,7 @@ function GovernanceRow({
         segment is what grew the row.
       */}
       {armed ? (
-        <div className="ap-project-consequence">
+        <div className="ap-project-consequence" id={consequenceId}>
           <Quiet says={promotionConsequence(project)} />
         </div>
       ) : null}
@@ -861,13 +884,7 @@ function TriggerKills() {
           return (
             <li className="ui-rows-row ap-trigger-row" key={scope.id}>
               <span className="ap-trigger-name">{scope.label}</span>
-              {scope.reads ? (
-                <Badge tone={engaged ? "paused" : "active"}>
-                  {engaged ? "held" : "running"}
-                </Badge>
-              ) : (
-                <Badge tone="off">not read</Badge>
-              )}
+              <StateBadge domain="brake" state={scope.reads ? (engaged ? "held" : "released") : "not_read"} />
               {scope.reads ? (
                 <Button
                   variant="ghost"

@@ -337,13 +337,38 @@ describe("Waiting - each section reads the route that serves it", () => {
     // click away like every other one — the section itself is on screen from the
     // first paint, because it answers no route and waits for nothing.
     const section = await screen.findByRole("region", { name: "Calendar events" });
-    fireEvent.click(within(section).getByRole("button", { name: "why?" }));
+    fireEvent.click(await within(section).findByRole("button", { name: "why?" }));
 
     const said = await screen.findByText(/mounts no route that lists the pending ones/);
     expect(said.textContent).toMatch(/what is missing is the door, not the record/);
     // Nothing was asked for on its behalf.
     const asked = daemon.apiFetch.mock.calls.map(([path]) => String(path));
     expect(asked.some((path) => path.includes("calendar"))).toBe(false);
+  });
+
+  it("an excluded list says why it is not counted", async () => {
+    daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld()));
+
+    await renderWaiting();
+
+    const section = await screen.findByRole("region", { name: "Parked runs" });
+    fireEvent.click(await within(section).findByRole("button", { name: "why?" }));
+    const explanation = within(section).getByText(/A parked run is not in the count above either/);
+    expect(explanation.textContent).toContain("approval that frees it");
+  });
+});
+
+describe("Waiting - git requests", () => {
+  it("a blocked git request wears one word and the row says what to do", async () => {
+    daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld({ vcs: [vcsRow({ status: "blocked" })] })));
+
+    await renderWaiting();
+
+    const list = await screen.findByRole("list", { name: "Git requests waiting on you" });
+    const row = within(list).getByText("push #61").closest("li");
+    if (row === null) throw new Error("no blocked git row");
+    expect(within(row).getByText("blocked").textContent).toBe("blocked");
+    expect(within(row).getByText(/alpha:main/).textContent).toContain("submit it again");
   });
 });
 
@@ -788,7 +813,12 @@ describe("Waiting - a project in the location", () => {
     expect(screen.queryByText("approval #12")).toBeNull();
 
     // The admission, and the way back out of it.
-    const note = screen.getByRole("status");
+    //
+    // Found by what it says rather than by being the page's only live region: every
+    // `ConfirmButton` now renders its own polite `role="status"` — empty at rest — so that
+    // arming and expiring are announced, and this page holds several of them.
+    const note = screen.getByText(/^Only nucleos\./);
+    expect(note.getAttribute("role")).toBe("status");
     expect(note.textContent).toBe("Only nucleos. Show everything");
     expect(within(note).getByRole("link", { name: "Show everything" }).getAttribute("href")).toBe(
       "/waiting",

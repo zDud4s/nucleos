@@ -10,7 +10,7 @@ import {
   type TeamView,
   type TriggerRequest,
 } from "../data/teams";
-import { Badge, Button, ConfirmButton, ErrorNote, Panel, RefusalNote, RelativeTime } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, RelativeTime, StateBadge } from "../ui";
 import { daemonProse } from "./prose";
 
 /**
@@ -117,7 +117,7 @@ function RuleRow({
     <li className="teams-rule">
       <div className="teams-rule-head">
         <span className="teams-rule-name">{rule.name}</span>
-        <Badge tone={armed ? "active" : "off"}>{armed ? "armed" : "disarmed"}</Badge>
+        <StateBadge domain="setting" state={armed ? "armed" : "disarmed"} />
         <span className="teams-rule-source">{rule.source}</span>
         {rule.cron !== null && <code className="teams-rule-cron">{rule.cron}</code>}
         {rule.timezone !== null && <span className="teams-rule-zone">{rule.timezone}</span>}

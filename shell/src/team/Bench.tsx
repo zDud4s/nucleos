@@ -12,7 +12,6 @@ import {
   type TeamView,
 } from "../data/teams";
 import {
-  Badge,
   ConfirmButton,
   Count,
   Crumb,
@@ -23,6 +22,7 @@ import {
   TabsContent,
   TabsList,
   TabsTrigger,
+  StateBadge,
 } from "../ui";
 import { Charter } from "./Charter";
 import { Decisions } from "./Decisions";
@@ -148,13 +148,8 @@ function BenchHead({ team, live, waiting }: { team: TeamView; live: number; wait
     <header className="teams-bench-head">
       <div className="teams-bench-title">
         <h1 className="teams-bench-name">{team.name}</h1>
-        {live > 0 ? (
-          <Badge tone="active">at work</Badge>
-        ) : waiting > 0 ? (
-          <Badge tone="pending">waiting on you</Badge>
-        ) : (
-          <Badge tone="off">idle</Badge>
-        )}
+        {/* "waiting on you" belongs to Waiting's decision count; this is open team action. */}
+        <StateBadge domain="department" state={live > 0 ? "working" : waiting > 0 ? "waiting" : "idle"} />
       </div>
       <p className="teams-bench-remit">{team.mission}</p>
       <div className="teams-bench-aside">

@@ -100,8 +100,8 @@ function mailFetch(world: MailWorld): (path: string, init?: RequestInit) => Prom
  * so it needs router context, and `renderApp` would mount the gate and the
  * rail's own live queries around every assertion for no benefit here.
  */
-function renderMail() {
-  return renderWithRouter(<Mail />, { initialPath: "/mail" });
+function renderMail(initialPath = "/mail") {
+  return renderWithRouter(<Mail />, { initialPath });
 }
 
 describe("Mail — panel order", () => {
@@ -278,5 +278,10 @@ describe("Mail search field", () => {
     const labelText = label?.querySelector("span");
     expect(labelText?.className).toContain("ui-field-label");
     expect(labelText?.textContent).toBe("Search");
+    fireEvent.change(input, { target: { value: "invoice" } });
+    fireEvent.submit(screen.getByRole("search", { name: "Search the mail queue" }));
+    const actions = screen.getByRole("button", { name: "Search" }).closest(".mail-search-actions");
+    expect(actions?.className).toContain("mail-search-actions");
+    expect(actions?.querySelectorAll("button")).toHaveLength(2);
   });
 });

@@ -17,7 +17,6 @@ import {
   type ErrandStatus,
 } from "../data/errands";
 import {
-  Badge,
   Button,
   ConfirmButton,
   ErrorNote,
@@ -177,7 +176,7 @@ function ErrandRow({ errand, active }: { errand: Errand; active: boolean }) {
       >
         <span className="errands-row-name">{errand.name}</span>
         <StateBadge domain="errand" state={errand.status} />
-        <Badge tone={errand.brain === "local" ? "active" : "info"}>{errand.brain}</Badge>
+        <span className="errands-row-brain">{errand.brain}</span>
         <span className="errands-row-folder">{errand.folder}</span>
         <span
           className={

@@ -14,8 +14,8 @@ export interface StateBadgeProps {
  * hand over the literal. That is what keeps the fourteen §7 distinctions from
  * being re-decided, differently, on every page that happens to show a run.
  *
- * A state the map has no reading for is shown *as itself*, in the neutral
- * informational tone, with the ignorance stated in the tooltip. The alternative
+ * A state the map has no reading for is shown *as itself* in Switched Off Grey,
+ * the tone with the least claim in it, with the ignorance stated in the tooltip. The alternative
  * — falling back to a plausible-looking tone — would be the app asserting a
  * meaning it does not have, which is the precise failure §7 exists to prevent.
  * An absent state with no per-domain reading renders nothing: there is no fact
@@ -31,7 +31,7 @@ export function StateBadge({ domain, state }: StateBadgeProps) {
   if (literal === "") return null;
 
   return (
-    <Badge tone="info" className="ui-state-unmapped" title={`this shell has no reading for ${domain} state "${literal}"`}>
+    <Badge tone="off" className="ui-state-unmapped" title={`this shell has no reading for ${domain} state "${literal}"`}>
       {literal}
     </Badge>
   );

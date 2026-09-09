@@ -338,6 +338,50 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
     ).toBe("false");
   });
 
+  /**
+   * The sentence under the row is the armed button's description, not a paragraph near it.
+   *
+   * Sighted, the pairing is obvious: the line appears the moment the segment arms, directly
+   * under the row it belongs to. To a screen reader it was two unrelated things — a button
+   * that had quietly renamed itself, and a sentence somewhere below. The id is `useId`'s
+   * rather than a literal because the roster renders one of these per project, and four rows
+   * sharing one id would point every switch at the first row's sentence.
+   */
+  it("the armed row points the switch at its consequence", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({
+          project_id: "alpha",
+          mode: "shadow",
+          project_root: "C:/repos/alpha",
+          promotable: true,
+          classes_ready: 2,
+          classes_total: 2,
+          withheld_classes_ready: 1,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const offer = await screen.findByRole("button", { name: "Let it act" });
+    // Nothing to describe until there is something to confirm.
+    expect(offer.getAttribute("aria-describedby")).toBeNull();
+
+    fireEvent.click(offer);
+
+    const armed = screen.getByRole("button", { name: "Let alpha act" });
+    const describedBy = armed.getAttribute("aria-describedby");
+    expect(describedBy).not.toBeNull();
+
+    // And it resolves to the sentence the row prints, on the full-width line under it.
+    const described = document.getElementById(describedBy ?? "");
+    expect(described).not.toBeNull();
+    expect(described?.className).toContain("ap-project-consequence");
+    expect(described?.textContent).toContain("alpha acts on its own");
+  });
+
   it("the budget period is a word and not a stem", async () => {
     const world = cockpitWorld();
     daemon.apiFetch.mockImplementation(cockpitFetch(world));
@@ -366,7 +410,7 @@ describe("Autopilot - the trigger brakes say which of them the núcleo reads", (
 
     // Read now, so a real state rather than the fixed "not read" label — and a
     // button, where before there was none.
-    expect(within(team).getByText("running")).toBeDefined();
+    expect(within(team).getByText("released")).toBeDefined();
     expect(within(team).getByRole("button", { name: "Hold team triggers" })).toBeDefined();
     // The hedge said engaging this brake would stop nothing. It is no longer
     // true and must no longer be on screen.
@@ -550,5 +594,51 @@ describe("Autopilot - the route", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Autopilot" })).toBeDefined();
     expect(router.state.location.pathname).toBe("/autopilot");
     expect(screen.queryByText("Autopilot is not built yet")).toBeNull();
+  });
+});
+
+describe("Autopilot - map-authored readings", () => {
+  it("a trigger brake that is not engaged reads released, not running", async () => {
+    const world = cockpitWorld({ projects: [project({ project_id: "alpha" })], scopedKills: [{ scope_type: "trigger", scope_id: "scheduled", engaged: false }] });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+    await renderCockpit();
+    const team = switchFor("Team triggers");
+    const reading = within(team).getByText("released");
+    expect(reading.textContent).toBe("released");
+    expect(reading.className).toContain("ui-badge-off");
+    expect(within(team).queryByText("running")).toBeNull();
+  });
+
+  it("a project's mode is the map's word, not the page's", async () => {
+    const world = cockpitWorld({ projects: [project({ project_id: "alpha", mode: "active" })] });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+    await renderCockpit();
+    const row = (await screen.findByText("alpha")).closest("li");
+    if (row === null) throw new Error("no roster row for alpha");
+    const reading = within(row).getByText("active");
+    expect(reading.textContent).toBe("active");
+    expect(within(row).queryByText("acting")).toBeNull();
+  });
+
+  it("the headline partitions the roster and counts nobody twice", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({ project_id: "bravo", mode: "active", promotable: false }),
+        project({ project_id: "alpha", mode: "shadow", promotable: true }),
+        project({ project_id: "delta", mode: "shadow", promotable: false }),
+        project({ project_id: "charlie", mode: "off", promotable: false }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const headline = await screen.findByText(
+      "1 acting on its own; 2 watching in shadow, 1 of them ready to leave it; 1 off",
+    );
+    expect(headline.textContent).toBe(
+      "1 acting on its own; 2 watching in shadow, 1 of them ready to leave it; 1 off",
+    );
+    expect(1 + 2 + 1).toBe(world.projects.length);
   });
 });

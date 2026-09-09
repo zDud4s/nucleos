@@ -420,7 +420,7 @@
 }
 
 /* A control that has to be on every row of a table and must not compete with
-   the readings in those rows. Borderless and faint at rest, underlined on
+   the readings in those rows. Borderless and muted at rest, underlined on
    hover: findable by anybody looking for it, invisible to anybody scanning the
    column beside it.
 
@@ -433,12 +433,16 @@
 
    A control needs an affordance at rest. Hue is not available: cyan is reserved
    for links, and a tone would make an action look like a state. The affordance is
-   a hairline underline. */
+   a hairline underline — and the underline is what lets the text stop at Muted
+   rather than Faint. Faint on Working Surface measures 3.8:1, under the 4.5:1
+   floor, which is a reading and not a taste on something that is now explicitly
+   a control label; Muted is 6.9:1 and still recedes, because the underline is
+   doing the finding. */
 .ui-button-quiet {
   padding: 0;
   background: none;
   border-color: transparent;
-  color: var(--text-faint);
+  color: var(--text-muted);
   font-weight: var(--weight-regular);
   text-decoration: underline;
   text-decoration-color: var(--border-strong);
@@ -563,14 +567,24 @@
   color: var(--text-muted);
 }
 
+/*
+  The same control at the smaller rank.
+
+  `why?` is a button that opens a paragraph, and it underlined only on hover while its
+  twin one section over underlined at rest — on `10-project-state` all three treatments
+  were on one screen. One treatment, one floor: `--text-muted` and the hairline.
+*/
 .ui-quiet-ask {
   font-size: var(--text-xs);
-  color: var(--text-faint);
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
   text-underline-offset: 2px;
 }
 
 .ui-quiet-ask:hover {
-  text-decoration: underline;
+  color: var(--text);
+  text-decoration-color: currentColor;
 }
 
 /**
@@ -1351,6 +1365,23 @@
   border: 0;
   border-radius: 0;
   white-space: nowrap;
+}
+
+/*
+  Armed, inside a track that clips.
+
+  `.ui-confirm-armed > .ui-button` draws its ring OUTSIDE the button, and `.ui-switch`
+  carries `overflow: hidden` so the three segments read as one box — so on the roster the
+  armed segment was the same green segment it had been before the click, and the only
+  signals left were two words of label and a sentence at the other end of the row. Three
+  classes here against two there, so this REPLACES the outer ring rather than adding to it.
+
+  `--text` and not a hue: the segment is `.ui-button-approve`, so the fill is already the
+  tone, and a second colour on top of it would be saying the same thing twice in a
+  different word. 2px and not 3: an inset ring eats the button's own padding.
+*/
+.ui-switch-seg-wrap > .ui-confirm-armed > .ui-button {
+  box-shadow: inset 0 0 0 2px var(--text);
 }
 
 /*

@@ -5,6 +5,7 @@ import { isApiRefusal } from "../data/client";
 import { folderOf, gateOf, headline, inAttentionOrder, type Folder, type Gate } from "../data/roster";
 import { useProjects, type ProjectSummary } from "../data/system";
 import { Badge, type BadgeTone } from "../ui/Badge";
+import { StateBadge } from "../ui";
 import { Button } from "../ui/Button";
 import { Count } from "../ui/Count";
 import { ErrorNote } from "../ui/ErrorNote";
@@ -236,7 +237,7 @@ function Row({
               beside the name it is a fact about.
             */}
             {project.mode !== "shadow" && (
-              <Badge tone={project.mode === "active" ? "active" : "off"}>{project.mode}</Badge>
+              <StateBadge domain="autopilot" state={project.mode} />
             )}
           </span>
         </th>

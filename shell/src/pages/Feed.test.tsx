@@ -206,7 +206,7 @@ describe("Feed - a search freezes the list and Back to live resumes it", () => {
 /* ------------------------------------------------------ A15: unmapped kinds -- */
 
 describe("Feed - a kind this shell has no reading for", () => {
-  it("renders the literal rather than a guessed label", async () => {
+  it("an unknown feed kind wears the same ignorance device as an unknown state", async () => {
     // `email_<class>` is built from configuration (`notify_classes`), so the
     // shell cannot have a table entry for everybody's classes. Showing the
     // literal admits ignorance; a plausible label would be a claim.
@@ -217,7 +217,9 @@ describe("Feed - a kind this shell has no reading for", () => {
     await renderFeed();
 
     const list = await screen.findByRole("list", { name: "Feed" });
-    expect(within(list).getByText("email_shopping")).toBeDefined();
+    const unknown = within(list).getByText("email_shopping");
+    expect(unknown.className).toContain("ui-state-unmapped");
+    expect(unknown.className).toContain("ui-badge-off");
   });
 });
 

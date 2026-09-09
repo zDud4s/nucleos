@@ -25,6 +25,14 @@ export interface ModeSwitchProps {
    * having to know what that sentence is or where it goes.
    */
   onArmedChange?: (armed: boolean) => void;
+  /**
+   * The consequence sentence the caller prints under the control, named for a screen reader.
+   *
+   * The armed label is one line inside a fixed track and says WHICH project; what letting it
+   * act would MEAN is a sentence with room, and it lives at the other end of the row. Passed
+   * only while armed, because that is the only time the caller renders it.
+   */
+  actDescribedBy?: string;
   /** A write is in flight; every segment is inert. */
   busy?: boolean;
   onChoose: (mode: SwitchMode) => void;
@@ -69,6 +77,7 @@ export function ModeSwitch({
   actAllowed,
   actArmedLabel,
   onArmedChange,
+  actDescribedBy,
   busy,
   onChoose,
 }: ModeSwitchProps) {
@@ -111,6 +120,7 @@ export function ModeSwitch({
             variant="approve"
             disabled={!actAllowed || busy}
             onArmedChange={onArmedChange}
+            describedBy={actDescribedBy}
             onConfirm={() => onChoose("active")}
           />
         </span>

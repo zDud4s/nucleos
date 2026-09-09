@@ -105,16 +105,19 @@ export function Boundary({ modules, imports, unread, foreign, seam }: BoundaryPr
           </>
         ) : (
           <>
-            <span className="text-tone-danger-fg">{sides.crossing}</span> import
-            {sides.crossing === 1 ? "" : "s"} cross between sides. Nothing here should be able to do
-            that, so the walk and this drawing disagree about what a side is.
+            <span className="ui-wrong">
+              {sides.crossing} import{sides.crossing === 1 ? "" : "s"} cross between sides.
+            </span>{" "}
+            Nothing here should be able to do that, so the walk and this drawing disagree about
+            what a side is.
           </>
         )}
         {sides.loose > 0 ? (
           <>
             {" "}
-            <span className="text-tone-danger-fg">{sides.loose}</span> import
-            {sides.loose === 1 ? " ends" : "s end"} on no file this map lists.
+            <span className="ui-wrong">
+              {sides.loose} import{sides.loose === 1 ? " ends" : "s end"} on no file this map lists.
+            </span>
           </>
         ) : null}
       </p>

@@ -137,9 +137,9 @@ describe("the boundary between the two sides", () => {
       { seam: { served: ["/things"], calls: 1, matched: 0, unmatched: [{ path: "/thingz", file: "shell/src/data/things.ts", line: 12 }] } },
     );
 
-    expect((container.querySelector(".text-tone-danger-fg") as HTMLElement | null)?.className).toContain(
-      "text-tone-danger-fg",
-    );
+    const wrong = container.querySelector(".ui-wrong") as HTMLElement | null;
+    expect(wrong?.className).toContain("ui-wrong");
+    expect(wrong?.textContent).toContain("cross between sides");
     expect((container.querySelector(".bg-tone-danger-bg") as HTMLElement | null)?.className).toContain(
       "bg-tone-danger-bg",
     );

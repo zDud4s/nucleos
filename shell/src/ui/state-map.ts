@@ -20,6 +20,7 @@ import type { BadgeTone } from "./Badge";
  * trusting this file's claim. An unmapped state is rendered as itself — see
  * `StateBadge` — because showing the literal admits ignorance, while assigning
  * it a tone would be a claim.
+ * A domain the núcleo does not write is allowed here only when its own docstring says so.
  */
 export type StateDomain =
   | "run"
@@ -41,7 +42,10 @@ export type StateDomain =
   | "team_run"
   | "team_item"
   | "team_action"
-  | "autopilot";
+  | "autopilot"
+  | "brake"
+  | "setting"
+  | "department";
 
 export interface StateReading {
   tone: BadgeTone;
@@ -68,6 +72,26 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     off: { tone: "off", label: "off" },
     shadow: { tone: "shadow", label: "shadow" },
     active: { tone: "active", label: "active" },
+  },
+  /** A brake is a switch, not workload: released is switched off on purpose; not_read is wired to nothing. */
+  brake: {
+    held: { tone: "paused", label: "held" },
+    released: { tone: "off", label: "released" },
+    not_read: { tone: "off", label: "not read" },
+  },
+  /** A setting that is on is a stated fact, never work in flight; off is not a held rule. */
+  setting: {
+    enabled: { tone: "info", label: "enabled" },
+    disabled: { tone: "off", label: "disabled" },
+    armed: { tone: "info", label: "armed" },
+    unarmed: { tone: "off", label: "unarmed" },
+    disarmed: { tone: "off", label: "disarmed" },
+  },
+  /** The núcleo does not write department states: this shell derivation keeps Teams and Bench in one vocabulary. */
+  department: {
+    working: { tone: "active", label: "at work" },
+    waiting: { tone: "pending", label: "waiting" },
+    idle: { tone: "off", label: "idle" },
   },
   /**
    * Run outcomes. `concurrency.rs`'s `LIVE_RUN_STATUSES` and `runs.rs`'s
@@ -205,8 +229,11 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * A request in the git queue.
    *
    * Two distinctions, both load-bearing. `blocked` is terminal but **not** a
-   * failure: the queue will not retry it, and the answer is to fix the tree and
-   * submit again — so it takes the held tone rather than the red one. And
+   * failure: the queue will not retry it, and the answer is to submit again —
+   * so it takes the held tone rather than the red one. The instruction lives on
+   * `pages/Waiting.tsx`'s `VcsRow`: a full sentence in an 11px pill at 0.08em
+   * tracking is a badge doing the row's work, while every other badge in the
+   * shots is one or two words. And
    * `escalated` is a *normal outcome*: a person owns the conflict now, which is
    * the queue working, not the queue breaking. Dressing either as `failed`
    * sends somebody to debug a merge that behaved exactly as designed. `succeeded` is terminal
@@ -215,7 +242,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
   vcs: {
     succeeded: { tone: "info", label: "landed" },
     failed: { tone: "danger", label: "failed" },
-    blocked: { tone: "paused", label: "blocked — submit it again" },
+    blocked: { tone: "paused", label: "blocked" },
     escalated: { tone: "pending", label: "escalated to you" },
     rejected: { tone: "off", label: "rejected" },
     cancelled: { tone: "off", label: "cancelled" },

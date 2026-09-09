@@ -18,7 +18,6 @@ import {
   type TeamView,
 } from "../data/teams";
 import {
-  Badge,
   Button,
   ErrorNote,
   Meter,
@@ -273,13 +272,13 @@ function LiveTask({ run, team }: { run: TeamRun; team: TeamView | null }) {
         <p className="teams-loading">reading what it has spent…</p>
       ) : (
         // The money meter lives here and only here: this is the one place in
-        // the pillar where a spend and the ceiling it runs against both exist.
+        // the pillar where a spend and the ceiling it runs against both exist. The default active
+        // reading is right: money being spent is not a question for the reader.
         <Meter
           label="spent on this task"
           value={detail.data.cost_usd}
           ceiling={team?.budget_usd ?? null}
           format={usd}
-          tone="pending"
         />
       )}
     </article>
@@ -418,9 +417,8 @@ function DepartmentRow({
  * be both, and the one that is spending money is the one worth the badge.
  */
 function RowState({ live, waiting }: { live: number; waiting: number }) {
-  if (live > 0) return <Badge tone="active">at work</Badge>;
-  if (waiting > 0) return <Badge tone="pending">waiting</Badge>;
-  return <Badge tone="off">idle</Badge>;
+  const state = live > 0 ? "working" : waiting > 0 ? "waiting" : "idle";
+  return <StateBadge domain="department" state={state} />;
 }
 
 /**

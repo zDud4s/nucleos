@@ -405,7 +405,7 @@ function FeedRow({
  * The kind, or the kind's own literal.
  *
  * The same posture as `ui/StateBadge`: a kind this shell has no reading for is
- * shown as itself in the neutral tone, with the ignorance said out loud in the
+ * shown as itself through the shared `ui-state-unmapped` device, with the ignorance said out loud in the
  * tooltip. The núcleo grows kinds faster than the table does, and a plausible
  * guess would be the shell asserting a meaning it does not have.
  *
@@ -424,7 +424,7 @@ export function KindBadge({ kind }: { kind: string }) {
     );
   }
   return (
-    <Badge tone="info" title={`this shell has no reading for the feed kind "${kind}"`}>
+    <Badge tone="off" className="ui-state-unmapped" title={`this shell has no reading for the feed kind "${kind}"`}>
       {kind}
     </Badge>
   );

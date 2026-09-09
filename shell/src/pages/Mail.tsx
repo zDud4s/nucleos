@@ -177,8 +177,10 @@ function MailSearchBar({ q, onSearch }: { q: string | undefined; onSearch: (q: s
           placeholder="sender, subject or summary"
         />
       </Field>
-      <Button type="submit">Search</Button>
-      {q !== undefined && <Button onClick={() => onSearch(undefined)}>Clear</Button>}
+      <div className="mail-search-actions">
+        <Button type="submit">Search</Button>
+        {q !== undefined && <Button onClick={() => onSearch(undefined)}>Clear</Button>}
+      </div>
     </form>
   );
 }

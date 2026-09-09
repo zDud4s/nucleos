@@ -444,22 +444,24 @@ describe("RunDetail — absent readings", () => {
 });
 
 describe("RunDetail headline", () => {
-  it('a completed run finished, it did not "end completed"', async () => {
+  it("the headline and the badge use one word for one state", async () => {
     daemon.apiFetch.mockImplementation(detailFetch(detail({ status: "completed", project_id: "alpha" }), NO_TAIL, []));
 
     await renderApp({ initialPath: "/runs/5" });
 
-    const heading = await screen.findByText("finished, in alpha");
-    expect(heading.textContent).toBe("finished, in alpha");
+    const heading = await screen.findByText("completed, in alpha");
+    expect(heading.textContent).toBe("completed, in alpha");
     expect(heading.textContent).not.toMatch(/ended completed/);
+    expect(heading.textContent).not.toMatch(/finished/);
   });
 
-  it("uses the state map label for an ended timed-out run", async () => {
+  it("uses the state map label for a timed-out run", async () => {
     daemon.apiFetch.mockImplementation(detailFetch(detail({ status: "timed_out" }), NO_TAIL, []));
 
     await renderApp({ initialPath: "/runs/5" });
 
-    expect(await screen.findByText(/ended timed out/)).toBeDefined();
+    const heading = await screen.findByText(/timed out, in alpha/);
+    expect(heading.textContent).not.toMatch(/ended /);
     expect(screen.queryByText(/ended timed_out/)).toBeNull();
   });
 });

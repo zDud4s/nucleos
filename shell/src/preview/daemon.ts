@@ -1,4 +1,5 @@
 import type { Agent } from "../data/agents";
+import type { ClassTally } from "../data/autopilot";
 import type { Concurrency, Job, JobDetail, JobItem, RunSearchResult } from "../data/fleet";
 import type { MapImport, MapModule, ProjectMap } from "../data/project-map";
 import type {
@@ -789,6 +790,37 @@ export const VCS_REQUESTS: VcsRequestSummary[] = [
     created_at: ago(1 * DAY),
   },
 ];
+
+/**
+ * What the classifier has recorded for each project, class by class.
+ *
+ * The route had no branch, so the daemon fell through to `[]` and `10-project-state` said
+ * "Nothing recorded in shadow yet" beside a roster row claiming 5 of 5 classes clearing the
+ * bar — the contradiction reached a screen for the first time when round 8 made alpha
+ * promotable. The bar is `READINESS_MIN_REVIEWED` reviews at `READINESS_MIN_AGREE_PERCENT`
+ * agreement, per class; `ClassTally` carries no "withheld" field, so a class the classifier
+ * held back is one with `would_allow: 0` and the total sitting in `would_pend`/`would_deny`.
+ */
+export const SCOREBOARD: Record<string, ClassTally[]> = {
+  alpha: [
+    { mode: "shadow", action_class: "read-local", total: 46, would_allow: 46, would_pend: 0, would_deny: 0, reviewed: 18, agree: 18, disagree: 0 },
+    { mode: "shadow", action_class: "confined-to-workspace", total: 31, would_allow: 31, would_pend: 0, would_deny: 0, reviewed: 14, agree: 14, disagree: 0 },
+    { mode: "shadow", action_class: "vcs-local", total: 12, would_allow: 12, would_pend: 0, would_deny: 0, reviewed: 11, agree: 11, disagree: 0 },
+    // The two the classifier withheld — the other half of the bar, and the reason alpha's
+    // row carries `withheld_classes_ready: 2`.
+    { mode: "shadow", action_class: "unrecognized", total: 22, would_allow: 0, would_pend: 22, would_deny: 0, reviewed: 20, agree: 19, disagree: 1 },
+    { mode: "shadow", action_class: "push-merge-deploy", total: 15, would_allow: 0, would_pend: 15, would_deny: 0, reviewed: 12, agree: 12, disagree: 0 },
+  ],
+  delta: [
+    { mode: "shadow", action_class: "read-local", total: 30, would_allow: 30, would_pend: 0, would_deny: 0, reviewed: 12, agree: 12, disagree: 0 },
+    { mode: "shadow", action_class: "confined-to-workspace", total: 18, would_allow: 18, would_pend: 0, would_deny: 0, reviewed: 10, agree: 10, disagree: 0 },
+    // Short on evidence, not on agreement — the panel has to be able to show both ways of
+    // failing the bar, or "still short" reads as one thing.
+    { mode: "shadow", action_class: "vcs-local", total: 9, would_allow: 9, would_pend: 0, would_deny: 0, reviewed: 4, agree: 4, disagree: 0 },
+    { mode: "shadow", action_class: "unrecognized", total: 11, would_allow: 0, would_pend: 11, would_deny: 0, reviewed: 10, agree: 8, disagree: 2 },
+    { mode: "shadow", action_class: "destructive", total: 6, would_allow: 0, would_pend: 0, would_deny: 6, reviewed: 3, agree: 3, disagree: 0 },
+  ],
+};
 
 /**
  * A moment relative to the REAL clock, not the frozen one.
@@ -1955,6 +1987,11 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/team-triggers") return TRIGGERS;
   if (path === "/team-actions") return ACTIONS;
   if (path === "/vcs/requests") return VCS_REQUESTS;
+  /* Matched on the route rather than the whole path: `useScoreboard` always sends
+     `?project_id=`, so a `path ===` comparison would never fire. */
+  if (splitQuery(path)[0] === "/scoreboard") {
+    return SCOREBOARD[splitQuery(path)[1].get("project_id") ?? ""] ?? [];
+  }
   if (path === "/proposals") return PROPOSALS;
   if (path === "/proposals/team-actions") return TEAM_ACTION_PROPOSALS;
   if (path === "/proposals/recruits") return RECRUITS;

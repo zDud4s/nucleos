@@ -72,6 +72,15 @@
   margin-bottom: var(--space-4);
 }
 
+/* The visible Field label adds a row above the input. Its input is 0.8125rem × 1.55 line-height
+   + 2 × 0.5rem padding + 2px border = 2.384375rem, so this wrapper centres the buttons on it. */
+.mail-search-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 2.384375rem;
+}
+
 /* ------------------------------------------------------------------ list -- */
 
 .mail-row {

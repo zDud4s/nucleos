@@ -142,6 +142,87 @@ describe("ConfirmButton", () => {
     expect(armed.closest("span")?.className).toContain("ui-confirm-armed");
   });
 
+  /**
+   * Armed is said out loud, not only drawn.
+   *
+   * The label swap and `.ui-confirm-armed` are both things you have to be LOOKING at the
+   * button to notice. A screen reader was told nothing at all: the button's accessible name
+   * changed under it with no announcement, so the one control on the page that deliberately
+   * asks for a second press gave no sign it was waiting for one.
+   */
+  it("the armed state is announced", () => {
+    setup();
+
+    // Nothing is claimed before anything happens — the region exists so it can speak, not
+    // so it can narrate a control at rest.
+    expect(screen.getByRole("status").textContent).toBe("");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
+
+    expect(screen.getByRole("status").textContent).toBe(
+      "armed: Really delete — press again to confirm",
+    );
+
+    // And the prefix is load-bearing: the announcement is not a second exact copy of the
+    // label, so `getByText` on the label still finds one node — the button.
+    expect(screen.getByText("Really delete").tagName).toBe("BUTTON");
+  });
+
+  /**
+   * The window closing is the event nobody sees.
+   *
+   * A confirm is followed by whatever the confirm does — a row disappears, a page moves —
+   * so it says for itself that it happened. An expiry is four seconds of nothing, after
+   * which the next click arms again instead of acting, and until this region existed the
+   * only way to find that out was to press the button and watch it not fire.
+   */
+  it("an expiry is announced and a confirm is not", () => {
+    const { onConfirm } = setup();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
+    act(() => {
+      vi.advanceTimersByTime(4000);
+    });
+
+    expect(screen.getByRole("status").textContent).toBe("disarmed — nothing changed");
+
+    // Arm it again and go through with it. The confirm path CLEARS the region rather than
+    // reporting an expiry that did not happen: "nothing changed" after a delete would be
+    // the one wrong thing this region could possibly say.
+    fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Really delete" }));
+
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status").textContent).toBe("");
+  });
+
+  /**
+   * The consequence is the caller's sentence, and the button can point at it.
+   *
+   * Inside `ModeSwitch` the label is a segment of a fixed track and says only WHICH project;
+   * what confirming would mean is a sentence the page prints elsewhere. `describedBy` is how
+   * the two are joined without the interlock having to know what the sentence is.
+   */
+  it("the description is carried to the button", () => {
+    render(
+      <ConfirmButton
+        label="Let it act"
+        confirmLabel="Let alpha act"
+        variant="approve"
+        describedBy="consequence-1"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    const button = screen.getByRole("button", { name: "Let it act" });
+    expect(button.getAttribute("aria-describedby")).toBe("consequence-1");
+    // A description is not a name: the button is still found by the words on it.
+    expect(button.textContent).toBe("Let it act");
+  });
+
   it("arming swaps only danger to danger-solid", () => {
     setup();
     render(

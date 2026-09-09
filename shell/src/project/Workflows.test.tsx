@@ -88,6 +88,14 @@ describe("the workflows mode", () => {
     });
   });
 
+  it("the quiet controls are the primitive", async () => {
+    await openWorkflows({ workflows: [installedWorkflow()] });
+
+    expect((await screen.findByRole("button", { name: "stop using it" })).className).toContain(
+      "ui-button-quiet",
+    );
+  });
+
   /**
    * Drift is stated with both hashes, never implied.
    *

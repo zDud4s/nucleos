@@ -16,19 +16,8 @@ import type { AutopilotMode, ProjectSummary } from "../data/system";
  * unlocked on different arithmetic from the one the núcleo enforces would offer a button that
  * always refuses, and two copies of a sentence about restraint would eventually say two different
  * things about it.
+ * The third vocabulary is gone too: the map says `active`, the daemon literal, and that word wins.
  */
-
-export const MODE_TONE: Record<AutopilotMode, "active" | "shadow" | "off"> = {
-  active: "active",
-  shadow: "shadow",
-  off: "off",
-};
-
-export const MODE_LABEL: Record<AutopilotMode, string> = {
-  active: "acting",
-  shadow: "shadow",
-  off: "off",
-};
 
 /**
  * What each setting means, in one line, for a surface with room to say it.

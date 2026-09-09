@@ -469,3 +469,13 @@ describe("Errands - the route and the list", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Errands" })).toBeDefined();
   });
 });
+
+describe("Errands - map-authored readings", () => {
+  it("the brain is an identifier, not a state", async () => {
+    daemon.apiFetch.mockImplementation(errandsFetch(errandsState({ errands: [errand({ brain: "local" })] })));
+    await renderErrands("/errands");
+    const brain = await screen.findByText("local");
+    expect(brain.className).toContain("errands-row-brain");
+    expect(brain.className).not.toContain("ui-badge");
+  });
+});

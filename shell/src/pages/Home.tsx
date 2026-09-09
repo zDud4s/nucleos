@@ -77,8 +77,10 @@ export function Home() {
         <StatCard
           label="Waiting on you"
           value={waiting}
-          // "Every kind" was wrong: skipped items, refused actions, and calendar events are records, not held decisions.
-          detail={waiting === undefined ? undefined : waiting === 0 ? "nothing waiting on you" : "the Waiting page's seven decision lists, records aside"}
+          // What the number IS, not a table of contents for another page. Four lists are outside it
+          // and for three different reasons: skipped and refused are records, calendar events have no
+          // listing route, and a parked run is the run side of an approval already counted.
+          detail={waiting === undefined ? undefined : waiting === 0 ? "nothing waiting on you" : "decisions held for you — not records, and not the calendar"}
         />
         <StatCard
           label="Window spend"
@@ -123,7 +125,7 @@ export function Home() {
             <Link to="/waiting" className="ui-button ui-button-link">
               Waiting
             </Link>{" "}
-            — everything that stopped to ask you something, of every kind, in one queue.
+            — every decision that stopped to ask you something, in one queue.
           </p>
         </div>
       </Section>
