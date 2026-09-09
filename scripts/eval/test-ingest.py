@@ -13,11 +13,13 @@ the within-layer spread is carried on every pair because the second pass found t
 the size of the effect.
 """
 
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -133,7 +135,72 @@ def main():
     check("a reference git does not know is refused rather than left dangling",
           raises(lambda: ingest.resolve_reference("41e9a56", ROOT)))
 
-    total = 15
+    # --- the ladder's write path ---------------------------------------------
+    #
+    # Stubbed rather than run: a real cell needs a daemon on 8791, builds a worktree, and cost
+    # between $0.97 and $7.14 the twelve times it was done for real. What is under test is the
+    # wiring — that the numbers `watch()` returns reach the ledger in the right fields — and that
+    # survives stubbing. `test-auto-approve.py` stubs its daemon for the same reason.
+
+    import ladder  # noqa: E402  -- safe to import only since the loop moved into main()
+
+    check("importing the ladder contacts no daemon and runs no cell",
+          ladder._TOKEN is None)
+
+    def drive(work, call_impl):
+        ledger = os.path.join(work, "eval-cells.jsonl")
+        saved = {name: getattr(ladder, name) for name in
+                 ("requested", "prompt_for", "prepare", "call", "watch", "score", "turns_of")}
+        ingest.LEDGER, saved_ledger = ledger, ingest.LEDGER
+        try:
+            ladder.requested = lambda argv: [("T1", "H0")]
+            ladder.prompt_for = lambda task: "fix the thing"
+            ladder.prepare = lambda task, layer, tree: None
+            ladder.call = call_impl
+            ladder.watch = lambda project, first: {"wall": 265, "cost": 1.89, "runs": [900267]}
+            ladder.score = lambda task, layer, tree, first: "solved"
+            ladder.turns_of = lambda runs: 34
+            ladder.main([])
+        finally:
+            for name, value in saved.items():
+                setattr(ladder, name, value)
+            ingest.LEDGER = saved_ledger
+        return [json.loads(line) for line in open(ledger, encoding="utf-8")]
+
+    with tempfile.TemporaryDirectory() as work:
+        rows = drive(work, lambda path, method="GET", body=None: {"id": 900267})
+        # The real T1 x H0 cell of the first pass, as `ABLATION.md` records it.
+        check("a finished cell reaches the ledger with every number in its own field",
+              len(rows) == 1 and rows[0]["task"] == "T1" and rows[0]["layer"] == "H0"
+              and rows[0]["verdict"] == "solved" and rows[0]["turns"] == 34
+              and rows[0]["cost"] == 1.89 and rows[0]["wall"] == 265)
+        check("the ledger row names the runs the cell was made of, and calls itself measured",
+              rows[0]["run_ids"] == [900267] and rows[0]["source"] == "ladder")
+
+    def refuse(path, method="GET", body=None):
+        raise urllib.error.HTTPError(
+            "http://x/runs", 409, "Conflict", {}, io.BytesIO(b"busy"))
+
+    with tempfile.TemporaryDirectory() as work:
+        rows = drive(work, refuse)
+        check("a refused cell is recorded as refused, not left out of the ledger",
+              len(rows) == 1 and rows[0]["verdict"] == "refused"
+              and rows[0]["turns"] is None and rows[0]["run_ids"] == [])
+
+    # A cell that already cost money must not be lost to a ledger that cannot be written.
+    with tempfile.TemporaryDirectory() as work:
+        blocked = os.path.join(work, "missing-dir", "\0", "cells.jsonl")
+        saved_ledger, ingest.LEDGER = ingest.LEDGER, blocked
+        try:
+            ladder.record(ingest.Cell("T1", "H0", "solved", turns=34), [900267])
+            survived = True
+        except Exception:
+            survived = False
+        finally:
+            ingest.LEDGER = saved_ledger
+        check("a ledger write that fails shouts instead of killing the cell", survived)
+
+    total = 20
     print(f"\n{total - failures}/{total} as expected")
     return 1 if failures else 0
 

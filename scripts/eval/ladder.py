@@ -97,7 +97,22 @@ ENV.update({
     "PATH": "C:\\Projects\\mingw64\\bin;C:\\Projects\\cargo\\bin;" + os.environ.get("PATH", ""),
 })
 
-token = subprocess.run([DAEMON_EXE, "--print-token"], capture_output=True, text=True).stdout.strip()
+_TOKEN = None
+
+
+def daemon_token():
+    """Fetch the daemon token on first use, not at import.
+
+    This used to run at module scope, which meant importing this file spawned the daemon binary --
+    and, with the ladder loop also at module scope, an `import ladder` ran real cells at real cost.
+    Nothing could test any function in here without paying for it. Both are now behind a call.
+    """
+    global _TOKEN
+    if _TOKEN is None:
+        _TOKEN = subprocess.run(
+            [DAEMON_EXE, "--print-token"], capture_output=True, text=True
+        ).stdout.strip()
+    return _TOKEN
 
 
 def say(text):
@@ -125,7 +140,7 @@ def call(path, method="GET", body=None):
     request = urllib.request.Request(
         DAEMON + path,
         data=json.dumps(body).encode() if body is not None else None,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {daemon_token()}", "Content-Type": "application/json"},
         method=method,
     )
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -292,49 +307,55 @@ def turns_of(run_ids):
         return None
 
 
-results = []
-for task, layer in requested(sys.argv[1:]):
-    prompt = prompt_for(task)
-    if True:
-        project = f"eval-{task}-{layer}"
-        tree = f"{TREES}/{task}-{layer}"
-        say(f"\n===== {task} x {layer} =====")
-        prepare(task, layer, tree)
+def main(argv):
+    results = []
+    for task, layer in requested(argv):
+        prompt = prompt_for(task)
+        if True:
+            project = f"eval-{task}-{layer}"
+            tree = f"{TREES}/{task}-{layer}"
+            say(f"\n===== {task} x {layer} =====")
+            prepare(task, layer, tree)
 
-        body = {"prompt": prompt, "cwd": tree, "mode": MODE[layer]}
-        if MODE[layer] == "worktree":
-            body["project_id"] = project
-        try:
-            created = call("/runs", "POST", body)
-        except urllib.error.HTTPError as error:
-            say(f"    recusado: HTTP {error.code} {error.read().decode()[:200]}")
-            results.append((task, layer, "refused", None, None, None))
-            record(Cell(task, layer, "refused"), [])
-            continue
-        first_id = created["id"]
-        say(f"    run {first_id} criado")
+            body = {"prompt": prompt, "cwd": tree, "mode": MODE[layer]}
+            if MODE[layer] == "worktree":
+                body["project_id"] = project
+            try:
+                created = call("/runs", "POST", body)
+            except urllib.error.HTTPError as error:
+                say(f"    recusado: HTTP {error.code} {error.read().decode()[:200]}")
+                results.append((task, layer, "refused", None, None, None))
+                record(Cell(task, layer, "refused"), [])
+                continue
+            first_id = created["id"]
+            say(f"    run {first_id} criado")
 
-        approver = None
-        if layer in ("H2", "H3"):
-            approver = subprocess.Popen(
-                ["python", "scripts/eval/auto-approve.py", "--project", project,
-                 "--interval", "3", "--max", "200"],
-                cwd=ROOT, env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        try:
-            outcome = watch(project if MODE[layer] != "real" else None, first_id)
-        finally:
-            if approver:
-                approver.terminate()
+            approver = None
+            if layer in ("H2", "H3"):
+                approver = subprocess.Popen(
+                    ["python", "scripts/eval/auto-approve.py", "--project", project,
+                     "--interval", "3", "--max", "200"],
+                    cwd=ROOT, env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            try:
+                outcome = watch(project if MODE[layer] != "real" else None, first_id)
+            finally:
+                if approver:
+                    approver.terminate()
 
-        verdict = score(task, layer, tree, first_id)
-        turns = turns_of(outcome["runs"]) if outcome["runs"] else None
-        say(f"    -> {verdict} | {outcome['wall']}s | ${outcome['cost']} | "
-            f"turnos={turns} | runs={outcome['runs']}")
-        results.append((task, layer, verdict, outcome["wall"], outcome["cost"], turns))
-        record(Cell(task, layer, verdict, turns, outcome["cost"], outcome["wall"]),
-               outcome["runs"] or [first_id])
+            verdict = score(task, layer, tree, first_id)
+            turns = turns_of(outcome["runs"]) if outcome["runs"] else None
+            say(f"    -> {verdict} | {outcome['wall']}s | ${outcome['cost']} | "
+                f"turnos={turns} | runs={outcome['runs']}")
+            results.append((task, layer, verdict, outcome["wall"], outcome["cost"], turns))
+            record(Cell(task, layer, verdict, turns, outcome["cost"], outcome["wall"]),
+                   outcome["runs"] or [first_id])
 
-say("\n================ RESUMO ================")
-for row in results:
-    say("\t".join("" if v is None else str(v) for v in row))
+    say("\n================ RESUMO ================")
+    for row in results:
+        say("\t".join("" if v is None else str(v) for v in row))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
