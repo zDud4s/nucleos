@@ -3,7 +3,7 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { apiFetch } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
-import type { BadgeTone } from "../ui";
+import { readState, statesOf, type StateReading } from "../ui/state-map";
 
 /**
  * The feed, and the notifications the calendar is holding back.
@@ -265,120 +265,24 @@ export function isHeld(notification: PendingNotification): boolean {
 
 /* ------------------------------------------------------------- readings -- */
 
-export interface FeedReading {
-  tone: BadgeTone;
-  /** What this kind of line means, in a phrase. */
-  label: string;
-}
-
 /**
- * Every `kind` the núcleo actually writes, mapped to a reading.
+ * A feed kind's reading, which is the map's reading — the same shape it always was.
  *
- * **Built by enumeration, not by guessing**: every key below was taken from a
- * `feed::append` / `append_on` / `append_for_errand` call site in `core/src/`,
- * plus the two indirect writers — `job::say` (thirteen `job_*` kinds) and
- * `notify::deliver_or_defer`, which is how `token_efficiency` and the e-mail
- * classes reach the feed. Nothing here is a name that looked plausible.
- *
- * **An unmapped kind renders its own literal**, exactly as `ui/state-map.ts`
- * does for an unmapped state. The núcleo grows kinds faster than this table
- * will, and a guessed label is a claim the shell cannot support — showing the
- * raw literal admits ignorance, which is the only honest fallback.
- *
- * Two kinds are deliberately absent and cannot be added:
- *
- * - `email_<class>` is built at run time from `notify_classes`
- *   (`triage.rs`: `format!("email_{}", verdict.class)`), which is configuration.
- *   Only the shipped default — `urgent` — is mapped; anybody else's class reads
- *   as its literal, which is right, because only they know what it means.
- * - The tones are the seven of `tokens.css` and nothing else. Where the núcleo's
- *   own line covers several outcomes at once — `vcs_request_finished` carries
- *   *succeeded*, *failed*, *blocked* and *escalated*; `council_finished` carries
- *   whatever status settled it — the reading is `info` and the verdict is left
- *   in the summary, rather than the shell picking one of four and being wrong
- *   three times.
+ * The table this alias replaces lived here, in a `.ts` file, with 46 `tone:` literals in it,
+ * and `ui/badge-authorship.test.ts` walked only `.tsx` and only `<Badge` tags. So the app's
+ * largest tone table was invisible to the one test that exists to find exactly that, and it
+ * stayed invisible long enough for five rows to drift into Acting Green. It is in
+ * `ui/state-map.ts` now, and the ratchet walks `.ts` too.
  */
-export const FEED_KINDS: Record<string, FeedReading> = {
-  /* -- jobs: `job::say`, thirteen kinds ----------------------------------- */
-  job_started: { tone: "active", label: "job started" },
-  job_planned: { tone: "info", label: "job planned" },
-  job_replanned: { tone: "info", label: "job replanned" },
-  job_plan_failed: { tone: "danger", label: "job could not be planned" },
-  job_item_failed: { tone: "danger", label: "job item failed" },
-  job_gate_failed: { tone: "danger", label: "job gate failed" },
-  job_waiting: { tone: "pending", label: "job waiting" },
-  job_finished: { tone: "active", label: "job finished" },
-  job_failed: { tone: "danger", label: "job failed" },
-  /**
-   * The three ways a job stops that are **not** failures, and never share a
-   * reading with `job_failed` — §7's sharpest row. `stopped` is a person or a
-   * brake halting the chain, `cancelled` is the request being withdrawn, and
-   * `expired` is the four-hour window closing on it.
-   */
-  job_stopped: { tone: "off", label: "job stopped" },
-  job_cancelled: { tone: "off", label: "job cancelled" },
-  job_expired: { tone: "paused", label: "job expired" },
-  /** The daemon died under it. A defect in us, not in the work. */
-  job_interrupted: { tone: "paused", label: "job interrupted" },
-
-  /* -- runs --------------------------------------------------------------- */
-  run_retry: { tone: "info", label: "run retried" },
-  run_failed_final: { tone: "danger", label: "run failed for good" },
-  run_interrupted: { tone: "paused", label: "run interrupted" },
-  run_stopped_probing: { tone: "danger", label: "run stopped after repeated refusals" },
-  /** Not an alarm. See {@link readEfficiencySignal}. */
-  token_efficiency: { tone: "info", label: "efficiency observation" },
-
-  /* -- worktrees ---------------------------------------------------------- */
-  worktree_gate_failed: { tone: "danger", label: "worktree gate failed" },
-  worktree_provision_failed: { tone: "danger", label: "worktree could not be made" },
-  worktree_released: { tone: "off", label: "worktree released" },
-  worktree_branch_kept: { tone: "info", label: "unmerged branch kept" },
-  worktree_removed: { tone: "off", label: "worktree removed" },
-  worktree_gc_failed: { tone: "danger", label: "worktree cleanup failed" },
-
-  /* -- the git queue ------------------------------------------------------ */
-  vcs_request_finished: { tone: "info", label: "git request settled" },
-  vcs_request_cancelled: { tone: "off", label: "git request cancelled" },
-  vcs_request_interrupted: { tone: "paused", label: "git request interrupted" },
-
-  /* -- council ------------------------------------------------------------ */
-  council_started: { tone: "active", label: "council started" },
-  council_stage: { tone: "info", label: "council stage" },
-  council_finished: { tone: "info", label: "council settled" },
-
-  /* -- errands and the scheduler ------------------------------------------ */
-  schedule_rule_invalid: { tone: "danger", label: "schedule rule invalid" },
-  errand_rule_fired: { tone: "active", label: "errand rule fired" },
-  errand_rule_failed: { tone: "danger", label: "errand rule failed" },
-  errand_investigation_done: { tone: "active", label: "errand investigation done" },
-  errand_investigation_failed: { tone: "danger", label: "errand investigation failed" },
-
-  /* -- e-mail ------------------------------------------------------------- */
-  email_digest: { tone: "info", label: "e-mail digest" },
-  email_urgent: { tone: "pending", label: "urgent e-mail" },
-  email_triage_failed: { tone: "danger", label: "e-mail triage failed" },
-  email_triage_paused: { tone: "paused", label: "e-mail triage paused" },
-  email_triage_stalled: { tone: "paused", label: "e-mail triage stalled" },
-  email_fetch_skipped: { tone: "info", label: "e-mail skipped" },
-  /** A misconfigured `sent_mailbox`: mail arrives and correspondents are lost. */
-  email_sent_mailbox_foreign: { tone: "danger", label: "sent mail filed elsewhere" },
-
-  /* -- governance and the rest -------------------------------------------- */
-  action_authorized: { tone: "info", label: "action authorised by a grant" },
-  proposal_record_failed: { tone: "danger", label: "proposal not recorded" },
-  promotion_ready: { tone: "pending", label: "promotion ready" },
-  /** The one kind the núcleo spells with a dot (`web.rs`). */
-  "web.read": { tone: "info", label: "web page read" },
-};
+export type FeedReading = StateReading;
 
 /** The reading for a kind, or `null` when this shell has none. */
 export function readFeedKind(kind: string): FeedReading | null {
-  return FEED_KINDS[kind.trim()] ?? null;
+  return readState("feed", kind);
 }
 
 /** Every mapped kind, sorted, for the filter's `datalist`. */
-export const FEED_KIND_NAMES: string[] = Object.keys(FEED_KINDS).sort();
+export const FEED_KIND_NAMES: string[] = statesOf("feed").sort();
 
 /**
  * Why a `job_waiting` line is waiting, read out of its summary.

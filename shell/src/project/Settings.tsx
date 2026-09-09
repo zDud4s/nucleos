@@ -122,19 +122,21 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
         value={project.mode}
         actAllowed={project.promotable}
         actArmedLabel={promotionConfirmLabel(project)}
+        actConsequence={promotionConsequence(project)}
         onArmedChange={setArmed}
-        actDescribedBy={armed ? consequenceId : undefined}
+        actDescribedBy={consequenceId}
         busy={setMode.isPending}
         onChoose={change}
       />
 
       {/* Immediately under the switch and above everything else this block says, so arming
-          pushes the standing copy down rather than moving the button itself. */}
-      {armed ? (
-        <p className="text-xs text-text-muted" id={consequenceId}>
-          {promotionConsequence(project)}
-        </p>
-      ) : null}
+          pushes the standing copy down rather than moving the button itself. In the document
+          at rest, hidden, so the switch can be described before it is armed: a description
+          attached at the moment of arming lands on a button that already has focus and is
+          not re-announced. `.sr-only` is absolutely positioned — nothing moves. */}
+      <p className={armed ? "text-xs text-text-muted" : "sr-only"} id={consequenceId}>
+        {promotionConsequence(project)}
+      </p>
 
       <p className="text-xs text-text-muted">{MODE_MEANING[project.mode]}.</p>
 
@@ -294,7 +296,8 @@ function Chip({ row }: { row: ClassTally }) {
       title={`${row.total} decided, ${row.reviewed} reviewed, ${row.disagree} disagreed`}
     >
       {row.action_class}
-      <span className="ml-1 text-text-faint">
+      {/* The fraction needs a real gap from the hyphenated class name. */}
+      <span className="ml-2 text-text-faint">
         {row.reviewed}/{row.total}
       </span>
     </span>

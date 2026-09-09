@@ -3,7 +3,6 @@ import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import { isApiRefusal } from "../data/client";
 import {
   DIFF_LINE_CAP,
-  RULE_STATE_WORD,
   VIEWS,
   autonomyOf,
   concernsOf,
@@ -28,12 +27,11 @@ import {
   type InspectEntry,
   type ProjectRules,
   type ProjectView,
-  type RuleState,
 } from "../data/projects";
 import { useAssistantModels, type ModelChoice } from "../data/chats";
 import { useProjects } from "../data/system";
 import {
-  Badge,
+  StateBadge,
   Button,
   Crumb,
   ErrorNote,
@@ -43,7 +41,6 @@ import {
   RefusalNote,
   RelativeTime,
   Teach,
-  type BadgeTone,
 } from "../ui";
 import "./projects.css";
 
@@ -921,12 +918,6 @@ const CLOCK_SAID: Record<AutonomyRule["clock"], string> = {
  * against fires nothing, by design, and drawing it in the same green as a rule
  * that will run tonight is how "armed" came to mean two different things.
  */
-const STATE_TONE: Record<RuleState, BadgeTone> = {
-  armed: "active",
-  "never-fires": "danger",
-  capped: "paused",
-  unseen: "pending",
-};
 
 /**
  * Everything that starts work here without you, as one table.
@@ -1019,7 +1010,7 @@ function RuleRows({ rule }: { rule: AutonomyRule }) {
           <Trigger rule={rule} />
         </td>
         <td>
-          <Badge tone={STATE_TONE[rule.state]}>{RULE_STATE_WORD[rule.state]}</Badge>
+          <StateBadge domain="rule" state={rule.state} />
         </td>
         <td className="pj-col-num">
           <Moment
@@ -1357,6 +1348,7 @@ function WipPanel({ projectId, rules }: { projectId: string; rules: ProjectRules
         &ldquo;how much unanswered work am I willing to have open&rdquo;, not a quota.
       </p>
 
+      {/* Open work occupies the ceiling; a full queue asks the reader to review it. */}
       <Meter
         label="open and unreviewed"
         value={rules.open_proposals}

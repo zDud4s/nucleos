@@ -51,6 +51,10 @@ export function KillSwitchControl() {
                 Really release — work resumes
               </>
             }
+            /* The label is a fragment, so there is nothing to interpolate: this control
+               announced "armed — press again to confirm", with no object, on the button that
+               restarts everything autonomous in the app. */
+            sayAs="Really release — work resumes"
             variant="danger-solid"
             onConfirm={() => set.mutate(false)}
             disabled={set.isPending}

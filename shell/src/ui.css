@@ -478,20 +478,23 @@
 /**
  * Armed: the control is live and will act on the next click.
  *
- * A ring rather than a colour change alone — the button has already changed
- * what it says, and the ring is the peripheral signal that something on this
- * page is waiting for a second click.
+ * A ring rather than a lift — the button has already changed what it says, and the ring is
+ * the peripheral signal that something on this page is waiting for a second click.
+ *
+ * ONE colour, at every site, and the colour is the text colour. The ring answers "is this
+ * control live?"; the variant underneath it already answers "what kind of thing is it?", and
+ * a ring that tried to answer both said the second one at a contrast nobody could read. The
+ * neutral hairline this used to draw measured 1.7:1 against Working Surface and the danger
+ * tint 1.2:1, both under the 3:1 floor for a non-text indicator — so at 51 of 53 sites the
+ * only signal that the next click fires was the label. `--text` is 14.3:1 on the same
+ * surface, and it is not the focus ring: that is a 2px cyan `outline` at `--focus-ring`.
+ *
+ * The variants keep their own answer where it belongs. A `danger` button still swaps to
+ * `danger-solid` while armed (`ConfirmButton.tsx`), so the FILL changes and the ring does
+ * not have to say it twice.
  */
 .ui-confirm-armed > .ui-button {
-  box-shadow: 0 0 0 3px var(--border-strong);
-}
-
-/* The ring is neutral by default and red only where the button is: an armed
-   Archive that glowed danger-red would reintroduce, for four seconds, exactly
-   the confusion the variant grammar exists to end. */
-.ui-confirm-armed > .ui-button-danger,
-.ui-confirm-armed > .ui-button-danger-solid {
-  box-shadow: 0 0 0 3px var(--tone-danger-bg);
+  box-shadow: 0 0 0 3px var(--text);
 }
 
 /* ----------------------------------------------------------------- teach -- */
@@ -1033,6 +1036,11 @@
 
 .ui-gauge-danger .ui-gauge-fill {
   background: var(--tone-danger-fg);
+}
+
+/* A quantity is a past fact, not a state. */
+.ui-gauge-quantity .ui-gauge-fill {
+  background: var(--text-muted);
 }
 
 /* Full is worth seeing without reading: the ceiling itself takes the tone. */

@@ -1600,12 +1600,13 @@ function VcsRow({ row, count }: { row: VcsRequestSummary; count: number }) {
         <span className="waiting-meta">{row.project_id}</span>
         <RelativeTime at={row.created_at} />
       </div>
-      {/* The badge says the state in one word; what to do about it is the row's
-          job, and this is where a row's detail goes. */}
+      {/* The badge says the state in one word; the metadata says which repository and where
+          the request came from. */}
       <p className="waiting-meta">
         {row.repo_key} — {row.origin}
-        {row.status === "blocked" ? " — submit it again" : ""}
       </p>
+      {/* And what to do about it is its own line, not a third clause on the faint mono one. */}
+      {row.status === "blocked" ? <p className="waiting-hint">submit it again</p> : null}
     </li>
   );
 }

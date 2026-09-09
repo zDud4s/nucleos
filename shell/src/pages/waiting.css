@@ -137,6 +137,19 @@
   overflow-wrap: anywhere;
 }
 
+/* What to do about a row, on a line of its own.
+
+   It was a third clause on the mono `.waiting-meta` path line — `--text-faint`, 11px, the
+   quietest rank on the card — so the one sentence asking somebody to act was drawn as the
+   least important thing on the row, after a repository key and an origin. The badge says the
+   state in one word and this says what to do about it; body face at `--text-sm` and
+   `--text-muted` puts it between the two, which is where an instruction belongs. */
+.waiting-hint {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
 /* Why the agent says it wants this. A model wrote it, so it is rendered as text
    and never as markup — there is no `dangerouslySetInnerHTML` in this slice. */
 .waiting-reasoning {

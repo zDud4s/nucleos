@@ -11,7 +11,6 @@ import {
   type RefinementStatus,
 } from "../data/refinements";
 import {
-  Badge,
   Button,
   ConfirmButton,
   Count,
@@ -21,7 +20,7 @@ import {
   RefusalNote,
   RelativeTime,
   Teach,
-  type BadgeTone,
+  StateBadge,
 } from "../ui";
 import "./learned.css";
 
@@ -199,7 +198,7 @@ function Row({ row, decisions }: { row: Refinement; decisions?: ReactNode }) {
   return (
     <li className="ui-rows-row learned-row">
       <div className="learned-head">
-        <Badge tone={KIND_TONE[row.kind]}>{KIND_LABEL[row.kind]}</Badge>
+        <StateBadge domain="refinement" state={row.kind} />
         <span className="learned-scope">
           {row.project_id ?? "this machine"}
         </span>
@@ -305,26 +304,6 @@ const KIND_ORDER: Record<RefinementKind, number> = {
   subagent: 3,
 };
 
-const KIND_LABEL: Record<RefinementKind, string> = {
-  prompt: "instruction",
-  memory: "fact",
-  skill: "how-to",
-  subagent: "delegation",
-};
-
-/**
- * A tone per kind, and none of them `danger`.
- *
- * Nothing on this page is an alarm: every row here was either approved by a
- * person or is waiting for one. The tones separate kinds at a glance, which is
- * the only thing colour is doing here.
- */
-const KIND_TONE: Record<RefinementKind, BadgeTone> = {
-  prompt: "active",
-  memory: "info",
-  skill: "shadow",
-  subagent: "off",
-};
 
 /**
  * What the decision doors say when they say no.

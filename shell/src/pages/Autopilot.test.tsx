@@ -206,11 +206,17 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
 
       `alpha` carries a null `wip_limit` here, which is no ceiling and is never written as a
       zero — the reason the sentence is worth putting anywhere at all.
+
+      Found by class and not by text: the sentence is now in the document twice while armed
+      — once on the visible line and once inside the interlock's live region, which says it
+      rather than showing it — so `getByText` matches two elements and fails on the
+      ambiguity rather than on anything being wrong.
     */
     const ARMED = "Let alpha act";
-    const consequence = await screen.findByText(/alpha acts on its own/);
-    expect(consequence.textContent).toContain("no ceiling on proposals");
-    expect(consequence.closest(".ap-project-consequence")).not.toBeNull();
+    const consequence = document.querySelector(".ap-project-consequence");
+    expect(consequence).not.toBeNull();
+    expect(consequence?.textContent).toContain("alpha acts on its own");
+    expect(consequence?.textContent).toContain("no ceiling on proposals");
 
     // And the interlock claims no pressed state while it is still an offer: in this group
     // `aria-pressed` means "this IS the setting", and nothing has been set yet.
@@ -225,8 +231,11 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
       expect(screen.queryByRole("button", { name: ARMED })).toBeNull();
     });
 
-    // And the sentence goes away with the interlock it belonged to.
-    expect(screen.queryByText(/alpha acts on its own/)).toBeNull();
+    // And the sentence stops being SHOWN with the interlock it belonged to. It does not leave
+    // the document: the switch points at it whether or not it is armed, and an
+    // `aria-describedby` naming an element that is not there describes nothing.
+    expect(document.querySelector(".ap-project-consequence")).toBeNull();
+    expect(screen.getByText(/alpha acts on its own/).closest(".sr-only")).not.toBeNull();
 
     const input = await screen.findByLabelText("Folder for alpha");
 
@@ -339,15 +348,22 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
   });
 
   /**
-   * The sentence under the row is the armed button's description, not a paragraph near it.
+   * The sentence under the row is the armed button's description, and it is one BEFORE the press.
    *
    * Sighted, the pairing is obvious: the line appears the moment the segment arms, directly
    * under the row it belongs to. To a screen reader it was two unrelated things — a button
    * that had quietly renamed itself, and a sentence somewhere below. The id is `useId`'s
    * rather than a literal because the roster renders one of these per project, and four rows
    * sharing one id would point every switch at the first row's sentence.
+   *
+   * Pointing at it only while armed was the same mistake one level down: `aria-describedby`
+   * arriving in the render that swaps a focused button's label is not re-announced by any
+   * major screen reader, so the description was attached at the one moment it could not be
+   * heard. The element is in the document at rest as `.sr-only` — `position: absolute`, so it
+   * takes no grid track and the row keeps the height it was measured at — and arming swaps
+   * the class rather than mounting anything.
    */
-  it("the armed row points the switch at its consequence", async () => {
+  it("the consequence describes the switch before the press", async () => {
     const world = cockpitWorld({
       projects: [
         project({
@@ -366,20 +382,24 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
     await renderCockpit();
 
     const offer = await screen.findByRole("button", { name: "Let it act" });
-    // Nothing to describe until there is something to confirm.
-    expect(offer.getAttribute("aria-describedby")).toBeNull();
+    const describedBy = offer.getAttribute("aria-describedby");
+    expect(describedBy).not.toBeNull();
+
+    // Described at rest, and the description resolves: a sentence nobody can see and every
+    // screen reader can, on a control that has not been touched yet.
+    const described = document.getElementById(describedBy ?? "");
+    expect(described).not.toBeNull();
+    expect(described?.className).toBe("sr-only");
+    expect(described?.textContent).toContain("alpha acts on its own");
 
     fireEvent.click(offer);
 
-    const armed = screen.getByRole("button", { name: "Let alpha act" });
-    const describedBy = armed.getAttribute("aria-describedby");
-    expect(describedBy).not.toBeNull();
-
-    // And it resolves to the sentence the row prints, on the full-width line under it.
-    const described = document.getElementById(describedBy ?? "");
-    expect(described).not.toBeNull();
-    expect(described?.className).toContain("ap-project-consequence");
-    expect(described?.textContent).toContain("alpha acts on its own");
+    // Arming shows it, on the full-width line under the row — same element, same id, same
+    // sentence. The armed button still points at it.
+    expect(described?.className).toBe("ap-project-consequence");
+    expect(
+      screen.getByRole("button", { name: "Let alpha act" }).getAttribute("aria-describedby"),
+    ).toBe(describedBy);
   });
 
   it("the budget period is a word and not a stem", async () => {
@@ -578,6 +598,32 @@ describe("Autopilot - the stat cards name what they count", () => {
     // What changed is the card no longer promising to BE the queue; the link
     // that actually goes there is untouched.
     expect(screen.getByRole("link", { name: "Go to the queue" })).toBeDefined();
+  });
+});
+
+/* ---------------------------------------------------------- the ask form -- */
+
+describe("Autopilot - the ask form", () => {
+  /**
+   * One label rank above the field, not two.
+   *
+   * "ASK FOR ONE" and "WHAT SHOULD ALPHA DO?" were two 11px uppercase labels on consecutive
+   * lines above one textarea, which makes the reader work out which of them names the box. The
+   * field's label carries the question; the section had nothing of its own to add.
+   */
+  it("the ask form has one label above its field", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+
+    await renderCockpit();
+
+    expect(screen.queryByText("ask for one")).toBeNull();
+    const field = screen.getByLabelText(/^What should .+ do\?$/);
+    // Written as the attribute's own serialisation, not a bare string: the id
+    // is also a kebab token from the `ap-` family, and a stray literal reads
+    // to `css-contract.mjs` as a class nobody styled (the same shape of false
+    // positive as `chats-zoom`/`fleet-exclusion`, one abbreviated attribute
+    // reference away from being masked out).
+    expect(field.outerHTML).toContain('id="ap-job-prompt"');
   });
 });
 

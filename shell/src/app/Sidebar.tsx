@@ -80,6 +80,15 @@ function writeRosterOpen(open: boolean): void {
  * moment anyone opened a detail route, which reads as "you are nowhere".
  * `/` is exempt: every path starts with it, and a prefix rule would light Home
  * on every page in the app.
+ *
+ * One case the prefix rule gets wrong, and it is not fixed here. A row that owns the rows
+ * under it matches every one of their paths: inside `/projects/alpha/state` both
+ * `All projects` and `alpha` were active, so two rows carried `aria-current="page"` and the
+ * rail said "you are here" twice on every project screen — with the quiet fill, the `--text`
+ * label, the glyph and the 2px bar on both. The row that discloses a roster passes an
+ * `active` override of its own instead (`pathname === entry.path`, in `item`'s call below),
+ * because knowing which paths have children is `nav.ts`'s business: encode it here and this
+ * function has to hold a list it cannot see.
  */
 function isActive(pathname: string, path: string): boolean {
   if (path === "/") return pathname === "/";
@@ -645,6 +654,15 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
         className={classes.join(" ")}
         aria-current={active ? "page" : undefined}
         /*
+          `Link`'s OWN active detection is a prefix match with no way to turn it
+          off, and it appends its own `aria-current="page"` after ours whenever
+          `pathname` merely starts with `entry.path` — which is exactly the case
+          the roster-disclosing row's `active` override exists to defeat. `exact`
+          only when an override was given: every other row still wants the
+          router's default prefix rule, which already agrees with `isActive`.
+        */
+        activeOptions={activeOverride !== undefined ? { exact: true } : undefined}
+        /*
           Spelled out rather than left to the name computation over the
           children, which concatenates adjacent inline text with no separator
           and would announce this item as "Waiting7". A count that is on screen
@@ -758,7 +776,10 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
                       and no magic number that a taller row would falsify.
                     */}
                     <div className="nav-rowhead">
-                      {item(entry)}
+                      {/* Equality, not the prefix rule: this row owns the roster under it, so
+                          a prefix match lights it on every path any of its children own. See
+                          `isActive`. */}
+                      {item(entry, { active: pathname === entry.path })}
                       {/*
                         A link and a disclosure, side by side, and deliberately
                         not one control doing both: `All projects` is a page —

@@ -458,8 +458,9 @@ function GovernanceRow({
           value={project.mode}
           actAllowed={project.promotable}
           actArmedLabel={promotionConfirmLabel(project)}
+          actConsequence={promotionConsequence(project)}
           onArmedChange={setArmed}
-          actDescribedBy={armed ? consequenceId : undefined}
+          actDescribedBy={consequenceId}
           busy={setMode.isPending}
           onChoose={(mode) =>
             change(
@@ -491,12 +492,18 @@ function GovernanceRow({
 
         Full width because the last track is `minmax(0, 1fr)` — the sentence inside the
         segment is what grew the row.
+
+        Rendered at rest and not only while armed, which is the difference between a
+        description and an announcement. `aria-describedby` appearing in the same render that
+        swaps a focused button's label is not re-announced by any major screen reader — the
+        attribute arrived after the element already had focus, so the sentence was attached at
+        the one moment it could not be heard. Here it is part of the button's accessible
+        description before anybody presses anything, and `.sr-only` is `position: absolute`,
+        so at rest it takes no grid track and the row is exactly the height it was.
       */}
-      {armed ? (
-        <div className="ap-project-consequence" id={consequenceId}>
-          <Quiet says={promotionConsequence(project)} />
-        </div>
-      ) : null}
+      <div className={armed ? "ap-project-consequence" : "sr-only"} id={consequenceId}>
+        <Quiet says={promotionConsequence(project)} />
+      </div>
 
       {project.mode !== "active" && !project.promotable ? (
         <div className="ap-project-blocker">
@@ -957,7 +964,6 @@ function JobsPanel({
         </ul>
       )}
 
-      <p className="ap-subhead">ask for one</p>
       <div className="ap-form">
         <label className="ap-field-label" htmlFor="ap-job-prompt">
           What should {selected ?? "a project"} do?

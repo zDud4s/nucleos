@@ -61,6 +61,25 @@ async function panelFor(headingText: string | RegExp): Promise<HTMLElement> {
 }
 
 describe("Learned", () => {
+  it("four kinds of refinement wear one tone, because a kind is not a state", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        refinement({ id: 1, kind: "prompt" }),
+        refinement({ id: 2, kind: "memory" }),
+        refinement({ id: 3, kind: "skill" }),
+        refinement({ id: 4, kind: "subagent" }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+
+    for (const [kind, word] of [["prompt", "instruction"], ["memory", "fact"], ["skill", "how-to"], ["subagent", "delegation"]] as const) {
+      const badge = await screen.findByText(word);
+      expect(badge.className, kind).toContain("ui-badge-info");
+    }
+    expect(screen.queryByText("instruction")?.className).not.toContain("ui-badge-shadow");
+  });
+
   it("keeps what is waiting apart from what is in force", async () => {
     daemon.apiFetch.mockImplementation(
       daemonWith([

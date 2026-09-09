@@ -4,8 +4,9 @@ import { Link } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import { folderOf, gateOf, headline, inAttentionOrder, type Folder, type Gate } from "../data/roster";
 import { useProjects, type ProjectSummary } from "../data/system";
-import { Badge, type BadgeTone } from "../ui/Badge";
+import { Badge } from "../ui/Badge";
 import { StateBadge } from "../ui";
+import { readState } from "../ui/state-map";
 import { Button } from "../ui/Button";
 import { Count } from "../ui/Count";
 import { ErrorNote } from "../ui/ErrorNote";
@@ -302,12 +303,6 @@ function Row({
  * that had gone — and that says nothing at all about the code. Drawing it as a failure sends
  * somebody to read a diff when the thing to fix is a path.
  */
-const GATE_TONE: Record<Exclude<Gate, "none">, BadgeTone> = {
-  passed: "active",
-  failed: "danger",
-  errored: "paused",
-};
-
 function GateCell({ gate, at }: { gate: Gate; at: string | null }) {
   if (gate === "none") {
     return (
@@ -316,18 +311,10 @@ function GateCell({ gate, at }: { gate: Gate; at: string | null }) {
       </span>
     );
   }
-  return (
-    <Badge tone={GATE_TONE[gate]} title={at === null ? undefined : `last run ${at}`}>
-      {gate}
-    </Badge>
-  );
+  const reading = readState("gate", gate);
+  if (reading === null) return <span className="text-text-faint">{gate}</span>;
+  return <Badge tone={reading.tone} title={at === null ? undefined : `last run ${at}`}>{gate}</Badge>;
 }
-
-const FOLDER_WORD: Record<Folder, string> = {
-  ok: "ok",
-  missing: "gone",
-  unset: "not named",
-};
 
 /**
  * Where the project's folder is, and how loudly to say it.
@@ -364,16 +351,18 @@ function FolderCell({
       </span>
     );
   }
+  const reading = readState("folder", folder);
+  if (reading === null) return <span className="text-text-faint">{folder}</span>;
   return (
     <Badge
-      tone={folder === "missing" ? "danger" : "off"}
+      tone={reading.tone}
       title={
         folder === "missing"
           ? `${root} is not on this disk`
           : "no folder has been named for this project"
       }
     >
-      {FOLDER_WORD[folder]}
+      {reading.label}
     </Badge>
   );
 }

@@ -1,7 +1,8 @@
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
-import { readFeedKind, useRecentFeed, type FeedEntry } from "../data/feed";
-import { Badge, ErrorNote, Panel, RefusalNote, RelativeTime } from "../ui";
+import { useRecentFeed, type FeedEntry } from "../data/feed";
+import { ErrorNote, Panel, RefusalNote, RelativeTime } from "../ui";
+import { KindBadge } from "../pages/Feed";
 /*
   The rules this block is drawn with are `ap-` and live in `pages/autopilot.css`, where
   they were written for the cockpit. Imported here rather than copied, because a CSS
@@ -63,15 +64,9 @@ export function FeedEmbed({ lines = EMBED_LINES }: FeedEmbedProps) {
 }
 
 function FeedLine({ entry }: { entry: FeedEntry }) {
-  const reading = readFeedKind(entry.kind);
   return (
     <li className="ap-feed-line">
-      <Badge
-        tone={reading?.tone ?? "info"}
-        title={reading === null ? `this shell has no reading for feed kind "${entry.kind}"` : undefined}
-      >
-        {reading?.label ?? entry.kind}
-      </Badge>
+      <KindBadge kind={entry.kind} />
       <span className="ap-feed-summary">{entry.summary}</span>
       <RelativeTime at={entry.created_at} />
     </li>

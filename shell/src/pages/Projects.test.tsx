@@ -573,6 +573,27 @@ describe("Projects - what starts work without you", () => {
     expect(within(table).queryByText("armed")).toBeNull();
   });
 
+  it("an armed rule is a stated setting, not work in flight", async () => {
+    answerWith(
+      projectsWorld({
+        rules: rules({
+          schedules: [{ name: "nightly", cron: "0 3 * * *", prompt: "tidy", cwd: null, timezone: null, next_fire_at: null, problem: null, last_fired_at: null, fires_today: 0, daily_cap: 4 }],
+          repo_triggers: [{ name: "on-main", branch: "main", prompt: "run", last_sha: null }],
+        }),
+      }),
+    );
+
+    await renderProjects("/projects/alpha/rules");
+
+    const table = await screen.findByRole("table", { name: /start work in this project/ });
+    const armed = within(table).getByText("armed");
+    expect(armed.className).toContain("ui-badge-info");
+    expect(armed.className).not.toContain("ui-badge-active");
+    const unseen = within(table).getByText("no commit seen yet");
+    expect(unseen.className).toContain("ui-badge-info");
+    expect(unseen.className).not.toContain("ui-badge-pending");
+  });
+
   /* The primitive that exists for exactly this and that this page had never
      used. "Nothing is scheduled" and "no commit starts anything here" were two
      sentences saying nothing twice. */

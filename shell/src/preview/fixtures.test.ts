@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED } from "../data/autopilot";
-import { PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
+import { FEED, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
+import { readFeedKind } from "../data/feed";
 
 /**
  * The states the preview must be able to photograph, pinned as facts about the fixtures.
@@ -14,6 +15,12 @@ import { PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
  * a legitimate state — so the claim has to be made here, out loud.
  */
 describe("the preview fixtures", () => {
+  it("the feed serves lines across kinds, and exactly one the shell cannot read", () => {
+    expect(FEED.length).toBeGreaterThanOrEqual(12);
+    expect(FEED.filter((row) => readFeedKind(row.kind) === null).map((row) => row.kind)).toEqual(["map_stamp_recorded"]);
+    for (const kind of ["job_finished", "job_started", "job_failed", "vcs_request_finished", "email_urgent", "token_efficiency", "web.read"]) expect(FEED.some((row) => row.kind === kind), kind).toBe(true);
+    expect(new Set(FEED.map((row) => readFeedKind(row.kind)?.tone)).size).toBeGreaterThanOrEqual(4);
+  });
   /*
     Exactly one, and it is the one the shots point at.
 

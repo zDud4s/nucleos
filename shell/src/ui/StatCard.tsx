@@ -14,6 +14,8 @@ export interface StatCardProps {
   value: ReactNode | undefined;
   /** The line under the figure: a split, a ceiling, a trend. */
   detail?: ReactNode;
+  /** A bar under the reading, for a figure that runs against a ceiling. */
+  bar?: ReactNode;
   /**
    * The figure is bad news, and should say so.
    *
@@ -33,7 +35,7 @@ export interface StatCardProps {
  * first screen is a *reading*, not a console. Nothing on a stat card is
  * clickable and nothing behind one mutates.
  */
-export function StatCard({ label, value, detail, tone }: StatCardProps) {
+export function StatCard({ label, value, detail, bar, tone }: StatCardProps) {
   return (
     <article
       className={tone === undefined ? "ui-stat" : `ui-stat ui-stat-${tone}`}
@@ -42,6 +44,7 @@ export function StatCard({ label, value, detail, tone }: StatCardProps) {
       <p className="ui-stat-value">{value === undefined ? "—" : value}</p>
       <p className="ui-stat-label">{label}</p>
       {detail === undefined ? null : <p className="ui-stat-detail">{detail}</p>}
+      {bar === undefined ? null : bar}
     </article>
   );
 }

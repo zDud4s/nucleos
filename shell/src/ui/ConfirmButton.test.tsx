@@ -223,6 +223,56 @@ describe("ConfirmButton", () => {
     expect(button.textContent).toBe("Let it act");
   });
 
+  it("the consequence is announced, not the label", () => {
+    render(
+      <ConfirmButton
+        label="Let it act"
+        confirmLabel="Let alpha act"
+        sayAs="alpha acts on its own — 3 of its 4 proposal slots already in use, no approval"
+        variant="approve"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Let it act" }));
+
+    // The eye gets the label; the ear used to get the same two words. What somebody needs
+    // before pressing again is what it MEANS, and that is the sentence the caller prints.
+    const said = screen.getByText(/^armed: alpha acts on its own/);
+    expect(said.getAttribute("role")).toBe("status");
+    expect(said.textContent).toBe(
+      "armed: alpha acts on its own — 3 of its 4 proposal slots already in use, no approval — press again to confirm",
+    );
+  });
+
+  it("a label that is not a string still announces its object", () => {
+    render(
+      <ConfirmButton
+        label={
+          <>
+            <span aria-hidden="true">▶</span>Release kill switch
+          </>
+        }
+        confirmLabel={
+          <>
+            <span aria-hidden="true">▶</span>Really release — work resumes
+          </>
+        }
+        sayAs="Really release — work resumes"
+        variant="danger-solid"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Release kill switch" }));
+
+    // A fragment cannot be interpolated, so this used to say "armed — press again to confirm"
+    // and name nothing at all — on the control that restarts every autonomous thing there is.
+    const said = screen.getByText(/^armed: Really release/);
+    expect(said.getAttribute("role")).toBe("status");
+    expect(screen.queryByText("armed — press again to confirm")).toBeNull();
+  });
+
   it("arming swaps only danger to danger-solid", () => {
     setup();
     render(

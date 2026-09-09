@@ -206,6 +206,25 @@ describe("Feed - a search freezes the list and Back to live resumes it", () => {
 /* ------------------------------------------------------ A15: unmapped kinds -- */
 
 describe("Feed - a kind this shell has no reading for", () => {
+  it("a mapped kind's reading comes from the map, and an unmapped one still shows its own literal", async () => {
+    daemon.apiFetch.mockImplementation(
+      feedFetch([
+        entry({ id: 8, kind: "job_finished", summary: "job 8 finished" }),
+        entry({ id: 9, kind: "nonesuch_kind", summary: "a kind without a map reading" }),
+      ]),
+    );
+
+    await renderFeed();
+
+    const mapped = await screen.findByText("job finished");
+    expect(mapped.className).toContain("ui-badge-info");
+    expect(mapped.className).not.toContain("ui-badge-active");
+    expect(mapped.getAttribute("title")).toBe("job_finished");
+    const unknown = screen.getByText("nonesuch_kind");
+    expect(unknown.className).toContain("ui-state-unmapped");
+    expect(unknown.className).toContain("ui-badge-off");
+  });
+
   it("an unknown feed kind wears the same ignorance device as an unknown state", async () => {
     // `email_<class>` is built from configuration (`notify_classes`), so the
     // shell cannot have a table entry for everybody's classes. Showing the

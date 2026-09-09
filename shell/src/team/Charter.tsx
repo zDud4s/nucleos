@@ -406,10 +406,12 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
               onChange={(event) => edit("maxLiveRuns", { maxLiveRuns: event.target.value })}
             />
           </Field>
+          {/* Live runs occupy this ceiling right now: the reading Acting Green is for. */}
           <Meter
             label="at work"
             value={runs.filter((run) => run.team_id === existing?.id && LIVE.has(run.state)).length}
             ceiling={parseCeiling(form.maxLiveRuns)}
+            tone="active"
           />
           <Field label="Max open actions (0-20)">
             <input

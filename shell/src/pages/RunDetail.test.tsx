@@ -444,24 +444,24 @@ describe("RunDetail — absent readings", () => {
 });
 
 describe("RunDetail headline", () => {
-  it("the headline and the badge use one word for one state", async () => {
+  it("a terminal run's headline says where it ran and leaves the state to the badge", async () => {
     daemon.apiFetch.mockImplementation(detailFetch(detail({ status: "completed", project_id: "alpha" }), NO_TAIL, []));
 
     await renderApp({ initialPath: "/runs/5" });
 
-    const heading = await screen.findByText("completed, in alpha");
-    expect(heading.textContent).toBe("completed, in alpha");
-    expect(heading.textContent).not.toMatch(/ended completed/);
-    expect(heading.textContent).not.toMatch(/finished/);
+    const heading = await screen.findByText("ran in alpha");
+    expect(heading.textContent).toBe("ran in alpha");
+    expect(screen.getAllByText("completed").length).toBeGreaterThan(0);
+    expect(heading.textContent).not.toContain("completed");
   });
 
-  it("uses the state map label for a timed-out run", async () => {
+  it("keeps terminal state out of a timed-out headline", async () => {
     daemon.apiFetch.mockImplementation(detailFetch(detail({ status: "timed_out" }), NO_TAIL, []));
 
     await renderApp({ initialPath: "/runs/5" });
 
-    const heading = await screen.findByText(/timed out, in alpha/);
+    const heading = await screen.findByText("ran in alpha");
     expect(heading.textContent).not.toMatch(/ended /);
-    expect(screen.queryByText(/ended timed_out/)).toBeNull();
+    expect(heading.textContent).not.toContain("timed out");
   });
 });

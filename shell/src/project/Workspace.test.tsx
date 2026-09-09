@@ -775,6 +775,43 @@ describe("the settings this app authors", () => {
     ).toBe(false);
   });
 
+  it("an action class and its tally do not run together", async () => {
+    // The Chip renders one row of the shadow scoreboard; `settingsState`'s project overrides
+    // alone leave it empty, since the block reads `useScoreboard`, not the project's own fields.
+    const state = daemonState({
+      projects: [
+        project({
+          project_id: "nucleos",
+          mode: "shadow",
+          project_root: "C:/p",
+          promotable: false,
+          classes_ready: 2,
+          classes_total: 5,
+        }),
+      ],
+      scoreboard: [
+        {
+          mode: "shadow",
+          action_class: "read-local",
+          total: 46,
+          would_allow: 40,
+          would_pend: 5,
+          would_deny: 1,
+          reviewed: 18,
+          agree: 12,
+          disagree: 6,
+        },
+      ],
+    });
+    await openState(state);
+
+    const chip = await screen.findByTitle(/decided, .* reviewed/);
+    const fraction = chip.querySelector("span") as HTMLElement;
+    expect(fraction.className).toContain("ml-2");
+    expect(fraction.className).not.toContain("ml-1");
+    expect(chip.getAttribute("title")).toContain("disagreed");
+  });
+
   /**
    * Arming it says what it would mean, under the switch — where nothing above the button moves.
    *
@@ -799,20 +836,67 @@ describe("the settings this app authors", () => {
       }),
     );
 
-    // Nothing says it before it is armed: it is what confirming would do, not a standing fact.
-    expect(screen.queryByText(/nucleos acts on its own/)).toBeNull();
+    const offer = await screen.findByRole("button", { name: "Let it act" });
 
-    fireEvent.click(await screen.findByRole("button", { name: "Let it act" }));
+    // Nothing SHOWS it before it is armed: it is what confirming would do, not a standing
+    // fact. It is in the document all the same, hidden — see the case below for why.
+    expect(screen.getByText(/nucleos acts on its own/).className).toBe("sr-only");
+
+    fireEvent.click(offer);
 
     const armed = await screen.findByRole("button", { name: "Let nucleos act" });
     // The interlock claims no pressed state: in this group `aria-pressed` means "this IS the
     // setting", and armed is the one moment nothing has been set.
     expect(armed.getAttribute("aria-pressed")).toBeNull();
 
+    // Read through the description rather than by text: while armed the sentence is in the
+    // document twice — the paragraph under the switch, and the live region saying it — so
+    // `getByText` matches two elements and fails on the ambiguity.
+    const said = document.getElementById(armed.getAttribute("aria-describedby") ?? "");
     // And the count reads as a count already taken, not as an allowance being granted.
-    const said = await screen.findByText(/nucleos acts on its own/);
-    expect(said.textContent).toContain("3 of its 4 proposal slots already in use");
-    expect(said.tagName).toBe("P");
+    expect(said?.textContent).toContain("3 of its 4 proposal slots already in use");
+    expect(said?.tagName).toBe("P");
+    expect(said?.className).toBe("text-xs text-text-muted");
+  });
+
+  /**
+   * And it is the switch's description before anybody presses it.
+   *
+   * The paragraph used to be mounted by the arming, which meant `aria-describedby` arrived in
+   * the same render that swapped a focused button's label — and a description added to an
+   * element that already has focus is not re-announced by any major screen reader. The
+   * sentence was attached at the one moment it could not be heard. It is a standing
+   * description now: the element is always there, `.sr-only` at rest (absolutely positioned,
+   * so nothing in the block moves), and arming only swaps the class.
+   */
+  it("the mode switch is described before it is armed", async () => {
+    await openState(
+      settingsState({
+        promotable: true,
+        classes_ready: 5,
+        classes_total: 5,
+        withheld_classes_ready: 1,
+        wip_limit: 4,
+        open_proposals: 3,
+      }),
+    );
+
+    const offer = await screen.findByRole("button", { name: "Let it act" });
+    const describedBy = offer.getAttribute("aria-describedby");
+    expect(describedBy).not.toBeNull();
+
+    const described = document.getElementById(describedBy ?? "");
+    expect(described).not.toBeNull();
+    expect(described?.className).toBe("sr-only");
+    expect(described?.textContent).toContain("nucleos acts on its own");
+
+    fireEvent.click(offer);
+
+    // Same element, same id, now visible — and the armed button still points at it.
+    expect(described?.className).toBe("text-xs text-text-muted");
+    expect(
+      screen.getByRole("button", { name: "Let nucleos act" }).getAttribute("aria-describedby"),
+    ).toBe(describedBy);
   });
 
   /**

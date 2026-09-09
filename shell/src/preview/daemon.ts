@@ -8,7 +8,7 @@ import type {
   ProjectRules,
 } from "../data/projects";
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
-import type { PendingNotification } from "../data/feed";
+import type { FeedEntry, PendingNotification } from "../data/feed";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary, Proposal } from "../data/system";
@@ -35,7 +35,9 @@ import type { VcsRequestSummary } from "../data/waiting";
  * question.
  */
 
-const DAY = 86_400_000;
+const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
 /** Fixed, because a screenshot taken twice should be the same screenshot. */
 export const NOW = Date.parse("2026-08-24T09:41:00Z");
 
@@ -1200,6 +1202,22 @@ export const CALENDAR_CONFIG: CalendarConfigView = {
  * Both lists non-empty, because the panel keeps them apart and a preview with
  * only one of them photographs half a component.
  */
+/** Representative feed rows, including the unmapped-device state. */
+export const FEED: FeedEntry[] = [
+  { id: 12, project_id: "alpha", kind: "job_finished", summary: "job 41 finished", run_id: 41, errand_id: null, created_at: ago(3 * MINUTE) },
+  { id: 11, project_id: "alpha", kind: "job_started", summary: "job 42 started", run_id: 42, errand_id: null, created_at: ago(9 * MINUTE) },
+  { id: 10, project_id: "bravo", kind: "job_failed", summary: "job 39 failed", run_id: 39, errand_id: null, created_at: ago(31 * MINUTE) },
+  { id: 9, project_id: "bravo", kind: "job_waiting", summary: "job 40 is waiting", run_id: 40, errand_id: null, created_at: ago(48 * MINUTE) },
+  { id: 8, project_id: "alpha", kind: "vcs_request_finished", summary: "git request settled", run_id: null, errand_id: null, created_at: ago(HOUR) },
+  { id: 7, project_id: null, kind: "email_urgent", summary: "urgent e-mail", run_id: null, errand_id: null, created_at: ago(2 * HOUR) },
+  { id: 6, project_id: "alpha", kind: "token_efficiency", summary: "efficiency observation", run_id: 38, errand_id: null, created_at: ago(3 * HOUR) },
+  { id: 5, project_id: null, kind: "web.read", summary: "web page read", run_id: null, errand_id: 2, created_at: ago(4 * HOUR) },
+  { id: 4, project_id: null, kind: "errand_rule_fired", summary: "rule fired", run_id: null, errand_id: 2, created_at: ago(5 * HOUR) },
+  { id: 3, project_id: "delta", kind: "council_finished", summary: "council settled", run_id: null, errand_id: null, created_at: ago(7 * HOUR) },
+  { id: 2, project_id: "bravo", kind: "worktree_released", summary: "worktree released", run_id: null, errand_id: null, created_at: ago(DAY) },
+  { id: 1, project_id: "alpha", kind: "map_stamp_recorded", summary: "module map stamp", run_id: null, errand_id: null, created_at: ago(2 * DAY) },
+];
+
 export const HELD: PendingNotification[] = [
   {
     id: 1,
@@ -1803,6 +1821,7 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/calendar/busy") return { busy: true };
   if (path === "/calendar/config") return CALENDAR_CONFIG;
   if (path === "/notifications/pending") return HELD;
+  if (splitQuery(path)[0] === "/feed") return FEED;
 
   /*
     The four readings the State mode leads with — and the reason that mode

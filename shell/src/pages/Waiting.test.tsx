@@ -368,7 +368,12 @@ describe("Waiting - git requests", () => {
     const row = within(list).getByText("push #61").closest("li");
     if (row === null) throw new Error("no blocked git row");
     expect(within(row).getByText("blocked").textContent).toBe("blocked");
-    expect(within(row).getByText(/alpha:main/).textContent).toContain("submit it again");
+
+    // The instruction is its own line now. It rode at the end of the faint mono path line —
+    // `--text-faint` at 11px, third clause in an em-dash chain — which is the quietest rank on
+    // the card, for the one sentence on it that is asking somebody to do something.
+    expect(within(row).getByText(/alpha:main/).textContent).not.toContain("submit it again");
+    expect(within(row).getByText("submit it again").className).toBe("waiting-hint");
   });
 });
 

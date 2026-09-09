@@ -1,8 +1,18 @@
 import { describe, expect, it } from "vitest";
 
-import { readState } from "./state-map";
+import { readState, statesOf } from "./state-map";
 
 describe("state tones", () => {
+  it("a feed line is a record, so the feed domain spends no Acting Green", () => {
+    const kinds = statesOf("feed");
+    expect(kinds).toHaveLength(46);
+    for (const kind of kinds) expect(readState("feed", kind)?.tone, kind).not.toBe("active");
+    for (const kind of ["job_started", "job_finished", "council_started", "errand_rule_fired", "errand_investigation_done"] as const) expect(readState("feed", kind)?.tone, kind).toBe("info");
+    for (const [domain, state, tone, label] of [["rule", "armed", "info", "armed"], ["rule", "never-fires", "danger", "never fires"], ["rule", "capped", "paused", "capped today"], ["rule", "unseen", "info", "no commit seen yet"], ["folder", "missing", "danger", "gone"], ["folder", "unset", "off", "not named"], ["refinement", "prompt", "info", "instruction"], ["refinement", "subagent", "info", "delegation"]] as const) {
+      const reading = readState(domain, state); expect(reading?.tone, `${domain}.${state}`).toBe(tone); expect(reading?.label, `${domain}.${state}`).toBe(label);
+    }
+    expect(new Set(statesOf("refinement").map((kind) => readState("refinement", kind)?.tone)).size).toBe(1);
+  });
   it("every finished-without-verdict state reads as a fact, not as work in flight", () => {
     for (const [domain, state] of [
       ["run", "completed"],

@@ -23,6 +23,17 @@ import { ModeSwitch } from "./ModeSwitch";
 const LABEL = "Let alpha act";
 
 /**
+ * And what the ear gets when that segment arms.
+ *
+ * The other channel, and a different string on purpose: the label is drawn inside a segment
+ * of a fixed track, so it can only be a few words, while this is what letting alpha act
+ * MEANS. `ModeSwitch` takes it as `actConsequence` and hands it to the interlock's live
+ * region — the eye reads the label, the ear is told the consequence.
+ */
+const CONSEQUENCE =
+  "alpha acts on its own — 3 of its 4 proposal slots already in use, no approval";
+
+/**
  * The one control both surfaces that set a project's autonomy now use.
  *
  * Fake timers, and `fireEvent` rather than `userEvent`, for the reason
@@ -42,7 +53,13 @@ describe("ModeSwitch", () => {
   it("three segments, verbs, and the current one pressed", () => {
     const onChoose = vi.fn();
     render(
-      <ModeSwitch value="shadow" actAllowed actArmedLabel={LABEL} onChoose={onChoose} />,
+      <ModeSwitch
+        value="shadow"
+        actAllowed
+        actArmedLabel={LABEL}
+        actConsequence={CONSEQUENCE}
+        onChoose={onChoose}
+      />,
     );
 
     const group = screen.getByRole("group", { name: "Autopilot mode" });
@@ -82,7 +99,13 @@ describe("ModeSwitch", () => {
   it("letting it act takes two presses and is not green when locked", () => {
     const onChoose = vi.fn();
     const locked = render(
-      <ModeSwitch value="shadow" actAllowed={false} actArmedLabel={LABEL} onChoose={onChoose} />,
+      <ModeSwitch
+        value="shadow"
+        actAllowed={false}
+        actArmedLabel={LABEL}
+        actConsequence={CONSEQUENCE}
+        onChoose={onChoose}
+      />,
     );
 
     const blocked = screen.getByRole("button", { name: "Let it act" });
@@ -117,7 +140,13 @@ describe("ModeSwitch", () => {
     locked.unmount();
 
     render(
-      <ModeSwitch value="shadow" actAllowed actArmedLabel={LABEL} onChoose={onChoose} />,
+      <ModeSwitch
+        value="shadow"
+        actAllowed
+        actArmedLabel={LABEL}
+        actConsequence={CONSEQUENCE}
+        onChoose={onChoose}
+      />,
     );
 
     // One press arms and says what the second one will do. It does not act.
@@ -150,7 +179,13 @@ describe("ModeSwitch", () => {
   it("unlocked, the third segment keeps the approve tone", () => {
     const onChoose = vi.fn();
     render(
-      <ModeSwitch value="shadow" actAllowed actArmedLabel={LABEL} onChoose={onChoose} />,
+      <ModeSwitch
+        value="shadow"
+        actAllowed
+        actArmedLabel={LABEL}
+        actConsequence={CONSEQUENCE}
+        onChoose={onChoose}
+      />,
     );
 
     const offer = screen.getByRole("button", { name: "Let it act" });
@@ -173,7 +208,13 @@ describe("ModeSwitch", () => {
   it("the third segment stops being an interlock once it is the setting", () => {
     const onChoose = vi.fn();
     render(
-      <ModeSwitch value="active" actAllowed actArmedLabel={LABEL} onChoose={onChoose} />,
+      <ModeSwitch
+        value="active"
+        actAllowed
+        actArmedLabel={LABEL}
+        actConsequence={CONSEQUENCE}
+        onChoose={onChoose}
+      />,
     );
 
     const acting = screen.getByRole("button", { name: "Let it act" });
@@ -187,7 +228,14 @@ describe("ModeSwitch", () => {
   it("is inert while a write is in flight", () => {
     const onChoose = vi.fn();
     render(
-      <ModeSwitch value="shadow" actAllowed busy actArmedLabel={LABEL} onChoose={onChoose} />,
+      <ModeSwitch
+        value="shadow"
+        actAllowed
+        busy
+        actArmedLabel={LABEL}
+        actConsequence={CONSEQUENCE}
+        onChoose={onChoose}
+      />,
     );
 
     for (const name of ["Turn off", "Watch in shadow", "Let it act"]) {
@@ -215,6 +263,7 @@ describe("ModeSwitch", () => {
         value="shadow"
         actAllowed
         actArmedLabel={LABEL}
+        actConsequence={CONSEQUENCE}
         onArmedChange={onArmedChange}
         onChoose={onChoose}
       />,
@@ -233,17 +282,18 @@ describe("ModeSwitch", () => {
   });
 
   /**
-   * And the sentence it prints is the armed button's description.
+   * And the sentence it prints is the armed button's description, from the first render.
    *
-   * `onArmedChange` puts the consequence on the page; this is the other half — the armed
-   * segment naming it, so a screen reader hears what confirming would do instead of a
-   * two-word label and a paragraph it has no reason to associate with the button.
+   * `onArmedChange` puts the consequence on the page; this is the other half — the segment
+   * naming it, so a screen reader hears what confirming would do instead of a two-word label
+   * and a paragraph it has no reason to associate with the button.
    *
-   * Rendered through a caller rather than by passing `actDescribedBy` directly, because the
-   * conditionality is the caller's: the element only exists while armed, and an
-   * `aria-describedby` pointing at an id that is not in the document describes nothing.
+   * Rendered through a caller because the class swap is the caller's: the element is in the
+   * document the whole time and only its visibility changes. That is the change this case
+   * pins — it used to assert the attribute was absent at rest, which was the bug written
+   * down as a guarantee.
    */
-  it("the armed segment is described only while armed", () => {
+  it("the armed segment is described at rest and announced on arm", () => {
     function Caller() {
       const [armed, setArmed] = useState(false);
       return (
@@ -252,39 +302,43 @@ describe("ModeSwitch", () => {
             value="shadow"
             actAllowed
             actArmedLabel={LABEL}
+            actConsequence={CONSEQUENCE}
             onArmedChange={setArmed}
-            actDescribedBy={armed ? "consequence" : undefined}
+            actDescribedBy="consequence"
             onChoose={vi.fn()}
           />
-          {armed ? <p id="consequence">alpha acts on its own — 3 of 4 proposal slots</p> : null}
+          <p id="consequence" className={armed ? undefined : "sr-only"}>
+            {CONSEQUENCE}
+          </p>
         </>
       );
     }
 
     render(<Caller />);
 
-    // At rest there is nothing to point at, and the attribute is absent rather than empty.
+    /*
+      Described BEFORE the press, which is the whole change.
+
+      The attribute used to arrive in the same render that swapped the label, on a button that
+      already had focus — and a description added to a focused element is not re-announced by
+      any major screen reader. So the sentence was attached at the one moment it could not be
+      heard. It is a standing description now; the caller hides the element, it does not
+      withhold it.
+    */
     const offer = screen.getByRole("button", { name: "Let it act" });
-    expect(offer.getAttribute("aria-describedby")).toBeNull();
+    expect(offer.getAttribute("aria-describedby")).toBe("consequence");
+    expect(document.getElementById("consequence")?.textContent).toBe(CONSEQUENCE);
+    expect(document.getElementById("consequence")?.className).toBe("sr-only");
 
     fireEvent.click(offer);
 
-    const armed = screen.getByRole("button", { name: LABEL });
-    expect(armed.getAttribute("aria-describedby")).toBe("consequence");
-    // And the id resolves: a description that names a missing element is worse than none,
-    // because it reads as a control that was described and cannot be.
-    expect(document.getElementById("consequence")?.textContent).toContain(
-      "alpha acts on its own",
+    // And the arming itself is announced with the consequence, not with the segment's label.
+    const said = screen.getByText(new RegExp(`^armed: ${CONSEQUENCE.slice(0, 20)}`));
+    expect(said.getAttribute("role")).toBe("status");
+    expect(document.getElementById("consequence")?.className).toBe("");
+    expect(screen.getByRole("button", { name: LABEL }).getAttribute("aria-describedby")).toBe(
+      "consequence",
     );
-
-    // The window closes, the sentence goes, and the attribute goes with it.
-    act(() => {
-      vi.advanceTimersByTime(4000);
-    });
-    expect(
-      screen.getByRole("button", { name: "Let it act" }).getAttribute("aria-describedby"),
-    ).toBeNull();
-    expect(document.getElementById("consequence")).toBeNull();
   });
 
   /**

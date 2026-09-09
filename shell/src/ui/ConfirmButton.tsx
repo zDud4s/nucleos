@@ -22,11 +22,9 @@ const ARM_WINDOW_MS = 4000;
  */
 const DWELL_MS = 300;
 
-export interface ConfirmButtonProps {
+interface ConfirmButtonBase {
   /** What it says at rest. */
   label: ReactNode;
-  /** What it says once armed. Say what will happen, not "Confirm". */
-  confirmLabel: ReactNode;
   onConfirm: () => void;
   /**
    * Told whenever the armed state changes.
@@ -67,6 +65,30 @@ export interface ConfirmButtonProps {
 }
 
 /**
+ * What it says once armed, and what it SAYS OUT LOUD once armed.
+ *
+ * Two channels, and they were the same string until it turned out they could not be. The
+ * label is drawn in the button — short by construction, because inside `ModeSwitch` it is a
+ * segment of a fixed track — while the live region is the only thing anyone not looking at
+ * the screen gets. So the eye read "alpha acts on its own — 3 of its 4 proposal slots already
+ * in use, no approval" and the ear got "armed: Let alpha act", which names the project and
+ * not one consequence of letting it act.
+ *
+ * A union rather than an optional prop, because the degenerate case was silent: a
+ * `confirmLabel` that is not a string cannot be interpolated, and the kill switch — an icon
+ * and "Really release — work resumes" in a fragment — announced "armed — press again to
+ * confirm", with no object at all, on the control that restarts every autonomous thing in the
+ * app. With this, a non-string label without `sayAs` does not compile.
+ *
+ * Say what will happen, not "Confirm".
+ */
+type ConfirmSpeech =
+  | { confirmLabel: string; sayAs?: string }
+  | { confirmLabel: ReactNode; sayAs: string };
+
+export type ConfirmButtonProps = ConfirmButtonBase & ConfirmSpeech;
+
+/**
  * A two-click interlock for the actions that cannot be undone.
  *
  * Arm, then confirm. There is no dialog: a modal that asks "are you sure?"
@@ -77,6 +99,7 @@ export interface ConfirmButtonProps {
 export function ConfirmButton({
   label,
   confirmLabel,
+  sayAs,
   onConfirm,
   onArmedChange,
   variant,
@@ -97,11 +120,18 @@ export function ConfirmButton({
   // silent to anyone not looking at the button, and the 4 s window used to expire without a
   // word. Prefixed rather than bare so it is not a second copy of the label on the page —
   // `getByText` matches on the whole string, and two exact matches would be ambiguous.
+  //
+  // `sayAs` first, because the consequence is what somebody needs before they press again;
+  // the label is the fallback and is only ever the whole story where the two are the same
+  // sentence. The objectless third branch is unreachable from TypeScript — the props union
+  // requires `sayAs` for a non-string label — and is kept because unreachable is a claim
+  // about the type checker, and this is the announcement on a control that cannot be undone.
   const [said, setSaid] = useState("");
+  const spoken = sayAs ?? (typeof confirmLabel === "string" ? confirmLabel : null);
   const armedSaid =
-    typeof confirmLabel === "string"
-      ? `armed: ${confirmLabel} — press again to confirm`
-      : "armed — press again to confirm";
+    spoken === null
+      ? "armed — press again to confirm"
+      : `armed: ${spoken} — press again to confirm`;
 
   function clearTimers() {
     if (dwellTimer.current !== null) {

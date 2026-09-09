@@ -122,6 +122,41 @@ describe("Sidebar", () => {
     expect(screen.getByRole("link", { name: "Home" }).getAttribute("aria-current")).toBeNull();
   });
 
+  /**
+   * Two rows said it, on every project screen there is.
+   *
+   * `isActive` prefix-matches so that `/runs/412` keeps Runs lit, and the row that owns the
+   * roster is the one place that is wrong: inside `/projects/alpha/state` both `All projects`
+   * and `alpha` matched, and both got the fill, the `--text` label, the glyph, the bar and
+   * `aria-current="page"`. "You are here" twice is "you are here" nowhere.
+   */
+  it("says you are here once, even where a row owns the rows under it", async () => {
+    await renderWithRouter(<Sidebar projects={[{ id: "alpha", mode: "active", pending: 0 }]} />, {
+      initialPath: "/projects/alpha/state",
+    });
+
+    const here = screen
+      .getAllByRole("link")
+      .filter((link) => link.getAttribute("aria-current") === "page");
+    expect(here).toHaveLength(1);
+    expect(here[0].getAttribute("aria-label") ?? here[0].textContent).toContain("alpha");
+  });
+
+  /** And the group's own row is not given up — it is lit on the page it actually is. */
+  it("and on the list itself it is All projects", async () => {
+    await renderWithRouter(<Sidebar projects={[{ id: "alpha", mode: "active", pending: 0 }]} />, {
+      initialPath: "/projects",
+    });
+
+    expect(
+      screen.getByRole("link", { name: "All projects" }).getAttribute("aria-current"),
+    ).toBe("page");
+    const here = screen
+      .getAllByRole("link")
+      .filter((link) => link.getAttribute("aria-current") === "page");
+    expect(here).toHaveLength(1);
+  });
+
   it("navigates on Enter from the keyboard", async () => {
     const { router } = await renderWithRouter(<Sidebar />);
 

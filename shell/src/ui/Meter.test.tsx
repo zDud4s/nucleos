@@ -12,7 +12,7 @@ import { LimitChip, Meter, usd } from "./Meter";
 
 describe("Meter", () => {
   it("draws a dashed rail for a null ceiling, and never a bar at 0% or 100%", () => {
-    const { container } = render(<Meter label="at work" value={2} ceiling={null} />);
+    const { container } = render(<Meter label="at work" value={2} ceiling={null} tone="active" />);
 
     // The rail, not a bar: no fill element exists at all, so there is nothing
     // that could be read as empty or as full.
@@ -28,26 +28,41 @@ describe("Meter", () => {
   });
 
   it("fills to the share of a real ceiling, and marks the one that is spent", () => {
-    const { container, rerender } = render(<Meter label="waiting on you" value={3} ceiling={5} />);
+    const { container, rerender } = render(<Meter label="waiting on you" value={3} ceiling={5} tone="active" />);
 
     const fill = container.querySelector(".ui-gauge-fill") as HTMLElement;
     expect(fill.style.width).toBe("60%");
     expect(screen.getByText("3 / 5")).toBeDefined();
     expect(container.querySelector(".ui-gauge-full")).toBeNull();
 
-    rerender(<Meter label="waiting on you" value={5} ceiling={5} />);
+    rerender(<Meter label="waiting on you" value={5} ceiling={5} tone="active" />);
     expect(container.querySelector(".ui-gauge-full")).not.toBeNull();
   });
 
   it("treats a ceiling of zero as a real setting rather than a division by nothing", () => {
     // `null` is the brake off; `0` is the brake fully on — "never start one".
     // The two must not render the same way, and neither may render as NaN.
-    const { container } = render(<Meter label="at work" value={1} ceiling={0} />);
+    const { container } = render(<Meter label="at work" value={1} ceiling={0} tone="active" />);
 
     const fill = container.querySelector(".ui-gauge-fill") as HTMLElement;
     expect(fill.style.width).toBe("100%");
     expect(screen.getByText("1 / 0")).toBeDefined();
     expect(container.querySelector(".ui-gauge-open")).toBeNull();
+  });
+
+  it("a quantity is drawn in muted text and never in a state's colour", () => {
+    const { container, rerender } = render(
+      <Meter label="window spend" value={4.1} ceiling={5} tone="quantity" format={usd} />,
+    );
+    const gauge = container.querySelector(".ui-gauge") as HTMLElement;
+    expect(gauge.className).toContain("ui-gauge-quantity");
+    expect(gauge.className).not.toContain("ui-gauge-active");
+    expect(screen.getByText("$4.10 / $5.00")).toBeDefined();
+
+    rerender(<Meter label="window spend" value={4.1} ceiling={5} tone="quantity" format={usd} head={false} />);
+    expect(container.querySelector(".ui-gauge-head")).toBeNull();
+    expect(container.querySelector(".ui-gauge-fill")).not.toBeNull();
+    expect(screen.getByRole("img", { name: "window spend: $4.10 of $5.00" })).toBeDefined();
   });
 });
 

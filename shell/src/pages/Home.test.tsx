@@ -98,6 +98,25 @@ describe("Home", () => {
     expect(spend.textContent).not.toMatch(/0\.00/);
   });
 
+  it("the window spend shows its share of the ceiling, and shows no bar when there is no ceiling", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonFetch(daemonState({ budget: { ...daemonState().budget, window_spend_usd: 4.1, limit_usd: 5 } })),
+    );
+    const first = await renderWithRouter(<Home />);
+    const spend = await card("Window spend");
+    const fill = spend.querySelector(".ui-gauge-fill") as HTMLElement;
+    expect(fill.style.width).toBe("82%");
+    expect(spend.querySelector(".ui-gauge")?.className).toContain("ui-gauge-quantity");
+    expect(spend.querySelector(".ui-gauge-head")).toBeNull();
+    first.unmount();
+
+    daemon.apiFetch.mockImplementation(
+      daemonFetch(daemonState({ budget: { ...daemonState().budget, limit_usd: null } })),
+    );
+    await renderWithRouter(<Home />);
+    expect((await card("Window spend")).querySelector(".ui-gauge")).toBeNull();
+  });
+
   it("shows an em dash rather than a zero while nothing has been read", async () => {
     // A count nobody has managed to fetch and a count that is genuinely zero are
     // different pieces of news, and only one of them means you can go to lunch.
@@ -175,6 +194,37 @@ describe("Home", () => {
     expect(screen.getByRole("article", { name: "Subsystems healthy" }).className).toContain(
       "ui-stat-danger",
     );
+    // ui-wrong lands on the span StatCard's detail slot wraps, not on the slot's own
+    // p.ui-stat-detail — Boundary.tsx's rule is that the whole sentence carries the tone.
+    expect(
+      screen
+        .getByRole("article", { name: "Subsystems healthy" })
+        .querySelector(".ui-stat-detail .ui-wrong"),
+    ).not.toBeNull();
+  });
+
+  it("a subsystem down tones the whole sentence, not just the numeral", async () => {
+    // The same fixture the neighbouring case uses for `ui-stat-danger`.
+    const answer = daemonFetch(daemonState({ proposals: [] }));
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/health/readout"
+        ? {
+            status: "degraded",
+            subsystems: [
+              { name: "sqlite_pool", status: "ok" },
+              { name: "worktree_disk", status: "degraded", reason: "low-disk-space" },
+              { name: "browser_sidecar", status: "down", reason: "not-running" },
+            ],
+          }
+        : answer(path, init),
+    );
+
+    await renderWithRouter(<Home />);
+
+    const card_ = await screen.findByRole("article", { name: "Subsystems healthy" });
+    expect(card_.className).toContain("ui-stat-danger");
+    // The detail carries it too: one reading, one treatment — Boundary.tsx's rule.
+    expect(card_.querySelector(".ui-stat-detail .ui-wrong")).not.toBeNull();
   });
 
   it("an all-clear keeps the mode sentence and all five cards", async () => {
@@ -215,6 +265,11 @@ describe("Home", () => {
     expect(screen.getByRole("article", { name: "Subsystems healthy" }).className).not.toContain(
       "ui-stat-danger",
     );
+    expect(
+      screen
+        .getByRole("article", { name: "Subsystems healthy" })
+        .querySelector(".ui-stat-detail .ui-wrong"),
+    ).toBeNull();
   });
 
   it("mutates nothing — the first screen is a reading, not a console", async () => {

@@ -183,7 +183,7 @@
   padding-inline: var(--space-4);
 }
 
-/* What arming the third mode segment would do, said while it is armed.
+/* What arming the third mode segment would do, shown while it is armed.
 
    Its own row rather than the switch's cell, and that is the whole point: the sentence used to be
    the armed LABEL, inside the last track (`minmax(0, 1fr)`, 362px at 1440px). It wrapped, and the
@@ -197,7 +197,15 @@
    state while `promotable` is a polled prop, so a roster tick that withdrew the promotion inside
    the 4 s window would put both lines in the same row. They would stack rather than overlap, so
    the failure is a row one line taller and not a collision; the claim is still an argument and is
-   written as one. */
+   written as one.
+
+   The element itself is in the document AT REST, and this class is only what makes it visible.
+   At rest it carries `.sr-only` instead, so the switch can be described (`aria-describedby`)
+   before anybody arms it — a description attached in the same render that swaps a focused
+   button's label is not re-announced, so pointing at the sentence only while armed pointed at
+   it at the one moment it could not be heard. `.sr-only` is `position: absolute`, so the hidden
+   copy takes no grid track and the row's height at rest is unchanged; arming swaps the class
+   and the sentence appears in the row it always had. */
 .ap-project-consequence {
   grid-column: 1 / -1;
   padding-inline: var(--space-4);

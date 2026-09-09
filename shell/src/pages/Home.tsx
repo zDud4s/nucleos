@@ -12,7 +12,7 @@ import {
   type SubsystemReadout,
 } from "../data/system";
 import { useWaitingCount } from "../data/waiting";
-import { PageHeader, Section, StatCard } from "../ui";
+import { Meter, PageHeader, Section, StatCard, usd } from "../ui";
 import { headlineFor as systemHeadline } from "./System";
 
 /**
@@ -86,6 +86,18 @@ export function Home() {
           label="Window spend"
           value={spend === undefined ? undefined : `$${spend.window_spend_usd.toFixed(2)}`}
           detail={ceiling(spend)}
+          bar={
+            spend === undefined || spend.limit_usd === null ? undefined : (
+              <Meter
+                label="window spend"
+                value={spend.window_spend_usd}
+                ceiling={spend.limit_usd}
+                tone="quantity"
+                format={usd}
+                head={false}
+              />
+            )
+          }
         />
         {/*
           The fifth, and the one that is not about the autopilot: whether the machine
@@ -101,7 +113,13 @@ export function Home() {
               ? undefined
               : `${healthy}/${subsystems.length}`
           }
-          detail={systemHeadline(health.data)}
+          detail={
+            wrongClause(health.data) === null ? (
+              systemHeadline(health.data)
+            ) : (
+              <span className="ui-wrong">{systemHeadline(health.data)}</span>
+            )
+          }
           tone={wrongClause(health.data) === null ? undefined : "danger"}
         />
       </div>

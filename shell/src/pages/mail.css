@@ -72,13 +72,18 @@
   margin-bottom: var(--space-4);
 }
 
-/* The visible Field label adds a row above the input. Its input is 0.8125rem × 1.55 line-height
-   + 2 × 0.5rem padding + 2px border = 2.384375rem, so this wrapper centres the buttons on it. */
+/* The visible Field label adds a row above the input, so the buttons beside it need the
+   input's own height to centre on. Written as the relationship rather than the number it
+   evaluates to: the input is `.ui-field input` — `font-size: var(--text-sm)`,
+   `padding: var(--space-2)` on four sides, a 1px border — and its line height is the body
+   leading it inherits (`base.css` sets `line-height: var(--leading-normal)` and gives controls
+   `font: inherit`). The number this evaluates to used to be typed out by hand, which meant a
+   change to any one of those four tokens moved the input and left the buttons where they were. */
 .mail-search-actions {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  min-height: 2.384375rem;
+  min-height: calc(var(--text-sm) * var(--leading-normal) + 2 * var(--space-2) + 2px);
 }
 
 /* ------------------------------------------------------------------ list -- */

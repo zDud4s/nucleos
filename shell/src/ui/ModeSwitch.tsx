@@ -19,6 +19,15 @@ export interface ModeSwitchProps {
    */
   actArmedLabel: string;
   /**
+   * The sentence the live region says when the third segment arms.
+   *
+   * Not the same string as `actArmedLabel` and that is the whole point: the label is drawn
+   * inside a segment of a fixed track and can only be a few words, while this is what the
+   * choice MEANS and is the only thing anyone not looking at the screen gets. The caller
+   * already prints it under the control — this is the same sentence, said.
+   */
+  actConsequence: string;
+  /**
    * Told when the third segment arms and disarms, straight from `ConfirmButton`.
    *
    * How a caller renders the consequence sentence at the right moment without this control
@@ -30,7 +39,9 @@ export interface ModeSwitchProps {
    *
    * The armed label is one line inside a fixed track and says WHICH project; what letting it
    * act would MEAN is a sentence with room, and it lives at the other end of the row. Passed
-   * only while armed, because that is the only time the caller renders it.
+   * ALWAYS, not only while armed: the caller renders the element at rest — hidden — and points
+   * at it the whole time, because a description added at the moment of arming lands on a
+   * button that already has focus and is not re-announced by any major screen reader.
    */
   actDescribedBy?: string;
   /** A write is in flight; every segment is inert. */
@@ -66,6 +77,12 @@ export interface ModeSwitchProps {
  * `onArmedChange`; `Autopilot.tsx` prints the sentence on a full-width line under the row and
  * `project/Settings.tsx` as a paragraph under the switch. Nothing above the button moves.
  *
+ * The caller renders that element AT REST, hidden (`.sr-only`, absolutely positioned, so it
+ * takes no track and the row keeps its height), and swaps the class when armed. This control
+ * does both halves of the sentence's other life: it SAYS it, through `actConsequence` on the
+ * interlock's live region, and it POINTS at it, through `actDescribedBy`, from the first
+ * render — a description that arrives with the arming arrives too late to be heard.
+ *
  * The third segment is the one that differs, twice over. It is a `ConfirmButton` while it is
  * still something you could do — letting a project act on its own is the setting here that is
  * hardest to take back — and a plain pressed segment once it IS the setting, because there is then
@@ -76,6 +93,7 @@ export function ModeSwitch({
   value,
   actAllowed,
   actArmedLabel,
+  actConsequence,
   onArmedChange,
   actDescribedBy,
   busy,
@@ -117,6 +135,7 @@ export function ModeSwitch({
           <ConfirmButton
             label="Let it act"
             confirmLabel={actArmedLabel}
+            sayAs={actConsequence}
             variant="approve"
             disabled={!actAllowed || busy}
             onArmedChange={onArmedChange}

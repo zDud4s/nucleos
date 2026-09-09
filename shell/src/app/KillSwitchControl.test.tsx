@@ -90,6 +90,30 @@ describe("KillSwitchControl", () => {
     });
   });
 
+  /**
+   * And the ear is told what it is about to release.
+   *
+   * The label here is a fragment — an icon plus words — so there is nothing to interpolate,
+   * and the live region used to say "armed — press again to confirm" with no object at all,
+   * on the one button that restarts every autonomous thing in the app. `sayAs` is what makes
+   * the announcement name its object; the type now requires it wherever the label is not a
+   * plain string.
+   */
+  it("the release announces what it releases", async () => {
+    daemon.apiFetch.mockImplementation(daemonFetch(daemonState({ kill: { engaged: true } })));
+
+    renderWithQuery(<KillSwitchControl />);
+    fireEvent.click(await screen.findByRole("button", { name: /release kill switch/i }));
+
+    // Found by text and then checked for the role: `getByRole("status")` is ambiguous the
+    // moment a page carries a second interlock, and this control shares its page with many.
+    const said = screen.getByText(/^armed: Really release/);
+    expect(said.getAttribute("role")).toBe("status");
+    expect(said.textContent).toBe(
+      "armed: Really release — work resumes — press again to confirm",
+    );
+  });
+
   it("stays on screen while the state is unread", async () => {
     // The daemon is not answering this route. The control that stops everything
     // is exactly the control that must not disappear when things look wrong.

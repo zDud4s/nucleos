@@ -45,7 +45,11 @@ export type StateDomain =
   | "autopilot"
   | "brake"
   | "setting"
-  | "department";
+  | "department"
+  | "feed"
+  | "rule"
+  | "folder"
+  | "refinement";
 
 export interface StateReading {
   tone: BadgeTone;
@@ -93,6 +97,30 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     waiting: { tone: "pending", label: "waiting" },
     idle: { tone: "off", label: "idle" },
   },
+  /**
+   * Every `kind` the núcleo actually writes into the feed, mapped to a reading.
+   *
+   * Built by enumeration, not by guessing: every key was taken from a feed writer in core.
+   * An unmapped kind renders its literal; configured e-mail classes beyond `urgent` are
+   * deliberately absent. This domain spends no Acting Green: a feed line is written once,
+   * so a fact that may have ended hours ago cannot claim work is executing now.
+   */
+  feed: {
+    job_started: { tone: "info", label: "job started" }, job_planned: { tone: "info", label: "job planned" }, job_replanned: { tone: "info", label: "job replanned" }, job_plan_failed: { tone: "danger", label: "job could not be planned" }, job_item_failed: { tone: "danger", label: "job item failed" }, job_gate_failed: { tone: "danger", label: "job gate failed" }, job_waiting: { tone: "pending", label: "job waiting" }, job_finished: { tone: "info", label: "job finished" }, job_failed: { tone: "danger", label: "job failed" }, job_stopped: { tone: "off", label: "job stopped" }, job_cancelled: { tone: "off", label: "job cancelled" }, job_expired: { tone: "paused", label: "job expired" }, job_interrupted: { tone: "paused", label: "job interrupted" },
+    run_retry: { tone: "info", label: "run retried" }, run_failed_final: { tone: "danger", label: "run failed for good" }, run_interrupted: { tone: "paused", label: "run interrupted" }, run_stopped_probing: { tone: "danger", label: "run stopped after repeated refusals" }, token_efficiency: { tone: "info", label: "efficiency observation" },
+    worktree_gate_failed: { tone: "danger", label: "worktree gate failed" }, worktree_provision_failed: { tone: "danger", label: "worktree could not be made" }, worktree_released: { tone: "off", label: "worktree released" }, worktree_branch_kept: { tone: "info", label: "unmerged branch kept" }, worktree_removed: { tone: "off", label: "worktree removed" }, worktree_gc_failed: { tone: "danger", label: "worktree cleanup failed" },
+    vcs_request_finished: { tone: "info", label: "git request settled" }, vcs_request_cancelled: { tone: "off", label: "git request cancelled" }, vcs_request_interrupted: { tone: "paused", label: "git request interrupted" },
+    council_started: { tone: "info", label: "council started" }, council_stage: { tone: "info", label: "council stage" }, council_finished: { tone: "info", label: "council settled" },
+    schedule_rule_invalid: { tone: "danger", label: "schedule rule invalid" }, errand_rule_fired: { tone: "info", label: "errand rule fired" }, errand_rule_failed: { tone: "danger", label: "errand rule failed" }, errand_investigation_done: { tone: "info", label: "errand investigation done" }, errand_investigation_failed: { tone: "danger", label: "errand investigation failed" },
+    email_digest: { tone: "info", label: "e-mail digest" }, email_urgent: { tone: "pending", label: "urgent e-mail" }, email_triage_failed: { tone: "danger", label: "e-mail triage failed" }, email_triage_paused: { tone: "paused", label: "e-mail triage paused" }, email_triage_stalled: { tone: "paused", label: "e-mail triage stalled" }, email_fetch_skipped: { tone: "info", label: "e-mail skipped" }, email_sent_mailbox_foreign: { tone: "danger", label: "sent mail filed elsewhere" },
+    action_authorized: { tone: "info", label: "action authorised by a grant" }, proposal_record_failed: { tone: "danger", label: "proposal not recorded" }, promotion_ready: { tone: "pending", label: "promotion ready" }, "web.read": { tone: "info", label: "web page read" },
+  },
+  /** Rule settings are shell derivations: armed is stated, capped is a ceiling, and never-fires is a fault. */
+  rule: { armed: { tone: "info", label: "armed" }, "never-fires": { tone: "danger", label: "never fires" }, capped: { tone: "paused", label: "capped today" }, unseen: { tone: "info", label: "no commit seen yet" } },
+  /** Folder facts are derived by the shell; an unnamed folder is off, while a missing named one is a fault. */
+  folder: { ok: { tone: "info", label: "ok" }, missing: { tone: "danger", label: "gone" }, unset: { tone: "off", label: "not named" } },
+  /** Refinement kinds are facts, not a severity scale, so all four use Stated Blue. */
+  refinement: { prompt: { tone: "info", label: "instruction" }, memory: { tone: "info", label: "fact" }, skill: { tone: "info", label: "how-to" }, subagent: { tone: "info", label: "delegation" } },
   /**
    * Run outcomes. `concurrency.rs`'s `LIVE_RUN_STATUSES` and `runs.rs`'s
    * `TERMINAL_RUN_STATUSES` name all eight; `run_stop.rs` counts the same set.

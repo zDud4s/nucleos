@@ -621,14 +621,14 @@ describe("Teams - map-authored readings", () => {
     expect(within(row).queryByText("waiting on you")).toBeNull();
   });
 
-  it("the spend meter does not ask anything of you", async () => {
+  it("the spend meter draws a quantity, not work in flight", async () => {
     const team = teamView({ budget_usd: 5, max_live_runs: 1 });
     const live = teamRun({ id: "run-1", state: "working" });
     daemon.apiFetch.mockImplementation(teamsFetch({ teams: [team], runs: [live], runViews: { "run-1": { ...live, items: [], cost_usd: 1.2 } } }));
     await renderTeams();
     const meter = await screen.findByRole("img", { name: "spent on this task: $1.20 of $5.00" });
     const gauge = meter.closest(".ui-gauge");
-    expect(gauge?.className).toContain("ui-gauge-active");
-    expect(gauge?.className).not.toContain("ui-gauge-pending");
+    expect(gauge?.className).toContain("ui-gauge-quantity");
+    expect(gauge?.className).not.toContain("ui-gauge-active");
   });
 });

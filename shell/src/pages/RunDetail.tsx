@@ -26,7 +26,6 @@ import {
   RefusalNote,
   StateBadge,
 } from "../ui";
-import { readState } from "../ui/state-map";
 import "./runs.css";
 
 /**
@@ -592,17 +591,12 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
  * three of those are readings that belong in the strip below it, drawn as themselves:
  * a spend written into a sentence cannot be compared with the spend on the run before,
  * and a semicolon list of three states is a table somebody typed out. Terminal states use the
- * map's label with no verb in front; only a live run needs the prose "still going". What is left
+ * badge below names the state; only a live run needs the prose "still going". What is left
  * is the one thing that is genuinely prose — what this run was for, and where it ran.
  */
 function headline(run: Run): string {
-  // One vocabulary for one state: the map's label, with no verb in front of it.
-  // "ended completed" described itself twice and "finished" was a second word for
-  // a state the badge two lines below already names. A terminal state IS the
-  // sentence; a run still going is the only one that needs a verb.
-  const state = runIsAlive(run.status)
-    ? "still going"
-    : (readState("run", run.status)?.label ?? run.status);
-  const where = run.project_id === null ? "no project" : `in ${run.project_id}`;
-  return `${state}, ${where}`;
+  // The badge below already names the state. A terminal headline says where it ran; only a live
+  // run needs a verb, because that fact is not visible at a glance in the badge's word.
+  const where = run.project_id === null ? "outside any project" : `in ${run.project_id}`;
+  return runIsAlive(run.status) ? `still going, ${where}` : `ran ${where}`;
 }

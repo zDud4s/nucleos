@@ -271,14 +271,14 @@ function LiveTask({ run, team }: { run: TeamRun; team: TeamView | null }) {
       {detail.data === undefined ? (
         <p className="teams-loading">reading what it has spent…</p>
       ) : (
-        // The money meter lives here and only here: this is the one place in
-        // the pillar where a spend and the ceiling it runs against both exist. The default active
-        // reading is right: money being spent is not a question for the reader.
+        // The money meter lives here and only here: this is the one place in the pillar where a
+        // spend and its ceiling both exist. Money taken is a fact, not work in flight.
         <Meter
           label="spent on this task"
           value={detail.data.cost_usd}
           ceiling={team?.budget_usd ?? null}
           format={usd}
+          tone="quantity"
         />
       )}
     </article>

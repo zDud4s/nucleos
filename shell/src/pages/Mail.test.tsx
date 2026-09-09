@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 
@@ -283,5 +286,24 @@ describe("Mail search field", () => {
     const actions = screen.getByRole("button", { name: "Search" }).closest(".mail-search-actions");
     expect(actions?.className).toContain("mail-search-actions");
     expect(actions?.querySelectorAll("button")).toHaveLength(2);
+  });
+
+  /**
+   * The buttons centre on the input by arithmetic, and the arithmetic is in tokens.
+   *
+   * jsdom lays nothing out, so the sheet is where this is checkable. The number that used to be
+   * typed out here was right — the input's font size times the inherited leading, plus its
+   * padding twice, plus two borders — but any one of those tokens changing moved the input and
+   * left the buttons where they were.
+   */
+  it("the search buttons take their height from the input's tokens", () => {
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "mail.css"), "utf8");
+    const rule = /\.mail-search-actions\s*\{([^}]*)\}/.exec(css);
+    expect(rule).not.toBeNull();
+    expect(rule?.[1]).toMatch(/min-height:\s*calc\(/);
+    expect(rule?.[1]).toContain("var(--text-sm)");
+    expect(rule?.[1]).toContain("var(--leading-normal)");
+    expect(rule?.[1]).toContain("var(--space-2)");
+    expect(css).not.toContain("2.384375");
   });
 });

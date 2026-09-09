@@ -15,15 +15,11 @@ const TONES = "active|shadow|off|pending|paused|danger|info";
 const LITERAL = new RegExp(`tone=(?:"(?:${TONES})"|\\{[^}]*"(?:${TONES})"[^}]*\\})`);
 const ALLOWED = new Map<string, { literals: number; tables?: string[]; reason: string }>([
   ["calendar/DaySheet.tsx", { literals: 5, reason: "facts about a day — today, not a working day, a short or long one, a proposed occurrence. No núcleo state machine writes any of them." }],
-  ["app/FeedEmbed.tsx", { literals: 1, tables: ["readFeedKind"], reason: "the feed kind table's fallback, mirroring Feed.tsx; the drawer must not answer the same question differently." }],
   ["pages/Autopilot.tsx", { literals: 2, reason: "`queue full` is a ceiling this page derives, and a shadow decision's action class is an identifier — neither is a domain state." }],
   ["pages/Browser.tsx", { literals: 3, reason: "a grant's kind and whether it submits forms are permissions the shell decides, and a write's HTTP method is an identifier." }],
   ["pages/Calendar.tsx", { literals: 1, reason: "busy or free right now is computed from the calendar in the browser; the daemon sends no such literal." }],
   ["pages/Contacts.tsx", { literals: 4, reason: "a contact's verdict, whether you write back, and a merge are facts about a person, not a lifecycle." }],
   ["pages/Feed.tsx", { literals: 1, tables: ["readFeedKind"], reason: "the ignorance device for an unknown feed kind — the same posture as StateBadge, in the slice that owns feed kinds." }],
-  ["pages/Learned.tsx", { literals: 0, tables: ["KIND_TONE"], reason: "a refinement's kind, decided by a local table; a domain in the map would be the honest home for it." }],
-  ["pages/Projects.tsx", { literals: 0, tables: ["STATE_TONE"], reason: "a project rule's state, decided by a local table; a candidate for the map." }],
-  ["pages/Roster.tsx", { literals: 1, tables: ["GATE_TONE"], reason: "a missing project folder is a fault about the filesystem, not a state; GATE_TONE is a local table and a candidate for the map." }],
   ["pages/System.tsx", { literals: 1, reason: "a token's authority level is an identifier off the wire, not a lifecycle state." }],
   ["pages/Voice.tsx", { literals: 4, reason: "the dictation phase lives entirely in the webview — no núcleo literal exists for it." }],
   ["team/Decisions.tsx", { literals: 1, reason: "`granted — nobody decides` is a sentence about an absent proposal, not a state of one." }],
@@ -49,12 +45,14 @@ function callSites(source: string): { line: number; attrs: string }[] {
 }
 function files(): string[] {
   return readdirSync(shellSource, { recursive: true })
-    .filter((entry): entry is string => typeof entry === "string" && entry.endsWith(".tsx") && !entry.endsWith(".test.tsx"))
+    .filter((entry): entry is string => typeof entry === "string" && (entry.endsWith(".ts") || entry.endsWith(".tsx")) && !entry.endsWith(".test.ts") && !entry.endsWith(".test.tsx"))
     .map((entry) => join(shellSource, entry))
     .filter((file) => file !== join(shellSource, "ui", "StateBadge.tsx"));
 }
 
 describe("Badge tone authorship", () => {
+  const OBJECT_ROW = new RegExp(`\\btone:\\s*"(?:${TONES})"`);
+  const MAP = join(shellSource, "ui", "state-map.ts");
   it("a Badge outside the map's own primitive may not name a tone", () => {
     for (const file of files()) {
       const source = readFileSync(file, "utf8"); const sites = callSites(source).filter((site) => LITERAL.test(site.attrs));
@@ -74,5 +72,24 @@ describe("Badge tone authorship", () => {
   it("no page spends Acting Green on a word through text-tone-active-fg", () => {
     for (const file of files()) expect(readFileSync(file, "utf8"), file).not.toContain("text-tone-active-fg");
     for (const file of ["canvas/WorkflowCanvas.tsx", "project/WorkflowGraph.tsx", "project/ModeState.tsx"]) expect(readFileSync(join(shellSource, file), "utf8"), file).toContain("bg-tone-active-fg");
+  });
+  it("a tone literal in a .ts object row is caught wherever it hides", () => {
+    for (const file of files()) {
+      if (file !== MAP) expect(OBJECT_ROW.test(readFileSync(file, "utf8")), relative(shellSource, file)).toBe(false);
+    }
+    expect(OBJECT_ROW.test(`const T = { job_started: { tone: "active", label: "x" } };`)).toBe(true);
+    expect(OBJECT_ROW.test(`tone?: "danger";`)).toBe(false);
+  });
+  it("BadgeTone is named only inside ui/, so a tone table cannot be built elsewhere", () => {
+    for (const file of files()) {
+      const key = relative(shellSource, file).split(sep).join("/");
+      if (!key.startsWith("ui/")) expect(readFileSync(file, "utf8").includes("BadgeTone"), key).toBe(false);
+    }
+  });
+  it("one author for a feed kind: the embed and the drawer both reach Feed.tsx's KindBadge", () => {
+    for (const key of ["app/FeedEmbed.tsx", "app/NotificationsDrawer.tsx"]) {
+      const source = readFileSync(join(shellSource, key), "utf8");
+      expect(source, key).toContain("KindBadge"); expect(source, key).not.toContain("<Badge");
+    }
   });
 });

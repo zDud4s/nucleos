@@ -191,12 +191,13 @@ function LiveTask({ run, ceiling }: { run: TeamRun; ceiling: number | null }) {
       ) : (
         <>
           <Rounds items={detail.data.items} round={detail.data.round} />
+          {/* A spend does not ask the reader for anything; Teams reads the same meter this way. */}
           <Meter
             label="spent on this task"
             value={detail.data.cost_usd}
             ceiling={ceiling}
             format={usd}
-            tone="pending"
+            tone="quantity"
           />
         </>
       )}

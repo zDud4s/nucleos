@@ -217,7 +217,7 @@ describe("the roster", () => {
     expect(rendered.router.state.location.pathname).toBe("/projects");
   });
 
-  /** A gate that could not RUN says nothing about the code, so it is not drawn as a failure. */
+  /** The map already reads `job.gate_errored` as info; Roster was the last surface saying otherwise. */
   it("keeps a gate that could not run apart from one that said no", async () => {
     await openRoster([fine("broken", { last_gate: "failed" }), fine("unrun", { last_gate: "errored" })]);
 
@@ -226,7 +226,15 @@ describe("the roster", () => {
     const unrunRow = screen.getByRole("rowheader", { name: "unrun" }).closest("tr") as HTMLElement;
 
     expect(within(brokenRow).getByText("failed").className).toContain("ui-badge-danger");
-    expect(within(unrunRow).getByText("errored").className).toContain("ui-badge-paused");
+    expect(within(unrunRow).getByText("errored").className).toContain("ui-badge-info");
+  });
+
+  it("a gate that could not run is a fact, not a ceiling", async () => {
+    await openRoster([fine("unrun", { last_gate: "errored" })]);
+    await screen.findByRole("table");
+    const cell = screen.getByText("errored");
+    expect(cell.className).toContain("ui-badge-info");
+    expect(cell.textContent).toBe("errored");
   });
 
   it("says so plainly when the núcleo knows of no project", async () => {
