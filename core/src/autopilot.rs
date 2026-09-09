@@ -6,6 +6,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use crate::wip::{open_proposals_term, open_shadow_decisions_term};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -34,6 +36,17 @@ pub struct ProjectSummary {
     /// and whether the project is currently deferring new work because of it. A project can be idle
     /// purely because its queue is full, so the UI has to be able to say so.
     pub open_review_items: i64,
+    /// The two queues `open_review_items` is the sum of, so a screen can say WHICH one is full.
+    ///
+    /// The total on its own is what produced the report this field exists to answer: the panel said
+    /// the queue was full, the proposals list was empty, and both were telling the truth about
+    /// different queues. Measured on `nucleos` 2026-09-08 -- 0 proposals, 13 shadow decisions --
+    /// which is exactly the shape that makes a correct total look like a broken one.
+    ///
+    /// Summed in Rust rather than in SQL so the parts and the whole cannot disagree: there is no
+    /// second expression here that could be changed without the first.
+    pub open_proposals: i64,
+    pub open_shadow_decisions: i64,
     pub wip_limit: Option<i64>,
     pub queue_full: bool,
     /// The last thing this project's gate said, and when it said it.
@@ -191,9 +204,10 @@ pub async fn autopilot_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, 
         .collect()
 }
 
-/// One raw roster row: `(project_id, mode, project_root, pending, open_review_items, wip_override)`.
-/// Named because the tuple carries six positional fields and is only readable at the destructure.
-type RosterRow = (String, String, Option<String>, i64, i64, Option<i64>);
+/// One raw roster row: `(project_id, mode, project_root, pending, open_proposals,
+/// open_shadow_decisions, wip_override)`. Named because the tuple carries seven positional fields
+/// and is only readable at the destructure.
+type RosterRow = (String, String, Option<String>, i64, i64, i64, Option<i64>);
 
 /// The most recent gate verdict for every project, in one query.
 ///
@@ -230,54 +244,35 @@ async fn last_gate_verdicts(
 }
 
 pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummary>> {
-    let projects: Vec<RosterRow> = sqlx::query_as(
+    // Every subquery below that also feeds the WIP brake is EXPANDED FROM `wip.rs`, not retyped.
+    // These were two hand-written copies of one piece of arithmetic, and they drifted twice --
+    // most recently into a roster that displayed 19 against a daemon that refused work at 13. The
+    // macro takes the only thing that differs (a bound `?1` there, a correlated `state.project_id`
+    // here) as an argument, so the filters cannot be changed in one place and not the other.
+    //
+    // Selected as two columns and added in Rust, rather than summed in SQL: the parts are what the
+    // shell needs to point at a screen, and deriving the total from them is one fewer expression
+    // that could go out of step with itself.
+    let projects: Vec<RosterRow> = sqlx::query_as(concat!(
         "SELECT state.project_id, state.mode, state.project_root,
-                (SELECT COUNT(*)
-                 FROM shadow_decisions
-                 JOIN runs ON shadow_decisions.run_id = runs.id
-                 WHERE runs.project_id = state.project_id
-                   AND shadow_decisions.human_verdict IS NULL
-                   AND runs.mode = 'shadow')
+                ",
+        open_shadow_decisions_term!("state.project_id"),
+        "
                 +
                 (SELECT COUNT(*)
                  FROM runs
                  WHERE runs.project_id = state.project_id
                    AND runs.status = 'awaiting_approval') AS pending,
-                -- Same arithmetic as `wip::open_proposals`, deliberately: the flag the shell renders
-                -- and the gate the daemon enforces must not be able to disagree. Shadow decisions
-                -- count because a shadow run mints no proposal, so counting proposals alone left
-                -- the brake invisible in the mode that generates the most review work. Scoped to
-                -- `runs.mode = 'shadow'`: a `worktree`-mode decision was already enforced (no
-                -- verdict left to give it) or already became a proposal the first term counts, so
-                -- an unfiltered count would either double-count or count enforced work as backlog.
-                -- Both copies of this subquery must carry the same filter, or this display number
-                -- and the number the daemon enforces (`wip::open_proposals`) would disagree.
-                --
-                -- They did disagree, and the warning above guarded the wrong half of the sum. The
-                -- sentence is about the shadow-decisions subquery; the drift arrived in the
-                -- proposals one beside it, which counted every `kind` while `wip.rs` had already
-                -- excluded `skipped-item` and `fleet-exclusion`. Measured 2026-09-08 on `nucleos`:
-                -- the roster displayed 19 and the daemon's own log refused work at 13, the six
-                -- between them being skipped items that are deliberately not review work. So the
-                -- exclusion is repeated here rather than left implied -- the same filter, spelled
-                -- the same way, in both copies.
-                (SELECT COUNT(*)
-                 FROM proposals
-                 WHERE proposals.project_id = state.project_id
-                   AND proposals.status = 'pending'
-                   AND proposals.kind <> 'skipped-item'
-                   AND proposals.kind <> 'fleet-exclusion')
-                +
-                (SELECT COUNT(*)
-                 FROM shadow_decisions
-                 JOIN runs ON shadow_decisions.run_id = runs.id
-                 WHERE runs.project_id = state.project_id
-                   AND shadow_decisions.human_verdict IS NULL
-                   AND runs.mode = 'shadow') AS open_proposals,
+                ",
+        open_proposals_term!("state.project_id"),
+        " AS open_proposals,
+                ",
+        open_shadow_decisions_term!("state.project_id"),
+        " AS open_shadow_decisions,
                 state.wip_limit AS wip_limit
          FROM autopilot_state AS state
-         ORDER BY state.project_id",
-    )
+         ORDER BY state.project_id"
+    ))
     .fetch_all(pool)
     .await?;
 
@@ -291,7 +286,15 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
     projects
         .into_iter()
         .map(
-            |(project_id, mode, project_root, pending, open_review_items, wip_override)| {
+            |(
+                project_id,
+                mode,
+                project_root,
+                pending,
+                open_proposals,
+                open_shadow_decisions,
+                wip_override,
+            )| {
                 let mode = Mode::from_db_str(&mode).ok_or_else(|| {
                     sqlx::Error::Protocol(format!("invalid autopilot mode in database: {mode}"))
                 })?;
@@ -302,6 +305,7 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                     Some((status, at)) => (Some(status.clone()), Some(at.clone())),
                     None => (None, None),
                 };
+                let open_review_items = open_proposals + open_shadow_decisions;
                 Ok(ProjectSummary {
                     project_id,
                     mode,
@@ -316,6 +320,8 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                         withheld_classes_ready,
                     ),
                     open_review_items,
+                    open_proposals,
+                    open_shadow_decisions,
                     wip_limit,
                     queue_full: crate::wip::queue_full(open_review_items, wip_limit),
                     last_gate,
@@ -717,6 +723,8 @@ mod tests {
                     withheld_classes_ready: 0,
                     promotable: false,
                     open_review_items: 0,
+                    open_proposals: 0,
+                    open_shadow_decisions: 0,
                     wip_limit: Some(3),
                     queue_full: false,
                     last_gate: None,
@@ -732,6 +740,8 @@ mod tests {
                     withheld_classes_ready: 0,
                     promotable: false,
                     open_review_items: 0,
+                    open_proposals: 0,
+                    open_shadow_decisions: 0,
                     wip_limit: Some(3),
                     queue_full: false,
                     last_gate: None,
@@ -747,6 +757,8 @@ mod tests {
                     withheld_classes_ready: 0,
                     promotable: false,
                     open_review_items: 0,
+                    open_proposals: 0,
+                    open_shadow_decisions: 0,
                     wip_limit: Some(3),
                     queue_full: false,
                     last_gate: None,
@@ -785,6 +797,8 @@ mod tests {
                     withheld_classes_ready: 0,
                     promotable: false,
                     open_review_items: 0,
+                    open_proposals: 0,
+                    open_shadow_decisions: 0,
                     wip_limit: Some(3),
                     queue_full: false,
                     last_gate: None,
@@ -800,6 +814,8 @@ mod tests {
                     withheld_classes_ready: 0,
                     promotable: false,
                     open_review_items: 0,
+                    open_proposals: 0,
+                    open_shadow_decisions: 0,
                     wip_limit: Some(3),
                     queue_full: false,
                     last_gate: None,
@@ -968,6 +984,8 @@ mod tests {
                 // `pending` is what the person is shown, `open_review_items` is what the brake
                 // measures, and both have to see the same backlog.
                 open_review_items: 1,
+                open_proposals: 0,
+                open_shadow_decisions: 1,
                 wip_limit: Some(3),
                 queue_full: false,
                 last_gate: None,
@@ -998,6 +1016,8 @@ mod tests {
                 withheld_classes_ready: 0,
                 promotable: false,
                 open_review_items: 0,
+                open_proposals: 0,
+                open_shadow_decisions: 0,
                 wip_limit: Some(3),
                 queue_full: false,
                 last_gate: None,
@@ -1064,10 +1084,12 @@ mod tests {
         );
     }
 
-    /// The roster's `open_review_items` and `wip::open_proposals` are two hand-written copies of the
-    /// same query — nothing else stops them drifting apart. Compares the two NUMBERS, not two
-    /// hardcoded literals, so a change to one copy that is not mirrored in the other fails this
-    /// test rather than silently making the shell disagree with the daemon.
+    /// The roster's `open_review_items` and `wip::open_review_items` USED to be two hand-written
+    /// copies of the same query — nothing else stopped them drifting apart, and twice they did.
+    /// They are now one macro expanded twice, so this can no longer fail by drift alone. It is
+    /// kept, and kept comparing the two NUMBERS, because it is the test that says what the shared
+    /// text must MEAN: the absolute `2` below is what breaks when the filters themselves change,
+    /// in either copy or in the one text behind both.
     #[tokio::test]
     async fn o_roster_e_o_portao_contam_o_mesmo() {
         let pool = test_pool().await;
@@ -1144,9 +1166,10 @@ mod tests {
         }
 
         let roster = project_roster(&pool).await.unwrap();
-        let gate = crate::wip::open_proposals(&pool, "project-a")
+        let gate = crate::wip::open_review_items(&pool, "project-a")
             .await
-            .unwrap();
+            .unwrap()
+            .total();
 
         assert_eq!(roster.len(), 1);
         assert_eq!(
@@ -1155,8 +1178,132 @@ mod tests {
         );
         assert_eq!(
             gate, 2,
-            "1 pending proposal + 1 shadow decision; neither the 5 worktree decisions nor the 2              excluded-kind proposals may count"
+            "1 pending proposal + 1 shadow decision; neither the 5 worktree decisions              nor the 2 excluded-kind proposals may count"
         );
+    }
+
+    /// Seeds the exact shape that produced the report: a queue the brake calls full, and a
+    /// proposals list with nothing in it. Both are correct -- every waiting item is a shadow
+    /// decision -- and the total alone cannot say so, which is why the split exists.
+    ///
+    /// Measured on `nucleos` 2026-09-08 the real numbers were 0 and 13; this is the same shape at
+    /// fixture scale, plus the excluded kinds that must not show up in either half.
+    #[tokio::test]
+    async fn the_split_says_which_queue_is_holding_the_project() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode) VALUES ('project-a', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Pending proposals, but only of the kinds that are notes rather than queue. The counted
+        // half is therefore zero, which is what makes the proposals screen empty while the brake
+        // holds -- the coincidence that made a correct total look like a broken one.
+        sqlx::query(
+            "INSERT INTO proposals (kind, status, run_id, project_id, reasoning, created_at)
+             VALUES ('skipped-item', 'pending', 1, 'project-a', 'test', '2026-08-24T00:00:00Z'),
+                    ('fleet-exclusion', 'pending', 1, 'project-a', 'test', '2026-08-24T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let shadow_run_id = seed_shadow_decisions(&pool, "shadow", 3).await;
+        let _ = shadow_run_id;
+        seed_shadow_decisions(&pool, "worktree", 4).await;
+
+        let roster = project_roster(&pool).await.unwrap();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(
+            (
+                roster[0].open_proposals,
+                roster[0].open_shadow_decisions,
+                roster[0].open_review_items
+            ),
+            (0, 3, 3),
+            "the two excluded kinds count in neither half, the 4 worktree decisions in neither,              and the total is the sum of what is left"
+        );
+
+        let items = crate::wip::open_review_items(&pool, "project-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            (items.proposals, items.shadow_decisions),
+            (roster[0].open_proposals, roster[0].open_shadow_decisions),
+            "the roster's split and the brake's split are one query, expanded twice"
+        );
+        assert_eq!(
+            items.describe().as_deref(),
+            Some("3 shadow decisions"),
+            "with nothing in the proposals half, the sentence must not mention proposals at all"
+        );
+    }
+
+    /// The gate counts a queue; `shadow::list_unreviewed` serves the rows of it. If those two ever
+    /// disagree, the brake holds for items nobody can find -- which is unclearable by construction,
+    /// because the brake only releases when a human reviews something.
+    ///
+    /// This is the cross-module half the earlier guard could not cover: that test compares the
+    /// roster against `wip.rs`, and since both now expand the same macro it can no longer catch a
+    /// filter that drifts in a THIRD module. `shadow.rs` is that third module, and it carries its
+    /// own hand-written copy of `runs.mode = 'shadow'`. Deleting the filter on either side turns
+    /// 3 into 7 on exactly one side of this assertion.
+    #[tokio::test]
+    async fn the_queue_the_brake_counts_is_the_queue_a_human_can_open() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode) VALUES ('project-a', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        seed_shadow_decisions(&pool, "shadow", 3).await;
+        seed_shadow_decisions(&pool, "worktree", 4).await;
+
+        let roster = project_roster(&pool).await.unwrap();
+        let reviewable = crate::shadow::list_unreviewed(&pool, "project-a")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reviewable.len() as i64,
+            roster[0].open_shadow_decisions,
+            "every shadow decision the brake counts must be one the review screen offers"
+        );
+        assert_eq!(
+            reviewable.len(),
+            3,
+            "and the four already-enforced worktree decisions are in neither"
+        );
+    }
+
+    /// Seeds `count` unreviewed decisions on a fresh run in `mode`, and answers its run id.
+    async fn seed_shadow_decisions(pool: &SqlitePool, mode: &str, count: usize) -> i64 {
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-a', 'work', 'completed', ?, '2026-08-24T00:00:00Z')",
+        )
+        .bind(mode)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        for index in 0..count {
+            sqlx::query(
+                "INSERT INTO shadow_decisions
+                 (run_id, tool_name, decision, action_class, classifier_version, created_at)
+                 VALUES (?, 'Bash', 'allow', 'read-local', 2, ?)",
+            )
+            .bind(run_id)
+            .bind(format!("2026-08-24T00:0{index}:00Z"))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        run_id
     }
 
     #[tokio::test]

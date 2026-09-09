@@ -442,7 +442,11 @@ impl NucleosTools {
                        mode, how far it is from leaving shadow (`classes_ready` of \
                        `classes_total`, `withheld_classes_ready`, and `promotable`) and whether \
                        its WIP brake is currently holding new work back (`open_review_items`, \
-                       `wip_limit`, `queue_full`). Start here: a project in `shadow` mode can plan \
+                       `wip_limit`, `queue_full`). `open_review_items` is the SUM of two \
+                       separate queues, served beside it as `open_proposals` and \
+                       `open_shadow_decisions` -- read those first, because a project can sit \
+                       at its ceiling with an EMPTY proposals list when all of it is shadow \
+                       decisions. Start here: a project in `shadow` mode can plan \
                        but cannot act, so work dispatched to one produces a plan and nothing else."
     )]
     async fn list_projects(&self) -> String {

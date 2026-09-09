@@ -3351,6 +3351,11 @@ struct ProjectRules {
     /// the brake is off.
     wip_limit: Option<i64>,
     open_review_items: i64,
+    /// The two queues that total is made of, so the panel can name the screen that clears it.
+    /// A total alone reads as "the proposals list", which on this project was empty while the
+    /// brake held: all of it was unreviewed shadow decisions (`wip::OpenReviewItems`).
+    open_proposals: i64,
+    open_shadow_decisions: i64,
     /// Whether that ceiling is currently refusing new autonomous work.
     queue_full: bool,
 }
@@ -3468,9 +3473,10 @@ async fn get_project_rules(
     let wip_limit = crate::wip::wip_limit(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let open_review_items = crate::wip::open_proposals(&state.pool, &id)
+    let items = crate::wip::open_review_items(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let open_review_items = items.total();
 
     // Read before the struct takes `id`, which is what the borrow checker was pointing at and is
     // also the clearer order: every other field here is gathered above.
@@ -3488,6 +3494,8 @@ async fn get_project_rules(
         repo_triggers,
         wip_limit,
         open_review_items,
+        open_proposals: items.proposals,
+        open_shadow_decisions: items.shadow_decisions,
         queue_full: crate::wip::queue_full(open_review_items, wip_limit),
     }))
 }
