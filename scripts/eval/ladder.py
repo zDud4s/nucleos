@@ -53,6 +53,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ingest  # noqa: E402
+
 # Overridable, because a checked-in script that only runs on the machine it was written on is a
 # personal note with a path in the repository. Defaults are this machine's.
 ROOT = os.environ.get("NUCLEOS_ROOT") or os.path.abspath(
@@ -99,6 +102,23 @@ token = subprocess.run([DAEMON_EXE, "--print-token"], capture_output=True, text=
 
 def say(text):
     print(text, flush=True)
+
+
+Cell = ingest.Cell
+
+
+def record(cell, run_ids):
+    """Append the cell to the durable ledger as it finishes, not at the end of the ladder.
+
+    A ladder that only prints its results loses them when the terminal closes, which is how the
+    nineteen cells of 2026-08-17/19 came to survive only as prose. A failure to write must not kill
+    a cell that already cost real money, so it is shouted with the row inline and the run carries
+    on — the summary below is still printed either way.
+    """
+    try:
+        ingest.append_cell(ingest.LEDGER, cell, run_ids=run_ids, source="ladder")
+    except Exception as error:  # noqa: BLE001 — losing the row is worse than any write failure
+        say(f"    AVISO: a linha do ledger nao foi escrita ({error}); grava-a a mao: {cell}")
 
 
 def call(path, method="GET", body=None):
@@ -289,6 +309,7 @@ for task, layer in requested(sys.argv[1:]):
         except urllib.error.HTTPError as error:
             say(f"    recusado: HTTP {error.code} {error.read().decode()[:200]}")
             results.append((task, layer, "refused", None, None, None))
+            record(Cell(task, layer, "refused"), [])
             continue
         first_id = created["id"]
         say(f"    run {first_id} criado")
@@ -311,6 +332,8 @@ for task, layer in requested(sys.argv[1:]):
         say(f"    -> {verdict} | {outcome['wall']}s | ${outcome['cost']} | "
             f"turnos={turns} | runs={outcome['runs']}")
         results.append((task, layer, verdict, outcome["wall"], outcome["cost"], turns))
+        record(Cell(task, layer, verdict, turns, outcome["cost"], outcome["wall"]),
+               outcome["runs"] or [first_id])
 
 say("\n================ RESUMO ================")
 for row in results:

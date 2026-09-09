@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Drive `auto-approve.py` against a stub daemon.
 
-Not wired into `scripts/gates.sh`: that would put Python in the definition of green for everyone,
-which is a decision about the gate rather than about this script. Run it by hand after touching
-the approver — `python scripts/eval/test-auto-approve.py`.
+Wired into `scripts/gates.sh` as `eval: approver`, in the hooks leg. (Corrected 2026-09-09: this
+said the opposite — that wiring it in would put Python in the definition of green for everyone —
+and it has been in the gate for long enough that the sentence sent whoever read it looking for a
+decision nobody still holds. The hooks leg runs six Python suites.) Also runs standalone:
+`python scripts/eval/test-auto-approve.py`.
 
 It is here rather than thrown away because it earned it. The approver looked correct and was not:
 a proposal answered with 409 stays pending, so the loop re-answered it every poll and spent the
