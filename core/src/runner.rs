@@ -1424,6 +1424,85 @@ pub(crate) fn window_env(request: &RunRequest) -> Option<(&'static str, String)>
         .map(|window| ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", window.to_string()))
 }
 
+/// The environment that takes background tasks away from a run nothing can wake, or nothing for a
+/// run something can.
+///
+/// A background task reports back by waking the session that started it, and a run with no later
+/// turn has no session left to wake: once its turn ends the CLI exits and kills the task with it.
+/// Measured on run 900473 (CLI 2.1.263): the model launched the gate's build in the background,
+/// ended its turn with "I'll wait for the background gate build (task `b84qqcytz`) to finish before
+/// continuing — it'll notify automatically when done", and the stream closed on that task being
+/// `killed`. The run was recorded `completed`, its work half done and uncommitted. A `sleep 20`
+/// launched the same way reproduces it in thirteen seconds.
+///
+/// With `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` the CLI takes `run_in_background` out of the
+/// `Bash` schema, so the same request is refused as an unexpected parameter and nothing is left
+/// running when the turn ends — measured with the same prompt against the same CLI.
+///
+/// Only a steerable run with somewhere its later turns come from keeps them: its process outlives
+/// the turn, which is what a task's notification needs. A steerable run with no channel closes its
+/// stdin after the opening turn, and for this purpose is a headless run.
+///
+/// Set before `request.env` at the spawn site, like [`window_env`], so an explicit entry still wins.
+pub(crate) fn background_env(request: &RunRequest) -> Option<(&'static str, &'static str)> {
+    let can_be_woken = request.steerable && request.messages.is_some();
+    (!can_be_woken).then_some(("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1"))
+}
+
+/// PURE: the background tasks this stream reports killed after its last answer, each named once.
+///
+/// The signature, read off run 900473's own stream:
+///
+/// ```text
+/// {"type":"result","subtype":"success","stop_reason":"end_turn",...}
+/// {"type":"system","subtype":"task_updated","task_id":"b84qqcytz","patch":{"status":"killed",...}}
+/// {"type":"system","subtype":"task_notification","task_id":"b84qqcytz","status":"stopped",...}
+/// ```
+///
+/// After the `result` and never before it: a task stopped mid-turn was stopped by the model, which
+/// is a decision; one killed after the last answer was killed by the process ending under it.
+///
+/// The second line behind [`background_env`], not the first. With background tasks taken away this
+/// finds nothing, and it exists for the day it would: a CLI that renames the variable would
+/// otherwise bring back a run recorded `completed` with its work abandoned, and nothing saying so.
+pub(crate) fn orphaned_background_tasks(stdout: &str) -> Vec<String> {
+    let mut answered = false;
+    let mut orphaned: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("result") => {
+                answered = true;
+                continue;
+            }
+            Some("system") if answered => {}
+            _ => continue,
+        }
+        let killed = match value.get("subtype").and_then(serde_json::Value::as_str) {
+            Some("task_updated") => {
+                value
+                    .pointer("/patch/status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("killed")
+            }
+            Some("task_notification") => matches!(
+                value.get("status").and_then(serde_json::Value::as_str),
+                Some("stopped" | "killed")
+            ),
+            _ => false,
+        };
+        if killed
+            && let Some(task) = value.get("task_id").and_then(serde_json::Value::as_str)
+            && !orphaned.iter().any(|seen| seen == task)
+        {
+            orphaned.push(task.to_string());
+        }
+    }
+    orphaned
+}
+
 /// Whether this line says the CLI compacted its own context.
 ///
 /// The event, read off a real headless stream rather than inferred from the source:
@@ -2479,6 +2558,12 @@ impl CommandRunner for ClaudeCliRunner {
         if let Some((name, value)) = window_env(&request) {
             cmd.env(name, value);
         }
+        // Read now, while `request.messages` is still there to be asked about: the steering task
+        // takes it once the process is running.
+        let background_off = background_env(&request);
+        if let Some((name, value)) = background_off {
+            cmd.env(name, value);
+        }
         for (k, v) in &request.env {
             cmd.env(k, v);
         }
@@ -2767,6 +2852,24 @@ impl CommandRunner for ClaudeCliRunner {
                 request.max_turns.unwrap_or_default()
             ));
         }
+        // Only for a run nothing can wake, which is the run background tasks were taken from: a
+        // conversation that keeps its process is still there when its task finishes.
+        let orphaned = if background_off.is_some() {
+            orphaned_background_tasks(&stdout_acc)
+        } else {
+            Vec::new()
+        };
+        if !orphaned.is_empty() {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            stderr_str.push_str(&format!(
+                "nucleos: this run ended its turn with background task(s) {} still running, and \
+                 they died with the process; nothing can deliver their result to a run with no \
+                 later turn, so the work they were doing never finished\n",
+                orphaned.join(", ")
+            ));
+        }
         let exit_code = match (
             progress_timeout_elapsed,
             turns_exceeded,
@@ -2785,6 +2888,9 @@ impl CommandRunner for ClaudeCliRunner {
                 stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
                 -1
             }
+            // The CLI's zero is a claim about the turn, and says nothing about the work it left
+            // running when the turn ended.
+            (None, None, None, None) if !orphaned.is_empty() => -1,
             (None, None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
         };
 
@@ -5775,6 +5881,96 @@ mod tests {
         assert_eq!(outcome.cache_creation_tokens, Some(40));
         assert_eq!(outcome.num_turns, Some(1));
         assert_eq!(outcome.cost_usd, Some(0.02));
+    }
+
+    /// Who keeps background tasks: only a run whose process outlives its turn.
+    #[test]
+    fn a_run_nothing_can_wake_is_given_no_background_tasks() {
+        let taken = Some(("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1"));
+
+        assert_eq!(background_env(&test_run_request("p")), taken);
+
+        let mut steerable_alone = test_run_request("p");
+        steerable_alone.steerable = true;
+        assert_eq!(
+            background_env(&steerable_alone),
+            taken,
+            "with no channel, stdin closes after the opening turn and nothing can wake it either"
+        );
+
+        let (_later, turns) = tokio::sync::mpsc::unbounded_channel::<LaterTurn>();
+        let mut conversation = test_run_request("p");
+        conversation.steerable = true;
+        conversation.messages = Some(turns);
+        assert_eq!(background_env(&conversation), None);
+    }
+
+    /// The signature, as run 900473's own stream wrote it.
+    #[test]
+    fn a_task_killed_after_the_last_answer_is_named_as_orphaned() {
+        let stdout = [
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"I'll wait for the background gate build to finish"}]}}"#,
+            r#"{"type":"result","subtype":"success","stop_reason":"end_turn","session_id":"s"}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"session_id":"s"}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"b84qqcytz","patch":{"status":"killed","end_time":1789005221034},"session_id":"s"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"b84qqcytz","tool_use_id":"toolu_1","status":"stopped","session_id":"s"}"#,
+        ]
+        .join("\n");
+
+        assert_eq!(
+            orphaned_background_tasks(&stdout),
+            vec!["b84qqcytz".to_string()],
+            "one task, named once although two events report it"
+        );
+    }
+
+    /// Stopped by the model mid-turn is a decision; finishing after the answer is not dying.
+    #[test]
+    fn a_task_stopped_mid_turn_or_finished_after_it_is_not_orphaned() {
+        let stdout = [
+            r#"{"type":"system","subtype":"task_updated","task_id":"early","patch":{"status":"killed"}}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"late","status":"completed"}"#,
+        ]
+        .join("\n");
+
+        assert!(orphaned_background_tasks(&stdout).is_empty());
+    }
+
+    /// Both lines of defence, through the real loop: the variable reaches the spawned process, and
+    /// a clean exit that left a task behind is recorded as the failure it is.
+    #[tokio::test]
+    async fn a_headless_run_that_leaves_a_task_running_is_not_a_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = printing(&[
+            r#"{"type":"system","subtype":"init","session_id":"fake","tools":[]}"#,
+        ]) + r#"printf '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"background-off=%s"}]}}\n' "$CLAUDE_CODE_DISABLE_BACKGROUND_TASKS""#
+            + "\n"
+            + &printing(&[
+                r#"{"type":"result","subtype":"success","result":"waiting","stop_reason":"end_turn","session_id":"fake"}"#,
+                r#"{"type":"system","subtype":"task_updated","task_id":"b84qqcytz","patch":{"status":"killed"},"session_id":"fake"}"#,
+                r#"{"type":"system","subtype":"task_notification","task_id":"b84qqcytz","status":"stopped","session_id":"fake"}"#,
+            ]);
+        let request = fake_cli(dir.path(), &script);
+        let _bin = FakeClaudeBin::set("sh");
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let outcome = claude_runner()
+            .run_prompt(request, session_tx, discard_transcript())
+            .await
+            .expect("the fake CLI spawns");
+
+        assert!(
+            outcome.stdout.contains(r#""text":"background-off=1""#),
+            "the variable must reach the process it is meant for: {}",
+            outcome.stdout
+        );
+        assert_eq!(outcome.exit_code, -1, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("b84qqcytz"),
+            "the stderr names the task: {}",
+            outcome.stderr
+        );
     }
 
     /// Off by one is the entire bug class of a ceiling, so it is asserted on both sides of the edge.
