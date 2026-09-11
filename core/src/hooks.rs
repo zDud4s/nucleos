@@ -5307,7 +5307,10 @@ mod tests {
         let app = test_router(state.clone());
 
         for (tool_name, tool_input) in [
-            ("Read", serde_json::json!({"file_path": "C:\\work\\repo\\src\\main.rs"})),
+            (
+                "Read",
+                serde_json::json!({"file_path": "C:\\work\\repo\\src\\main.rs"}),
+            ),
             ("Bash", serde_json::json!({"command": "git status"})),
         ] {
             let decision = decide(
@@ -5320,7 +5323,11 @@ mod tests {
                 .to_string(),
             )
             .await;
-            assert_eq!(decision.decision, "allow", "{tool_name}: {}", decision.reason);
+            assert_eq!(
+                decision.decision, "allow",
+                "{tool_name}: {}",
+                decision.reason
+            );
         }
     }
 

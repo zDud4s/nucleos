@@ -2329,6 +2329,9 @@ async fn no_room_on_disk(project_root: &std::path::Path) -> Option<String> {
     })
 }
 
+// The callers create distinct run lifecycles and spell each axis out; an options struct would hide
+// the fixed values that distinguish user, resolution, job-node, and job-item runs.
+#[allow(clippy::too_many_arguments)]
 async fn create_run_with(
     state: &AppState,
     prompt: String,
