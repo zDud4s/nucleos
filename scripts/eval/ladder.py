@@ -239,7 +239,19 @@ def sh(args, timeout=2400):
     return subprocess.run(args, cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=timeout)
 
 
+def base_of(output):
+    """The commit `base.sh` laid the tree out from, read off its report line.
+
+    Its last line is `task<TAB>kind<TAB>sha<TAB>dest`. `None` when there is no such line, so the
+    row reads as unrecorded rather than the cell dying after its tree was already built.
+    """
+    lines = output.strip().splitlines()
+    fields = lines[-1].split("\t") if lines else []
+    return fields[2] if len(fields) >= 3 else None
+
+
 def prepare(task, layer, tree):
+    """Lay out the cell's tree and return the base commit it was laid out from."""
     # Sweep both addresses a worktree-mode cell may have left something at: the legacy sibling
     # (`nucleos-worktrees/<task>-<layer>`, what a machine that ran the ladder before the daemon's
     # default moved can still have on disk) and the current one, `<tree>/WORKTREES_SUBDIR`.
@@ -256,6 +268,7 @@ def prepare(task, layer, tree):
     done = sh([GIT_BASH, "scripts/eval/base.sh", "--task", task, "--dest", tree])
     if done.returncode != 0:
         raise SystemExit(f"base.sh failed for {task}: {done.stderr[-400:]}")
+    base = base_of(done.stdout)
     done = sh(["python", "scripts/eval/layer.py", "--layer", layer, "--tree", tree])
     if done.returncode != 0:
         raise SystemExit(f"layer.py failed for {task}/{layer}: {done.stderr[-400:]}")
@@ -268,6 +281,7 @@ def prepare(task, layer, tree):
         built = subprocess.run(["cargo", "test", "-p", "nucleos-core", "--no-run"],
                                cwd=tree, env=ENV, capture_output=True, text=True, timeout=2400)
         say(f"    pre-aquecimento H0: exit={built.returncode} {int(time.time()-started)}s")
+    return base
 
 
 def watch(project, first_id):
@@ -394,7 +408,7 @@ def main(argv):
             project = f"eval-{task}-{layer}"
             tree = f"{TREES}/{task}-{layer}"
             say(f"\n===== {task} x {layer} =====")
-            prepare(task, layer, tree)
+            base = prepare(task, layer, tree)
 
             body = {"prompt": prompt, "cwd": tree, "mode": MODE[layer]}
             worktree = MODE[layer] == "worktree"
@@ -406,7 +420,7 @@ def main(argv):
                 except urllib.error.HTTPError as error:
                     say(f"    ativacao recusada: HTTP {error.code} {error.read().decode()[:200]}")
                     results.append((task, layer, "refused", None, None, None))
-                    record(Cell(task, layer, "refused"), [])
+                    record(Cell(task, layer, "refused", base=base), [])
                     continue
             try:
                 try:
@@ -414,7 +428,7 @@ def main(argv):
                 except urllib.error.HTTPError as error:
                     say(f"    recusado: HTTP {error.code} {error.read().decode()[:200]}")
                     results.append((task, layer, "refused", None, None, None))
-                    record(Cell(task, layer, "refused"), [])
+                    record(Cell(task, layer, "refused", base=base), [])
                     continue
                 first_id = created["id"]
                 say(f"    run {first_id} criado")
@@ -436,7 +450,7 @@ def main(argv):
             say(f"    -> {verdict} | {outcome['wall']}s | ${outcome['cost']} | "
                 f"turnos={turns} | runs={outcome['runs']}")
             results.append((task, layer, verdict, outcome["wall"], outcome["cost"], turns))
-            record(Cell(task, layer, verdict, turns, outcome["cost"], outcome["wall"]),
+            record(Cell(task, layer, verdict, turns, outcome["cost"], outcome["wall"], base),
                    outcome["runs"] or [first_id])
 
     say("\n================ RESUMO ================")

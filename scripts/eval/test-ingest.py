@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+from dataclasses import asdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -136,6 +137,32 @@ def main():
     check("a reference git does not know is refused rather than left dangling",
           raises(lambda: ingest.resolve_reference("41e9a56", ROOT)))
 
+    # --- the base a cell was measured against --------------------------------
+    #
+    # `base.sh` prints the commit it laid the tree out from, and until now the ladder dropped it. A
+    # ledger that cannot say what was measured cannot tell a repeat from a different task.
+
+    sha_a, sha_b = "a" * 40, "b" * 40
+    with tempfile.TemporaryDirectory() as work:
+        ledger = os.path.join(work, "eval-cells.jsonl")
+        ingest.append_cell(ledger, ingest.Cell("T1", "H3", "solved", turns=13, base=sha_a),
+                           run_ids=[900474], source="ladder")
+        check("a ledger row records the commit its task's tree was laid out from",
+              ingest.read_cells(ledger)[0].base == sha_a)
+
+    split = [ingest.Cell("T1", "H3", "solved", turns=13, base=sha_a),
+             ingest.Cell("T1", "H0", "solved", turns=41, base=sha_b)]
+    check("a task measured against two different bases is refused, not paired as repeats",
+          raises(lambda: ingest.pair(split, "H3", "H0", "turns")))
+
+    legacy = [ingest.Cell("T1", "H3", "solved", turns=13),
+              ingest.Cell("T1", "H0", "solved", turns=41, base=sha_a)]
+    check("a transcribed row with no recorded base still pairs",
+          len(ingest.pair(legacy, "H3", "H0", "turns")) == 1)
+    _, evidence = ingest.references([asdict(cell) for cell in legacy], "H3", "H0", "turns")
+    check("and the references name it unrecorded instead of passing it off as measured",
+          evidence == [f"base:T1:{sha_a}", "base:T1:unrecorded"])
+
     # --- the ladder's write path ---------------------------------------------
     #
     # Stubbed rather than run: a real cell needs a daemon on 8791, builds a worktree, and cost
@@ -148,7 +175,7 @@ def main():
     check("importing the ladder contacts no daemon and runs no cell",
           ladder._TOKEN is None)
 
-    def drive(work, call_impl, cell=("T1", "H0")):
+    def drive(work, call_impl, cell=("T1", "H0"), base=None):
         ledger = os.path.join(work, "eval-cells.jsonl")
         # `getattr` with a default so a name the ladder does not have yet reads as a FAIL line
         # below rather than as a traceback that takes every other check down with it.
@@ -162,7 +189,7 @@ def main():
             # test must not answer anybody's approvals.
             ladder.start_approver = lambda project: None
             ladder.prompt_for = lambda task: "fix the thing"
-            ladder.prepare = lambda task, layer, tree: None
+            ladder.prepare = lambda task, layer, tree: base
             ladder.call = call_impl
             ladder.watch = lambda project, first: {"wall": 265, "cost": 1.89, "runs": [900267]}
             ladder.score = lambda task, layer, tree, first: "solved"
@@ -183,6 +210,14 @@ def main():
               and rows[0]["cost"] == 1.89 and rows[0]["wall"] == 265)
         check("the ledger row names the runs the cell was made of, and calls itself measured",
               rows[0]["run_ids"] == [900267] and rows[0]["source"] == "ladder")
+
+    with tempfile.TemporaryDirectory() as work:
+        rows = drive(work, lambda path, method="GET", body=None: {"id": 900267}, base=sha_a)
+        check("the row carries the base commit the cell's tree was laid out from",
+              rows[0]["base"] == sha_a)
+    check("which the ladder reads off base.sh's own report line",
+          ladder.base_of(f"T1\tsynthetic\t{sha_a}\tC:/Projects/nucleos-eval/T1-H3\n") == sha_a
+          and ladder.base_of("") is None)
 
     def refuse(path, method="GET", body=None):
         raise urllib.error.HTTPError(
@@ -324,7 +359,7 @@ def main():
     check("a whole ladder is the three layers the daemon can still run",
           [layer for _, layer in ladder.requested(["T1"])] == ["H0", "H2", "H3"])
 
-    total = 30
+    total = 36
     print(f"\n{total - failures}/{total} as expected")
     return 1 if failures else 0
 

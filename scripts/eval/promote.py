@@ -6,8 +6,8 @@
     decision = promote.BinaryPolicy(min_pairs=8, max_p_value=0.05).decide(samples)
 
 This module does not measure anything. `verify-task.sh` and `score.sh` produce the verdicts; this
-decides what a set of verdicts is allowed to conclude. Ingesting `ladder.py` output into
-`PairedSample` rows is deliberately not here yet.
+decides what a set of verdicts is allowed to conclude. `ingest.py` turns the ladder's ledger into
+`PairedSample` rows, and into the references the command line addresses each decision by.
 
 ## Why the address covers the references
 
@@ -22,6 +22,11 @@ left behind: that module's `verify_persisted_id` also accepts a legacy id comput
 alone, and applies the reference check only when the id is the newer form. A record stored under
 the legacy address therefore has its references outside the address entirely. There is one address
 here, and it always covers the references.
+
+What the command line addresses is the decision. Its config is the two layers, the metric and the
+policy; its trace references digest the ledger rows behind each pair; its evidence references are
+the base commits those rows were measured against — `unrecorded` for the transcribed history,
+which the address names rather than excuses.
 
 ## Why the gate is not a mean and a win rate
 
@@ -48,7 +53,7 @@ import json
 import math
 import random
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 
 class PromoteError(Exception):
@@ -288,7 +293,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     try:
-        cells = ingest.read_cells(args.ledger)
+        rows = ingest.read_rows(args.ledger)
+        cells = [ingest.cell_from(row) for row in rows]
         pairs = ingest.pair(cells, args.candidate, args.baseline, args.metric)
     except ingest.IngestError as error:
         print(f"undecidable: {error}")
@@ -297,14 +303,6 @@ def main(argv=None):
     if not pairs:
         print(f"undecidable: no task was scored under both {args.candidate} and {args.baseline}")
         return EXIT_UNDECIDABLE
-
-    print(f"{args.metric}: {args.candidate} (candidate) vs {args.baseline} (baseline)")
-    for sample in pairs:
-        left = ingest.spread(cells, sample.unit, args.candidate, args.metric)
-        right = ingest.spread(cells, sample.unit, args.baseline, args.metric)
-        print(f"  {sample.unit:<6} {sample.candidate:>8.2f} vs {sample.baseline:>8.2f}"
-              f"   runs: [{', '.join(str(v) for v in left)}]"
-              f" vs [{', '.join(str(v) for v in right)}]")
 
     try:
         if args.metric == "verdict":
@@ -316,10 +314,34 @@ def main(argv=None):
                 resamples=args.resamples, seed=args.seed,
                 higher_is_better=False, precision_ratio=args.precision_ratio,
             )
+        # A verdict quoted without its address cannot be told apart from the same verdict over a
+        # ledger that has since grown a row, or under a laxer policy.
+        traces, evidence = ingest.references(rows, args.candidate, args.baseline, args.metric)
+        candidate = Candidate.new(
+            {"candidate": args.candidate, "baseline": args.baseline, "metric": args.metric,
+             "policy": {"kind": type(policy).__name__, **asdict(policy)}},
+            traces, evidence,
+        )
+        candidate.verify_integrity()
         decision = policy.decide(pairs)
     except PromoteError as error:
         print(f"undecidable: {error}")
         return EXIT_UNDECIDABLE
+
+    print(f"{args.metric}: {args.candidate} (candidate) vs {args.baseline} (baseline)")
+    print(f"candidate {candidate.id}")
+    for sample in pairs:
+        left = ingest.spread(cells, sample.unit, args.candidate, args.metric)
+        right = ingest.spread(cells, sample.unit, args.baseline, args.metric)
+        print(f"  {sample.unit:<6} {sample.candidate:>8.2f} vs {sample.baseline:>8.2f}"
+              f"   runs: [{', '.join(str(v) for v in left)}]"
+              f" vs [{', '.join(str(v) for v in right)}]")
+
+    unrecorded = sorted(ref.split(":")[1] for ref in candidate.evidence_refs
+                        if ref.endswith(":unrecorded"))
+    if unrecorded:
+        print(f"  no recorded base commit for {', '.join(unrecorded)}: transcribed rows,"
+              " and the address says so")
 
     print()
     if decision.p_value is not None:
@@ -330,9 +352,10 @@ def main(argv=None):
 
     if decision.passed:
         print(f"\nPROMOTE: {args.candidate} over {args.baseline} on {args.metric}"
-              f" ({decision.sample_count} pairs)")
+              f" ({decision.sample_count} pairs) as candidate {candidate.id[:12]}")
         return EXIT_PROMOTE
-    print(f"\nREFUSED: {args.candidate} over {args.baseline} on {args.metric}")
+    print(f"\nREFUSED: {args.candidate} over {args.baseline} on {args.metric}"
+          f" as candidate {candidate.id[:12]}")
     for failure in decision.failures:
         print(f"  - {failure}")
     return EXIT_REFUSED

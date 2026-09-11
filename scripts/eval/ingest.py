@@ -32,6 +32,7 @@ resolving under H1 once and failing once. Averaging that to 0.5 buries the findi
 task; the same task still pairs on turns or cost, where the spread is the thing worth seeing.
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -57,27 +58,35 @@ METRICS = NUMERIC_METRICS + ("verdict",)
 
 @dataclass
 class Cell:
-    """One (task, layer) run of the ladder, as `ladder.py` already has it in hand."""
+    """One (task, layer) run of the ladder, as `ladder.py` already has it in hand.
+
+    `base` is the commit `base.sh` laid the task's tree out from. It is `None` on every row
+    transcribed before the ledger kept it — which is all nineteen `manual` rows.
+    """
     task: str
     layer: str
     verdict: str
     turns: float = None
     cost: float = None
     wall: float = None
+    base: str = None
+
+
+def _value(cell, metric):
+    return SCOREABLE[cell.verdict] if metric == "verdict" else getattr(cell, metric)
+
+
+def _counts(cell, task, layer, metric):
+    """Whether this cell is one of the numbers behind `layer`'s side of `task`'s pair."""
+    return (cell.task == task and cell.layer == layer and cell.verdict in SCOREABLE
+            and _value(cell, metric) is not None)
 
 
 def _values(cells, task, layer, metric):
     """Every number this layer produced for this task — repeats included, order preserved."""
     if metric not in METRICS:
         raise IngestError(f"unknown metric '{metric}'; known: {', '.join(METRICS)}")
-    out = []
-    for cell in cells:
-        if cell.task != task or cell.layer != layer or cell.verdict not in SCOREABLE:
-            continue
-        value = SCOREABLE[cell.verdict] if metric == "verdict" else getattr(cell, metric)
-        if value is not None:
-            out.append(value)
-    return out
+    return [_value(cell, metric) for cell in cells if _counts(cell, task, layer, metric)]
 
 
 def spread(cells, task, layer, metric):
@@ -96,6 +105,16 @@ def pair(cells, candidate, baseline, metric):
         right = _values(cells, task, baseline, metric)
         if not left or not right:
             continue
+        # Two bases are two tasks that happen to share a name. Averaging them would pair a
+        # measurement of one against a measurement of the other and call it a repeat.
+        bases = {cell.base for cell in cells if cell.base and any(
+            _counts(cell, task, layer, metric) for layer in (candidate, baseline))}
+        if len(bases) > 1:
+            raise IngestError(
+                f"{task} was measured against {len(bases)} different base commits "
+                f"({', '.join(sorted(base[:12] for base in bases))}); "
+                "those are different tasks, not repeats of one"
+            )
         if metric == "verdict":
             for layer, values in ((candidate, left), (baseline, right)):
                 if len(set(values)) > 1:
@@ -111,6 +130,30 @@ def pair(cells, candidate, baseline, metric):
     return samples
 
 
+def references(rows, candidate, baseline, metric):
+    """What a decision over these ledger rows was made of, as `promote.Candidate` references.
+
+    One trace reference per paired task: a digest over every row behind either side of its pair,
+    so changing one number, one run id or adding one repeat moves the candidate's address. One
+    evidence reference per base commit those rows were measured against, and `unrecorded` for
+    rows that never said — named in the address, so a decision resting on transcribed history
+    carries that fact with it instead of passing for one anybody could re-mount.
+    """
+    cells = [cell_from(row) for row in rows]
+    traces, evidence = [], []
+    for task in sorted(sample.unit for sample in pair(cells, candidate, baseline, metric)):
+        used = sorted(
+            (row for row, cell in zip(rows, cells)
+             if any(_counts(cell, task, layer, metric) for layer in (candidate, baseline))),
+            key=promote.canonical_json,
+        )
+        digest = hashlib.sha256(promote.canonical_json(used).encode("utf-8")).hexdigest()
+        traces.append(f"rows:{task}:{digest}")
+        evidence.extend(f"base:{task}:{base}"
+                        for base in sorted({row.get("base") or "unrecorded" for row in used}))
+    return traces, evidence
+
+
 def append_cell(path, cell, run_ids, source):
     """Append one measured cell. Called by `ladder.py` as each cell finishes, never in bulk."""
     if source not in ("ladder", "manual"):
@@ -123,6 +166,7 @@ def append_cell(path, cell, run_ids, source):
         "turns": cell.turns,
         "cost": cell.cost,
         "wall": cell.wall,
+        "base": cell.base,
         "run_ids": list(run_ids),
         "source": source,
     }
@@ -130,10 +174,20 @@ def append_cell(path, cell, run_ids, source):
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def cell_from(row):
+    return Cell(row["task"], row["layer"], row["verdict"],
+                row.get("turns"), row.get("cost"), row.get("wall"), row.get("base"))
+
+
 def read_cells(path):
+    return [cell_from(row) for row in read_rows(path)]
+
+
+def read_rows(path):
+    """The ledger as written, one dict per row — what `references` digests."""
     if not os.path.exists(path):
         return []
-    cells = []
+    rows = []
     for number, line in enumerate(open(path, encoding="utf-8"), start=1):
         line = line.strip()
         if not line:
@@ -145,9 +199,8 @@ def read_cells(path):
         for required in ("task", "layer", "verdict"):
             if required not in row:
                 raise IngestError(f"{path}:{number} has no '{required}'")
-        cells.append(Cell(row["task"], row["layer"], row["verdict"],
-                          row.get("turns"), row.get("cost"), row.get("wall")))
-    return cells
+        rows.append(row)
+    return rows
 
 
 def resolve_reference(reference, root=ROOT):

@@ -13,6 +13,7 @@ an exact sign test and a bootstrap interval, not a mean and a win rate.
 """
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -175,6 +176,26 @@ def main():
     # without doing anything, and a test that only reads the code would call that a pass.
     check("a gate that passes exits 0 and says so",
           result.returncode == 0 and "PROMOTE" in result.stdout)
+    passed = result
+
+    def address(result):
+        found = re.search(r"candidate ([0-9a-f]{64})", result.stdout)
+        return found.group(1) if found else None
+
+    gate = ("--candidate", "H3", "--baseline", "H1", "--metric", "turns", "--min-pairs", "6")
+    check("the verdict carries the content address of what it decided over",
+          address(passed) is not None)
+    check("the same ledger under the same policy gives the same address",
+          address(run_gate(clean, *gate)) == address(passed))
+    moved = [ingest.Cell(cell.task, cell.layer, cell.verdict,
+                         turns=cell.turns + (1 if index == 0 else 0))
+             for index, cell in enumerate(clean)]
+    check("one measured number changing moves the address",
+          address(run_gate(moved, *gate)) not in (None, address(passed)))
+    check("so does a different policy over the same ledger",
+          address(run_gate(clean, *gate[:-1], "5")) not in (None, address(passed)))
+    check("rows with no recorded base are named as such, not passed off as measured",
+          "no recorded base commit" in passed.stdout)
 
     noisy = [
         ingest.Cell("T1", "H3", "solved", turns=13), ingest.Cell("T1", "H3", "solved", turns=14),
@@ -200,7 +221,7 @@ def main():
     check("a verdict that varies between runs is cannot-decide, not refusal",
           result.returncode == 2)
 
-    total = 20
+    total = 25
     print(f"\n{total - failures}/{total} as expected")
     return 1 if failures else 0
 
