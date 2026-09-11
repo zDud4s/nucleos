@@ -7230,6 +7230,63 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         panic!("run did not reach completed status in time, last status: {status}");
     }
 
+    /// The persistence half of the turn-ceiling bug: a run that dies at the ceiling after one full
+    /// turn had already answered must not read back `num_turns`/`cost_usd` as unknown. `runner.rs`
+    /// keeps `usage`/`cost_usd` from the last completed turn across a ceiling break — see
+    /// `a_ceiling_death_after_one_full_turn_still_reports_that_turns_cost_and_count` in that module
+    /// — so a real number reaches `RunOutcome` here on purpose, and this test is the other half of
+    /// the claim: that the UPDATE this module runs on a `TURN_CEILING_EXIT_CODE` outcome actually
+    /// binds the columns it was handed rather than dropping them, the way `assistant.rs`'s `failed`
+    /// arm drops the token columns for a chat turn.
+    #[tokio::test]
+    async fn a_run_that_dies_at_the_ceiling_still_reports_the_turn_before_it() {
+        let (state, runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: crate::runner::TURN_CEILING_EXIT_CODE,
+            stdout: r#"{"type":"result","total_cost_usd":0.05,"num_turns":1}"#.to_string(),
+            stderr: "nucleos: stopped after 3 turns; this run's ceiling was 3\n".to_string(),
+            session_id: Some("fake-session-id".into()),
+            cost_usd: Some(0.05),
+            input_tokens: Some(11),
+            output_tokens: Some(22),
+            cache_read_tokens: Some(0),
+            cache_creation_tokens: Some(0),
+            num_turns: Some(1),
+            compacted: false,
+        });
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "keep going past the ceiling").await;
+
+        let mut status = String::new();
+        for _ in 0..100 {
+            let parsed = get_run_status(&app, created.id).await;
+            status = parsed.status.clone();
+            if status == "failed" {
+                assert_eq!(
+                    parsed.exit_code,
+                    Some(crate::runner::TURN_CEILING_EXIT_CODE),
+                    "a ceiling death is not a launch failure and must carry its own exit code"
+                );
+                assert_eq!(
+                    parsed.cost_usd,
+                    Some(0.05),
+                    "the completed turn's cost must not be read back NULL"
+                );
+                assert_eq!(
+                    parsed.num_turns,
+                    Some(1),
+                    "the completed turn's count must not be read back NULL"
+                );
+                assert_eq!(parsed.input_tokens, Some(11));
+                assert_eq!(parsed.output_tokens, Some(22));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run did not reach failed status in time, last status: {status}");
+    }
+
     /// A run that ran out of time is the one that MOST needs measuring: it went too far.
     ///
     /// Losing the denominator here is being blind in exactly the case the metric exists to see —

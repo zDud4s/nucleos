@@ -4794,6 +4794,119 @@ mod tests {
         }
     }
 
+    /// A process-wide guard for `NUCLEOS_CLAUDE_BIN`, mirroring `git_exec::tests::WorktreeRootEnv`
+    /// exactly: this override is the only way to point `ClaudeCliRunner` at a script instead of the
+    /// real CLI, so a test proving something about the turn-ceiling exit path has to set it, and
+    /// restore whatever was there before on drop rather than leaving a later test pointed at a fake
+    /// binary. No multi-thread runtime holds this lock across an await, same reasoning as that guard.
+    struct ClaudeBinEnv {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ClaudeBinEnv {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("NUCLEOS_CLAUDE_BIN");
+            unsafe {
+                std::env::set_var("NUCLEOS_CLAUDE_BIN", path);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ClaudeBinEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("NUCLEOS_CLAUDE_BIN", value),
+                    None => std::env::remove_var("NUCLEOS_CLAUDE_BIN"),
+                }
+            }
+        }
+    }
+
+    /// A fake CLI that prints a fixed transcript and exits — `.bat`, because Windows resolves that
+    /// extension through `cmd.exe` without this test needing to name a shell itself, unlike `.sh`,
+    /// which raw `CreateProcess` cannot run at all (measured directly against this machine's
+    /// toolchain before relying on it here). It never reads stdin and ignores every argument
+    /// `cli_args` hands it, which is fine for every case below: none of them are steerable, and the
+    /// point is what the daemon does with a transcript, not what argv `cli_args` built.
+    fn fake_claude_script(dir: &std::path::Path, lines: &[&str]) -> std::path::PathBuf {
+        let path = dir.join("fake_claude.bat");
+        let mut script = String::from("@echo off\r\n");
+        for line in lines {
+            script.push_str("echo ");
+            script.push_str(line);
+            script.push_str("\r\n");
+        }
+        std::fs::write(&path, script).expect("write the fake CLI script");
+        path
+    }
+
+    /// The regression this bug was filed over. `usage` and `cost_usd` are set from the last `Ended`
+    /// turn and never reset — see the `TurnEvent::Ended` arm inside `run_prompt_with_turns` — so a
+    /// process that answers once and then loops into the ceiling on its NEXT turn must still report
+    /// what the first one cost. Before this test existed, that property was pinned only by
+    /// `a_real_cli_answers_a_second_turn_down_the_same_stdin`, which needs a paid, authenticated CLI
+    /// and is `#[ignore]`d for exactly that reason — this is the same claim, proven deterministically
+    /// against a real spawned process reading a scripted stream, so it runs in the gate.
+    ///
+    /// `steerable: false`, matching the run this bug was actually filed against: an ordinary
+    /// autopilot/job run, the kind `runs.rs` spawns, not a chat turn, a council seat or a team
+    /// member. What still lets a second turn exist without this request opting into steering is
+    /// nothing the request controls — the CLI's own stream decides where a `result` line falls —
+    /// and this fake reproduces a transcript where one already had, exactly as
+    /// `create_run_inner(..., steerable: true)` lets an operator-messaged run on the Runs page do.
+    #[tokio::test]
+    async fn a_ceiling_death_after_one_full_turn_still_reports_that_turns_cost_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_claude_script(
+            dir.path(),
+            &[
+                r#"{"type":"system","subtype":"init","session_id":"fake-session","tools":[]}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"turn one"}]}}"#,
+                r#"{"type":"result","subtype":"success","total_cost_usd":0.05,"num_turns":1,"session_id":"fake-session","usage":{"input_tokens":11,"output_tokens":22,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"loop one"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"loop two"}]}}"#,
+            ],
+        );
+        let _guard = ClaudeBinEnv::set(&script);
+
+        let mut request = test_run_request("keep going");
+        // One `assistant` for the turn that answers, one more to trip the ceiling mid-way through
+        // the turn that never does: `turns_from_line` counts three `assistant` events total ("turn
+        // one", "loop one", "loop two"), and `over_turn_ceiling` fires once that count reaches 3.
+        request.max_turns = Some(3);
+        let runner = ClaudeCliRunner {
+            model: "sonnet".to_owned(),
+            plan_model: None,
+            review_model: None,
+        };
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let outcome = runner
+            .run_prompt(request, session_tx, discard_transcript())
+            .await
+            .expect("the fake CLI spawns and runs to the ceiling");
+
+        assert_eq!(
+            outcome.exit_code, TURN_CEILING_EXIT_CODE,
+            "the fake transcript must trip the ceiling before its second turn ends"
+        );
+        assert_eq!(
+            outcome.cost_usd,
+            Some(0.05),
+            "the first turn's cost must survive a ceiling death in the turn after it — this is \
+             the NULL the owner reported, and a real number exists here to lose"
+        );
+        assert_eq!(
+            outcome.num_turns,
+            Some(1),
+            "the first turn's own turn count must survive, not read back as unknown"
+        );
+        assert_eq!(outcome.input_tokens, Some(11));
+        assert_eq!(outcome.output_tokens, Some(22));
+    }
+
     #[tokio::test]
     async fn fake_runner_returns_canned_outcome() {
         let runner = FakeCommandRunner {
