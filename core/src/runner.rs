@@ -1626,6 +1626,63 @@ pub(crate) fn extract_usage(stdout: &str) -> RunUsage {
     usage
 }
 
+/// PURE: what a stream that never reached a `result` still says it used.
+///
+/// [`extract_usage`] reads the `result` event, and a headless run emits exactly one, at the very
+/// end. A run stopped before it — a turn ceiling, a progress deadline, a stream that broke — used to
+/// write NULL in every column, whatever it had burned: run 900463 was stopped at its ceiling after
+/// 125 responses and nearly ten million cache-read tokens, and recorded none of them.
+///
+/// Every `assistant` event carries its message's `usage`, and three of its fields are exact,
+/// because the input side is settled before the model writes a word. Summed once per message — the
+/// blocks of one message repeat the same figures, so summing events would count an answer once per
+/// block — they matched the `result` of run 900473 to the token: 28 input, 1,023,866 cache read,
+/// 68,996 cache creation.
+///
+/// `output_tokens` is not one of them and stays `None`. The figure on an `assistant` event is a
+/// count taken while the message was still being written: the same run's messages summed to 40
+/// against a `result` of 8,124. Written down, that would read as measured and be wrong by two
+/// orders of magnitude; unknown is the honest value, as it is everywhere else in [`RunUsage`].
+///
+/// `num_turns` is counted by the same [`TurnCounter`] the ceiling reads, so a run stopped at its
+/// ceiling records the number that stopped it. It is not the CLI's own `num_turns`, which counts
+/// something else (16 against 14 messages on 900473) and never arrived here anyway.
+///
+/// And no cost. Nothing here prices tokens, and the budget already charges a run with no cost by
+/// how long it ran (`budget::compute_spend`); a figure built from the input side alone would
+/// displace that estimate with a smaller one.
+pub(crate) fn usage_without_a_result(stdout: &str) -> RunUsage {
+    let mut turns = TurnCounter::default();
+    let mut usage = RunUsage::default();
+    for line in stdout.lines() {
+        if !turns.line(line) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let Some(reported) = value
+            .get("message")
+            .and_then(|message| message.get("usage"))
+        else {
+            continue;
+        };
+        let add = |total: &mut Option<i64>, field: &str| {
+            if let Some(tokens) = reported.get(field).and_then(serde_json::Value::as_i64) {
+                *total = Some(total.unwrap_or(0).saturating_add(tokens));
+            }
+        };
+        add(&mut usage.input_tokens, "input_tokens");
+        add(&mut usage.cache_read_tokens, "cache_read_input_tokens");
+        add(
+            &mut usage.cache_creation_tokens,
+            "cache_creation_input_tokens",
+        );
+    }
+    usage.num_turns = (turns.count() > 0).then_some(turns.count());
+    usage
+}
+
 // The `TreeKiller` this module used to define lives in `process_tree.rs` now, together with the
 // spawn contract that makes it correct off Windows. This copy was the one whose `Drop` called
 // `taskkill` with no `cfg` at all — a silent no-op on every other platform.
@@ -2544,6 +2601,7 @@ impl CommandRunner for ClaudeCliRunner {
         // the only place the running total lives.
         let mut splitter = TurnSplitter::new();
         let mut usage = RunUsage::default();
+        let mut turn_ended = false;
         let mut running_context_fill: Option<i64> = None;
         let mut compacted = false;
 
@@ -2628,6 +2686,7 @@ impl CommandRunner for ClaudeCliRunner {
                 // and `usage` still describes the turn that ended last.
                 for event in splitter.line(line.clone()) {
                     if let TurnEvent::Ended(turn) = &event {
+                        turn_ended = true;
                         usage = turn.usage;
                         if turn.cost_usd.is_some() {
                             cost_usd = Some(splitter.spent());
@@ -2728,6 +2787,12 @@ impl CommandRunner for ClaudeCliRunner {
             }
             (None, None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
         };
+
+        // Only when no turn ended: a `result` is the CLI's own account and is never second-guessed,
+        // and a stream without one still said, message by message, what it read.
+        if !turn_ended {
+            usage = usage_without_a_result(&stdout_acc);
+        }
 
         Ok(RunOutcome {
             exit_code,
@@ -4521,6 +4586,74 @@ mod tests {
         );
     }
 
+    /// Points `NUCLEOS_CLAUDE_BIN` at a program for as long as it lives, and puts the previous value
+    /// back on drop.
+    ///
+    /// Under `worktree::test_env_lock`, which every test that writes the process environment takes:
+    /// the variable is process-wide, and a second test pointing it elsewhere mid-run would hand this
+    /// one a CLI it did not write.
+    struct FakeClaudeBin {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl FakeClaudeBin {
+        fn set(program: &str) -> Self {
+            let lock = crate::worktree::test_env_lock();
+            let previous = std::env::var_os("NUCLEOS_CLAUDE_BIN");
+            unsafe { std::env::set_var("NUCLEOS_CLAUDE_BIN", program) };
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for FakeClaudeBin {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("NUCLEOS_CLAUDE_BIN", value),
+                    None => std::env::remove_var("NUCLEOS_CLAUDE_BIN"),
+                }
+            }
+        }
+    }
+
+    /// A shell script that prints `lines` verbatim, one per line.
+    fn printing(lines: &[&str]) -> String {
+        let mut script = String::from("cat <<'STREAM'\n");
+        for line in lines {
+            script.push_str(line);
+            script.push('\n');
+        }
+        script.push_str("STREAM\n");
+        script
+    }
+
+    /// A request whose CLI is `script`, spawned through the real runner loop with `sh` as the
+    /// program — so the test holds a [`FakeClaudeBin`] set to `"sh"`.
+    ///
+    /// It works because of where the runner puts things: `-p` first and a non-steerable run's
+    /// prompt second, so a prompt that is the script's path makes `sh -p <script> <flags...>` run
+    /// it, every flag after arriving as a positional argument it ignores. `-p` is `sh`'s own
+    /// privileged-mode switch and harmless here. One script for every platform where a `.bat` would
+    /// serve one, and `sh` is the program the gate tests already need.
+    fn fake_cli(dir: &std::path::Path, script: &str) -> RunRequest {
+        let path = dir.join("fake-claude.sh");
+        std::fs::write(&path, script).expect("write the fake CLI");
+        // Forward slashes: on Windows `sh` is MSYS, which reads `C:/...` reliably.
+        test_run_request(&path.display().to_string().replace('\\', "/"))
+    }
+
+    fn claude_runner() -> ClaudeCliRunner {
+        ClaudeCliRunner {
+            model: "sonnet".to_owned(),
+            plan_model: None,
+            review_model: None,
+        }
+    }
+
     fn test_run_request(prompt: &str) -> RunRequest {
         RunRequest {
             prompt: prompt.to_string(),
@@ -5532,6 +5665,116 @@ mod tests {
         assert!(turns.line(anonymous));
         assert!(turns.line(anonymous));
         assert_eq!(turns.count(), 4);
+    }
+
+    /// The input side of a stream, once per answer; the output side, not at all.
+    #[test]
+    fn a_stream_with_no_result_reports_its_input_side_once_per_answer() {
+        let stdout = [
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"output_tokens":1},"content":[{"type":"text"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"output_tokens":1},"content":[{"type":"tool_use"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":2,"cache_read_input_tokens":200,"output_tokens":4},"content":[{"type":"text"}]}}"#,
+        ]
+        .join("\n");
+
+        let usage = usage_without_a_result(&stdout);
+
+        assert_eq!(usage.input_tokens, Some(5), "m1 once, not once per block");
+        assert_eq!(usage.cache_read_tokens, Some(300));
+        assert_eq!(usage.cache_creation_tokens, Some(10));
+        assert_eq!(
+            usage.output_tokens, None,
+            "an assistant event's output count is taken mid-message; it is not the answer's total"
+        );
+        assert_eq!(usage.num_turns, Some(2));
+    }
+
+    /// Unknown is not zero: a stream that never answered has not reported reading nothing.
+    #[test]
+    fn a_stream_that_never_answered_reports_nothing_rather_than_zero() {
+        let usage =
+            usage_without_a_result(r#"{"type":"system","subtype":"init","session_id":"s"}"#);
+        assert_eq!(usage, RunUsage::default());
+    }
+
+    /// The run this was filed over, through the real loop against a spawned process: stopped at
+    /// its ceiling with no `result` ever written. A pure test of `usage_without_a_result` would
+    /// pass with the function never called, and not being called is what left 900463 all NULL.
+    #[tokio::test]
+    async fn a_run_stopped_before_its_result_still_reports_what_its_stream_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut request = fake_cli(
+            dir.path(),
+            &printing(&[
+                r#"{"type":"system","subtype":"init","session_id":"fake","tools":[]}"#,
+                r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"output_tokens":1},"content":[{"type":"text","text":"looking"}]}}"#,
+                r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"output_tokens":1},"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#,
+                r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":2,"cache_read_input_tokens":200,"cache_creation_input_tokens":0,"output_tokens":1},"content":[{"type":"text","text":"again"}]}}"#,
+                r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":1,"cache_read_input_tokens":300,"cache_creation_input_tokens":5,"output_tokens":1},"content":[{"type":"text","text":"and again"}]}}"#,
+                r#"{"type":"assistant","message":{"id":"m4","usage":{"input_tokens":1000,"cache_read_input_tokens":1000,"cache_creation_input_tokens":1000,"output_tokens":1},"content":[{"type":"text","text":"never read"}]}}"#,
+            ]),
+        );
+        // Three responses in four events: counted by event, the ceiling would trip on m2.
+        request.max_turns = Some(3);
+        let _bin = FakeClaudeBin::set("sh");
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let outcome = claude_runner()
+            .run_prompt(request, session_tx, discard_transcript())
+            .await
+            .expect("the fake CLI spawns");
+
+        assert_eq!(
+            outcome.exit_code, TURN_CEILING_EXIT_CODE,
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(outcome.num_turns, Some(3), "the count that stopped it");
+        assert_eq!(
+            outcome.input_tokens,
+            Some(6),
+            "m1 once, m2, m3 — and never m4"
+        );
+        assert_eq!(outcome.cache_read_tokens, Some(600));
+        assert_eq!(outcome.cache_creation_tokens, Some(15));
+        assert_eq!(outcome.output_tokens, None);
+        assert_eq!(
+            outcome.cost_usd, None,
+            "the budget's own time estimate covers this"
+        );
+    }
+
+    /// The other side of the same line: once a `result` has arrived, its figures are the run's,
+    /// and the stream's partial ones never overwrite them.
+    #[tokio::test]
+    async fn a_run_that_reached_its_result_reports_the_results_figures() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = fake_cli(
+            dir.path(),
+            &printing(&[
+                r#"{"type":"system","subtype":"init","session_id":"fake","tools":[]}"#,
+                r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"output_tokens":1},"content":[{"type":"text","text":"done"}]}}"#,
+                r#"{"type":"result","subtype":"success","result":"done","total_cost_usd":0.02,"num_turns":1,"session_id":"fake","usage":{"input_tokens":7,"output_tokens":50,"cache_read_input_tokens":900,"cache_creation_input_tokens":40}}"#,
+            ]),
+        );
+        let _bin = FakeClaudeBin::set("sh");
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let outcome = claude_runner()
+            .run_prompt(request, session_tx, discard_transcript())
+            .await
+            .expect("the fake CLI spawns");
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(outcome.input_tokens, Some(7));
+        assert_eq!(outcome.output_tokens, Some(50));
+        assert_eq!(outcome.cache_read_tokens, Some(900));
+        assert_eq!(outcome.cache_creation_tokens, Some(40));
+        assert_eq!(outcome.num_turns, Some(1));
+        assert_eq!(outcome.cost_usd, Some(0.02));
     }
 
     /// Off by one is the entire bug class of a ceiling, so it is asserted on both sides of the edge.
