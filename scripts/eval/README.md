@@ -100,7 +100,7 @@ reasons that have nothing to do with the task. The script refuses one up front.
 score, one cell at a time:
 
 ```sh
-python scripts/eval/ladder.py T3          # all four layers
+python scripts/eval/ladder.py T3          # every layer still runnable: H0, H2, H3 (H1 retired, a840181)
 python scripts/eval/ladder.py T2:H3 T3    # one cell, then a whole ladder
 ```
 

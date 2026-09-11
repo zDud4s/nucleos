@@ -13,6 +13,7 @@ the within-layer spread is carried on every pair because the second pass found t
 the size of the effect.
 """
 
+import contextlib
 import io
 import json
 import os
@@ -147,13 +148,19 @@ def main():
     check("importing the ladder contacts no daemon and runs no cell",
           ladder._TOKEN is None)
 
-    def drive(work, call_impl):
+    def drive(work, call_impl, cell=("T1", "H0")):
         ledger = os.path.join(work, "eval-cells.jsonl")
-        saved = {name: getattr(ladder, name) for name in
-                 ("requested", "prompt_for", "prepare", "call", "watch", "score", "turns_of")}
+        # `getattr` with a default so a name the ladder does not have yet reads as a FAIL line
+        # below rather than as a traceback that takes every other check down with it.
+        saved = {name: getattr(ladder, name, None) for name in
+                 ("requested", "prompt_for", "prepare", "call", "watch", "score", "turns_of",
+                  "start_approver")}
         ingest.LEDGER, saved_ledger = ledger, ingest.LEDGER
         try:
-            ladder.requested = lambda argv: [("T1", "H0")]
+            ladder.requested = lambda argv: [cell]
+            # Stubbed like the daemon: the real one is `auto-approve.py` against port 8791, and a
+            # test must not answer anybody's approvals.
+            ladder.start_approver = lambda project: None
             ladder.prompt_for = lambda task: "fix the thing"
             ladder.prepare = lambda task, layer, tree: None
             ladder.call = call_impl
@@ -200,7 +207,124 @@ def main():
             ingest.LEDGER = saved_ledger
         check("a ledger write that fails shouts instead of killing the cell", survived)
 
-    total = 20
+    # --- the ladder, under the daemon's project gate -------------------------
+    #
+    # Since a840181 (2026-08-26) `create_run` refuses an unattended run for a project in `off`, and a
+    # project the daemon has never heard of reads as off. The ladder ran on 2026-08-17/19, before
+    # that door asked anything — which is how all four layers ran then and three of them 422 now.
+
+    class Daemon:
+        """Records every call and answers the way the real routes do."""
+
+        def __init__(self, refuse=lambda method, path, body: False):
+            self.calls = []
+            self.refuse = refuse
+
+        def __call__(self, path, method="GET", body=None):
+            self.calls.append((method, path, body))
+            code = self.refuse(method, path, body)
+            if code:
+                # True is the 422 every refusal here used to be; a number is that status instead.
+                raise urllib.error.HTTPError(
+                    "http://x" + path, 422 if code is True else code, "Refused", {},
+                    io.BytesIO(b"project is not onboarded to .ai/workflow"))
+            if (method, path) == ("POST", "/runs"):
+                return {"id": 900500}
+            return {}
+
+        def modes(self):
+            return [(body["project_id"], body["mode"], body.get("project_root"))
+                    for method, path, body in self.calls
+                    if (method, path) == ("POST", "/autopilot/state")]
+
+        def first(self, method, path):
+            return next((i for i, (m, p, _) in enumerate(self.calls)
+                         if (m, p) == (method, path)), None)
+
+    daemon = Daemon()
+    with tempfile.TemporaryDirectory() as work:
+        drive(work, daemon, cell=("T1", "H2"))
+    modes = daemon.modes()
+    shadow_at = daemon.first("POST", "/autopilot/state")
+    launch_at = daemon.first("POST", "/runs")
+    check("a worktree cell puts its own project in shadow, rooted at its own tree, before launching",
+          bool(modes) and modes[0] == ("eval-T1-H2", "shadow", f"{ladder.TREES}/T1-H2")
+          and shadow_at is not None and launch_at is not None and shadow_at < launch_at)
+    check("and switches that project back off once the cell is over",
+          len(modes) == 2 and modes[1] == ("eval-T1-H2", "off", None))
+
+    # `off` alone leaves a row in the owner's roster, which lists every project in any mode — the
+    # probe of 2026-09-11 found `eval-T1-H2` there, switched off, where before it there was nothing.
+    # `DELETE /projects/{id}` takes it off the roster, touches nothing on disk, and keeps the history
+    # the ledger's run ids point into unless `forget_history` is asked for — which the exact-path
+    # match below also rules out.
+    off_at = next((i for i in reversed(range(len(daemon.calls)))
+                   if daemon.calls[i][:2] == ("POST", "/autopilot/state")
+                   and daemon.calls[i][2]["mode"] == "off"), None)
+    removal_at = daemon.first("DELETE", "/projects/eval-T1-H2")
+    check("and then takes it off the roster, keeping its history",
+          off_at is not None and removal_at is not None and removal_at > off_at)
+
+    daemon = Daemon(refuse=lambda method, path, body: (method, path) == ("POST", "/runs"))
+    with tempfile.TemporaryDirectory() as work:
+        rows = drive(work, daemon, cell=("T1", "H2"))
+    check("a run the daemon refuses still leaves its project off",
+          [mode for _, mode, _ in daemon.modes()] == ["shadow", "off"]
+          and rows[0]["verdict"] == "refused")
+
+    daemon = Daemon(refuse=lambda method, path, body: (body or {}).get("mode") == "shadow")
+    with tempfile.TemporaryDirectory() as work:
+        rows = drive(work, daemon, cell=("T1", "H3"))
+    check("a refused activation is recorded as refused and launches nothing",
+          rows[0]["verdict"] == "refused" and daemon.first("POST", "/runs") is None)
+
+    daemon = Daemon()
+    with tempfile.TemporaryDirectory() as work:
+        drive(work, daemon, cell=("T1", "H0"))
+    check("a real-mode cell touches no project's mode", daemon.modes() == [])
+
+    # Switching back off can fail too, and a project left in shadow is inert but visible in the
+    # roster — so it must be said, with the command that fixes it, and never kill the ladder.
+    daemon = Daemon(refuse=lambda method, path, body: (body or {}).get("mode") == "off")
+    heard = io.StringIO()
+    with tempfile.TemporaryDirectory() as work, contextlib.redirect_stdout(heard):
+        try:
+            drive(work, daemon, cell=("T1", "H2"))
+            survived = True
+        except Exception:
+            survived = False
+    check("a project that cannot be switched off is shouted about, not left silently in shadow",
+          survived and "eval-T1-H2" in heard.getvalue() and '"mode": "off"' in heard.getvalue())
+
+    # After a real cell the daemon may still hold the run's worktree — released later, or swept
+    # within half an hour — and `DELETE /projects/{id}` answers 409 until then. The door has to be
+    # shut already by that point, which is why `off` comes first and the held removal is only told.
+    daemon = Daemon(refuse=lambda method, path, body: 409 if method == "DELETE" else False)
+    heard = io.StringIO()
+    with tempfile.TemporaryDirectory() as work, contextlib.redirect_stdout(heard):
+        try:
+            drive(work, daemon, cell=("T1", "H2"))
+            survived = True
+        except Exception:
+            survived = False
+    check("a removal the daemon holds leaves the project off, and says so",
+          survived and bool(daemon.modes()) and daemon.modes()[-1][1] == "off"
+          and "eval-T1-H2" in heard.getvalue() and "409" in heard.getvalue())
+
+    # H1 is the worktree layer WITHOUT the classifier hook, and activating a project requires that
+    # very hook (`activation_prerequisites`, `autopilot.rs`). The daemon no longer runs the
+    # configuration H1 describes, so the ladder stops offering it rather than paying to hear 422.
+    try:
+        list(ladder.requested(["T1:H1"]))
+        why = ""
+    except SystemExit as refusal:
+        why = str(refusal)
+    check("H1 is no longer a layer the ladder runs, and the refusal says why",
+          "a840181" in why and "hook" in why)
+    check("a whole ladder is the three layers the daemon can still run",
+          [layer for _, layer in ladder.requested(["T1"])] == ["H0", "H2", "H3"])
+
+    total = 30
     print(f"\n{total - failures}/{total} as expected")
     return 1 if failures else 0
 

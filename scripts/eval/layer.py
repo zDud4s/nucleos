@@ -20,6 +20,14 @@ would have been four names for one layer. Measured on 2026-08-16: a run launched
 the whole difference the ladder claims between those layers, so it had better be the only thing this
 touches.
 
+**And one file the agent never sees, since 2026-09-11.** H2 and H3 also get
+`.ai/workflow/workflow.md`, because the daemon will not put a project in `shadow` without one and a
+worktree cell cannot start for a project in `off` (`a840181`). It does not break the sentence above
+where it matters: `.ai/` is gitignored, so the file lives in the project root the activation check
+reads and never in the worktree the agent is handed — from inside a run, `PreToolUse` is still the
+only difference. H1 cannot be activated at all without the hook it is defined by lacking, which is
+why `ladder.py` retired it.
+
 **Constant: `permissions.allow`.** Every layer gets the same list, and that is a decision worth
 stating because the opposite reading is tempting. `ABLATION.md` worried that enumerating allowed
 commands would "make that list part of the harness, arbitrary, biasing exactly what we want to
@@ -154,6 +162,34 @@ def write_cargo_config(tree: str) -> str:
                      "[build]\n"
                      f'target-dir = "{SHARED_TARGET_DIR}"\n')
     return config_path
+
+
+def plant_activation_marker(tree: str) -> str:
+    """Satisfy the daemon's onboarding check for a tree that can be activated, and say so inside it.
+
+    Since `a840181` (2026-08-26) a worktree cell needs its project in `shadow`, and
+    `activation_prerequisites` (`core/src/autopilot.rs`) refuses a root with no
+    `.ai/workflow/workflow.md`. `.ai/` is gitignored, so no tree `base.sh` produces carries one.
+
+    **This passes a safety check by construction, and it is written down here because of that.** The
+    check exists to confirm a project really works under the AI workflow; an eval tree does not, and
+    the file tells anyone who opens it so rather than passing itself off as the workflow. What makes
+    it harmless: the only reader of this path in the daemon is that check, and being gitignored it
+    lives in the project root the check inspects and never in the worktree the agent is handed.
+
+    Only for the layers with the hook, because activation requires the hook as well — for H0 and H1
+    no file changes the answer.
+    """
+    path = os.path.join(tree, ".ai", "workflow", "workflow.md")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(
+            "# Not the AI workflow.\n\n"
+            "Planted by scripts/eval/layer.py so the daemon's activation check "
+            "(activation_prerequisites, core/src/autopilot.rs) accepts this eval tree as a shadow "
+            "project for one ablation cell. Nothing else reads this file, and it is gitignored, so "
+            "it never reaches the worktree the agent works in. See layer.py for why.\n")
+    return path
 
 
 def write_gate(tree: str) -> str:
@@ -300,6 +336,10 @@ def main() -> int:
     # worktree, and `runs.rs` reads it from the project root before the worktree exists.
     gate_path = write_gate(args.tree) if args.layer == "H3" else None
 
+    # Gitignored for the same reason as the gate: it stays in the project root the daemon's
+    # activation check reads, and never reaches the worktree.
+    marker_path = plant_activation_marker(args.tree) if args.layer in LAYERS_WITH_HOOK else None
+
     # Only the worktree layers need it, and H0 is deliberately left as the plain directory
     # `materialize.sh` argues for.
     repo_note = None
@@ -319,6 +359,9 @@ def main() -> int:
         print(f"  gate_command: {GATE_COMMAND}")
         print(f"    in {os.path.relpath(gate_path, args.tree)} — gitignored on purpose: read from "
               f"the project root before the worktree exists, so the run cannot repoint it")
+    if marker_path:
+        print(f"  activation marker: {os.path.relpath(marker_path, args.tree)} — gitignored; lets the"
+              f" daemon put this tree's project in shadow (a840181), read by nothing else")
     print(f"  PreToolUse:  {'kept' if args.layer in LAYERS_WITH_HOOK else 'removed'}"
           f" (was {'present' if had_pre else 'absent'})")
     print(f"  PostToolUse: {'removed' if had_post else 'absent'} — its script is gitignored, so it "
