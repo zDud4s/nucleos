@@ -36,24 +36,61 @@ pub const TURN_CEILING_EXIT_CODE: i32 = i32::MIN + 1;
 /// worth reading rather than a quota to spend.
 pub const DEFAULT_MAX_TURNS: i64 = 200;
 
-/// PURE: how many model responses this stream has carried, folded one line at a time.
+/// PURE fold: how many model responses this stream has carried, one line at a time.
 ///
-/// One function for both CLIs. Claude says `assistant` once per completed model message; `codex
-/// exec` says `turn.completed`. Neither name appears in the other's stream, so a single fold cannot
-/// double-count — and the alternative, a counter per CLI, is how a ceiling ends up enforced on one
-/// path and quietly absent on the other, which is worse than no ceiling because somebody will
-/// believe it is there.
+/// One counter for both CLIs. `codex exec` says `turn.completed` once per turn. Claude says
+/// `assistant` once per content BLOCK, not once per message: an answer holding some text and two
+/// tool calls arrives as three `assistant` events carrying the same `message.id` and the same
+/// `usage`. Measured on this daemon's own runs against CLI 2.1.263: 32 events for 14 messages on
+/// run 900473, 200 for 125 on run 900463. Counting events is what stopped 900463 at 125 responses
+/// under a ceiling that says 200, and it fell hardest on the runs that call the most tools at once,
+/// which is nothing a brake on motion should care about.
+///
+/// So a Claude event counts once per id. A set rather than only the last id seen: nothing here then
+/// depends on the blocks of one message arriving next to each other, and the price is one short
+/// string per response. An `assistant` event with no id counts on its own, as every event did
+/// before ids were read.
+///
+/// Neither event name appears in the other CLI's stream, so one fold cannot double-count — and the
+/// alternative, a counter per CLI, is how a ceiling ends up enforced on one path and quietly absent
+/// on the other, which is worse than no ceiling because somebody will believe it is there.
 ///
 /// Counted from the transcript rather than asked of the CLI: measured against CLI 2.1.198, there is
 /// no `--max-turns` flag to delegate this to. `--max-budget-usd` exists and is a different brake —
 /// money, which the job already has, rather than motion, which nothing had.
-pub(crate) fn turns_from_line(line: &str, current: i64) -> i64 {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-        return current;
-    };
-    match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("assistant") | Some("turn.completed") => current.saturating_add(1),
-        _ => current,
+#[derive(Debug, Default)]
+pub(crate) struct TurnCounter {
+    count: i64,
+    seen: std::collections::HashSet<String>,
+}
+
+impl TurnCounter {
+    /// Folds one line in, and answers whether it began a response this counter had not seen yet.
+    pub(crate) fn line(&mut self, line: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            return false;
+        };
+        let began = match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("turn.completed") => true,
+            Some("assistant") => match value
+                .get("message")
+                .and_then(|message| message.get("id"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(id) => self.seen.insert(id.to_string()),
+                None => true,
+            },
+            _ => false,
+        };
+        if began {
+            self.count = self.count.saturating_add(1);
+        }
+        began
+    }
+
+    /// The responses counted so far.
+    pub(crate) fn count(&self) -> i64 {
+        self.count
     }
 }
 
@@ -2514,7 +2551,7 @@ impl CommandRunner for ClaudeCliRunner {
         let mut policy_violation: Option<String> = None;
         let mut init_seen = false;
         let mut progress_timeout_elapsed: Option<Duration> = None;
-        let mut turns: i64 = 0;
+        let mut turns = TurnCounter::default();
         let mut turns_exceeded: Option<i64> = None;
 
         loop {
@@ -2556,9 +2593,9 @@ impl CommandRunner for ClaudeCliRunner {
             // After the line is accumulated and mirrored, never before: a run stopped here still has
             // to leave the transcript of the turn that stopped it, or the evidence for why it was
             // stopped is the one thing missing from the record.
-            turns = turns_from_line(&line, turns);
-            if over_turn_ceiling(turns, request.max_turns) {
-                turns_exceeded = Some(turns);
+            turns.line(&line);
+            if over_turn_ceiling(turns.count(), request.max_turns) {
+                turns_exceeded = Some(turns.count());
                 break;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -2994,7 +3031,7 @@ impl CommandRunner for CodexCliRunner {
         let mut stdout_acc = String::new();
         let mut post_launch_error: Option<std::io::Error> = None;
         let mut progress_timeout_elapsed: Option<Duration> = None;
-        let mut turns: i64 = 0;
+        let mut turns = TurnCounter::default();
         let mut turns_exceeded: Option<i64> = None;
 
         loop {
@@ -3025,11 +3062,11 @@ impl CommandRunner for CodexCliRunner {
                 shared.push('\n');
             }
             // The same brake as the Claude body above, counting `turn.completed` instead of
-            // `assistant` — `turns_from_line` knows both, so this path cannot drift out of step
+            // `assistant` — `TurnCounter` knows both, so this path cannot drift out of step
             // with the other by being edited on its own.
-            turns = turns_from_line(&line, turns);
-            if over_turn_ceiling(turns, request.max_turns) {
-                turns_exceeded = Some(turns);
+            turns.line(&line);
+            if over_turn_ceiling(turns.count(), request.max_turns) {
+                turns_exceeded = Some(turns.count());
                 break;
             }
         }
@@ -5434,17 +5471,19 @@ mod tests {
 
     /// One fold for both CLIs, because their per-turn events cannot appear in the same stream.
     ///
-    /// Claude says `assistant` once per completed model message; `codex exec` says `turn.completed`.
-    /// Counting both in one function is what keeps the ceiling from being a Claude-only brake — a
-    /// limit that silently does not apply on one of the two paths is worse than no limit, because
-    /// somebody will believe it is there.
+    /// Claude says `assistant` once per content block of a model message; `codex exec` says
+    /// `turn.completed` once per turn. Counting both in one place is what keeps the ceiling from
+    /// being a Claude-only brake — a limit that silently does not apply on one of the two paths is
+    /// worse than no limit, because somebody will believe it is there.
     #[test]
     fn a_turn_is_counted_once_per_model_response_on_either_cli() {
-        let claude = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#;
+        let claude = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"hi"}]}}"#;
         let codex = r#"{"type":"turn.completed","usage":{"input_tokens":10}}"#;
 
-        assert_eq!(turns_from_line(claude, 0), 1);
-        assert_eq!(turns_from_line(codex, 4), 5);
+        let mut turns = TurnCounter::default();
+        assert!(turns.line(claude));
+        assert!(turns.line(codex));
+        assert_eq!(turns.count(), 2);
 
         // Everything else in either stream is not a turn. `stream_event` in particular arrives by
         // the hundred for a single message — counting it would trip a ceiling of 200 inside one
@@ -5458,8 +5497,41 @@ mod tests {
             "not json at all",
             "",
         ] {
-            assert_eq!(turns_from_line(quiet, 7), 7, "counted a turn for: {quiet}");
+            assert!(!turns.line(quiet), "counted a turn for: {quiet}");
         }
+        assert_eq!(turns.count(), 2);
+    }
+
+    /// The shape of a real answer, and the reason the counter reads ids at all: one response that
+    /// says something and calls two tools is three `assistant` events with one `message.id`. Counted
+    /// as three, run 900463 was stopped at 125 responses under a ceiling of 200.
+    #[test]
+    fn the_blocks_of_one_answer_are_one_turn_however_many_tools_it_calls() {
+        let block = |id: &str, kind: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"{id}","content":[{{"type":"{kind}"}}]}}}}"#
+            )
+        };
+        let mut turns = TurnCounter::default();
+
+        assert!(turns.line(&block("msg_a", "text")));
+        assert!(!turns.line(&block("msg_a", "tool_use")));
+        assert!(!turns.line(&block("msg_a", "tool_use")));
+        assert_eq!(turns.count(), 1, "three blocks of one answer are one turn");
+
+        // The tool results in between are not turns, and the next answer is one.
+        assert!(!turns.line(r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#));
+        assert!(turns.line(&block("msg_b", "text")));
+        // An id already counted stays counted, even with another answer's blocks in between.
+        assert!(!turns.line(&block("msg_a", "text")));
+        assert_eq!(turns.count(), 2);
+
+        // With no id there is nothing to join events by, so each counts, as every event did before.
+        let anonymous =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#;
+        assert!(turns.line(anonymous));
+        assert!(turns.line(anonymous));
+        assert_eq!(turns.count(), 4);
     }
 
     /// Off by one is the entire bug class of a ceiling, so it is asserted on both sides of the edge.
