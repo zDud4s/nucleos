@@ -4189,9 +4189,9 @@ mod tests {
 
     /// Every run carries a daemon-assigned session id, and an assistant turn is a run. Its first
     /// turn had nothing to resume, so it was launched with neither `--resume` nor `--session-id`:
-    /// the run had an id only if the CLI's stream volunteered one. `budget.rs` deduplicates spend by
-    /// `session_id`, so a first turn whose stream carried no `init` event — the case `runner.rs`
-    /// already has a test for — was money charged against nothing at all.
+    /// the run had an id only if the CLI's stream volunteered one, so a first turn whose stream
+    /// carried no `init` event — the case `runner.rs` already has a test for — was spend no
+    /// conversation owned.
     ///
     /// Asserted on the row and on what the runner was handed, because either alone is satisfiable
     /// without the other: a row written and never passed to the CLI leaves the two disagreeing about

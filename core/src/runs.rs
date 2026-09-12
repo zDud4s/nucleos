@@ -3789,6 +3789,47 @@ pub const TERMINAL_RUN_STATUSES: &[&str] = &[
     "superseded",
 ];
 
+/// Writes what a run's stream showed before a terminator cut it off: the transcript itself, and the
+/// turns and prompt tokens `runner::usage_without_a_result` rebuilds from it.
+///
+/// The record the wall-clock branch of `spawn_run` already keeps for a timed-out run, for the same
+/// reason — there is no `RunOutcome` to read — and it was missing for exactly the run that reaches
+/// here most: one paused for approval, which left `stdout`, `num_turns` and every token count NULL
+/// and no `run_events` at all.
+///
+/// `stdout IS NULL` keeps it from replacing anything a body already recorded, and the events follow
+/// only a write that landed, so a second call cannot duplicate them. Best-effort, like the rest of
+/// termination: the run is terminated either way.
+async fn record_the_cut_stream(pool: &sqlx::SqlitePool, id: i64, seen: &str) {
+    if seen.is_empty() {
+        return;
+    }
+    let usage = crate::runner::usage_without_a_result(seen);
+    let written = sqlx::query(
+        "UPDATE runs SET stdout = ?, num_turns = ?, input_tokens = ?, cache_read_tokens = ?, \
+         cache_creation_tokens = ?, context_peak = ?, tools_used = ? WHERE id = ? AND stdout IS NULL",
+    )
+    .bind(seen)
+    .bind(usage.num_turns)
+    .bind(usage.input_tokens)
+    .bind(usage.cache_read_tokens)
+    .bind(usage.cache_creation_tokens)
+    .bind(peak_of(seen))
+    .bind(tools_of(seen))
+    .bind(id)
+    .execute(pool)
+    .await;
+    match written {
+        Ok(done) if done.rows_affected() == 1 => append_run_events(pool, id, seen).await,
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            run_id = id,
+            %error,
+            "could not record the stream of a run cut off before its result"
+        ),
+    }
+}
+
 /// Terminates an in-flight run: aborts its task (which, via `kill_on_drop`, kills the CLI process)
 /// and records `status`. Removing the entry from the handle map is the atomic arbiter when several
 /// termination reasons race (user cancel, timeout, or Chunk 3's §8.4 approval-pause): whoever removes
@@ -3805,6 +3846,14 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
     let handle = state.run_handles.lock().unwrap().remove(&id);
     match handle {
         Some(h) => {
+            // Taken BEFORE the abort. The task's `Registration` removes this entry when it drops, and
+            // dropping it is exactly what the abort does — read afterwards, the stream the run wrote
+            // is already gone, which is how every paused run came to leave no transcript.
+            let stream = state
+                .run_tails
+                .lock()
+                .ok()
+                .and_then(|tails| tails.get(&id).cloned());
             h.abort();
             let now = chrono::Utc::now().to_rfc3339();
             // First writer wins: no rows means the run finalised itself while this call was on its
@@ -3818,19 +3867,34 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
             .execute(&state.pool)
             .await;
             warn_on_terminal_write_err(&result, id, status);
+            // Only for the terminator that won. No rows means the body finished on its own and wrote
+            // its own stdout and usage, read off a real `result` — those are the ones to keep.
+            let won = matches!(&result, Ok(done) if done.rows_affected() == 1);
+            if won && let Some(stream) = stream {
+                let seen = stream
+                    .lock()
+                    .map(|shared| shared.clone())
+                    .unwrap_or_default();
+                record_the_cut_stream(&state.pool, id, &seen).await;
+            }
             // The run is over; anything it queued and never started goes with it (spec §7). After
             // the status write, because this is a consequence of the run ending — and best-effort,
             // because the run IS terminated either way and a queue row that outlives its run is a
             // stale request a human can cancel, not a broken run.
-            if ends_the_run(status) {
-                if let Err(error) = crate::vcs::cancel_for_run(&state.pool, id).await {
-                    tracing::warn!(run_id = id, %error, "could not cancel the run's queued vcs requests");
-                }
-                // Every status that ends a run also ends its chance to report a cost: the abort
-                // above dropped the future, so `cancelled`, `failed`, `interrupted` and `timed_out`
-                // all leave the same silent `$0`. Sharing `ends_the_run` is what keeps
-                // `awaiting_approval` out — that run resumes, and the resume carries the real cost
-                // for the whole session; approximating the pause would bill the same time twice.
+            if ends_the_run(status)
+                && let Err(error) = crate::vcs::cancel_for_run(&state.pool, id).await
+            {
+                tracing::warn!(run_id = id, %error, "could not cancel the run's queued vcs requests");
+            }
+            // Every terminator here stops the run before its `result`, the only line that carries a
+            // cost, so every one of them leaves a run that spent money and reported none — the pause
+            // included. It was left out once, on the belief that the resume "carries the real cost
+            // for the whole session". It does not: a resume reports its own invocation and nothing
+            // before it. Run 900475 resumed a session of 31 turns and reported 5 turns and $0.12, and
+            // every total that reads `runs` — the budget, the ablation — lost the paused half.
+            // `ends_the_run` still decides the queue above, where the pause must stay out; it does
+            // not decide this.
+            if won || ends_the_run(status) {
                 record_time_approx_cost(&state.pool, id).await;
             }
             true
@@ -10626,5 +10690,68 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             "a run that reported no usage has no residual, and certainly not the whole of what we \
              wrote"
         );
+    }
+
+    /// A run paused for approval is cut off before its `result`, the only line that reports what the
+    /// invocation used, and its resume reports its own invocation and nothing before it — measured:
+    /// 900475 said 5 turns and $0.12 for a session that had taken 31. So the paused half is recorded
+    /// here, off its own stream, or no total that reads `runs` ever sees it.
+    #[tokio::test]
+    async fn a_run_paused_for_approval_keeps_what_it_did_before_the_pause() {
+        let state = test_state().await;
+        let started = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'real', ?)",
+        )
+        .bind(started.to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let stream = [
+            r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":1000}}}"#,
+            r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":1000}}}"#,
+            r#"{"type":"user","message":{"content":[]}}"#,
+            r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":2,"cache_read_input_tokens":1100}}}"#,
+        ]
+        .join("\n")
+            + "\n";
+        state
+            .run_tails
+            .lock()
+            .unwrap()
+            .insert(id, std::sync::Arc::new(std::sync::Mutex::new(stream)));
+        spawn_registered(&state, id, std::future::pending::<()>());
+
+        assert!(finalize_termination(&state, id, "awaiting_approval").await);
+
+        let (status, turns, cache_read, cost, stdout): (
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<f64>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, num_turns, cache_read_tokens, cost_usd, stdout FROM runs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "awaiting_approval");
+        assert_eq!(turns, Some(2), "the turns taken before the pause");
+        assert_eq!(cache_read, Some(2100));
+        assert!(stdout.is_some(), "the transcript the pause used to throw away");
+        assert!(
+            cost.is_some_and(|cost| cost > 0.0),
+            "ten minutes of work before the pause is not free: {cost:?}"
+        );
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_events WHERE run_id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(events, 4);
     }
 }

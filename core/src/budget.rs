@@ -63,6 +63,10 @@ pub enum BudgetDecision {
 /// One run's contribution to the budget, already parsed from the `runs` table.
 #[derive(Debug, Clone)]
 pub struct SpendRow {
+    // Loaded and no longer read by the arithmetic: spend is summed run by run, and grouping by
+    // session was the undercount `compute_spend` describes. Kept so a reader can still tell which
+    // runs continued one conversation.
+    #[allow(dead_code)]
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
     // Retained as loaded run telemetry for non-pricing readers. Without a price table these fields
@@ -102,52 +106,24 @@ fn time_approx(row: &SpendRow, now: DateTime<Utc>, rate_per_hour: f64) -> f64 {
     )
 }
 
-/// Total spend across `rows`, deduping resumed sessions and approximating unknown costs by time.
-/// `now` is used for the duration of rows that have not completed yet.
+/// Total spend across `rows`: each run for the cost it reported, and a run that reported none for
+/// the time it ran. `now` is used for the duration of rows that have not completed yet.
+///
+/// **Run by run, and never one figure per session.** This used to count the largest cost in each
+/// session, on the belief that `--resume` reports the cumulative session total. It reports its own
+/// invocation, and the database had been saying so: the assistant's session `e38f60a4` is thirteen
+/// resumed turns with a cost each, running 0.084, 0.207, 0.309, 0.043 — no running total goes down —
+/// and approval resume 900475 reported 5 turns and $0.12 for a session that had taken 31. Counting
+/// the largest billed that conversation 0.309 of the 1.49 it reported, and billed every run an
+/// approval split for the part after the approval, while the budget believed it was rounding up.
+///
+/// Summing keeps what the maximum was defending: a later, smaller report can no longer erase spend
+/// already counted, because nothing is ever replaced.
 pub fn compute_spend(rows: &[SpendRow], now: DateTime<Utc>, cfg: &BudgetConfig) -> f64 {
-    use std::collections::HashMap;
-
     let rate = cfg.time_cost_per_hour_usd;
-    let mut total = 0.0;
-    let mut sessions: HashMap<&str, Vec<&SpendRow>> = HashMap::new();
-
-    for row in rows {
-        match row.session_id.as_deref() {
-            // Sessionless rows cannot be deduped; each counts on its own.
-            None => total += row.cost_usd.unwrap_or_else(|| time_approx(row, now, rate)),
-            Some(session_id) => sessions.entry(session_id).or_default().push(row),
-        }
-    }
-
-    for group in sessions.values() {
-        // `--resume` reports the cumulative session total, so a session with any known cost counts
-        // ONE of those values rather than their sum; a session with no known cost yet falls back
-        // to time.
-        //
-        // The largest, not the most recent. Cumulativeness is an assumption about the CLI's output,
-        // not something this can verify: a restart, a version change, or a crafted result line can
-        // report less than the session has already spent, and taking that value verbatim erases
-        // real money and reopens the gate. A spend limit has to round the wrong way on purpose,
-        // and `max` costs nothing when the assumption does hold.
-        let largest_known_cost = group
-            .iter()
-            .filter_map(|row| row.cost_usd)
-            .fold(None::<f64>, |acc, cost| {
-                Some(acc.map_or(cost, |a| a.max(cost)))
-            });
-
-        match largest_known_cost {
-            Some(cost) => total += cost,
-            None => {
-                total += group
-                    .iter()
-                    .map(|row| time_approx(row, now, rate))
-                    .sum::<f64>()
-            }
-        }
-    }
-
-    total
+    rows.iter()
+        .map(|row| row.cost_usd.unwrap_or_else(|| time_approx(row, now, rate)))
+        .sum()
 }
 
 pub async fn load_budget_config(pool: &SqlitePool) -> sqlx::Result<BudgetConfig> {
@@ -363,10 +339,10 @@ fn spend_rows(raw: Vec<RawRow>) -> sqlx::Result<Vec<SpendRow>> {
         .collect()
 }
 
-/// What one job has spent, all of it, deduplicated by session exactly as the global figure is.
+/// What one job has spent, all of it, summed run by run exactly as the global figure is.
 ///
-/// The same arithmetic as the house limit and deliberately so: a resumed node shares its session
-/// with the run it resumed and must not be counted twice, and a run whose cost the CLI never
+/// The same arithmetic as the house limit and deliberately so: a resumed node and the run it
+/// resumed each reported their own invocation, so both count, and a run whose cost the CLI never
 /// reported is approximated from elapsed time rather than treated as free — *failing to measure a
 /// cost cannot mean treating it as zero* (decision of 2026-07-20).
 pub async fn job_spend(pool: &SqlitePool, job_id: i64, now: DateTime<Utc>) -> sqlx::Result<f64> {
@@ -586,9 +562,10 @@ mod tests {
     }
 
     #[test]
-    fn resumed_session_counts_one_reported_cost_not_their_sum() {
-        // Original paused run (no result -> cost None) then a resume run whose cost is the
-        // cumulative session total. Must count 0.9 once, NOT 0.9 + time-approx of the first row.
+    fn a_resumed_session_counts_every_run_it_was_split_into() {
+        // A paused run (no result -> cost None, 30 min -> 1.5 at $3/h) then its resume, which
+        // reports its own invocation and nothing before it: 1.5 + 0.9. Counting only the 0.9 is
+        // the undercount `compute_spend` describes.
         let rows = vec![
             SpendRow {
                 session_id: Some("s1".into()),
@@ -613,16 +590,16 @@ mod tests {
         ];
         approx(
             compute_spend(&rows, ts("2026-07-20T11:00:00Z"), &cfg(3.0)),
-            0.9,
+            2.4,
         );
     }
 
     #[test]
     fn a_later_smaller_report_cannot_erase_spend_already_counted() {
-        // The cumulative-total assumption is an assumption, not a guarantee: a CLI restart, a
-        // version change, or simply a crafted result line can make a resume report LESS than the
-        // session already spent. Taking the most recent value verbatim then wipes out real money
-        // and reopens the budget gate. A spend limit must round the wrong way on purpose.
+        // What the old per-session maximum was defending, and summing still holds it: a resume
+        // that reports LESS than the session already spent — which is simply what a cheap turn
+        // after an expensive one looks like — must not wipe out real money and reopen the budget
+        // gate. Nothing is replaced, so the earlier 40 stays counted beside the 0.02.
         let rows = vec![
             SpendRow {
                 session_id: Some("s1".into()),
@@ -647,7 +624,7 @@ mod tests {
         ];
         approx(
             compute_spend(&rows, ts("2026-07-20T11:00:00Z"), &cfg(3.0)),
-            40.0,
+            40.02,
         );
     }
 
@@ -981,10 +958,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn window_spend_dedups_resumed_session() {
+    async fn window_spend_counts_both_halves_of_a_resumed_session() {
         let pool = test_pool().await;
         let now = ts("2026-07-20T12:00:00Z");
-        // paused original (no result cost) then a resume run reporting the cumulative session total.
+        // A paused original (no result cost, 30 min -> 1.5 at $3/h) then a resume reporting only
+        // its own invocation: both are spend, 1.5 + 0.9.
         insert_run(
             &pool,
             "worktree",
@@ -1004,7 +982,7 @@ mod tests {
         )
         .await;
 
-        approx(window_spend(&pool, now).await.unwrap(), 0.9);
+        approx(window_spend(&pool, now).await.unwrap(), 2.4);
     }
 
     #[tokio::test]
