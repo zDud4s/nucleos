@@ -105,11 +105,53 @@ fn tampered_gate_script(
     None
 }
 
+/// Leading `NAME=value` words, taken off the front of the command they precede.
+///
+/// A gate command is spawned directly and never through a shell, so a project that needs a variable
+/// set for its own suite had no way to ask for one: written as a prefix it named a program that
+/// does not exist, and there was nowhere else to put it. What a given project needs set, and why,
+/// belongs to that project's `gate_command` rather than here.
+///
+/// **Read here rather than by wrapping the configured line in `bash -c`, because the wrapper costs
+/// the tamper check.** [`worktree_scripts`] looks for the gate's script among the command's WORDS,
+/// and `-c "…"` collapses the whole line into a single word that names no file: the check would
+/// find nothing to compare and pass in silence, which is the one failure mode it exists to prevent.
+/// A prefix keeps the script a word of its own.
+///
+/// Only a PREFIX is honoured. A `NAME=value` after the program is an ordinary argument, which is
+/// what a shell does with it too, and a gate command that passes one to its script must keep being
+/// able to. A word counts as an assignment only when the name before `=` is non-empty and spelled
+/// the way an environment variable is — otherwise a relative path such as `a=b/script.sh` would be
+/// eaten, and the script it names would stop being checked.
+fn split_environment(mut words: Vec<String>) -> (Vec<(String, String)>, Vec<String>) {
+    let is_assignment = |word: &String| match word.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        }
+        None => false,
+    };
+    let at = words.iter().take_while(|word| is_assignment(word)).count();
+    let rest = words.split_off(at);
+    let environment = words
+        .into_iter()
+        .map(|word| {
+            let (name, value) = word.split_once('=').expect("checked by is_assignment");
+            (name.to_owned(), value.to_owned())
+        })
+        .collect();
+    (environment, rest)
+}
+
 /// Runs a verification command in `worktree` without involving agent hooks or classification.
 ///
 /// `command` is a program followed by arguments, not a shell line. Shell operators such as `&&`
 /// are passed as ordinary arguments; callers that need them must name a shell explicitly, for
-/// example `bash -c "cargo test && cargo clippy"`.
+/// example `bash -c "cargo test && cargo clippy"`. Leading `NAME=value` words are the one shell
+/// shape read here rather than passed on — see [`split_environment`] for why they cannot be
+/// delegated to a wrapper.
 ///
 /// `project_root` is the un-agented copy of the repository. It is not where the command runs — that
 /// is always the worktree — but the reference the gate's own script is checked against first.
@@ -123,6 +165,9 @@ pub async fn run_gate(
         Ok(words) => words,
         Err(reason) => return GateOutcome::Errored { reason },
     };
+    // Before `split_first`, so the program is the first word that is not an assignment. `words` from
+    // here on is the command proper, which is also what the tamper check below must see.
+    let (environment, words) = split_environment(words);
     let Some((program, arguments)) = words.split_first() else {
         return GateOutcome::Errored {
             reason: "gate command is empty".to_owned(),
@@ -139,6 +184,7 @@ pub async fn run_gate(
     let mut command = Command::new(program);
     command
         .args(arguments)
+        .envs(environment)
         .current_dir(worktree)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -329,7 +375,7 @@ where
 #[rustfmt::skip]
 #[cfg(test)]
 mod tests {
-    use super::{ExitVerdict, GateOutcome, classify_exit, run_gate};
+    use super::{ExitVerdict, GateOutcome, classify_exit, run_gate, split_environment};
     use std::time::Duration;
 
     #[tokio::test]
@@ -470,5 +516,94 @@ mod tests {
         assert_eq!(classify_exit(Some(3)), ExitVerdict::Failed(3));
         // -1 is a real exit code a program may choose, and must not be confused with "no code".
         assert_eq!(classify_exit(Some(-1)), ExitVerdict::Failed(-1));
+    }
+
+    fn words(command: &str) -> Vec<String> {
+        super::split_command(command).expect("splits")
+    }
+
+    #[test]
+    fn a_leading_assignment_is_environment_and_not_the_program() {
+        let (environment, rest) = split_environment(words("BUILD_DIR=elsewhere sh scripts/g.sh"));
+
+        assert_eq!(environment, vec![("BUILD_DIR".to_owned(), "elsewhere".to_owned())]);
+        assert_eq!(rest, vec!["sh".to_owned(), "scripts/g.sh".to_owned()]);
+    }
+
+    /// Only a prefix. A shell would pass this one through as an argument, and a gate script that
+    /// takes `KEY=VALUE` arguments must keep receiving them.
+    #[test]
+    fn an_assignment_after_the_program_stays_an_argument() {
+        let (environment, rest) = split_environment(words("sh scripts/g.sh MODE=fast"));
+
+        assert!(environment.is_empty(), "not a prefix: {environment:?}");
+        assert_eq!(rest, vec!["sh".to_owned(), "scripts/g.sh".to_owned(), "MODE=fast".to_owned()]);
+    }
+
+    /// A word with `=` in it is not an assignment unless the name is spelled like one. Without this
+    /// the FIRST word of `a/g.sh=x sh` would be swallowed as environment, and a path that should
+    /// have been compared against the project root would stop being compared at all.
+    #[test]
+    fn a_path_that_merely_contains_an_equals_sign_is_not_environment() {
+        let (environment, rest) = split_environment(words("scripts/a=b.sh --now"));
+
+        assert!(environment.is_empty(), "a path is not an assignment: {environment:?}");
+        assert_eq!(rest, vec!["scripts/a=b.sh".to_owned(), "--now".to_owned()]);
+    }
+
+    /// The variable has to reach the child, not merely leave the parser.
+    ///
+    /// The child exits with the variable's own value, because that needs no nested quotes:
+    /// `split_command` has no escape character, so a `"` inside a `"…"` word ends it early and the
+    /// probe would be testing the splitter rather than the environment. An unset `GATE_PROBE` makes
+    /// this `exit` with no argument, which is exit 0 — so `Failed { exit_code: 7 }` is reachable
+    /// only if the value actually arrived.
+    #[tokio::test]
+    async fn the_named_variable_reaches_the_command() {
+        let worktree = tempfile::tempdir().expect("create temporary worktree");
+
+        let outcome = run_gate(
+            worktree.path(),
+            worktree.path(),
+            r#"GATE_PROBE=7 sh -c "exit $GATE_PROBE""#,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        match outcome {
+            GateOutcome::Failed { exit_code: 7, .. } => {}
+            other => panic!("the child must see GATE_PROBE=7, got {other:?}"),
+        }
+    }
+
+    /// **The reason the prefix is parsed here instead of wrapping the whole line in `bash -c`.**
+    /// A wrapper collapses the command into one word that names no file, so `worktree_scripts`
+    /// finds nothing, `tampered_gate_script` compares nothing, and a run that rewrote its own gate
+    /// is measured by the rewritten copy — silently, with a verdict that looks ordinary. This
+    /// asserts the check still fires with an assignment in front of the script.
+    #[tokio::test]
+    async fn an_environment_prefix_does_not_blind_the_tamper_check() {
+        let project = tempfile::tempdir().expect("project root");
+        let worktree = tempfile::tempdir().expect("worktree");
+        std::fs::create_dir_all(project.path().join("scripts")).unwrap();
+        std::fs::create_dir_all(worktree.path().join("scripts")).unwrap();
+        std::fs::write(project.path().join("scripts/g.sh"), "exit 1\n").unwrap();
+        // What the agent left behind: same path, now passing.
+        std::fs::write(worktree.path().join("scripts/g.sh"), "exit 0\n").unwrap();
+
+        let outcome = run_gate(
+            worktree.path(),
+            project.path(),
+            "BUILD_DIR=elsewhere sh scripts/g.sh",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        match outcome {
+            GateOutcome::Errored { reason } => {
+                assert!(reason.contains("scripts/g.sh"), "must name it: {reason}");
+            }
+            other => panic!("an env prefix must not hide the rewritten script, got {other:?}"),
+        }
     }
 }
