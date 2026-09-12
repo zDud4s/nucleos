@@ -1886,7 +1886,8 @@ impl Driver {
                     let _ = sqlx::query(
                         "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?,
                                 cost_usd = ?, input_tokens = ?, output_tokens = ?,
-                                cache_read_tokens = ?, num_turns = ?, completed_at = ?
+                                cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?,
+                                completed_at = ?
                          WHERE id = ? AND status = 'running'",
                     )
                     .bind(&run.stdout)
@@ -1894,6 +1895,7 @@ impl Driver {
                     .bind(run.input_tokens)
                     .bind(run.output_tokens)
                     .bind(run.cache_read_tokens)
+                    .bind(run.cache_creation_tokens)
                     .bind(run.num_turns)
                     .bind(&completed_at)
                     .bind(run_id)
@@ -1916,10 +1918,14 @@ impl Driver {
                     // THIS arm — carries the completed turn's own count and usage in `RunOutcome`
                     // exactly as the `completed` arm above does, and this `UPDATE` was the one
                     // place that dropped them on the floor instead of binding them.
+                    //
+                    // Cache creation among them, in both arms: the window a seat spent building its
+                    // cache is spend like any other, and a row without it reads as cheaper than it was.
                     let _ = sqlx::query(
                         "UPDATE runs SET status = 'failed', exit_code = ?, stdout = ?, stderr = ?,
                                 cost_usd = ?, input_tokens = ?, output_tokens = ?,
-                                cache_read_tokens = ?, num_turns = ?, completed_at = ?
+                                cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?,
+                                completed_at = ?
                          WHERE id = ? AND status = 'running'",
                     )
                     .bind(run.exit_code)
@@ -1929,6 +1935,7 @@ impl Driver {
                     .bind(run.input_tokens)
                     .bind(run.output_tokens)
                     .bind(run.cache_read_tokens)
+                    .bind(run.cache_creation_tokens)
                     .bind(run.num_turns)
                     .bind(&completed_at)
                     .bind(run_id)
@@ -3395,6 +3402,7 @@ mod tests {
                     input_tokens: Some(11),
                     output_tokens: Some(22),
                     cache_read_tokens: Some(0),
+                    cache_creation_tokens: Some(7),
                     num_turns: Some(1),
                     ..blank
                 }),
@@ -3547,14 +3555,18 @@ mod tests {
             .stage1_run_id
             .expect("a seat that launched has a run row, whatever it ended with");
 
-        let (exit_code, cost_usd, num_turns, input_tokens, output_tokens): (
+        /// `exit_code, cost_usd, num_turns, input_tokens, output_tokens, cache_creation_tokens`.
+        type SeatNumbers = (
             Option<i32>,
             Option<f64>,
             Option<i64>,
             Option<i64>,
             Option<i64>,
-        ) = sqlx::query_as(
-            "SELECT exit_code, cost_usd, num_turns, input_tokens, output_tokens FROM runs WHERE id = ?",
+            Option<i64>,
+        );
+        let (exit_code, cost_usd, num_turns, input_tokens, output_tokens, cache_creation_tokens): SeatNumbers = sqlx::query_as(
+            "SELECT exit_code, cost_usd, num_turns, input_tokens, output_tokens, cache_creation_tokens
+             FROM runs WHERE id = ?",
         )
         .bind(run_id)
         .fetch_one(&state.pool)
@@ -3574,6 +3586,11 @@ mod tests {
         );
         assert_eq!(input_tokens, Some(11));
         assert_eq!(output_tokens, Some(22));
+        assert_eq!(
+            cache_creation_tokens,
+            Some(7),
+            "the cache the seat built is spend too, and must not be read back NULL"
+        );
     }
 
     /// One answer has nothing to be ranked against, and the phase would ask a seat to order an
