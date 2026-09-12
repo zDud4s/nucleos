@@ -46,7 +46,7 @@ import { spawn } from "node:child_process";
 import { readFile, mkdtemp } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, extname, dirname, resolve } from "node:path";
+import { delimiter, join, extname, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ownUntilExit } from "./leave-nothing-behind.mjs";
 
@@ -61,29 +61,65 @@ const SURFACE_TIMEOUT = 15_000;
  * Chromium, by whichever name this machine has it.
  *
  * Edge is the fallback and not the first choice only because Chrome's headless mode is the one
- * more people run; both are the same engine, and Edge's is the same one the Tauri window uses.
+ * more people run. On Windows, WebView2 and Edge are both Chromium; on macOS and Linux, the
+ * Tauri window is WKWebView or WebKitGTK, so this gate measures Chromium's policy reading, not
+ * the window's (spec section 6 residual risk).
  * Missing entirely is a FAILURE and not a skip — `scripts/gates.sh` treats a missing tool that way
  * everywhere else, and a gate that quietly passes when it could not run is worse than no gate.
  */
-const BROWSERS = [
-  "C:/Program Files/Google/Chrome/Application/chrome.exe",
-  "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
-  "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
-  "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
-];
-
 function die(message) {
   console.error("csp gate: " + message);
   process.exit(1);
 }
 
-const browser = BROWSERS.find((path) => existsSync(path));
-if (browser === undefined) {
+function findBrowser() {
+  const override = process.env.NUCLEOS_CSP_BROWSER;
+  if (override) {
+    if (existsSync(override)) return override;
+    die("NUCLEOS_CSP_BROWSER names " + override + ", which does not exist");
+  }
+
+  const browsers =
+    process.platform === "win32"
+      ? [
+          "C:/Program Files/Google/Chrome/Application/chrome.exe",
+          "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
+          "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+          "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
+        ]
+      : process.platform === "darwin"
+        ? [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+          ]
+        : [
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "microsoft-edge",
+          ];
+  const browser =
+    process.platform === "win32" || process.platform === "darwin"
+      ? browsers.find((path) => existsSync(path))
+      : browsers
+          .flatMap((name) => (process.env.PATH ?? "").split(delimiter).map((dir) => join(dir, name)))
+          .find((path) => existsSync(path));
+  if (browser) return browser;
+
+  const searched =
+    process.platform === "win32" || process.platform === "darwin"
+      ? browsers.join(", ")
+      : "on PATH: " + browsers.join(", ");
   die(
-    "no Chromium found. Looked for Chrome and Edge in Program Files.\n" +
+    "no Chromium found. Looked for " + searched + ".\n" +
+      "  Set NUCLEOS_CSP_BROWSER to a browser executable to override this search.\n" +
       "  This gate needs a browser that enforces a Content-Security-Policy; a test runner cannot.",
   );
 }
+
+const browser = findBrowser();
 
 /* ---------------------------------------------------------------- the build */
 
