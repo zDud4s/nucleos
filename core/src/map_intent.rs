@@ -299,7 +299,7 @@ fn extraction_format() -> serde_json::Value {
 ///
 /// **Not `1`, and the reason is that the ceiling counts something other than what "ask once" means.**
 /// [`crate::runner::over_turn_ceiling`] is `turns >= ceiling` and
-/// [`crate::runner::turns_from_line`] increments on every `assistant` AND every `turn.completed`
+/// [`crate::runner::TurnCounter`] counts every new `assistant` message AND every `turn.completed`
 /// event, so `Some(1)` breaks the stream ON the first assistant message — before the `result` event
 /// carrying the answer has been read. The cloud arm would then return a truncated transcript and
 /// `TURN_CEILING_EXIT_CODE` for every run that had in fact succeeded, which the exit-code check
@@ -995,13 +995,15 @@ mod tests {
         // request that no fake can observe: `FakeCommandRunner` records `max_turns` nowhere and
         // enforces no ceiling, so a value that strangles every real run would ship green.
         //
-        // `Some(1)` reads like "ask once" and is not: `turns_from_line` counts `assistant` events,
+        // `Some(1)` reads like "ask once" and is not: `TurnCounter` counts `assistant` messages,
         // `over_turn_ceiling` is `turns >= ceiling`, and the stream BREAKS at that point — before
         // the `result` event carrying the answer has been read. Every successful cloud extraction
         // would come back truncated and non-zero.
         let assistant =
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#;
-        let after_one_answer = crate::runner::turns_from_line(assistant, 0);
+        let mut turns = crate::runner::TurnCounter::default();
+        turns.line(assistant);
+        let after_one_answer = turns.count();
         assert_eq!(after_one_answer, 1);
 
         assert!(
@@ -1014,8 +1016,8 @@ mod tests {
         );
         // A `turn.completed` beside the `assistant` is already two events for one answer, which is
         // why the margin is not two either.
-        let after_completion =
-            crate::runner::turns_from_line(r#"{"type":"turn.completed"}"#, after_one_answer);
+        turns.line(r#"{"type":"turn.completed"}"#);
+        let after_completion = turns.count();
         assert_eq!(after_completion, 2);
         assert!(!crate::runner::over_turn_ceiling(
             after_completion,
