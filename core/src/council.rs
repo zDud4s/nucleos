@@ -1886,7 +1886,8 @@ impl Driver {
                     let _ = sqlx::query(
                         "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?,
                                 cost_usd = ?, input_tokens = ?, output_tokens = ?,
-                                cache_read_tokens = ?, num_turns = ?, completed_at = ?
+                                cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?,
+                                completed_at = ?
                          WHERE id = ? AND status = 'running'",
                     )
                     .bind(&run.stdout)
@@ -1894,6 +1895,7 @@ impl Driver {
                     .bind(run.input_tokens)
                     .bind(run.output_tokens)
                     .bind(run.cache_read_tokens)
+                    .bind(run.cache_creation_tokens)
                     .bind(run.num_turns)
                     .bind(&completed_at)
                     .bind(run_id)
@@ -1909,15 +1911,32 @@ impl Driver {
                     // A non-zero exit is still a run that spent money, so its cost is recorded
                     // exactly as a successful one's is. The council counts against the budget, and
                     // a failed seat that cost nothing on paper would understate what was spent.
+                    //
+                    // `num_turns` and the token columns travel here too, and did not used to: a
+                    // seat that answers once and then dies at its turn ceiling —
+                    // `crate::runner::TURN_CEILING_EXIT_CODE`, a non-zero exit, so it lands in
+                    // THIS arm — carries the completed turn's own count and usage in `RunOutcome`
+                    // exactly as the `completed` arm above does, and this `UPDATE` was the one
+                    // place that dropped them on the floor instead of binding them.
+                    //
+                    // Cache creation among them, in both arms: the window a seat spent building its
+                    // cache is spend like any other, and a row without it reads as cheaper than it was.
                     let _ = sqlx::query(
                         "UPDATE runs SET status = 'failed', exit_code = ?, stdout = ?, stderr = ?,
-                                cost_usd = ?, completed_at = ?
+                                cost_usd = ?, input_tokens = ?, output_tokens = ?,
+                                cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?,
+                                completed_at = ?
                          WHERE id = ? AND status = 'running'",
                     )
                     .bind(run.exit_code)
                     .bind(&run.stdout)
                     .bind(&run.stderr)
                     .bind(run.cost_usd)
+                    .bind(run.input_tokens)
+                    .bind(run.output_tokens)
+                    .bind(run.cache_read_tokens)
+                    .bind(run.cache_creation_tokens)
+                    .bind(run.num_turns)
                     .bind(&completed_at)
                     .bind(run_id)
                     .execute(&pool)
@@ -3267,6 +3286,12 @@ mod tests {
         Answers(String),
         /// The CLI ran and exited non-zero: the model refused, or the tool it wanted was denied.
         Fails(String),
+        /// The CLI answered once and then hit its turn ceiling on a later turn: a real, non-zero
+        /// exit — `crate::runner::TURN_CEILING_EXIT_CODE` — carrying the completed turn's own
+        /// `cost_usd`/`num_turns`/token counts, exactly as `runner.rs`'s own ceiling test proves
+        /// `RunOutcome` looks in that case. Distinct from `Fails`, whose fixture leaves every one of
+        /// those `None` and so cannot tell a caller that drops them from one that does not.
+        DiesAtTheCeiling,
         /// The launch itself failed — no work done, nothing spent.
         WillNotLaunch(String),
         /// Never returns, so the seat's own wall clock is what ends it.
@@ -3367,6 +3392,18 @@ mod tests {
                 Scripted::Fails(stderr) => Ok(crate::runner::RunOutcome {
                     exit_code: 1,
                     stderr,
+                    ..blank
+                }),
+                Scripted::DiesAtTheCeiling => Ok(crate::runner::RunOutcome {
+                    exit_code: crate::runner::TURN_CEILING_EXIT_CODE,
+                    stderr: "nucleos: stopped after 3 turns; this run's ceiling was 3\n"
+                        .to_string(),
+                    cost_usd: Some(0.05),
+                    input_tokens: Some(11),
+                    output_tokens: Some(22),
+                    cache_read_tokens: Some(0),
+                    cache_creation_tokens: Some(7),
+                    num_turns: Some(1),
                     ..blank
                 }),
                 Scripted::WillNotLaunch(reason) => Err(std::io::Error::other(reason)),
@@ -3485,6 +3522,75 @@ mod tests {
         assert_eq!(anon.len(), 2);
         assert!(!anon.values().any(|seat| *seat == 1));
         assert!(row.chairman_run_id.is_some());
+    }
+
+    /// The bug this was filed over, reproduced at a council seat: a seat that answers once and then
+    /// dies at its turn ceiling is a non-zero exit, same as `Fails` above — and that branch's own
+    /// `UPDATE` bound `cost_usd` but not `num_turns` or the token columns, silently dropping numbers
+    /// `RunOutcome` actually carried. `RunDetail.tsx` reads this seat's row exactly as it reads any
+    /// other run's, so what is missing here is the same "none recorded" the owner reported.
+    #[tokio::test]
+    async fn a_seat_that_dies_at_the_ceiling_still_reports_the_turn_before_it() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("the first answer".into()),
+            Scripted::DiesAtTheCeiling,
+            Scripted::Answers("the third answer".into()),
+        ]
+        .into();
+        *runner.stage2.lock().unwrap() = [
+            Scripted::Answers("A: 1\nB: 2".into()),
+            Scripted::Answers("A: 1\nB: 2".into()),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+
+        assert_eq!(row.status, STATUS_DONE);
+        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
+        assert_eq!(seats[1].stage1_status, SEAT_ERROR);
+        let run_id = seats[1]
+            .stage1_run_id
+            .expect("a seat that launched has a run row, whatever it ended with");
+
+        /// `exit_code, cost_usd, num_turns, input_tokens, output_tokens, cache_creation_tokens`.
+        type SeatNumbers = (
+            Option<i32>,
+            Option<f64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let (exit_code, cost_usd, num_turns, input_tokens, output_tokens, cache_creation_tokens): SeatNumbers = sqlx::query_as(
+            "SELECT exit_code, cost_usd, num_turns, input_tokens, output_tokens, cache_creation_tokens
+             FROM runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(exit_code, Some(crate::runner::TURN_CEILING_EXIT_CODE));
+        assert_eq!(
+            cost_usd,
+            Some(0.05),
+            "the completed turn's cost must not be read back NULL"
+        );
+        assert_eq!(
+            num_turns,
+            Some(1),
+            "the completed turn's count must not be read back NULL"
+        );
+        assert_eq!(input_tokens, Some(11));
+        assert_eq!(output_tokens, Some(22));
+        assert_eq!(
+            cache_creation_tokens,
+            Some(7),
+            "the cache the seat built is spend too, and must not be read back NULL"
+        );
     }
 
     /// One answer has nothing to be ranked against, and the phase would ask a seat to order an

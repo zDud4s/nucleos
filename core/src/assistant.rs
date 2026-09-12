@@ -2783,14 +2783,22 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // answers, and this is a fact about ONE of them. `RunOutcome` is where the
                     // splitter already put the right turn's copy.
                     let compacted = o.compacted;
+                    // The tokens and the turn count too, which every other terminal write in the
+                    // core already takes off the outcome and this one did not: a chat turn read back
+                    // "none recorded" under numbers the runner had measured and handed it.
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(o.exit_code)
                     .bind(&reply)
                     .bind(&o.stderr)
                     .bind(&o.session_id)
                     .bind(o.cost_usd)
+                    .bind(o.input_tokens)
+                    .bind(o.output_tokens)
+                    .bind(o.cache_read_tokens)
+                    .bind(o.cache_creation_tokens)
+                    .bind(o.num_turns)
                     .bind(&tools_used)
                     .bind(&thought)
                     .bind(thought_tokens)
@@ -2841,14 +2849,22 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                 // turn killed at the tool-policy barrier died before it could call anything, so the
                 // session it leaves has read nothing and is safe to resume; the read-side check in
                 // `get_session` is what decides that, and it decides it the same way here.
+                //
+                // The measurements are kept for the reason the cost is: a turn that answered nothing
+                // still spent what it spent, and one stopped at its ceiling has read the most.
                 None => {
                     let failed = sqlx::query(
-                        "UPDATE runs SET status = 'failed', exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'failed', exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(o.exit_code)
                     .bind(&o.stderr)
                     .bind(&o.session_id)
                     .bind(o.cost_usd)
+                    .bind(o.input_tokens)
+                    .bind(o.output_tokens)
+                    .bind(o.cache_read_tokens)
+                    .bind(o.cache_creation_tokens)
+                    .bind(o.num_turns)
                     .bind(&completed_at)
                     .bind(id)
                     .execute(&pool)
@@ -3812,6 +3828,103 @@ mod tests {
         // Cache-read tokens occupy the window exactly as fresh input tokens do, which is the whole
         // reason this is not just `input_tokens`: a resumed conversation is nearly all cache.
         assert_eq!(fill, Some(96_000), "the turn recorded no context fill");
+    }
+
+    /// The columns a chat turn's terminal write reads off its outcome, and the numbers it hands in.
+    type Measured = (
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
+
+    /// Runs one chat turn against `outcome` and reads back what its row recorded.
+    async fn measured_turn(chat_id: &str, outcome: crate::runner::RunOutcome) -> Measured {
+        let mut state = test_state().await;
+        state.runner = Arc::new(FakeCommandRunner {
+            canned: Mutex::new(Some(outcome)),
+            ..Default::default()
+        });
+        let id = send_message(&state, chat_id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+        sqlx::query_as(
+            "SELECT status, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    num_turns FROM runs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    fn measured_outcome(exit_code: i32, stdout: &str) -> crate::runner::RunOutcome {
+        crate::runner::RunOutcome {
+            exit_code,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            session_id: Some("s".to_string()),
+            cost_usd: Some(0.01),
+            input_tokens: Some(3),
+            output_tokens: Some(40),
+            cache_read_tokens: Some(900),
+            cache_creation_tokens: Some(15),
+            num_turns: Some(2),
+            compacted: false,
+        }
+    }
+
+    /// A finished turn records what it read and how many turns it took.
+    ///
+    /// Found by measurement: every chat turn read back `num_turns` and every token column NULL,
+    /// while `runs.rs`, the council and the team all stored them. The runner had them; this write
+    /// was the one that did not ask.
+    #[tokio::test]
+    async fn a_finished_turn_records_its_tokens_and_turns() {
+        let stream = r#"{"type":"result","subtype":"success","result":"pronto"}"#;
+
+        let row = measured_turn("tokens-chat", measured_outcome(0, stream)).await;
+
+        assert_eq!(
+            row,
+            (
+                "completed".to_string(),
+                Some(3),
+                Some(40),
+                Some(900),
+                Some(15),
+                Some(2)
+            )
+        );
+    }
+
+    /// A turn that answered nothing still spent what it spent. The ceiling is the sharpest case: the
+    /// turn stopped there read the most, and was the one whose row said the least.
+    #[tokio::test]
+    async fn a_turn_stopped_before_it_answered_still_records_what_it_read() {
+        let stream =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a meio"}]}}"#;
+
+        let row = measured_turn(
+            "ceiling-chat",
+            measured_outcome(crate::runner::TURN_CEILING_EXIT_CODE, stream),
+        )
+        .await;
+
+        assert_eq!(
+            row,
+            (
+                "failed".to_string(),
+                Some(3),
+                Some(40),
+                Some(900),
+                Some(15),
+                Some(2)
+            )
+        );
     }
 
     /// What a Telegram user actually received when the tool-policy barrier killed a turn: the CLI's

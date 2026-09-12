@@ -4794,6 +4794,65 @@ mod tests {
         }
     }
 
+    /// The regression this bug was filed over. `usage` and `cost_usd` are set from the last `Ended`
+    /// turn and never reset — see the `TurnEvent::Ended` arm inside `run_prompt_with_turns` — so a
+    /// process that answers once and then loops into the ceiling on its NEXT turn must still report
+    /// what the first one cost. Before this test existed, that property was pinned only by
+    /// `a_real_cli_answers_a_second_turn_down_the_same_stdin`, which needs a paid, authenticated CLI
+    /// and is `#[ignore]`d for exactly that reason — this is the same claim, proven deterministically
+    /// against a real spawned process reading a scripted stream, so it runs in the gate.
+    ///
+    /// `steerable: false`, matching the run this bug was actually filed against: an ordinary
+    /// autopilot/job run, the kind `runs.rs` spawns, not a chat turn, a council seat or a team
+    /// member. What still lets a second turn exist without this request opting into steering is
+    /// nothing the request controls — the CLI's own stream decides where a `result` line falls —
+    /// and this fake reproduces a transcript where one already had, exactly as
+    /// `create_run_inner(..., steerable: true)` lets an operator-messaged run on the Runs page do.
+    #[tokio::test]
+    async fn a_ceiling_death_after_one_full_turn_still_reports_that_turns_cost_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut request = fake_cli(
+            dir.path(),
+            &printing(&[
+                r#"{"type":"system","subtype":"init","session_id":"fake-session","tools":[]}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"turn one"}]}}"#,
+                r#"{"type":"result","subtype":"success","total_cost_usd":0.05,"num_turns":1,"session_id":"fake-session","usage":{"input_tokens":11,"output_tokens":22,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"loop one"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"loop two"}]}}"#,
+            ]),
+        );
+        let _bin = FakeClaudeBin::set("sh");
+        // One answer for the turn that ends, two more to trip the ceiling mid-way through the turn
+        // that never does: an `assistant` event with no `message.id` is an answer of its own to
+        // [`TurnCounter`], so "turn one", "loop one" and "loop two" are three, and
+        // `over_turn_ceiling` fires once the count reaches 3.
+        request.max_turns = Some(3);
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let outcome = claude_runner()
+            .run_prompt(request, session_tx, discard_transcript())
+            .await
+            .expect("the fake CLI spawns and runs to the ceiling");
+
+        assert_eq!(
+            outcome.exit_code, TURN_CEILING_EXIT_CODE,
+            "the fake transcript must trip the ceiling before its second turn ends"
+        );
+        assert_eq!(
+            outcome.cost_usd,
+            Some(0.05),
+            "the first turn's cost must survive a ceiling death in the turn after it — this is \
+             the NULL the owner reported, and a real number exists here to lose"
+        );
+        assert_eq!(
+            outcome.num_turns,
+            Some(1),
+            "the first turn's own turn count must survive, not read back as unknown"
+        );
+        assert_eq!(outcome.input_tokens, Some(11));
+        assert_eq!(outcome.output_tokens, Some(22));
+    }
+
     #[tokio::test]
     async fn fake_runner_returns_canned_outcome() {
         let runner = FakeCommandRunner {
