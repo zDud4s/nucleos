@@ -150,6 +150,9 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     run "hooks: filter"   . "$py" scripts/test-hook-filter.py
     run "hooks: evidence" . "$py" scripts/test-evidence-gate.py
     run "eval: approver"  . "$py" scripts/eval/test-auto-approve.py
+    run "eval: promote"   . "$py" scripts/eval/test-promote.py
+    run "eval: ingest"    . "$py" scripts/eval/test-ingest.py
+    run "eval: layer"     . "$py" scripts/eval/test-layer.py
     run "usage: split"    . "$py" scripts/test-usage-split.py
     run "usage: statusline" . "$py" scripts/test-statusline-context.py
     # Hermetic like its neighbours: the network is behind one seam the test swaps out, so this

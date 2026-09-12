@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Drive `auto-approve.py` against a stub daemon.
 
-Not wired into `scripts/gates.sh`: that would put Python in the definition of green for everyone,
-which is a decision about the gate rather than about this script. Run it by hand after touching
-the approver — `python scripts/eval/test-auto-approve.py`.
+Wired into `scripts/gates.sh` as `eval: approver`, in the hooks leg. (Corrected 2026-09-09: this
+said the opposite — that wiring it in would put Python in the definition of green for everyone —
+and it has been in the gate for long enough that the sentence sent whoever read it looking for a
+decision nobody still holds. The hooks leg runs six Python suites.) Also runs standalone:
+`python scripts/eval/test-auto-approve.py`.
 
 It is here rather than thrown away because it earned it. The approver looked correct and was not:
 a proposal answered with 409 stays pending, so the loop re-answered it every poll and spent the
@@ -41,6 +43,7 @@ PROPOSALS = [
 ]
 
 approved = []
+unparseable = []
 
 
 class Stub(BaseHTTPRequestHandler):
@@ -62,6 +65,16 @@ class Stub(BaseHTTPRequestHandler):
     def do_POST(self):
         proposal_id = int(self.path.split("/")[2])
         approved.append(proposal_id)
+        # As the daemon does: a JSON content type over a body that does not parse is a 400, and an
+        # empty body is exactly that. A stub that ignored the body let the approver send one, and
+        # the first real cell to need an approval sat in `awaiting_approval` because of it.
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        try:
+            json.loads(raw)
+        except ValueError:
+            unparseable.append(proposal_id)
+            self._send(400, b"Failed to parse the request body as JSON")
+            return
         # 5 answers 409 — the normal race, and the one that stays pending for ever.
         if proposal_id == 5:
             self._send(409, b'{"error":"not pending"}')
@@ -119,8 +132,9 @@ def main() -> int:
     check("a 409 is recorded as failed rather than swallowed",
           "failed" in records[1] and "409" in records[1]["failed"])
     check("the exit was clean", result.returncode == 0)
+    check("every approval carries a body the daemon can parse", unparseable == [])
 
-    total = 9
+    total = 10
     print(f"\n{total - failures}/{total} as expected")
     return 1 if failures else 0
 
