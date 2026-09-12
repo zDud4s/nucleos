@@ -291,4 +291,117 @@ describe("ConfirmButton", () => {
     expect(screen.getByRole("button", { name: "Archive it" }).className).toContain("ui-button-quiet");
     expect(screen.getByRole("button", { name: "Archive it" }).className).not.toContain("ui-button-danger-solid");
   });
+
+  it("the interlock says which row it is armed on", () => {
+    render(
+      <ConfirmButton
+        label="Approve #101"
+        confirmLabel="Let this action happen"
+        subject="#101"
+        variant="approve"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve #101" }));
+
+    // The eye keeps the anchor where the rest label had it, at the end.
+    expect(screen.getByRole("button", { name: "Let this action happen · #101" })).toBeDefined();
+
+    // The ear gets it first: by the time the consequence has been read the question is
+    // already "which one?", and five cards on this page carry the same consequence.
+    const said = screen.getByText(/^armed: #101/);
+    expect(said.getAttribute("role")).toBe("status");
+    expect(said.textContent).toBe(
+      "armed: #101 — Let this action happen — press again to confirm",
+    );
+  });
+
+  it("a long announcement gets a longer window, and a short one still gets four seconds", () => {
+    render(
+      <ConfirmButton
+        label="Let it act"
+        confirmLabel="Let alpha act"
+        sayAs="alpha acts on its own — 3 of its 4 proposal slots already in use, no approval"
+        variant="approve"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Let it act" }));
+
+    // Twenty-three words of announcement is about six and a half seconds at 180 wpm. The
+    // window this replaces was four, so the control expired while it was still talking.
+    act(() => {
+      vi.advanceTimersByTime(4000);
+    });
+    expect(screen.getByRole("button", { name: "Let alpha act" })).toBeDefined();
+
+    act(() => {
+      vi.advanceTimersByTime(5200);
+    });
+    expect(screen.getByRole("button", { name: "Let it act" })).toBeDefined();
+  });
+
+  it("a sentence that changes under an armed control gets its own window", () => {
+    const first = "alpha acts on its own — no approval";
+    const second = "alpha acts on its own — 1 of its 4 proposal slots already in use";
+    const { rerender } = render(
+      <ConfirmButton label="Let it act" confirmLabel="Let alpha act" sayAs={first} variant="approve" onConfirm={vi.fn()} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Let it act" }));
+    act(() => {
+      vi.advanceTimersByTime(3000);
+    });
+
+    // A roster tick rewrites the consequence with a finger over the button.
+    rerender(
+      <ConfirmButton label="Let it act" confirmLabel="Let alpha act" sayAs={second} variant="approve" onConfirm={vi.fn()} />,
+    );
+    expect(screen.getByRole("status").textContent).toBe(
+      `armed: ${second} — press again to confirm`,
+    );
+
+    // The new sentence gets its own window rather than the second left of the old one's:
+    // past 4000 ms from the first press, and still armed.
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    expect(screen.getByRole("button", { name: "Let alpha act" })).toBeDefined();
+  });
+
+  it("the window says it is closing before it closes", () => {
+    const { onConfirm } = setup();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
+
+    // Eight words, so this one is still the floor: the allowance is for sentences that need
+    // it, not a longer window for everything.
+    act(() => {
+      vi.advanceTimersByTime(2999);
+    });
+    expect(screen.getByRole("status").textContent).toBe(
+      "armed: Really delete — press again to confirm",
+    );
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(screen.getByRole("status").textContent).toBe("one second left");
+
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(screen.getByRole("status").textContent).toBe("disarmed — nothing changed");
+
+    // And a confirm says neither: the action is about to happen and will speak for itself.
+    fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Really delete" }));
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status").textContent).toBe("");
+  });
 });

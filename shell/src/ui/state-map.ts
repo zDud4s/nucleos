@@ -98,27 +98,109 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     idle: { tone: "off", label: "idle" },
   },
   /**
-   * Every `kind` the núcleo actually writes into the feed, mapped to a reading.
+   * Every `kind` the núcleo writes into the feed, mapped to a reading.
    *
-   * Built by enumeration, not by guessing: every key was taken from a feed writer in core.
-   * An unmapped kind renders its literal; configured e-mail classes beyond `urgent` are
-   * deliberately absent. This domain spends no Acting Green: a feed line is written once,
-   * so a fact that may have ended hours ago cannot claim work is executing now.
+   * The enumeration is not this file's claim any more: `state-map-completeness.test.ts` reads the
+   * kind argument at every call of `feed::append` / `append_on` / `append_for_errand` and of the
+   * two wrappers that forward a caller's kind (`job.rs::say`, `notify.rs::deliver_or_defer`)
+   * across `core/src`, outside the test modules, and fails on a difference in either direction.
+   * It went in at 46 rows and found eighteen kinds the núcleo writes and this table did not read —
+   * the two the Teams pillar writes most among them — each of which had been rendering
+   * `.ui-state-unmapped`, the device for a word the shell has never heard of.
+   *
+   * The one exclusion is `email_urgent`: `triage.rs:835` builds `format!("email_{}", class)` from
+   * a project's configured notify classes, so the shell can read the class everybody has and not
+   * everybody's classes.
+   *
+   * This domain spends no Acting Green: a feed line is written once and never refreshed, so a
+   * fact that may have ended hours ago cannot claim work is executing now.
+   *
+   * Three kinds are ONE kind for two or three outcomes, and their summary is the only carrier of
+   * which one happened — `team_action`, `team_run_finished` and `command_finished`. Each is a fact
+   * here, with the verdict left to the sentence; splitting them is a change in `core/`, and is a
+   * named follow-up for the owner rather than a thing the shell may guess at.
    */
   feed: {
-    job_started: { tone: "info", label: "job started" }, job_planned: { tone: "info", label: "job planned" }, job_replanned: { tone: "info", label: "job replanned" }, job_plan_failed: { tone: "danger", label: "job could not be planned" }, job_item_failed: { tone: "danger", label: "job item failed" }, job_gate_failed: { tone: "danger", label: "job gate failed" }, job_waiting: { tone: "pending", label: "job waiting" }, job_finished: { tone: "info", label: "job finished" }, job_failed: { tone: "danger", label: "job failed" }, job_stopped: { tone: "off", label: "job stopped" }, job_cancelled: { tone: "off", label: "job cancelled" }, job_expired: { tone: "paused", label: "job expired" }, job_interrupted: { tone: "paused", label: "job interrupted" },
-    run_retry: { tone: "info", label: "run retried" }, run_failed_final: { tone: "danger", label: "run failed for good" }, run_interrupted: { tone: "paused", label: "run interrupted" }, run_stopped_probing: { tone: "danger", label: "run stopped after repeated refusals" }, token_efficiency: { tone: "info", label: "efficiency observation" },
-    worktree_gate_failed: { tone: "danger", label: "worktree gate failed" }, worktree_provision_failed: { tone: "danger", label: "worktree could not be made" }, worktree_released: { tone: "off", label: "worktree released" }, worktree_branch_kept: { tone: "info", label: "unmerged branch kept" }, worktree_removed: { tone: "off", label: "worktree removed" }, worktree_gc_failed: { tone: "danger", label: "worktree cleanup failed" },
-    vcs_request_finished: { tone: "info", label: "git request settled" }, vcs_request_cancelled: { tone: "off", label: "git request cancelled" }, vcs_request_interrupted: { tone: "paused", label: "git request interrupted" },
-    council_started: { tone: "info", label: "council started" }, council_stage: { tone: "info", label: "council stage" }, council_finished: { tone: "info", label: "council settled" },
-    schedule_rule_invalid: { tone: "danger", label: "schedule rule invalid" }, errand_rule_fired: { tone: "info", label: "errand rule fired" }, errand_rule_failed: { tone: "danger", label: "errand rule failed" }, errand_investigation_done: { tone: "info", label: "errand investigation done" }, errand_investigation_failed: { tone: "danger", label: "errand investigation failed" },
-    email_digest: { tone: "info", label: "e-mail digest" }, email_urgent: { tone: "pending", label: "urgent e-mail" }, email_triage_failed: { tone: "danger", label: "e-mail triage failed" }, email_triage_paused: { tone: "paused", label: "e-mail triage paused" }, email_triage_stalled: { tone: "paused", label: "e-mail triage stalled" }, email_fetch_skipped: { tone: "info", label: "e-mail skipped" }, email_sent_mailbox_foreign: { tone: "danger", label: "sent mail filed elsewhere" },
-    action_authorized: { tone: "info", label: "action authorised by a grant" }, proposal_record_failed: { tone: "danger", label: "proposal not recorded" }, promotion_ready: { tone: "pending", label: "promotion ready" }, "web.read": { tone: "info", label: "web page read" },
+    // Jobs.
+    job_started: { tone: "info", label: "job started" },
+    job_planned: { tone: "info", label: "job planned" },
+    job_replanned: { tone: "info", label: "job replanned" },
+    job_plan_failed: { tone: "danger", label: "job could not be planned" },
+    job_item_failed: { tone: "danger", label: "job item failed" },
+    job_item_conflicted: { tone: "danger", label: "job item did not merge" },
+    job_item_orphaned: { tone: "off", label: "job item never attempted" },
+    job_gate_failed: { tone: "danger", label: "job gate failed" },
+    job_waiting: { tone: "pending", label: "job waiting" },
+    job_finished: { tone: "info", label: "job finished" },
+    job_failed: { tone: "danger", label: "job failed" },
+    job_stopped: { tone: "off", label: "job stopped" },
+    job_cancelled: { tone: "off", label: "job cancelled" },
+    job_expired: { tone: "paused", label: "job expired" },
+    job_interrupted: { tone: "paused", label: "job interrupted" },
+    // Runs.
+    run_retry: { tone: "info", label: "run retried" },
+    run_failed_final: { tone: "danger", label: "run failed for good" },
+    run_interrupted: { tone: "paused", label: "run interrupted" },
+    run_stopped_probing: { tone: "danger", label: "run stopped after repeated refusals" },
+    resume_did_not_act: { tone: "info", label: "approved action never attempted" },
+    shadow_run_completed: { tone: "shadow", label: "shadow run completed" },
+    worktree_run_completed: { tone: "info", label: "worktree run completed" },
+    token_efficiency: { tone: "info", label: "efficiency observation" },
+    // Worktrees.
+    worktree_gate_failed: { tone: "danger", label: "worktree gate failed" },
+    worktree_provision_failed: { tone: "danger", label: "worktree could not be made" },
+    worktree_released: { tone: "off", label: "worktree released" },
+    worktree_branch_kept: { tone: "info", label: "unmerged branch kept" },
+    worktree_removed: { tone: "off", label: "worktree removed" },
+    worktree_gc_failed: { tone: "danger", label: "worktree cleanup failed" },
+    // Git.
+    vcs_request_finished: { tone: "info", label: "git request settled" },
+    vcs_request_cancelled: { tone: "off", label: "git request cancelled" },
+    vcs_request_interrupted: { tone: "paused", label: "git request interrupted" },
+    vcs_resolution_started: { tone: "info", label: "conflict resolution started" },
+    vcs_resolution_cancelled: { tone: "off", label: "conflict resolution stopped" },
+    vcs_resolution_discarded: { tone: "danger", label: "resolution discarded changes" },
+    land_resolution_failed: { tone: "danger", label: "resolution could not be landed" },
+    // Teams.
+    team_run_started: { tone: "info", label: "team run started" },
+    team_run_finished: { tone: "info", label: "team run settled" },
+    team_item_dropped: { tone: "off", label: "team item dropped" },
+    team_action: { tone: "info", label: "team action settled" },
+    team_trigger_armed: { tone: "info", label: "team trigger armed" },
+    team_trigger_skipped: { tone: "paused", label: "team trigger did not fire" },
+    // Council.
+    council_started: { tone: "info", label: "council started" },
+    council_stage: { tone: "info", label: "council stage" },
+    council_finished: { tone: "info", label: "council settled" },
+    // Schedules and errands.
+    schedule_rule_invalid: { tone: "danger", label: "schedule rule invalid" },
+    errand_rule_fired: { tone: "info", label: "errand rule fired" },
+    errand_rule_failed: { tone: "danger", label: "errand rule failed" },
+    errand_investigation_done: { tone: "info", label: "errand investigation done" },
+    errand_investigation_failed: { tone: "danger", label: "errand investigation failed" },
+    // Mail.
+    email_digest: { tone: "info", label: "e-mail digest" },
+    email_urgent: { tone: "pending", label: "urgent e-mail" },
+    email_triage_failed: { tone: "danger", label: "e-mail triage failed" },
+    email_triage_paused: { tone: "paused", label: "e-mail triage paused" },
+    email_triage_stalled: { tone: "paused", label: "e-mail triage stalled" },
+    email_fetch_skipped: { tone: "info", label: "e-mail skipped" },
+    email_sent_mailbox_foreign: { tone: "danger", label: "sent mail filed elsewhere" },
+    // Project settings and machine lines.
+    config_written: { tone: "info", label: "project file written" },
+    workflow_changed: { tone: "info", label: "workflow changed" },
+    command_finished: { tone: "info", label: "project command finished" },
+    action_authorized: { tone: "info", label: "action authorised by a grant" },
+    proposal_record_failed: { tone: "danger", label: "proposal not recorded" },
+    promotion_ready: { tone: "pending", label: "promotion ready" },
+    "web.read": { tone: "info", label: "web page read" },
   },
   /** Rule settings are shell derivations: armed is stated, capped is a ceiling, and never-fires is a fault. */
   rule: { armed: { tone: "info", label: "armed" }, "never-fires": { tone: "danger", label: "never fires" }, capped: { tone: "paused", label: "capped today" }, unseen: { tone: "info", label: "no commit seen yet" } },
-  /** Folder facts are derived by the shell; an unnamed folder is off, while a missing named one is a fault. */
-  folder: { ok: { tone: "info", label: "ok" }, missing: { tone: "danger", label: "gone" }, unset: { tone: "off", label: "not named" } },
+  /** Folder facts are derived by the shell; an unnamed folder is off, while a missing named one is a fault.
+   * A healthy folder is the absence of a fact, so `ok` is absent rather than a map row nobody renders.
+   */
+  folder: { missing: { tone: "danger", label: "gone" }, unset: { tone: "off", label: "not named" } },
   /** Refinement kinds are facts, not a severity scale, so all four use Stated Blue. */
   refinement: { prompt: { tone: "info", label: "instruction" }, memory: { tone: "info", label: "fact" }, skill: { tone: "info", label: "how-to" }, subagent: { tone: "info", label: "delegation" } },
   /**

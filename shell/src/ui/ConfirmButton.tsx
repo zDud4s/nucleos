@@ -2,13 +2,46 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Button, type ButtonIntent, type ButtonVariant } from "./Button";
 
 /**
- * How long an armed control stays armed.
+ * How long an armed control stays armed, at least.
  *
  * Long enough to read the second label and mean it; short enough that a control
  * you armed and walked away from is not still live when you come back. An
  * interlock that never expires is a single-click delete with extra steps.
  */
 const ARM_WINDOW_MS = 4000;
+
+/**
+ * The time the window allows per word of what it has to say.
+ *
+ * 400 ms a word is 150 words a minute, which is slower than any screen reader's default rate —
+ * so the window outlasts the speech at every rate anybody actually uses, and the slack grows
+ * with the sentence instead of being a constant somebody has to guess right. It is an
+ * allowance, not a claim about how fast anyone reads.
+ *
+ * The number this joins was 4 s flat, and it was set when the announcement was two words.
+ * Three rounds later the roster's interlock says "armed: alpha acts on its own — 3 of its 4
+ * proposal slots already in use, no approval — press again to confirm": twenty-three words,
+ * about six and a half seconds at 180 wpm, inside a four-second window. The control expired
+ * while it was still explaining itself, and then queued "disarmed — nothing changed" behind
+ * the sentence it had interrupted.
+ */
+const MS_PER_WORD = 400;
+
+/**
+ * How long before the window closes the region says so.
+ *
+ * Exactly one second, because the sentence says "one second left" and a lead time that
+ * drifted from it would make the announcement a lie. One warning per armed window, three
+ * words long — it cannot still be speaking when "disarmed" lands a second later. The floor
+ * is four seconds and this is one, so there is always a window to warn inside.
+ */
+const CLOSING_LEAD_MS = 1000;
+
+/** The window this announcement needs: the floor, or a word at a time, whichever is longer. */
+function armWindowFor(said: string): number {
+  const words = said.trim().split(/\s+/).length;
+  return Math.max(ARM_WINDOW_MS, words * MS_PER_WORD);
+}
 
 /**
  * The dead time immediately after arming.
@@ -81,10 +114,19 @@ interface ConfirmButtonBase {
  * app. With this, a non-string label without `sayAs` does not compile.
  *
  * Say what will happen, not "Confirm".
+ *
+ * `subject` is the third thing either channel can carry, and it is the row's own identifier
+ * rather than a sentence: `#101`, a run id, an agent's name. The page this was written for
+ * shows five byte-identical `git status` cards, and an interlock that says "Let this action
+ * happen" on all five names the action and not the row — so the eye loses the identifier the
+ * rest label was showing a click ago, and the ear never had it. It is on the string arm only,
+ * and `never` on the other, because the identifier is composed into the label AS TEXT: a
+ * label that is not text cannot have it appended, and a `.ui-*` span to hold it would put a
+ * class in this file, which is not where classes live.
  */
 type ConfirmSpeech =
-  | { confirmLabel: string; sayAs?: string }
-  | { confirmLabel: ReactNode; sayAs: string };
+  | { confirmLabel: string; sayAs?: string; subject?: string }
+  | { confirmLabel: ReactNode; sayAs: string; subject?: never };
 
 export type ConfirmButtonProps = ConfirmButtonBase & ConfirmSpeech;
 
@@ -100,6 +142,7 @@ export function ConfirmButton({
   label,
   confirmLabel,
   sayAs,
+  subject,
   onConfirm,
   onArmedChange,
   variant,
@@ -114,6 +157,7 @@ export function ConfirmButton({
   // render it belongs to.
   const dwelling = useRef(false);
   const dwellTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const closingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disarmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // What a screen reader is told, and the only channel that carries it: the label swap is
@@ -126,17 +170,41 @@ export function ConfirmButton({
   // sentence. The objectless third branch is unreachable from TypeScript — the props union
   // requires `sayAs` for a non-string label — and is kept because unreachable is a claim
   // about the type checker, and this is the announcement on a control that cannot be undone.
+  //
+  // The subject comes FIRST in what is said and LAST in what is drawn, and the asymmetry is
+  // the point. The ear needs to know which row before it is told what will happen to it,
+  // because by the time the consequence is read the question is already "which one?". The eye
+  // has the opposite problem: the rest label ended in the identifier ("Approve #101"), so
+  // keeping it at the end holds the anchor still while the verb changes under it.
+  //
+  // The separator is `·` and not a dash: the label already contains an em dash at several
+  // sites, and it is for the eye only — the announcement spells the same two facts with the
+  // dashes it has always used, so nothing depends on a screen reader pronouncing a middle dot.
   const [said, setSaid] = useState("");
   const spoken = sayAs ?? (typeof confirmLabel === "string" ? confirmLabel : null);
+  // The `typeof` guard is unreachable from TypeScript — the props union puts `subject` on the
+  // string arm only — and is kept for the same reason the objectless branch below is:
+  // unreachable is a claim about the type checker, and this is the label on a control that
+  // cannot be undone.
+  const armedLabel =
+    subject === undefined || typeof confirmLabel !== "string"
+      ? confirmLabel
+      : `${confirmLabel} · ${subject}`;
   const armedSaid =
     spoken === null
       ? "armed — press again to confirm"
-      : `armed: ${spoken} — press again to confirm`;
+      : subject === undefined
+        ? `armed: ${spoken} — press again to confirm`
+        : `armed: ${subject} — ${spoken} — press again to confirm`;
 
   function clearTimers() {
     if (dwellTimer.current !== null) {
       clearTimeout(dwellTimer.current);
       dwellTimer.current = null;
+    }
+    if (closingTimer.current !== null) {
+      clearTimeout(closingTimer.current);
+      closingTimer.current = null;
     }
     if (disarmTimer.current !== null) {
       clearTimeout(disarmTimer.current);
@@ -151,6 +219,7 @@ export function ConfirmButton({
   useEffect(() => {
     return () => {
       if (dwellTimer.current !== null) clearTimeout(dwellTimer.current);
+      if (closingTimer.current !== null) clearTimeout(closingTimer.current);
       if (disarmTimer.current !== null) clearTimeout(disarmTimer.current);
     };
   }, []);
@@ -162,17 +231,47 @@ export function ConfirmButton({
     setSaid("disarmed — nothing changed");
   }
 
+  /*
+    The window is a function of what has to be said, and it restarts when that changes.
+
+    One effect and not two places: arming and re-announcing are the same event as far as the
+    clock is concerned, and the flat 4 s this replaces was set in `handleClick`, where it could
+    only ever be a constant. `sayAs` is a PROP, so it can be rewritten under an armed control —
+    a roster tick can change the consequence while a finger is over the button — and
+    re-announcing without restarting the clock would hand a new sentence the remainder of the
+    old sentence's window, which is this whole defect in miniature.
+
+    `armed` and `armedSaid` are the whole dependency list on purpose. `disarm` is redefined on
+    every render, so listing it would restart the window on every render and the control would
+    never expire; `onArmedChange` is a caller's prop and is an inline arrow at some sites, with
+    the same result. The house carries this exemption in three other files.
+  */
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!armed) return;
+    setSaid(armedSaid);
+    const span = armWindowFor(armedSaid);
+    if (closingTimer.current !== null) clearTimeout(closingTimer.current);
+    if (disarmTimer.current !== null) clearTimeout(disarmTimer.current);
+    closingTimer.current = setTimeout(() => {
+      closingTimer.current = null;
+      // Said before it happens, not after. An expiry announced at the moment it lands tells
+      // somebody the window they were inside is already gone; a second earlier it is still a
+      // window. Three words, because the warning must not outlast what it warns about.
+      setSaid("one second left");
+    }, span - CLOSING_LEAD_MS);
+    disarmTimer.current = setTimeout(disarm, span);
+  }, [armed, armedSaid]);
+
   function handleClick() {
     if (!armed) {
       setArmed(true);
       onArmedChange?.(true);
-      setSaid(armedSaid);
       dwelling.current = true;
       dwellTimer.current = setTimeout(() => {
         dwellTimer.current = null;
         dwelling.current = false;
       }, DWELL_MS);
-      disarmTimer.current = setTimeout(disarm, ARM_WINDOW_MS);
       return;
     }
 
@@ -185,7 +284,7 @@ export function ConfirmButton({
     onArmedChange?.(false);
     // A confirm is not an expiry: the action is about to happen, so there is nothing to
     // report about it not happening. Clearing rather than announcing keeps the region for
-    // the one event that is otherwise silent.
+    // the two events that are otherwise silent.
     setSaid("");
     onConfirm();
   }
@@ -203,7 +302,8 @@ export function ConfirmButton({
         Everywhere else the attribute was equally wrong for the same reason: an interlock
         halfway through is not a state anything is in.
 
-        The interlock itself is untouched — arm, 300 ms dwell, 4 s window, `onArmedChange`.
+        The interlock itself is untouched — arm, 300 ms dwell, a window of at least 4 s,
+        `onArmedChange`.
         What is armed is said by the label, which is where a caller can also read it.
       */}
       <Button
@@ -214,7 +314,7 @@ export function ConfirmButton({
         aria-describedby={describedBy}
         onClick={handleClick}
       >
-        {armed ? confirmLabel : label}
+        {armed ? armedLabel : label}
       </Button>
       {/*
         Said, not shown. `base.css`'s `.sr-only` rather than a `.ui-*` twin: `ui.css` already

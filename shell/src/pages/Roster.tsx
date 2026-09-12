@@ -327,6 +327,10 @@ function GateCell({ gate, at }: { gate: Gate; at: string | null }) {
  *
  * A folder that is *gone* stays a fault whatever the mode: it was named, something moved it, and
  * that is a fact about a disk rather than about the autopilot.
+ *
+ * The words come from the map even where the tone does not: the dormant case renders
+ * `readState("folder", "unset")`'s label as plain text. `ok` has no map row: a healthy folder is
+ * the absence of a fact, and the old row was a reading nothing rendered.
  */
 function FolderCell({
   folder,
@@ -344,14 +348,14 @@ function FolderCell({
       </span>
     );
   }
+  const reading = readState("folder", folder);
   if (folder === "unset" && off) {
     return (
       <span className="text-text-faint" title="this project is switched off and has no folder">
-        not named
+        {reading === null ? folder : reading.label}
       </span>
     );
   }
-  const reading = readState("folder", folder);
   if (reading === null) return <span className="text-text-faint">{folder}</span>;
   return (
     <Badge

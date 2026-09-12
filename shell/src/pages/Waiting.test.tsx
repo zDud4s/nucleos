@@ -439,6 +439,22 @@ describe("Waiting - a section with nothing in it", () => {
 /* -------------------------------------------------------- A13: the freeze -- */
 
 describe("Waiting - the ordering freeze", () => {
+  it("the armed approval names the row it will approve", async () => {
+    const world = waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+    await screen.findByText("approval #1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve #1" }));
+
+    // Two cards, one consequence sentence between them. Before this the armed button said
+    // only what would happen, on a page whose whole difficulty is which row it happens to.
+    expect(screen.getByRole("button", { name: "Let this action happen · #1" })).toBeDefined();
+    const said = screen.getByText("armed: #1 — Let this action happen — press again to confirm");
+    expect(said.getAttribute("role")).toBe("status");
+  });
+
   it("holds a section's order still while one of its cards is armed", async () => {
     const world = waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] });
     daemon.apiFetch.mockImplementation(waitingFetch(world));
@@ -449,7 +465,7 @@ describe("Waiting - the ordering freeze", () => {
 
     // One click arms; it does not decide.
     fireEvent.click(screen.getByRole("button", { name: "Approve #1" }));
-    expect(screen.getByRole("button", { name: "Let this action happen" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Let this action happen · #1" })).toBeDefined();
 
     // Now the daemon answers in a different order, with one more row.
     world.approvals = [proposal({ id: 2 }), proposal({ id: 1 }), proposal({ id: 3 })];
@@ -559,7 +575,7 @@ describe("Waiting - the sections that are not there", () => {
     // The confirm click is its own step — a `waitFor` must not both click the
     // confirm and assert the mutation, since disarming makes a retry throw.
     await new Promise((resolve) => setTimeout(resolve, 350));
-    fireEvent.click(within(list).getByRole("button", { name: "Let this action happen" }));
+    fireEvent.click(within(list).getByRole("button", { name: "Let this action happen · #202" }));
 
     await waitFor(() => {
       expect(
@@ -619,7 +635,7 @@ describe("Waiting - the sections that are not there", () => {
     fireEvent.click(within(list).getByRole("button", { name: "Hire #301" }));
     await new Promise((resolve) => setTimeout(resolve, 350));
     fireEvent.click(
-      within(list).getByRole("button", { name: "Write the agent and add them to the roster" }),
+      within(list).getByRole("button", { name: "Write the agent and add them to the roster · #301" }),
     );
 
     await waitFor(() => {
@@ -760,9 +776,9 @@ describe("Waiting - a skipped item is put away, not refused", () => {
     // timers into a suite that waits on react-query. The confirm is a *separate*
     // wait, because `mutate` reaches the client a tick after the click.
     await waitFor(() => {
-      const armed = screen.queryByRole("button", { name: "I have read it" });
+      const armed = screen.queryByRole("button", { name: "I have read it · #41" });
       if (armed !== null) fireEvent.click(armed);
-      expect(screen.queryByRole("button", { name: "I have read it" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "I have read it · #41" })).toBeNull();
     });
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/proposals/41/dismiss", { method: "POST" });

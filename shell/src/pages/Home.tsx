@@ -113,6 +113,8 @@ export function Home() {
               ? undefined
               : `${healthy}/${subsystems.length}`
           }
+          /* One device for one piece of news: the clause that is wrong wears the tone and the
+             figure stays the figure. See the note under `.ui-stat-detail` in `ui.css`. */
           detail={
             wrongClause(health.data) === null ? (
               systemHeadline(health.data)
@@ -120,7 +122,6 @@ export function Home() {
               <span className="ui-wrong">{systemHeadline(health.data)}</span>
             )
           }
-          tone={wrongClause(health.data) === null ? undefined : "danger"}
         />
       </div>
 

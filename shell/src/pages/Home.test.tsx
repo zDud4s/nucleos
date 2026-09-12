@@ -191,9 +191,9 @@ describe("Home", () => {
 
     // And the card that counts the same fact wears the same tone. The figure reads
     // "2/3" whether or not anything is wrong; the tone is what says which it is.
-    expect(screen.getByRole("article", { name: "Subsystems healthy" }).className).toContain(
-      "ui-stat-danger",
-    );
+    const subsystemsCard = screen.getByRole("article", { name: "Subsystems healthy" });
+    expect(subsystemsCard.className).toBe("ui-stat");
+    expect(subsystemsCard.querySelector(".ui-stat-value")?.className).toBe("ui-stat-value");
     // ui-wrong lands on the span StatCard's detail slot wraps, not on the slot's own
     // p.ui-stat-detail — Boundary.tsx's rule is that the whole sentence carries the tone.
     expect(
@@ -222,7 +222,7 @@ describe("Home", () => {
     await renderWithRouter(<Home />);
 
     const card_ = await screen.findByRole("article", { name: "Subsystems healthy" });
-    expect(card_.className).toContain("ui-stat-danger");
+    expect(card_.className).toBe("ui-stat");
     // The detail carries it too: one reading, one treatment — Boundary.tsx's rule.
     expect(card_.querySelector(".ui-stat-detail .ui-wrong")).not.toBeNull();
   });
@@ -262,9 +262,7 @@ describe("Home", () => {
 
     // Nor does the healthy card wear the tone. A figure that is always red says nothing
     // when something actually goes wrong.
-    expect(screen.getByRole("article", { name: "Subsystems healthy" }).className).not.toContain(
-      "ui-stat-danger",
-    );
+    expect(screen.getByRole("article", { name: "Subsystems healthy" }).className).toBe("ui-stat");
     expect(
       screen
         .getByRole("article", { name: "Subsystems healthy" })

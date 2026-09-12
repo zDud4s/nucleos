@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED } from "../data/autopilot";
 import { FEED, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
-import { readFeedKind } from "../data/feed";
+import { readEfficiencySignal, readFeedKind, waitReasonFromSummary } from "../data/feed";
 
 /**
  * The states the preview must be able to photograph, pinned as facts about the fixtures.
@@ -16,10 +16,30 @@ import { readFeedKind } from "../data/feed";
  */
 describe("the preview fixtures", () => {
   it("the feed serves lines across kinds, and exactly one the shell cannot read", () => {
-    expect(FEED.length).toBeGreaterThanOrEqual(12);
+    expect(FEED.length).toBeGreaterThanOrEqual(14);
     expect(FEED.filter((row) => readFeedKind(row.kind) === null).map((row) => row.kind)).toEqual(["map_stamp_recorded"]);
-    for (const kind of ["job_finished", "job_started", "job_failed", "vcs_request_finished", "email_urgent", "token_efficiency", "web.read"]) expect(FEED.some((row) => row.kind === kind), kind).toBe(true);
+    for (const kind of ["job_finished", "job_started", "job_failed", "vcs_request_finished", "email_urgent", "token_efficiency", "web.read", "team_run_finished", "team_trigger_armed"]) expect(FEED.some((row) => row.kind === kind), kind).toBe(true);
     expect(new Set(FEED.map((row) => readFeedKind(row.kind)?.tone)).size).toBeGreaterThanOrEqual(4);
+  });
+
+  it("no badge restates its own row", () => {
+    // The P3 of the 2026-09-09 critique, held as a property of the fixture rather than as taste:
+    // six of twelve pairs were the same string, because the summaries had been written from the
+    // labels. A summary in the núcleo's shape carries an id, a path or a branch; the badge carries
+    // the class, which is also the page's filter facet.
+    for (const row of FEED) {
+      const label = readFeedKind(row.kind)?.label ?? row.kind;
+      expect(row.summary.trim().toLowerCase(), row.kind).not.toBe(label.toLowerCase());
+    }
+  });
+
+  it("the rows that carry a second reading are written so it can be read", () => {
+    // Both readings are parsed out of the summary, so a generic fixture sentence silently
+    // switches the device off. Neither had ever been photographed.
+    const waiting = FEED.find((row) => row.kind === "job_waiting");
+    expect(waitReasonFromSummary(waiting!.summary)).toBe("slot");
+    const efficiency = FEED.find((row) => row.kind === "token_efficiency");
+    expect(readEfficiencySignal(efficiency!.summary)?.signal).toBe("cold cache");
   });
   /*
     Exactly one, and it is the one the shots point at.

@@ -76,7 +76,10 @@ export function Boundary({ modules, imports, unread, foreign, seam }: BoundaryPr
           >
             <span className="font-display text-sm text-text">{side.folder}</span>
             <span className="text-xs uppercase tracking-wide text-text-faint">{side.reader}</span>
-            <span className="mt-1 text-xs text-text-muted">
+            {/* No margin of its own: the card is a column with `gap-0.5`, and a top
+                margin here made one of its four gaps three times the other three.
+                Invisible until round 11 layered the reset that was cancelling it. */}
+            <span className="text-xs text-text-muted">
               <span className="font-display text-sm text-text">{side.files}</span> file
               {side.files === 1 ? "" : "s"} · {side.imports} import{side.imports === 1 ? "" : "s"}{" "}
               inside

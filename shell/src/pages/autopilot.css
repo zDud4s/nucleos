@@ -464,11 +464,16 @@
   margin: 0;
 }
 
+/* A rule above the ask form, because round 10 took its heading away and left it touching the
+   jobs list. A hairline says "a different act, on the same subject" without saying it twice. */
 .ap-form {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   align-items: flex-start;
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
 }
 
 .ap-field-label {

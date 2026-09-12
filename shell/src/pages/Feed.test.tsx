@@ -68,6 +68,17 @@ function feedCalls(): string[] {
     .filter((path) => path.startsWith("/feed"));
 }
 
+describe("Feed - filter layout", () => {
+  it("the Search button is a member of the filter row, not a loose child of it", async () => {
+    daemon.apiFetch.mockImplementation(feedFetch([entry()]));
+    await renderFeed();
+
+    const search = await screen.findByRole("button", { name: "Search" });
+    expect(search.parentElement?.className).toBe("feed-filter-submit");
+    expect(search.parentElement?.parentElement?.className).toContain("feed-filters");
+  });
+});
+
 /* ------------------------------- A15: one kind, four different situations -- */
 
 describe("Feed - a waiting line says what it is waiting for", () => {
@@ -239,6 +250,28 @@ describe("Feed - a kind this shell has no reading for", () => {
     const unknown = within(list).getByText("email_shopping");
     expect(unknown.className).toContain("ui-state-unmapped");
     expect(unknown.className).toContain("ui-badge-off");
+  });
+
+  it("reads the kinds the Teams pillar writes most, instead of showing them as words it has never heard", async () => {
+    // Twelve real kinds rendered `.ui-state-unmapped` until the completeness test enumerated the
+    // writers; `team_run_finished` and `team_action` are the two the pillar writes most.
+    daemon.apiFetch.mockImplementation(
+      feedFetch([
+        entry({ id: 11, kind: "team_run_finished", summary: "a team run failed: no specialist answered" }),
+        entry({ id: 12, kind: "team_action", summary: "a department's `email_send` failed: the mailbox refused it" }),
+        entry({ id: 13, kind: "team_trigger_skipped", summary: "`morning digest` did not start support: a run is already in flight" }),
+      ]),
+    );
+
+    await renderFeed();
+
+    const settled = await screen.findByText("team run settled");
+    expect(settled.className).toContain("ui-badge-info");
+    expect(settled.className).not.toContain("ui-state-unmapped");
+    expect(screen.getByText("team action settled").className).toContain("ui-badge-info");
+    const skipped = screen.getByText("team trigger did not fire");
+    expect(skipped.className).toContain("ui-badge-paused");
+    expect(skipped.className).not.toContain("ui-state-unmapped");
   });
 });
 

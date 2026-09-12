@@ -497,6 +497,66 @@
   box-shadow: 0 0 0 3px var(--text);
 }
 
+/**
+ * Armed, on a control with no box.
+ *
+ * `.ui-button-quiet` is `padding: 0`, `background: none`, `border-color: transparent` — an
+ * underlined run of `--text-muted` text, on purpose, because it has to sit on every row of a
+ * table without competing with the readings in those rows. So the one ring above had nothing
+ * to sit on: at the ten quiet interlocks it was a 3px opaque band hugging the content box of
+ * 13px text with nothing between them, a slab around a word at the weight of the word's own
+ * stems. No shot had ever photographed one.
+ *
+ * The ring is kept and the box is given, rather than the other way round. A quieter armed
+ * state — the text to Primary and the underline doubled — is what `:hover` already draws, and
+ * an armed control is under the pointer, so the one signal it could add would be a 1px change
+ * in underline thickness: the same "nobody can see it" that took the 1.7:1 and 1.2:1 rings out
+ * at 51 sites last round.
+ *
+ * The vertical is the primitive's own, so an armed quiet button is exactly as tall as a real
+ * one. The horizontal is `--space-1` and NOT the primitive's `--space-3`, and that is measured
+ * rather than chosen: every container that holds a quiet interlock gives it `gap:
+ * var(--space-2)` — `.waiting-actions`, `.ui-panel-aside`, `.chats-archive`,
+ * `.contacts-unmerge` — so 4px of padding plus a 3px ring leaves 1px of surface before the
+ * neighbour, where 12px would paint 7px over it.
+ *
+ * The negative margin is the whole reason this is safe: it cancels the padding in the outer
+ * box, so the ring grows outward from the word and the word does not move. Nothing here
+ * transitions — `.ui-button` animates background, border and colour only — so the box appears
+ * in the frame the click lands in.
+ */
+.ui-confirm-armed > .ui-button-quiet {
+  padding: 0.34rem var(--space-1);
+  margin: -0.34rem calc(-1 * var(--space-1));
+}
+
+/**
+ * Two rings, and they do not share a band.
+ *
+ * `base.css` draws focus as `outline: 2px solid var(--focus-ring)` at `outline-offset: 2px`,
+ * so the outline occupies 2-4px outside the border box and the armed ring occupies 0-3px: two
+ * of the outline's two pixels land ON the ring. Composited over `--text` the cyan measures
+ * 1.3:1 against the ring it sits on, so a keyboard user who armed a control very nearly lost
+ * the mark that says the keyboard is here — at the one moment the app is asking for a
+ * deliberate second press.
+ *
+ * At 4px the outline is 4-6px out, clear of the ring with 1px of surface between the two
+ * marks, and it composites over `--surface` instead: 3.9:1, above the 3:1 floor for a non-text
+ * indicator. Two devices, two bands, one job each.
+ *
+ * Here and not in `base.css`, because the offset is a fact about the armed state and not about
+ * focus: every other control in the app keeps the global 2px. Two classes and a pseudo-class
+ * is 0,3,0 against the global rule's 0,1,0, and both sheets are unlayered — and if the
+ * `:focus-visible` rule moves into `@layer base`, an unlayered rule wins outright. It holds
+ * either way.
+ *
+ * Inside `.ui-switch` this changes nothing: there the ring is inset and the track's `overflow:
+ * hidden` clips outlines whatever their offset.
+ */
+.ui-confirm-armed > .ui-button:focus-visible {
+  outline-offset: 4px;
+}
+
 /* ----------------------------------------------------------------- teach -- */
 
 .ui-teach {
@@ -816,15 +876,14 @@
   line-height: var(--leading-snug);
   color: var(--text-faint);
 }
-
-/* A card whose figure is bad news. The tone rides the FIGURE and not the card:
-   the box is furniture, and painting the whole of it red would make a reading
-   look like an alert, which is the one thing the Home page must never be. Only
-   `danger` today, and a union rather than a boolean so a second tone can be
-   added without renaming the prop. */
-.ui-stat-danger .ui-stat-value {
-  color: var(--tone-danger-fg);
-}
+/* No card-level tone, since round 11. This app has ONE device for a wrong fact — `.ui-wrong`
+   on the clause that is wrong, as `canvas/Boundary.tsx`, `pages/Home.tsx` and `pages/System.tsx`
+   all use it — and `.ui-stat-danger .ui-stat-value` was a second one painting the numeral. The
+   two together drew a red figure, a grey label and a red clause: three colours in a three-line
+   card for one piece of news. Round 9 retired exactly that on the map's boundary readout, where
+   the numeral-only red was two devices for one sentence. `6/10` is the reading and keeps the
+   reading colour, like the other four cards; what is red is "1 down, 1 degraded". A caller
+   wraps its own detail in `.ui-wrong`. */
 
 /* ----------------------------------------------------------- page header -- */
 

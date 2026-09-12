@@ -661,6 +661,7 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
               <ConfirmButton
                 label={`Give wheel #${session.proposal_id} the window`}
                 confirmLabel="Open a real browser here"
+                subject={`#${session.proposal_id}`}
                 variant="approve"
                 disabled={approve.isPending}
                 onArmedChange={onArmedChange}
@@ -669,6 +670,7 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
               <ConfirmButton
                 label={`Refuse wheel #${session.proposal_id}`}
                 confirmLabel="Refuse and close the session"
+                subject={`#${session.proposal_id}`}
                 variant="ghost"
                 disabled={reject.isPending}
                 onArmedChange={onArmedChange}
@@ -750,6 +752,7 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
               <ConfirmButton
                 label={`Approve #${proposal.id}`}
                 confirmLabel="Let this action happen"
+                subject={`#${proposal.id}`}
                 variant="approve"
                 disabled={approve.isPending}
                 onArmedChange={onArmedChange}
@@ -758,6 +761,7 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
               <ConfirmButton
                 label={`Reject #${proposal.id}`}
                 confirmLabel="Refuse and end the run"
+                subject={`#${proposal.id}`}
                 variant="ghost"
                 disabled={reject.isPending}
                 onArmedChange={onArmedChange}
@@ -925,6 +929,7 @@ function TeamActionCard({
         <ConfirmButton
           label={`Approve #${proposal.id}`}
           confirmLabel="Let this action happen"
+          subject={`#${proposal.id}`}
           variant="approve"
           disabled={approve.isPending}
           onArmedChange={onArmedChange}
@@ -933,6 +938,7 @@ function TeamActionCard({
         <ConfirmButton
           label={`Reject #${proposal.id}`}
           confirmLabel="Refuse and close the action"
+          subject={`#${proposal.id}`}
           variant="ghost"
           disabled={reject.isPending}
           onArmedChange={onArmedChange}
@@ -1122,6 +1128,7 @@ function RecruitmentCard({
         <ConfirmButton
           label={`Hire #${proposal.id}`}
           confirmLabel="Write the agent and add them to the roster"
+          subject={`#${proposal.id}`}
           variant="approve"
           disabled={hire.isPending || form === null}
           onArmedChange={onArmedChange}
@@ -1226,6 +1233,7 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
               <ConfirmButton
                 label={`Merge #${suggestion.proposal_id}`}
                 confirmLabel="They are one person"
+                subject={`#${suggestion.proposal_id}`}
                 variant="approve"
                 disabled={decide.isPending}
                 onArmedChange={onArmedChange}
@@ -1236,6 +1244,7 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
               <ConfirmButton
                 label={`Keep #${suggestion.proposal_id} apart`}
                 confirmLabel="They are different people"
+                subject={`#${suggestion.proposal_id}`}
                 variant="quiet"
                 disabled={decide.isPending}
                 onArmedChange={onArmedChange}
@@ -1374,6 +1383,7 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                 <ConfirmButton
                   label={`Approve request #${proposal.id}`}
                   confirmLabel="Keep these two apart"
+                  subject={`#${proposal.id}`}
                   variant="approve"
                   disabled={approve.isPending}
                   onArmedChange={onArmedChange}
@@ -1382,6 +1392,7 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                 <ConfirmButton
                   label={`Reject request #${proposal.id}`}
                   confirmLabel="Let them run together"
+                  subject={`#${proposal.id}`}
                   variant="ghost"
                   disabled={reject.isPending}
                   onArmedChange={onArmedChange}
@@ -1447,6 +1458,7 @@ function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
               <ConfirmButton
                 label={`Put item #${proposal.id} away`}
                 confirmLabel="I have read it"
+                subject={`#${proposal.id}`}
                 variant="quiet"
                 disabled={dismiss.isPending}
                 onArmedChange={onArmedChange}

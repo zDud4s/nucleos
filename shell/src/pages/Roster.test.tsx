@@ -17,6 +17,7 @@ import {
   type DaemonState,
 } from "../test/harness";
 import type { ProjectSummary } from "../data/system";
+import { statesOf } from "../ui/state-map";
 
 async function openRoster(projects: ProjectSummary[], overrides: Partial<DaemonState> = {}) {
   const state = daemonState({ projects, ...overrides });
@@ -196,6 +197,17 @@ describe("the roster", () => {
     expect(row("asleep").getByText("not named").className).not.toContain("ui-badge");
     expect(row("unfinished").getByText("not named").className).toContain("ui-badge");
     expect(row("moved").getByText("gone").className).toContain("ui-badge-danger");
+  });
+
+  it("keeps no folder reading nobody reads", async () => {
+    expect(statesOf("folder").sort()).toEqual(["missing", "unset"]);
+
+    await openRoster([fine("here")]);
+    await screen.findByRole("table");
+    const row = within(screen.getByRole("rowheader", { name: "here" }).closest("tr") as HTMLElement);
+    const cell = row.getByText("ok");
+    expect(cell.className).not.toContain("ui-badge");
+    expect(cell.getAttribute("title")).toBe("C:/Projects/here");
   });
 
   /**

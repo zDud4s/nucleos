@@ -1202,20 +1202,31 @@ export const CALENDAR_CONFIG: CalendarConfigView = {
  * Both lists non-empty, because the panel keeps them apart and a preview with
  * only one of them photographs half a component.
  */
-/** Representative feed rows, including the unmapped-device state. */
+/**
+ * Representative feed rows, including the unmapped-device state.
+ *
+ * Every summary is in the shape the núcleo's own writer builds, and that is the point rather than
+ * decoration. Two of the row's readings are PARSED out of the summary — `waitReasonFromSummary`
+ * and `readEfficiencySignal` — and the round-10 fixture's generic sentences ("job 40 is waiting",
+ * "efficiency observation") parsed to `null`, so neither device had ever appeared in a shot. The
+ * generic summaries also made the badge look redundant: six of twelve badge/summary pairs on
+ * `06-feed.png` were the same string, which is a fact about this fixture and not about the page.
+ */
 export const FEED: FeedEntry[] = [
-  { id: 12, project_id: "alpha", kind: "job_finished", summary: "job 41 finished", run_id: 41, errand_id: null, created_at: ago(3 * MINUTE) },
-  { id: 11, project_id: "alpha", kind: "job_started", summary: "job 42 started", run_id: 42, errand_id: null, created_at: ago(9 * MINUTE) },
-  { id: 10, project_id: "bravo", kind: "job_failed", summary: "job 39 failed", run_id: 39, errand_id: null, created_at: ago(31 * MINUTE) },
-  { id: 9, project_id: "bravo", kind: "job_waiting", summary: "job 40 is waiting", run_id: 40, errand_id: null, created_at: ago(48 * MINUTE) },
-  { id: 8, project_id: "alpha", kind: "vcs_request_finished", summary: "git request settled", run_id: null, errand_id: null, created_at: ago(HOUR) },
-  { id: 7, project_id: null, kind: "email_urgent", summary: "urgent e-mail", run_id: null, errand_id: null, created_at: ago(2 * HOUR) },
-  { id: 6, project_id: "alpha", kind: "token_efficiency", summary: "efficiency observation", run_id: 38, errand_id: null, created_at: ago(3 * HOUR) },
-  { id: 5, project_id: null, kind: "web.read", summary: "web page read", run_id: null, errand_id: 2, created_at: ago(4 * HOUR) },
-  { id: 4, project_id: null, kind: "errand_rule_fired", summary: "rule fired", run_id: null, errand_id: 2, created_at: ago(5 * HOUR) },
-  { id: 3, project_id: "delta", kind: "council_finished", summary: "council settled", run_id: null, errand_id: null, created_at: ago(7 * HOUR) },
-  { id: 2, project_id: "bravo", kind: "worktree_released", summary: "worktree released", run_id: null, errand_id: null, created_at: ago(DAY) },
-  { id: 1, project_id: "alpha", kind: "map_stamp_recorded", summary: "module map stamp", run_id: null, errand_id: null, created_at: ago(2 * DAY) },
+  { id: 14, project_id: "alpha", kind: "job_finished", summary: "job 41 finished `completed` after 6 item(s)", run_id: 41, errand_id: null, created_at: ago(3 * MINUTE) },
+  { id: 13, project_id: "alpha", kind: "job_started", summary: "job 42 started on job/42-tighten-the-gate", run_id: 42, errand_id: null, created_at: ago(9 * MINUTE) },
+  { id: 12, project_id: null, kind: "team_run_finished", summary: "a team run done: the department delivered", run_id: null, errand_id: null, created_at: ago(14 * MINUTE) },
+  { id: 11, project_id: "bravo", kind: "job_failed", summary: "job 39 could not start its implement node: the runner exited before the first turn", run_id: 39, errand_id: null, created_at: ago(31 * MINUTE) },
+  { id: 10, project_id: "bravo", kind: "job_waiting", summary: "job 40 is waiting: another run holds the project's worktree slot", run_id: 40, errand_id: null, created_at: ago(48 * MINUTE) },
+  { id: 9, project_id: "alpha", kind: "vcs_request_finished", summary: "vcs request 21 escalated - the merge would revert two files nobody asked about", run_id: null, errand_id: null, created_at: ago(HOUR) },
+  { id: 8, project_id: null, kind: "team_trigger_armed", summary: "`morning digest` is armed for support", run_id: null, errand_id: null, created_at: ago(95 * MINUTE) },
+  { id: 7, project_id: null, kind: "email_urgent", summary: "the accountant is blocked on the Q3 reconciliation and has asked twice", run_id: null, errand_id: null, created_at: ago(2 * HOUR) },
+  { id: 6, project_id: "alpha", kind: "token_efficiency", summary: "token efficiency (project alpha): 4 runs in a row sent a prompt of 38412 tokens and neither read nor wrote a single cached token", run_id: 38, errand_id: null, created_at: ago(3 * HOUR) },
+  { id: 5, project_id: null, kind: "web.read", summary: "read https://docs.rs/sqlx/latest/sqlx/ (raw)", run_id: null, errand_id: 2, created_at: ago(4 * HOUR) },
+  { id: 4, project_id: null, kind: "errand_rule_fired", summary: "the rule \"weekday sweep\" of the errand \"inbox\" started a turn", run_id: null, errand_id: 2, created_at: ago(5 * HOUR) },
+  { id: 3, project_id: "delta", kind: "council_finished", summary: "council done", run_id: null, errand_id: null, created_at: ago(7 * HOUR) },
+  { id: 2, project_id: "bravo", kind: "worktree_released", summary: "released worktree C:/Projects/bravo/.nucleos/worktrees/run-318 + branch run/318-retry-the-gate", run_id: null, errand_id: null, created_at: ago(DAY) },
+  { id: 1, project_id: "alpha", kind: "map_stamp_recorded", summary: "module map stamp for core/src/feed.rs", run_id: null, errand_id: null, created_at: ago(2 * DAY) },
 ];
 
 export const HELD: PendingNotification[] = [

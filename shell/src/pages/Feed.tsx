@@ -306,7 +306,9 @@ function FeedFilterBar({
         />
       </label>
 
-      <Button type="submit">Search</Button>
+      <div className="feed-filter-submit">
+        <Button type="submit">Search</Button>
+      </div>
     </form>
   );
 }
@@ -413,6 +415,15 @@ function FeedRow({
  * the same question differently. It is not a design system primitive — it knows
  * about feed kinds specifically — so it stays with the slice that owns them
  * rather than moving into `ui/`.
+ *
+ * **A badge does not restate its row.** It survived the 2026-09-09 critique, which saw twelve
+ * pills over twelve sentences saying the same thing, and the reason is that the restatement was
+ * the FIXTURE's: its summaries had been written from these labels, while the núcleo writes ids,
+ * paths and branches (`worktree.rs:1327`, `vcs.rs:2475`, `job.rs:4522`). With the fixture in the
+ * núcleo's shapes the pill carries the one thing the sentence does not — the class, which is also
+ * this page's filter facet (`FEED_KIND_NAMES` feeds the `kind` datalist) and the only carrier of
+ * the tone that separates "went wrong" from "happened". `preview/fixtures.test.ts` holds the rule
+ * as a property: no fixture row's summary may equal its badge's label.
  */
 export function KindBadge({ kind }: { kind: string }) {
   const reading = readFeedKind(kind);

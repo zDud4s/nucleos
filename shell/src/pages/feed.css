@@ -24,6 +24,8 @@
  * per-filter widths says that out loud.
  */
 .feed-filters {
+  /* One height for every control in this row, declared once and read three times. */
+  --feed-control-h: calc(var(--text-sm) * var(--leading-normal) + 2 * var(--space-2) + 2px);
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
@@ -47,6 +49,7 @@
 
 .feed-filter input,
 .feed-filter select {
+  height: var(--feed-control-h);
   min-width: 9rem;
   padding: var(--space-2);
   border: 1px solid var(--border);
@@ -66,6 +69,16 @@
 /* An id and a count. Both are two or three digits and neither earns a column. */
 .feed-filter-narrow input {
   min-width: 5rem;
+}
+
+/* The submit button is a member of the row, not a loose child of it. */
+.feed-filter-submit {
+  display: flex;
+  align-items: flex-end;
+}
+
+.feed-filter-submit > button {
+  min-height: var(--feed-control-h);
 }
 
 /* ---------------------------------------------------------------- freeze -- */
