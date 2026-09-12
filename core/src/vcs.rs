@@ -1427,6 +1427,18 @@ pub struct ClaimedRequest {
     /// held. `run_id` travels with the claim so the feed entry `drain_once` writes for it reports the
     /// run this operation was really performed for, not a row that may since have moved on.
     pub run_id: Option<i64>,
+    /// What a `BranchDelete` is judged against: the project's integration branch, resolved by
+    /// `land::integration_branch` once the request is claimed. `None` for every other operation, and
+    /// for a delete whose project has no integration branch that can be resolved.
+    ///
+    /// **It travels with the claim because the executor's behaviour differs on it.** `git branch
+    /// --delete` asks whether a branch is merged into its upstream, or into HEAD when it has none,
+    /// and HEAD here is the project root's: whatever the main checkout happens to be parked on.
+    /// Measured 2026-09-12: four branches already merged into `master` were refused four times over,
+    /// because the main checkout stood on a feature branch that did not contain them. That is
+    /// `land.rs`'s decision #2 defect, a target read off a checkout's HEAD, reached by the one
+    /// operation that module does not build.
+    pub integration_branch: Option<Branch>,
 }
 
 /// How a claimed request ended.
@@ -1621,6 +1633,7 @@ pub async fn claim_next(
                 project_root,
                 from_resolution,
                 run_id,
+                integration_branch: None,
             }))
         }
         Err(error) => {
@@ -2460,6 +2473,29 @@ pub async fn drain_once(
             return false;
         }
     };
+    // Resolved here rather than in `claim_next`: it runs git, and a claim is one transaction that
+    // has no business holding the database while a subprocess starts. An unresolvable project keeps
+    // `None`, which leaves git judging against HEAD as it always did, and git still refuses anything
+    // unmerged either way. So the fallback costs a refusal and never a lost commit.
+    let mut claimed = claimed;
+    if matches!(claimed.op, Op::BranchDelete { .. }) {
+        match crate::land::integration_branch(
+            pool,
+            &claimed.project_id,
+            std::path::Path::new(&claimed.project_root),
+            std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT,
+        )
+        .await
+        {
+            Ok(branch) => claimed.integration_branch = Some(branch),
+            Err(reason) => tracing::warn!(
+                vcs_request_id = claimed.id,
+                %reason,
+                "vcs: a branch delete has no integration branch to be judged against, so git \
+                 judges it against the main checkout's HEAD"
+            ),
+        }
+    }
     let id = claimed.id;
     let outcome = executor.execute(&claimed).await;
 

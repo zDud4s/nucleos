@@ -640,6 +640,47 @@ mod tests {
         );
     }
 
+    /// **The same defect, reached by a delete.** The queue landed `feat/x` on `master` while the main
+    /// checkout stood on `chore/other`, and then refused to delete it: `git branch --delete` asked
+    /// the parked HEAD, which never saw the landing. Through `drain_once`, because what is being
+    /// proved is that the claim carries the integration branch to the executor.
+    #[tokio::test]
+    async fn a_landed_branch_is_deleted_though_the_main_checkout_stands_elsewhere() {
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-delete-", "chore/other");
+        assert!(git_in(&repo, &["checkout", "-q", "master"]));
+        assert!(git_in(
+            &repo,
+            &["merge", "--no-ff", "-m", "land feat/x", "feat/x"]
+        ));
+        assert!(git_in(&repo, &["checkout", "-q", "chore/other"]));
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+        let op = Op::BranchDelete {
+            branch: "feat/x".into(),
+        };
+        let id = crate::vcs::submit(&pool, &repo_id, &op, Origin::Human)
+            .await
+            .unwrap();
+        assert!(
+            crate::vcs::drain_once(&pool, "alpha", &crate::git_exec::GitExecutor::default()).await
+        );
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "succeeded"
+        );
+        assert!(
+            !git_in(&repo, &["rev-parse", "--verify", "-q", "refs/heads/feat/x"]),
+            "feat/x is gone"
+        );
+    }
+
     /// **The same regression as the test above, read instead of landed.**
     ///
     /// The panel at `/projects/{id}/github` reported this branch from

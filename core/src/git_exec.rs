@@ -2042,7 +2042,11 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                 fetch(project_root, remote.as_str(), deadline).await
             }
             crate::vcs::Op::BranchDelete { branch } => {
-                branch_delete(project_root, branch.as_str(), deadline).await
+                let judged_against = request
+                    .integration_branch
+                    .as_ref()
+                    .map(|integration| integration.as_str());
+                branch_delete(project_root, branch.as_str(), judged_against, deadline).await
             }
             crate::vcs::Op::Rebase { branch, onto } => {
                 rebase(project_root, branch.as_str(), onto.as_str(), deadline).await
@@ -2293,11 +2297,63 @@ async fn fetch(project_root: &Path, remote: &str, deadline: std::time::Instant) 
 /// offer this without owning the question of what is safe to lose. A branch checked out in some
 /// worktree is refused by git too, with `Cannot delete branch … used by worktree` — a guard this
 /// module would otherwise have to reproduce against `worktree list`, and get wrong.
-async fn branch_delete(project_root: &Path, branch: &str, deadline: std::time::Instant) -> Outcome {
+///
+/// **Merged into what is `judged_against`, the project's integration branch, and never the main
+/// checkout's HEAD.** `--delete` compares a branch with its upstream, and with HEAD only when it has
+/// none. HEAD is the project root's, so a main checkout parked on a feature branch used to refuse
+/// every landed branch that feature branch did not contain. So a branch with no upstream borrows
+/// the integration branch as one for exactly as long as the delete takes. The judgement is still
+/// git's, computed from the same commit graph, and so is the refusal of a checked-out branch; only
+/// what it is compared with changes. A branch that already tracks something keeps it, because its
+/// owner chose that comparison and it is not this queue's to replace.
+async fn branch_delete(
+    project_root: &Path,
+    branch: &str,
+    judged_against: Option<&str>,
+    deadline: std::time::Instant,
+) -> Outcome {
     let reference = format!("refs/heads/{branch}");
     let sha = match revision(project_root, &reference, deadline).await {
         Ok(sha) => sha,
         Err(outcome) => return outcome,
+    };
+
+    let borrowed_upstream = match judged_against {
+        Some(target) if target != branch => {
+            let tracked = match git(
+                project_root,
+                &["for-each-ref", "--format=%(upstream)", &reference],
+                deadline,
+            )
+            .await
+            {
+                Ok(tracked) if tracked.succeeded() => tracked,
+                Ok(tracked) => {
+                    return failed(format!("could not read what {branch} tracks"), &tracked);
+                }
+                Err(outcome) => return outcome,
+            };
+            if tracked.stdout.trim().is_empty() {
+                let upstream = format!("--set-upstream-to={target}");
+                let set = match git(
+                    project_root,
+                    &["branch", &upstream, "--end-of-options", branch],
+                    deadline,
+                )
+                .await
+                {
+                    Ok(set) => set,
+                    Err(outcome) => return outcome,
+                };
+                if !set.succeeded() {
+                    return failed(format!("could not judge {branch} against {target}"), &set);
+                }
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
     };
 
     let deleted = match git(
@@ -2311,6 +2367,15 @@ async fn branch_delete(project_root: &Path, branch: &str, deadline: std::time::I
         Err(outcome) => return outcome,
     };
     if !deleted.succeeded() {
+        // A refused delete leaves the branch exactly as it found it, and it found no upstream.
+        if borrowed_upstream {
+            let _ = git(
+                project_root,
+                &["branch", "--unset-upstream", "--end-of-options", branch],
+                deadline,
+            )
+            .await;
+        }
         return failed(
             format!("deleting {branch} failed; git's output says why"),
             &deleted,
@@ -2897,6 +2962,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: true,
                 run_id: None,
+                integration_branch: None,
             })
             .await
     }
@@ -3011,6 +3077,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -3157,6 +3224,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await
     }
@@ -4011,6 +4079,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -4375,6 +4444,7 @@ pub(crate) mod tests {
                 project_root: project_root.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -4693,6 +4763,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -4755,6 +4826,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -4826,6 +4898,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -4908,6 +4981,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -4957,6 +5031,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -5004,6 +5079,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -5019,6 +5095,123 @@ pub(crate) mod tests {
             was,
             "the branch is still there, with its commits — this queue never forces"
         );
+    }
+
+    /// A delete of `feat/x`, judged against `integration` when there is one.
+    async fn delete_feat_x(repo: &Path, integration: Option<&str>) -> Outcome {
+        use crate::vcs::VcsExecutor;
+
+        GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::BranchDelete {
+                    branch: "feat/x".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
+                run_id: None,
+                integration_branch: integration.map(Into::into),
+            })
+            .await
+    }
+
+    /// What `feat/x` tracks, as `for-each-ref` reports it: empty when nothing.
+    fn upstream_of_feat_x(repo: &Path) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["for-each-ref", "--format=%(upstream)", "refs/heads/feat/x"])
+            .output()
+            .expect("git should start");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// `feat/x` merged into `master`, and the main checkout parked on `master~1`, which does not
+    /// contain it: the state of the machine on 2026-09-12, reduced.
+    fn a_landed_branch_under_a_parked_checkout(prefix: &str) -> (tempfile::TempDir, PathBuf) {
+        let (container, repo) = repo_with_a_branch_to_merge(prefix);
+        for args in [
+            &["merge", "--no-ff", "-m", "land feat/x", "feat/x"][..],
+            &["checkout", "-q", "-b", "chore/parked", "master~1"][..],
+        ] {
+            let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+            assert!(git_ok(&repo, &args));
+        }
+        (container, repo)
+    }
+
+    /// **The defect, and why the executor needs the integration branch at all.** With nothing to be
+    /// judged against, git asks the parked HEAD, which never saw the landing, and refuses a branch
+    /// whose every commit is on `master`.
+    #[tokio::test]
+    async fn a_landed_branch_is_refused_when_judged_against_a_parked_head() {
+        let (_container, repo) = a_landed_branch_under_a_parked_checkout("nucleos-gitexec-parked-");
+
+        let outcome = delete_feat_x(&repo, None).await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
+    }
+
+    /// Judged against the integration branch, the same landed branch is deleted, and it leaves no
+    /// borrowed upstream behind in the config.
+    #[tokio::test]
+    async fn a_landed_branch_is_deleted_wherever_the_main_checkout_stands() {
+        let (_container, repo) = a_landed_branch_under_a_parked_checkout("nucleos-gitexec-landed-");
+        let was = sha_of(&repo, "refs/heads/feat/x");
+
+        let outcome = delete_feat_x(&repo, Some("master")).await;
+
+        match outcome {
+            Outcome::Succeeded { sha, .. } => assert_eq!(sha.as_deref(), Some(was.as_str())),
+            other => panic!("a branch merged into master must be deletable, got {other:?}"),
+        }
+        let config = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "--get-regexp", r"^branch\.feat/x\."])
+            .output()
+            .expect("git should start");
+        assert!(
+            String::from_utf8_lossy(&config.stdout).trim().is_empty(),
+            "the delete takes the borrowed upstream with it"
+        );
+    }
+
+    /// Still git's refusal, whatever it is compared with: an unmerged branch survives, and the
+    /// upstream it borrowed for the attempt is given back.
+    #[tokio::test]
+    async fn an_unmerged_branch_is_still_refused_and_keeps_no_upstream() {
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-unmerged-judged-");
+        let was = sha_of(&repo, "refs/heads/feat/x");
+
+        let outcome = delete_feat_x(&repo, Some("master")).await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
+        assert_eq!(
+            sha_of(&repo, "refs/heads/feat/x"),
+            was,
+            "this queue never forces"
+        );
+        assert_eq!(
+            upstream_of_feat_x(&repo),
+            "",
+            "a refused delete leaves the branch as it found it"
+        );
+    }
+
+    /// A branch that already tracks something keeps being judged by it: its owner chose that.
+    #[tokio::test]
+    async fn a_branch_that_tracks_something_is_judged_by_what_it_tracks() {
+        let (_container, repo) = a_landed_branch_under_a_parked_checkout("nucleos-gitexec-tracks-");
+        let tracks = ["branch", "--set-upstream-to=chore/parked", "feat/x"];
+        let tracks: Vec<&OsStr> = tracks.iter().map(OsStr::new).collect();
+        assert!(git_ok(&repo, &tracks));
+
+        let outcome = delete_feat_x(&repo, Some("master")).await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
+        assert_eq!(upstream_of_feat_x(&repo), "refs/heads/chore/parked");
     }
 
     /// A branch that is not there fails before anything reaches the network, naming the ref.
@@ -5045,6 +5238,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -5084,6 +5278,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -5131,6 +5326,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -5171,6 +5367,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
@@ -5273,6 +5470,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                integration_branch: None,
             })
             .await;
 
