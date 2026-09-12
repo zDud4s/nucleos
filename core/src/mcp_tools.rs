@@ -406,6 +406,18 @@ struct ProjectPathParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ProjectCatParams {
+    /// Which project's repository. Call list_projects if you do not know it.
+    project_id: String,
+    /// The file, relative to the project's own root.
+    path: Option<String>,
+    /// The first line to show, counting from 1. Absent means the start of the file.
+    offset: Option<usize>,
+    /// How many lines to show at most. Absent means as many as fit in one answer.
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ProjectGrepParams {
     /// Which project's repository. Call list_projects if you do not know it.
     project_id: String,
@@ -492,25 +504,37 @@ impl NucleosTools {
 
     #[tool(
         description = "Read one file's contents out of a project's own checkout, as plain text. \
-                       `path` is relative to the project's root."
+                       `path` is relative to the project's root. A long file comes back one \
+                       window at a time, about 20,000 characters: the last line then says which \
+                       lines were shown and the `offset` to pass to read on. `offset` (from 1) \
+                       and `limit` choose the lines yourself — find them with project_grep first \
+                       rather than paging through a whole file."
     )]
     async fn project_cat(
         &self,
-        Parameters(ProjectPathParams { project_id, path }): Parameters<ProjectPathParams>,
+        Parameters(ProjectCatParams {
+            project_id,
+            path,
+            offset,
+            limit,
+        }): Parameters<ProjectCatParams>,
     ) -> String {
         match self
             .client
             .project_cat(&project_id, &path.unwrap_or_default())
             .await
         {
-            Ok(text) => text,
+            Ok(text) => window_of_file(&text, offset, limit),
             Err(msg) => error_json(msg),
         }
     }
 
     #[tool(
         description = "Search for text inside a project's own checkout. `path` narrows the search \
-                       to a file or folder; absent or empty searches the whole project."
+                       to a file or folder; absent or empty searches the whole project. Each \
+                       matching line is quoted up to 300 characters, and a search with more \
+                       matches than fit in one answer comes back as an object with the first \
+                       ones, `total` and `truncated`: narrow it to see the rest."
     )]
     async fn project_grep(
         &self,
@@ -523,7 +547,8 @@ impl NucleosTools {
         json_result(
             self.client
                 .project_grep(&project_id, &query, &path.unwrap_or_default())
-                .await,
+                .await
+                .map(bounded_matches),
         )
     }
 
@@ -2788,6 +2813,116 @@ fn json_result<T: Serialize>(result: Result<T, String>) -> String {
 
 fn error_json(msg: String) -> String {
     serde_json::json!({"error": msg}).to_string()
+}
+
+/// How much of a project read one tool answer carries, in bytes of text.
+///
+/// The CLI refuses a tool result over its token ceiling, and hands the agent an error instead of
+/// any part of it. Measured on job 25's own reads: a `project_cat` of a 5,348-line file (261,688
+/// characters) and a `project_grep` whose matches serialised to 54,833 characters both came back
+/// as "exceeds maximum allowed tokens", so the agent that asked learned nothing from either.
+/// 20,000 is under that ceiling with room to spare even at two characters a token, which source
+/// code full of punctuation comes close to.
+const READ_BUDGET: usize = 20_000;
+
+/// The longest one grep match's line is quoted. A minified file is a single line holding everything.
+const MATCH_TEXT: usize = 300;
+
+/// PURE: `text` cut to at most `max` bytes, on a character boundary.
+fn clip(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// PURE: the part of a file one `project_cat` answer carries.
+///
+/// A file that fits comes back whole and untouched. Otherwise: lines from `offset` (counting from 1),
+/// at most `limit` of them, within [`READ_BUDGET`], followed by one line saying which lines those
+/// were and the offset to read on from. That last line is the point: a window that ends without
+/// saying so reads as the end of the file.
+fn window_of_file(text: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    if offset.unwrap_or(1) <= 1 && limit.is_none() && text.len() <= READ_BUDGET {
+        return text.to_owned();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let first = offset.unwrap_or(1).max(1);
+    if first > total {
+        return format!("[the file has {total} lines; offset {first} is past its end]");
+    }
+    let mut shown = String::new();
+    let mut last = first - 1;
+    for line in lines
+        .iter()
+        .skip(first - 1)
+        .take(limit.unwrap_or(usize::MAX).max(1))
+    {
+        if last >= first && shown.len() + line.len() + 1 > READ_BUDGET {
+            break;
+        }
+        // Only ever the first line shown, since any later one breaks above: a line longer than
+        // the whole budget is quoted up to it, and marked, rather than skipped as if absent.
+        if line.len() > READ_BUDGET {
+            shown.push_str(clip(line, READ_BUDGET));
+            shown.push_str(" [line cut here]\n");
+        } else {
+            shown.push_str(line);
+            shown.push('\n');
+        }
+        last += 1;
+    }
+    let read_on = if last < total {
+        format!(
+            "; call project_cat again with offset={} to read on",
+            last + 1
+        )
+    } else {
+        String::new()
+    };
+    format!("{shown}[lines {first}-{last} of {total}{read_on}]")
+}
+
+/// PURE: a grep answer that fits one tool result.
+///
+/// Every quoted line is cut to [`MATCH_TEXT`], and matches are kept in order while they fit
+/// [`READ_BUDGET`]. When any were left out, the answer becomes an object that says how many there
+/// were, because a list that silently stops reads as all of them.
+fn bounded_matches(matches: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Array(all) = matches else {
+        return matches;
+    };
+    let total = all.len();
+    let mut kept = Vec::new();
+    let mut used = 2;
+    for mut found in all {
+        if let Some(text) = found.get("text").and_then(serde_json::Value::as_str)
+            && text.len() > MATCH_TEXT
+        {
+            found["text"] = format!("{}…", clip(text, MATCH_TEXT)).into();
+        }
+        let size = found.to_string().len() + 1;
+        if used + size > READ_BUDGET {
+            break;
+        }
+        used += size;
+        kept.push(found);
+    }
+    if kept.len() == total {
+        return serde_json::Value::Array(kept);
+    }
+    serde_json::json!({
+        "matches": kept,
+        "shown": kept.len(),
+        "total": total,
+        "truncated": true,
+        "note": "narrow it with `path` or a more specific query to see the rest",
+    })
 }
 
 /// Which box this process was launched to serve, read from `--box errand --errand <id>`.
@@ -5170,5 +5305,117 @@ mod tests {
             "get_run carries a run's stdout — for a triage run, a stranger's mail answered back by \
              a local model — which is exactly what an allowlist to a third party must never carry"
         );
+    }
+
+    /// A file that fits is the file, byte for byte: no footer on something that was not cut.
+    #[test]
+    fn a_file_that_fits_comes_back_whole_and_untouched() {
+        assert_eq!(window_of_file("a\r\nb\n", None, None), "a\r\nb\n");
+    }
+
+    /// The case job 25 hit: a file far over the budget comes back a window at a time, each window
+    /// saying where the next one starts, and the windows join up with nothing skipped.
+    #[test]
+    fn a_long_file_comes_back_a_window_at_a_time() {
+        let text: String = (1..=5348)
+            .map(|n| format!("line {n:>5} {}\n", "x".repeat(40)))
+            .collect();
+
+        let mut offset = None;
+        let mut next_line = 1;
+        let mut windows = 0;
+        loop {
+            let window = window_of_file(&text, offset, None);
+            assert!(window.len() <= READ_BUDGET + 200, "{}", window.len());
+            assert!(
+                window.starts_with(&format!("line {next_line:>5} ")),
+                "window {windows} must start where the last one said"
+            );
+            windows += 1;
+            let footer = window.lines().last().unwrap();
+            match footer.split("offset=").nth(1) {
+                Some(rest) => {
+                    let read_on: usize = rest.split(' ').next().unwrap().parse().unwrap();
+                    offset = Some(read_on);
+                    next_line = read_on;
+                }
+                None => {
+                    assert!(footer.ends_with("of 5348]"), "{footer}");
+                    break;
+                }
+            }
+        }
+        assert!(windows > 10, "{windows}");
+    }
+
+    #[test]
+    fn offset_and_limit_choose_the_lines() {
+        let text: String = (1..=10).map(|n| format!("l{n}\n")).collect();
+
+        assert_eq!(
+            window_of_file(&text, Some(3), Some(2)),
+            "l3\nl4\n[lines 3-4 of 10; call project_cat again with offset=5 to read on]"
+        );
+        assert_eq!(
+            window_of_file(&text, Some(9), None),
+            "l9\nl10\n[lines 9-10 of 10]"
+        );
+        assert_eq!(
+            window_of_file(&text, Some(11), None),
+            "[the file has 10 lines; offset 11 is past its end]"
+        );
+    }
+
+    /// A minified file is one line of everything. It is quoted up to the budget, on a character
+    /// boundary, and marked as cut.
+    #[test]
+    fn a_line_longer_than_the_budget_is_cut_inside_it() {
+        let text = "é".repeat(READ_BUDGET);
+
+        let window = window_of_file(&text, None, None);
+
+        assert!(window.len() <= READ_BUDGET + 100, "{}", window.len());
+        assert!(window.contains("[line cut here]"), "{window:.80}");
+        assert!(window.ends_with("[lines 1-1 of 1]"));
+    }
+
+    #[test]
+    fn a_grep_that_fits_is_the_plain_list() {
+        let matches = serde_json::json!([
+            {"path": "a.rs", "line": 1, "text": "one"},
+            {"path": "b.rs", "line": 2, "text": "two"},
+        ]);
+
+        assert_eq!(bounded_matches(matches.clone()), matches);
+    }
+
+    /// The other half of job 25's case: a search with more matches than fit says how many it left
+    /// out, rather than returning a list that looks complete.
+    #[test]
+    fn a_grep_too_long_for_one_answer_says_how_many_it_left_out() {
+        let matches: Vec<serde_json::Value> = (1..=2000)
+            .map(|n| serde_json::json!({"path": "core/src/runner.rs", "line": n, "text": "            max_turns: None,"}))
+            .collect();
+
+        let bounded = bounded_matches(serde_json::Value::Array(matches));
+
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(bounded["total"], 2000);
+        let shown = bounded["shown"].as_u64().unwrap();
+        assert!(shown > 50 && shown < 2000, "{shown}");
+        assert_eq!(bounded["matches"].as_array().unwrap().len() as u64, shown);
+        assert!(bounded.to_string().len() <= READ_BUDGET + 300);
+    }
+
+    #[test]
+    fn a_minified_match_is_quoted_short() {
+        let matches =
+            serde_json::json!([{"path": "app.min.js", "line": 1, "text": "é".repeat(5000)}]);
+
+        let bounded = bounded_matches(matches);
+
+        let text = bounded[0]["text"].as_str().unwrap();
+        assert!(text.len() <= MATCH_TEXT + 3, "{}", text.len());
+        assert!(text.ends_with('…'));
     }
 }
