@@ -349,7 +349,7 @@ pub async fn create_calendar_event(
 /// answering synchronously has no pass to be picked up on. Without that, the button would approve
 /// nothing.
 ///
-/// `project_id` is NULL like its three siblings, so `wip::OPEN_REVIEW_ITEMS_SQL` does not count
+/// `project_id` is NULL like its three siblings, so `wip::open_review_items` does not count
 /// these against a project's review ceiling. That is deliberate and it is a real gap: the ceiling
 /// that would govern them is the autonomy list itself, and an agent that files a hundred refused
 /// operations is an agent filling somebody's approvals queue. Nothing here throttles that yet, and
@@ -401,7 +401,7 @@ pub async fn create_github_action(
 /// this takes a transaction where its four siblings take a pool.
 ///
 /// `project_id` is NULL, like `calendar-event` and `contact-merge` before it, and the consequence is
-/// deliberate: `wip::OPEN_REVIEW_ITEMS_SQL` filters by project, so these never reach the per-project
+/// deliberate: `wip::open_review_items` filters by project, so these never reach the per-project
 /// ceiling. The ceiling that governs them is `teams.max_open_actions`, which is per team, because a
 /// department has no project to be counted against.
 pub(crate) async fn create_team_action_in_transaction(

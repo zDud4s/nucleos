@@ -43,7 +43,16 @@ export interface ProjectSummary {
    */
   withheld_classes_ready?: number;
   promotable: boolean;
-  open_proposals: number;
+  open_review_items: number;
+  /**
+   * The two queues that total is made of.
+   *
+   * Optional because the shell can be newer than the daemon it talks to. Absent reads as "not
+   * known", and every caller then says only the total — the behaviour before these existed —
+   * rather than inventing a zero for a queue that may be full.
+   */
+  open_proposals?: number;
+  open_shadow_decisions?: number;
   wip_limit: number | null;
   queue_full: boolean;
   /**

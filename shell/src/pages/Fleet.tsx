@@ -85,7 +85,7 @@ export function Fleet() {
    */
   const stale = concurrency.isError && concurrency.data !== undefined;
   const capacity = concurrency.data;
-  const waiting = projects.data?.reduce((total, project) => total + project.open_proposals, 0);
+  const waiting = projects.data?.reduce((total, project) => total + project.open_review_items, 0);
 
   const actions: FleetActions = {
     openJob,

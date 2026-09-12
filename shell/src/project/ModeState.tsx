@@ -70,7 +70,7 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
       : {
           killSwitch: killSwitch.data?.engaged === true,
           budgetPaused: budget.data?.paused === true,
-          openProposals: project.open_proposals,
+          openProposals: project.open_review_items,
           failedGatesWithoutRescue: 0,
           interruptedRuns: 0,
           workflowDrift: driftingWorkflows(workflows.data).length > 0,

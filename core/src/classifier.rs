@@ -2862,15 +2862,19 @@ mod tests {
                 // `outside-workspace` exists to be.
                 (r"C:\elsewhere\notes.ipynb", "deny", "outside-workspace"),
                 // The agent's own governance. A person decides, always.
-                (r"C:\work\repo\.ai\autopilot.yaml", "pending_approval", "self-governing-file"),
+                (
+                    r"C:\work\repo\.ai\autopilot.yaml",
+                    "pending_approval",
+                    "self-governing-file",
+                ),
                 // A file whose contents run on somebody else's next command.
-                (r"C:\work\repo\build.rs", "pending_approval", "executes-on-next-command"),
+                (
+                    r"C:\work\repo\build.rs",
+                    "pending_approval",
+                    "executes-on-next-command",
+                ),
             ] {
-                assert_classification(
-                    classify(tool, &json!({key: target}), cwd),
-                    decision,
-                    class,
-                );
+                assert_classification(classify(tool, &json!({key: target}), cwd), decision, class);
             }
 
             // No workspace at all: there is nothing for the write to be inside of, so the one

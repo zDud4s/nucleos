@@ -62,7 +62,7 @@ describe("the roster", () => {
   it("puts what needs somebody at the top, whatever it is called", async () => {
     await openRoster([
       fine("ANSup"),
-      fine("zeta", { open_proposals: 4, last_gate: "passed" }),
+      fine("zeta", { open_review_items: 4, last_gate: "passed" }),
       fine("beta", { last_gate: "failed" }),
       fine("gamma", { root_exists: false }),
     ]);

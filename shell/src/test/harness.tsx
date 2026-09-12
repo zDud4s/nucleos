@@ -599,7 +599,7 @@ export function project(overrides: Partial<ProjectSummary> = {}): ProjectSummary
     classes_ready: 0,
     classes_total: 0,
     promotable: false,
-    open_proposals: 0,
+    open_review_items: 0,
     wip_limit: null,
     queue_full: false,
     ...overrides,

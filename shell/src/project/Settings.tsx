@@ -178,7 +178,7 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
 function Ceiling({ project }: { project: ProjectSummary }) {
   const setLimit = useSetWipLimit();
   const limit = project.wip_limit;
-  const open = project.open_proposals;
+  const open = project.open_review_items;
 
   function set(next: number | null) {
     setLimit.mutate({ projectId: project.project_id, limit: next });
