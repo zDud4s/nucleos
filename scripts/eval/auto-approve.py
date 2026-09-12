@@ -64,7 +64,11 @@ def call(url: str, token: str, method: str = "GET"):
         url,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         method=method,
-        data=b"" if method == "POST" else None,
+        # `{}`, not nothing. The daemon's approve route takes an optional JSON body, and an empty
+        # body sent as `application/json` is not an absent one — it is JSON that fails to parse,
+        # answered 400. That is what stranded run 900474's first approval on 2026-09-12: refused,
+        # recorded as failed, and never retried, because a proposal is answered once.
+        data=b"{}" if method == "POST" else None,
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         body = response.read()

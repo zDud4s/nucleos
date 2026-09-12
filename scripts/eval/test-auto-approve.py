@@ -43,6 +43,7 @@ PROPOSALS = [
 ]
 
 approved = []
+unparseable = []
 
 
 class Stub(BaseHTTPRequestHandler):
@@ -64,6 +65,16 @@ class Stub(BaseHTTPRequestHandler):
     def do_POST(self):
         proposal_id = int(self.path.split("/")[2])
         approved.append(proposal_id)
+        # As the daemon does: a JSON content type over a body that does not parse is a 400, and an
+        # empty body is exactly that. A stub that ignored the body let the approver send one, and
+        # the first real cell to need an approval sat in `awaiting_approval` because of it.
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        try:
+            json.loads(raw)
+        except ValueError:
+            unparseable.append(proposal_id)
+            self._send(400, b"Failed to parse the request body as JSON")
+            return
         # 5 answers 409 — the normal race, and the one that stays pending for ever.
         if proposal_id == 5:
             self._send(409, b'{"error":"not pending"}')
@@ -121,8 +132,9 @@ def main() -> int:
     check("a 409 is recorded as failed rather than swallowed",
           "failed" in records[1] and "409" in records[1]["failed"])
     check("the exit was clean", result.returncode == 0)
+    check("every approval carries a body the daemon can parse", unparseable == [])
 
-    total = 9
+    total = 10
     print(f"\n{total - failures}/{total} as expected")
     return 1 if failures else 0
 
