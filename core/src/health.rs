@@ -946,6 +946,7 @@ mod tests {
     /// with `--help`, which is the program's business and not this regression's. Pinning `== Ok`
     /// would make a test about SPLITTING fail over an exit code — the same category of misdirected
     /// alarm the bug itself was.
+    #[cfg(windows)]
     #[tokio::test]
     async fn a_quoted_transcriber_path_probes_the_program_and_not_the_quote() {
         // `cmd` exists on every Windows host and needs no arguments to resolve.
@@ -960,12 +961,47 @@ mod tests {
     }
 
     /// And the unquoted form, which every config written before quoting existed uses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_quoted_transcriber_path_probes_the_program_and_not_the_quote_on_unix() {
+        // `sh` exists on every Unix host.
+        let readout = voice_probe(true, "\"sh\" -m model.bin".to_string()).await;
+
+        assert_ne!(
+            readout.reason,
+            Some(FailureCategory::Missing),
+            "a quoted path that resolves must not be reported missing, got {:?}",
+            readout.status
+        );
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn an_unquoted_transcriber_path_still_probes_its_first_token() {
         let readout = voice_probe(true, "cmd -m model.bin".to_string()).await;
         assert_ne!(readout.reason, Some(FailureCategory::Missing));
 
         let missing = voice_probe(true, "definitely-not-a-program-anywhere -x".to_string()).await;
+        assert_eq!(
+            missing.status,
+            HealthState::Down,
+            "a transcriber that does not exist has to be reported"
+        );
+        assert_eq!(missing.reason, Some(FailureCategory::Missing));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unquoted_transcriber_path_still_probes_its_first_token_on_unix() {
+        // `sh` exists on every Unix host.
+        let readout = voice_probe(true, "sh -m model.bin".to_string()).await;
+        assert_ne!(readout.reason, Some(FailureCategory::Missing));
+
+        let missing = voice_probe(
+            true,
+            "/nonexistent-nucleos/definitely-not-a-program -x".to_string(),
+        )
+        .await;
         assert_eq!(
             missing.status,
             HealthState::Down,
