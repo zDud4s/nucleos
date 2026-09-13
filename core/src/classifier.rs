@@ -828,7 +828,7 @@ fn classify_shell_command(
     let mut confined = false;
     let mut declared = false;
     for segment in segments {
-        match classify_segment(segment, cwd, policy, rules, unrecognized) {
+        match classify_segment(segment, cwd, policy, rules, shell, unrecognized) {
             Segment::Unrecognized => {
                 return classification(
                     "pending_approval",
@@ -975,6 +975,7 @@ fn classify_segment(
     cwd: Option<&Path>,
     policy: &crate::github::Policy,
     rules: &crate::project_policy::ShellRules,
+    shell: crate::command_reader::Shell,
     unrecognized: Unrecognized,
 ) -> Segment {
     // Redirection is a property of ONE command, which is why it is judged here rather than over the
@@ -993,7 +994,7 @@ fn classify_segment(
     // Raw, not normalized: `normalize_command` lowercases, and a `cd` target is a path. Folding it
     // here would widen the workspace behind the containment check's back, which is the same reason
     // `deletes_outside_cwd` reads raw tokens.
-    if lands_inside_the_workspace(segment, cwd) {
+    if lands_inside_the_workspace(segment, cwd, shell) {
         return Segment::ReadLocal;
     }
 
@@ -1036,7 +1037,7 @@ fn classify_segment(
     // being local.
     if unrecognized == Unrecognized::MayBeConfined
         && shell_form_is_readable(&normalized)
-        && confined_to_workspace(segment, cwd)
+        && confined_to_workspace(segment, cwd, shell)
     {
         return Segment::Confined;
     }
@@ -1084,7 +1085,11 @@ fn shell_for(tool_name: &str) -> crate::command_reader::Shell {
 ///
 /// Without a `cwd` there is no boundary to be inside of, so the answer is no — the same reading
 /// `writes_outside_cwd` was corrected to.
-fn lands_inside_the_workspace(segment: &str, cwd: Option<&Path>) -> bool {
+fn lands_inside_the_workspace(
+    segment: &str,
+    cwd: Option<&Path>,
+    shell: crate::command_reader::Shell,
+) -> bool {
     let tokens = shell_words(segment);
     let Some(program) = tokens.first() else {
         return false;
@@ -1142,9 +1147,44 @@ fn lands_inside_the_workspace(segment: &str, cwd: Option<&Path>) -> bool {
         if target.starts_with('~') || target.contains('$') || target.contains('%') {
             return false;
         }
-        let target = fold_for_containment(&normalize_path(target, Some(cwd)));
+        let target = with_git_bash_drive(target, shell, &workspace);
+        let target = fold_for_containment(&normalize_path(&target, Some(cwd)));
         target == workspace || target.starts_with(&format!("{workspace}/"))
     })
+}
+
+/// PURE: Git bash's spelling of a drive, `/c/Projects`, as the `C:/Projects` it names.
+///
+/// Git bash is the shell every `Bash` tool call runs under on Windows, and it mounts each drive at a
+/// single letter under `/`. The containment checks compared `/c/Projects/x` with a workspace of
+/// `C:/Projects/x`, found no common prefix, and refused a `cd` into the very directory the run was
+/// standing in. Measured on job 26, 2026-09-13: its replan node spelled its own worktree that way
+/// and was refused, with nobody there to approve it.
+///
+/// **Only for a POSIX shell, and only when the workspace itself sits on a drive.** PowerShell reads
+/// `/c/Projects` as `\c\Projects` on the current drive, a different directory, which must not be
+/// judged as the workspace. On a machine with no drive letters `/c/` is an ordinary directory
+/// name, and a workspace with no `X:` in it never takes the rewrite.
+///
+/// Used by the two checks that can ALLOW and by nothing that refuses. `deletes_outside_cwd` and the
+/// write guards still read `/c/…` as outside, which costs an approval and never lets anything
+/// through.
+fn with_git_bash_drive(path: &str, shell: crate::command_reader::Shell, workspace: &str) -> String {
+    let bytes = path.as_bytes();
+    let names_a_drive = shell == crate::command_reader::Shell::Posix
+        && workspace.as_bytes().get(1) == Some(&b':')
+        && bytes.first() == Some(&b'/')
+        && bytes.get(1).is_some_and(u8::is_ascii_alphabetic)
+        && matches!(bytes.get(2), None | Some(b'/'));
+    if names_a_drive {
+        format!(
+            "{}:{}",
+            char::from(bytes[1]).to_ascii_uppercase(),
+            &path[2..]
+        )
+    } else {
+        path.to_owned()
+    }
 }
 
 fn classification(decision: &str, action_class: &'static str, reason: &str) -> Classification {
@@ -1886,7 +1926,11 @@ fn is_absolute_path(path: &str) -> bool {
 ///
 /// A bare `README.md` — no separator, no leading `.` — is not read as a path either. It could as
 /// easily be a subcommand, and `./README.md` is available to anyone who means the file.
-fn confined_to_workspace(segment: &str, cwd: Option<&Path>) -> bool {
+fn confined_to_workspace(
+    segment: &str,
+    cwd: Option<&Path>,
+    shell: crate::command_reader::Shell,
+) -> bool {
     let Some(cwd) = cwd else {
         return false;
     };
@@ -1916,7 +1960,8 @@ fn confined_to_workspace(segment: &str, cwd: Option<&Path>) -> bool {
         if candidate.starts_with('~') || candidate.contains('$') || candidate.contains('%') {
             return false;
         }
-        let resolved = fold_for_containment(&normalize_path(candidate, Some(cwd)));
+        let resolved = with_git_bash_drive(candidate, shell, &workspace);
+        let resolved = fold_for_containment(&normalize_path(&resolved, Some(cwd)));
         if resolved != workspace && !resolved.starts_with(&format!("{workspace}/")) {
             return false;
         }
@@ -2646,6 +2691,96 @@ mod tests {
                 "read-local",
             );
         }
+    }
+
+    /// Git bash names a drive `/c/`, and a path into the workspace spelled that way is a path into
+    /// the workspace. Job 26's replan node, 2026-09-13, was refused the first line below, unattended.
+    #[test]
+    fn a_git_bash_drive_path_is_the_drive_it_names() {
+        let on_a_drive = Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-26");
+        let judge = |tool: &str, command: &str, cwd: &Path, unrecognized: Unrecognized| {
+            super::classify(
+                tool,
+                &json!({ "command": command }),
+                Some(cwd),
+                &crate::github::Policy::empty(),
+                &shell_rules(&[], &[]),
+                unrecognized,
+            )
+        };
+
+        for command in [
+            r#"cd "/c/Projects/nucleos/.nucleos/worktrees/job-26" && git status && echo "---DIFF---" && git diff --stat"#,
+            "cd /c/Projects/nucleos/.nucleos/worktrees/job-26/core",
+            "mkdir -p /c/Projects/nucleos/.nucleos/worktrees/job-26/target/x",
+        ] {
+            assert_classification(
+                judge("Bash", command, on_a_drive, Unrecognized::AsksAPerson),
+                "allow",
+                "read-local",
+            );
+        }
+        // The confinement rule reads the same spelling the same way.
+        assert_eq!(
+            judge(
+                "Bash",
+                "frobnicate /c/Projects/nucleos/.nucleos/worktrees/job-26/core/src/vcs.rs",
+                on_a_drive,
+                Unrecognized::MayBeConfined,
+            )
+            .decision
+            .decision,
+            "allow"
+        );
+
+        // Still the drive it names, so the rest of the drive is still outside.
+        for command in [
+            "cd /c/Windows",
+            "cd /c",
+            "cd /d/Projects/nucleos/.nucleos/worktrees/job-26",
+        ] {
+            assert_classification(
+                judge("Bash", command, on_a_drive, Unrecognized::AsksAPerson),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+        assert_eq!(
+            judge(
+                "Bash",
+                "frobnicate /c/Windows/win.ini",
+                on_a_drive,
+                Unrecognized::MayBeConfined
+            )
+            .decision
+            .decision,
+            "pending_approval"
+        );
+
+        // PowerShell reads `/c/Projects` as `\c\Projects` on the current drive: not the workspace.
+        assert_classification(
+            judge(
+                "PowerShell",
+                "cd /c/Projects/nucleos/.nucleos/worktrees/job-26",
+                on_a_drive,
+                Unrecognized::AsksAPerson,
+            ),
+            "pending_approval",
+            "unrecognized",
+        );
+
+        // With no drive in the workspace, `/c/` is an ordinary directory and is left alone: a
+        // rewrite here would put the workspace's own subdirectory outside it.
+        assert_classification(
+            judge(
+                "Bash",
+                "cd /c/repo/sub",
+                Path::new("/c/repo"),
+                Unrecognized::AsksAPerson,
+            ),
+            "allow",
+            "read-local",
+        );
     }
 
     #[test]
