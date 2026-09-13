@@ -2771,6 +2771,9 @@ pub fn implement_prompt(
          {description}\n\n\
          The full queue is in {artifacts}/plan.json for context. Do not start another item and do \
          not edit that file. Your work is verified after you finish, so leave the tree building. \
+         That check is the project's gate, and it runs the whole test suite the moment you stop, \
+         so do not run the whole suite yourself: run the narrowest check that tells you your change \
+         works. A command that prints nothing for long is taken for a hang, and it ends this item. \
          Leave it UNCOMMITTED: the job commits for you once the gate agrees, and committing by hand \
          stops this item to ask permission for something already arranged.",
         ordinal + 1
@@ -2794,7 +2797,8 @@ pub fn implement_prompt(
             "\n\nThis item has been attempted before. That attempt finished, the project's gate ran \
              over the tree, and the gate said no — this is the tail of what it printed:\n\n{output}\n\n\
              The work that attempt left is still in the tree: nothing was undone, so you are \
-             continuing it rather than starting again. Make the gate agree."
+             continuing it rather than starting again. Make the gate agree: the tail says which \
+             step went red, so re-run that step, not the whole gate."
         ));
     }
     prompt
@@ -10841,6 +10845,31 @@ mod tests {
         assert!(!without.contains("replaces"), "{without}");
     }
 
+    /// Job 26, 2026-09-13: a retry sent back for formatting alone ran the whole test suite through
+    /// `| tail`, printed nothing for thirty minutes, and was killed as a hang with its fix unsaved.
+    #[test]
+    fn an_implement_node_is_told_the_gate_runs_the_suite_so_it_need_not() {
+        let first = implement_prompt("x", 0, 1, "/wt/.nucleos", &[], None, None);
+        assert!(
+            first.contains("do not run the whole suite yourself"),
+            "{first}"
+        );
+        assert!(first.contains("taken for a hang"), "{first}");
+        let retry = implement_prompt(
+            "x",
+            0,
+            1,
+            "/wt/.nucleos",
+            &[],
+            Some("gates FAILED:\n  core: fmt"),
+            None,
+        );
+        assert!(
+            retry.contains("re-run that step, not the whole gate"),
+            "{retry}"
+        );
+    }
+
     /// A replan that could not answer stops the job; it does not fail it.
     ///
     /// The rounds that ran are on the branch, gated green, and worth looking at. `failed` for want of
@@ -12097,7 +12126,11 @@ mod tests {
              write the thing\n\n\
              The full queue is in /wt/.nucleos/plan.json for context. Do not start another item \
              and do not edit that file. Your work is verified after you finish, so leave the tree \
-             building. Leave it UNCOMMITTED: the job commits for you once the gate agrees, and \
+             building. That check is the project's gate, and it runs the whole test suite the \
+             moment you stop, so do not run the whole suite yourself: run the narrowest check \
+             that tells you your change works. A command that prints nothing for long is taken \
+             for a hang, and it ends this item. Leave it UNCOMMITTED: the job commits for you \
+             once the gate agrees, and \
              committing by hand stops this item to ask permission for something already arranged."
         );
         // Said twice on purpose: the equality above is the guarantee, and this says what it is a
