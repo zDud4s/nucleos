@@ -67,6 +67,10 @@ struct PlanFile {
 
 #[derive(Debug, Deserialize)]
 struct PlanItem {
+    /// The unfinished items this one takes over, numbered as the replan prompt lists them
+    /// (one-based). Only a replan is shown any, so only a replan's items carry this.
+    #[serde(default)]
+    replaces: Vec<i64>,
     description: String,
     /// `Option`, and the distinction it carries is the whole of decision 10: **an absent key is not
     /// an empty list**.
@@ -121,6 +125,8 @@ pub struct PlannedItem {
 /// A validated work queue, plus however much of it did not fit.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PlannedItems {
+    /// Every unfinished item the plan says it takes over, as zero-based ordinals.
+    pub replaces: Vec<usize>,
     pub items: Vec<PlannedItem>,
     /// Items the daemon's ceiling cut. Carried rather than discarded so the feed can say what was
     /// left out — a queue silently trimmed reads downstream as the whole of what the planner found.
@@ -394,13 +400,22 @@ pub fn parse_plan(
 
     let total = parsed.items.len();
     let mut items = Vec::with_capacity(total.min(max_items));
+    let mut replaced: Vec<usize> = Vec::new();
     for (index, item) in parsed.items.into_iter().take(max_items).enumerate() {
         let PlanItem {
             description,
+            replaces,
             files,
             depends_on,
             agent_id,
         } = item;
+        // A zero or a negative names no item the prompt listed, so it names nothing.
+        replaced.extend(
+            replaces
+                .into_iter()
+                .filter(|number| *number >= 1)
+                .map(|number| (number - 1) as usize),
+        );
         let (files, depends_on, agent_id) = match graph {
             Some(graph) => {
                 let (files, depends_on, agent_id) =
@@ -420,7 +435,10 @@ pub fn parse_plan(
         });
     }
 
+    replaced.sort_unstable();
+    replaced.dedup();
     Ok(PlannedItems {
+        replaces: replaced,
         dropped: total - items.len(),
         items,
         // `done` wins over any items alongside it, and the alternative would be worse in both
@@ -498,6 +516,8 @@ pub enum ItemState {
     /// person was asked to decide about; nobody is being asked anything about an orphan, and the
     /// thing that broke is already in the queue saying so.
     Orphaned,
+    /// Taken over by an item of a later round. Stored as [`STATUS_SUPERSEDED`].
+    Superseded,
 }
 
 /// Every variant of [`ItemState`], for the tests that have to say something about all of them.
@@ -506,7 +526,7 @@ pub enum ItemState {
 /// derive macro for the sake of one array, and the alternative to both — tests that enumerate the
 /// states inline — is what lets a new variant be born untested everywhere at once.
 #[cfg(test)]
-const EVERY_ITEM_STATE: [ItemState; 14] = [
+const EVERY_ITEM_STATE: [ItemState; 15] = [
     ItemState::Pending,
     ItemState::Running,
     ItemState::Implemented,
@@ -521,6 +541,7 @@ const EVERY_ITEM_STATE: [ItemState; 14] = [
     ItemState::Conflicted,
     ItemState::Reverted,
     ItemState::Orphaned,
+    ItemState::Superseded,
 ];
 
 /// Whether the job still owes a review node.
@@ -1155,6 +1176,8 @@ fn never_lands(state: ItemState) -> bool {
             | ItemState::Cancelled
             | ItemState::Skipped
             | ItemState::Orphaned
+            // Its own work never lands: the item that took it over is a different item.
+            | ItemState::Superseded
     )
 }
 
@@ -1277,6 +1300,9 @@ fn ending(job: &JobView) -> Outcome {
 ///
 /// `Cancelled` is deliberately absent. It stops the job at the short-circuit, team or no team, and
 /// never reaches here.
+///
+/// `Superseded` is absent too, and that absence is the point of the state: a later round took the
+/// failure over, and the item that did is the one read here.
 fn failed_ending(job: &JobView) -> Option<Outcome> {
     if job
         .items
@@ -1343,6 +1369,7 @@ fn item_state_from(status: &str, gate_attempts: i64, gate_retries: i64) -> ItemS
         "gate_failed" => ItemState::GateFailed,
         "gate_errored" => ItemState::GateErrored,
         STATUS_SKIPPED => ItemState::Skipped,
+        STATUS_SUPERSEDED => ItemState::Superseded,
         // The four states of parallel items. Nothing writes these rows yet, and they are read
         // ahead of the writer on purpose: the `_ =>` below would take any of them for `pending`
         // and hand the item back to the queue as work nobody had started.
@@ -1395,7 +1422,8 @@ impl ItemState {
             | ItemState::Skipped
             | ItemState::Merging
             | ItemState::Reverted
-            | ItemState::Orphaned => None,
+            | ItemState::Orphaned
+            | ItemState::Superseded => None,
         }
     }
 }
@@ -1652,6 +1680,13 @@ pub const STATUS_CANCELLED: &str = "cancelled";
 /// [`TERMINAL_STATUSES`] below: that list is job endings, and a skipped item ends nothing — the job
 /// carries on to the next one, which is the whole point of it.
 pub const STATUS_SKIPPED: &str = "skipped";
+
+/// An unfinished item a later round's replan said it takes over. Terminal, and not a failure: the
+/// item that replaced it is judged in its place, which is what lets a job that went round again
+/// after a failure end as something other than `failed`. Measured on job 26, 2026-09-13: its round-0
+/// item failed, round 1 redid the same work and passed the gate, and the job was still reported
+/// `failed` because nothing told the ending that the failure had been answered.
+pub const STATUS_SUPERSEDED: &str = "superseded";
 
 /// Every ending this module can write.
 ///
@@ -2639,7 +2674,18 @@ pub fn replan_prompt(
                 ),
             }
         }
+        lines.push_str(
+            "\nAn item of yours that takes one of these over says so with \"replaces\": [N], N \
+             being the number it has above. The job then judges it by that item instead of by the \
+             old failure. Leave \"replaces\" out for new work; a failure nothing takes over still \
+             decides how the job ends.\n",
+        );
         lines
+    };
+    let replaces_key = if unfinished.is_empty() {
+        ""
+    } else {
+        ", \"replaces\": []"
     };
     // The graph rules are repeated here word for word rather than referred to, and the reason is
     // that the node reading them is not the node that read them before. A replan writes items into
@@ -2671,7 +2717,7 @@ pub fn replan_prompt(
          Decide whether the task below is finished. Write ONE of these to {artifacts}/plan.json and \
          change nothing else:\n\n\
          {{\"done\": true, \"why\": \"...\"}}\n\
-         {{\"items\": [{{\"description\": \"...\"{shape}}}]}}\n\n\
+         {{\"items\": [{{\"description\": \"...\"{shape}{replaces_key}}}]}}\n\n\
          {rules}\
          That file is the only thing that is read; anything you print is discarded. Prefer \
          {{\"done\": true}} when the task is met — saying so ends the job in one node, where \
@@ -2725,6 +2771,9 @@ pub fn implement_prompt(
          {description}\n\n\
          The full queue is in {artifacts}/plan.json for context. Do not start another item and do \
          not edit that file. Your work is verified after you finish, so leave the tree building. \
+         That check is the project's gate, and it runs the whole test suite the moment you stop, \
+         so do not run the whole suite yourself: run the narrowest check that tells you your change \
+         works. A command that prints nothing for long is taken for a hang, and it ends this item. \
          Leave it UNCOMMITTED: the job commits for you once the gate agrees, and committing by hand \
          stops this item to ask permission for something already arranged.",
         ordinal + 1
@@ -2748,7 +2797,8 @@ pub fn implement_prompt(
             "\n\nThis item has been attempted before. That attempt finished, the project's gate ran \
              over the tree, and the gate said no — this is the tail of what it printed:\n\n{output}\n\n\
              The work that attempt left is still in the tree: nothing was undone, so you are \
-             continuing it rather than starting again. Make the gate agree."
+             continuing it rather than starting again. Make the gate agree: the tail says which \
+             step went red, so re-run that step, not the whole gate."
         ));
     }
     prompt
@@ -3307,6 +3357,22 @@ async fn open_the_next_round(
         .bind(files)
         .bind(edges(&item.depends_on))
         .bind(item.agent_id.as_deref())
+        .execute(pool)
+        .await?;
+    }
+
+    // A failure the new round takes over stops deciding how the job ends; its replacement does.
+    // Only an item that is actually unfinished, from an earlier round, can be superseded - a number
+    // naming anything else is ignored rather than trusted, which is what the `WHERE` is for.
+    for ordinal in &planned.replaces {
+        sqlx::query(
+            "UPDATE job_items SET status = ?
+             WHERE job_id = ? AND ordinal = ? AND round < ? AND status IN ('gate_failed', 'failed')",
+        )
+        .bind(STATUS_SUPERSEDED)
+        .bind(job.id)
+        .bind(*ordinal as i64)
+        .bind(round)
         .execute(pool)
         .await?;
     }
@@ -6821,7 +6887,8 @@ mod tests {
                 | ItemState::Merging
                 | ItemState::Conflicted
                 | ItemState::Reverted
-                | ItemState::Orphaned => (),
+                | ItemState::Orphaned
+                | ItemState::Superseded => (),
             };
         }
     }
@@ -6853,7 +6920,8 @@ mod tests {
                 | ItemState::GateFailed
                 | ItemState::GateErrored
                 | ItemState::Skipped
-                | ItemState::Orphaned => false,
+                | ItemState::Orphaned
+                | ItemState::Superseded => false,
             }
         }
 
@@ -10644,6 +10712,164 @@ mod tests {
         );
     }
 
+    /// The replan names the unfinished items it takes over, one-based as it was shown them.
+    #[test]
+    fn a_replan_item_names_the_unfinished_items_it_takes_over() {
+        let planned = parse_plan(
+            Some(
+                br#"{"items": [{"description": "again", "replaces": [3, 1]}, {"description": "new"}]}"#,
+            ),
+            5,
+            None,
+        )
+        .unwrap();
+        assert_eq!(planned.items.len(), 2);
+        // One-based as the prompt lists them, zero-based as the rows store them.
+        assert_eq!(planned.replaces, vec![0, 2]);
+
+        let nothing = parse_plan(
+            Some(br#"{"items": [{"description": "x", "replaces": [0]}, {"description": "y"}]}"#),
+            5,
+            None,
+        )
+        .unwrap();
+        assert!(nothing.replaces.is_empty(), "a zero names no item");
+    }
+
+    /// Read back as what it is. The fallback in `item_state_from` is `Pending`, so a status it did
+    /// not know would come back as work to START - the one reading of a finished item that costs a
+    /// second run of it.
+    #[test]
+    fn a_superseded_item_is_read_back_as_superseded_and_not_as_work_to_do() {
+        assert_eq!(
+            item_state_from(STATUS_SUPERSEDED, 0, 0),
+            ItemState::Superseded
+        );
+        assert_eq!(ItemState::Superseded.claimable_as(), None);
+    }
+
+    /// Job 26, 2026-09-13: its round-0 item failed, round 1 redid it and passed the gate, and the job
+    /// was reported `failed`. With the failure taken over, the ending is read from what is left.
+    #[test]
+    fn a_failure_a_later_round_took_over_no_longer_decides_the_ending() {
+        let closing = |items: &[ItemState], replanned: Replan, max_rounds: i64| {
+            view_in_round(
+                items,
+                ReviewState::Done,
+                RoundState {
+                    round: 1,
+                    max_rounds,
+                    replanned,
+                    a_broken_item_may_go_round_again: true,
+                    ..RoundState::default()
+                },
+            )
+        };
+        let taken_over = [ItemState::Superseded, ItemState::Passed];
+        let not_taken_over = [ItemState::Failed, ItemState::Passed];
+
+        // The replan confirmed the task is met: completed, which the failure used to forbid.
+        assert_eq!(
+            next_step(&closing(&taken_over, Replan::Done, 3)),
+            Next::Finish(Outcome::Completed)
+        );
+        // Out of rounds with nobody confirming: stopped, the honest reading of green work that was
+        // never declared finished - and no longer `failed`, which is what job 26 was told.
+        assert_eq!(
+            next_step(&closing(&taken_over, Replan::NotYet, 2)),
+            Next::Finish(Outcome::Stopped)
+        );
+        // A failure nothing took over still decides, exactly as before.
+        assert_eq!(
+            next_step(&closing(&not_taken_over, Replan::NotYet, 2)),
+            Next::Finish(Outcome::Failed)
+        );
+    }
+
+    /// The next round marks what it takes over, and only what may be taken over: an unfinished item
+    /// of an earlier round. A number naming finished work is ignored rather than trusted.
+    #[tokio::test]
+    async fn opening_a_round_supersedes_only_the_unfinished_items_it_names() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_items(&pool, job_id, &["failed", "passed", "gate_failed"]).await;
+        sqlx::query("UPDATE jobs SET max_rounds = 5 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_node(&pool, job_id, "replan", "completed").await;
+        write_plan(
+            worktree.path(),
+            r#"{"items": [{"description": "item 1 again", "replaces": [1, 2]}, {"description": "new"}]}"#,
+        )
+        .await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            statuses,
+            [
+                STATUS_SUPERSEDED,
+                "passed",
+                "gate_failed",
+                "pending",
+                "pending"
+            ],
+            "item 1 taken over, item 2 was finished and stays, item 3 was not named and stays"
+        );
+    }
+
+    /// Told how to take a failure over when there is one, and not burdened with it when there is not.
+    #[test]
+    fn a_replan_is_told_how_to_take_over_what_broke_and_only_when_something_did() {
+        let broke = Unfinished {
+            ordinal: 0,
+            description: "the flaky test".to_owned(),
+            gate_output: None,
+        };
+        let with = replan_prompt("t", 0, &[], "/wt/.nucleos", None, &[broke]);
+        assert!(with.contains("\"replaces\": [N]"), "{with}");
+        assert!(with.contains("\"replaces\": []"), "{with}");
+        let without = replan_prompt("t", 0, &[], "/wt/.nucleos", None, &[]);
+        assert!(!without.contains("replaces"), "{without}");
+    }
+
+    /// Job 26, 2026-09-13: a retry sent back for formatting alone ran the whole test suite through
+    /// `| tail`, printed nothing for thirty minutes, and was killed as a hang with its fix unsaved.
+    #[test]
+    fn an_implement_node_is_told_the_gate_runs_the_suite_so_it_need_not() {
+        let first = implement_prompt("x", 0, 1, "/wt/.nucleos", &[], None, None);
+        assert!(
+            first.contains("do not run the whole suite yourself"),
+            "{first}"
+        );
+        assert!(first.contains("taken for a hang"), "{first}");
+        let retry = implement_prompt(
+            "x",
+            0,
+            1,
+            "/wt/.nucleos",
+            &[],
+            Some("gates FAILED:\n  core: fmt"),
+            None,
+        );
+        assert!(
+            retry.contains("re-run that step, not the whole gate"),
+            "{retry}"
+        );
+    }
+
     /// A replan that could not answer stops the job; it does not fail it.
     ///
     /// The rounds that ran are on the branch, gated green, and worth looking at. `failed` for want of
@@ -11900,7 +12126,11 @@ mod tests {
              write the thing\n\n\
              The full queue is in /wt/.nucleos/plan.json for context. Do not start another item \
              and do not edit that file. Your work is verified after you finish, so leave the tree \
-             building. Leave it UNCOMMITTED: the job commits for you once the gate agrees, and \
+             building. That check is the project's gate, and it runs the whole test suite the \
+             moment you stop, so do not run the whole suite yourself: run the narrowest check \
+             that tells you your change works. A command that prints nothing for long is taken \
+             for a hang, and it ends this item. Leave it UNCOMMITTED: the job commits for you \
+             once the gate agrees, and \
              committing by hand stops this item to ask permission for something already arranged."
         );
         // Said twice on purpose: the equality above is the guarantee, and this says what it is a

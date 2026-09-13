@@ -569,6 +569,8 @@ async fn declared_sets(
 /// Removing a state from the predicted set is the unsafe direction — a path that leaves the
 /// intersection turns a `Collide` into a `Clean` — and what makes it safe here is precisely that
 /// these three have trees. `orphaned` never gets one and never writes, so there is nothing to lose.
+/// `superseded` leaves for the same reason: a later round took its work over, and it never runs
+/// again.
 const DECLARED_SETS_SQL: &str = "SELECT worktrees.owner_id, job_items.id, jobs.team_id,
             job_items.files
      FROM worktrees
@@ -579,7 +581,8 @@ const DECLARED_SETS_SQL: &str = "SELECT worktrees.owner_id, job_items.id, jobs.t
        AND worktrees.owner_kind = 'job'
        AND job_items.status NOT IN ('implemented','passed','failed','cancelled',
                                     'gate_failed','gate_errored','skipped',
-                                    'merging','conflicted','reverted','orphaned')
+                                    'merging','conflicted','reverted','orphaned',
+                                    'superseded')
      ORDER BY worktrees.owner_id, job_items.id";
 
 #[cfg(test)]
@@ -1367,6 +1370,8 @@ mod tests {
             "conflicted",
             "reverted",
             "orphaned",
+            // Taken over by a later round: terminal, and it never writes again.
+            crate::job::STATUS_SUPERSEDED,
         ];
         for status in finished {
             assert!(

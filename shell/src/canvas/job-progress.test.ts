@@ -31,6 +31,7 @@ const EVERY_STORED_STATUS = [
   "conflicted",
   "reverted",
   "orphaned",
+  "superseded",
 ];
 
 function job(over: Partial<Job> = {}): Job {

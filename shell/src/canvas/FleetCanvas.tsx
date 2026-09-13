@@ -468,6 +468,8 @@ function itemReading(item: Pick<JobItem, "status">): string {
       return "taken back off the branch";
     case "orphaned":
       return "never attempted — something it needed did not land";
+    case "superseded":
+      return "taken over by a later round";
     default:
       // The core reads an unknown status as still-to-do rather than as done,
       // and so does this. Safe in the core, where erring toward "not finished"
