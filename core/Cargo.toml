@@ -67,5 +67,12 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
 ] }
 
+# `process_tree.rs` only, for `killpg(2)`: signalling a process group without a `kill` program whose
+# parsing of a negative pid is the program's to get wrong (measured: procps-ng 4.0.4 on Ubuntu 24.04
+# read `kill -KILL -<pid>` as every process of the user). Already in the lock file as a dependency of
+# tokio and others, so this declares what is already built rather than adding a tree.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.27.0"

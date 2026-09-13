@@ -2671,20 +2671,26 @@ pub(crate) mod tests {
         );
     }
 
-    /// `Duration::ZERO` takes the deadline branch without needing a slow git command to exist.
+    /// A git command still running when its deadline passes is killed and reported, never awaited.
     ///
-    /// The mechanism, stated precisely because "it is already elapsed" is not quite it: `timeout`
-    /// polls the inner future first and the timer second, and tokio rounds a sleep deadline up to
-    /// the next 1ms tick. So what this relies on is that a Windows `git` process cannot be spawned,
-    /// executed and reaped inside a millisecond — a margin of one to two orders of magnitude, not a
-    /// coin flip.
+    /// The command is a shell alias that sleeps, so git cannot finish first on any platform. It used
+    /// to be `rev-parse HEAD` under `Duration::ZERO`, which relied on git not being spawned, run and
+    /// reaped inside tokio's first 1ms timer tick: true on Windows, false on Linux, where git won and
+    /// the test failed (measured in WSL2 Ubuntu 24.04, 2026-09-12). Production is not exposed to it:
+    /// every caller refuses a spent budget before spawning (`remaining`, and the
+    /// `saturating_duration_since` check beside each direct `run_git` call), so `Duration::ZERO`
+    /// reaches this function only from here.
     #[tokio::test]
     async fn a_git_command_that_outlives_its_deadline_is_reported_rather_than_awaited() {
         let (_container, repo) = init_contained_repo("nucleos-gitexec-deadline-");
 
         let error = run_git(
             &repo,
-            &[OsStr::new("rev-parse"), OsStr::new("HEAD")],
+            &[
+                OsStr::new("-c"),
+                OsStr::new("alias.nap=!sleep 30"),
+                OsStr::new("nap"),
+            ],
             std::time::Duration::ZERO,
         )
         .await

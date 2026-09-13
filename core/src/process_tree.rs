@@ -38,7 +38,7 @@
 /// Prepares `command` so a `TreeKiller` on its pid can name every process it goes on to spawn.
 ///
 /// Unix only, because that is the platform whose primitive has to exist before the child does: the
-/// child becomes its own process-group leader, so `kill -KILL -<pid>` reaches it and everything it
+/// child becomes its own process-group leader, so `killpg` on its pid reaches it and everything it
 /// spawned — and nothing else. It also detaches the child from the daemon's terminal group, which is
 /// wanted anyway: a Ctrl-C in the daemon's console should not reach a gate command mid-measurement.
 ///
@@ -198,16 +198,38 @@ fn taskkill_tree(pid: u32) {
         .status();
 }
 
-/// The negative pid is a process GROUP, which is why `spawn_in_own_group` is not optional. A child
-/// spawned without it inherits the daemon's group, and this line then either names a group that does
-/// not exist or names one the daemon shares with processes nobody asked us to touch.
+/// Sends `signal` to the process group `pid` leads, and to nothing else.
+///
+/// `killpg(2)` and not the `kill` program, and the reason was measured rather than reasoned: Ubuntu
+/// 24.04's `/usr/bin/kill` (procps-ng 4.0.4) misreads `kill -KILL -<pid>` (`kill -0 -99999`, a group
+/// that does not exist, exits 0) and with `-KILL` the signal reached every process of the user, the
+/// WSL session itself included. The arguments this module passed were right; the binary was the
+/// fault, and a kill that is only as safe as whichever `kill` is first on PATH is not one to run from
+/// a destructor. The syscall takes the group id as a positive number: no sign left to misparse.
+///
+/// Refuses 0 and 1 before the call: `killpg(0, _)` is the CALLER's own group, which would take the
+/// daemon down with the tree, and group 1 is init's. A pid that does not fit a `pid_t` names no group.
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    let group = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|group| *group > 1)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: `killpg` reads two integers and touches no memory of this process.
+    if unsafe { libc::killpg(group, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `pid` names a process GROUP here, which is why `spawn_in_own_group` is not optional. A child
+/// spawned without it inherits the daemon's group, and then no group with this id exists: `killpg`
+/// fails with ESRCH and kills nothing, rather than reaching processes nobody asked us to touch.
 #[cfg(not(windows))]
 fn kill_process_group(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-KILL", &format!("-{pid}")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    // Best effort, as `taskkill_tree` is: this runs from `Drop` and has nobody to report to.
+    let _ = signal_group(pid, libc::SIGKILL);
 }
 
 #[cfg(windows)]
@@ -342,6 +364,93 @@ mod tests {
             .kill_on_drop(true);
         spawn_in_own_group(&mut command);
         command
+    }
+
+    #[cfg(unix)]
+    type Lines = tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>;
+
+    /// A shell in a group of its own that prints `ready`, then `got` if and only if SIGURG reaches it.
+    ///
+    /// SIGURG because its default action is to be IGNORED: should `signal_group` ever regress into a
+    /// broadcast (what procps-ng's misparse did with SIGKILL, taking the whole WSL session down), every
+    /// process without this trap, the test runner included, does not notice.
+    #[cfg(unix)]
+    fn urg_listener() -> (tokio::process::Child, Lines) {
+        use tokio::io::AsyncBufReadExt;
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap 'echo got; exit 0' URG; echo ready; while :; do sleep 1; done")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        spawn_in_own_group(&mut command);
+        let mut child = command.spawn().expect("`sh` must be on PATH");
+        let stdout = child.stdout.take().expect("stdout was piped");
+        (child, tokio::io::BufReader::new(stdout).lines())
+    }
+
+    /// The assertion the procps-ng misparse failed: a signal to one group reaches that group and no
+    /// other process. The sentinel sits in a group of its own, outside the target's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signalling_a_group_reaches_only_that_group() {
+        let (mut target, mut target_says) = urg_listener();
+        let (mut sentinel, mut sentinel_says) = urg_listener();
+        for says in [&mut target_says, &mut sentinel_says] {
+            let line = tokio::time::timeout(Duration::from_secs(10), says.next_line())
+                .await
+                .expect("the shell never said it was ready")
+                .expect("reading the pipe must succeed");
+            assert_eq!(line.as_deref(), Some("ready"));
+        }
+
+        signal_group(target.id().expect("a live child has a pid"), libc::SIGURG)
+            .expect("the target's group exists");
+
+        let heard = tokio::time::timeout(Duration::from_secs(10), target_says.next_line())
+            .await
+            .expect("the signal never reached the group it named")
+            .expect("reading the pipe must succeed");
+        assert_eq!(heard.as_deref(), Some("got"));
+        // Past the one-second `sleep` a trap waits behind, so silence here is not latency.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), sentinel_says.next_line())
+                .await
+                .is_err(),
+            "a process outside the group heard a signal sent to the group"
+        );
+
+        // `Child::kill`, never a group kill: it names exactly one pid, so this cleanup cannot become
+        // the broadcast the test exists to rule out.
+        let _ = target.kill().await;
+        let _ = sentinel.kill().await;
+    }
+
+    /// The probe that caught procps-ng: `kill -0 -99999` exited 0 for a group that does not exist.
+    /// `i32::MAX` is above every pid Linux (`pid_max` at most 2^22) or macOS (99999) can issue, and
+    /// signal 0 delivers nothing either way.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_that_does_not_exist_is_an_error() {
+        let error = signal_group(i32::MAX as u32, 0).expect_err("no such group can exist");
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH), "got: {error}");
+    }
+
+    /// Refused before the syscall: `killpg(0, _)` is the caller's own group (the test runner here, the
+    /// daemon in production) and group 1 is init's. Signal 0, so a regression reports, never delivers.
+    #[cfg(unix)]
+    #[test]
+    fn the_callers_own_group_and_init_are_never_signalled() {
+        for pid in [0, 1, u32::MAX] {
+            let error = signal_group(pid, 0).expect_err("this pid names no group of ours");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "pid {pid}: {error}"
+            );
+        }
     }
 
     /// The case `kill_on_drop` and `TreeKiller` both miss, and the one that actually happens.
