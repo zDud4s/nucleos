@@ -282,7 +282,6 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "git reflog",
     "cargo test",
     "cargo check",
-    "cargo fmt --check",
     "cargo clippy",
     // **`cargo build` was missing, and its absence was an omission rather than a decision.** The
     // three above compile the crate and run `build.rs` exactly as this does — `cargo test` goes
@@ -397,6 +396,12 @@ const SAFE_EXACT_COMMANDS: &[&str] = &[
     "git remote",
     "git remote -v",
     "git remote --verbose",
+    // Exact, because `cargo` followed by anything is every cargo subcommand there is. Asked by an
+    // implement node of job 26 on 2026-09-13 before it went near the gate's formatting, and
+    // refused. `-v` is `-V` after `normalize_command` has lowercased it; typed as `-v` it is cargo's
+    // verbose flag with no subcommand, which prints the usage and does nothing else either.
+    "cargo --version",
+    "cargo -v",
 ];
 
 pub struct Classification {
@@ -1420,7 +1425,35 @@ fn has_shell_control(command: &str) -> bool {
 fn is_safe_command(command: &str) -> bool {
     shell_form_is_readable(command)
         && (SAFE_EXACT_COMMANDS.contains(&command)
-            || matches_command_prefix(command, SAFE_COMMAND_PREFIXES))
+            || matches_command_prefix(command, SAFE_COMMAND_PREFIXES)
+            || checks_formatting_without_writing(command))
+}
+
+/// `cargo fmt` with `--check` anywhere in it: rustfmt reports what it would change and writes
+/// nothing.
+///
+/// A rule rather than a list entry, because the list matches on a prefix and this flag moves. The
+/// gate runs `cargo fmt --all -- --check` (`scripts/gates.sh`) while the list held only
+/// `cargo fmt --check`, so the one spelling the gate judges a node by was the one a node could not
+/// run. Measured on job 26, 2026-09-13: refused four times across its implement, retry and review
+/// nodes, and its first round went red on `core: fmt` alone with every test passing.
+///
+/// `--emit` is refused beside it: it is how rustfmt is told where to write, and a check has no
+/// business naming a destination. Plain `cargo fmt` stays where `mutating_siblings_remain_pending`
+/// pins it, because without `--check` it rewrites the tree.
+///
+/// **It replaced the list's `cargo fmt --check` entry rather than joining it.** The lists are read
+/// as an OR, so the entry let `cargo fmt --check -- --emit files` through whatever the guard here
+/// said, and the test pinning that refusal went red the first time it ran. One place decides
+/// `cargo fmt` now.
+fn checks_formatting_without_writing(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    tokens.next().map(program_name) == Some("cargo")
+        && tokens.next() == Some("fmt")
+        && command.split_whitespace().any(|token| token == "--check")
+        && !command
+            .split_whitespace()
+            .any(|token| token.starts_with("--emit"))
 }
 
 /// The guards a command has to clear before ANY list may say yes to it, separated from the lists
@@ -2249,6 +2282,12 @@ mod tests {
             "git remote -v",
             "cargo check",
             "cargo fmt --check",
+            // The gate's own spelling, and one with a package before the separator: `--check`
+            // is read wherever it stands, not only straight after `fmt`.
+            "cargo fmt --all -- --check",
+            "cargo fmt -p nucleos-core -- --check",
+            "cargo --version",
+            "cargo -V",
             "cargo clippy",
             // The two an autonomous run parked on overnight on 2026-08-27, both of them the first
             // thing anybody reaches for: a build baseline, and asking where you are.
@@ -2583,6 +2622,32 @@ mod tests {
         }
     }
 
+    /// Every command the `core` gate runs is one a node may run first.
+    ///
+    /// Read from `scripts/gates.sh` itself rather than copied here, because a copy is what drifted:
+    /// the gate said `cargo fmt --all -- --check` and this file allowed `cargo fmt --check`, and
+    /// nothing noticed until job 26 went red on formatting it had been refused the means to check.
+    #[test]
+    fn the_core_gate_asks_nothing_a_node_is_refused() {
+        let gates = include_str!("../../scripts/gates.sh");
+        let commands: Vec<&str> = gates
+            .lines()
+            .filter(|line| line.trim_start().starts_with("run \"core: "))
+            .filter_map(|line| line.split_once(" . ").map(|(_, command)| command.trim()))
+            .collect();
+        assert!(
+            commands.len() >= 3,
+            "expected fmt, clippy and test among the core gate's steps, read {commands:?}"
+        );
+        for command in commands {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
     #[test]
     fn mutating_siblings_remain_pending() {
         for (command, action_class) in [
@@ -2591,6 +2656,10 @@ mod tests {
             ("git checkout .", "unrecognized"),
             ("git remote add origin https://x", "unrecognized"),
             ("cargo fmt", "unrecognized"),
+            ("cargo fmt --all", "unrecognized"),
+            // A check that names a destination is not a check.
+            ("cargo fmt --check -- --emit files", "unrecognized"),
+            ("cargo fmt -- --emit=files --check", "unrecognized"),
             ("cargo clippy --fix", "unrecognized"),
             ("cargo fix", "unrecognized"),
         ] {
