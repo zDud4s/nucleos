@@ -141,6 +141,9 @@ const LIFECYCLE: Record<string, Lifecycle> = {
   // Withdrawn work, not a verdict — `state-map.ts` gives it the `off` tone and never the failure
   // one, and this bucket exists so that this drawing cannot disagree with the badges beside it.
   cancelled: "withdrawn",
+  // A later round took this item's work over: set aside, not a verdict, and the item that
+  // replaced it is the one to read.
+  superseded: "withdrawn",
   // Never attempted, because something it depended on ended badly. Terminal, and a failure of the
   // job even though this item never ran.
   orphaned: "stopped",
@@ -159,6 +162,7 @@ const READING: Record<string, string> = {
   gate_errored: "the gate could not run",
   failed: "failed",
   cancelled: "stopped by somebody",
+  superseded: "taken over by a later round",
   orphaned: "never attempted — something it needed ended badly",
 };
 
