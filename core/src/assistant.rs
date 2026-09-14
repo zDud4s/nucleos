@@ -2300,6 +2300,62 @@ pub(crate) fn tool_policy_for(
     }
 }
 
+/// Chooses the CLI that should answer a conversation turn.
+pub(crate) fn answering_cli(
+    config: &crate::config::ModelsConfig,
+    pinned: Option<&str>,
+) -> &'static str {
+    pinned
+        .and_then(|id| config.runner_of(id))
+        .unwrap_or_else(|| {
+            if config.active_runner() == "codex" {
+                "codex"
+            } else {
+                "claude"
+            }
+        })
+}
+
+/// Chooses a runner for a turn without replacing the daemon's default unnecessarily.
+pub(crate) fn runner_for_turn(
+    daemon: &std::sync::Arc<dyn crate::runner::CommandRunner>,
+    assistants: &dyn crate::assistants::Assistants,
+    config: &crate::config::ModelsConfig,
+    pinned: Option<&str>,
+) -> (
+    std::sync::Arc<dyn crate::runner::CommandRunner>,
+    &'static str,
+) {
+    let cli = answering_cli(config, pinned);
+    if pinned.is_none() || cli == config.active_runner() {
+        (daemon.clone(), cli)
+    } else {
+        (
+            assistants
+                .cli_runner(cli, pinned)
+                .unwrap_or_else(|| daemon.clone()),
+            cli,
+        )
+    }
+}
+
+/// Whether this turn may retain a live CLI process for a later turn.
+pub(crate) fn may_keep_process(policy: crate::runner::ToolPolicy, cli: &str) -> bool {
+    matches!(policy, crate::runner::ToolPolicy::Unrestricted) && cli == "claude"
+}
+
+/// Whether a rooted shell conversation may answer through Codex.
+pub(crate) fn may_answer_on_codex(cwd: Option<&str>) -> bool {
+    tool_policy_for(
+        cwd,
+        Origin::Shell,
+        cwd.is_some_and(|directory| {
+            crate::autopilot::classifier_hook_is_wired(std::path::Path::new(directory))
+        }),
+        false,
+    ) == crate::runner::ToolPolicy::Unrestricted
+}
+
 /// Everything one orchestrator turn is launched with.
 ///
 /// A struct rather than a row of parameters, for the reason `RunRequest` gives about its own: at
@@ -2368,7 +2424,8 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         doctrine,
     } = launch;
     let pool = state.pool.clone();
-    let runner = state.runner.clone();
+    let daemon_runner = state.runner.clone();
+    let assistants = state.assistants.clone();
     let run_timeout = state.run_timeout;
     let control_token = state.token.0.clone();
     let files_root = state.files_root.clone();
@@ -2487,17 +2544,6 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             });
         }
 
-        // Which door this turn goes through. Decided once and named, because the two are not
-        // interchangeable and the reason is a security one before it is a speed one.
-        //
-        // A rooted turn carries a key scoped to its CONVERSATION, minted just above, which stays
-        // true as the turns change under it. An `McpOnly` turn carries the daemon's control token —
-        // safe only because that policy leaves it no Bash, no Read and no Write to look at its own
-        // environment with — and a process holding THAT key, kept alive and idle between turns, is
-        // a different and much worse proposition. So only rooted conversations keep a process, and
-        // the barrier that makes it safe is the same one that earned it the tools.
-        let may_live = matches!(tool_policy, crate::runner::ToolPolicy::Unrestricted);
-
         // Read here rather than carried in from the request that started the turn: it is a property
         // of the conversation at the moment it answers, and somebody who moved the selector while
         // reading the last reply means this turn.
@@ -2567,6 +2613,25 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         let answering = crate::chats::answering(&pool, &turn.slot.chat_id)
             .await
             .unwrap_or_default();
+        let config = crate::config::models_config_now();
+        let (runner, cli) = runner_for_turn(
+            &daemon_runner,
+            assistants.as_ref(),
+            &config,
+            answering.model.as_deref(),
+        );
+
+        // Which door this turn goes through. Decided once and named, because the two are not
+        // interchangeable and the reason is a security one before it is a speed one.
+        //
+        // A rooted turn carries a key scoped to its CONVERSATION, minted just above, which stays
+        // true as the turns change under it. An `McpOnly` turn carries the daemon's control token —
+        // safe only because that policy leaves it no Bash, no Read and no Write to look at its own
+        // environment with — and a process holding THAT key, kept alive and idle between turns, is
+        // a different and much worse proposition. So only rooted Claude conversations keep a
+        // process, and the barrier that makes it safe is the same one that earned it the tools. A
+        // Codex turn has no stdin a later turn can arrive on.
+        let may_live = may_keep_process(tool_policy, cli);
 
         // A turn with no `resume` is a conversation that was deliberately let go of — it read
         // third-party text, or somebody asked for a fresh context — so a process still holding the
@@ -2914,6 +2979,110 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    struct CliAssistants {
+        claude: Option<Arc<dyn crate::runner::CommandRunner>>,
+        codex: Option<Arc<dyn crate::runner::CommandRunner>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::assistants::Assistants for CliAssistants {
+        fn assistant_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: Option<&str>,
+        ) -> Result<Arc<crate::local_agent::LocalAssistant>, crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::RouteNotConfigured)
+        }
+
+        fn serves(&self, _brain: crate::chats::Brain) -> Result<(), crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::RouteNotConfigured)
+        }
+
+        async fn can_serve(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: &str,
+        ) -> Result<(), crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::RouteNotConfigured)
+        }
+
+        async fn declared_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _models: &[String],
+        ) -> std::collections::HashMap<String, crate::capabilities::Declared> {
+            std::collections::HashMap::new()
+        }
+
+        fn cli_runner(
+            &self,
+            cli: &str,
+            _model: Option<&str>,
+        ) -> Option<Arc<dyn crate::runner::CommandRunner>> {
+            match cli {
+                "claude" => self.claude.clone(),
+                "codex" => self.codex.clone(),
+                _ => None,
+            }
+        }
+    }
+
+    fn turn_config() -> crate::config::ModelsConfig {
+        crate::config::ModelsConfig {
+            assistant_choices: vec![
+                crate::config::AssistantChoice {
+                    id: "sonnet".to_string(),
+                    label: "Sonnet".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: ["low", "medium", "high", "xhigh", "max"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    runner: Some("claude".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+                crate::config::AssistantChoice {
+                    id: "opus".to_string(),
+                    label: "Opus".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: ["low", "medium", "high", "xhigh", "max"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    runner: Some("claude".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+                crate::config::AssistantChoice {
+                    id: "gpt-5.6-terra".to_string(),
+                    label: "GPT-5.6 Terra".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: ["low", "medium", "high", "xhigh", "max", "ultra"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    runner: Some("codex".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+                crate::config::AssistantChoice {
+                    id: "gpt-5.5".to_string(),
+                    label: "GPT-5.5".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: ["low", "medium", "high", "xhigh"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    runner: Some("codex".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+            ],
+            ..crate::config::ModelsConfig::default()
+        }
+    }
+
     async fn test_pool() -> SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -3133,6 +3302,72 @@ mod tests {
     /// What `FakeCommandRunner::default` answers, so a test can say "this went down the CLI path"
     /// without asserting on a string whose meaning is not obvious at the call site.
     const CLI_FAKE_REPLY: &str = "fake output";
+
+    #[test]
+    fn a_pinned_codex_model_is_answered_by_the_codex_runner() {
+        let daemon: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let codex: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let assistants = CliAssistants {
+            claude: None,
+            codex: Some(codex.clone()),
+        };
+        let config = turn_config();
+
+        let (runner, cli) = runner_for_turn(&daemon, &assistants, &config, Some("gpt-5.5"));
+        assert!(Arc::ptr_eq(&runner, &codex));
+        assert_eq!(cli, "codex");
+        assert_eq!(answering_cli(&config, Some("gpt-5.5")), "codex");
+
+        let without_codex = CliAssistants {
+            claude: None,
+            codex: None,
+        };
+        let (runner, cli) = runner_for_turn(&daemon, &without_codex, &config, Some("gpt-5.5"));
+        assert!(Arc::ptr_eq(&runner, &daemon));
+        assert_eq!(cli, "codex");
+    }
+
+    #[test]
+    fn an_unpinned_or_claude_pinned_turn_keeps_the_daemons_runner() {
+        let daemon: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let assistants = CliAssistants {
+            claude: Some(Arc::new(FakeCommandRunner::default())),
+            codex: Some(Arc::new(FakeCommandRunner::default())),
+        };
+        let config = turn_config();
+
+        for pinned in [None, Some("sonnet"), Some("not-in-the-catalogue")] {
+            let (runner, cli) = runner_for_turn(&daemon, &assistants, &config, pinned);
+            assert!(Arc::ptr_eq(&runner, &daemon), "{pinned:?}");
+            assert_eq!(cli, "claude", "{pinned:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_rooted_conversation_may_answer_on_codex() {
+        assert!(!may_answer_on_codex(None));
+        let root = tempfile::TempDir::new().unwrap();
+        let cwd = root.path().to_str().unwrap();
+        assert!(!may_answer_on_codex(Some(cwd)));
+        crate::autopilot::wire_classifier_hook(root.path()).unwrap();
+        assert!(may_answer_on_codex(Some(cwd)));
+    }
+
+    #[test]
+    fn a_codex_turn_never_keeps_a_live_process() {
+        assert!(!may_keep_process(
+            crate::runner::ToolPolicy::Unrestricted,
+            "codex"
+        ));
+        assert!(may_keep_process(
+            crate::runner::ToolPolicy::Unrestricted,
+            "claude"
+        ));
+        assert!(!may_keep_process(
+            crate::runner::ToolPolicy::McpOnly,
+            "claude"
+        ));
+    }
 
     #[test]
     fn only_an_explicit_telegram_origin_is_telegram() {

@@ -548,10 +548,13 @@ export function useChats() {
  * an hour rather than `Infinity` so a daemon restart is eventually noticed
  * without the app being restarted too.
  */
-export function useAssistantModels() {
+export function useAssistantModels(chatId?: string) {
   return useQuery({
-    queryKey: keys.chats.models,
-    queryFn: () => apiFetch<AssistantModels>("/assistant/models"),
+    queryKey: chatId === undefined ? keys.chats.models : keys.chats.modelsFor(chatId),
+    queryFn: () =>
+      apiFetch<AssistantModels>(
+        `/assistant/models${chatId === undefined ? "" : `?chat=${encodeURIComponent(chatId)}`}`,
+      ),
     staleTime: 60 * 60 * 1000,
   });
 }

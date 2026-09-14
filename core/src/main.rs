@@ -973,6 +973,8 @@ async fn main() {
             tracing::info!(model = %models_config.codex_model, "codex CLI selected as the run runner");
             Arc::new(runner::CodexCliRunner {
                 model: models_config.codex_model.clone(),
+                // A run keeps the user's Codex config; only chats pin a sandbox (`for_chat`).
+                sandbox_mode: None,
             })
         }
         Some(other) => {
@@ -1153,8 +1155,8 @@ async fn main() {
     // Assembles the assistant that answers a turn from what was just resolved above — one factory
     // in place of the two singletons `local_assistant`/`hosted_assistant` used to be. No production
     // caller until this packet; `AppState.assistants` below is the first one.
-    let assistants: Arc<dyn assistants::Assistants> =
-        Arc::new(assistants::ConfiguredAssistants::new(
+    let assistants: Arc<dyn assistants::Assistants> = Arc::new(
+        assistants::ConfiguredAssistants::new(
             local_model,
             hosted_model,
             hosted_key,
@@ -1162,7 +1164,9 @@ async fn main() {
             token_value.clone(),
             pool.clone(),
             runner::OLLAMA_BASE_URL.to_string(),
-        ));
+        )
+        .with_agent_clis(Arc::new(claude_runner()), models_config.codex_model.clone()),
+    );
 
     let state = AppState {
         token: Token(token_value),

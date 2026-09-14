@@ -150,6 +150,15 @@ pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// effort and the model can be set in separate requests and the model can change afterwards.
 pub fn is_effort_level(config: &ModelsConfig, value: &str) -> bool {
     config.effort_levels().iter().any(|level| level == value)
+        || config
+            .assistant_choices
+            .iter()
+            .any(|choice| choice.efforts.iter().any(|level| level == value))
+}
+
+/// Loads the current models configuration, falling back to defaults on failure.
+pub fn models_config_now() -> ModelsConfig {
+    load_models_config(Path::new(MODELS_CONFIG_PATH)).unwrap_or_default()
 }
 
 fn default_assistant_choices() -> Vec<AssistantChoice> {
@@ -176,6 +185,28 @@ fn default_assistant_choices() -> Vec<AssistantChoice> {
 }
 
 impl ModelsConfig {
+    /// Returns the CLI configured for a cloud model id.
+    pub fn runner_of(&self, id: &str) -> Option<&'static str> {
+        self.assistant_choices
+            .iter()
+            .find(|choice| choice.brain == "cloud" && choice.id == id)
+            .map(|choice| match choice.runner.as_deref() {
+                Some("codex") => "codex",
+                _ => "claude",
+            })
+    }
+
+    /// Returns the model catalogue available to a chat's rooted state.
+    pub fn catalogue_for_chat(&self, installed: &[String], rooted: bool) -> Vec<AssistantChoice> {
+        let mut choices = self.catalogue_scoped(installed, rooted);
+        if !rooted {
+            choices.retain(|choice| {
+                choice.brain != "cloud" || choice.runner.as_deref() != Some("codex")
+            });
+        }
+        choices
+    }
+
     /// The model a conversation runs on when it has pinned none — what the runner was built with.
     ///
     /// Reported beside the catalogue so the window can name the unpinned state instead of leaving
@@ -229,6 +260,11 @@ impl ModelsConfig {
     /// Ollama degrades to precisely today's behaviour rather than to some other empty state --
     /// trivially true here since `catalogue()` now calls this function with an empty slice.
     pub fn catalogue_with_installed(&self, installed: &[String]) -> Vec<AssistantChoice> {
+        self.catalogue_scoped(installed, false)
+    }
+
+    /// Builds a model catalogue limited to one runner or open to every runner.
+    fn catalogue_scoped(&self, installed: &[String], every_runner: bool) -> Vec<AssistantChoice> {
         // Only the models belonging to the CLI this daemon was actually started with. The file may
         // hold both lists — `scripts/refresh-models.py` writes both when it can reach both — and
         // offering `sonnet` to a daemon running Codex would produce a turn that dies at spawn.
@@ -241,7 +277,9 @@ impl ModelsConfig {
         // Cloud only. The local route is the same whichever CLI is configured, so filtering it by
         // the runner would hide a working model for a reason that has nothing to do with it.
         choices.retain(|choice| {
-            choice.brain != "cloud" || choice.runner.as_deref().unwrap_or("claude") == active
+            choice.brain != "cloud"
+                || every_runner
+                || choice.runner.as_deref().unwrap_or("claude") == active
         });
         // A file that says nothing about the running CLI would otherwise produce an empty menu.
         // The configured model always works — it is what the runner was built with.
@@ -1883,6 +1921,125 @@ fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn chat_choices() -> Vec<AssistantChoice> {
+        vec![
+            AssistantChoice {
+                id: "sonnet".to_string(),
+                label: "Sonnet".to_string(),
+                brain: "cloud".to_string(),
+                efforts: ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                runner: Some("claude".to_string()),
+                tools: None,
+                installed: None,
+            },
+            AssistantChoice {
+                id: "opus".to_string(),
+                label: "Opus".to_string(),
+                brain: "cloud".to_string(),
+                efforts: ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                runner: Some("claude".to_string()),
+                tools: None,
+                installed: None,
+            },
+            AssistantChoice {
+                id: "gpt-5.6-terra".to_string(),
+                label: "GPT-5.6 Terra".to_string(),
+                brain: "cloud".to_string(),
+                efforts: ["low", "medium", "high", "xhigh", "max", "ultra"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                runner: Some("codex".to_string()),
+                tools: None,
+                installed: None,
+            },
+            AssistantChoice {
+                id: "gpt-5.5".to_string(),
+                label: "GPT-5.5".to_string(),
+                brain: "cloud".to_string(),
+                efforts: ["low", "medium", "high", "xhigh"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                runner: Some("codex".to_string()),
+                tools: None,
+                installed: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn runner_of_names_the_cli_a_cloud_choice_belongs_to() {
+        let config = ModelsConfig {
+            assistant_choices: chat_choices(),
+            ..ModelsConfig::default()
+        };
+        assert_eq!(config.runner_of("gpt-5.5"), Some("codex"));
+        assert_eq!(config.runner_of("sonnet"), Some("claude"));
+
+        let mut mystery = config.clone();
+        mystery.assistant_choices[0].runner = Some("mystery".to_string());
+        assert_eq!(mystery.runner_of("sonnet"), Some("claude"));
+        mystery.assistant_choices[0].runner = None;
+        assert_eq!(mystery.runner_of("sonnet"), Some("claude"));
+        assert_eq!(config.runner_of("not-in-the-catalogue"), None);
+    }
+
+    #[test]
+    fn a_rooted_chat_is_offered_both_clis_in_one_menu() {
+        let config = ModelsConfig {
+            assistant_choices: chat_choices(),
+            ..ModelsConfig::default()
+        };
+        let chat_catalogue = config.catalogue_for_chat(&[], true);
+        let offered: Vec<&str> = chat_catalogue
+            .iter()
+            .map(|choice| choice.id.as_str())
+            .collect();
+        assert!(
+            ["sonnet", "opus", "gpt-5.6-terra", "gpt-5.5"]
+                .into_iter()
+                .all(|id| offered.contains(&id))
+        );
+        let catalogue = config.catalogue();
+        let unchanged: Vec<&str> = catalogue.iter().map(|choice| choice.id.as_str()).collect();
+        assert_eq!(unchanged, vec!["sonnet", "opus"]);
+    }
+
+    #[test]
+    fn an_unrooted_chat_is_never_offered_a_codex_model() {
+        for primary_runner in [None, Some("codex".to_string())] {
+            let config = ModelsConfig {
+                primary_runner,
+                assistant_choices: chat_choices(),
+                ..ModelsConfig::default()
+            };
+            assert!(
+                config
+                    .catalogue_for_chat(&[], false)
+                    .iter()
+                    .all(|choice| choice.runner.as_deref() != Some("codex"))
+            );
+        }
+    }
+
+    #[test]
+    fn the_effort_door_knows_every_clis_levels() {
+        let config = ModelsConfig {
+            assistant_choices: chat_choices(),
+            ..ModelsConfig::default()
+        };
+        assert!(is_effort_level(&config, "ultra"));
+        assert!(!is_effort_level(&config, "nonsense"));
+        assert!(!config.effort_levels().contains(&"ultra".to_string()));
+    }
+
     /// The picker must not offer a route the daemon cannot take.
     ///
     /// A conversation moved to `local` with no local model configured is refused at the first turn

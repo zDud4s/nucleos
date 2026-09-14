@@ -1732,7 +1732,7 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (/^\/projects\/[^/]+\/map\/silenced$/.test(route)) return { rows: [], total: 0 };
 
   if (path === "/assistant/chats") return CHATS;
-  if (path === "/assistant/models") return CHAT_MODELS;
+  if (splitQuery(path)[0] === "/assistant/models") return CHAT_MODELS;
   if (path === "/assistant/ide-sessions") return [];
   /* The project block, and the permission rung with it. `tools: true` so the menu photographs with
      all five reachable -- see the note on `CHATS`. */

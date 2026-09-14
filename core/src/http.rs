@@ -10369,7 +10369,7 @@ async fn get_local_model_size(
 async fn post_local_model_pull(
     Json(body): Json<PullRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
-    let (_, choices) = menu().await;
+    let (_, choices) = menu(Asking::Daemon).await;
     if !choices
         .iter()
         .any(|choice| choice.brain == "local" && choice.id == body.model)
@@ -10642,7 +10642,7 @@ async fn post_project_judge(
     // model beside it — so a model there is not a judge's model and has nothing to be checked
     // against.
     if let (Some(named), Some(model)) = (brain, model) {
-        match chosen_brain(&state, model).await {
+        match chosen_brain(&state, model, Asking::Daemon).await {
             Ok(route) if route == named => {}
             Ok(route) => {
                 return Err(unusable_judge(format!(
@@ -10655,6 +10655,9 @@ async fn post_project_judge(
                 return Err(unusable_judge(format!(
                     "nothing on this daemon's model menu is called `{model}`"
                 )));
+            }
+            Err(BrainRefusal::NeedsRoot) => {
+                return Err(unusable_judge(CODEX_NEEDS_A_ROOT.to_string()));
             }
             // `can_serve`'s own words, carried through rather than summarised — it is the layer that
             // knows WHY, and the two cases that reach here are the ordinary ones: a local model
@@ -10865,7 +10868,7 @@ async fn create_chat(
     // precedence `patch_chat` applies, for the same reason: a row saying `local` while naming a
     // cloud model would be sent to Ollama under a name it has never heard.
     let brain = match body.model.as_deref() {
-        Some(id) => chosen_brain(&state, id).await?,
+        Some(id) => chosen_brain(&state, id, Asking::Chat { rooted: false }).await?,
         None => crate::chats::Brain::from_wire(body.brain.as_deref().unwrap_or("cloud")),
     };
     // Checked before the row exists, so a bad level leaves no conversation behind to explain. The
@@ -11082,8 +11085,7 @@ async fn create_chat(
 /// what startup does: a picker that fails closed leaves somebody unable to change a model because
 /// of a typo in a key that has nothing to do with models.
 fn models_config() -> crate::config::ModelsConfig {
-    crate::config::load_models_config(std::path::Path::new(crate::config::MODELS_CONFIG_PATH))
-        .unwrap_or_default()
+    crate::config::models_config_now()
 }
 
 /// Every named model is on the menu AND is one the agent CLI could take over, or a refusal.
@@ -11342,7 +11344,9 @@ fn ollama_tags_client() -> &'static reqwest::Client {
 /// empty list on failure, `catalogue_with_installed` with an empty list IS `catalogue()`, and
 /// `OLLAMA_TAGS_CLIENT` — built once and reused, never a fresh client per call — bounds how long a
 /// wedged Ollama can hold up either caller to `OLLAMA_TAGS_TIMEOUT`.
-async fn menu() -> (
+async fn menu(
+    asking: Asking,
+) -> (
     crate::config::ModelsConfig,
     Vec<crate::config::AssistantChoice>,
 ) {
@@ -11352,7 +11356,10 @@ async fn menu() -> (
         crate::runner::OLLAMA_BASE_URL,
     )
     .await;
-    let choices = config.catalogue_with_installed(&installed);
+    let choices = match asking {
+        Asking::Daemon => config.catalogue_with_installed(&installed),
+        Asking::Chat { rooted } => config.catalogue_for_chat(&installed, rooted),
+    };
     (config, choices)
 }
 
@@ -11360,11 +11367,26 @@ async fn menu() -> (
 enum BrainRefusal {
     /// No catalogue entry — the current `menu()`, installed models included — names this id.
     UnknownModel,
+    /// A Codex model needs a rooted conversation with its classifier hook wired.
+    NeedsRoot,
     /// The id names a real choice, but this machine cannot serve what it names —
     /// `Assistants::can_serve`'s own reason, carried verbatim into the refusal body of both
     /// doors that ask — opening a conversation and re-pointing one — so somebody who picked a
     /// model this machine cannot run is told which one and why, not handed a bare 503.
     CannotServe(String),
+}
+
+/// The reason Codex cannot answer an unrooted conversation.
+const CODEX_NEEDS_A_ROOT: &str =
+    "A Codex model answers only a conversation rooted in a project whose classifier hook is wired.";
+
+/// The caller whose available models are being selected.
+#[derive(Clone, Copy, Debug)]
+enum Asking {
+    /// The daemon's project-independent model menu.
+    Daemon,
+    /// A chat menu constrained by whether the conversation is rooted.
+    Chat { rooted: bool },
 }
 
 /// Which route a choice id names and can actually run, or a refusal.
@@ -11393,16 +11415,33 @@ enum BrainRefusal {
 /// (`assistants::NoAssistants`) may, and treating that as a capability refusal here would refuse
 /// every cloud pick the moment `state.assistants` is not fully wired — the wrong door, not a
 /// capability gap.
-async fn chosen_brain(state: &AppState, id: &str) -> Result<crate::chats::Brain, BrainRefusal> {
-    let config = models_config();
-    let brain = if let Some(choice) = config
-        .catalogue()
-        .into_iter()
-        .find(|choice| choice.id == id)
-    {
+async fn chosen_brain(
+    state: &AppState,
+    id: &str,
+    asking: Asking,
+) -> Result<crate::chats::Brain, BrainRefusal> {
+    chosen_brain_in(state, &models_config(), id, asking).await
+}
+
+/// Resolves a model choice for one caller using a supplied model configuration.
+async fn chosen_brain_in(
+    state: &AppState,
+    config: &crate::config::ModelsConfig,
+    id: &str,
+    asking: Asking,
+) -> Result<crate::chats::Brain, BrainRefusal> {
+    if matches!(asking, Asking::Chat { rooted: false }) && config.runner_of(id) == Some("codex") {
+        return Err(BrainRefusal::NeedsRoot);
+    }
+
+    let cheap_choices = match asking {
+        Asking::Daemon => config.catalogue(),
+        Asking::Chat { rooted } => config.catalogue_for_chat(&[], rooted),
+    };
+    let brain = if let Some(choice) = cheap_choices.into_iter().find(|choice| choice.id == id) {
         crate::chats::Brain::from_wire(&choice.brain)
     } else {
-        let (_, choices) = menu().await;
+        let (_, choices) = menu(asking).await;
         choices
             .into_iter()
             .find(|choice| choice.id == id)
@@ -11419,6 +11458,12 @@ async fn chosen_brain(state: &AppState, id: &str) -> Result<crate::chats::Brain,
     Ok(brain)
 }
 
+/// Query parameters for the assistant model menu.
+#[derive(serde::Deserialize)]
+struct ModelsQuery {
+    chat: Option<String>,
+}
+
 /// Which models a conversation may be moved to, and how hard each can be asked to think.
 ///
 /// Built from the same `menu()` `chosen_brain` uses, above — installed models included, over
@@ -11432,8 +11477,23 @@ async fn chosen_brain(state: &AppState, id: &str) -> Result<crate::chats::Brain,
 /// (the common case for the hosted route, and for local when nothing is configured) is skipped
 /// rather than asked with an empty slice, so an untouched install costs this route nothing beyond
 /// the network read `menu()` already pays for.
-async fn get_assistant_models(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let (config, choices) = menu().await;
+async fn get_assistant_models(
+    State(state): State<AppState>,
+    Query(query): Query<ModelsQuery>,
+) -> Json<serde_json::Value> {
+    let asking = match query.chat {
+        Some(chat_id) => Asking::Chat {
+            rooted: crate::assistant::may_answer_on_codex(
+                crate::chats::cwd_of(&state.pool, &chat_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            ),
+        },
+        None => Asking::Daemon,
+    };
+    let (config, choices) = menu(asking).await;
 
     let mut declared: std::collections::HashMap<String, crate::capabilities::Declared> =
         std::collections::HashMap::new();
@@ -11722,6 +11782,9 @@ impl From<BrainRefusal> for ChatRefusal {
     fn from(refusal: BrainRefusal) -> Self {
         match refusal {
             BrainRefusal::UnknownModel => ChatRefusal::Status(StatusCode::BAD_REQUEST),
+            BrainRefusal::NeedsRoot => {
+                ChatRefusal::WithDetail(StatusCode::BAD_REQUEST, CODEX_NEEDS_A_ROOT.to_string())
+            }
             // Not a 500, for the same reason `BrainRefusal`'s own `From<StatusCode>` impl gives:
             // nothing broke, this machine simply cannot run what was asked for.
             BrainRefusal::CannotServe(reason) => {
@@ -11833,7 +11896,16 @@ async fn patch_chat(
     // name it has never heard.
     if let Some(model) = &body.model {
         let brain = match model {
-            Some(id) => Some(chosen_brain(&state, id).await?),
+            Some(id) => {
+                let cwd = crate::chats::cwd_of(&state.pool, &chat_id)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(%error, "reading a conversation's project failed");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+                let rooted = crate::assistant::may_answer_on_codex(cwd.as_deref());
+                Some(chosen_brain(&state, id, Asking::Chat { rooted }).await?)
+            }
             // Unpinning says nothing about the route. The conversation goes back to following the
             // configured model, and `brain` keeps whatever it already had — changing it here would
             // be this route inventing a decision nobody expressed.
@@ -25158,6 +25230,104 @@ mod tests {
             crate::chats::brain_of(&state.pool, id).await.unwrap(),
             Some(crate::chats::Brain::Cloud)
         );
+    }
+
+    #[tokio::test]
+    async fn the_door_takes_a_codex_pick_only_for_a_rooted_conversation() {
+        let state = test_state().await;
+        let config = crate::config::ModelsConfig {
+            primary_runner: None,
+            assistant_choices: vec![
+                crate::config::AssistantChoice {
+                    id: "sonnet".to_string(),
+                    label: "Sonnet".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: vec![],
+                    runner: Some("claude".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+                crate::config::AssistantChoice {
+                    id: "opus".to_string(),
+                    label: "Opus".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: vec![],
+                    runner: Some("claude".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+                crate::config::AssistantChoice {
+                    id: "gpt-5.6-terra".to_string(),
+                    label: "GPT-5.6 Terra".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: vec![],
+                    runner: Some("codex".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+                crate::config::AssistantChoice {
+                    id: "gpt-5.5".to_string(),
+                    label: "GPT-5.5".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: vec![],
+                    runner: Some("codex".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            chosen_brain_in(&state, &config, "gpt-5.5", Asking::Chat { rooted: false }).await,
+            Err(BrainRefusal::NeedsRoot)
+        ));
+        assert!(matches!(
+            chosen_brain_in(&state, &config, "gpt-5.5", Asking::Chat { rooted: true }).await,
+            Ok(crate::chats::Brain::Cloud)
+        ));
+        assert!(matches!(
+            chosen_brain_in(&state, &config, "gpt-5.5", Asking::Daemon).await,
+            Err(BrainRefusal::UnknownModel)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_codex_refusal_reaches_the_window_as_a_sentence() {
+        let response = ChatRefusal::from(BrainRefusal::NeedsRoot).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        assert_eq!(body["detail"].as_str(), Some(CODEX_NEEDS_A_ROOT));
+    }
+
+    #[tokio::test]
+    async fn the_menu_route_takes_a_conversation() {
+        let state = test_state().await;
+        let (created, body) = call(
+            state.clone(),
+            "POST",
+            "/assistant/chats",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(created, StatusCode::OK);
+        let id = body["chat_id"].as_str().unwrap();
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/assistant/models?chat={id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["choices"].is_array());
+
+        let (status, _) = call(state, "GET", "/assistant/models?chat=nope", None).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// What the window builds its picker from. An empty list would be a menu with nothing on it —

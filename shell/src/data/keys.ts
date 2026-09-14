@@ -346,11 +346,11 @@ export const keys = {
     /**
      * The models a conversation may be moved to — `GET /assistant/models`.
      *
-     * Its own key and not a child of `detail`, because it is the same answer for
-     * every conversation: one fetch feeds every picker on the page, and a
-     * per-chat key would refetch it once per row.
+     * Its own key and not a child of `detail`, because it is the daemon-wide
+     * answer. A conversation picker uses `modelsFor` so its menu can differ.
      */
     models: ["chats", "models"] as const,
+    modelsFor: (chatId: string) => ["chats", "models", chatId] as const,
     /**
      * The tools a conversation may be told not to reach for — `GET /assistant/tools`.
      *
