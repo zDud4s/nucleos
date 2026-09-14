@@ -5664,18 +5664,19 @@ mod tests {
         drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
 
         let started = std::time::Instant::now();
-        let ticket = wait_for(&pool, id, Duration::from_millis(50))
-            .await
-            .unwrap();
+        let ticket = wait_for(&pool, id, Duration::from_secs(10)).await.unwrap();
         assert_eq!(ticket.status, "succeeded");
         assert_eq!(ticket.result_sha.as_deref(), Some("abc123"));
-        // The name's actual claim: without this, a loop that sleeps before its first read would
-        // report the same status and sha 50ms later and still pass every assertion above. A single
-        // in-memory read takes microseconds; one `WAIT_POLL_INTERVAL` sleep alone is 10ms, so this
-        // is not a close margin — it is the difference between "never slept" and "slept at all".
+        // What this still proves, and what it gave up. A loop that ignored `succeeded` and ran to
+        // its deadline would report the same status and sha ten seconds later and still pass every
+        // assertion above; a second is nowhere near either side of that. The bound used to be
+        // `WAIT_POLL_INTERVAL`, which also caught one stray poll before the first read, but one
+        // slow read on a loaded machine outlasts a poll as well, and that bound failed the sibling
+        // below with no defect to find (2026-09-13). No wall-clock bound tells "never slept" from
+        // "slept once" on a shared machine, so this no longer claims to.
         assert!(
-            started.elapsed() < WAIT_POLL_INTERVAL,
-            "an already-finished request must answer from the first read, not pay for a poll"
+            started.elapsed() < Duration::from_secs(1),
+            "an already-finished request must end the wait, not run it out"
         );
     }
 
@@ -5713,9 +5714,7 @@ mod tests {
         .await;
 
         let started = std::time::Instant::now();
-        let ticket = wait_for(&pool, id, Duration::from_millis(50))
-            .await
-            .unwrap();
+        let ticket = wait_for(&pool, id, Duration::from_secs(10)).await.unwrap();
 
         assert_eq!(ticket.id, id);
         assert_eq!(ticket.status, "failed");
@@ -5725,12 +5724,14 @@ mod tests {
         );
         assert_eq!(ticket.failure_reason.as_deref(), Some("CONFLICT (content)"));
         // Without this, a `wait_for` that dropped `failed` from its terminal set would still
-        // report the right content 50ms later once the deadline forced an answer, and every
+        // report the right content ten seconds later once the deadline forced an answer, and every
         // assertion above would still pass. This is what actually proves `failed` ends the wait as
-        // fast as `succeeded` does, rather than merely agreeing with it once time runs out.
+        // fast as `succeeded` does, rather than merely agreeing with it once time runs out. Seconds
+        // against one, not 50ms against `WAIT_POLL_INTERVAL`: on a loaded machine a single slow
+        // read outlasted the poll interval and failed this with nothing wrong (2026-09-13).
         assert!(
-            started.elapsed() < WAIT_POLL_INTERVAL,
-            "a failed request must answer from the first read, not pay for a poll"
+            started.elapsed() < Duration::from_secs(1),
+            "a failed request must end the wait, not run it out"
         );
     }
 
