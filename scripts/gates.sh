@@ -212,6 +212,7 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     run "hooks: filter"   . "$py" scripts/test-hook-filter.py
     run "hooks: evidence" . "$py" scripts/test-evidence-gate.py
     run "gates: summary"  . "$py" scripts/test-gates-summary.py
+    run "gates: own target" . "$py" scripts/test-own-cargo-target.py
     run "eval: approver"  . "$py" scripts/eval/test-auto-approve.py
     run "eval: promote"   . "$py" scripts/eval/test-promote.py
     run "eval: ingest"    . "$py" scripts/eval/test-ingest.py
