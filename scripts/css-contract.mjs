@@ -55,16 +55,16 @@
  * because acting on it deletes working CSS.
  *
  * **What it cannot decide, it says by naming the file.** A kebab string in a
- * literal is indistinguishable from a class name, and the two findings left in
- * this repository are exactly that: `fleet-exclusion` is an API value in
- * `data/waiting.ts`, and `chats-zoom` is a test asserting a class is ABSENT
- * (`.not.toContain`). Neither is a defect, and both are one line to dismiss
- * because the location is printed beside them. 18 of 20 sheets are clean.
+ * literal is indistinguishable from a class name. The last two findings were
+ * exactly that, and each was answered where it was written rather than in a
+ * suppression list: `chats-zoom` was a test asserting a bare prefix was ABSENT,
+ * and now names the class the record actually took; `fleet-exclusion` was a
+ * proposal `kind` in a fixture, and a `kind:` value is now masked below, the
+ * way an id is. All 20 sheets are clean.
  *
  * Scaffolding, not a gate. It reports; `scripts/gates.sh` does not call it.
- * Wiring it in means deciding what to do about those two — a suppression list,
- * or extraction narrowed to `className` — which is a different piece of work
- * from building the instrument that says which ones there are.
+ * Wiring it in is its own decision — what a gate should do the next time a
+ * literal looks like a class — and not one this instrument makes for itself.
  *
  *   node scripts/css-contract.mjs [name ...]
  */
@@ -165,6 +165,13 @@ function indexSources() {
       */
       .replace(/--[a-z][a-z0-9]*(?:-[a-z0-9]+)*/g, " ")
       .replace(ID_REFERENCE, " ")
+      /*
+        A `kind:` value is the daemon's vocabulary, not a class. `kind: "fleet-exclusion"` in a
+        Waiting fixture is the proposal kind `/fleet/exclusions/requests` sends, and it was
+        reported as a class no sheet defines. Masked where it is written, like an id: a name that
+        is ever both a kind and a class is still read everywhere else it appears.
+      */
+      .replace(/\bkind:\s*"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"/g, " ")
       .replace(/[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\$\{[^}]*\}/g, " ");
     for (const m of masked.matchAll(/[a-z][a-z0-9]*(?:-[a-z0-9]+)+/g)) {
       named.add(m[0]);

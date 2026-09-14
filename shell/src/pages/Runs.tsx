@@ -663,20 +663,18 @@ function NewRunForm({
           );
         }}
       >
+        {/* The inner id is Start run's: the button points at the same
+            sentence to say why it is not pressable yet. `Field` itself names
+            the box by its label and describes it by the helper. */}
         <Field
           label="Prompt"
           helper={<span id={hintId}>Start run waits until this says what the run should do.</span>}
         >
-          {/* Named outright, and with the visible word: `Field` renders its
-              helper inside the `<label>`, so without this the helper would be
-              read as part of the name instead of as the description. */}
           <textarea
             ref={promptRef}
             className="runs-prompt"
             rows={4}
             value={draft.prompt}
-            aria-label="Prompt"
-            aria-describedby={hintId}
             onChange={(event) => patch({ prompt: event.target.value })}
           />
         </Field>
@@ -929,11 +927,15 @@ function PresetRow({
       <p className="runs-preset-prompt">{preset.prompt}</p>
       <div className="runs-preset-actions">
         {preset.mode === "real" ? (
+          // No `subject`: the interlock reserves the armed label's width from
+          // the first paint, and "Run in real mode · memory-upkeep" made this
+          // the widest control in the list. The name is already on the row, in
+          // its own head a line above, so the eye keeps its anchor; the ear
+          // gets it in `sayAs`.
           <ConfirmButton
             label={`Run ${preset.name}`}
             confirmLabel="Run in real mode"
-            subject={preset.name}
-            sayAs={`runs in real mode, acting on the files in ${preset.cwd ?? "the daemon's default directory"} as they are`}
+            sayAs={`runs ${preset.name} in real mode, acting on the files in ${preset.cwd ?? "the daemon's default directory"} as they are`}
             variant="ghost"
             intent="go"
             disabled={busy}
@@ -958,14 +960,23 @@ function PresetRow({
 /* ------------------------------------------------------------- refusals -- */
 
 /**
- * Why the núcleo would not start this.
+ * Why the núcleo would not start this — in its own words, when it sent any.
+ *
+ * `POST /runs` writes a sentence for every refusal it makes (`create_run` in
+ * `core/src/runs.rs`, and `create_run_reason` in `core/src/http.rs`), and on
+ * this route the sentence says more than a code can: the two 409s — the kill
+ * switch engaged, a worktree run's project with no free slot — share a status
+ * and arrive as different prose. So the daemon's prose wins, and the sentences
+ * below are the floor for a body that came back empty.
  *
  * **The codes here were read out of `core/src/runs.rs`, not out of the old
  * shell's comment, which named 503 for the kill switch and 429 for the budget
- * and was wrong on both counts.** `create_run` answers 409 when the switch is
- * engaged and 503 when the switch could not be *read* — it fails closed, which
- * is why an unreadable switch stops a run rather than starting one. 422 is the
- * project's own autopilot being `off` for a shadow or worktree run.
+ * and was wrong on both counts.** 409 is the switch engaged, or a worktree
+ * project full. 503 is something `create_run` reads before every start that
+ * could not be read: the kill switch, or — for a shadow or worktree run in a
+ * project — that project's autopilot mode. It fails closed on both, which is
+ * why an unreadable switch or mode stops a run rather than starting one. 422
+ * is the project's own autopilot being `off` for a shadow or worktree run.
  *
  * There is deliberately **no 429 branch**. The daemon does not brake a
  * person-requested run on the budget: the ceilings pace proactive autonomy, and
@@ -975,9 +986,9 @@ function PresetRow({
  */
 const START_SENTENCES: Record<string, string> = {
   conflict:
-    "the kill switch is engaged — nothing autonomous starts until it is released; a worktree run meets the same answer when its project is already full, and the núcleo sends no body that tells the two apart",
+    "the kill switch is engaged, or this worktree run's project has no free slot — nothing was started",
   unavailable:
-    "the kill switch could not be read, so the núcleo refused rather than start something the switch may have forbidden",
+    "the kill switch or the project's autopilot mode could not be read, so the núcleo refused rather than start something either may have forbidden",
   unprocessable:
     "that project is off, and a shadow or worktree run is one nobody is watching — put the project in shadow or active first",
   bad_request:
@@ -990,7 +1001,12 @@ function StartRefusal({ error, what }: { error: unknown; what: string }) {
   if (!isApiRefusal(error)) {
     return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
   }
-  return <RefusalNote refusal={error} sentences={START_SENTENCES} />;
+  return (
+    <RefusalNote
+      refusal={error}
+      sentences={{ ...START_SENTENCES, ...daemonProse(error) }}
+    />
+  );
 }
 
 /** `POST /presets` has exactly one refusal worth a sentence of its own. */

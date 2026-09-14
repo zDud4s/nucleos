@@ -276,11 +276,14 @@ describe("Mail search field", () => {
 
     expect(await screen.findByRole("search", { name: "Search the mail queue" })).toBeDefined();
     const input = screen.getByLabelText("Search sender, subject or summary");
-    const label = input.closest("label");
-    expect(label?.className).toContain("ui-field");
-    const labelText = label?.querySelector("span");
-    expect(labelText?.className).toContain("ui-field-label");
-    expect(labelText?.textContent).toBe("Search");
+    // The field is a column around a `<label for>` and the control: the label holds its own text
+    // and nothing else, so a helper can never become part of the control's name.
+    const field = input.closest(".ui-field");
+    expect(field).not.toBeNull();
+    const label = field?.querySelector("label");
+    expect(label?.className).toContain("ui-field-label");
+    expect(label?.textContent).toBe("Search");
+    expect(label?.htmlFor).toBe(input.id);
     fireEvent.change(input, { target: { value: "invoice" } });
     fireEvent.submit(screen.getByRole("search", { name: "Search the mail queue" }));
     const actions = screen.getByRole("button", { name: "Search" }).closest(".mail-search-actions");

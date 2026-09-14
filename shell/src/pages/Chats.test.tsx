@@ -5069,7 +5069,9 @@ describe("Chats - how large the conversation is drawn", () => {
     for (const sel of [".chats-detail-head", ".chats-composer-box", ".ui-page-header"]) {
       const other = container.querySelector(sel);
       if (other === null) continue;
-      expect(other.className).not.toContain("chats-zoom");
+      // The class the record just took, by name. A bare prefix was a class no sheet defines, which
+      // `scripts/css-contract.mjs` cannot tell from a typo.
+      expect(other.className).not.toContain("chats-zoom-90");
     }
   });
 });

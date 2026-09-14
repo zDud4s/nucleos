@@ -163,7 +163,9 @@ describe("state-map completeness", () => {
     expect(jobRs).toMatch(/_ => ItemState::Pending/);
 
     expect(new Set(statesOf("job_item"))).toEqual(new Set([...arms, "pending"]));
-    expect(readState("job_item", "conflicted")?.tone).toBe("danger");
+    // Put down rather than failed (`core/src/job.rs`, `ItemState::Conflicted`), so held and not
+    // wrong; and not a summons either, because the queue starts the resolution run itself.
+    expect(readState("job_item", "conflicted")?.tone).toBe("paused");
     expect(readState("job_item", "conflicted")?.tone).toBe(readState("feed", "job_item_conflicted")?.tone);
   });
 

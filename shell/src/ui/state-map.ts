@@ -130,7 +130,9 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     job_replanned: { tone: "info", label: "job replanned" },
     job_plan_failed: { tone: "danger", label: "job could not be planned" },
     job_item_failed: { tone: "danger", label: "job item failed" },
-    job_item_conflicted: { tone: "danger", label: "job item did not merge" },
+    // Held Ember, as `job_item.conflicted` is: the item is put down, not failed, and one event
+    // keeps one tone on both pages — the same reasoning `reverted` follows.
+    job_item_conflicted: { tone: "paused", label: "job item did not merge" },
     job_item_orphaned: { tone: "off", label: "job item never attempted" },
     job_gate_failed: { tone: "danger", label: "job gate failed" },
     job_waiting: { tone: "pending", label: "job waiting" },
@@ -275,13 +277,17 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * never stored, only derived from `gate_failed` and an attempt count, so the wire cannot say it.
    * `state-map-completeness.test.ts` holds this row to that function.
    *
-   * **`conflicted` is Wrong Red, not Awaiting-You Amber, because nobody is being waited on.**
-   * `ItemState::claimable_as` answers `Some("conflicted")` and `batch_of` takes a claimable item
-   * as work (`core/src/job.rs`, the comment above `next_step`'s positional search: "`Conflicted`
-   * is found by the same search, and it is work for the same reason: the item owes a run"). The
-   * queue starts the resolution run in the item's own tree by itself. So what the reader learns
-   * is a fault in the branch — the feed's `job_item_conflicted` says "job item did not merge" in
-   * the same tone, and one event must not wear two tones on two pages.
+   * **`conflicted` is Held Ember — not Wrong Red, and not Awaiting-You Amber.** The daemon says
+   * which in the variant's own doc (`core/src/job.rs`, `ItemState::Conflicted`): "The item is put
+   * down rather than failed: a conflict is a question about two pieces of work, not a verdict on
+   * either", and it "Leaves for `Running` — the resolution node, in that same tree". Red would be
+   * the verdict the daemon declines to give. Amber would be a summons, and nobody is being waited
+   * on: `ItemState::claimable_as` answers `Some("conflicted")` and `batch_of` takes a claimable
+   * item as work (the comment above `next_step`'s positional search: "`Conflicted` is found by
+   * the same search, and it is work for the same reason: the item owes a run"), so the queue
+   * starts the resolution run itself. Put down and owed a run is `reverted`'s reading too — held,
+   * not wrong — and the feed's `job_item_conflicted` wears the same tone, because one event must
+   * not wear two tones on two pages.
    *
    * `skipped` is the one that does ask: the item put itself down with a `skipped-item` proposal,
    * and that proposal is in Waiting. `orphaned` is the feed's `job_item_orphaned`, quiet for the
@@ -300,7 +306,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     // The `gate` domain's rule: a gate that could not run measured nothing.
     gate_errored: { tone: "info", label: "gate not measured" },
     skipped: { tone: "pending", label: "skipped, needs a decision" },
-    conflicted: { tone: "danger", label: "did not merge" },
+    conflicted: { tone: "paused", label: "did not merge" },
     orphaned: { tone: "off", label: "never attempted" },
   },
 

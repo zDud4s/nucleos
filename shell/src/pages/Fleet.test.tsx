@@ -314,7 +314,7 @@ async function pastTheDwell(): Promise<void> {
 /* ------------------------------------------------------------ the columns -- */
 
 describe("Fleet — columns", () => {
-  it("shows the capacity, and folds an idle project into one line at 0/N", async () => {
+  it("shows the capacity, and lists an idle project as a row of its own rather than a column", async () => {
     daemon.apiFetch.mockImplementation(
       fleetFetch(
         fleetState({
@@ -353,12 +353,13 @@ describe("Fleet — columns", () => {
     expect(within(held).getByText("tidy the imports")).toBeDefined();
     expect(within(held).getByRole("link", { name: "Open in Runs" }).getAttribute("href")).toBe("/runs/7");
 
-    // An idle project is still named and still reachable, but it is one line, not a column:
-    // four empty columns were what pushed a column with a problem in it off the screen.
+    // An idle project is a row in a list of its own, not a column: four empty columns were what
+    // pushed a column with a problem in it off the screen.
     expect(screen.queryByRole("region", { name: "beta column" })).toBeNull();
-    const idle = screen.getByRole("region", { name: "Idle projects" });
+    const idle = screen.getByRole("region", { name: "Idle · 1" });
     expect(within(idle).getByRole("link", { name: "beta" }).getAttribute("href")).toBe("/projects/beta/state");
-    expect(within(idle).getByText("0/3")).toBeDefined();
+    expect(within(idle).getByText("0 of 3")).toBeDefined();
+    expect(within(idle).getByText("room for 3")).toBeDefined();
   });
 
   it("orders the columns by what is wrong in them before how busy they are", async () => {
@@ -637,10 +638,11 @@ describe("Fleet — columns", () => {
     expect(within(card).getAllByText(/nightly-backlog/).length).toBeGreaterThan(0);
     // The id is still there, second and as a handle.
     expect(within(card).getByText("id 7")).toBeDefined();
-    // Through the map, and in the feed's tone for the same event: the queue resolves a
-    // conflict itself (`batch_of` in `core/src/job.rs`), so this is a fault, not a summons.
+    // Through the map, and in the feed's tone for the same event: `core/src/job.rs` puts a
+    // conflicted item down rather than failing it, and the queue resolves it itself (`batch_of`),
+    // so Held Ember — neither a fault nor a summons.
     const state = within(card).getByText("did not merge");
-    expect(state.className).toContain("ui-badge-danger");
+    expect(state.className).toContain("ui-badge-paused");
     expect(within(card).queryByText(/to do/), "an item mid-conflict is not work nobody has started").toBeNull();
     expect(
       within(card).queryByText(/detail unavailable/i),
@@ -786,6 +788,196 @@ describe("Fleet — columns", () => {
   });
 });
 
+/* ---------------------------------------------------------- idle projects -- */
+
+describe("Fleet — idle projects", () => {
+  /** An idle project's row, found by its name's link. */
+  function rowOf(list: HTMLElement, name: string): HTMLElement {
+    return within(list).getByRole("link", { name }).closest("li")!;
+  }
+
+  it("gives each idle project a row with its mode, its capacity in the daemon's face, and its room", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 5, held: 0 },
+            projects: [column({ project_id: "alpha", limit: 3 }), column({ project_id: "bravo", limit: 2 })],
+          },
+          projects: [startable("alpha"), startable("bravo", { mode: "shadow" })],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+
+    const idle = await screen.findByRole("region", { name: "Idle · 2" });
+    expect(within(idle).getAllByRole("listitem")).toHaveLength(2);
+    const alpha = rowOf(idle, "alpha");
+    await waitFor(() => expect(within(alpha).getByText("active").className).toContain("ui-badge-active"));
+    expect(alpha.textContent).toContain("autopilot");
+    expect(within(alpha).getByText("0 of 3").className).toContain("fleet-idle-capacity");
+    expect(within(alpha).getByText("room for 3")).toBeDefined();
+    expect(within(rowOf(idle, "bravo")).getByText("shadow").className).toContain("ui-badge-shadow");
+  });
+
+  it("is the page's body when nothing is in flight anywhere", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 6, held: 0 },
+            projects: [
+              column({ project_id: "charlie", limit: 1 }),
+              column({ project_id: "alpha", limit: 3 }),
+              column({ project_id: "bravo", limit: 2 }),
+            ],
+          },
+          projects: [startable("alpha"), startable("bravo"), startable("charlie")],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+
+    const idle = await screen.findByRole("region", { name: "Idle · 3" });
+    // No columns at all, and the list is not a footnote under them: it is what the page says.
+    expect(document.querySelector(".fleet-columns")).toBeNull();
+    expect(screen.queryAllByRole("region", { name: / column$/ })).toHaveLength(0);
+    // In the page's own order — nothing wrong and nothing busy anywhere, so by name.
+    expect(within(idle).getAllByRole("link").map((link) => link.textContent)).toEqual(["alpha", "bravo", "charlie"]);
+    expect(await headlineText()).toBe("nothing in flight; room for 6");
+  });
+
+  it("opens the header's panel from a row with that project chosen, and gives focus back to the row", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 5, held: 0 },
+            projects: [column({ project_id: "alpha", limit: 2 }), column({ project_id: "bravo", limit: 3 })],
+          },
+          projects: [startable("alpha"), startable("bravo")],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    const alpha = await screen.findByRole("button", { name: "New job in alpha" });
+    fireEvent.click(alpha);
+
+    // The one panel, not a second form: the header's button says it is open.
+    expect(document.querySelectorAll("form.fleet-new-job")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "New job" }).getAttribute("aria-expanded")).toBe("true");
+    // The row's project, and not the roomiest, which is bravo.
+    const select = screen.getByLabelText("Project for the new job") as HTMLSelectElement;
+    expect(select.value).toBe("alpha");
+    const prompt = screen.getByLabelText("Prompt");
+    await waitFor(() => expect(document.activeElement).toBe(prompt));
+
+    fireEvent.keyDown(prompt, { key: "Escape" });
+    expect(document.activeElement).toBe(alpha);
+
+    // Another row while the panel is open: the pick moves, and focus goes in again.
+    const bravo = screen.getByRole("button", { name: "New job in bravo" });
+    fireEvent.click(bravo);
+    fireEvent.click(alpha);
+    expect(select.value).toBe("alpha");
+    await waitFor(() => expect(document.activeElement).toBe(prompt));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(document.activeElement).toBe(alpha);
+  });
+
+  it("says in a row why the núcleo would refuse a job there, in the select's words, and offers no button", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 8, held: 0 },
+            projects: [
+              column({ project_id: "alpha" }),
+              column({ project_id: "charlie" }),
+              column({ project_id: "delta" }),
+              column({ project_id: "echo" }),
+            ],
+          },
+          projects: [
+            startable("alpha"),
+            startable("charlie", { mode: "shadow" }),
+            // Active with no root is a real state: `resolve_start` refuses it with `NoRoot`.
+            startable("delta", { project_root: null }),
+            project({ project_id: "echo", mode: "off" }),
+          ],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    const idle = await screen.findByRole("region", { name: "Idle · 4" });
+
+    const charlie = rowOf(idle, "charlie");
+    await waitFor(() =>
+      expect(within(charlie).getByText("in shadow — jobs start only when the autopilot is active")).toBeDefined(),
+    );
+    expect(within(charlie).queryByRole("button")).toBeNull();
+    expect(within(rowOf(idle, "delta")).getByText("no folder recorded")).toBeDefined();
+    expect(within(rowOf(idle, "delta")).queryByRole("button")).toBeNull();
+    expect(within(rowOf(idle, "echo")).getByText("autopilot off — jobs start only when it is active")).toBeDefined();
+    expect(within(rowOf(idle, "alpha")).getByRole("button", { name: "New job in alpha" })).toBeDefined();
+
+    // One rule in two places: the option says exactly what the row says.
+    fireEvent.click(screen.getByRole("button", { name: "New job" }));
+    const select = screen.getByLabelText("Project for the new job") as HTMLSelectElement;
+    expect(select.querySelector('option[value="charlie"]')?.textContent).toBe(
+      "charlie — in shadow — jobs start only when the autopilot is active",
+    );
+  });
+
+  it("takes the row's New job away while the view is stale, and keeps the row", async () => {
+    const state = fleetState({
+      concurrency: {
+        house: { limit: 4, held: 0 },
+        projects: [column({ project_id: "alpha" }), column({ project_id: "charlie" })],
+      },
+      projects: [startable("alpha"), startable("charlie", { mode: "shadow" })],
+    });
+    let answering = true;
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (!answering && path === "/concurrency") throw new ApiRefusal(503, "unavailable", "");
+      return await fleetFetch(state)(path, init);
+    });
+
+    const { queryClient } = await renderWithRouter(<Fleet />);
+    expect(await screen.findByRole("button", { name: "New job in alpha" })).toBeDefined();
+
+    answering = false;
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: keys.concurrency });
+    });
+
+    expect(await screen.findByText(/view is stale — last good read/)).toBeDefined();
+    // Removed, not disabled: the room it would ask for is room nobody can vouch for.
+    expect(screen.queryByRole("button", { name: "New job in alpha" })).toBeNull();
+    // Still named, still reachable, and still saying why the other one cannot take a job.
+    const idle = screen.getByRole("region", { name: "Idle · 2" });
+    expect(within(idle).getByRole("link", { name: "alpha" })).toBeDefined();
+    expect(within(rowOf(idle, "charlie")).getByText(/in shadow — jobs start only/)).toBeDefined();
+  });
+
+  it("keeps the row's New job while the kill switch is engaged, as the header keeps its own", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(fleetState({ kill: true, concurrency: { house: { limit: 4, held: 0 }, projects: [column()] } })),
+    );
+
+    await renderWithRouter(<Fleet />);
+    await waitFor(async () => expect(await headlineText()).toContain("the kill switch is engaged"));
+
+    // The panel is where the refusal is said, beside the button it disables.
+    fireEvent.click(screen.getByRole("button", { name: "New job in alpha" }));
+    expect(screen.getByText(/the núcleo refuses every new job until it is released/)).toBeDefined();
+  });
+});
+
 /* --------------------------------------------------------------- headline -- */
 
 describe("Fleet — the headline", () => {
@@ -837,14 +1029,20 @@ describe("Fleet — the headline", () => {
 
     await waitFor(async () =>
       expect(await headlineText()).toBe(
-        "1 slot held by nothing, awaiting reconciliation; 1 item did not merge; " +
-          "1 observed overlap between trees; 1 job awaiting approval; 1 job held by an exclusion; " +
+        "1 slot held by nothing, awaiting reconciliation; 1 observed overlap between trees; " +
+          "1 item did not merge; 1 job awaiting approval; 1 job held by an exclusion; " +
           "the kill switch is engaged — no new job starts; " +
           "5 in flight of 8 across all projects; room for 3 more",
       ),
     );
     // The one clause somebody can act on is a door to where it is acted on.
     const header = await pageHeader();
+    // The faults wear the wrong-fact colour and the item that did not merge does not: it was put
+    // down, not failed (`core/src/job.rs`, `ItemState::Conflicted`).
+    expect([...header.querySelectorAll(".ui-wrong")].map((node) => node.textContent)).toEqual([
+      "1 slot held by nothing, awaiting reconciliation",
+      "1 observed overlap between trees",
+    ]);
     expect(within(header).getByRole("link", { name: "1 job awaiting approval" }).getAttribute("href")).toBe("/waiting");
     expect((await headlineText()).toLowerCase()).not.toContain("waiting on you");
   });
@@ -1003,7 +1201,11 @@ describe("Fleet — asking for a job", () => {
     await openComposer();
 
     const select = screen.getByLabelText("Project for the new job") as HTMLSelectElement;
-    await waitFor(() => expect(select.querySelector('option[value="delta"]')?.textContent).toBe("delta — autopilot off"));
+    await waitFor(() =>
+      expect(select.querySelector('option[value="delta"]')?.textContent).toBe(
+        "delta — autopilot off — jobs start only when it is active",
+      ),
+    );
     const options = Object.fromEntries([...select.options].map((option) => [option.value, option]));
     expect(options.alpha.textContent).toBe("alpha — room for 1 (1 of 2)");
     expect(options.alpha.disabled).toBe(false);
@@ -1379,7 +1581,7 @@ describe("Fleet — a job's items", () => {
     expect(within(items).getAllByText(/no gate configured/i).length).toBeGreaterThan(0);
     expect(within(items).getByText(/gate passed/i)).toBeDefined();
     // Every item's own state through the one map, in the same words its slot card uses.
-    expect(within(items).getByText("did not merge").className).toContain("ui-badge-danger");
+    expect(within(items).getByText("did not merge").className).toContain("ui-badge-paused");
     expect(within(items).getAllByText("done")[0].className).toContain("ui-badge-info");
   });
 

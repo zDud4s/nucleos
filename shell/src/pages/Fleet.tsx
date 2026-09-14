@@ -12,6 +12,7 @@ import {
   useProposeExclusion,
   useRevokeExclusion,
   type Concurrency,
+  type ProjectConcurrency,
 } from "../data/fleet";
 import {
   useBudget,
@@ -68,8 +69,9 @@ import "./fleet.css";
  *
  * **What is wrong comes first, everywhere on the page.** The headline says the worst fact before
  * the capacity, and the columns are ordered by the same ladder, so a leaked slot in a quiet
- * project is read before three busy projects that are fine. Idle projects fold into one line at
- * the bottom: they are the normal, and the normal recedes.
+ * project is read before three busy projects that are fine. Idle projects come after the columns
+ * as a list of their own, one row each: quieter than a column, because the normal recedes, and
+ * never less than content, because on a quiet day they are the whole page.
  *
  * **The kill switch control is not duplicated here.** It lives in the frame, on every page; a
  * second copy is a second thing to keep in step and a second thing to be wrong. What this page
@@ -96,6 +98,16 @@ export function Fleet() {
    */
   const [layout, setLayout] = useState<Layout>(loadLayout);
   const [composing, setComposing] = useState(false);
+  /**
+   * The project the panel's select holds — here and not in the form, so an idle row can open the
+   * panel with its own project already chosen. Empty is "nobody picked", which the form reads as
+   * the roomiest.
+   */
+  const [picked, setPicked] = useState("");
+  /** One more on every request to open the panel, so focus goes in even when it is already open. */
+  const [asked, setAsked] = useState(0);
+  /** The control that opened the panel — the header's New job or a row's — and so where focus goes back. */
+  const returnTo = useRef<HTMLElement | null>(null);
   const panelId = useId();
   const openerId = useId();
 
@@ -139,12 +151,22 @@ export function Fleet() {
     stale,
   };
 
+  function openComposer(from: HTMLElement, project?: string) {
+    returnTo.current = from;
+    if (project !== undefined) setPicked(project);
+    setComposing(true);
+    setAsked((count) => count + 1);
+  }
+
   // Focus goes back to the control that opened the panel, which is the standard the project
   // switcher set: a panel that closes and drops focus on `<body>` leaves a keyboard user at the
-  // top of the document.
+  // top of the document. The row that opened it can be gone by the time it closes — its project
+  // took a slot meanwhile and left the idle list — and then the header's New job is the one
+  // control left that means the same thing.
   function closeComposer() {
     setComposing(false);
-    document.getElementById(openerId)?.focus();
+    const back = returnTo.current;
+    (back !== null && back.isConnected ? back : document.getElementById(openerId))?.focus();
   }
 
   return (
@@ -173,7 +195,9 @@ export function Fleet() {
                   intent="go"
                   aria-expanded={composing}
                   aria-controls={panelId}
-                  onClick={() => setComposing(!composing)}
+                  onClick={(event) =>
+                    composing ? setComposing(false) : openComposer(event.currentTarget)
+                  }
                 >
                   New job
                 </Button>
@@ -189,9 +213,12 @@ export function Fleet() {
         <NewJobPanel
           id={panelId}
           open={composing}
+          asked={asked}
           columns={model.columns}
           projects={projects.data}
           engaged={engaged}
+          picked={picked}
+          onPick={setPicked}
           onClose={closeComposer}
         />
       )}
@@ -254,7 +281,13 @@ export function Fleet() {
             }}
           />
         ) : (
-          <Columns columns={model.columns} projects={projects.data} />
+          <Columns
+            columns={model.columns}
+            projects={projects.data}
+            stale={stale}
+            panelId={panelId}
+            onNewJob={openComposer}
+          />
         ))}
     </FleetActionsProvider>
   );
@@ -294,20 +327,25 @@ function ViewSwitch({ view, onChange }: { view: FleetView; onChange: (next: Flee
 /* ---------------------------------------------------------------- columns -- */
 
 /**
- * The busy projects as columns, and the idle ones as one line under them.
+ * The busy projects as columns, and the idle ones as a list after them.
  *
  * An idle project used to keep a full column at `0/N`, on the argument that a column vanishing
  * makes the layout jump. With the columns ordered by what is wrong, position is no longer the
  * thing a reader memorises — the headline is — and four empty columns were pushing the one with
- * a problem in it off the right of the screen. Folded, an idle project is still named and still
- * one click from its own page.
+ * a problem in it off the right of the screen. So only a busy project is a column.
  */
 function Columns({
   columns,
   projects,
+  stale,
+  panelId,
+  onNewJob,
 }: {
   columns: FleetColumn[];
   projects: ProjectSummary[] | undefined;
+  stale: boolean;
+  panelId: string;
+  onNewJob: (from: HTMLElement, project: string) => void;
 }) {
   const busy = columns.filter((column) => !column.idle);
   const idle = columns.filter((column) => column.idle);
@@ -325,23 +363,104 @@ function Columns({
         </div>
       )}
       {idle.length > 0 && (
-        <section className="fleet-idle" aria-label="Idle projects">
-          <h2 className="fleet-idle-title">Idle</h2>
-          <ul className="fleet-idle-list">
-            {idle.map(({ project }) => (
-              <li key={project.project_id} className="fleet-idle-item">
-                <Link to={`/projects/${project.project_id}/state`} className="fleet-idle-link">
-                  {project.project_id}
-                </Link>{" "}
-                <span className="fleet-idle-count">
-                  {project.slots.length}/{project.limit}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </section>
+        <IdleProjects
+          columns={idle}
+          projects={projects}
+          stale={stale}
+          panelId={panelId}
+          onNewJob={onNewJob}
+        />
       )}
     </>
+  );
+}
+
+/**
+ * The projects with nothing held: a list after the busy columns, or the page's body when nothing
+ * is busy anywhere.
+ *
+ * It was a column each, which is the paragraph above; then one line at the foot of the page, and
+ * on a quiet day that line was the page — five projects reduced to a footnote of underlined names.
+ * A list is neither. It is the rows idiom (`.ui-rows`), read by scanning down it, with the two
+ * facts the column head carried — the autopilot mode and the capacity — the room that capacity
+ * leaves, and the one thing an idle project is for.
+ *
+ * **The row's New job is the header's, aimed.** It opens the same panel with this project already
+ * chosen rather than being a second form: one form per page is the rule the panel exists for. It
+ * is offered only where `POST /jobs` would take the job, and `whyNoJob` is that rule — the select's
+ * rule too, so a row and the list of options can never disagree. Where it would not, the row says
+ * why in the select's own words. Gone while the view is stale, like every control on this page
+ * that acts on capacity; kept while the kill switch is engaged, like the header's, because the
+ * panel is where that refusal is said.
+ */
+function IdleProjects({
+  columns,
+  projects,
+  stale,
+  panelId,
+  onNewJob,
+}: {
+  columns: FleetColumn[];
+  projects: ProjectSummary[] | undefined;
+  stale: boolean;
+  panelId: string;
+  onNewJob: (from: HTMLElement, project: string) => void;
+}) {
+  const titleId = useId();
+  return (
+    <section className="fleet-idle-group" aria-labelledby={titleId}>
+      <h2 id={titleId} className="fleet-idle-title">
+        Idle <span className="fleet-idle-count">· {columns.length}</span>
+      </h2>
+      <ul className="fleet-idle ui-rows">
+        {columns.map(({ project }) => {
+          const summary = projects?.find((row) => row.project_id === project.project_id);
+          const why = whyNoJob(project, summary);
+          const room = project.limit - project.slots.length;
+          return (
+            <li key={project.project_id} className="ui-rows-row fleet-idle-row">
+              <Link to={`/projects/${project.project_id}/state`} className="fleet-idle-name">
+                {project.project_id}
+              </Link>
+              {/* The cell stays when `/projects` has not answered, so the capacity still lines up
+                  under the others — and stays empty, because a guessed mode on a safety control
+                  is worse than none. */}
+              <span className="fleet-idle-mode">
+                {summary !== undefined && (
+                  <>
+                    <span className="sr-only">autopilot </span>
+                    <StateBadge domain="autopilot" state={summary.mode} />
+                  </>
+                )}
+              </span>
+              <span className="fleet-idle-capacity">
+                {project.slots.length} of {project.limit}
+              </span>
+              <span className="fleet-idle-room">{room > 0 ? `room for ${room}` : "no room"}</span>
+              <span className="fleet-idle-act">
+                {why !== null ? (
+                  <span className="fleet-idle-why">{why}</span>
+                ) : (
+                  !stale && (
+                    // Named with the project: five buttons all called "New job" are five of the
+                    // same name to anybody not looking at the row they sit in.
+                    <Button
+                      variant="quiet"
+                      intent="go"
+                      aria-label={`New job in ${project.project_id}`}
+                      aria-controls={panelId}
+                      onClick={(event) => onNewJob(event.currentTarget, project.project_id)}
+                    >
+                      New job
+                    </Button>
+                  )
+                )}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
   );
 }
 
@@ -414,30 +533,37 @@ function ProjectColumn({
 function NewJobPanel({
   id,
   open,
+  asked,
   columns,
   projects,
   engaged,
+  picked,
+  onPick,
   onClose,
 }: {
   id: string;
   open: boolean;
+  /** Changes on every request to open, so a second row's New job moves focus in again. */
+  asked: number;
   columns: FleetColumn[];
   projects: ProjectSummary[] | undefined;
   engaged: boolean;
+  picked: string;
+  onPick: (project: string) => void;
   onClose: () => void;
 }) {
   const prompt = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if (open) prompt.current?.focus();
-  }, [open]);
+  }, [open, asked]);
 
   return (
     <div
       id={id}
       className="fleet-compose"
       hidden={!open}
-      // Escape anywhere inside closes it, and focus goes back to New job.
+      // Escape anywhere inside closes it, and focus goes back to whichever New job opened it.
       onKeyDown={(event) => {
         if (event.key === "Escape") onClose();
       }}
@@ -455,6 +581,8 @@ function NewJobPanel({
           columns={columns}
           projects={projects}
           engaged={engaged}
+          picked={picked}
+          onPick={onPick}
           onStarted={onClose}
         />
       </Panel>
@@ -471,16 +599,35 @@ export interface ProjectChoice {
 }
 
 /**
- * Every project, each with the reason it cannot take a job, if there is one.
+ * Why `POST /jobs` would refuse a job in this project, or `null` when it would take one.
  *
- * The reasons are `POST /jobs`'s own, read out of `core/src/job.rs` and asked before the press
+ * The reasons are the route's own, read out of `core/src/job.rs` and asked before the press
  * rather than after it: `resolve_start` refuses a project whose autopilot is not `active` —
  * `shadow` included, because shadow is plan-only and a job writes to a worktree — and one with no
- * root recorded, and `concurrency::room_for` refuses a full one. A disabled option that says why
- * is a refusal the reader never has to earn.
+ * root recorded, and `concurrency::room_for` refuses a full one.
  *
- * When `/projects` has not answered, the mode and root are not known, and nothing is disabled on
+ * One function, said in two places: an option in the New job select and an idle row on the page.
+ * Two copies of these sentences would be two answers to one question the first time either was
+ * reworded.
+ *
+ * When `/projects` has not answered, the mode and root are not known, and nothing is refused on
  * their account: guessing would be a claim, and the daemon still refuses what it must.
+ */
+export function whyNoJob(
+  project: ProjectConcurrency,
+  summary: ProjectSummary | undefined,
+): string | null {
+  const held = project.slots.length;
+  if (summary?.mode === "off") return "autopilot off — jobs start only when it is active";
+  if (summary?.mode === "shadow") return "in shadow — jobs start only when the autopilot is active";
+  if (summary !== undefined && summary.project_root === null) return "no folder recorded";
+  if (project.limit - held <= 0) return `full (${held} of ${project.limit})`;
+  return null;
+}
+
+/**
+ * Every project, each with the reason it cannot take a job, if there is one (`whyNoJob`). A
+ * disabled option that says why is a refusal the reader never has to earn.
  */
 export function projectChoices(
   columns: FleetColumn[],
@@ -491,17 +638,10 @@ export function projectChoices(
     .map(({ project }) => {
       const held = project.slots.length;
       const room = project.limit - held;
-      const summary = projects?.find((row) => row.project_id === project.project_id);
-      const reason =
-        summary !== undefined && summary.mode === "off"
-          ? "autopilot off"
-          : summary !== undefined && summary.mode === "shadow"
-            ? "in shadow — a job needs active"
-            : summary !== undefined && summary.project_root === null
-              ? "no folder recorded"
-              : room <= 0
-                ? `full (${held} of ${project.limit})`
-                : null;
+      const reason = whyNoJob(
+        project,
+        projects?.find((row) => row.project_id === project.project_id),
+      );
       return {
         id: project.project_id,
         room,
@@ -540,12 +680,17 @@ function NewJobForm({
   columns,
   projects,
   engaged,
+  picked,
+  onPick,
   onStarted,
 }: {
   promptRef: RefObject<HTMLTextAreaElement | null>;
   columns: FleetColumn[];
   projects: ProjectSummary[] | undefined;
   engaged: boolean;
+  /** The project somebody chose — in the select or on an idle row — or empty for the roomiest. */
+  picked: string;
+  onPick: (project: string) => void;
   onStarted: () => void;
 }) {
   const create = useCreateJob();
@@ -554,7 +699,6 @@ function NewJobForm({
   const [budget, setBudget] = useState("");
   const [rounds, setRounds] = useState("");
   const [team, setTeam] = useState("");
-  const [picked, setPicked] = useState("");
   const hintId = useId();
   const killId = useId();
   const whyId = useId();
@@ -602,19 +746,17 @@ function NewJobForm({
         );
       }}
     >
+      {/* The inner id is Start job's: the button points at the same sentence to say why it is not
+          pressable yet. `Field` itself names the box by its label and describes it by the helper. */}
       <Field
         label="Prompt"
         helper={<span id={hintId}>Start job waits until this says what the job should work on.</span>}
       >
-        {/* Named outright: `Field` renders its helper inside the `<label>`, so without this the
-            helper would be read as part of the name instead of as the description. */}
         <textarea
           ref={promptRef}
           className="fleet-new-job-prompt"
           rows={3}
           value={prompt}
-          aria-label="Prompt"
-          aria-describedby={hintId}
           onChange={(event) => setPrompt(event.target.value)}
         />
       </Field>
@@ -624,7 +766,7 @@ function NewJobForm({
           <select
             value={choice?.id ?? ""}
             aria-label="Project for the new job"
-            onChange={(event) => setPicked(event.target.value)}
+            onChange={(event) => onPick(event.target.value)}
           >
             {choices.map((one) => (
               <option key={one.id} value={one.id} disabled={!one.available}>
@@ -832,8 +974,11 @@ function counted(count: number, one: string, many: string): string {
  * The page's answer to "is everything fine?", worst fact first.
  *
  * A ladder in the order of what it asks of the reader, the way Home's is. Faults lead — a slot
- * held by nothing, an item that did not merge, two trees measured writing the same file — and
- * they are set in the wrong-fact colour, as Home sets its own. Then what is waiting on a
+ * held by nothing, two trees measured writing the same file — and they are set in the wrong-fact
+ * colour, as Home sets its own. Then an item that did not merge, in plain words and not in that
+ * colour: `core/src/job.rs` puts a conflicted item down rather than failing it ("a conflict is a
+ * question about two pieces of work, not a verdict on either") and the queue starts the
+ * resolution run itself, so it is work that stopped, not a fault. Then what is waiting on a
  * decision, which is a door to Waiting; then what a rule is holding back; then the kill switch,
  * which is not a fault but is the reason nothing new starts; then a stale reading, because every
  * number after it is the last good one rather than the current one. The capacity comes last, and
@@ -854,19 +999,15 @@ function headline({ capacity, totals, engaged, stale, waiting }: HeadlineFacts):
       </span>,
     );
   }
-  if (totals.conflicted > 0) {
-    clauses.push(
-      <span className="ui-wrong">
-        {counted(totals.conflicted, "item", "items")} did not merge
-      </span>,
-    );
-  }
   if (totals.collided > 0) {
     clauses.push(
       <span className="ui-wrong">
         {counted(totals.collided, "observed overlap", "observed overlaps")} between trees
       </span>,
     );
+  }
+  if (totals.conflicted > 0) {
+    clauses.push(`${counted(totals.conflicted, "item", "items")} did not merge`);
   }
   if (totals.awaiting > 0) {
     clauses.push(

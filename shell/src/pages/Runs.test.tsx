@@ -608,6 +608,32 @@ describe("Runs - when the nucleo refuses to start one", () => {
 
     const said = await screen.findByText(/could not be read/);
     expect(said.textContent).not.toMatch(/is not available/);
+    // Two things are read before a start and either can be the one that failed, so a body that
+    // came back empty is answered with both rather than with a guess.
+    expect(said.textContent).toMatch(/kill switch/);
+    expect(said.textContent).toMatch(/autopilot mode/);
+  });
+
+  it("says which of the two could not be read when the daemon says so", async () => {
+    // `create_run`'s second 503: a shadow or worktree run in a project whose autopilot mode it
+    // could not read. It fails closed there too, and names the project in its own sentence.
+    await refuseStartWith(
+      new ApiRefusal(503, "unavailable", "`alpha`'s autopilot mode could not be read, so nothing was started"),
+    );
+
+    const said = await screen.findByText(/autopilot mode could not be read/);
+    expect(said.textContent).toBe("`alpha`'s autopilot mode could not be read, so nothing was started");
+  });
+
+  it("tells a full project from the kill switch by the daemon's own sentence, though both are 409", async () => {
+    // `create_run_reason` in `core/src/http.rs` writes the full project's sentence; the switch
+    // writes its own. Same status, different prose, and the prose is what is shown.
+    await refuseStartWith(
+      new ApiRefusal(409, "conflict", "this project has no free slot right now, so nothing was started"),
+    );
+
+    const said = await screen.findByText(/no free slot right now/);
+    expect(said.textContent).not.toMatch(/kill switch/);
   });
 
   it("has no sentence of its own for a 429, because this route never sends one", async () => {
@@ -702,12 +728,14 @@ describe("Runs - presets", () => {
 
     fireEvent.click(within(presets).getByRole("button", { name: "Run tidy" }));
     // Armed, and nothing has run: the label now says what the second press does.
-    expect(await within(presets).findByRole("button", { name: "Run in real mode · tidy" })).toBeDefined();
+    // No subject appended: the name is on the row already, and appending it made the armed
+    // label — and so the reserved width — the widest thing in the list.
+    expect(await within(presets).findByRole("button", { name: "Run in real mode" })).toBeDefined();
     expect(started).toEqual([]);
 
     // Past the interlock's double-click dwell, the second press is a decision.
     await new Promise((resolve) => setTimeout(resolve, 350));
-    fireEvent.click(within(presets).getByRole("button", { name: "Run in real mode · tidy" }));
+    fireEvent.click(within(presets).getByRole("button", { name: "Run in real mode" }));
     await waitFor(() => expect(started).toEqual(["/presets/4/run"]));
 
     fireEvent.click(within(presets).getByRole("button", { name: "Run nightly" }));

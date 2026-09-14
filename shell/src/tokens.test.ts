@@ -276,6 +276,29 @@ describe("the light theme clears AA where it is read", () => {
   });
 
   /**
+   * A link is read wherever it lands: in the page headline on the ground, on a card, in a well.
+   * `#0b8493` measured 4.10:1 on `--bg` — the headline's link was under the floor while the
+   * same colour passed on a card, which is why every ground is asked and not only the white one.
+   */
+  it("light --accent clears 4.5:1 as link text on bg, surface and sunken", () => {
+    const accent = token("--accent");
+    for (const groundName of ["--bg", "--surface", "--surface-sunken"]) {
+      const ratio = contrast(accent, token(groundName));
+      expect(ratio, `--accent on ${groundName}: ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  /** A Held Ember badge is its foreground on its own fill, over whatever the badge sits on. */
+  it("light --tone-paused-fg clears 4.5:1 on its own fill over bg, surface and sunken", () => {
+    const fg = token("--tone-paused-fg");
+    const fill = token("--tone-paused-bg");
+    for (const groundName of ["--bg", "--surface", "--surface-sunken"]) {
+      const ratio = contrast(fg, over(fill, token(groundName)));
+      expect(ratio, `--tone-paused-fg on --tone-paused-bg over ${groundName}: ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  /**
    * Both rules are set at `--text-xs` (11 px), where `--text-faint` is under
    * the 4.5:1 floor; `--text-muted` is the step on the ladder that clears it.
    */

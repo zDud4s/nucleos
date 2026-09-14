@@ -142,15 +142,18 @@ export function noExceptions(): Exceptions {
 /**
  * How bad a column's worst fact is, as a rank: lower is worse.
  *
- * Three rungs, in the order the headline says them. A fault — a leaked slot, a merge that did
- * not land, two trees measured writing the same file — outranks a job waiting on a person, which
- * outranks a job a rule is holding back. Nothing at all is last.
+ * Four rungs, in the order the headline says them. A fault — a leaked slot, two trees measured
+ * writing the same file — outranks an item put down on a merge conflict, which is not a fault
+ * (`core/src/job.rs`, `ItemState::Conflicted`: "a conflict is a question about two pieces of
+ * work, not a verdict on either") but is work that stopped; that outranks a job waiting on a
+ * person, which outranks a job a rule is holding back. Nothing at all is last.
  */
 export function severity(found: Exceptions): number {
-  if (found.leaked + found.conflicted + found.collided > 0) return 0;
-  if (found.awaiting > 0) return 1;
-  if (found.excluded > 0) return 2;
-  return 3;
+  if (found.leaked + found.collided > 0) return 0;
+  if (found.conflicted > 0) return 1;
+  if (found.awaiting > 0) return 2;
+  if (found.excluded > 0) return 3;
+  return 4;
 }
 
 /**
@@ -161,9 +164,9 @@ export function severity(found: Exceptions): number {
  * principle 2). Busyness second, because among projects with nothing wrong the one doing the most
  * is the one being watched. The name last, so two equal columns never swap places on a tick.
  *
- * An idle project is not dropped here. It is the page that folds idle projects into one line —
- * this order is about which busy column comes first, and a project's position among its peers is
- * still the thing a reader memorises.
+ * An idle project is not dropped here. It is the page that lists idle projects apart from the
+ * busy columns — this order is about which busy column comes first, and a project's position
+ * among its peers is still the thing a reader memorises.
  */
 export function orderColumns(columns: FleetColumn[]): FleetColumn[] {
   return [...columns].sort((left, right) => {

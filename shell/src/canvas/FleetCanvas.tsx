@@ -326,7 +326,9 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
             // same pair can be asked about again — which is the grammar's word for it. No
             // `subject` on the armed label: the interlock reserves the wider label's width, and
             // "· job 56" pushed a four-letter Lift half a card to the right of its sentence. The
-            // partner is still said to the ear, in `sayAs`, and is already in the sentence.
+            // partner is still said to the ear, in `sayAs`, and is already in the sentence. The
+            // width still reserved is "Lift the rule"'s, and `fleet.css` starts the resting label
+            // at its left edge (`.fleet-edge-note .ui-confirm-stack`) rather than centring it.
             !actions.stale && (
               <ConfirmButton
                 label="Lift"

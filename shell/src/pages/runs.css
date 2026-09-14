@@ -255,6 +255,20 @@
   gap: var(--space-2) var(--space-4);
 }
 
+/* Delete is a quiet interlock: an underlined word in a box reserved for "Delete
+   memory-upkeep for good". Centred in that box it stood off from Run beside it,
+   and on a wrapped line off the row's left edge. Start-aligned, as Fleet's Lift
+   is and for the same reason; the width stays reserved, so arming moves
+   nothing. Scoped to this row, because System's quiet Restart is aligned to a
+   right edge and centring is the closer of the two answers there. */
+.runs-preset-actions .ui-confirm-stack {
+  justify-items: start;
+}
+
+.runs-preset-actions .ui-confirm-stack > * {
+  justify-content: flex-start;
+}
+
 /* ================================================================ filters == */
 
 /* A strip on the page, not a card on it: the list below is the one box. */

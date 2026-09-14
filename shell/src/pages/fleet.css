@@ -181,7 +181,9 @@
   border-bottom: 1px solid var(--border);
 }
 
-.fleet-column-title {
+/* The idle list's heading wears the same rank: its rows are projects, as the columns are. */
+.fleet-column-title,
+.fleet-idle-title {
   margin: 0;
   min-width: 0;
   font-family: var(--font-display);
@@ -217,63 +219,127 @@
 /* ------------------------------------------------------------------ idle -- */
 
 /**
- * Every project with nothing held, as one line under the busy columns.
+ * Every project with nothing held: a list after the busy columns, or the page's body.
  *
- * A section title's rank, in the muted rung rather than the faint one: faint
- * failed AA at this 11px size. The names are links in the text colour with a
- * quiet underline — the crumb's idiom — because five cyan words in the line
- * that means "nothing to see" would make it the loudest thing on the page.
+ * `.ui-rows` is the list and this sheet only lays its rows out. The rows share one grid through
+ * `subgrid`, so the mode, the capacity and the room line up down the list whatever each project
+ * is called — which is what makes it a list rather than a pile of sentences — and the last track
+ * holds the row's New job, or the words for why there is none, against the right edge.
+ *
+ * A container and not a window query: the same list is the whole page at 1280 and a strip under
+ * the columns at 800, and it is its own width that decides whether a row fits on one line.
  */
-.fleet-idle {
+.fleet-idle-group {
   display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-2) var(--space-4);
+  flex-direction: column;
+  gap: var(--space-3);
+  container: fleet-idle / inline-size;
+}
+
+/* After the columns, the same air the columns leave between their own rows. */
+.fleet-columns + .fleet-idle-group {
   margin-top: var(--space-6);
-  padding-top: var(--space-3);
-  border-top: 1px solid var(--border);
 }
 
-.fleet-idle-title {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: var(--text-xs);
+/* The count beside the heading: the heading's face, one rung down. */
+.fleet-idle-count {
+  font-weight: var(--weight-regular);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+/* Five tracks: name, mode, capacity, room, and the action. The name track is as wide as the
+   longest name and no wider; the room track takes what is left, which is what puts the action
+   at the right edge. */
+.fleet-idle.ui-rows {
+  display: grid;
+  grid-template-columns: minmax(0, max-content) auto auto minmax(0, 1fr) auto;
+  column-gap: var(--space-4);
+}
+
+/* The row's own gap is restated rather than inherited from `.ui-rows-row`, whose 4px would
+   otherwise be the gutter inside every row while the list's is 16px. */
+.fleet-idle-row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: center;
+  column-gap: var(--space-4);
+}
+
+/* A real destination, in the text colour with a quiet underline — the crumb's idiom. The name is
+   what the row is about, and five cyan names down a list whose other job is to say "nothing in
+   flight here" would make it the loudest thing on the page. */
+.fleet-idle-name {
+  min-width: 0;
   font-weight: var(--weight-medium);
-  letter-spacing: var(--tracking-wider);
-  text-transform: uppercase;
-  color: var(--text-muted);
-}
-
-.fleet-idle-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-1) var(--space-4);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.fleet-idle-item {
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
-
-.fleet-idle-link {
   color: var(--text);
   text-decoration: underline;
   text-decoration-color: var(--border-strong);
   text-underline-offset: 0.2em;
+  overflow-wrap: anywhere;
 }
 
-.fleet-idle-link:hover {
+.fleet-idle-name:hover {
   text-decoration-color: currentColor;
 }
 
-.fleet-idle-count {
+.fleet-idle-mode {
+  display: inline-flex;
+}
+
+/* The daemon's capacity reading, in its face: mono and tabular, so `0 of 3` and `0 of 12` hold
+   one column down the list. */
+.fleet-idle-capacity {
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.fleet-idle-room {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* The row's one action, or why there is none, at the edge where a list's action is looked for. */
+.fleet-idle-act {
+  justify-self: end;
+  text-align: end;
+}
+
+.fleet-idle-why {
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+}
+
+/**
+ * Narrow: the name and its readings on one line, the action on the next.
+ *
+ * Under 40rem the five tracks cannot all hold their content — a reason is a whole clause — so each
+ * row leaves the shared grid for a wrapping line of its own, and the action starts its line from
+ * the left, where the eye comes back to after the name.
+ */
+@container fleet-idle (max-width: 40rem) {
+  .fleet-idle.ui-rows {
+    display: flex;
+  }
+
+  .fleet-idle-row {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-3);
+  }
+
+  .fleet-idle-act {
+    flex-basis: 100%;
+    text-align: start;
+  }
 }
 
 /* ------------------------------------------------------------- slot card -- */
@@ -438,6 +504,27 @@
   flex: 1 1 10rem;
   min-width: 0;
   color: var(--text-muted);
+}
+
+/**
+ * Lift, flush with the note it belongs to.
+ *
+ * The interlock reserves the armed label's width ("Lift the rule") so that arming moves nothing,
+ * and centres the resting label inside it — right for a button with a box, wrong for a quiet one,
+ * which is an underlined word with no box to be centred in. In a card the note wraps, Lift lands
+ * on a line of its own, and it read as indented from the badge above it.
+ *
+ * Start-aligned here and not in the primitive, because not every quiet interlock sits on a left
+ * edge: System stacks its quiet Restart against the right one (`.sy-subsystem-action`,
+ * `align-items: flex-end`), and start there would pull it off the edge it is aligned to. The
+ * reserved width stays.
+ */
+.fleet-edge-note .ui-confirm-stack {
+  justify-items: start;
+}
+
+.fleet-edge-note .ui-confirm-stack > * {
+  justify-content: flex-start;
 }
 
 /* The keyboard's way to the pairing question: a select and its button. */
