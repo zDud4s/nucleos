@@ -551,6 +551,18 @@ pub enum ReviewState {
     Pending,
     Running,
     Done,
+    /// Wanted, and not had, because no item of this round reached `passed`.
+    ///
+    /// A review exists to judge what the round produced, and a round in which nothing passed has
+    /// put nothing on the branch: every red item was reverted to its footing before the queue moved
+    /// on. Measured on job 27, 2026-09-14: round 0's only item ended `gate_failed`, its work was
+    /// reverted, and the review (run 900513, $0.12) found `HEAD` at the base and a clean tree and
+    /// reported "no work was done" — about work that had been done, measured, and taken back.
+    ///
+    /// Not a failed review, and nothing reads it as one: it closes the round the way `Done` does,
+    /// but no node ran, so there is no verdict anywhere to quote. `load_view` derives it from the
+    /// item rows on every read, so a restart finds the same answer rather than remembering one.
+    Skipped,
 }
 
 /// How a job ended.
@@ -1028,8 +1040,26 @@ pub fn next_step(job: &JobView) -> Next {
     match job.review {
         ReviewState::Pending => Next::SpawnReview,
         ReviewState::Running => Next::Wait,
-        ReviewState::NotWanted | ReviewState::Done => close_the_round(job),
+        // A round in which nothing passed goes on exactly as it would have after its review: to
+        // the replan, or to the ending. See `ReviewState::Skipped`.
+        ReviewState::NotWanted | ReviewState::Done | ReviewState::Skipped => close_the_round(job),
     }
+}
+
+/// PURE: whether `next_step` answered what it did only because the round's review was skipped.
+///
+/// Asked by putting the review back and asking again, rather than by restating the conditions under
+/// which `next_step` reaches the review: a second copy of those would agree with the first only
+/// until one of them was edited. `ReviewState::Skipped` alone is not enough, because the view reads
+/// it all through a round in which nothing has passed YET. While items are still to run the skip
+/// has decided nothing, and a job cancelled mid-round ends at the short-circuit, review or no
+/// review.
+fn the_skip_decided(view: &JobView) -> bool {
+    view.review == ReviewState::Skipped
+        && next_step(&JobView {
+            review: ReviewState::Pending,
+            ..view.clone()
+        }) == Next::SpawnReview
 }
 
 /// Who the director gave this item to, in their own words, or `None`.
@@ -1541,6 +1571,16 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
             .bind(round)
             .fetch_one(pool)
             .await?;
+    // And the one after it: did anything this round queued PASS. Asked of the rows for the same
+    // reason, and asked on every read rather than written down, so a round spared its review is
+    // spared it again after a restart — see `ReviewState::Skipped`.
+    let passed_this_round: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM job_items WHERE job_id = ? AND round = ? AND status = 'passed'",
+    )
+    .bind(job_id)
+    .bind(round)
+    .fetch_one(pool)
+    .await?;
 
     let plan_run = latest_node("plan").await?;
     let spec_run = latest_node("spec").await?;
@@ -1577,6 +1617,10 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
 
     let review = match (review_wanted != 0, review_run.as_deref()) {
         (false, _) => ReviewState::NotWanted,
+        // Only while the round has no review of its own. One already running, or landed, is read
+        // for what it is, which also leaves a job that reviewed such a round before this existed
+        // reading exactly as it did.
+        (true, None) if passed_this_round == 0 => ReviewState::Skipped,
         (true, None) => ReviewState::Pending,
         (true, Some(status)) if node_in_flight(status) => ReviewState::Running,
         // A review that failed is still a review that happened. Its verdict is advisory — §5.5 of
@@ -2935,6 +2979,28 @@ async fn say(pool: &SqlitePool, job: &JobRow, kind: &str, summary: &str) {
     // A job is not a run, so the feed row carries no run id — writing the job's id into that column
     // would point every reader at whatever run happens to share the number.
     let _ = crate::feed::append(pool, Some(&job.project_id), kind, summary, None).await;
+}
+
+/// `say`, unless the feed already carries this exact line for this job's project.
+///
+/// For a row written on the way INTO a step that can still be refused after it: a replan parked for
+/// want of a slot, or a review parked behind a council, comes back through the same arm on every
+/// tick until it starts, and a row said on each pass is the feed of one sentence repeated that
+/// `park` already refuses to write. The summaries this is given name the job and the round, so
+/// "already said" is exact.
+async fn say_once(pool: &SqlitePool, job: &JobRow, kind: &str, summary: &str) {
+    let said: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM feed WHERE project_id = ? AND kind = ? AND summary = ? LIMIT 1",
+    )
+    .bind(&job.project_id)
+    .bind(kind)
+    .bind(summary)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    if said.is_none() {
+        say(pool, job, kind, summary).await;
+    }
 }
 
 /// Folds a finished node's outcome back into the job.
@@ -4832,6 +4898,23 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
     let next = next_step(&view);
     if matches!(next, Next::Wait) {
         return Step::Stopped;
+    }
+    // Said here, ahead of both roads a closing round can take — the ending just below and the
+    // replan past the brakes — because the skip is the reason for either, and a reader who finds a
+    // round with no review in the feed should find why beside it.
+    if the_skip_decided(&view) {
+        say_once(
+            pool,
+            job,
+            "job_review_skipped",
+            &format!(
+                "job {} round {}: no item of the round passed, so there was nothing on the branch \
+                 for a review to judge and none was run",
+                job.id,
+                view.rounds.round + 1
+            ),
+        )
+        .await;
     }
     if let Next::Finish(outcome) = &next {
         let outcome = *outcome;
@@ -10363,10 +10446,13 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
+        // No review, and deliberately: both items went red and were reverted, so the round put
+        // nothing on the branch, and a review would read a diff of nothing — which is what job
+        // 27's round-0 review did on 2026-09-14. See `ReviewState::Skipped`.
         assert_eq!(
             stages,
-            vec!["spec", "plan", "implement", "implement", "review"],
-            "the whole queue runs, and the review still gets to see what came out of it"
+            vec!["spec", "plan", "implement", "implement"],
+            "the whole queue runs, and a round in which nothing passed is not reviewed"
         );
 
         let _ =
@@ -10654,6 +10740,185 @@ mod tests {
             Next::Wait,
             "waiting for the replan, not paying for a second review of the same queue"
         );
+    }
+
+    /// A job whose round has run out of items, allowed to go round again after a red gate: the
+    /// shape job 27 was in on 2026-09-14 when its round-0 review was spent on nothing.
+    async fn a_round_run_out(
+        pool: &sqlx::SqlitePool,
+        worktree: &std::path::Path,
+        items: &[&str],
+        review: bool,
+    ) -> i64 {
+        let job_id = seed_job(pool, "project-a", "gating").await.unwrap();
+        sqlx::query(
+            "UPDATE jobs SET project_root = ?, rule_name = NULL, budget_usd = 25.0, max_rounds = 5,
+                             review = ?
+             WHERE id = ?",
+        )
+        .bind(worktree.to_string_lossy().into_owned())
+        .bind(review)
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        seed_worktree(pool, job_id, worktree).await;
+        seed_items(pool, job_id, items).await;
+        spend_the_red_items_gates(pool, job_id).await;
+        job_id
+    }
+
+    /// The red items as `record_gate` leaves them: the attempt counted, so against a budget of no
+    /// retries each one reads `GateFailed` and not `GateRetriable` — an item over, not one to redo.
+    async fn spend_the_red_items_gates(pool: &sqlx::SqlitePool, job_id: i64) {
+        sqlx::query(
+            "UPDATE job_items SET gate_attempts = 1 WHERE job_id = ? AND status = 'gate_failed'",
+        )
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn skips_said(told: &[String]) -> usize {
+        told.iter()
+            .filter(|line| line.contains("nothing on the branch for a review to judge"))
+            .count()
+    }
+
+    /// A round in which nothing passed goes on to the replan without paying to review nothing.
+    ///
+    /// Job 27, 2026-09-14: round 0's only item ended `gate_failed`, its work was reverted, and the
+    /// review (run 900513, $0.12) found `HEAD` at the base and reported "no work was done". The
+    /// round now closes the way it would have after that review, and the feed says why it had none.
+    #[tokio::test]
+    async fn a_round_in_which_nothing_passed_goes_to_the_replan_without_a_review() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = a_round_run_out(&pool, worktree.path(), &["gate_failed"], true).await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(view.review, ReviewState::Skipped);
+        assert_eq!(next_step(&view), Next::SpawnReplan);
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(
+            stages_run(&pool, job_id).await,
+            vec!["replan"],
+            "the round was reviewed although nothing in it passed"
+        );
+        let told = feed_texts(&pool).await;
+        assert_eq!(
+            skips_said(&told),
+            1,
+            "the skip has to be said, once: {told:?}"
+        );
+        // Derived from the rows, so a second read — a restart — finds the same answer.
+        assert_eq!(
+            load_view(&pool, job_id).await.unwrap().review,
+            ReviewState::Skipped
+        );
+    }
+
+    /// The same for a job of one round: it ends where it would have ended after the review,
+    /// `gate_failed`, without the review.
+    #[tokio::test]
+    async fn a_one_round_job_in_which_nothing_passed_ends_without_a_review() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "gating").await.unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_items(&pool, job_id, &["gate_failed"]).await;
+        spend_the_red_items_gates(&pool, job_id).await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(view.review, ReviewState::Skipped);
+        assert_eq!(next_step(&view), Next::Finish(Outcome::GateFailed));
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert!(stages_run(&pool, job_id).await.is_empty());
+        assert_eq!(job_status(&pool, job_id).await, "gate_failed");
+        assert_eq!(
+            feed_kinds(&pool).await,
+            vec!["job_review_skipped", "job_finished"],
+            "the reason there was no review belongs beside the ending it led to"
+        );
+    }
+
+    /// One item that passed is a round with something to judge, and it is judged — whatever
+    /// happened to the rest of it.
+    #[tokio::test]
+    async fn a_round_with_one_passed_item_still_gets_its_review() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id =
+            a_round_run_out(&pool, worktree.path(), &["gate_failed", "passed"], true).await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(view.review, ReviewState::Pending);
+        assert_eq!(next_step(&view), Next::SpawnReview);
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(stages_run(&pool, job_id).await, vec!["review"]);
+        assert_eq!(skips_said(&feed_texts(&pool).await), 0);
+    }
+
+    /// A job that never wanted a review walks a round in which nothing passed exactly as it did: no
+    /// review, and no line saying one was skipped, because none was owed.
+    #[tokio::test]
+    async fn a_job_with_review_off_walks_a_round_with_nothing_passed_as_it_did() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = a_round_run_out(&pool, worktree.path(), &["gate_failed"], false).await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(view.review, ReviewState::NotWanted);
+        assert_eq!(next_step(&view), Next::SpawnReplan);
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(stages_run(&pool, job_id).await, vec!["replan"]);
+        assert_eq!(skips_said(&feed_texts(&pool).await), 0);
+    }
+
+    /// The skip is said only once it is what decided the step. While items are still to run the
+    /// view reads `Skipped` — nothing has passed yet — and has decided nothing.
+    #[test]
+    fn a_skipped_review_decides_only_once_the_round_has_nothing_left_to_run() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view(true, &[GateFailed], ReviewState::Skipped)),
+            Next::Finish(Outcome::GateFailed)
+        );
+        assert!(the_skip_decided(&view(
+            true,
+            &[GateFailed],
+            ReviewState::Skipped
+        )));
+        assert!(
+            !the_skip_decided(&view(true, &[GateFailed, Pending], ReviewState::Skipped)),
+            "an item still to run: the skip has decided nothing yet"
+        );
+        assert!(
+            !the_skip_decided(&view(true, &[Cancelled], ReviewState::Skipped)),
+            "a cancelled job ends at the short-circuit, review or no review"
+        );
+        assert!(!the_skip_decided(&view(
+            true,
+            &[GateFailed],
+            ReviewState::NotWanted
+        )));
     }
 
     /// Ending #1. `completed` and not `stopped`, because the node that just looked at the work is
@@ -11641,13 +11906,16 @@ mod tests {
         // cannot happen: `record_gate` marks the item anyway and answers `Stopped`, refusing to let
         // a queue advance onto a tree it could not put back. The MARK is what these assertions read.
         //
-        // And there the two part company, which is the point of the test. Silence stops the job
-        // where it stands. A verdict does not: the queue is spent, so the job goes on to have its
-        // work reviewed, and only then is it called `gate_failed` — pinned purely in
+        // And there the two part company, which is the point of the test: silence ends the job
+        // `gate_errored`, a verdict ends it `gate_failed`. Silence stops the job where it stands.
+        // A verdict lets the queue carry on, and here the queue is spent, so the job goes where a
+        // spent queue goes — without a review, because the round's only item did not pass and
+        // there is nothing on the branch for one to judge (see `ReviewState::Skipped`). The
+        // verdict with a review in front of it is pinned purely in
         // `one_red_gate_makes_the_whole_job_gate_failed_however_it_ends`.
         assert_eq!(
             next_step(&load_view(&pool, broken).await.unwrap()),
-            Next::SpawnReview
+            Next::Finish(Outcome::GateFailed)
         );
         assert_eq!(
             next_step(&load_view(&pool, unmeasured).await.unwrap()),
