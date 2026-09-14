@@ -1536,11 +1536,13 @@
   min-width: 0;
 }
 
+/* Muted at 500, not faint: faint failed AA at this 11px rank (3.8:1 on the working surface). */
 .ui-field-label {
   font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 
 /* Present for a screen reader, absent from the page — see `labelHidden`. */
@@ -1573,9 +1575,9 @@
 }
 
 /* `base.css` sets `color: inherit`, which reaches `::placeholder` — a hint that reads as
-   text somebody already typed. Said once, here. */
+   text somebody already typed. Said once, here — and muted, because faint failed AA (3.8:1). */
 .ui-field ::placeholder {
-  color: var(--text-faint);
+  color: var(--text-muted);
   opacity: 1;
 }
 
