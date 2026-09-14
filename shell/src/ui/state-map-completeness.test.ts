@@ -2,7 +2,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { RUN_STATUSES, runIsAlive } from "../data/runs";
-import { statesOf } from "./state-map";
+import { readState, statesOf } from "./state-map";
 
 const moduleUrl = import.meta.url.startsWith("file:") ? import.meta.url : `file://${import.meta.url}`;
 const repoRoot = fileURLToPath(new URL("../../../", moduleUrl));
@@ -133,6 +133,38 @@ describe("state-map completeness", () => {
 
     expect(new Set(statesOf("job"))).toEqual(new Set([...jobLive, ...jobTerminal]));
     expect(new Set(statesOf("team_run"))).toEqual(new Set([...teamLive, ...teamTerminal]));
+  });
+
+  /**
+   * `job_items.status` has no Rust list of its own — `LIVE_ITEM_STATUSES` is test-only and
+   * covers only the unfinished half — so the vocabulary is read where the núcleo reads it back:
+   * the arms of `item_state_from`. `pending` is the one stored value that function reaches
+   * through `_ =>`, because it is the column's default, and it is asserted separately so the
+   * scan cannot quietly lose it.
+   */
+  it("every job item status the núcleo reads back has a reading, and conflicted is not a summons", () => {
+    const start = jobRs.indexOf("fn item_state_from(");
+    expect(start, "item_state_from is gone from job.rs").toBeGreaterThan(-1);
+    // The function's own closing brace, at column 0 — `\r?` because the checkout may be CRLF,
+    // and a search for "\n}\n" that never matched ran on into the next function's arms.
+    const rest = jobRs.slice(start);
+    const end = rest.search(/\r?\n\}\r?\n/);
+    expect(end, "could not find where item_state_from ends").toBeGreaterThan(0);
+    const body = rest.slice(0, end);
+    const constants = statusConstants(jobRs);
+    const arms = new Set<string>();
+    for (const [, literal] of body.matchAll(/"([a-z_]+)"(?:\s+if [^=]+)?\s*=>/g)) arms.add(literal);
+    for (const [, name] of body.matchAll(/\b(STATUS_\w+)\s*=>/g)) {
+      const value = constants.get(name);
+      expect(value, `${name} is not a pub const in job.rs`).toBeDefined();
+      arms.add(value!);
+    }
+    expect(arms.size).toBeGreaterThanOrEqual(12);
+    expect(jobRs).toMatch(/_ => ItemState::Pending/);
+
+    expect(new Set(statesOf("job_item"))).toEqual(new Set([...arms, "pending"]));
+    expect(readState("job_item", "conflicted")?.tone).toBe("danger");
+    expect(readState("job_item", "conflicted")?.tone).toBe(readState("feed", "job_item_conflicted")?.tone);
   });
 
   it("a team item has four states and planned is not one of them", () => {

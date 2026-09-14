@@ -116,17 +116,95 @@ export function slotStateLiteral(detail: SlotDetail): string | null {
 }
 
 /**
- * The columns, with the work in flight on the left.
+ * What is wrong, or waiting, in one project — counted, so the page can say it before it draws it.
  *
- * An idle project **keeps** its column, showing `0/N`: a column that vanishes
- * when it empties makes the layout jump every night that ends, and a project's
- * position on screen is the one thing the reader memorises.
+ * Five facts and not a severity score: the headline names each one in its own words, and a
+ * number that summed them would say "3" about a leak, a conflict and a pending approval that ask
+ * three different things of the reader.
  */
-export function orderColumns(projects: ProjectConcurrency[]): ProjectConcurrency[] {
-  return [...projects].sort((left, right) => {
-    const busier = right.slots.length - left.slots.length;
-    return busier !== 0 ? busier : left.project_id.localeCompare(right.project_id);
+export interface Exceptions {
+  /** Slots whose owner a complete listing did not return: leaked, awaiting the sweep. */
+  leaked: number;
+  /** Items of a directed job whose merge into the job's branch conflicted. */
+  conflicted: number;
+  /** Pairs of trees the núcleo MEASURED overlapping. A prediction is not counted here. */
+  collided: number;
+  /** Jobs parked on a person's approval. */
+  awaiting: number;
+  /** Jobs held back by an exclusion rule in force. */
+  excluded: number;
+}
+
+export function noExceptions(): Exceptions {
+  return { leaked: 0, conflicted: 0, collided: 0, awaiting: 0, excluded: 0 };
+}
+
+/**
+ * How bad a column's worst fact is, as a rank: lower is worse.
+ *
+ * Three rungs, in the order the headline says them. A fault — a leaked slot, a merge that did
+ * not land, two trees measured writing the same file — outranks a job waiting on a person, which
+ * outranks a job a rule is holding back. Nothing at all is last.
+ */
+export function severity(found: Exceptions): number {
+  if (found.leaked + found.conflicted + found.collided > 0) return 0;
+  if (found.awaiting > 0) return 1;
+  if (found.excluded > 0) return 2;
+  return 3;
+}
+
+/**
+ * The columns, exceptions first, then the busiest, then by name.
+ *
+ * Exceptions first so that a problem in a quiet project never drifts off the right of the screen
+ * behind three busy ones that are fine: exceptions dominate, the normal recedes (PRODUCT.md,
+ * principle 2). Busyness second, because among projects with nothing wrong the one doing the most
+ * is the one being watched. The name last, so two equal columns never swap places on a tick.
+ *
+ * An idle project is not dropped here. It is the page that folds idle projects into one line —
+ * this order is about which busy column comes first, and a project's position among its peers is
+ * still the thing a reader memorises.
+ */
+export function orderColumns(columns: FleetColumn[]): FleetColumn[] {
+  return [...columns].sort((left, right) => {
+    const worse = severity(left.exceptions) - severity(right.exceptions);
+    if (worse !== 0) return worse;
+    const busier = right.project.slots.length - left.project.slots.length;
+    return busier !== 0 ? busier : left.project.project_id.localeCompare(right.project.project_id);
   });
+}
+
+/** One column's exceptions, read off its cards and its project's own collision reading. */
+export function exceptionsOf(project: ProjectConcurrency, cards: SlotCardModel[]): Exceptions {
+  const found = noExceptions();
+  for (const card of cards) {
+    if (card.detail.kind === "orphaned") found.leaked += 1;
+    // Off the SLOT, not off the detail: the daemon joins `item_status` onto the slot, so a
+    // conflict is known even when the jobs listing that would describe the item failed.
+    if (card.slot.owner_kind === "item" && card.slot.item_status === "conflicted") {
+      found.conflicted += 1;
+    }
+    if (card.detail.kind === "job") {
+      if (card.detail.job.status === "awaiting_approval") found.awaiting += 1;
+      if (card.detail.job.status === "waiting" && card.detail.job.wait_reason === "excluded") {
+        found.excluded += 1;
+      }
+    }
+  }
+  if (project.collision.observed.state === "collide") {
+    found.collided = project.collision.observed.overlaps.length;
+  }
+  return found;
+}
+
+function addExceptions(into: Exceptions, more: Exceptions): Exceptions {
+  return {
+    leaked: into.leaked + more.leaked,
+    conflicted: into.conflicted + more.conflicted,
+    collided: into.collided + more.collided,
+    awaiting: into.awaiting + more.awaiting,
+    excluded: into.excluded + more.excluded,
+  };
 }
 
 export interface CollisionBadge {
@@ -277,72 +355,47 @@ export function partnersOf(edges: ExclusionEdge[], jobId: number): Partner[] {
 /* ------------------------------------------------------------------ layout -- */
 
 /**
- * How far apart the fallback positions sit, and how wide a row is before it
- * wraps.
+ * How far apart the fallback positions sit.
  *
  * **A cell has to be bigger than a card.** The first pass at this in the old
  * shell used a cell exactly a card wide, and two nodes in the same grid column
  * overlapped on the very first paint — which jsdom cannot see, because it does
- * no layout.
+ * no layout. `ZONE_HEAD` is the room above a row for its project's label.
  */
 const STEP_X = 320;
-const STEP_Y = 360;
-const PER_ROW = 4;
+const STEP_Y = 400;
 const MARGIN = 24;
-
-/** How many cells the derived positions spread over before they repeat. */
-const CELLS = PER_ROW * PER_ROW;
-
-/** Where the nth cell is. Defined for every n, not only the first `CELLS`. */
-function cellPosition(index: number): Point {
-  return {
-    x: MARGIN + (index % PER_ROW) * STEP_X,
-    y: MARGIN + Math.floor(index / PER_ROW) * STEP_Y,
-  };
-}
+export const ZONE_HEAD = 36;
+export const ZONE_PAD = 12;
 
 /**
- * A small, stable, order-independent hash of the key (FNV-1a, 32 bits).
+ * The position of every live node, saved or derived — one row per project.
  *
- * It is here so a node with no saved position is **derived from its key** and
- * never dropped at the origin: the first time somebody opens the canvas nothing
- * has a saved position, and a fleet piled in one corner reads as a broken
- * canvas. Derived and not random, so the arrangement a person learns stays
- * learned until they move something.
- */
-function hash(key: string): number {
-  let value = 0x811c9dc5;
-  for (let index = 0; index < key.length; index += 1) {
-    value ^= key.charCodeAt(index);
-    value = Math.imul(value, 0x01000193) >>> 0;
-  }
-  return value;
-}
-
-/**
- * The position of every live node, saved or derived.
+ * A row per project because the canvas now draws each project as a labelled region, and a
+ * region is only a region if its cards arrive next to each other. The positions used to be a
+ * hash of the key over a 4×4 grid, which kept each card still but scattered a project across
+ * the whole surface, so the one fact the columns carry — whose slots these are — was the one
+ * fact the canvas could not show.
  *
- * Two keys that want the same cell are separated here, and that is a deliberate
- * dent in the "a node never moves because its neighbours changed" rule. It has
- * to be: any position derived from the key alone collides, and a card exactly
- * underneath another cannot be read, cannot be clicked, and cannot be dragged
- * out from under. The tie is broken by the key rather than by arrival order, so
- * it is the same node that gives way every time.
+ * `rows` is the busy projects' card keys, **sorted by project id and then by slot**, and the
+ * sort is the caller's promise rather than an accident: both are stable across ticks, so a card
+ * that nobody moved stays where it arrived for as long as its project and its slot do. The one
+ * dent in that is a project emptying — the rows below it close up — and it is cheaper to accept
+ * than an empty band left on the surface for every project that finished.
+ *
+ * A saved position always wins. It is somebody's arrangement, and a derivation has no business
+ * overruling it.
  */
-export function positionsFor(nodeKeys: string[], saved: Layout): Layout {
+export function positionsFor(rows: string[][], saved: Layout): Layout {
   const layout: Layout = {};
-  const taken = new Set<number>();
-  for (const key of [...nodeKeys].sort()) {
-    const chosen = saved[key];
-    if (chosen !== undefined) {
-      layout[key] = chosen;
-      continue;
-    }
-    let cell = hash(key) % CELLS;
-    while (taken.has(cell)) cell += 1;
-    taken.add(cell);
-    layout[key] = cellPosition(cell);
-  }
+  rows.forEach((keys, row) => {
+    keys.forEach((key, column) => {
+      layout[key] = saved[key] ?? {
+        x: MARGIN + ZONE_PAD + column * STEP_X,
+        y: MARGIN + ZONE_HEAD + row * STEP_Y,
+      };
+    });
+  });
   return layout;
 }
 
@@ -481,9 +534,19 @@ export interface SlotCardModel {
   project: ProjectConcurrency;
   slot: HeldSlot;
   detail: SlotDetail;
+  /** Only the warnings about THIS owner. A project-wide `not_measured` is the column's. */
   badges: CollisionBadge[];
   partners: Partner[];
   end: ConnectionEnd;
+  /**
+   * The other jobs of this project this job could be asked never to share a slot with.
+   *
+   * The keyboard's way to the question the canvas asks by dragging a line: same project, both
+   * jobs, and no rule or request already joining the pair — the three things `isValidConnection`
+   * and the daemon's refusals check, answered before the control is drawn. Empty for anything
+   * that is not a job.
+   */
+  peers: number[];
 }
 
 /**
@@ -508,9 +571,19 @@ export type ExclusionFlowEdge = Edge<ExclusionEdgeData, "exclusion">;
 export interface FleetColumn {
   project: ProjectConcurrency;
   cards: SlotCardModel[];
+  exceptions: Exceptions;
+  /**
+   * What is true of the whole project rather than of one card — today, a source that did not
+   * measure overlap. Said once, in the column head, instead of once per card: four cards
+   * repeating "predicted — overlap not measured" was one fact taking four lines.
+   */
+  notes: CollisionBadge[];
+  /** Nothing held. The page folds these into one quiet line under the busy columns. */
+  idle: boolean;
 }
 
 export interface FleetModel {
+  /** Every project, exceptions first — busy and idle alike. */
   columns: FleetColumn[];
   nodes: SlotNode[];
   edges: ExclusionFlowEdge[];
@@ -518,6 +591,8 @@ export interface FleetModel {
   exclusions: ExclusionEdge[];
   /** Node key → end, so a dropped line can be judged without walking the nodes. */
   ends: Record<string, ConnectionEnd>;
+  /** Every column's exceptions, summed — the page headline's material. */
+  totals: Exceptions;
 }
 
 export interface FleetInput {
@@ -540,12 +615,13 @@ export interface FleetInput {
  */
 export function buildFleet(input: FleetInput): FleetModel {
   const exclusions = exclusionEdges(input.exclusions, input.requests);
-  const projects = orderColumns(input.concurrency?.projects ?? []);
+  const joined = new Set(exclusions.map((edge) => `${edge.low}:${edge.high}`));
 
-  const columns: FleetColumn[] = projects.map((project) => ({
-    project,
-    cards: project.slots.map((slot) => {
-      const detail = slotDetail(slot, input.jobs, input.runs);
+  const unordered: FleetColumn[] = (input.concurrency?.projects ?? []).map((project) => {
+    const details = project.slots.map((slot) => slotDetail(slot, input.jobs, input.runs));
+    const jobIds = details.flatMap((detail) => (detail.kind === "job" ? [detail.job.id] : []));
+    const cards: SlotCardModel[] = project.slots.map((slot, index) => {
+      const detail = details[index];
       const jobId = detail.kind === "job" ? detail.job.id : null;
       const key = ownerKey(slot);
       return {
@@ -553,23 +629,54 @@ export function buildFleet(input: FleetInput): FleetModel {
         project,
         slot,
         detail,
-        badges: collisionBadges(project, { kind: slot.owner_kind, id: slot.owner_id }),
+        badges: collisionBadges(project, { kind: slot.owner_kind, id: slot.owner_id }).filter(
+          (badge) => badge.state === "collide",
+        ),
         partners: jobId === null ? [] : partnersOf(exclusions, jobId),
         end: { key, projectId: project.project_id, jobId },
+        peers:
+          jobId === null
+            ? []
+            : jobIds.filter(
+                (other) =>
+                  other !== jobId &&
+                  !joined.has(`${Math.min(other, jobId)}:${Math.max(other, jobId)}`),
+              ),
       };
-    }),
-  }));
+    });
+    return {
+      project,
+      cards,
+      exceptions: exceptionsOf(project, cards),
+      // The owner is nobody, so only the project-wide rows survive: a `collide` names owners,
+      // and one that named nobody would be a warning about no card.
+      notes: collisionBadges(project, { kind: "", id: -1 }).filter(
+        (badge) => badge.state === "not_measured",
+      ),
+      idle: project.slots.length === 0,
+    };
+  });
+  const columns = orderColumns(unordered);
 
   const cards = columns.flatMap((column) => column.cards);
-  const positions = positionsFor(
-    cards.map((card) => card.key),
-    input.layout,
-  );
+  // By project id and by slot, NOT in the exceptions-first order above: a column may move
+  // across the page when something goes wrong in it, but a region on the canvas must not jump
+  // rows because its project's news changed.
+  const rows = [...columns]
+    .filter((column) => column.cards.length > 0)
+    .sort((left, right) => left.project.project_id.localeCompare(right.project.project_id))
+    .map((column) =>
+      [...column.cards].sort((left, right) => left.slot.slot - right.slot.slot).map((card) => card.key),
+    );
+  const positions = positionsFor(rows, input.layout);
   const nodes: SlotNode[] = cards.map((card) => ({
     id: card.key,
     type: "slotCard",
     position: positions[card.key],
     data: { card },
+    // xyflow names the node wrapper with this, and the wrapper is what takes focus on the
+    // surface — without it a screen reader lands on a node that is called nothing at all.
+    ariaLabel: nodeName(card),
   }));
 
   const ends: Record<string, ConnectionEnd> = {};
@@ -587,9 +694,101 @@ export function buildFleet(input: FleetInput): FleetModel {
         target,
         type: "exclusion" as const,
         data: { exclusion },
+        // The library's own default is "Edge from job:55 to job:56": two storage keys and a
+        // direction the rule does not have. An exclusion is symmetric, and this is what it says.
+        ariaLabel: edgeName(exclusion),
       },
     ];
   });
 
-  return { columns, nodes, edges, exclusions, ends };
+  const totals = columns.reduce(
+    (sum, column) => addExceptions(sum, column.exceptions),
+    noExceptions(),
+  );
+  return { columns, nodes, edges, exclusions, ends, totals };
+}
+
+/** A canvas node's accessible name: whose slot, in which project. */
+export function nodeName(card: SlotCardModel): string {
+  const { detail, slot, project } = card;
+  const owner =
+    detail.kind === "item"
+      ? `item ${detail.ordinal + 1} of job ${detail.job.id}`
+      : `${slot.owner_kind} ${slot.owner_id}`;
+  return `${project.project_id}, slot ${slot.slot} — ${owner}`;
+}
+
+/** An exclusion edge's accessible name, in the words the cards use. */
+export function edgeName(exclusion: ExclusionEdge): string {
+  return exclusion.state === "active"
+    ? `job ${exclusion.low} and job ${exclusion.high} never run at the same time`
+    : `asked: job ${exclusion.low} and job ${exclusion.high} never at the same time — waiting for a decision`;
+}
+
+/* ----------------------------------------------------------------- zones -- */
+
+/** One project's region on the canvas: where it is drawn, and what its label says. */
+export interface Zone {
+  projectId: string;
+  /** `alpha 2/3` — the column head's reading, so the two views agree. */
+  label: string;
+  /** A project-wide fact, when there is one — the column head's note, said once here too. */
+  note: string | null;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** What a card measures before xyflow has measured it: the node's CSS width and a typical height. */
+const CARD_FALLBACK = { width: 304, height: 200 };
+
+/**
+ * The region around each project's cards, from wherever those cards are NOW.
+ *
+ * Derived from the live positions and the measured sizes rather than laid out in advance, so a
+ * region follows a card that somebody dragged and grows with one whose item list was opened.
+ * A card with no measurement yet — the first frame, or jsdom, which measures nothing — counts at
+ * the card's CSS width and a typical height, which is close enough for one frame.
+ *
+ * Regions of two projects can overlap if somebody drags a card deep into another project's
+ * space. That is left alone: it is their arrangement, and a region that pushed cards around to
+ * keep itself tidy would be the canvas overruling a person.
+ */
+export function zonesFor(
+  nodes: Array<Pick<SlotNode, "position" | "data"> & { measured?: { width?: number; height?: number } }>,
+): Zone[] {
+  const byProject = new Map<string, { project: ProjectConcurrency; nodes: typeof nodes }>();
+  for (const node of nodes) {
+    const project = node.data.card.project;
+    const entry = byProject.get(project.project_id) ?? { project, nodes: [] };
+    entry.nodes.push(node);
+    byProject.set(project.project_id, entry);
+  }
+  return [...byProject.values()].map(({ project, nodes: members }) => {
+    let left = Infinity;
+    let top = Infinity;
+    let right = -Infinity;
+    let bottom = -Infinity;
+    for (const node of members) {
+      const width = node.measured?.width ?? CARD_FALLBACK.width;
+      const height = node.measured?.height ?? CARD_FALLBACK.height;
+      left = Math.min(left, node.position.x);
+      top = Math.min(top, node.position.y);
+      right = Math.max(right, node.position.x + width);
+      bottom = Math.max(bottom, node.position.y + height);
+    }
+    const unmeasured = collisionBadges(project, { kind: "", id: -1 }).some(
+      (badge) => badge.state === "not_measured",
+    );
+    return {
+      projectId: project.project_id,
+      label: `${project.project_id} ${project.slots.length}/${project.limit}`,
+      note: unmeasured ? "overlap not measured" : null,
+      x: left - ZONE_PAD,
+      y: top - ZONE_HEAD,
+      width: right - left + 2 * ZONE_PAD,
+      height: bottom - top + ZONE_HEAD + ZONE_PAD,
+    };
+  });
 }

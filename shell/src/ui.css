@@ -471,8 +471,16 @@
 
 /* --------------------------------------------------------- confirmbutton -- */
 
+/* `position: relative` is for the live region inside, not for the button. That `.sr-only` span
+   is `position: absolute`, and with no positioned ancestor its containing block was the initial
+   one — so a 1px box placed at wherever the button sat in the flow escaped every scroller it was
+   inside, and the Fleet page at 800px measured a document 974px wide with nothing visible past
+   the edge. Anchored here, it stays inside whatever box the control is in. It sets no z-index,
+   so it opens no stacking context, and the armed ring (a `box-shadow` on the button) is drawn
+   exactly as before. */
 .ui-confirm {
   display: inline-flex;
+  position: relative;
 }
 
 /**

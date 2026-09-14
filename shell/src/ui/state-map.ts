@@ -42,6 +42,9 @@ export type StateDomain =
   | "team_run"
   | "team_item"
   | "team_action"
+  | "job_item"
+  | "collision_source"
+  | "exclusion"
   | "autopilot"
   | "brake"
   | "setting"
@@ -263,6 +266,70 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     stopped: { tone: "off", label: "stopped" },
     expired: { tone: "paused", label: "expired" },
     cancelled: { tone: "off", label: "cancelled" },
+  },
+
+  /**
+   * One item of a job's queue — every `job_items.status` the núcleo stores, read out of
+   * `item_state_from` in `core/src/job.rs`, plus `pending`, which that function reaches through
+   * its `_ =>` arm because it is the column's default. `GateRetriable` is absent on purpose: it is
+   * never stored, only derived from `gate_failed` and an attempt count, so the wire cannot say it.
+   * `state-map-completeness.test.ts` holds this row to that function.
+   *
+   * **`conflicted` is Wrong Red, not Awaiting-You Amber, because nobody is being waited on.**
+   * `ItemState::claimable_as` answers `Some("conflicted")` and `batch_of` takes a claimable item
+   * as work (`core/src/job.rs`, the comment above `next_step`'s positional search: "`Conflicted`
+   * is found by the same search, and it is work for the same reason: the item owes a run"). The
+   * queue starts the resolution run in the item's own tree by itself. So what the reader learns
+   * is a fault in the branch — the feed's `job_item_conflicted` says "job item did not merge" in
+   * the same tone, and one event must not wear two tones on two pages.
+   *
+   * `skipped` is the one that does ask: the item put itself down with a `skipped-item` proposal,
+   * and that proposal is in Waiting. `orphaned` is the feed's `job_item_orphaned`, quiet for the
+   * reason given there. `passed` is terminal success, so Stated Blue.
+   */
+  job_item: {
+    pending: { tone: "off", label: "to do" },
+    running: { tone: "active", label: "running" },
+    implemented: { tone: "active", label: "written, not yet measured" },
+    merging: { tone: "active", label: "merging" },
+    reverted: { tone: "paused", label: "taken back off the branch" },
+    passed: { tone: "info", label: "done" },
+    failed: { tone: "danger", label: "failed" },
+    cancelled: { tone: "off", label: "cancelled" },
+    gate_failed: { tone: "danger", label: "the gate failed" },
+    // The `gate` domain's rule: a gate that could not run measured nothing.
+    gate_errored: { tone: "info", label: "gate not measured" },
+    skipped: { tone: "pending", label: "skipped, needs a decision" },
+    conflicted: { tone: "danger", label: "did not merge" },
+    orphaned: { tone: "off", label: "never attempted" },
+  },
+
+  /**
+   * Which of the collision warning's two sources is speaking.
+   *
+   * The keys are the núcleo's own field names on `Collisions` (`declared`, `observed` —
+   * `data/fleet.ts`, read off `core/src/collision.rs`); the words and the tones are the shell's,
+   * and this docstring is the permission the header asks for. §7 asks for two badges because
+   * *this collided* is a measurement and *this will collide* is a prediction, so the source is
+   * worded apart AND toned apart: the measurement in Wrong Red, the prediction in Held Ember.
+   */
+  collision_source: {
+    observed: { tone: "danger", label: "observed" },
+    declared: { tone: "paused", label: "predicted" },
+  },
+
+  /**
+   * One "these two never run at the same time", in either of its two lives.
+   *
+   * A shell derivation, allowed by this docstring: `active` is a row of `fleet_exclusions` and
+   * `pending` is a `fleet-exclusion` proposal still in the queue (`canvas/model.ts`,
+   * `exclusionEdges`). A rule in force holds a job back, which is Held Ember's whole meaning —
+   * not Deliberating Violet, which is shadow mode and nothing else. A question nobody has answered
+   * asks something of the reader, so it is amber.
+   */
+  exclusion: {
+    active: { tone: "paused", label: "rule in force" },
+    pending: { tone: "pending", label: "asked, not decided" },
   },
 
   /**

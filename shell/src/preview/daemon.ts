@@ -244,7 +244,7 @@ export const RUNS: TeamRun[] = [
  * shape that says nothing. This one has two roots that can run at once, a join that waits on
  * both, a second round, and three of the readings that are easy to get wrong:
  * `gate_failed` (which the wire cannot tell from "going round again"), `cancelled` (withdrawn
- * work, never the failure tone) and `conflicted` (waiting on a person, not broken).
+ * work, never the failure tone) and `conflicted` (owed a resolution run, not waiting on a person).
  */
 function jobItem(overrides: Partial<JobItem>): JobItem {
   return {

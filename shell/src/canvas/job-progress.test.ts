@@ -82,10 +82,19 @@ describe("job-progress — the status table", () => {
 
   it("never lets a team state read as work not yet begun", () => {
     // The historical bug, pinned: all four fell to the default and read "to do", and the worst of
-    // them is `conflicted` -- an item waiting on a person, shown as work nobody has started.
+    // them is `conflicted` -- an item the queue owes a resolution run, shown as work nobody has
+    // started.
     for (const status of ["merging", "conflicted", "reverted", "orphaned"]) {
       expect(lifecycleOf(status)).not.toBe("todo");
     }
+  });
+
+  it("draws a conflicted item as work the queue still owes, not as a question for a person", () => {
+    // `core/src/job.rs`: `Conflicted` leaves for `Running`, the resolution node, and `next_step`
+    // finds it as work. Filing it under "waiting on a person" sent the reader to a queue that
+    // holds nothing for them.
+    expect(lifecycleOf("conflicted")).toBe("running");
+    expect(readingOf("conflicted")).not.toMatch(/person/);
   });
 
   it("keeps stopped-by-somebody apart from broke-on-its-own in the reading", () => {
@@ -207,7 +216,7 @@ describe("job-progress — the tally", () => {
   it("gathers waiting, gated and stopped into attention", () => {
     const tally = tallyOf(
       [
-        item({ ordinal: 0, status: "conflicted" }),
+        item({ ordinal: 0, status: "skipped" }),
         item({ ordinal: 1, status: "gate_failed" }),
         item({ ordinal: 2, status: "failed" }),
         item({ ordinal: 3, status: "passed" }),

@@ -23,13 +23,17 @@ beforeAll(() => {
 });
 
 /**
- * The real xyflow, with a tap on the two props the §9.2 spike is about.
+ * The real xyflow, with a tap on the props the §9.2 spike is about.
  *
  * Wrapping rather than replacing: the canvas really mounts, so this also proves
  * the library renders under jsdom at all, and the recorded props let the test
  * assert the reference identity xyflow's own reconciliation depends on.
  */
-const seen = vi.hoisted(() => ({ nodeTypes: [] as unknown[], edgeTypes: [] as unknown[] }));
+const seen = vi.hoisted(() => ({
+  nodeTypes: [] as unknown[],
+  edgeTypes: [] as unknown[],
+  props: [] as Record<string, unknown>[],
+}));
 vi.mock("@xyflow/react", async (original) => {
   const real = await original<typeof import("@xyflow/react")>();
   return {
@@ -37,6 +41,7 @@ vi.mock("@xyflow/react", async (original) => {
     ReactFlow: (props: Record<string, unknown>) => {
       seen.nodeTypes.push(props.nodeTypes);
       seen.edgeTypes.push(props.edgeTypes);
+      seen.props.push(props);
       return createElement(real.ReactFlow as never, props);
     },
   };
@@ -52,7 +57,7 @@ vi.mock("../data/client", async (original) => ({
 
 import { Fleet } from "./Fleet";
 import { FleetCanvas } from "../canvas/FleetCanvas";
-import { isValidConnection, loadLayout, saveLayout, slotDetail } from "../canvas/model";
+import { buildFleet, isValidConnection, loadLayout, saveLayout, slotDetail, zonesFor } from "../canvas/model";
 import { ApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
 import type {
@@ -66,13 +71,14 @@ import type {
   RunSearchResult,
 } from "../data/fleet";
 import { daemonFetch, daemonState, project, proposal, renderWithRouter } from "../test/harness";
-import type { Proposal } from "../data/system";
+import type { ProjectSummary, Proposal } from "../data/system";
 import type { TeamView } from "../data/teams";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
   daemon.apiText.mockReset();
   localStorage.clear();
+  seen.props.length = 0;
 });
 
 /* ------------------------------------------------------------- fixtures -- */
@@ -118,7 +124,7 @@ function item(overrides: Partial<JobItem> = {}): JobItem {
 }
 
 /**
- * One team of the house catalogue, as `/teams` sends it.
+ * One team of the catalogue, as `/teams` sends it.
  *
  * Local rather than shared with `Teams.test.tsx` for the reason `fleetFetch`
  * gives about routes: the shared harness is the floor, and a fixture that only
@@ -193,6 +199,29 @@ function run(overrides: Partial<RunSearchResult> = {}): RunSearchResult {
   };
 }
 
+function exclusion(overrides: Partial<FleetExclusion> = {}): FleetExclusion {
+  return {
+    id: 3,
+    project_id: "alpha",
+    job_low: 41,
+    job_high: 55,
+    proposal_id: 9,
+    paths: null,
+    created_at: "2026-08-17T09:00:00Z",
+    ...overrides,
+  };
+}
+
+/**
+ * A project the núcleo will start a job in: `POST /jobs` refuses one whose autopilot is not
+ * `active` or which has no root (`core/src/job.rs`, `resolve_start`), and the harness's own
+ * default project is `off` with no root — the right default for every other page, and a project
+ * this page must offer only as disabled.
+ */
+function startable(project_id: string, overrides: Partial<ProjectSummary> = {}): ProjectSummary {
+  return project({ project_id, mode: "active", project_root: `C:/repos/${project_id}`, ...overrides });
+}
+
 interface FleetState {
   concurrency: Concurrency | undefined;
   jobs: Job[] | undefined;
@@ -200,8 +229,11 @@ interface FleetState {
   exclusions: FleetExclusion[];
   requests: Proposal[];
   details: Record<number, JobDetail>;
-  /** The house catalogue the new-job form offers. Empty in a house with none. */
+  /** The catalogue the new-job form offers. Empty in a house with none. */
   teams: TeamView[];
+  /** What `/projects` answers: the autopilot mode, root and open proposals per project. */
+  projects: ProjectSummary[];
+  kill: boolean;
 }
 
 function fleetState(overrides: Partial<FleetState> = {}): FleetState {
@@ -213,9 +245,10 @@ function fleetState(overrides: Partial<FleetState> = {}): FleetState {
     requests: [],
     details: {},
     // Empty by default, which is what most of this suite is about: with no
-    // teams the picker is not drawn at all, so every test written before it
-    // existed still describes the page it describes.
+    // teams the picker is not drawn at all.
     teams: [],
+    projects: [startable("alpha")],
+    kill: false,
     ...overrides,
   };
 }
@@ -226,10 +259,10 @@ function fleetState(overrides: Partial<FleetState> = {}): FleetState {
  * A local switch rather than an edit to `test/harness.tsx`: the harness is the
  * shared floor, and a page that teaches it seven routes of its own makes every
  * other suite carry them. Anything this does not know falls through to the
- * shared responder, so `/projects` and `/autopilot/budget` still answer.
+ * shared responder, so `/projects`, `/autopilot/kill` and `/autopilot/budget` still answer.
  */
 function fleetFetch(state: FleetState): (path: string, init?: RequestInit) => Promise<unknown> {
-  const shared = daemonFetch(daemonState({ projects: [project({ project_id: "alpha" })] }));
+  const shared = daemonFetch(daemonState({ projects: state.projects, kill: { engaged: state.kill } }));
   return async (path, init) => {
     if (init?.method !== undefined && init.method !== "GET") return await shared(path, init);
     switch (path) {
@@ -254,10 +287,34 @@ function fleetFetch(state: FleetState): (path: string, init?: RequestInit) => Pr
   };
 }
 
+/**
+ * The page header — by its class, because every card and column head on this page is a
+ * `<header>` too, and jsdom maps each of them to `banner`.
+ */
+async function pageHeader(): Promise<HTMLElement> {
+  return await waitFor(() => {
+    const header = document.querySelector<HTMLElement>(".ui-page-header");
+    expect(header).not.toBeNull();
+    return header!;
+  });
+}
+
+/** The status region inside the page header — the sentence the page leads with. */
+async function headlineText(): Promise<string> {
+  return within(await pageHeader()).getByRole("status").textContent ?? "";
+}
+
+/** The interlock's 300ms dwell, which swallows a click arriving as the tail of a double-click. */
+async function pastTheDwell(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 350));
+  });
+}
+
 /* ------------------------------------------------------------ the columns -- */
 
 describe("Fleet — columns", () => {
-  it("shows the house capacity and gives an idle project a column at 0/N", async () => {
+  it("shows the capacity, and folds an idle project into one line at 0/N", async () => {
     daemon.apiFetch.mockImplementation(
       fleetFetch(
         fleetState({
@@ -294,14 +351,128 @@ describe("Fleet — columns", () => {
     // jobs would say `1/2` about a project that is already full.
     const held = within(alpha).getByRole("article", { name: "slot 1 — run 7" });
     expect(within(held).getByText("tidy the imports")).toBeDefined();
-    expect(within(held).getByRole("link", { name: "Open in Runs" })).toBeDefined();
+    expect(within(held).getByRole("link", { name: "Open in Runs" }).getAttribute("href")).toBe("/runs/7");
 
-    // An idle project KEEPS its column. One that vanished when it emptied would
-    // move every other column across the screen every night that ended, and a
-    // project's position is the one thing the reader memorises.
-    const beta = await screen.findByRole("region", { name: "beta column" });
-    expect(within(beta).getByText("0/3")).toBeDefined();
-    expect(within(beta).getByText(/nothing in flight/)).toBeDefined();
+    // An idle project is still named and still reachable, but it is one line, not a column:
+    // four empty columns were what pushed a column with a problem in it off the screen.
+    expect(screen.queryByRole("region", { name: "beta column" })).toBeNull();
+    const idle = screen.getByRole("region", { name: "Idle projects" });
+    expect(within(idle).getByRole("link", { name: "beta" }).getAttribute("href")).toBe("/projects/beta/state");
+    expect(within(idle).getByText("0/3")).toBeDefined();
+  });
+
+  it("orders the columns by what is wrong in them before how busy they are", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 8, held: 5 },
+            projects: [
+              column({
+                project_id: "busy",
+                limit: 3,
+                slots: [
+                  slot({ project_id: "busy", slot: 0, owner_id: 1 }),
+                  slot({ project_id: "busy", slot: 1, owner_id: 2 }),
+                  slot({ project_id: "busy", slot: 2, owner_id: 3 }),
+                ],
+              }),
+              column({
+                project_id: "calm",
+                limit: 2,
+                slots: [slot({ project_id: "calm", slot: 0, owner_id: 4 })],
+              }),
+              // One slot, and the complete jobs listing does not have its owner: a leaked slot.
+              column({
+                project_id: "quiet",
+                limit: 2,
+                slots: [slot({ project_id: "quiet", slot: 0, owner_id: 99 })],
+              }),
+            ],
+          },
+          jobs: [
+            job({ id: 1, project_id: "busy" }),
+            job({ id: 2, project_id: "busy" }),
+            job({ id: 3, project_id: "busy" }),
+            job({ id: 4, project_id: "calm" }),
+          ],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    await screen.findByRole("region", { name: "quiet column" });
+
+    // The quietest project comes first, because it is the one with a problem.
+    const order = screen
+      .getAllByRole("region", { name: / column$/ })
+      .map((region) => region.getAttribute("aria-label"));
+    expect(order).toEqual(["quiet column", "busy column", "calm column"]);
+  });
+
+  it("puts the project's autopilot mode in its column head, and nothing when it cannot read it", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 4, held: 2 },
+            projects: [
+              column({ slots: [slot()] }),
+              column({ project_id: "beta", slots: [slot({ project_id: "beta", owner_kind: "run", owner_id: 7 })] }),
+            ],
+          },
+          jobs: [job()],
+          runs: [run({ project_id: "beta" })],
+          // `/projects` knows alpha and not beta.
+          projects: [startable("alpha", { mode: "shadow" })],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+
+    const alpha = await screen.findByRole("region", { name: "alpha column" });
+    const head = within(alpha).getByRole("heading", { name: "alpha" }).parentElement!;
+    await waitFor(() => expect(within(head).getByText("shadow").className).toContain("ui-badge-shadow"));
+    expect(head.textContent).toContain("autopilot");
+
+    // A guessed mode on a safety control is worse than none.
+    const beta = screen.getByRole("region", { name: "beta column" });
+    const betaHead = within(beta).getByRole("heading", { name: "beta" }).parentElement!;
+    expect(betaHead.querySelector(".ui-badge")).toBeNull();
+  });
+
+  it("says a project-wide fact once in the column head, not on every card", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 4, held: 2 },
+            projects: [
+              column({
+                slots: [slot({ slot: 0, owner_id: 41 }), slot({ slot: 1, owner_id: 55 })],
+                collision: {
+                  declared: { state: "not_measured", overlaps: [] },
+                  observed: { state: "clean", overlaps: [] },
+                },
+              }),
+            ],
+          },
+          jobs: [job({ id: 41 }), job({ id: 55 })],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+
+    const alpha = await screen.findByRole("region", { name: "alpha column" });
+    expect(within(alpha).getAllByText("overlap not measured")).toHaveLength(1);
+    const source = within(alpha).getByText("predicted");
+    // The source is a badge, so it wears its tone's whole triple rather than a bare colour.
+    expect(source.className).toContain("ui-badge-paused");
+    for (const card of within(alpha).getAllByRole("article")) {
+      expect(within(card).queryByText("overlap not measured")).toBeNull();
+    }
   });
 
   it("keeps a slot with no description apart from a slot nothing is working in", async () => {
@@ -422,13 +593,14 @@ describe("Fleet — columns", () => {
     const mine = await screen.findByRole("article", { name: "slot 0 — item 7" });
     expect(within(mine).getByText(/also touched by item 8/)).toBeDefined();
     expect(within(mine).getByText(/core\/src\/job\.rs/)).toBeDefined();
+    expect(within(mine).getByText("observed").className).toContain("ui-badge-danger");
     // No `/items/<id>/cancel` exists, and the number would aim the one route
     // there is at somebody else's run. The gesture that stops this work is the
     // job's, on the job's card.
     expect(within(mine).queryByRole("button", { name: "Cancel" })).toBeNull();
   });
 
-  it("an item's card says which item of which job it is", async () => {
+  it("an item's card leads with which item of which job it is, and links to where the conflict is resolved", async () => {
     // The half that was missing while the card could only print `item 7`: an id
     // out of a sequence nobody reads, next to a slot number, next to nothing.
     daemon.apiFetch.mockImplementation(
@@ -459,33 +631,34 @@ describe("Fleet — columns", () => {
 
     await renderWithRouter(<Fleet />);
 
-    const card = await screen.findByRole("article", { name: "slot 1 — item 7" });
     // Counting from one on screen and from zero in the row, like every other
     // place this repository prints an ordinal to a person.
-    expect(within(card).getByText(/item 3 of job 41/)).toBeDefined();
-    expect(within(card).getByText(/nightly-backlog/)).toBeDefined();
-    // A slot is held from the claim until the item is terminal, so "it holds a
-    // slot" says nothing about whether it is working. This one is waiting on a
-    // person, and until `itemReading` learned the four states of a parallel item
-    // every one of them fell to its default and read as "to do".
-    expect(within(card).getByText(/the merge conflicted/)).toBeDefined();
+    const card = await screen.findByRole("article", { name: "slot 1 — item 3 of job 41" });
+    expect(within(card).getAllByText(/nightly-backlog/).length).toBeGreaterThan(0);
+    // The id is still there, second and as a handle.
+    expect(within(card).getByText("id 7")).toBeDefined();
+    // Through the map, and in the feed's tone for the same event: the queue resolves a
+    // conflict itself (`batch_of` in `core/src/job.rs`), so this is a fault, not a summons.
+    const state = within(card).getByText("did not merge");
+    expect(state.className).toContain("ui-badge-danger");
+    expect(within(card).queryByText(/to do/), "an item mid-conflict is not work nobody has started").toBeNull();
     expect(
       within(card).queryByText(/detail unavailable/i),
       "the card can describe itself now, so it must stop saying it cannot",
     ).toBeNull();
-    expect(
-      within(card).queryByText(/to do/),
-      "an item mid-conflict is not work nobody has started",
-    ).toBeNull();
+    // A real door, to the runs of this project, where the resolution run is listed.
+    const door = within(card).getByRole("link", { name: "Follow it in Runs" });
+    expect(door.getAttribute("href")).toBe("/runs?project=alpha");
   });
 
-  it("keeps the last good cards and says the view is stale when a refetch fails", async () => {
+  it("dims the cards, and takes away every control that would act on them, when the view is stale", async () => {
     const state = fleetState({
       concurrency: {
-        house: { limit: 4, held: 1 },
-        projects: [column({ slots: [slot()] })],
+        house: { limit: 4, held: 2 },
+        projects: [column({ slots: [slot({ slot: 0, owner_id: 41 }), slot({ slot: 1, owner_id: 55 })] })],
       },
-      jobs: [job()],
+      jobs: [job({ id: 41 }), job({ id: 55 })],
+      exclusions: [exclusion()],
     });
     let answering = true;
     daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
@@ -494,9 +667,11 @@ describe("Fleet — columns", () => {
     });
 
     const { queryClient } = await renderWithRouter(<Fleet />);
-    await screen.findByRole("article", { name: "slot 0 — job 41" });
-    // The form is here while the reading is the daemon's.
+    const card = await screen.findByRole("article", { name: "slot 0 — job 41" });
+    // The controls are here while the reading is the daemon's.
     expect(screen.getByRole("button", { name: "New job" })).toBeDefined();
+    expect(within(card).getByRole("button", { name: "Cancel" })).toBeDefined();
+    expect(within(card).getByRole("button", { name: "Lift" })).toBeDefined();
 
     answering = false;
     await act(async () => {
@@ -506,58 +681,236 @@ describe("Fleet — columns", () => {
     // `findBy` and not `getBy`: react-query hands observer notifications to a
     // `setTimeout(…, 0)`, so the refetch settling inside `act` is not the same
     // moment as the render that follows it.
-    expect(await screen.findByText(/view is stale/)).toBeDefined();
+    expect(await screen.findByText(/view is stale — last good read/)).toBeDefined();
+    expect(await headlineText()).toContain("the view is stale");
     // Blanking would read as "there is room", which is the one wrong thing this
-    // page can say. The card stays, and the note says how old it is.
-    expect(screen.getByRole("article", { name: "slot 0 — job 41" })).toBeDefined();
-    // And the action that would act on capacity nobody can vouch for is gone
+    // page can say. The card stays, receded, and the note says how old it is.
+    const after = screen.getByRole("article", { name: "slot 0 — job 41" });
+    expect(after.className).toContain("fleet-card-stale");
+    // And every action that would act on capacity nobody can vouch for is gone
     // rather than disabled — it fails before the click instead of after it.
     expect(screen.queryByRole("button", { name: "New job" })).toBeNull();
+    expect(within(after).queryByRole("button", { name: "Cancel" })).toBeNull();
+    expect(within(after).queryByRole("button", { name: "Lift" })).toBeNull();
+  });
+
+  it("lifts a rule in force only through the interlock", async () => {
+    const state = fleetState({
+      concurrency: {
+        house: { limit: 4, held: 2 },
+        projects: [column({ slots: [slot({ slot: 0, owner_id: 41 }), slot({ slot: 1, owner_id: 55 })] })],
+      },
+      jobs: [job({ id: 41 }), job({ id: 55 })],
+      exclusions: [exclusion()],
+    });
+    daemon.apiFetch.mockImplementation(fleetFetch(state));
+
+    await renderWithRouter(<Fleet />);
+    const card = await screen.findByRole("article", { name: "slot 0 — job 41" });
+
+    fireEvent.click(within(card).getByRole("button", { name: "Lift" }));
+    // Armed, and nothing has happened yet: lifting takes effect at once, so one click is not it.
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/fleet/exclusions/3", expect.anything());
+    await pastTheDwell();
+    fireEvent.click(within(card).getByRole("button", { name: "Lift the rule" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/fleet/exclusions/3", { method: "DELETE" });
+    });
+  });
+
+  it("asks the pairing question from the keyboard, with the same request the canvas sends", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 4, held: 2 },
+            projects: [column({ slots: [slot({ slot: 0, owner_id: 41 }), slot({ slot: 1, owner_id: 55 })] })],
+          },
+          jobs: [job({ id: 41 }), job({ id: 55 })],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    const card = await screen.findByRole("article", { name: "slot 0 — job 41" });
+
+    const partner = within(card).getByLabelText("Never at the same time as") as HTMLSelectElement;
+    expect([...partner.options].map((option) => option.textContent)).toEqual(["job 55"]);
+    fireEvent.click(within(card).getByRole("button", { name: "Ask" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/fleet/exclusions", {
+        method: "POST",
+        body: JSON.stringify({ job_a: 41, job_b: 55, paths: [] }),
+      });
+    });
+  });
+
+  it("draws the window spend against its ceiling", async () => {
+    daemon.apiFetch.mockImplementation(fleetFetch(fleetState()));
+
+    await renderWithRouter(<Fleet />);
+
+    const spend = await screen.findByRole("article", { name: "Window spend" });
+    await waitFor(() => expect(within(spend).getByText("$1.42")).toBeDefined());
+    expect(within(spend).getByRole("img", { name: "Window spend: $1.42 of $5.00" })).toBeDefined();
+  });
+
+  it("teaches what the page is for when no project is registered, and offers neither control", async () => {
+    daemon.apiFetch.mockImplementation(fleetFetch(fleetState()));
+
+    await renderWithRouter(<Fleet />);
+
+    expect(await screen.findByRole("heading", { name: "No projects yet" })).toBeDefined();
+    expect(screen.getByRole("link", { name: "Projects" }).getAttribute("href")).toBe("/projects");
+    expect(screen.queryByRole("group", { name: "How to look at the fleet" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "New job" })).toBeNull();
+  });
+
+  it("files a failed reading like a bug report, and offers no way of looking at nothing", async () => {
+    const state = fleetState();
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/concurrency") throw new Error("Failed to fetch");
+      return await fleetFetch(state)(path, init);
+    });
+
+    await renderWithRouter(<Fleet />);
+
+    const note = await screen.findByRole("alert");
+    expect(note.textContent).toContain("GET /concurrency");
+    expect(note.textContent).toContain("Failed to fetch");
+    expect(note.querySelector(".ui-reading-time")).not.toBeNull();
+    expect(screen.queryByRole("group", { name: "How to look at the fleet" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "New job" })).toBeNull();
+  });
+});
+
+/* --------------------------------------------------------------- headline -- */
+
+describe("Fleet — the headline", () => {
+  it("says the worst fact first, in the ladder's order, and the capacity last", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          kill: true,
+          concurrency: {
+            house: { limit: 8, held: 5 },
+            projects: [
+              column({
+                limit: 3,
+                slots: [
+                  slot({ slot: 0, owner_id: 41 }),
+                  slot({ slot: 1, owner_kind: "item", owner_id: 7, job_id: 41, ordinal: 0, item_status: "conflicted" }),
+                  // Not in the complete jobs listing: leaked.
+                  slot({ slot: 2, owner_id: 60 }),
+                ],
+              }),
+              column({
+                project_id: "bravo",
+                limit: 2,
+                slots: [
+                  slot({ project_id: "bravo", slot: 0, owner_id: 55 }),
+                  slot({ project_id: "bravo", slot: 1, owner_id: 56 }),
+                ],
+                collision: {
+                  declared: { state: "clean", overlaps: [] },
+                  observed: {
+                    state: "collide",
+                    overlaps: [{ a: { kind: "job", id: 55 }, b: { kind: "job", id: 56 }, paths: ["a.rs"] }],
+                  },
+                },
+              }),
+            ],
+          },
+          jobs: [
+            job({ id: 41, status: "awaiting_approval" }),
+            job({ id: 55, project_id: "bravo", status: "waiting", wait_reason: "excluded" }),
+            job({ id: 56, project_id: "bravo" }),
+          ],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    await screen.findByRole("region", { name: "alpha column" });
+
+    await waitFor(async () =>
+      expect(await headlineText()).toBe(
+        "1 slot held by nothing, awaiting reconciliation; 1 item did not merge; " +
+          "1 observed overlap between trees; 1 job awaiting approval; 1 job held by an exclusion; " +
+          "the kill switch is engaged — no new job starts; " +
+          "5 in flight of 8 across all projects; room for 3 more",
+      ),
+    );
+    // The one clause somebody can act on is a door to where it is acted on.
+    const header = await pageHeader();
+    expect(within(header).getByRole("link", { name: "1 job awaiting approval" }).getAttribute("href")).toBe("/waiting");
+    expect((await headlineText()).toLowerCase()).not.toContain("waiting on you");
+  });
+
+  it("says the capacity alone when nothing is wrong", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: { house: { limit: 4, held: 1 }, projects: [column({ slots: [slot()] })] },
+          jobs: [job()],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    await screen.findByRole("region", { name: "alpha column" });
+
+    await waitFor(async () =>
+      expect(await headlineText()).toBe("1 in flight of 4 across all projects; room for 3 more"),
+    );
   });
 
   /**
    * The headline names what the five are.
    *
-   * "5 waiting on you" was this page borrowing the one queue's phrase for a number that is
+   * The Waiting queue's own phrase would be this page borrowing it for a number that is
    * not that queue: these are open proposals across the roster, and the bare phrase belongs
    * to `/waiting` alone. Two projects and not one, so the sentence is proving the sum rather
    * than echoing a single row.
    */
-  it("the headline names what the five are", async () => {
-    const fleet = fleetFetch(
-      fleetState({ concurrency: { house: { limit: 5, held: 2 }, projects: [] } }),
-    );
-    const roster = daemonFetch(
-      daemonState({
-        projects: [
-          project({ project_id: "alpha", open_proposals: 3 }),
-          project({ project_id: "beta", open_proposals: 2 }),
-        ],
-      }),
-    );
-    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
-      path === "/projects" ? await roster(path, init) : await fleet(path, init),
+  it("names what the open proposals are", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: { house: { limit: 5, held: 2 }, projects: [] },
+          projects: [
+            project({ project_id: "alpha", open_proposals: 3 }),
+            project({ project_id: "beta", open_proposals: 2 }),
+          ],
+        }),
+      ),
     );
 
     await renderWithRouter(<Fleet />);
 
     const said = await screen.findByText(/proposals open across the roster/);
     expect(said.textContent).toBe(
-      "2 in flight of 5; room for 3 more; 5 proposals open across the roster",
+      "2 in flight of 5 across all projects; room for 3 more; 5 proposals open across the roster",
     );
-    expect(said.textContent).not.toContain("waiting on you");
 
     // The card is the same fact in the same words, so the two cannot drift apart.
     const card = screen.getByRole("article", { name: "Proposals open" });
     expect(within(card).getByText("5")).toBeDefined();
     expect(within(card).getByText("across the roster")).toBeDefined();
-    expect(screen.queryByRole("article", { name: "Waiting on you" })).toBeNull();
   });
 });
 
 /* -------------------------------------------------------------- new job -- */
 
 describe("Fleet — asking for a job", () => {
+  async function openComposer(): Promise<HTMLElement> {
+    const opener = await screen.findByRole("button", { name: "New job" });
+    fireEvent.click(opener);
+    return opener;
+  }
+
   async function refuseWith(refusal: ApiRefusal): Promise<void> {
     const state = fleetState({
       concurrency: { house: { limit: 4, held: 0 }, projects: [column({ slots: [] })] },
@@ -569,12 +922,132 @@ describe("Fleet — asking for a job", () => {
     });
 
     await renderWithRouter(<Fleet />);
-    const prompt = await screen.findByLabelText("What to work on in alpha");
-    fireEvent.change(prompt, { target: { value: "tidy the imports" } });
-    fireEvent.click(screen.getByRole("button", { name: "New job" }));
+    await openComposer();
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
+    fireEvent.click(screen.getByRole("button", { name: "Start job" }));
   }
 
-  it("says the kill switch and a full project differently, though both are 409", async () => {
+  it("opens one panel from the header, takes focus into it, and gives focus back on Escape and Close", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(fleetState({ concurrency: { house: { limit: 4, held: 0 }, projects: [column()] } })),
+    );
+
+    await renderWithRouter(<Fleet />);
+    const opener = await openComposer();
+    expect(opener.getAttribute("aria-expanded")).toBe("true");
+    // One form for the page, not one per column.
+    expect(document.querySelectorAll("form.fleet-new-job")).toHaveLength(1);
+
+    const prompt = screen.getByLabelText("Prompt");
+    await waitFor(() => expect(document.activeElement).toBe(prompt));
+
+    fireEvent.keyDown(prompt, { key: "Escape" });
+    expect(opener.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(opener);
+
+    fireEvent.click(opener);
+    await waitFor(() => expect(document.activeElement).toBe(prompt));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it("waits for a prompt, and says why the button is not yet pressable", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(fleetState({ concurrency: { house: { limit: 4, held: 0 }, projects: [column()] } })),
+    );
+
+    await renderWithRouter(<Fleet />);
+    await openComposer();
+
+    const start = screen.getByRole("button", { name: "Start job" }) as HTMLButtonElement;
+    expect(start.disabled).toBe(true);
+    const hint = document.getElementById(start.getAttribute("aria-describedby")!.split(" ")[0])!;
+    expect(hint.textContent).toMatch(/waits until this says what the job should work on/);
+
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
+    expect(start.disabled).toBe(false);
+  });
+
+  it("offers every project, disables the ones the núcleo would refuse and says why, and starts in the roomiest", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 10, held: 3 },
+            projects: [
+              column({ project_id: "alpha", limit: 2, slots: [slot({ owner_id: 41 })] }),
+              column({ project_id: "bravo", limit: 3, slots: [] }),
+              column({
+                project_id: "charlie",
+                limit: 2,
+                slots: [
+                  slot({ project_id: "charlie", slot: 0, owner_id: 61 }),
+                  slot({ project_id: "charlie", slot: 1, owner_id: 62 }),
+                ],
+              }),
+              column({ project_id: "delta", limit: 3, slots: [] }),
+            ],
+          },
+          jobs: [job({ id: 41 }), job({ id: 61, project_id: "charlie" }), job({ id: 62, project_id: "charlie" })],
+          projects: [
+            startable("alpha"),
+            startable("bravo"),
+            startable("charlie"),
+            project({ project_id: "delta", mode: "off" }),
+          ],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    await openComposer();
+
+    const select = screen.getByLabelText("Project for the new job") as HTMLSelectElement;
+    await waitFor(() => expect(select.querySelector('option[value="delta"]')?.textContent).toBe("delta — autopilot off"));
+    const options = Object.fromEntries([...select.options].map((option) => [option.value, option]));
+    expect(options.alpha.textContent).toBe("alpha — room for 1 (1 of 2)");
+    expect(options.alpha.disabled).toBe(false);
+    expect(options.charlie.textContent).toBe("charlie — full (2 of 2)");
+    expect(options.charlie.disabled).toBe(true);
+    expect(options.delta.disabled).toBe(true);
+    // The most room of the projects that can take one.
+    expect(select.value).toBe("bravo");
+
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
+    fireEvent.click(screen.getByRole("button", { name: "Start job" }));
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/jobs", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: "bravo",
+          prompt: "tidy the imports",
+          budget_usd: null,
+          max_rounds: null,
+          team_id: null,
+        }),
+      });
+    });
+  });
+
+  it("holds the button while the kill switch is engaged, and says so beside it and in the headline", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({ kill: true, concurrency: { house: { limit: 4, held: 0 }, projects: [column()] } }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    await waitFor(async () => expect(await headlineText()).toContain("the kill switch is engaged — no new job starts"));
+    await openComposer();
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
+
+    const start = screen.getByRole("button", { name: "Start job" }) as HTMLButtonElement;
+    expect(start.disabled).toBe(true);
+    const note = screen.getByText(/the núcleo refuses every new job until it is released/);
+    expect(start.getAttribute("aria-describedby")).toContain(note.id);
+  });
+
+  it("says the kill switch and a full project differently, though both are 409, and beside the button", async () => {
     // `POST /jobs` refuses in prose for both, so the status cannot tell them
     // apart and neither can the status-derived code. Collapsing them into one
     // sentence would tell somebody to wait for room that is already there, or
@@ -582,13 +1055,15 @@ describe("Fleet — asking for a job", () => {
     await refuseWith(
       new ApiRefusal(409, "conflict", "the kill switch is engaged; nothing autonomous starts"),
     );
-    const said = await screen.findByText(/kill switch is engaged/);
-    expect(said).toBeDefined();
+    const said = await screen.findByText(/kill switch is engaged; nothing autonomous starts/);
     // Not the shared floor's sentence for a 409 ("something about this has
     // already changed"), which is what both refusals would collapse to if the
     // page mapped the status-derived code to copy of its own.
     expect(said.textContent).not.toMatch(/already changed/);
     expect(said.textContent).not.toMatch(/piece\(s\) of work/);
+    // Next to the button that asked, not at the top of the page.
+    const start = screen.getByRole("button", { name: "Start job" });
+    expect(start.parentElement!.contains(said)).toBe(true);
   });
 
   it("shows the daemon's own sentence when the project is full", async () => {
@@ -596,7 +1071,6 @@ describe("Fleet — asking for a job", () => {
       new ApiRefusal(409, "conflict", "this project already has 2 piece(s) of work in flight"),
     );
     const said = await screen.findByText(/this project already has 2 piece\(s\) of work in flight/);
-    expect(said).toBeDefined();
     expect(said.textContent).not.toMatch(/kill switch/);
   });
 
@@ -604,10 +1078,9 @@ describe("Fleet — asking for a job", () => {
    * **The gap this closes.** `POST /jobs` has taken a `team_id` since the
    * parallel work landed and nothing in the product ever sent one, so a job
    * could only be directed by writing JSON by hand or a `graph:` rule into a
-   * config file. Every job started from the app was the sequential one,
-   * whatever teams the house had.
+   * config file.
    */
-  it("offers the house's teams and sends the one chosen", async () => {
+  it("offers the catalogue's teams and sends the one chosen", async () => {
     const state = fleetState({
       concurrency: { house: { limit: 4, held: 0 }, projects: [column({ slots: [] })] },
       teams: [teamView(), teamView({ id: "infra", name: "Infra", max_parallel: 3 })],
@@ -615,17 +1088,16 @@ describe("Fleet — asking for a job", () => {
     daemon.apiFetch.mockImplementation(fleetFetch(state));
 
     await renderWithRouter(<Fleet />);
-    const picker = await screen.findByLabelText("Team to direct the job in alpha");
+    await openComposer();
+    const picker = await screen.findByLabelText("Team to direct the job");
     // The ceiling is on the option and not only the name, because it is the
     // whole difference between the two choices: a team is what the job runs
     // items *at once* with, and the number is how many.
     expect(within(picker as HTMLElement).getByText(/Infra — up to 3 at once/)).toBeDefined();
 
     fireEvent.change(picker, { target: { value: "infra" } });
-    fireEvent.change(screen.getByLabelText("What to work on in alpha"), {
-      target: { value: "tidy the imports" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "New job" }));
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
+    fireEvent.click(screen.getByRole("button", { name: "Start job" }));
 
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/jobs", {
@@ -642,44 +1114,11 @@ describe("Fleet — asking for a job", () => {
   });
 
   /**
-   * Blank is a real choice on this field and not an unfilled one — it is how
-   * every job in the product has always run — so it travels as `null` and never
-   * as `""`. The daemon reads a team it cannot find as a 422, and an empty
-   * string is a team it cannot find.
-   */
-  it("sends no team when none is picked, and draws no picker in a house with none", async () => {
-    const state = fleetState({
-      concurrency: { house: { limit: 4, held: 0 }, projects: [column({ slots: [] })] },
-      teams: [teamView()],
-    });
-    daemon.apiFetch.mockImplementation(fleetFetch(state));
-
-    await renderWithRouter(<Fleet />);
-    fireEvent.change(await screen.findByLabelText("What to work on in alpha"), {
-      target: { value: "tidy the imports" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "New job" }));
-
-    await waitFor(() => {
-      expect(daemon.apiFetch).toHaveBeenCalledWith("/jobs", {
-        method: "POST",
-        body: JSON.stringify({
-          project_id: "alpha",
-          prompt: "tidy the imports",
-          budget_usd: null,
-          max_rounds: null,
-          team_id: null,
-        }),
-      });
-    });
-  });
-
-  /**
    * Gone rather than disabled, for the reason `max_items` has no field at all:
    * a control whose only option is the default does nothing, and drawing it
    * would advertise a feature whose first step is on another page.
    */
-  it("draws no team picker in a house that has no teams", async () => {
+  it("draws no team picker when there are no teams", async () => {
     daemon.apiFetch.mockImplementation(
       fleetFetch(
         fleetState({
@@ -689,8 +1128,9 @@ describe("Fleet — asking for a job", () => {
     );
 
     await renderWithRouter(<Fleet />);
-    await screen.findByLabelText("What to work on in alpha");
-    expect(screen.queryByLabelText("Team to direct the job in alpha")).toBeNull();
+    await openComposer();
+    expect(screen.getByLabelText("Prompt")).toBeDefined();
+    expect(screen.queryByLabelText("Team to direct the job")).toBeNull();
   });
 });
 
@@ -738,9 +1178,7 @@ describe("Fleet — cancelling", () => {
     // Real timers rather than fake ones: the page polls, and the wait is the
     // interlock's 300ms dwell, which swallows a click arriving as the tail of a
     // double-click. Clicking through it without waiting would confirm nothing.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 350));
-    });
+    await pastTheDwell();
     fireEvent.click(within(card).getByRole("button", { name: "Cancel run 7?" }));
 
     await waitFor(() => {
@@ -781,6 +1219,51 @@ describe("the fleet canvas", () => {
     for (const captured of seen.nodeTypes) expect(captured).toBe(seen.nodeTypes[0]);
     for (const captured of seen.edgeTypes) expect(captured).toBe(seen.edgeTypes[0]);
   });
+
+  it("never tells a screen reader it can delete what nothing here may delete, and never zooms past legible", () => {
+    render(<FleetCanvas nodes={[]} edges={[]} ends={{}} onPropose={() => {}} onLayoutChange={() => {}} />);
+
+    const props = seen.props[seen.props.length - 1];
+    const aria = props.ariaLabelConfig as Record<string, string>;
+    for (const said of Object.values(aria)) expect(said.toLowerCase()).not.toContain("delete");
+    expect(document.body.textContent?.toLowerCase()).not.toContain("press delete");
+    expect((props.fitViewOptions as { minZoom: number }).minZoom).toBeGreaterThanOrEqual(0.8);
+    // The gesture is explained where it is made.
+    expect(screen.getByText(/drag a line from the dot on one card's edge/)).toBeDefined();
+  });
+
+  it("names every node and every edge in words a person would use", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 4, held: 2 },
+            projects: [column({ slots: [slot({ slot: 0, owner_id: 41 }), slot({ slot: 1, owner_id: 55 })] })],
+          },
+          jobs: [job({ id: 41 }), job({ id: 55 })],
+          exclusions: [exclusion()],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    await screen.findByRole("region", { name: "alpha column" });
+    fireEvent.click(screen.getByRole("button", { name: "Canvas" }));
+
+    // Asserted on what xyflow is handed rather than on its DOM: jsdom gives the pane no size,
+    // so the library lays out no node wrappers here. It turns `ariaLabel` into the wrapper's
+    // `aria-label` — the element that takes focus on the surface — and the screenshot harness
+    // checks that in a real browser.
+    await waitFor(() => expect(seen.props.length).toBeGreaterThan(0));
+    const handed = seen.props[seen.props.length - 1];
+    const nodes = handed.nodes as Array<{ ariaLabel?: string }>;
+    expect(nodes.map((node) => node.ariaLabel)).toEqual([
+      "alpha, slot 0 — job 41",
+      "alpha, slot 1 — job 55",
+    ]);
+    const edges = handed.edges as Array<{ ariaLabel?: string }>;
+    expect(edges.map((edge) => edge.ariaLabel)).toEqual(["job 41 and job 55 never run at the same time"]);
+  });
 });
 
 describe("the canvas model", () => {
@@ -820,6 +1303,37 @@ describe("the canvas model", () => {
     expect(isValidConnection(alphaOne, aRun)).toBe(false);
     expect(isValidConnection(alphaOne, undefined)).toBe(false);
   });
+
+  it("lays a project's cards out on one row and draws a labelled region around them", () => {
+    const model = buildFleet({
+      concurrency: {
+        house: { limit: 6, held: 3 },
+        projects: [
+          column({ project_id: "bravo", limit: 2, slots: [slot({ project_id: "bravo", slot: 0, owner_id: 9 })] }),
+          column({ slots: [slot({ slot: 0, owner_id: 41 }), slot({ slot: 1, owner_id: 55 })] }),
+        ],
+      },
+      jobs: [job({ id: 41 }), job({ id: 55 }), job({ id: 9, project_id: "bravo" })],
+      runs: [],
+      exclusions: [],
+      requests: [],
+      layout: {},
+    });
+
+    const at = Object.fromEntries(model.nodes.map((node) => [node.id, node.position]));
+    // Same project, same row; the next project, the next row.
+    expect(at["job:41"].y).toBe(at["job:55"].y);
+    expect(at["job:55"].x).toBeGreaterThan(at["job:41"].x);
+    expect(at["job:9"].y).toBeGreaterThan(at["job:41"].y);
+
+    const zones = zonesFor(model.nodes);
+    const alpha = zones.find((zone) => zone.projectId === "alpha")!;
+    expect(alpha.label).toBe("alpha 2/2");
+    // The region contains both of its cards.
+    expect(alpha.x).toBeLessThan(at["job:41"].x);
+    expect(alpha.x + alpha.width).toBeGreaterThan(at["job:55"].x);
+    expect(model.nodes.find((node) => node.id === "job:9")?.ariaLabel).toBe("bravo, slot 0 — job 9");
+  });
 });
 
 /* ------------------------------------------------------------ job detail -- */
@@ -849,6 +1363,7 @@ describe("Fleet — a job's items", () => {
                   // "no gate configured", not "the tests passed".
                   gate_status: null,
                 }),
+                item({ ordinal: 2, description: "merge the importer", round: 1, status: "conflicted", gate_status: null }),
               ],
             },
           },
@@ -861,16 +1376,18 @@ describe("Fleet — a job's items", () => {
 
     const items = await screen.findByRole("list", { name: "items of job 41" });
     expect(within(items).getByText("round 2")).toBeDefined();
-    expect(within(items).getByText(/no gate configured/i)).toBeDefined();
+    expect(within(items).getAllByText(/no gate configured/i).length).toBeGreaterThan(0);
     expect(within(items).getByText(/gate passed/i)).toBeDefined();
+    // Every item's own state through the one map, in the same words its slot card uses.
+    expect(within(items).getByText("did not merge").className).toContain("ui-badge-danger");
+    expect(within(items).getAllByText("done")[0].className).toContain("ui-badge-info");
   });
 
   /**
    * **Why these two and not those.** The question a parallel queue provokes and
    * a sequential one never did — and until the daemon put `agent_id`,
    * `depends_on` and `files` on the wire, the answer lived only inside the fold
-   * that made the batch. A person watching two of three items move could see
-   * which two and nothing about why.
+   * that made the batch.
    *
    * The ordinals are shown `+1`, matching the number on the row above them: a
    * `depends_on` of `[0]` refers to the item drawn as `1`, and printing the raw
@@ -972,17 +1489,7 @@ describe("Fleet — a job's items", () => {
             ],
           },
           jobs: [job({ id: 41 }), job({ id: 55 })],
-          exclusions: [
-            {
-              id: 3,
-              project_id: "alpha",
-              job_low: 41,
-              job_high: 55,
-              proposal_id: 9,
-              paths: null,
-              created_at: "2026-08-17T09:00:00Z",
-            },
-          ],
+          exclusions: [exclusion()],
           requests: [
             proposal({ id: 12, status: "pending", tool_input: JSON.stringify({ job_low: 41, job_high: 55 }) }),
           ],
@@ -999,9 +1506,13 @@ describe("Fleet — a job's items", () => {
     expect(within(low).getByText(/not at the same time as job 55 — that one waits/)).toBeDefined();
     const high = await screen.findByRole("article", { name: "slot 1 — job 55" });
     expect(within(high).getByText(/not at the same time as job 41 — this one waits/)).toBeDefined();
+    // A rule in force holds a job back: Held Ember, never the shadow tone.
+    expect(within(low).getByText("rule in force").className).toContain("ui-badge-paused");
 
     // The rule in force wins over the request that asked for the same pair:
     // drawing both would be one constraint rendered twice.
     expect(screen.queryByText(/waiting for a decision/)).toBeNull();
+    // And a pair already joined is not offered again.
+    expect(within(low).queryByLabelText("Never at the same time as")).toBeNull();
   });
 });

@@ -22,7 +22,22 @@ import { buildProgress, type Lifecycle, type ProgressNode } from "./job-progress
  * seconds, and a graph that relaid itself on every tick would move under the cursor of somebody
  * reading it while nothing structural had changed.
  */
-export function JobProgressGraph({ job, items }: { job: Job; items: JobItem[] }) {
+export function JobProgressGraph({
+  job,
+  items,
+  showReading = true,
+}: {
+  job: Job;
+  items: JobItem[];
+  /**
+   * Whether to say the one-line reading above the drawing.
+   *
+   * `false` where a `JobProgressLine` already sits beside it — the fleet's item panel — because
+   * the same "4/7 done · 1 needing a look" twice, one line apart, reads as two readings that
+   * happen to agree rather than as one.
+   */
+  showReading?: boolean;
+}) {
   const progress = useMemo(() => buildProgress(job, items), [job, items]);
 
   // The layout depends on ids, edges and labels -- never on a status. Statuses change on every
@@ -65,7 +80,12 @@ export function JobProgressGraph({ job, items }: { job: Job; items: JobItem[] })
 
   return (
     <div className="jp">
-      <p className="jp-reading">{progress.reading}</p>
+      {showReading && <p className="jp-reading">{progress.reading}</p>}
+      {/* At its own size, inside a box that scrolls sideways. `max-width: 100%` on the SVG used
+          to shrink a 753-wide drawing into a 260px card, and its 11px labels arrived at under
+          4px — a graph that fits and cannot be read is not one. Focusable so the keyboard can
+          scroll it, and named so that stop says what it is. */}
+      <div className="jp-scroll" tabIndex={0} role="group" aria-label={`queue of job ${job.id}, scrolls sideways`}>
       <svg
         className="jp-svg"
         viewBox={`0 0 ${view.width} ${view.height}`}
@@ -102,6 +122,7 @@ export function JobProgressGraph({ job, items }: { job: Job; items: JobItem[] })
           })}
         </g>
       </svg>
+      </div>
       <Legend />
     </div>
   );
