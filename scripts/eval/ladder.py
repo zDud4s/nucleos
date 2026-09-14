@@ -92,6 +92,11 @@ RETIRED = {
 }
 MODE = {"H0": "real", "H1": "worktree", "H2": "worktree", "H3": "worktree"}
 TERMINAL = ("succeeded", "completed", "failed", "timed_out", "cancelled", "killed", "errored")
+# How long a chain may run before the watcher stops following it. A worktree chain pays a fresh
+# crate compile, every approval pause and the daemon's own gate before it turns terminal: T4xH3 on
+# 2026-09-13 was still inside that gate at 2400s, and the ladder went on to score a tree the agent
+# was still writing to. An environment override, because a slow machine needs more, not a patch.
+WATCH_CEILING = int(os.environ.get("EVAL_WATCH_CEILING", "5400"))
 
 # `core/src/worktree.rs::worktree_root()`'s default moved from a SIBLING of the project root
 # (`<parent>/nucleos-worktrees/<project>/run-*`) to INSIDE it (`<project>/.nucleos/worktrees/run-*`,
@@ -322,7 +327,7 @@ def watch(project, first_id):
             last = (row.get("id"), status)
         if status in TERMINAL:
             break
-        if time.time() - started > 2400:
+        if time.time() - started > WATCH_CEILING:
             say("    watcher: a cadeia passou o tecto da worktree")
             break
         time.sleep(10)
@@ -445,7 +450,10 @@ def main(argv):
                 if worktree:
                     deactivate(project)
 
-            verdict = score(task, layer, tree, first_id)
+            # A chain the watcher gave up on is still writing to the tree it would score, so any
+            # verdict read from it is about a half-edited file. It is recorded as what it is.
+            verdict = (score(task, layer, tree, first_id) if outcome["status"] in TERMINAL
+                       else "timed_out")
             turns = turns_of(outcome["runs"]) if outcome["runs"] else None
             say(f"    -> {verdict} | {outcome['wall']}s | ${outcome['cost']} | "
                 f"turnos={turns} | runs={outcome['runs']}")

@@ -175,7 +175,7 @@ def main():
     check("importing the ladder contacts no daemon and runs no cell",
           ladder._TOKEN is None)
 
-    def drive(work, call_impl, cell=("T1", "H0"), base=None):
+    def drive(work, call_impl, cell=("T1", "H0"), base=None, status="completed", scored=None):
         ledger = os.path.join(work, "eval-cells.jsonl")
         # `getattr` with a default so a name the ladder does not have yet reads as a FAIL line
         # below rather than as a traceback that takes every other check down with it.
@@ -191,8 +191,10 @@ def main():
             ladder.prompt_for = lambda task: "fix the thing"
             ladder.prepare = lambda task, layer, tree: base
             ladder.call = call_impl
-            ladder.watch = lambda project, first: {"wall": 265, "cost": 1.89, "runs": [900267]}
-            ladder.score = lambda task, layer, tree, first: "solved"
+            ladder.watch = lambda project, first: {"wall": 265, "cost": 1.89, "runs": [900267],
+                                                   "status": status}
+            ladder.score = lambda task, layer, tree, first: (scored.append(tree) if scored
+                                                             is not None else None) or "solved"
             ladder.turns_of = lambda runs: 34
             ladder.main([])
         finally:
@@ -218,6 +220,16 @@ def main():
     check("which the ladder reads off base.sh's own report line",
           ladder.base_of(f"T1\tsynthetic\t{sha_a}\tC:/Projects/nucleos-eval/T1-H3\n") == sha_a
           and ladder.base_of("") is None)
+
+    # T4 x H3 on 2026-09-13: the watcher gave up at its ceiling while the daemon was still gating
+    # the chain, and the ladder scored the worktree anyway, mid-edit. A chain that is not over
+    # has no verdict yet, and the tree it is still writing to must not be read as one.
+    with tempfile.TemporaryDirectory() as work:
+        scored = []
+        rows = drive(work, lambda path, method="GET", body=None: {"id": 900267},
+                     status="running", scored=scored)
+        check("a chain the watcher gave up on is recorded as timed out, not scored mid-flight",
+              rows[0]["verdict"] == "timed_out" and scored == [])
 
     def refuse(path, method="GET", body=None):
         raise urllib.error.HTTPError(
