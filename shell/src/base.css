@@ -258,8 +258,8 @@ svg {
 }
 
 /* Unlayered on purpose, and for a reason that is about `!important` rather than about
-   motion. In the important origin the cascade REVERSES layer order â€” an earlier layer
-   wins, and unlayered important wins over all of them â€” so moving these declarations into
+   motion. In the important origin the cascade REVERSES layer order — an earlier layer
+   wins, and unlayered important wins over all of them — so moving these declarations into
    `@layer base` changes what they beat. Nobody has reasoned that through, and this is the
    one block in the file that exists to protect somebody. It stays where it was. */
 @media (prefers-reduced-motion: reduce) {

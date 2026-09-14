@@ -124,7 +124,10 @@ export function validateWaitingSearch(search: Record<string, unknown>) {
  * about a project, and showing it under a heading that says otherwise would be a wrong claim
  * rather than a generous one. The narrowing note below says what is being left out.
  */
-function onlyProject<T>(view: Reading<T>, projectId: string | undefined): Reading<T> {
+function onlyProject<T>(
+  view: Reading<T>,
+  projectId: string | undefined,
+): Reading<T> {
   if (projectId === undefined || view.rows === undefined) return view;
   const rows = view.rows.filter(
     (row) => (row as { project_id?: string | null }).project_id === projectId,
@@ -176,22 +179,52 @@ export function Waiting() {
    * before the two records, and being stable is what preserves that.
    */
   const sections: { filled: boolean; node: ReactNode }[] = [
-    { filled: has(wheel.rows), node: <WheelRequestSection key="wheel" view={wheel} /> },
-    { filled: has(approvals.rows), node: <ActionApprovalSection key="approvals" view={approvals} /> },
+    {
+      filled: has(wheel.rows),
+      node: <WheelRequestSection key="wheel" view={wheel} />,
+    },
+    {
+      filled: has(approvals.rows),
+      node: <ActionApprovalSection key="approvals" view={approvals} />,
+    },
     {
       filled: has(teamActions.rows),
-      node: <TeamActionSection key="team-actions" view={teamActions} executing={openActions.data} />,
+      node: (
+        <TeamActionSection
+          key="team-actions"
+          view={teamActions}
+          executing={openActions.data}
+        />
+      ),
     },
-    { filled: has(recruits.rows), node: <RecruitmentSection key="recruits" view={recruits} /> },
-    { filled: has(merges.rows), node: <ContactMergeSection key="merges" view={merges} /> },
+    {
+      filled: has(recruits.rows),
+      node: <RecruitmentSection key="recruits" view={recruits} />,
+    },
+    {
+      filled: has(merges.rows),
+      node: <ContactMergeSection key="merges" view={merges} />,
+    },
     // Never filled: it is a statement about a route the núcleo does not mount,
     // and it says the same thing on every morning there has ever been.
     { filled: false, node: <CalendarEventAbsence key="calendar" /> },
-    { filled: has(exclusions.rows), node: <ExclusionRequestSection key="exclusions" view={exclusions} /> },
-    { filled: has(skipped.rows), node: <SkippedItemsPanel key="skipped" view={skipped} /> },
-    { filled: has(refused.rows), node: <RefusedActionsPanel key="refused" view={refused} /> },
+    {
+      filled: has(exclusions.rows),
+      node: <ExclusionRequestSection key="exclusions" view={exclusions} />,
+    },
+    {
+      filled: has(skipped.rows),
+      node: <SkippedItemsPanel key="skipped" view={skipped} />,
+    },
+    {
+      filled: has(refused.rows),
+      node: <RefusedActionsPanel key="refused" view={refused} />,
+    },
     { filled: has(vcs.rows), node: <GitQueuePanel key="vcs" view={vcs} /> },
-    { filled: has(parked.rows), node: <ParkedRunsPanel key="parked" view={parked} /> },
+    {
+      filled: has(parked.rows),
+      node: <ParkedRunsPanel key="parked" view={parked} />,
+    },
   ];
 
   return (
@@ -232,9 +265,15 @@ function countOf(...lists: (unknown[] | undefined)[]): number | undefined {
  * settled and left a note about. Merging them would make a quiet morning with
  * nine skipped items look like nine things blocking.
  */
-function headlineFor(decisions: number | undefined, records: number | undefined): string | undefined {
+function headlineFor(
+  decisions: number | undefined,
+  records: number | undefined,
+): string | undefined {
   if (decisions === undefined) return undefined;
-  const first = decisions === 0 ? "nothing is waiting on a decision" : `${decisions} waiting on a decision`;
+  const first =
+    decisions === 0
+      ? "nothing is waiting on a decision"
+      : `${decisions} waiting on a decision`;
   if (records === undefined || records === 0) return first;
   return `${first}; ${records} to read and put away`;
 }
@@ -269,14 +308,19 @@ function useOrderFreeze<T>(rows: T[], idOf: (row: T) => number) {
   return { items: inSnapshotOrder(rows, idOf, snapshot), onArmedChange };
 }
 
-function inSnapshotOrder<T>(rows: T[], idOf: (row: T) => number, snapshot: number[] | null): T[] {
+function inSnapshotOrder<T>(
+  rows: T[],
+  idOf: (row: T) => number,
+  snapshot: number[] | null,
+): T[] {
   if (snapshot === null) return rows;
   const rank = new Map(snapshot.map((id, index) => [id, index]));
   // `sort` is stable, so everything the snapshot never saw keeps the daemon's
   // own order behind everything it did.
   return [...rows].sort(
     (a, b) =>
-      (rank.get(idOf(a)) ?? Number.MAX_SAFE_INTEGER) - (rank.get(idOf(b)) ?? Number.MAX_SAFE_INTEGER),
+      (rank.get(idOf(a)) ?? Number.MAX_SAFE_INTEGER) -
+      (rank.get(idOf(b)) ?? Number.MAX_SAFE_INTEGER),
   );
 }
 
@@ -297,7 +341,9 @@ function listClass(count: number): string {
 
 /** A card: a shared row, plus this page's own air between the parts of one. */
 function cardClass(count: number): string {
-  return dense(count) ? "ui-rows-row waiting-card ui-rows-row-dense" : "ui-rows-row waiting-card";
+  return dense(count)
+    ? "ui-rows-row waiting-card ui-rows-row-dense"
+    : "ui-rows-row waiting-card";
 }
 
 /* ------------------------------------------------------------- shared parts -- */
@@ -382,8 +428,13 @@ function Queue({
 }
 
 function ListError({ error, what }: { error: unknown; what: string }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about {what}</ErrorNote>;
+  if (isApiRefusal(error))
+    return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
+  return (
+    <ErrorNote>
+      the núcleo did not answer — nothing is known about {what}
+    </ErrorNote>
+  );
 }
 
 /**
@@ -401,7 +452,8 @@ const DECISION_SENTENCES: Record<string, string> = {
   not_found: "that proposal is gone; there is nothing left to decide",
   unprocessable:
     "the núcleo accepted the request and found nothing usable inside the proposal to act on",
-  internal: "the núcleo failed while carrying the decision out — nothing was changed",
+  internal:
+    "the núcleo failed while carrying the decision out — nothing was changed",
 };
 
 /**
@@ -420,9 +472,17 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
   return { [refusal.code]: detail };
 }
 
-function DecisionRefusal({ error, trustProse }: { error: unknown; trustProse: boolean }) {
+function DecisionRefusal({
+  error,
+  trustProse,
+}: {
+  error: unknown;
+  trustProse: boolean;
+}) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — nothing was decided</ErrorNote>;
+    return (
+      <ErrorNote>the núcleo did not answer — nothing was decided</ErrorNote>
+    );
   }
   const sentences = trustProse
     ? { ...DECISION_SENTENCES, ...daemonProse(error) }
@@ -441,12 +501,17 @@ function DecisionRefusal({ error, trustProse }: { error: unknown; trustProse: bo
  * somebody hunting for a rule that was right not to be written.
  */
 function outcomeSentence(outcome: ApprovalOutcome): string {
-  if (typeof outcome.queued === "string" && outcome.queued !== "") return outcome.queued;
-  if (typeof outcome.closed === "string" && outcome.closed !== "") return outcome.closed;
-  if (typeof outcome.resume_run_id === "number") return `run ${outcome.resume_run_id} is going again`;
-  if (typeof outcome.exclusion_id === "number") return `rule ${outcome.exclusion_id} is in force`;
+  if (typeof outcome.queued === "string" && outcome.queued !== "")
+    return outcome.queued;
+  if (typeof outcome.closed === "string" && outcome.closed !== "")
+    return outcome.closed;
+  if (typeof outcome.resume_run_id === "number")
+    return `run ${outcome.resume_run_id} is going again`;
+  if (typeof outcome.exclusion_id === "number")
+    return `rule ${outcome.exclusion_id} is in force`;
   if (outcome.merged === true) return "the two are one contact now";
-  if (typeof outcome.event_id === "number") return `event ${outcome.event_id} is in the calendar`;
+  if (typeof outcome.event_id === "number")
+    return `event ${outcome.event_id} is in the calendar`;
   return "the núcleo recorded the decision";
 }
 
@@ -468,8 +533,12 @@ function DecisionNotes({
       )}
       {/* The approve door sends prose with its refusals; the refuse and dismiss
           doors answer with a bare status, so there is nothing of theirs to trust. */}
-      {approveError !== null && <DecisionRefusal error={approveError} trustProse />}
-      {refuseError !== null && <DecisionRefusal error={refuseError} trustProse={false} />}
+      {approveError !== null && (
+        <DecisionRefusal error={approveError} trustProse />
+      )}
+      {refuseError !== null && (
+        <DecisionRefusal error={refuseError} trustProse={false} />
+      )}
     </>
   );
 }
@@ -497,11 +566,14 @@ function readToolInput(raw: string): InputField[] | null {
   } catch {
     return null;
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-  return Object.entries(parsed as Record<string, unknown>).map(([name, value]) => ({
-    name,
-    value: plainValue(value),
-  }));
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+    return null;
+  return Object.entries(parsed as Record<string, unknown>).map(
+    ([name, value]) => ({
+      name,
+      value: plainValue(value),
+    }),
+  );
 }
 
 /** One value, flattened to a line of text. Nested structure is described, never dumped. */
@@ -572,7 +644,8 @@ function ReadFrom({ raw }: { raw: string | null }) {
       <p className="waiting-provenance-head">this turn had read</p>
       <ul className="waiting-provenance-list">
         {entries.map((entry, index) => {
-          const tool = typeof entry.tool === "string" ? entry.tool : "something unnamed";
+          const tool =
+            typeof entry.tool === "string" ? entry.tool : "something unnamed";
           // The arguments are stored as the daemon received them, so the url that
           // decides the question is in there and nowhere else. Flattened through
           // the same reader the action's own input uses, for the same reason:
@@ -586,7 +659,9 @@ function ReadFrom({ raw }: { raw: string | null }) {
           return (
             <li className="waiting-provenance-line" key={`${tool}-${index}`}>
               <span className="waiting-provenance-tool">{tool}</span>
-              {detail !== "" && <span className="waiting-provenance-detail">{detail}</span>}
+              {detail !== "" && (
+                <span className="waiting-provenance-detail">{detail}</span>
+              )}
             </li>
           );
         })}
@@ -601,7 +676,10 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
   const approve = useApproveProposal();
   const reject = useRejectProposal();
   const rows = view.rows ?? [];
-  const { items, onArmedChange } = useOrderFreeze(rows, (session) => session.proposal_id);
+  const { items, onArmedChange } = useOrderFreeze(
+    rows,
+    (session) => session.proposal_id,
+  );
 
   return (
     <Queue
@@ -612,9 +690,10 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
       says="nothing has asked for the wheel"
       why={
         <>
-          An agent has met a wall it may not climb and is asking for the window. Giving it the
-          wheel opens a real browser on this machine, in the profile named on the card; refusing
-          closes the session, and the run carries on without that page.
+          An agent has met a wall it may not climb and is asking for the window.
+          Giving it the wheel opens a real browser on this machine, in the
+          profile named on the card; refusing closes the session, and the run
+          carries on without that page.
         </>
       }
       notes={
@@ -629,8 +708,12 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
         {items.map((session) => (
           <li className={cardClass(items.length)} key={session.id}>
             <div className="waiting-card-head">
-              <span className="waiting-card-id">wheel #{session.proposal_id}</span>
-              <span className="waiting-meta">{session.project_id ?? "no project"}</span>
+              <span className="waiting-card-id">
+                wheel #{session.proposal_id}
+              </span>
+              <span className="waiting-meta">
+                {session.project_id ?? "no project"}
+              </span>
               <span className="waiting-meta">
                 {session.profile_kind} {session.profile_id}
               </span>
@@ -656,7 +739,9 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
                 <dd>{session.rule}</dd>
               </div>
             </dl>
-            {session.refusal !== null && <p className="waiting-reasoning">{session.refusal}</p>}
+            {session.refusal !== null && (
+              <p className="waiting-reasoning">{session.refusal}</p>
+            )}
             <div className="waiting-actions">
               <ConfirmButton
                 label={`Give wheel #${session.proposal_id} the window`}
@@ -686,11 +771,91 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
 
 /* ----------------------------------------------------- 2. action approvals -- */
 
+/* --------------------------------------------- the batch on the approvals -- */
+
+/**
+ * Which rows a batch decision names.
+ *
+ * Every identifier up to five, and above five the first three and a count. Five is the page
+ * this was written for — `DESIGN.md`'s five byte-identical `git status` cards — and naming
+ * them is the whole point: an interlock that says "Let these happen" and nothing else names
+ * the action and not the rows, which is the defect the single `subject` was added to fix.
+ * Twenty is where listing stops helping. The armed label becomes a paragraph, the
+ * announcement a thirty-word sentence that `armWindowFor` then holds the control open for,
+ * and neither is how somebody checks a selection — the bar's own line says all twenty, every
+ * time the selection changes, which is before anybody arms anything.
+ */
+function subjectFor(ids: number[]): string {
+  const named = ids.map((id) => `#${id}`);
+  if (named.length <= 5) return named.join(", ");
+  return `${named.slice(0, 3).join(", ")} and ${named.length - 3} more`;
+}
+
 function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
   const approve = useApproveProposal();
   const reject = useRejectProposal();
+  /**
+   * A second pair of doors for the batch, deliberately.
+   *
+   * `DecisionNotes` below reads the first pair, and it is a note about the last *single*
+   * decision — what it did, or why it did not. A batch that failed on one row out of five
+   * would overwrite that with its own refusal, on a note that belongs to a different
+   * gesture. The batch reports per row instead, beside the row.
+   */
+  const batchApprove = useApproveProposal();
+  const batchReject = useRejectProposal();
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [failed, setFailed] = useState<Map<number, unknown>>(new Map());
   const rows = view.rows ?? [];
-  const { items, onArmedChange } = useOrderFreeze(rows, (proposal) => proposal.id);
+  const { items, onArmedChange } = useOrderFreeze(
+    rows,
+    (proposal) => proposal.id,
+  );
+  /**
+   * The selection, read through the list rather than out of the Set.
+   *
+   * A row can be decided somewhere else while this page is open — the run resumed, another
+   * window approved it — and it leaves the queue on the next read. A count taken from the Set
+   * would keep counting it, and the interlock would name a decision nobody can take.
+   */
+  const chosen = items.filter((proposal) => selected.has(proposal.id));
+  const busy = batchApprove.isPending || batchReject.isPending;
+
+  function toggle(id: number, on: boolean) {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }
+
+  /**
+   * One call per row, one at a time, in the order they are on screen.
+   *
+   * The ids are taken before the first call and not read again: every decision invalidates
+   * the queue `onSettled`, so the list can refetch under the loop, and a batch that re-read
+   * it would be deciding a different set from the one that was named on the button. Sequential
+   * and not `Promise.all` for the same reason `Files.tsx` is: the núcleo answers each of these
+   * with a transaction of its own, and a failure has to be attributable to a row.
+   */
+  async function decide(door: {
+    mutateAsync: (id: number) => Promise<unknown>;
+  }) {
+    const ids = chosen.map((proposal) => proposal.id);
+    setFailed(new Map());
+    const failures = new Map<number, unknown>();
+    for (const id of ids) {
+      try {
+        await door.mutateAsync(id);
+      } catch (error) {
+        failures.set(id, error);
+      }
+    }
+    setFailed(failures);
+    // What went through is gone on the next read; what did not is still a decision to take.
+    setSelected(new Set(failures.keys()));
+  }
 
   return (
     <Queue
@@ -701,9 +866,10 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
       says="nothing is waiting to be let through"
       why={
         <>
-          A run that reaches for something outside its permission stops where it is and files one
-          of these. An empty queue means either that nothing has asked, or that the autopilot is
-          off — it is not a sign that anything is stuck.
+          A run that reaches for something outside its permission stops where it
+          is and files one of these. An empty queue means either that nothing
+          has asked, or that the autopilot is off — it is not a sign that
+          anything is stuck.
         </>
       }
       notes={
@@ -714,63 +880,127 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
         />
       }
     >
-      <ul className={listClass(items.length)} aria-label="Action approvals">
-        {items.map((proposal) => (
-          <li className={cardClass(items.length)} key={proposal.id}>
-            <div className="waiting-card-head">
-              <span className="waiting-card-id">approval #{proposal.id}</span>
-              <span className="waiting-card-title">
-                {proposal.tool_name ?? "an action that names no tool"}
-              </span>
-              <RelativeTime at={proposal.created_at} />
-            </div>
-            <dl className="waiting-facts">
-              <div className="waiting-fact">
-                <dt>run</dt>
-                <dd>
-                  {proposal.run_id === null ? (
-                    "no run"
-                  ) : (
-                    <Link className="waiting-row-link" to={`/runs/${proposal.run_id}`}>
-                      run {proposal.run_id}
-                    </Link>
-                  )}
-                </dd>
+      <>
+        {items.length > 0 && (
+          <div className="waiting-bulk">
+            <Button
+              variant="quiet"
+              disabled={busy || chosen.length === items.length}
+              onClick={() =>
+                setSelected(new Set(items.map((proposal) => proposal.id)))
+              }
+            >
+              Select all {items.length}
+            </Button>
+            {chosen.length > 0 && (
+              <>
+                <p className="waiting-bulk-said" role="status">
+                  {chosen.length} selected —{" "}
+                  {chosen.map((proposal) => `#${proposal.id}`).join(", ")}
+                </p>
+                <ConfirmButton
+                  label={`Approve ${chosen.length}`}
+                  confirmLabel="Let these happen"
+                  subject={subjectFor(chosen.map((proposal) => proposal.id))}
+                  variant="approve"
+                  disabled={busy}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() => void decide(batchApprove)}
+                />
+                <ConfirmButton
+                  label={`Reject ${chosen.length}`}
+                  confirmLabel="Refuse and end them"
+                  subject={subjectFor(chosen.map((proposal) => proposal.id))}
+                  variant="ghost"
+                  disabled={busy}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() => void decide(batchReject)}
+                />
+                <Button
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => setSelected(new Set())}
+                >
+                  Clear selection
+                </Button>
+              </>
+            )}
+          </div>
+        )}
+        <ul className={listClass(items.length)} aria-label="Action approvals">
+          {items.map((proposal) => (
+            <li className={cardClass(items.length)} key={proposal.id}>
+              <div className="waiting-card-head">
+                <input
+                  className="waiting-select"
+                  type="checkbox"
+                  aria-label={`Select approval #${proposal.id}`}
+                  checked={selected.has(proposal.id)}
+                  disabled={busy}
+                  onChange={(event) =>
+                    toggle(proposal.id, event.target.checked)
+                  }
+                />
+                <span className="waiting-card-id">approval #{proposal.id}</span>
+                <span className="waiting-card-title">
+                  {proposal.tool_name ?? "an action that names no tool"}
+                </span>
+                <RelativeTime at={proposal.created_at} />
               </div>
-              <div className="waiting-fact">
-                <dt>project</dt>
-                <dd>{proposal.project_id ?? "no project"}</dd>
+              <dl className="waiting-facts">
+                <div className="waiting-fact">
+                  <dt>run</dt>
+                  <dd>
+                    {proposal.run_id === null ? (
+                      "no run"
+                    ) : (
+                      <Link
+                        className="waiting-row-link"
+                        to={`/runs/${proposal.run_id}`}
+                      >
+                        run {proposal.run_id}
+                      </Link>
+                    )}
+                  </dd>
+                </div>
+                <div className="waiting-fact">
+                  <dt>project</dt>
+                  <dd>{proposal.project_id ?? "no project"}</dd>
+                </div>
+              </dl>
+              <p className="waiting-reasoning">
+                {proposal.reasoning.trim() === ""
+                  ? "nothing was recorded about why this was asked for"
+                  : proposal.reasoning}
+              </p>
+              <ToolInput raw={proposal.tool_input} />
+              <div className="waiting-actions">
+                <ConfirmButton
+                  label={`Approve #${proposal.id}`}
+                  confirmLabel="Let this action happen"
+                  subject={`#${proposal.id}`}
+                  variant="approve"
+                  disabled={approve.isPending}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() => approve.mutate(proposal.id)}
+                />
+                <ConfirmButton
+                  label={`Reject #${proposal.id}`}
+                  confirmLabel="Refuse and end the run"
+                  subject={`#${proposal.id}`}
+                  variant="ghost"
+                  disabled={reject.isPending}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() => reject.mutate(proposal.id)}
+                />
               </div>
-            </dl>
-            <p className="waiting-reasoning">
-              {proposal.reasoning.trim() === ""
-                ? "nothing was recorded about why this was asked for"
-                : proposal.reasoning}
-            </p>
-            <ToolInput raw={proposal.tool_input} />
-            <div className="waiting-actions">
-              <ConfirmButton
-                label={`Approve #${proposal.id}`}
-                confirmLabel="Let this action happen"
-                subject={`#${proposal.id}`}
-                variant="approve"
-                disabled={approve.isPending}
-                onArmedChange={onArmedChange}
-                onConfirm={() => approve.mutate(proposal.id)}
-              />
-              <ConfirmButton
-                label={`Reject #${proposal.id}`}
-                confirmLabel="Refuse and end the run"
-                subject={`#${proposal.id}`}
-                variant="ghost"
-                disabled={reject.isPending}
-                onArmedChange={onArmedChange}
-                onConfirm={() => reject.mutate(proposal.id)}
-              />
-            </div>
-          </li>
-        ))}
-      </ul>
+              {failed.has(proposal.id) && (
+                <DecisionRefusal error={failed.get(proposal.id)} trustProse />
+              )}
+            </li>
+          ))}
+        </ul>
+      </>
     </Queue>
   );
 }
@@ -793,7 +1023,10 @@ function TeamActionSection({
   executing: TeamAction[] | undefined;
 }) {
   const rows = view.rows ?? [];
-  const { items, onArmedChange } = useOrderFreeze(rows, (proposal) => proposal.id);
+  const { items, onArmedChange } = useOrderFreeze(
+    rows,
+    (proposal) => proposal.id,
+  );
 
   return (
     <Queue
@@ -804,9 +1037,9 @@ function TeamActionSection({
       says="no team is waiting on an action"
       why={
         <>
-          An action a team asked the núcleo to carry out under a propose grant. Approving
-          does not do the thing — it lets the núcleo do it on its next tick, about ten seconds
-          later.
+          An action a team asked the núcleo to carry out under a propose grant.
+          Approving does not do the thing — it lets the núcleo do it on its next
+          tick, about ten seconds later.
         </>
       }
     >
@@ -826,8 +1059,12 @@ function TeamActionSection({
 }
 
 /** One team action's payload, per `tool_name` — the three kinds a grant can ever name. */
-function payloadFields(kind: string | null, parsed: Record<string, unknown>): InputField[] {
-  const field = (value: unknown): string => (value === undefined ? "not given" : plainValue(value));
+function payloadFields(
+  kind: string | null,
+  parsed: Record<string, unknown>,
+): InputField[] {
+  const field = (value: unknown): string =>
+    value === undefined ? "not given" : plainValue(value);
   switch (kind) {
     case "send_email":
       return [
@@ -847,7 +1084,10 @@ function payloadFields(kind: string | null, parsed: Record<string, unknown>): In
         { name: "duration", value: field(parsed.duration) },
       ];
     default:
-      return Object.entries(parsed).map(([name, value]) => ({ name, value: plainValue(value) }));
+      return Object.entries(parsed).map(([name, value]) => ({
+        name,
+        value: plainValue(value),
+      }));
   }
 }
 
@@ -858,7 +1098,13 @@ function payloadFields(kind: string | null, parsed: Record<string, unknown>): In
  * second time can fail on data that is not ours to fix — the raw string is the
  * fallback, never a blank card.
  */
-function TeamActionPayload({ kind, raw }: { kind: string | null; raw: string | null }) {
+function TeamActionPayload({
+  kind,
+  raw,
+}: {
+  kind: string | null;
+  raw: string | null;
+}) {
   if (raw === null || raw.trim() === "") return null;
   const parsed = parseActionPayload(raw);
   if (parsed === null) {
@@ -914,15 +1160,22 @@ function TeamActionCard({
           <dt>execution</dt>
           <dd>
             {action === undefined ? (
-              <span className="waiting-meta">the execution state is not known yet</span>
+              <span className="waiting-meta">
+                the execution state is not known yet
+              </span>
             ) : (
-              <StateBadge domain="team_action" state={teamActionState(action)} />
+              <StateBadge
+                domain="team_action"
+                state={teamActionState(action)}
+              />
             )}
           </dd>
         </div>
       </dl>
       <p className="waiting-reasoning">
-        {proposal.reasoning.trim() === "" ? "nothing was recorded about why" : proposal.reasoning}
+        {proposal.reasoning.trim() === ""
+          ? "nothing was recorded about why"
+          : proposal.reasoning}
       </p>
       <TeamActionPayload kind={proposal.tool_name} raw={proposal.tool_input} />
       <div className="waiting-actions">
@@ -965,7 +1218,10 @@ function TeamActionCard({
  */
 function RecruitmentSection({ view }: { view: Reading<Proposal> }) {
   const rows = view.rows ?? [];
-  const { items, onArmedChange } = useOrderFreeze(rows, (proposal) => proposal.id);
+  const { items, onArmedChange } = useOrderFreeze(
+    rows,
+    (proposal) => proposal.id,
+  );
 
   return (
     <Queue
@@ -976,8 +1232,9 @@ function RecruitmentSection({ view }: { view: Reading<Proposal> }) {
       says="no team has asked for a specialist"
       why={
         <>
-          A director asked for a specialist by name. The request is editable here before it is
-          granted; saying not now leaves nothing behind — the team may ask again.
+          A director asked for a specialist by name. The request is editable
+          here before it is granted; saying not now leaves nothing behind — the
+          team may ask again.
         </>
       }
     >
@@ -1000,7 +1257,8 @@ function seedRecruitForm(raw: string | null): AgentRequest | null {
   if (raw === null) return null;
   const parsed = parseActionPayload(raw);
   if (parsed === null) return null;
-  const text = (value: unknown): string => (typeof value === "string" ? value : "");
+  const text = (value: unknown): string =>
+    typeof value === "string" ? value : "";
   return {
     name: text(parsed.name),
     speciality: text(parsed.speciality),
@@ -1032,7 +1290,9 @@ function RecruitmentCard({
   }, [form, proposal.tool_input]);
 
   function field<K extends keyof AgentRequest>(key: K, value: AgentRequest[K]) {
-    setForm((current) => (current === null ? current : { ...current, [key]: value }));
+    setForm((current) =>
+      current === null ? current : { ...current, [key]: value },
+    );
   }
 
   const idFor = (name: string) => `recruit-${proposal.id}-${name}`;
@@ -1044,10 +1304,14 @@ function RecruitmentCard({
         <RelativeTime at={proposal.created_at} />
       </div>
       <p className="waiting-reasoning">
-        {proposal.reasoning.trim() === "" ? "nothing was recorded about why" : proposal.reasoning}
+        {proposal.reasoning.trim() === ""
+          ? "nothing was recorded about why"
+          : proposal.reasoning}
       </p>
       {form === null ? (
-        <p className="waiting-payload-raw">{proposal.tool_input ?? "nothing was proposed"}</p>
+        <p className="waiting-payload-raw">
+          {proposal.tool_input ?? "nothing was proposed"}
+        </p>
       ) : (
         // The one card in this queue that is a form. The inset is what says the
         // fields are a thing standing on the row rather than more of the row.
@@ -1064,7 +1328,10 @@ function RecruitmentCard({
             />
           </div>
           <div className="waiting-recruit-field">
-            <label className="waiting-recruit-label" htmlFor={idFor("speciality")}>
+            <label
+              className="waiting-recruit-label"
+              htmlFor={idFor("speciality")}
+            >
               speciality
             </label>
             <input
@@ -1086,8 +1353,9 @@ function RecruitmentCard({
             />
           </div>
           <p className="waiting-recruit-hint">
-            Engine and tool policy are the two fields a director gets wrong most often — they are
-            also what costs money per turn and what widens what this agent can reach.
+            Engine and tool policy are the two fields a director gets wrong most
+            often — they are also what costs money per turn and what widens what
+            this agent can reach.
           </p>
           <div className="waiting-recruit-field">
             <label className="waiting-recruit-label" htmlFor={idFor("engine")}>
@@ -1108,11 +1376,19 @@ function RecruitmentCard({
               className="waiting-recruit-input"
               id={idFor("model")}
               value={form.model ?? ""}
-              onChange={(event) => field("model", event.target.value === "" ? null : event.target.value)}
+              onChange={(event) =>
+                field(
+                  "model",
+                  event.target.value === "" ? null : event.target.value,
+                )
+              }
             />
           </div>
           <div className="waiting-recruit-field">
-            <label className="waiting-recruit-label" htmlFor={idFor("tool_policy")}>
+            <label
+              className="waiting-recruit-label"
+              htmlFor={idFor("tool_policy")}
+            >
               tool policy
             </label>
             <input
@@ -1133,10 +1409,14 @@ function RecruitmentCard({
           disabled={hire.isPending || form === null}
           onArmedChange={onArmedChange}
           onConfirm={() => {
-            if (form !== null) hire.mutate({ proposalId: proposal.id, hire: form });
+            if (form !== null)
+              hire.mutate({ proposalId: proposal.id, hire: form });
           }}
         />
-        <Button disabled={reject.isPending} onClick={() => reject.mutate(proposal.id)}>
+        <Button
+          disabled={reject.isPending}
+          onClick={() => reject.mutate(proposal.id)}
+        >
           Not now
         </Button>
       </div>
@@ -1146,7 +1426,9 @@ function RecruitmentCard({
         </p>
       )}
       {hire.isError && <DecisionRefusal error={hire.error} trustProse />}
-      {reject.isError && <DecisionRefusal error={reject.error} trustProse={false} />}
+      {reject.isError && (
+        <DecisionRefusal error={reject.error} trustProse={false} />
+      )}
     </li>
   );
 }
@@ -1157,7 +1439,9 @@ function MergeSideView({ side, role }: { side: MergeSide; role: string }) {
   return (
     <div className="waiting-side">
       <p className="waiting-side-role">{role}</p>
-      <p className="waiting-side-name">{side.display_name ?? "no name recorded"}</p>
+      <p className="waiting-side-name">
+        {side.display_name ?? "no name recorded"}
+      </p>
       <ul className="waiting-addresses">
         {side.addresses.map((address) => (
           <li key={address}>{address}</li>
@@ -1165,7 +1449,9 @@ function MergeSideView({ side, role }: { side: MergeSide; role: string }) {
       </ul>
       <p className="waiting-meta">{side.messages_in} messages in</p>
       <p className="waiting-verdict">
-        {side.verdict === null ? "no standing decision" : `standing decision: ${side.verdict}`}
+        {side.verdict === null
+          ? "no standing decision"
+          : `standing decision: ${side.verdict}`}
       </p>
     </div>
   );
@@ -1181,7 +1467,10 @@ function verdictsConflict(suggestion: MergeSuggestion): boolean {
 function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
   const decide = useDecideContactMerge();
   const rows = view.rows ?? [];
-  const { items, onArmedChange } = useOrderFreeze(rows, (suggestion) => suggestion.proposal_id);
+  const { items, onArmedChange } = useOrderFreeze(
+    rows,
+    (suggestion) => suggestion.proposal_id,
+  );
 
   return (
     <Queue
@@ -1192,9 +1481,10 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
       says="no two contacts look like the same person"
       why={
         <>
-          Two records that look like one person. Merging is a pointer move and is undoable one
-          address at a time; saying they are different people is recorded too, which is what stops
-          the same suggestion coming back on every sweep.
+          Two records that look like one person. Merging is a pointer move and
+          is undoable one address at a time; saying they are different people is
+          recorded too, which is what stops the same suggestion coming back on
+          every sweep.
         </>
       }
       /* One mutation for both verdicts, so the refusal is shown once — and its
@@ -1212,7 +1502,9 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
         {items.map((suggestion) => (
           <li className={cardClass(items.length)} key={suggestion.proposal_id}>
             <div className="waiting-card-head">
-              <span className="waiting-card-id">merge #{suggestion.proposal_id}</span>
+              <span className="waiting-card-id">
+                merge #{suggestion.proposal_id}
+              </span>
               <RelativeTime at={suggestion.created_at} />
             </div>
             <p className="waiting-reasoning">{suggestion.reasoning}</p>
@@ -1225,8 +1517,9 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
                 contradict, and the remedy is to settle one of them first. */}
             {verdictsConflict(suggestion) && (
               <p className="waiting-conflict">
-                These two carry standing decisions that disagree, so the núcleo will refuse the
-                merge — settle one of them and decide this again.
+                These two carry standing decisions that disagree, so the núcleo
+                will refuse the merge — settle one of them and decide this
+                again.
               </p>
             )}
             <div className="waiting-actions">
@@ -1238,7 +1531,10 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
                 disabled={decide.isPending}
                 onArmedChange={onArmedChange}
                 onConfirm={() =>
-                  decide.mutate({ proposalId: suggestion.proposal_id, verdict: "approve" })
+                  decide.mutate({
+                    proposalId: suggestion.proposal_id,
+                    verdict: "approve",
+                  })
                 }
               />
               <ConfirmButton
@@ -1249,7 +1545,10 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
                 disabled={decide.isPending}
                 onArmedChange={onArmedChange}
                 onConfirm={() =>
-                  decide.mutate({ proposalId: suggestion.proposal_id, verdict: "reject" })
+                  decide.mutate({
+                    proposalId: suggestion.proposal_id,
+                    verdict: "reject",
+                  })
                 }
               />
             </div>
@@ -1283,11 +1582,12 @@ function CalendarEventAbsence() {
     <Section label="Calendar events">
       <Quiet says="the núcleo mounts no route that lists them">
         <p>
-          The núcleo can propose a calendar event and can decide one, but it mounts no route that
-          lists the pending ones — so this queue cannot show them. Nothing is being hidden: what is
-          missing is the door, not the record, and opening it is a change to the núcleo rather than
-          to this page. Nothing here is in the count above: with no route that lists them, there is
-          nothing to count.
+          The núcleo can propose a calendar event and can decide one, but it
+          mounts no route that lists the pending ones — so this queue cannot
+          show them. Nothing is being hidden: what is missing is the door, not
+          the record, and opening it is a change to the núcleo rather than to
+          this page. Nothing here is in the count above: with no route that
+          lists them, there is nothing to count.
         </p>
       </Quiet>
     </Section>
@@ -1328,7 +1628,10 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
   const approve = useApproveProposal();
   const reject = useRejectProposal();
   const rows = view.rows ?? [];
-  const { items, onArmedChange } = useOrderFreeze(rows, (proposal) => proposal.id);
+  const { items, onArmedChange } = useOrderFreeze(
+    rows,
+    (proposal) => proposal.id,
+  );
 
   return (
     <Queue
@@ -1339,9 +1642,9 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
       says="no job has asked to be kept apart from another"
       why={
         <>
-          A request that two jobs of one project never run at the same time. Drawing the edge
-          changed nothing; approving it writes the rule, and the higher-numbered job is the one
-          that waits.
+          A request that two jobs of one project never run at the same time.
+          Drawing the edge changed nothing; approving it writes the rule, and
+          the higher-numbered job is the one that waits.
         </>
       }
       notes={
@@ -1364,7 +1667,9 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                     ? "a pair this request does not name"
                     : `jobs ${pair.low} and ${pair.high}`}
                 </span>
-                <span className="waiting-meta">{proposal.project_id ?? "no project"}</span>
+                <span className="waiting-meta">
+                  {proposal.project_id ?? "no project"}
+                </span>
                 <RelativeTime at={proposal.created_at} />
               </div>
               <p className="waiting-reasoning">
@@ -1412,7 +1717,10 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
 function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
   const dismiss = useDismissProposal();
   const rows = view.rows ?? [];
-  const { items, onArmedChange } = useOrderFreeze(rows, (proposal) => proposal.id);
+  const { items, onArmedChange } = useOrderFreeze(
+    rows,
+    (proposal) => proposal.id,
+  );
 
   return (
     <Queue
@@ -1423,10 +1731,11 @@ function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
       says="no job put anything down"
       why={
         <>
-          Work a job put down overnight because it needed a decision, and carried on without.
-          Nothing resumes from here — the tree moved on hours ago — so the only thing left is to
-          read it and put it away. Which is why none of it is in the count above: this is a record
-          of a decision the night already took, not one held for you.
+          Work a job put down overnight because it needed a decision, and
+          carried on without. Nothing resumes from here — the tree moved on
+          hours ago — so the only thing left is to read it and put it away.
+          Which is why none of it is in the count above: this is a record of a
+          decision the night already took, not one held for you.
         </>
       }
       notes={
@@ -1445,11 +1754,15 @@ function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
               <span className="waiting-card-title">
                 {proposal.tool_name ?? "an action that names no tool"}
               </span>
-              <span className="waiting-meta">{proposal.project_id ?? "no project"}</span>
+              <span className="waiting-meta">
+                {proposal.project_id ?? "no project"}
+              </span>
               <RelativeTime at={proposal.created_at} />
             </div>
             <p className="waiting-reasoning">
-              {proposal.reasoning.trim() === "" ? "nothing was recorded about why" : proposal.reasoning}
+              {proposal.reasoning.trim() === ""
+                ? "nothing was recorded about why"
+                : proposal.reasoning}
             </p>
             <ToolInput raw={proposal.tool_input} />
             <div className="waiting-actions">
@@ -1496,12 +1809,13 @@ function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
       says="the barrier has refused nothing"
       why={
         <>
-          The barrier stopped these before they happened, in turns that have since ended. There is
-          nothing here to allow: what they were going to do is written out so you can decide
-          whether to do it yourself, and under it what the turn had read when it decided to — which
-          is usually the half that answers whether the idea was the agent&apos;s or a
-          stranger&apos;s. None of it is in the count above: the barrier already answered these, and
-          what is left is a record to read.
+          The barrier stopped these before they happened, in turns that have
+          since ended. There is nothing here to allow: what they were going to
+          do is written out so you can decide whether to do it yourself, and
+          under it what the turn had read when it decided to — which is usually
+          the half that answers whether the idea was the agent&apos;s or a
+          stranger&apos;s. None of it is in the count above: the barrier already
+          answered these, and what is left is a record to read.
         </>
       }
     >
@@ -1515,11 +1829,15 @@ function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
               </span>
               {/* The one listing that joins the errand in: "send_email" without
                   the errand is the verb with the subject missing. */}
-              <span className="waiting-meta">{proposal.errand_name ?? "no errand"}</span>
+              <span className="waiting-meta">
+                {proposal.errand_name ?? "no errand"}
+              </span>
               <RelativeTime at={proposal.created_at} />
             </div>
             <p className="waiting-reasoning">
-              {proposal.reasoning.trim() === "" ? "nothing was recorded about why" : proposal.reasoning}
+              {proposal.reasoning.trim() === ""
+                ? "nothing was recorded about why"
+                : proposal.reasoning}
             </p>
             <ToolInput raw={proposal.tool_input} />
             <ReadFrom raw={proposal.read_from} />
@@ -1563,16 +1881,22 @@ function GitQueuePanel({ view }: { view: Reading<VcsRequestSummary> }) {
       says="nothing has been through the git queue"
       why={
         <>
-          Every push, merge and rebase the núcleo has been asked to make. Two of the states want a
-          person — escalated, which means somebody owns a conflict now, and blocked, which the
-          queue will not retry — and neither is a failure.
+          Every push, merge and rebase the núcleo has been asked to make. Two of
+          the states want a person — escalated, which means somebody owns a
+          conflict now, and blocked, which the queue will not retry — and
+          neither is a failure.
         </>
       }
     >
       {wanted.length === 0 ? (
-        <p className="waiting-empty">nothing in the git queue is waiting on you.</p>
+        <p className="waiting-empty">
+          nothing in the git queue is waiting on you.
+        </p>
       ) : (
-        <ul className={listClass(wanted.length)} aria-label="Git requests waiting on you">
+        <ul
+          className={listClass(wanted.length)}
+          aria-label="Git requests waiting on you"
+        >
           {wanted.map((row) => (
             <VcsRow key={row.id} row={row} count={wanted.length} />
           ))}
@@ -1593,8 +1917,9 @@ function GitQueuePanel({ view }: { view: Reading<VcsRequestSummary> }) {
           while — it is not a finding and is not drawn as one. */}
       {rows.length >= VCS_LIST_LIMIT && (
         <p className="waiting-ceiling">
-          the listing stops at {VCS_LIST_LIMIT} rows — this is the queue&apos;s whole history, kept
-          rather than pruned, so a full listing only means the daemon has been running a while
+          the listing stops at {VCS_LIST_LIMIT} rows — this is the queue&apos;s
+          whole history, kept rather than pruned, so a full listing only means
+          the daemon has been running a while
         </p>
       )}
     </Queue>
@@ -1603,7 +1928,9 @@ function GitQueuePanel({ view }: { view: Reading<VcsRequestSummary> }) {
 
 function VcsRow({ row, count }: { row: VcsRequestSummary; count: number }) {
   return (
-    <li className={dense(count) ? "ui-rows-row ui-rows-row-dense" : "ui-rows-row"}>
+    <li
+      className={dense(count) ? "ui-rows-row ui-rows-row-dense" : "ui-rows-row"}
+    >
       <div className="waiting-card-head">
         <span className="waiting-card-id">
           {row.op} #{row.id}
@@ -1618,7 +1945,9 @@ function VcsRow({ row, count }: { row: VcsRequestSummary; count: number }) {
         {row.repo_key} — {row.origin}
       </p>
       {/* And what to do about it is its own line, not a third clause on the faint mono one. */}
-      {row.status === "blocked" ? <p className="waiting-hint">submit it again</p> : null}
+      {row.status === "blocked" ? (
+        <p className="waiting-hint">submit it again</p>
+      ) : null}
     </li>
   );
 }
@@ -1637,17 +1966,22 @@ function ParkedRunsPanel({ view }: { view: Reading<AwaitingRun> }) {
       says="no run is parked"
       why={
         <>
-          Worktree runs holding a tree while they wait. The decision that frees one is its approval
-          above; giving the tree back without deciding is on the run&apos;s own page. A parked run is
-          not in the count above either — the approval that frees it is, and counting both would
-          count one decision twice.
+          Worktree runs holding a tree while they wait. The decision that frees
+          one is its approval above; giving the tree back without deciding is on
+          the run&apos;s own page. A parked run is not in the count above either
+          — the approval that frees it is, and counting both would count one
+          decision twice.
         </>
       }
     >
       <ul className={listClass(rows.length)} aria-label="Parked runs">
         {rows.map((run) => (
           <li
-            className={dense(rows.length) ? "ui-rows-row ui-rows-row-dense" : "ui-rows-row"}
+            className={
+              dense(rows.length)
+                ? "ui-rows-row ui-rows-row-dense"
+                : "ui-rows-row"
+            }
             key={run.id}
           >
             <div className="waiting-card-head">
@@ -1655,7 +1989,9 @@ function ParkedRunsPanel({ view }: { view: Reading<AwaitingRun> }) {
                 run {run.id}
               </Link>
               <StateBadge domain="run" state="awaiting_approval" />
-              <span className="waiting-meta">{run.project_id ?? "no project"}</span>
+              <span className="waiting-meta">
+                {run.project_id ?? "no project"}
+              </span>
               <RelativeTime at={run.created_at} />
             </div>
             <p className="waiting-excerpt">{run.prompt}</p>

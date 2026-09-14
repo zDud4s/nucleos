@@ -354,6 +354,36 @@ export function useSidecars() {
   });
 }
 
+/** The supervisor key for a health-readout row, or `null` when it is not supervised. */
+export function sidecarKeyOf(rowName: string): string | null {
+  const SUFFIX = "_sidecar";
+  if (!rowName.endsWith(SUFFIX)) return null;
+  const key = rowName.slice(0, -SUFFIX.length);
+  return key === "" ? null : key;
+}
+
+/** What `POST /sidecars/{name}/restart` answers when the supervisor was asked. */
+export interface SidecarRestartAsked {
+  name: string;
+  asked: boolean;
+}
+
+/** Ask a sidecar's supervisor to stop waiting out its backoff and start it now. */
+export function useRestartSidecar() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) =>
+      apiFetch<SidecarRestartAsked>(`/sidecars/${encodeURIComponent(name)}/restart`, {
+        method: "POST",
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.health });
+      void queryClient.invalidateQueries({ queryKey: keys.system.sidecars });
+    },
+  });
+}
+
 /**
  * Did the whole readout time out?
  *

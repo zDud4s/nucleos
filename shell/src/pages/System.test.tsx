@@ -143,7 +143,11 @@ function systemWorld(overrides: Partial<SystemWorld> = {}): SystemWorld {
  */
 function systemFetch(
   world: SystemWorld,
-  opts: { onRestore?: (name: string) => unknown; onMint?: (mint: { name: string; level: ApiTokenLevel }) => unknown } = {},
+  opts: {
+    onRestore?: (name: string) => unknown;
+    onRestart?: (name: string) => unknown;
+    onMint?: (mint: { name: string; level: ApiTokenLevel }) => unknown;
+  } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   const shared = daemonFetch(daemonState({ projects: world.projects }));
   return async (path, init) => {
@@ -184,6 +188,12 @@ function systemFetch(
           migration_version: backup?.migration_version ?? 0,
           applies: `applies on the núcleo's next start, replacing everything written after ${name}`,
         };
+      }
+      const restartMatch = /^\/sidecars\/([^/]+)\/restart$/.exec(path);
+      if (restartMatch !== null) {
+        const name = decodeURIComponent(restartMatch[1]);
+        if (opts.onRestart !== undefined) return opts.onRestart(name);
+        return { name, asked: true };
       }
       if (path === "/api-tokens" && typeof init.body === "string") {
         const mint = JSON.parse(init.body) as { name: string; level: ApiTokenLevel };
@@ -390,6 +400,91 @@ describe("System - health readout", () => {
       expect(screen.queryByText(name)).toBeNull();
     }
     expect(screen.queryByRole("list", { name: "Subsystems" })).toBeNull();
+  });
+
+  it("offers a restart only beside a down sidecar", async () => {
+    const world = systemWorld({
+      readout: {
+        status: "degraded",
+        subsystems: [
+          { name: "sqlite_pool", status: "down", reason: "unreachable" },
+          { name: "echo_sidecar", status: "ok" },
+          { name: "browser_sidecar", status: "down", reason: "not-running" },
+          { name: "telegram_sidecar", status: "disabled", reason: "not-configured" },
+        ],
+      },
+    });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystem();
+
+    const list = await screen.findByRole("list", { name: "Subsystems" });
+    const restarts = within(list).getAllByRole("button", { name: "Restart" });
+    expect(restarts).toHaveLength(1);
+    expect(rowFor(list, "browser_sidecar").textContent).toContain("Restart");
+    expect(rowFor(list, "sqlite_pool").textContent).not.toContain("Restart");
+    expect(rowFor(list, "echo_sidecar").textContent).not.toContain("Restart");
+    expect(rowFor(list, "telegram_sidecar").textContent).not.toContain("Restart");
+  });
+
+  it("presses twice and asks the núcleo to restart the sidecar the row names", async () => {
+    const asked: string[] = [];
+    const world = systemWorld({
+      readout: {
+        status: "down",
+        subsystems: [{ name: "browser_sidecar", status: "down", reason: "not-running" }],
+      },
+    });
+    daemon.apiFetch.mockImplementation(
+      systemFetch(world, {
+        onRestart: (name) => {
+          asked.push(name);
+          return { name, asked: true };
+        },
+      }),
+    );
+
+    await renderSystem();
+
+    const list = await screen.findByRole("list", { name: "Subsystems" });
+    fireEvent.click(within(list).getByRole("button", { name: "Restart" }));
+    await afterDwell();
+    fireEvent.click(
+      await within(list).findByRole("button", { name: "Start it again · browser_sidecar" }),
+    );
+
+    await waitFor(() => {
+      expect(asked).toEqual(["browser"]);
+    });
+    const note = await within(list).findByText("asked — the supervisor is trying now");
+    expect(note.getAttribute("role")).toBe("status");
+  });
+
+  it("says why the núcleo refused a restart, in the row", async () => {
+    const world = systemWorld({
+      readout: {
+        status: "down",
+        subsystems: [{ name: "browser_sidecar", status: "down", reason: "not-running" }],
+      },
+    });
+    daemon.apiFetch.mockImplementation(
+      systemFetch(world, {
+        onRestart: () => {
+          throw new ApiRefusal(404, "not_supervised", "not_supervised");
+        },
+      }),
+    );
+
+    await renderSystem();
+
+    const list = await screen.findByRole("list", { name: "Subsystems" });
+    fireEvent.click(within(list).getByRole("button", { name: "Restart" }));
+    await afterDwell();
+    fireEvent.click(
+      await within(list).findByRole("button", { name: "Start it again · browser_sidecar" }),
+    );
+
+    expect(await within(list).findByText(/nothing is supervising it/)).toBeDefined();
   });
 });
 

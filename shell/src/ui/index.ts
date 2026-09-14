@@ -23,6 +23,22 @@ export { Field, type FieldProps } from "./Field";
 export { LimitChip, Meter, usd, type LimitChipProps, type MeterProps, type MeterTone } from "./Meter";
 export { ModeSwitch, type ModeSwitchProps, type SwitchMode } from "./ModeSwitch";
 export { PageHeader, type PageHeaderProps } from "./PageHeader";
+/**
+ * The one palette, and the one place the `Ctrl K` chord is bound.
+ *
+ * A page does not open a palette of its own: it contributes a group through
+ * `usePaletteGroup` and the shell's provider draws it. `SHORTCUT_HINT` is here
+ * so a page can print the chord beside a button without deciding what it is.
+ */
+export {
+  PaletteProvider,
+  SHORTCUT_HINT,
+  usePaletteGroup,
+  usePaletteOpen,
+  usePaletteQuery,
+  type PaletteGroup,
+  type PaletteItem,
+} from "./Palette";
 export { Panel, type PanelProps, type PanelVariant } from "./Panel";
 export { Quiet, type QuietProps } from "./Quiet";
 /**

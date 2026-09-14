@@ -63,4 +63,19 @@ describe("the armed ring", () => {
     // outline is 4-6px out, on the surface, where it measures 3.9:1.
     expect(focus?.[1]).toMatch(/outline-offset:\s*4px/);
   });
+
+  it("the two labels stack in one cell, so the button is the wider of them", () => {
+    const stack = /\.ui-confirm-stack\s*\{([^}]*)\}/.exec(ui);
+    expect(stack).not.toBeNull();
+    expect(stack?.[1]).toMatch(/display:\s*inline-grid/);
+
+    // Both children in the same area is the whole mechanism: the cell is the wider of the two
+    // labels, and the one not showing still occupies it. jsdom applies no stylesheet, so the
+    // component test can say a label is `aria-hidden` and only this can say it is invisible.
+    const child = /\.ui-confirm-stack\s*>\s*\*\s*\{([^}]*)\}/.exec(ui);
+    expect(child?.[1]).toMatch(/grid-area:\s*label/);
+
+    const hidden = /\.ui-confirm-stack\s*>\s*\[aria-hidden="true"\]\s*\{([^}]*)\}/.exec(ui);
+    expect(hidden?.[1]).toMatch(/visibility:\s*hidden/);
+  });
 });

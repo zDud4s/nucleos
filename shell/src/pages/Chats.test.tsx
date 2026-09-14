@@ -44,6 +44,7 @@ vi.mock("../data/dictation", () => ({
 
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
+import { PaletteProvider } from "../ui";
 import { ApiRefusal } from "../data/client";
 import type {
   Ask,
@@ -513,7 +514,9 @@ async function renderChats(initialPath: string) {
   await router.load();
   const result = render(
     <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
+      <PaletteProvider>
+        <RouterProvider router={router} />
+      </PaletteProvider>
     </QueryClientProvider>,
   );
   return { ...result, router, queryClient };
@@ -4095,11 +4098,11 @@ describe("Chats - finding a conversation by typing", () => {
     await renderChats("/chats/c-1");
     await screen.findByRole("list", { name: "Conversations" });
 
-    expect(screen.queryByRole("dialog", { name: /find a conversation/i })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Go to anything" })).toBeNull();
 
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
 
-    const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
     expect(within(palette).getByText("rewrite the gate")).toBeDefined();
     expect(within(palette).getByText("bump dependencies")).toBeDefined();
   });
@@ -4515,7 +4518,7 @@ describe("Chats - finding something that was said", () => {
     await screen.findByRole("list", { name: "Conversations" });
 
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
-    const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
     fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "leap" } });
 
     // No conversation is CALLED "leap" — this hit exists only because the word was said in one.
@@ -4539,7 +4542,7 @@ describe("Chats - finding something that was said", () => {
     await screen.findByRole("list", { name: "Transcript" });
 
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
-    const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
     fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "three parts" } });
 
     fireEvent.click(await within(palette).findByText(/the year rule has three parts/));
@@ -4549,6 +4552,51 @@ describe("Chats - finding something that was said", () => {
       const found = document.getElementById("turn-1");
       expect(found?.className).toContain("chats-turn-lit");
     });
+  });
+
+  // The invariant `openingAChat` is there for (`Chats.tsx`): the editor preview is state and
+  // outranks the route, so a turn chosen here has to put the picked-up session down. Without the
+  // call the URL changes, the row lights up, and the editor session keeps the right-hand column —
+  // the conversation you just pressed does not open, and nothing says so.
+  it("puts a picked-up editor session down when a found turn is chosen", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", first_message: "o que ficou por fazer" })],
+        {
+          "c-1": [
+            turnRow({ id: 1, asked: "e o parser?", answer: "the year rule has three parts" }),
+          ],
+        },
+        {
+          ideSessions: [ideSession()],
+          said: {
+            "aaaa-1111": {
+              cut: false,
+              said: [{ by_owner: true, text: "arranja o parser de datas", aside: false }],
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    // Picked up: from here it is the editor session on screen and not the route's conversation.
+    fireEvent.click(
+      await screen.findByRole("button", { name: /arranja o parser de datas/i }),
+    );
+    expect(await screen.findByPlaceholderText("Carry on where you left off…")).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
+    fireEvent.change(within(palette).getByRole("combobox"), {
+      target: { value: "three parts" },
+    });
+    fireEvent.click(await within(palette).findByText(/the year rule has three parts/));
+
+    await waitFor(() => {
+      expect(screen.queryByPlaceholderText("Carry on where you left off…")).toBeNull();
+    });
+    expect(await screen.findByRole("list", { name: "Transcript" })).toBeTruthy();
   });
 });
 

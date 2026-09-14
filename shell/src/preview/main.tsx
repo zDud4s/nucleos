@@ -156,6 +156,14 @@ function openTab(name: string): boolean {
   return true;
 }
 
+/** The text of an element with its `aria-hidden` parts left out. */
+function shownText(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+  if (!(node instanceof Element)) return "";
+  if (node.getAttribute("aria-hidden") === "true") return "";
+  return [...node.childNodes].map(shownText).join("");
+}
+
 /**
  * Press a named button before declaring the page ready.
  *
@@ -174,10 +182,28 @@ function openTab(name: string): boolean {
  * person would say should not have to spell the count it happens to have on
  * the day. Exact wins where both would match, so no existing shot changes
  * which button it presses.
+ *
+ * The name is read off what is VISIBLE, and that is not a detail. An interlock
+ * carries both of its labels at once — the rest one and the armed one, whichever
+ * is not showing marked `aria-hidden` — so `textContent` spells "Let it actLet
+ * alpha act" and matches neither branch. The press then lands on whatever plain
+ * button really is called "Let it act", which on this page is a DISABLED segment
+ * whose `.click()` does nothing: `02-autopilot-armed.png` came back byte-identical
+ * to `02-autopilot.png`, a photograph of a control at rest with the word "armed"
+ * in its name.
+ *
+ * The walk is recursive because the hidden half is not a child of the button: it
+ * is a child of `.ui-confirm-stack` inside it, and a one-level filter reads the
+ * stack as visible and takes both labels with it. A button with nothing visible
+ * in it at all — an icon on its own — falls back to `textContent`, which is what
+ * this always read.
  */
 function pressButton(name: string): boolean {
   const buttons = [...document.querySelectorAll("button")];
-  const label = (one: Element) => (one.textContent ?? "").trim();
+  const label = (one: Element) => {
+    const shown = shownText(one).trim();
+    return shown === "" ? (one.textContent ?? "").trim() : shown;
+  };
   const wanted =
     buttons.find((one) => label(one) === name) ?? buttons.find((one) => label(one).startsWith(name));
   if (wanted === undefined) return false;

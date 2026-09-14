@@ -476,6 +476,50 @@
 }
 
 /**
+ * The width an armed control will need, reserved before it needs it.
+ *
+ * One cell, two labels, both in it: the box is the wider of the two from the first paint and
+ * arming is a swap rather than a growth. The alternative was clipping the armed label to the
+ * rest width, which hides the `subject` — the one thing the armed label adds on a page of
+ * five byte-identical cards.
+ *
+ * `justify-items: center` and not `text-align`, because a label can be a fragment with a glyph
+ * in it (`app/KillSwitchControl.tsx`): centre the item, and let the item lay itself out. The
+ * button's own `justify-content: center` then centres this box inside the padding.
+ *
+ * The hidden one is hidden by the attribute that hides it from a screen reader, so there is one
+ * fact and not two: an element that is `aria-hidden` here is also `visibility: hidden`, and a
+ * future edit cannot silently take the label out of one channel and leave it in the other.
+ */
+.ui-confirm-stack {
+  display: inline-grid;
+  grid-template-areas: "label";
+  align-items: center;
+  justify-items: center;
+}
+
+/**
+ * Both labels in the one cell — and each of them still a ROW inside it.
+ *
+ * A grid item is blockified, so a label that is a fragment with a glyph in it
+ * (`app/KillSwitchControl.tsx`'s `<Play/>` beside its words) lost `.ui-button`'s own flex row
+ * the moment it moved in here: `base.css` makes every `svg` a block, and the icon stacked
+ * ABOVE the text with no gap. The button's `justify-content` centres this box; what lays the
+ * box's own contents out is this rule.
+ */
+.ui-confirm-stack > * {
+  grid-area: label;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+.ui-confirm-stack > [aria-hidden="true"] {
+  visibility: hidden;
+}
+
+/**
  * Armed: the control is live and will act on the next click.
  *
  * A ring rather than a lift — the button has already changed what it says, and the ring is
@@ -1529,4 +1573,109 @@
 .ui-field-helper {
   font-size: var(--text-xs);
   color: var(--text-muted);
+}
+
+/* --------------------------------------------------------------- palette -- */
+
+/**
+ * The one palette, dressed here rather than in `ui/vendor/command.tsx`.
+ *
+ * The same rule the tabs above follow: a vendored component is *kept* in
+ * `ui/vendor/` and dressed in real classes on real tokens. `ui.css` is
+ * unlayered, so every rule below beats the registry's Tailwind — including the
+ * selected row's `data-[selected=true]:bg-border` — which is how the palette is
+ * redressed without the vendor file being edited at all.
+ *
+ * No hue anywhere in it. The palette is chrome: a surface, a border, and a
+ * ladder of neutrals. Reserved Cyan reaches it only through the focus ring
+ * every control in the app inherits.
+ */
+
+.ui-palette {
+  /* The input is the top edge of this box. The vendor's `p-6` would inset it and
+     leave a frame of surface above the caret, which reads as a dialog with a
+     search field in it rather than as a thing you type into. */
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.ui-palette-input {
+  font-family: inherit;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+/* `base.css` sets `color: inherit`, and it reaches `::placeholder` — a hint that
+   reads as text somebody has already typed. Said here for the same reason
+   `.ui-field` says it, and `opacity: 1` is the UA's own fade being undone
+   rather than a transparency this sheet is choosing. */
+.ui-palette-input::placeholder {
+  color: var(--text-faint);
+  opacity: 1;
+}
+
+.ui-palette-list {
+  /* About ten rows. A list longer than the window is a list nobody scrolls to
+     the end of, and the answer to one that long is to type. */
+  max-height: 22rem;
+  overflow-y: auto;
+  padding: var(--space-1);
+}
+
+/* The heading cmdk draws above a group's rows. Quiet, because it is a label for
+   rows somebody is reading past — the row is the thing. */
+.ui-palette-group [cmdk-group-heading] {
+  padding: var(--space-2) var(--space-2) var(--space-1);
+  font-family: var(--font-display);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--text-faint);
+}
+
+.ui-palette-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  cursor: default;
+}
+
+/* The highlighted row, and it is a rung of the neutral ladder rather than a
+   colour — Contrast-Not-Hue, and the Reserved Cyan rule's own text sends you
+   here instead of to the accent. */
+.ui-palette-item[data-selected="true"] {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+/* Listed, and said to be unavailable. `nav.ts` already rules that hiding a
+   destination would be the shell pretending the feature was never designed, and
+   the palette does not get to overturn the rail on its own list; the reason
+   travels beside the row as the hint. */
+.ui-palette-item[data-disabled="true"] {
+  opacity: var(--opacity-disabled);
+}
+
+/* Right-aligned, and never the thing you read first: a hint is why a row is
+   disabled, or where it goes — not what it is. */
+.ui-palette-hint {
+  margin-left: auto;
+  padding-left: var(--space-3);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.ui-palette-empty {
+  padding: var(--space-4);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-align: center;
 }

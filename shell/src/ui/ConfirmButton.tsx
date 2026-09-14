@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { Button, type ButtonIntent, type ButtonVariant } from "./Button";
 
 /**
@@ -36,6 +36,27 @@ const MS_PER_WORD = 400;
  * is four seconds and this is one, so there is always a window to warn inside.
  */
 const CLOSING_LEAD_MS = 1000;
+
+/**
+ * How many windows one arming may open: the first, and one restart.
+ *
+ * The window restarts when the sentence changes, and that much is right — handing a new
+ * sentence the remainder of an old sentence's window is the defect this whole clock exists to
+ * avoid. What was missing is the bound. `sayAs` is a prop, and the one live one on this app is
+ * a roster consequence recomputed from a poll every three seconds: on a project whose proposal
+ * count moves, an armed "Let alpha act" was handed a fresh ten-second window every tick, for
+ * ever. An interlock that never expires is a single-click delete with extra steps, which is the
+ * sentence at the top of this file.
+ *
+ * Two and not "cap the total": a cap on total armed time lets the last rewrite inherit whatever
+ * is left of the old window, which is the thing the paragraph above refuses. Two and not "only
+ * when the word count changes": two different sentences of the same length would restart each
+ * other for ever, so that is not a bound at all.
+ *
+ * A rewrite past the second is still SAID — the ear must hear the sentence that is true now —
+ * it just does not buy more time.
+ */
+const MAX_ARM_WINDOWS = 2;
 
 /** The window this announcement needs: the floor, or a word at a time, whichever is longer. */
 function armWindowFor(said: string): number {
@@ -159,6 +180,20 @@ export function ConfirmButton({
   const dwellTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const closingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disarmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // How many windows this arming has already opened. A ref and not state: it is read and
+  // written inside the effect that schedules the clock, and a render is exactly what it must
+  // not cause.
+  const windows = useRef(0);
+  // What the unmount cleanup below reads. Its dependency list is empty — it is the unmount
+  // handler and nothing else — so the closure it captured belongs to the FIRST render, where
+  // `armed` is false and `onArmedChange` may be an inline arrow several renders out of date.
+  // Refs are the only way for a cleanup that runs once to see what is true when it runs.
+  const armedNow = useRef(false);
+  const reportArmed = useRef(onArmedChange);
+  useEffect(() => {
+    armedNow.current = armed;
+    reportArmed.current = onArmedChange;
+  });
 
   // What a screen reader is told, and the only channel that carries it: the label swap is
   // silent to anyone not looking at the button, and the 4 s window used to expire without a
@@ -216,11 +251,19 @@ export function ConfirmButton({
   // An armed control that unmounts — the row it belonged to was approved
   // elsewhere, the page navigated — must not leave a timer that calls setState
   // on a component that is gone.
+  //
+  // And it has to say it disarmed on the way out. `onArmedChange` is a PAIR — the queue
+  // holds its sort order for as long as the count is above zero — so a control that
+  // vanishes armed leaves that count stuck at one for the life of the page, and the list
+  // never unfreezes again. Waiting's batch interlock is exactly that shape: it unmounts the
+  // moment the selection empties under it, which `Clear selection` and unticking the last box
+  // both do while it is armed.
   useEffect(() => {
     return () => {
       if (dwellTimer.current !== null) clearTimeout(dwellTimer.current);
       if (closingTimer.current !== null) clearTimeout(closingTimer.current);
       if (disarmTimer.current !== null) clearTimeout(disarmTimer.current);
+      if (armedNow.current) reportArmed.current?.(false);
     };
   }, []);
 
@@ -245,11 +288,21 @@ export function ConfirmButton({
     every render, so listing it would restart the window on every render and the control would
     never expire; `onArmedChange` is a caller's prop and is an inline arrow at some sites, with
     the same result. The house carries this exemption in three other files.
+
+    The restart has a ceiling of `MAX_ARM_WINDOWS`, and a rewrite past it is still announced and
+    simply buys no more time — a consequence fed by a three-second poll would otherwise keep an
+    armed control live for ever. The counter resets the moment `armed` goes false, which is one
+    place for three events: a confirm, an expiry and an Escape all come back through here.
   */
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
-    if (!armed) return;
+    if (!armed) {
+      windows.current = 0;
+      return;
+    }
     setSaid(armedSaid);
+    if (windows.current >= MAX_ARM_WINDOWS) return;
+    windows.current += 1;
     const span = armWindowFor(armedSaid);
     if (closingTimer.current !== null) clearTimeout(closingTimer.current);
     if (disarmTimer.current !== null) clearTimeout(disarmTimer.current);
@@ -289,6 +342,31 @@ export function ConfirmButton({
     onConfirm();
   }
 
+  /*
+    Escape disarms, and blur does not.
+
+    A control that is live for four seconds and cannot be called off is an interlock that only
+    runs one way: the mouse can arm it and only the clock can stand it down. Escape is the key
+    every person in this app already presses to mean "no", and it costs nothing to honour.
+
+    On the button and not on the wrapper: the wrapper is not focusable, so a keydown only
+    reaches it when focus is already here. Not on the document either — there are 53 interlocks
+    in this app, and an Escape aimed at a dialog would stand down every armed control behind it.
+
+    The event is not stopped. Inside a sheet, Escape should still close the sheet; closing it
+    unmounts this control, which disarms it anyway, so both things happen and neither has to
+    know about the other.
+
+    And there is no blur handler, deliberately. Somebody who cannot see the label reads the
+    consequence by moving to it — the `aria-describedby` element, the live region — and
+    disarming on blur would take the control away at the exact moment they went to find out
+    what confirming would do. The window already expires on its own; that is what it is for.
+  */
+  function handleKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
+    if (event.key !== "Escape" || !armed) return;
+    disarm();
+  }
+
   return (
     <span className={armed ? "ui-confirm ui-confirm-armed" : "ui-confirm"}>
       {/*
@@ -313,8 +391,29 @@ export function ConfirmButton({
         title={title}
         aria-describedby={describedBy}
         onClick={handleClick}
+        onKeyDown={handleKeyDown}
       >
-        {armed ? armedLabel : label}
+        {/*
+          Both labels, always, stacked in one cell — and only one of them showing.
+
+          The armed label says what will happen instead of what the control is, so it is longer
+          at 48 of 53 sites: `Approve #101` becomes `Let this action happen · #101` and the button
+          grew about 198 device px under the finger that had just pressed it, taking most of the
+          box that said `Reject #101` a moment earlier — a click aimed at Reject landed on a live
+          confirm. Nothing in this app reserved that width; `ModeSwitch` only survives it by
+          keeping its label short by contract and clipping what does not fit.
+
+          So the width is spent once, at first paint, on the wider of the two, and arming becomes
+          a swap inside a box that does not move. `visibility: hidden` rather than `display: none`
+          because the hidden one still has to occupy the cell — that IS the mechanism — and
+          `aria-hidden` beside it because a label nobody can see must not be read out either: the
+          pair is what keeps every `getByRole("button", { name })` in the suite naming the label
+          that is showing.
+        */}
+        <span className="ui-confirm-stack">
+          <span aria-hidden={armed ? "true" : undefined}>{label}</span>
+          <span aria-hidden={armed ? undefined : "true"}>{armedLabel}</span>
+        </span>
       </Button>
       {/*
         Said, not shown. `base.css`'s `.sr-only` rather than a `.ui-*` twin: `ui.css` already

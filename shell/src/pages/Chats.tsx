@@ -32,14 +32,6 @@ import {
   DialogTitle,
 } from "../ui/vendor/dialog";
 import {
-  CommandDialog,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "../ui/vendor/command";
-import {
   ArrowUp,
   ChevronDown,
   ImagePlus,
@@ -108,6 +100,7 @@ import {
 } from "../data/chats";
 import { type RelaySent } from "../lib/turns";
 import { type ChatNotice } from "../data/chats";
+import { SHORTCUT_HINT, usePaletteGroup, usePaletteOpen, usePaletteQuery } from "../ui";
 import {
   anyTurnLive,
   marksBetween,
@@ -191,7 +184,6 @@ export function Chats() {
    * gets the whole width, which is what a page made of prose wants.
    */
   const [railOpen, setRailOpen] = useState(true);
-  const [paletteOpen, setPaletteOpen] = useState(false);
   /**
    * The editor conversation being considered, if any.
    *
@@ -240,25 +232,61 @@ export function Chats() {
   } | null>(null);
   const navigate = useNavigate();
   const unseen = rows.reduce((total, row) => total + row.waiting, 0);
+  const query = usePaletteQuery();
+  const openPalette = usePaletteOpen();
+  const said = useSaid(query);
+  const needle = query.trim().toLowerCase();
 
-  /**
-   * Ctrl+K, and Cmd+K for the same fingers on a Mac keyboard.
-   *
-   * On `window` rather than on a container because the point of it is to work while
-   * the caret is in the composer, which is where it will be nearly every time.
-   * `preventDefault` because Ctrl+K is a browser shortcut and the webview would
-   * otherwise act on it as well.
-   */
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key.toLowerCase() !== "k" || !(event.ctrlKey || event.metaKey))
-        return;
-      event.preventDefault();
-      setPaletteOpen((open) => !open);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  // Matched here rather than by cmdk, and `shouldFilter={false}` below is the other half of that.
+  // The hits underneath were matched by the daemon against the whole text of a conversation, which
+  // is text this list does not have — left to cmdk they would be filtered out again for not
+  // containing the query in their own visible row.
+  const named = rows.filter((row) => {
+    if (needle === "") return true;
+    const name = row.title ?? row.first_message ?? "New conversation";
+    return `${name} ${row.cwd ?? ""}`.toLowerCase().includes(needle);
+  });
+  const hits = said.data ?? [];
+
+  usePaletteGroup({
+    id: ["chats", "named"].join("-"),
+    heading: "Conversations",
+    items: named.map((row) => {
+      const name = row.title ?? row.first_message ?? "New conversation";
+      return {
+        id: `chat-${row.chat_id}`,
+        label: <>
+          <span className="chats-palette-title">{name}</span>
+          {row.cwd !== null && <span className="chats-palette-where">{row.cwd}</span>}
+          {row.waiting > 0 && <span className="chats-palette-waiting">{row.waiting}</span>}
+        </>,
+        match: `${name} ${row.cwd ?? ""}`,
+        run: () => {
+          openingAChat();
+          void navigate({ to: `/chats/${row.chat_id}` });
+        },
+      };
+    }),
+  });
+  usePaletteGroup(
+    hits.length === 0
+      ? null
+      : {
+          id: "chats-said",
+          heading: "Said in a conversation",
+          prematched: true,
+          items: hits.map((hit) => ({
+            id: `said-${hit.turn_id}`,
+            label: <SaidRow hit={hit} />,
+            match: hit.excerpt,
+            run: () => {
+              openingAChat();
+              void navigate({ to: `/chats/${hit.chat_id}` });
+              setFound({ chatId: hit.chat_id, turnId: hit.turn_id, at: Date.now() });
+            },
+          })),
+        },
+  );
 
   return (
     /* The class that turns this route from a document into an application: see `.chats-app`, which
@@ -306,9 +334,9 @@ export function Chats() {
                 <span className="chats-unseen">{unseen}</span>
               )}
             </Button>
-            <Button variant="ghost" onClick={() => setPaletteOpen(true)}>
+            <Button variant="ghost" onClick={openPalette}>
               Find a conversation
-              <kbd className="chats-kbd">Ctrl K</kbd>
+              <kbd className="chats-kbd">{SHORTCUT_HINT}</kbd>
             </Button>
           </>
         }
@@ -318,16 +346,6 @@ export function Chats() {
       {chats.isError && chats.data === undefined && (
         <ListError error={chats.error} />
       )}
-
-      <ConversationPalette
-        rows={rows}
-        open={paletteOpen}
-        onOpenChange={setPaletteOpen}
-        onFound={(chatId, turnId) =>
-          setFound({ chatId, turnId, at: Date.now() })
-        }
-        onOpenChat={openingAChat}
-      />
 
       <div
         className={
@@ -479,124 +497,6 @@ function ListError({ error }: { error: unknown }) {
     <ErrorNote>
       the núcleo did not answer — nothing is known about your conversations
     </ErrorNote>
-  );
-}
-
-/* --------------------------------------------------------------- the list -- */
-
-/**
- * Find a conversation by typing its name, rather than by reading down a list.
- *
- * The list panel answers "what have I got"; this answers "where is the one I mean",
- * and past a couple of dozen conversations those stop being the same question. It is
- * also what makes closing the list a real option rather than a way to lose things.
- *
- * The searchable text is the title AND the directory, because half of these are
- * remembered as "the one about the shell" rather than by whatever the daemon titled
- * them.
- */
-function ConversationPalette({
-  rows,
-  open,
-  onOpenChange,
-  onFound,
-  onOpenChat,
-}: {
-  rows: ChatSummary[];
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  /** A turn somebody picked out of a search, to be scrolled to once its conversation opens. */
-  onFound: (chatId: string, turnId: number) => void;
-  /** See `openingAChat`. Both of this palette's exits open a conversation. */
-  onOpenChat: () => void;
-}) {
-  const navigate = useNavigate();
-  const [query, setQuery] = useState("");
-  const said = useSaid(query);
-  const needle = query.trim().toLowerCase();
-
-  // Matched here rather than by cmdk, and `shouldFilter={false}` below is the other half of that.
-  // The hits underneath were matched by the daemon against the whole text of a conversation, which
-  // is text this list does not have — left to cmdk they would be filtered out again for not
-  // containing the query in their own visible row.
-  const named = rows.filter((row) => {
-    if (needle === "") return true;
-    const name = row.title ?? row.first_message ?? "New conversation";
-    return `${name} ${row.cwd ?? ""}`.toLowerCase().includes(needle);
-  });
-  const hits = said.data ?? [];
-
-  return (
-    <CommandDialog
-      open={open}
-      onOpenChange={(next) => {
-        onOpenChange(next);
-        // Cleared on the way out, so opening it again is a fresh question rather than the last
-        // one's answers under an empty box.
-        if (!next) setQuery("");
-      }}
-      title="Find a conversation"
-      description="Type to narrow the list. Enter opens the one highlighted."
-      /* Escape closes it, and a palette is a thing you dismiss rather than
-         close — the corner X is clutter that also has to be styled. */
-      showCloseButton={false}
-      shouldFilter={false}
-    >
-      <CommandInput
-        placeholder="Find a conversation, or something said in one…"
-        value={query}
-        onValueChange={setQuery}
-      />
-      <CommandList>
-        <CommandEmpty>Nothing matches that.</CommandEmpty>
-        <CommandGroup heading="Conversations">
-          {named.map((row) => {
-            const name = row.title ?? row.first_message ?? "New conversation";
-            return (
-              <CommandItem
-                key={row.chat_id}
-                value={`chat-${row.chat_id}`}
-                onSelect={() => {
-                  onOpenChange(false);
-                  onOpenChat();
-                  void navigate({ to: `/chats/${row.chat_id}` });
-                }}
-              >
-                <span className="chats-palette-title">{name}</span>
-                {row.cwd !== null && (
-                  <span className="chats-palette-where">{row.cwd}</span>
-                )}
-                {row.waiting > 0 && (
-                  <span className="chats-palette-waiting">{row.waiting}</span>
-                )}
-              </CommandItem>
-            );
-          })}
-        </CommandGroup>
-        {/* The second question, and the one a title cannot answer: a title is a summary a model
-            wrote, and what people come back for is a sentence they remember. Its own group so the
-            two never merge — retracing your own words and hunting an answer you were given are
-            different errands, and a merged list makes the second one wade through the first. */}
-        {hits.length > 0 && (
-          <CommandGroup heading="Said in a conversation">
-            {hits.map((hit) => (
-              <CommandItem
-                key={`said-${hit.turn_id}`}
-                value={`said-${hit.turn_id}`}
-                onSelect={() => {
-                  onOpenChange(false);
-                  onOpenChat();
-                  void navigate({ to: `/chats/${hit.chat_id}` });
-                  onFound(hit.chat_id, hit.turn_id);
-                }}
-              >
-                <SaidRow hit={hit} />
-              </CommandItem>
-            ))}
-          </CommandGroup>
-        )}
-      </CommandList>
-    </CommandDialog>
   );
 }
 

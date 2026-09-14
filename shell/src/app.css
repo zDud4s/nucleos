@@ -1136,6 +1136,92 @@
   font-size: 0;
 }
 
+/* --------------------------------------------------- nav: go to anything -- */
+
+/**
+ * The footer row that opens the palette.
+ *
+ * Measured off `.app-notify` below, which is measured off a `nav-item` — the
+ * same 10px gap and the same 7px/8px insets, so the mark, the word and the
+ * chord sit on exactly the columns every destination above them uses. A row
+ * that opens the way out of this page should not look like a different kind of
+ * thing from the rows it is a shortcut to.
+ */
+.app-goto {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 2.125rem;
+  padding: 7px var(--nav-inset);
+  border: none;
+  /* Its word and its chord are clipped by the closing rail, exactly as a row's
+     label is — without this they would spill out over the page while the rail
+     narrowed past the width they need. */
+  overflow: hidden;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.app-goto:hover {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+/* The same 16px box `.nav-icon` occupies, so this row's mark lines up with every
+   destination above it rather than sitting on its own inset. */
+.app-goto-glyph {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  color: var(--text-faint);
+}
+
+.app-goto-label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The chord, in the mono face every literal in this app is set in. Quiet: it is
+   the row's footnote, not its label. */
+.app-goto-keys {
+  flex: none;
+  padding: 0 var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+}
+
+/* Collapsed to icons, the same treatment `.app-notify-label` gets one block
+   down: clipped rather than lifted out of the flow, so the control keeps its
+   line box — which is what stops the row changing height with the rail's width
+   — and `flex: none` so the zero-width box cannot grow back into the space the
+   mark needs to sit on the centre line. */
+.nav-collapsed .app-goto-label,
+.nav-collapsed .app-goto-keys {
+  width: 0;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  text-indent: -100vw;
+  white-space: nowrap;
+  flex: none;
+}
+
+.nav-collapsed .app-goto {
+  /* No gap, for the reason the rows above have none: the label beside the mark
+     is zero wide here, so ten pixels of gap is ten pixels of nothing. */
+  gap: 0;
+}
+
 /* --------------------------------------------------- notifications drawer -- */
 
 /**

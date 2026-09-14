@@ -425,6 +425,47 @@
   gap: var(--space-2);
 }
 
+/* =================================================================== batch == */
+
+/**
+ * The strip above the approvals: the way into a selection, and the decision the
+ * selection makes possible.
+ *
+ * Above the list rather than in the heading's corner, because it is a control over the rows
+ * below it and a person meets it on the way down to them. Deliberately NOT `role="status"`:
+ * each interlock inside it carries a live region of its own, and a region around them would
+ * read the whole bar aloud every time one of them said a word.
+ */
+.waiting-bulk {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+/**
+ * The selection, said. This is where the identifiers live in full: the interlock truncates
+ * above five and this line never does, so the roster is on screen — and in the live region —
+ * before anybody arms anything.
+ */
+.waiting-bulk-said {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/**
+ * The box a row is picked with. `accent-color` and not the bare default: an unstyled checkbox
+ * draws the UA's blue, a colour this app does not own and which reads as the accent it is not.
+ * `browser.css` settles the same question the same way. `align-self` because the head is
+ * baseline-aligned text and a box has no baseline worth aligning to.
+ */
+.waiting-select {
+  accent-color: var(--text);
+  align-self: center;
+}
+
 /* What the last decision did. Green-ish and quiet: it is a receipt, not a state
    of the machine. */
 .waiting-outcome {

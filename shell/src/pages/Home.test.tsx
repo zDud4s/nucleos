@@ -204,7 +204,8 @@ describe("Home", () => {
   });
 
   it("a subsystem down tones the whole sentence, not just the numeral", async () => {
-    // The same fixture the neighbouring case uses for `ui-stat-danger`.
+    // The same fixture the neighbouring case uses — since round 11 the detail wears `.ui-wrong`
+    // and `StatCard` has no tone of its own.
     const answer = daemonFetch(daemonState({ proposals: [] }));
     daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
       path === "/health/readout"

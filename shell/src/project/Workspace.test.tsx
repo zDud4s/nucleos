@@ -971,6 +971,47 @@ describe("what this project can be asked to do", () => {
   });
 
   /**
+   * The other half of that rule, which nothing held: what is not in the bar has to be IN the
+   * palette. Asserting only the absence passes identically if the group never registers at all —
+   * the palette context's inert default swallows a failed registration without a word — so this
+   * opens the palette and reads the row.
+   *
+   * And it reads the outcome sentence's COUNT. It used to be drawn twice on every row: once in
+   * the label, left over from the page-local palette this group replaced, and once in the
+   * palette's own trailing slot. Two `margin-left: auto` spans in one flex row split the free
+   * space between them, so the same four words appeared at two different places on the row.
+   */
+  it("puts everything else in the palette, its outcome said once", async () => {
+    await openState(
+      withCommands([
+        projectCommand({
+          id: 1,
+          name: "gate",
+          is_gate: true,
+          last: {
+            outcome: "passed",
+            started_at: "2026-08-23T09:00:00Z",
+            ended_at: "2026-08-23T09:04:00Z",
+            exit_code: 0,
+            output: null,
+          },
+        }),
+        projectCommand({ id: 2, name: "fmt", command: "cargo fmt --check", is_gate: false }),
+      ]),
+    );
+    await screen.findByRole("button", { name: /^gate,/ });
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
+
+    expect(await within(palette).findByText("Run in nucleos")).toBeTruthy();
+    expect(within(palette).getByText("fmt")).toBeTruthy();
+    expect(within(palette).getByText("cargo fmt --check")).toBeTruthy();
+    // The gate's own row says "passed", so this sentence belongs to `fmt` alone — once.
+    expect(within(palette).getAllByText("never run here")).toHaveLength(1);
+  });
+
+  /**
    * A project whose commands are all verbs claims nothing about being green — and says so, rather
    * than drawing an empty bar that reads as "nothing is wrong".
    */

@@ -154,6 +154,16 @@ function indexSources() {
         rule as dead — the same mistake as deleting a stem's head, one line
         further down, and it was made here first.
       */
+      /*
+        A custom property is not a class. The token rule below is anchored on `[a-z]` and skips
+        the leading `--`, so `--feed-control-h` in a source file was indexed as the class
+        `feed-control-h` — a name no sheet defines, because it never was one.
+        `pages/sheet-layout.test.ts` built that name out of three string fragments to dodge
+        exactly this, which is a workaround nobody could read from the site. Masked where the
+        mistake is, so the test can write the property it is about. Fourth false-positive shape
+        after `.chats-zoom`, `.fleet-exclusion` and `id="value"`.
+      */
+      .replace(/--[a-z][a-z0-9]*(?:-[a-z0-9]+)*/g, " ")
       .replace(ID_REFERENCE, " ")
       .replace(/[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\$\{[^}]*\}/g, " ");
     for (const m of masked.matchAll(/[a-z][a-z0-9]*(?:-[a-z0-9]+)+/g)) {

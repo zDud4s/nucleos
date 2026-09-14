@@ -118,6 +118,30 @@ describe("ConfirmButton", () => {
     expect(onArmedChange.mock.calls.map(([armed]) => armed)).toEqual([true, false]);
   });
 
+  it("reports the disarm when an armed control unmounts", () => {
+    const onArmedChange = vi.fn();
+    const { unmount } = render(
+      <ConfirmButton
+        label="Approve 2"
+        confirmLabel="Really approve"
+        variant="danger"
+        onConfirm={() => {}}
+        onArmedChange={onArmedChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve 2" }));
+    expect(onArmedChange).toHaveBeenLastCalledWith(true);
+
+    // The batch interlock unmounts the moment the selection empties under it — `Clear
+    // selection`, or unticking the last box, both while it is armed. The armed report is a
+    // pair: without the second half the queue's count never returns to zero and the section
+    // keeps its sort order frozen for the rest of the page's life.
+    unmount();
+
+    expect(onArmedChange).toHaveBeenLastCalledWith(false);
+  });
+
   it("arming is a label swap, not a pressed state", () => {
     setup();
 
@@ -164,8 +188,13 @@ describe("ConfirmButton", () => {
     );
 
     // And the prefix is load-bearing: the announcement is not a second exact copy of the
-    // label, so `getByText` on the label still finds one node — the button.
-    expect(screen.getByText("Really delete").tagName).toBe("BUTTON");
+    // label, so `getByText` on the label still finds one node. That node is the label's own
+    // span rather than the button since the width was reserved — both labels live in the
+    // stack now — so what is asserted is that it is the span inside THIS button, and that
+    // the region did not become a second copy of the words on it.
+    const drawn = screen.getByText("Really delete");
+    expect(drawn.tagName).toBe("SPAN");
+    expect(drawn.closest("button")).toBe(screen.getByRole("button", { name: "Really delete" }));
   });
 
   /**
@@ -219,8 +248,12 @@ describe("ConfirmButton", () => {
 
     const button = screen.getByRole("button", { name: "Let it act" });
     expect(button.getAttribute("aria-describedby")).toBe("consequence-1");
-    // A description is not a name: the button is still found by the words on it.
-    expect(button.textContent).toBe("Let it act");
+    // A description is not a name: the button is still found by the words on it. `textContent`
+    // is no longer that question — it reads both labels now, because the hidden one is what
+    // holds the width — so ask what is SHOWING.
+    const showing = button.querySelectorAll(".ui-confirm-stack > :not([aria-hidden])");
+    expect(showing).toHaveLength(1);
+    expect(showing[0].textContent).toBe("Let it act");
   });
 
   it("the consequence is announced, not the label", () => {
@@ -363,10 +396,13 @@ describe("ConfirmButton", () => {
       `armed: ${second} — press again to confirm`,
     );
 
-    // The new sentence gets its own window rather than the second left of the old one's:
-    // past 4000 ms from the first press, and still armed.
+    // The new sentence gets its own window rather than the remainder of the old one's. The
+    // arithmetic matters: the FIRST announcement is fourteen words, so its own window ran to
+    // 5600 ms and the 5000 ms this used to assert at was still inside it — it proved the
+    // first window was long, not that a second one had opened. At 6000 ms the first window is
+    // over and this control is still armed, which only the restart can explain.
     act(() => {
-      vi.advanceTimersByTime(2000);
+      vi.advanceTimersByTime(3000);
     });
     expect(screen.getByRole("button", { name: "Let alpha act" })).toBeDefined();
   });
@@ -403,5 +439,173 @@ describe("ConfirmButton", () => {
     fireEvent.click(screen.getByRole("button", { name: "Really delete" }));
     expect(onConfirm).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("status").textContent).toBe("");
+  });
+
+  /**
+   * The width is spent before it is needed.
+   *
+   * The armed label is longer than the rest label at 48 of the 53 sites, so arming used to
+   * grow the button under the finger that had just pressed it — at the row this was measured
+   * on, into most of the box that said "Reject" a moment earlier. Both labels are in the cell
+   * from the first paint now, so the box is the wider of the two and arming moves nothing.
+   */
+  it("both labels are in the button, and only one of them is showing", () => {
+    setup();
+
+    const labels = () =>
+      screen
+        .getByRole("button", { name: /Delete series|Really delete/ })
+        .querySelectorAll(".ui-confirm-stack > *");
+
+    const atRest = labels();
+    expect(atRest).toHaveLength(2);
+    expect(atRest[0].textContent).toBe("Delete series");
+    expect(atRest[0].getAttribute("aria-hidden")).toBeNull();
+    expect(atRest[1].textContent).toBe("Really delete");
+    expect(atRest[1].getAttribute("aria-hidden")).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
+
+    // Neither label ever leaves the DOM — that IS the width. All that moves is which of the
+    // two is hidden.
+    const armed = labels();
+    expect(armed).toHaveLength(2);
+    expect(armed[0].textContent).toBe("Delete series");
+    expect(armed[0].getAttribute("aria-hidden")).toBe("true");
+    expect(armed[1].textContent).toBe("Really delete");
+    expect(armed[1].getAttribute("aria-hidden")).toBeNull();
+  });
+
+  /**
+   * Two labels for the eye, one for the ear.
+   *
+   * The hidden twin is a layout device, and a layout device that is read out loud is a second
+   * label on a control that cannot be undone. `aria-hidden` is what takes it out of the name,
+   * and it is the same attribute the stylesheet hides it by, so the two channels cannot drift.
+   */
+  it("the hidden label is hidden from the ear too", () => {
+    setup();
+
+    expect(screen.getByRole("button", { name: "Delete series" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Delete series Really delete" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
+
+    expect(screen.getByRole("button", { name: "Really delete" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Delete series Really delete" })).toBeNull();
+  });
+
+  /**
+   * Escape is how a person says no.
+   *
+   * A control that is live for four seconds and can only be stood down by the clock is an
+   * interlock that runs one way. Escape costs nothing to honour, and it says the same thing
+   * the expiry says, because from the outside they are the same event: nothing happened.
+   */
+  it("Escape disarms an armed control and says so", () => {
+    const { onConfirm, onArmedChange } = setup();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    fireEvent.keyDown(screen.getByRole("button", { name: "Really delete" }), { key: "Escape" });
+
+    expect(screen.getByRole("button", { name: "Delete series" })).toBeDefined();
+    expect(screen.getByRole("status").textContent).toBe("disarmed — nothing changed");
+    expect(onConfirm).not.toHaveBeenCalled();
+    expect(onArmedChange).toHaveBeenLastCalledWith(false);
+  });
+
+  /**
+   * And it says nothing when there is nothing to say.
+   *
+   * Escape on a control at rest is somebody dismissing something else — a sheet, a menu, a
+   * search box. Announcing "disarmed" there would report an event that did not happen, in the
+   * one region this component keeps for the two events that are otherwise silent.
+   */
+  it("Escape on a control at rest does nothing", () => {
+    const { onConfirm, onArmedChange } = setup();
+
+    fireEvent.keyDown(screen.getByRole("button", { name: "Delete series" }), { key: "Escape" });
+
+    expect(screen.getByRole("button", { name: "Delete series" })).toBeDefined();
+    expect(screen.getByRole("status").textContent).toBe("");
+    expect(onConfirm).not.toHaveBeenCalled();
+    expect(onArmedChange).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The restart has a ceiling, and the announcement does not.
+   *
+   * `sayAs` is a prop, and the live one on this app is recomputed from a poll every three
+   * seconds. Restarting the window on every rewrite — which is right for the first one —
+   * handed an armed control a fresh window for ever on any project whose figures move. Two
+   * windows: the first, and one restart.
+   */
+  it("a second rewrite re-announces but opens no third window", () => {
+    const { rerender } = render(
+      <ConfirmButton label="Let it act" confirmLabel="Let alpha act" sayAs="one" variant="approve" onConfirm={vi.fn()} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Let it act" }));
+
+    // Window 1 closes at 4000. The first rewrite lands at 2000 and opens window 2, to 6000.
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    rerender(
+      <ConfirmButton label="Let it act" confirmLabel="Let alpha act" sayAs="two" variant="approve" onConfirm={vi.fn()} />,
+    );
+
+    // The second rewrite lands at 4000 and is SAID, and buys nothing: without the ceiling it
+    // would have pushed the close out to 8000 and this control would still be live at 6000.
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    rerender(
+      <ConfirmButton label="Let it act" confirmLabel="Let alpha act" sayAs="three" variant="approve" onConfirm={vi.fn()} />,
+    );
+    expect(screen.getByRole("status").textContent).toBe("armed: three — press again to confirm");
+
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    expect(screen.getByRole("button", { name: "Let it act" })).toBeDefined();
+    expect(screen.getByRole("status").textContent).toBe("disarmed — nothing changed");
+  });
+
+  /**
+   * One warning per arming, whatever the sentence does in the middle.
+   *
+   * The first window's warning was scheduled for 3000 and the restart at 2000 must cancel it:
+   * a "one second left" fired inside a window that has just restarted is a lie about the
+   * window it is in, and the ear has no way to tell it from the true one that follows.
+   */
+  it("says `one second left` exactly once, even across a restart", () => {
+    const { rerender } = render(
+      <ConfirmButton label="Let it act" confirmLabel="Let alpha act" sayAs="one" variant="approve" onConfirm={vi.fn()} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Let it act" }));
+
+    const heard: string[] = [];
+    for (let elapsed = 250; elapsed <= 6500; elapsed += 250) {
+      act(() => {
+        vi.advanceTimersByTime(250);
+      });
+      if (elapsed === 2000) {
+        rerender(
+          <ConfirmButton label="Let it act" confirmLabel="Let alpha act" sayAs="two" variant="approve" onConfirm={vi.fn()} />,
+        );
+      }
+      heard.push(screen.getByRole("status").textContent ?? "");
+    }
+
+    // Transitions INTO the warning, not samples of it: the region holds its last sentence, so
+    // the true warning is read by four consecutive samples and a count of samples would say
+    // four whether the cancelled one fired or not.
+    const warnings = heard.filter((said, i) => said === "one second left" && heard[i - 1] !== "one second left");
+    expect(warnings).toHaveLength(1);
+    expect(heard[heard.length - 1]).toBe("disarmed — nothing changed");
   });
 });

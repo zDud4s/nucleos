@@ -11,7 +11,7 @@ import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
 import type { FeedEntry, PendingNotification } from "../data/feed";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
-import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary, Proposal } from "../data/system";
+import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary, Proposal, SidecarState } from "../data/system";
 import type { VoiceConfigView } from "../data/voice";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
@@ -1218,7 +1218,7 @@ export const FEED: FeedEntry[] = [
   { id: 12, project_id: null, kind: "team_run_finished", summary: "a team run done: the department delivered", run_id: null, errand_id: null, created_at: ago(14 * MINUTE) },
   { id: 11, project_id: "bravo", kind: "job_failed", summary: "job 39 could not start its implement node: the runner exited before the first turn", run_id: 39, errand_id: null, created_at: ago(31 * MINUTE) },
   { id: 10, project_id: "bravo", kind: "job_waiting", summary: "job 40 is waiting: another run holds the project's worktree slot", run_id: 40, errand_id: null, created_at: ago(48 * MINUTE) },
-  { id: 9, project_id: "alpha", kind: "vcs_request_finished", summary: "vcs request 21 escalated - the merge would revert two files nobody asked about", run_id: null, errand_id: null, created_at: ago(HOUR) },
+  { id: 9, project_id: "alpha", kind: "vcs_request_finished", summary: "vcs request 21 escalated — the merge would revert two files nobody asked about", run_id: null, errand_id: null, created_at: ago(HOUR) },
   { id: 8, project_id: null, kind: "team_trigger_armed", summary: "`morning digest` is armed for support", run_id: null, errand_id: null, created_at: ago(95 * MINUTE) },
   { id: 7, project_id: null, kind: "email_urgent", summary: "the accountant is blocked on the Q3 reconciliation and has asked twice", run_id: null, errand_id: null, created_at: ago(2 * HOUR) },
   { id: 6, project_id: "alpha", kind: "token_efficiency", summary: "token efficiency (project alpha): 4 runs in a row sent a prompt of 38412 tokens and neither read nor wrote a single cached token", run_id: 38, errand_id: null, created_at: ago(3 * HOUR) },
@@ -1652,6 +1652,61 @@ const EMAIL_DETAIL = {
   attachments: [],
 } satisfies EmailDetail;
 
+/**
+ * Every supervised sidecar, and the second half of `/health/readout`'s story above.
+ *
+ * That readout says `browser_sidecar` is down; until this existed the Sidecars panel beneath it read
+ * "no sidecar is registered", which is a daemon with no sidecars rather than a daemon with a sidecar
+ * that will not start — the empty-list fall-through telling a different story from the row above it.
+ *
+ * The SUPERVISOR's keys (`sidecar.rs:16-20`), not the readout's row names: `/sidecars` answers about
+ * processes and `/health/readout` about pillars. Telegram is absent on purpose — the readout has it
+ * `disabled`, nothing supervises it, and a sidecar list that invented a row for it would contradict
+ * the row above.
+ */
+const SIDECARS: SidecarState[] = [
+  {
+    name: "echo",
+    state: "running",
+    started_at: "2026-09-13T06:00:00Z",
+    last_failure: null,
+    last_failure_at: null,
+    restarts: 0,
+    last_line: null,
+    last_line_at: null,
+  },
+  {
+    name: "email",
+    state: "running",
+    started_at: "2026-09-13T06:00:00Z",
+    last_failure: null,
+    last_failure_at: null,
+    restarts: 1,
+    last_line: "email: polled INBOX, 3 new",
+    last_line_at: "2026-09-13T08:55:00Z",
+  },
+  {
+    name: "web",
+    state: "running",
+    started_at: "2026-09-13T06:00:00Z",
+    last_failure: null,
+    last_failure_at: null,
+    restarts: 0,
+    last_line: null,
+    last_line_at: null,
+  },
+  {
+    name: "browser",
+    state: "down",
+    started_at: null,
+    last_failure: "could not start: The system cannot find the file specified. (os error 2)",
+    last_failure_at: "2026-09-13T08:58:00Z",
+    restarts: 14,
+    last_line: null,
+    last_line_at: null,
+  },
+];
+
 export function answer(path: string, init?: RequestInit): unknown {
   /*
     The house's capacity, with nobody holding a slot. It is here so the Codigo
@@ -1780,6 +1835,19 @@ export function answer(path: string, init?: RequestInit): unknown {
         { name: "voice_transcriber", status: "disabled", reason: "not-configured" },
       ],
     } satisfies HealthReadout;
+  }
+
+  if (path === "/sidecars" && init?.method === undefined) return SIDECARS;
+
+  /*
+    Asking a supervisor to try now. Stateless, like every other write in this file, and
+    deliberately: flipping `browser` to `running` here would make a shot's answer depend on which
+    shots ran before it, and would take the control out of every picture after the first press —
+    including the armed one, which is the picture this route exists to make possible.
+  */
+  const restart = /^\/sidecars\/([^/]+)\/restart$/.exec(path);
+  if (restart !== null && init?.method === "POST") {
+    return { name: decodeURIComponent(restart[1]), asked: true };
   }
 
   /*

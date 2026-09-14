@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isAggregateTimeout, wantsAttention, type HealthReadout } from "./system";
+import { isAggregateTimeout, sidecarKeyOf, wantsAttention, type HealthReadout } from "./system";
 
 function readout(status: HealthReadout["status"], subsystems: HealthReadout["subsystems"] = []): HealthReadout {
   return { status, subsystems };
@@ -43,5 +43,29 @@ describe("wantsAttention", () => {
     const timedOut = readout("down", [{ name: "aggregate", status: "down", reason: "timeout" }]);
     expect(isAggregateTimeout(timedOut)).toBe(true);
     expect(wantsAttention(timedOut)).toBe(true);
+  });
+});
+
+describe("sidecarKeyOf", () => {
+  it("names the five supervised sidecars and nothing else", () => {
+    expect(sidecarKeyOf("browser_sidecar")).toBe("browser");
+    expect(sidecarKeyOf("echo_sidecar")).toBe("echo");
+    expect(sidecarKeyOf("telegram_sidecar")).toBe("telegram");
+    expect(sidecarKeyOf("email_sidecar")).toBe("email");
+    expect(sidecarKeyOf("web_sidecar")).toBe("web");
+
+    for (const row of [
+      "sqlite_pool",
+      "cli_binary",
+      "credential_manager",
+      "worktree_disk",
+      "voice_transcriber",
+      "voice_speaker",
+      "github",
+      "aggregate",
+      "_sidecar",
+    ]) {
+      expect(sidecarKeyOf(row)).toBeNull();
+    }
   });
 });

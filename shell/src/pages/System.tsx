@@ -8,6 +8,7 @@ import {
 } from "../data/autopilot";
 import {
   isAggregateTimeout,
+  sidecarKeyOf,
   useApiTokens,
   useBackups,
   useBudget,
@@ -17,6 +18,7 @@ import {
   usePiiTally,
   useProjects,
   useRevokeToken,
+  useRestartSidecar,
   useSetBudget,
   useSidecars,
   useStageRestore,
@@ -221,14 +223,54 @@ function HealthReadoutPanel({
 }
 
 function SubsystemRow({ row }: { row: SubsystemReadout }) {
+  const key = sidecarKeyOf(row.name);
   return (
     <li className="ui-rows-row sy-subsystem-row">
       <span className="sy-subsystem-name">{row.name}</span>
       <StateBadge domain="pillar" state={row.status} />
-      {row.reason !== undefined && (
-        <span className="sy-meta">reason: {row.reason}</span>
-      )}
+      <span className="sy-meta">{row.reason !== undefined && <>reason: {row.reason}</>}</span>
+      <div className="sy-subsystem-action">
+        {key !== null && row.status === "down" && <RestartSidecar name={key} subject={row.name} />}
+      </div>
     </li>
+  );
+}
+
+function RestartSidecar({ name, subject }: { name: string; subject: string }) {
+  const restart = useRestartSidecar();
+  return (
+    <>
+      <ConfirmButton
+        label="Restart"
+        confirmLabel="Start it again"
+        subject={subject}
+        variant="quiet"
+        disabled={restart.isPending}
+        onConfirm={() => {
+          restart.mutate(name);
+        }}
+      />
+      {restart.isSuccess && (
+        <span className="sy-restart-asked" role="status">
+          asked — the supervisor is trying now
+        </span>
+      )}
+      {restart.isError &&
+        (isApiRefusal(restart.error) ? (
+          <RefusalNote
+            refusal={restart.error}
+            sentences={{
+              running: "it is running now — there was nothing to start",
+              not_supervised:
+                "nothing is supervising it — the daemon starts a sidecar only when its pillar is switched on, and only at startup",
+              kill_switch:
+                "the emergency stop is engaged — release it first; the supervisor keeps retrying on its own meanwhile",
+            }}
+          />
+        ) : (
+          <ErrorNote>the núcleo did not answer — nothing was asked of it</ErrorNote>
+        ))}
+    </>
   );
 }
 

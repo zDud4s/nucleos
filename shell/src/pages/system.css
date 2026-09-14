@@ -90,7 +90,7 @@
 
 .sy-subsystem-row {
   display: grid;
-  grid-template-columns: minmax(0, 12rem) 8rem minmax(0, 1fr);
+  grid-template-columns: minmax(0, 12rem) 8rem minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--space-3);
 }
@@ -99,6 +99,29 @@
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   color: var(--text);
+}
+
+/* The padding is room for a RING that is drawn outside its button.
+   `.ui-confirm-armed`'s 3px `box-shadow` plus the quiet variant's negative inline margin
+   (`--space-1`) put 7 CSS px of the armed control past its own border box, and this row ends
+   exactly where `.ui-rows` clips: the list carries `overflow: hidden` and a row in a panel body
+   has `padding-inline: 0`. Armed, the Restart control lost its right-hand bar and its corner
+   curve — measured on `31-system-armed.png`, the ring stopping dead at x=2726 while the panel's
+   own border was still 48 device px further out. The room was there; nothing had claimed it.
+   Here and not in `ui.css`: the clip is shared by every panel in the app, and this is the page
+   that puts a confirm control at the end of one of its rows. */
+.sy-subsystem-action {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-2);
+  justify-self: end;
+  padding-inline-end: calc(var(--space-1) + 3px);
+}
+
+.sy-restart-asked {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
 /* --------------------------------------------------------------- sidecars == */

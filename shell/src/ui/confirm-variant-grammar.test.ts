@@ -59,12 +59,13 @@ describe("ConfirmButton variant grammar", () => {
     }
   });
 
-  it("Send, Archive, Requeue for triage and Revert are not danger", () => {
+  it("Send, Archive, Requeue for triage, Revert and Restart are not danger", () => {
     const expected = new Map([
       ["Send", "approve"],
       ["Archive", "quiet"],
       ["Requeue for triage", "quiet"],
       ["Revert", "quiet"],
+      ["Restart", "quiet"],
     ]);
 
     for (const file of tsxFiles(shellSource)) {

@@ -12,6 +12,7 @@ import { render, type RenderResult } from "@testing-library/react";
 import { NAV_PATHS } from "../app/nav";
 import { createAppQueryClient } from "../app/queryClient";
 import { createAppRouter } from "../router";
+import { PaletteProvider } from "../ui";
 import { ApiRefusal } from "../data/client";
 import type { Concurrency, HeldSlot, ProjectConcurrency } from "../data/fleet";
 import type { ClassTally } from "../data/autopilot";
@@ -1099,11 +1100,16 @@ export async function renderWithRouter(ui: ReactNode, options: HarnessOptions = 
   const queryClient = options.queryClient ?? createAppQueryClient();
 
   const rootRoute = createRootRoute({
+    /*
+      Wrapped exactly the way the real shell wraps its own tree. A page under
+      test gets the app's palette context the same way it gets the app's routes:
+      from the root route, for free, whether or not the test is about a palette.
+    */
     component: () => (
-      <>
+      <PaletteProvider>
         {ui}
         <Outlet />
-      </>
+      </PaletteProvider>
     ),
   });
   const routes = NAV_PATHS.map((path) =>

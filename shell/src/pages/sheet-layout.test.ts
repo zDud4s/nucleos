@@ -8,7 +8,10 @@ const sheet = (name: string) =>
 const feed = sheet("feed.css");
 const autopilot = sheet("autopilot.css");
 const body = (css: string, rule: RegExp) => rule.exec(css)?.[1] ?? "";
-const feedControlHeight = "--feed-" + "control-" + "h";
+// Written plainly since round 12: `scripts/css-contract.mjs` masks `--custom-property` literals,
+// so this no longer surfaces as a class nobody defined. It used to be built from three fragments
+// to dodge that, with nothing here to say so.
+const feedControlHeight = "--feed-control-h";
 
 describe("two layout facts a stylesheet owns", () => {
   it("every control in the feed filter bar is one height, declared once", () => {

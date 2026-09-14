@@ -1,5 +1,5 @@
 // §spec workspace-de-projeto
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
   outcomeSentence,
@@ -10,15 +10,7 @@ import {
   useRunProjectCommand,
   type ProjectCommand,
 } from "../data/project-commands";
-import { Button, Quiet } from "../ui";
-import {
-  CommandDialog,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "../ui/vendor/command";
+import { Button, Quiet, SHORTCUT_HINT, usePaletteGroup, usePaletteOpen } from "../ui";
 
 /**
  * What this project can be asked to do to itself.
@@ -33,7 +25,7 @@ import {
  * 2. **The bar holds the gates.** A gate's last verdict is a fact you want without asking: *is this
  *    green*. That is what earns a permanent place at the foot of the page.
  * 3. **Everything else is in the palette.** A verb you go looking for by name does not need to be
- *    on the screen while you are not looking for it. ⌘K, the same door `Chats` opens.
+ *    on the screen while you are not looking for it. There is one palette door.
  *
  * Nothing lands in the bar by accumulating there. A command is in it because somebody marked it a
  * gate, which is a claim about what its result means.
@@ -46,31 +38,34 @@ export interface CommandsProps {
 export function Commands({ projectId }: CommandsProps) {
   const commands = useProjectCommands(projectId);
   const run = useRunProjectCommand();
-  const [paletteOpen, setPaletteOpen] = useState(false);
   const [managing, setManaging] = useState(false);
+  const openPalette = usePaletteOpen();
+  const rows = commands.data ?? [];
 
-  /**
-   * Ctrl+K, and Cmd+K for the same fingers on a Mac keyboard — the binding `Chats` already uses,
-   * because two palettes with two shortcuts would be two things to remember.
-   *
-   * On `window`, and `preventDefault` because Ctrl+K is a browser shortcut the webview would
-   * otherwise act on as well.
-   */
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key.toLowerCase() !== "k" || !(event.ctrlKey || event.metaKey)) return;
-      event.preventDefault();
-      setPaletteOpen((open) => !open);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  usePaletteGroup({
+    id: "project-commands",
+    heading: `Run in ${projectId}`,
+    items: rows.map((row) => ({
+      id: `project-command-${row.id}`,
+      label: <>
+        <span className="text-text">{row.name}</span>
+        <span className="ml-2 font-mono text-xs text-text-faint">{row.command}</span>
+      </>,
+      match: `${row.name} ${row.command}`,
+      disabled: row.last?.outcome === "running",
+      // The outcome belongs to the palette's own trailing slot and is drawn there ONCE. It
+      // used to be in the label as well, left over from the page-local palette this group
+      // replaced: two `margin-left: auto` spans in one flex row split the free space between
+      // them, so the same sentence appeared twice with a gap torn through the middle.
+      hint: outcomeSentence(row.last),
+      run: () => run.mutate({ projectId, id: row.id }),
+    })),
+  });
 
   if (commands.data === undefined) {
     return <p className="text-sm text-text-faint">Reading this project's commands…</p>;
   }
 
-  const rows = commands.data;
   const gates = rows.filter((row) => row.is_gate);
   const refused = run.isError && isApiRefusal(run.error) ? run.error : null;
 
@@ -78,20 +73,6 @@ export function Commands({ projectId }: CommandsProps) {
     <Button variant="quiet" onClick={() => setManaging(!managing)}>
       {managing ? "done" : "declare a command"}
     </Button>
-  );
-
-  /*
-    The palette is offered from both shapes below and written once. Closed, it puts nothing in the
-    document at all, which is what lets the quiet line be the section's only child.
-  */
-  const palette = (
-    <CommandPalette
-      rows={rows}
-      projectId={projectId}
-      open={paletteOpen}
-      onOpenChange={setPaletteOpen}
-      onRun={(id) => run.mutate({ projectId, id })}
-    />
   );
 
   /*
@@ -108,7 +89,6 @@ export function Commands({ projectId }: CommandsProps) {
           project — declaration rather than detection, so a list nobody agreed to cannot appear on
           its own.
         </Quiet>
-        {palette}
       </>
     );
   }
@@ -140,10 +120,10 @@ export function Commands({ projectId }: CommandsProps) {
             )}
             <button
               type="button"
-              onClick={() => setPaletteOpen(true)}
+              onClick={openPalette}
               className="rounded-md border border-border px-2 py-1 text-xs text-text-faint hover:border-border-strong"
             >
-              all {rows.length} · ⌘K
+              all {rows.length} · {SHORTCUT_HINT}
             </button>
           </div>
 
@@ -156,7 +136,6 @@ export function Commands({ projectId }: CommandsProps) {
       <div>{declare}</div>
       {managing ? <Manage projectId={projectId} rows={rows} /> : null}
 
-      {palette}
     </div>
   );
 }
@@ -377,58 +356,3 @@ function GateButton({
   );
 }
 
-/**
- * Every command, searchable.
- *
- * The palette is where the list is allowed to be long, because nothing in it is on screen until
- * somebody asks for it by name. That is the whole reason the bar can stay short.
- */
-function CommandPalette({
-  rows,
-  projectId,
-  open,
-  onOpenChange,
-  onRun,
-}: {
-  rows: ProjectCommand[];
-  projectId: string;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  onRun: (id: number) => void;
-}) {
-  return (
-    <CommandDialog
-      open={open}
-      onOpenChange={onOpenChange}
-      title={`Run something in ${projectId}`}
-      description="Type to narrow the list. Enter runs the one highlighted."
-      /* Escape closes it. A palette is dismissed rather than closed, and the corner X is clutter
-         that also has to be styled — the same call `Chats` made. */
-      showCloseButton={false}
-    >
-      <CommandInput placeholder="Run…" />
-      <CommandList>
-        <CommandEmpty>No command matches that.</CommandEmpty>
-        <CommandGroup>
-          {rows.map((row) => (
-            <CommandItem
-              key={row.id}
-              // Searchable by what it RUNS as well as by its name: somebody looking for the clippy
-              // one may not remember what it was called.
-              value={`${row.name} ${row.command}`}
-              disabled={row.last?.outcome === "running"}
-              onSelect={() => {
-                onOpenChange(false);
-                onRun(row.id);
-              }}
-            >
-              <span className="text-text">{row.name}</span>
-              <span className="ml-2 font-mono text-xs text-text-faint">{row.command}</span>
-              <span className="ml-auto text-xs text-text-faint">{outcomeSentence(row.last)}</span>
-            </CommandItem>
-          ))}
-        </CommandGroup>
-      </CommandList>
-    </CommandDialog>
-  );
-}

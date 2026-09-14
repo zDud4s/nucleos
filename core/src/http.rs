@@ -44,6 +44,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/status", get(status))
         .route("/health/readout", get(health_readout))
         .route("/sidecars", get(get_sidecars))
+        .route("/sidecars/{name}/restart", post(post_sidecar_restart))
         .route("/config/email", get(get_email_config))
         .route("/backup", post(post_backup))
         .route("/backups", get(get_backups))
@@ -3531,6 +3532,60 @@ async fn post_project_wip_limit(
 /// empty inbox looks like too.
 async fn get_sidecars() -> Json<Vec<crate::sidecar::SidecarState>> {
     Json(crate::sidecar::states())
+}
+
+/// Ask a sidecar's supervisor to stop waiting and start it now.
+///
+/// **The kill switch covers this**, for [`delete_project_folder`]'s reason and with its wording:
+/// everything else the switch stops is autonomous and this is a person pressing a button, but the
+/// switch means *nothing that changes anything happens right now*, and spawning an operating-system
+/// process is a change. What it does NOT do is stop the supervisor's own retry loop, which the switch
+/// has never governed — so this refuses the button and says so, and the shell says the rest rather
+/// than implying the machine is frozen. Project brakes are not consulted: a sidecar belongs to no
+/// project, and `scoped_kill_engaged` wants a project id this route does not have.
+///
+/// `{name}` is the SUPERVISOR's key (`browser`), which is what `GET /sidecars` calls a sidecar. The
+/// health readout's row name (`browser_sidecar`) is the shell's to translate, and a wrong translation
+/// arrives here as `not_supervised` — a sentence in the row — rather than as silence.
+async fn post_sidecar_restart(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let halted = crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "refusal": "internal" })),
+            )
+        })?;
+    if halted {
+        return Err((
+            StatusCode::LOCKED,
+            Json(serde_json::json!({ "refusal": "kill_switch" })),
+        ));
+    }
+
+    match crate::sidecar::ask_to_restart(&name) {
+        crate::sidecar::RestartOutcome::Asked => {
+            tracing::info!(sidecar = %name, "a restart was asked for");
+            // 202 and not 200: what this promises is that the supervisor was told, not that the
+            // sidecar is up. The spawn happens in the supervisor's own task, and the readout is
+            // where the answer to "did it work" lives.
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "name": name, "asked": true })),
+            ))
+        }
+        crate::sidecar::RestartOutcome::AlreadyRunning => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "refusal": "running" })),
+        )),
+        crate::sidecar::RestartOutcome::NotSupervised => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "refusal": "not_supervised" })),
+        )),
+    }
 }
 
 /// The email pillar's settings, minus everything secret.
@@ -21712,6 +21767,60 @@ mod tests {
         // An array either way. The registry fills as supervisors start, so "none yet" has to be an
         // empty list rather than an error — a daemon with no sidecars configured is a normal daemon.
         assert!(listed.is_array());
+    }
+
+    /// A name nothing supervises is told so, rather than told "asked".
+    ///
+    /// `health.rs` reports a supervisor backing off and a name nobody ever started with the same word,
+    /// `not-running`; only the first has a task listening. A route that answered 202 to both would put
+    /// a button on the screen that does nothing and says it did something.
+    #[tokio::test]
+    async fn the_restart_route_refuses_a_sidecar_nobody_supervises_by_name() {
+        let state = test_state().await;
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sidecars/nothing-supervises-this/restart")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let refused: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(refused["refusal"], "not_supervised");
+    }
+
+    /// The kill switch covers this door, for `delete_project_folder`'s reason: the switch means
+    /// nothing that changes anything happens right now, and starting a process is a change.
+    #[tokio::test]
+    async fn a_restart_is_refused_while_the_kill_switch_is_engaged() {
+        let state = test_state().await;
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sidecars/browser/restart")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::LOCKED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let refused: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(refused["refusal"], "kill_switch");
     }
 
     /// The shell's transcript lived only in the window that made it, because nothing on a run row

@@ -10,6 +10,7 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 import { Waiting } from "./Waiting";
+import { ApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
 import type { AgentRequest } from "../data/agents";
 import type { Proposal } from "../data/system";
@@ -436,6 +437,183 @@ describe("Waiting - a section with nothing in it", () => {
   });
 });
 
+/* ----------------------------------------------------- A13: batch approvals -- */
+
+describe("Waiting - batch action approvals", () => {
+  it("each approval card carries a checkbox named for its row", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] })),
+    );
+
+    await renderWaiting();
+
+    expect(await screen.findByRole("checkbox", { name: "Select approval #1" })).toBeDefined();
+    expect(screen.getByRole("checkbox", { name: "Select approval #2" })).toBeDefined();
+  });
+
+  it("select all takes every row and clear selection empties it", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] })),
+    );
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("button", { name: "Select all 2" }));
+    expect((screen.getByRole("checkbox", { name: "Select approval #1" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("checkbox", { name: "Select approval #2" }) as HTMLInputElement).checked).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear selection" }));
+    expect((screen.getByRole("checkbox", { name: "Select approval #1" }) as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByRole("checkbox", { name: "Select approval #2" }) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("offers no batch decision until something is selected", async () => {
+    daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 })] })));
+
+    await renderWaiting();
+    await screen.findByRole("button", { name: "Select all 1" });
+    expect(screen.queryByRole("button", { name: "Approve 1" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject 1" })).toBeNull();
+  });
+
+  it("the bar says how many are selected and which", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] })),
+    );
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Select approval #2" }));
+
+    const said = screen.getByText("1 selected — #2");
+    expect(said.getAttribute("role")).toBe("status");
+  });
+
+  it("approves the selected rows one at a time, in the order they are on screen", async () => {
+    const world = waitingWorld({ approvals: [proposal({ id: 2 }), proposal({ id: 1 })] });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Select approval #2" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select approval #1" }));
+    const approveAll = screen.getByRole("button", { name: "Approve 2" });
+    fireEvent.click(approveAll);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
+    fireEvent.click(approveAll);
+
+    await waitFor(() => {
+      const approveCalls = daemon.apiFetch.mock.calls
+        .filter(([path, init]) => init?.method === "POST" && String(path).endsWith("/approve"))
+        .map(([path]) => String(path));
+      expect(approveCalls).toEqual(["/proposals/2/approve", "/proposals/1/approve"]);
+    });
+  });
+
+  it("a refusal on one row does not stop the others and is shown on that row", async () => {
+    const world = waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] });
+    const base = waitingFetch(world);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method === "POST" && path === "/proposals/1/approve") {
+        throw new ApiRefusal(409, "conflict", "");
+      }
+      return await base(path, init);
+    });
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("button", { name: "Select all 2" }));
+    const approveAll = screen.getByRole("button", { name: "Approve 2" });
+    fireEvent.click(approveAll);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
+    fireEvent.click(approveAll);
+
+    const failedRow = screen.getByText("approval #1").closest("li");
+    expect(failedRow).not.toBeNull();
+    expect(
+      await within(failedRow as HTMLElement).findByText(
+        "this one was already answered — the list clears it on the next read, and nothing further is needed",
+      ),
+    ).toBeDefined();
+    const approveCalls = daemon.apiFetch.mock.calls
+      .filter(([path, init]) => init?.method === "POST" && String(path).endsWith("/approve"))
+      .map(([path]) => String(path));
+    expect(approveCalls).toEqual(["/proposals/1/approve", "/proposals/2/approve"]);
+  });
+
+  it("keeps the rows that failed selected and drops the ones that went through", async () => {
+    const world = waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] });
+    const base = waitingFetch(world);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method === "POST" && path === "/proposals/1/approve") {
+        throw new ApiRefusal(409, "conflict", "");
+      }
+      return await base(path, init);
+    });
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("button", { name: "Select all 2" }));
+    const approveAll = screen.getByRole("button", { name: "Approve 2" });
+    fireEvent.click(approveAll);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
+    fireEvent.click(approveAll);
+
+    await screen.findByText(
+      "this one was already answered — the list clears it on the next read, and nothing further is needed",
+    );
+    expect((screen.getByRole("checkbox", { name: "Select approval #1" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("checkbox", { name: "Select approval #2" }) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("the armed batch names the rows it will approve", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] })),
+    );
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("button", { name: "Select all 2" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve 2" }));
+
+    expect(screen.getByRole("button", { name: "Let these happen · #1, #2" })).toBeDefined();
+  });
+
+  it("names the first three and counts the rest above five", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(
+        waitingWorld({ approvals: [1, 2, 3, 4, 5, 6].map((id) => proposal({ id })) }),
+      ),
+    );
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("button", { name: "Select all 6" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve 6" }));
+
+    expect(screen.getByRole("button", { name: "Let these happen · #1, #2, #3 and 3 more" })).toBeDefined();
+  });
+
+  it("holds the order still while the batch control is armed", async () => {
+    const world = waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    const { queryClient } = await renderWaiting();
+    fireEvent.click(await screen.findByRole("button", { name: "Select all 2" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve 2" }));
+
+    world.approvals = [proposal({ id: 2 }), proposal({ id: 1 }), proposal({ id: 3 })];
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: keys.proposals.all });
+    });
+    expect(await screen.findByText("approval #3")).toBeDefined();
+    expect(orderIn("Action approvals", /^approval #\d+$/)).toEqual([
+      "approval #1",
+      "approval #2",
+      "approval #3",
+    ]);
+  });
+});
+
 /* -------------------------------------------------------- A13: the freeze -- */
 
 describe("Waiting - the ordering freeze", () => {
@@ -453,6 +631,17 @@ describe("Waiting - the ordering freeze", () => {
     expect(screen.getByRole("button", { name: "Let this action happen · #1" })).toBeDefined();
     const said = screen.getByText("armed: #1 — Let this action happen — press again to confirm");
     expect(said.getAttribute("role")).toBe("status");
+
+    // The rest label is still here, holding the width it had a click ago — hidden from the eye
+    // by `visibility` and from the ear by `aria-hidden`, which is why the button's accessible
+    // name is still only the label that is showing and every other case on this page is
+    // untouched.
+    const armedButton = screen.getByRole("button", { name: "Let this action happen · #1" });
+    const labels = armedButton.querySelectorAll(".ui-confirm-stack > *");
+    expect(labels).toHaveLength(2);
+    expect(labels[0].textContent).toBe("Approve #1");
+    expect(labels[0].getAttribute("aria-hidden")).toBe("true");
+    expect(labels[1].getAttribute("aria-hidden")).toBeNull();
   });
 
   it("holds a section's order still while one of its cards is armed", async () => {
