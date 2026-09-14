@@ -4647,26 +4647,41 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             .expect("create space-free tempdir")
     }
 
+    /// Points worktree provisioning at a root of the test's own, and switches the disk floor off.
+    ///
+    /// The floor for the reason `job.rs`'s guard of the same name gives: it measures the machine,
+    /// and on 2026-09-13 a machine filling up under a loaded suite refused five team walks' item
+    /// runs. `an_item_run_gets_its_own_tree_and_pays_one_slot_for_every_attempt` opens an item's
+    /// checkout through this guard and would have been refused the same way. The one test that
+    /// wants the floor sets it after this, and this puts back what stood before either.
     struct WorktreeRootEnv {
-        previous: Option<OsString>,
+        root: Option<OsString>,
+        floor: Option<OsString>,
     }
 
     impl WorktreeRootEnv {
         fn set(path: &FsPath) -> Self {
-            let previous = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
+            let root = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
+            let floor = std::env::var_os("NUCLEOS_MIN_FREE_DISK_GB");
             unsafe {
                 std::env::set_var("NUCLEOS_WORKTREE_ROOT", path);
+                std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", "0");
             }
-            Self { previous }
+            Self { root, floor }
         }
     }
 
     impl Drop for WorktreeRootEnv {
         fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var("NUCLEOS_WORKTREE_ROOT", value),
-                    None => std::env::remove_var("NUCLEOS_WORKTREE_ROOT"),
+            for (name, previous) in [
+                ("NUCLEOS_WORKTREE_ROOT", &self.root),
+                ("NUCLEOS_MIN_FREE_DISK_GB", &self.floor),
+            ] {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
                 }
             }
         }
@@ -5786,6 +5801,128 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             "the slot is held by the item, which is what gives it back when the item is over"
         );
 
+    }
+
+    /// An item on a disk too full for another checkout is refused before the checkout exists, and
+    /// the feed says how full.
+    ///
+    /// The floor had no test of its own until 2026-09-14, and what found it was the job suite: team
+    /// walks parked on a machine whose cargo target trees had eaten the free space, and reported it
+    /// as nothing more than `last status waiting`. Those fixtures now switch the floor off — it
+    /// measures the machine, not the code they exercise — so this is where it is exercised
+    /// instead, on purpose, with a floor no volume this runs on comes near. That is what makes the
+    /// answer the same on every machine, which the walks' answer never was.
+    ///
+    /// The feed line is half the property. A refused item parks its job as `slot` whether the slot
+    /// or the disk said no, so this row is the only place a reader learns which.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_item_is_refused_its_checkout_on_a_full_disk_and_the_feed_says_how_full() {
+        let _lock = crate::worktree::test_env_lock();
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let container = crate::git_exec::tests::space_free_tempdir("nucleos-item-full-");
+        let root = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&root);
+        let trees = crate::git_exec::tests::space_free_tempdir("nucleos-item-full-trees-");
+        let _trees_env = WorktreeRootEnv::set(trees.path());
+        // After the guard, which switched the floor off and puts back whatever stood before it when
+        // it drops — so this bare `set_var` is undone with it. A million GiB is a floor no disk
+        // meets, which is what keeps this from depending on the machine it runs on.
+        unsafe { std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", "1000000") };
+
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: &root.to_string_lossy(),
+                rule_name: Some("nightly"),
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+            },
+        )
+        .await
+        .expect("start a job");
+        let item_id = sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status)
+             VALUES (?, 0, 'the item', 'running')",
+        )
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let base = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .arg("rev-parse")
+                .arg("HEAD")
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_owned();
+
+        let refused = create_job_item_run(
+            &state,
+            "do the item".to_owned(),
+            "proj".to_owned(),
+            root.to_string_lossy().into_owned(),
+            JobItem {
+                job_id,
+                item_id,
+                stage: "implement",
+                base,
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(CreateRunError::Busy)),
+            "a full disk is a condition of the machine, answered as `Busy`: {refused:?}"
+        );
+
+        let (run_id, summary): (i64, String) = sqlx::query_as(
+            "SELECT run_id, summary FROM feed WHERE kind = 'worktree_provision_failed'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("the refusal is in the feed");
+        assert!(
+            summary.starts_with("only ") && summary.contains(" MiB free "),
+            "the refusal has to say how much room there was: {summary}"
+        );
+        assert!(
+            summary.contains("at least 1024000000 MiB"),
+            "and against which floor, or it could be any refusal: {summary}"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "a refused run is retired, not left `running` for a restart to find"
+        );
+
+        let opened: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM worktrees WHERE owner_kind = 'item'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            opened, 0,
+            "the floor is read before the tree, so no checkout was opened"
+        );
     }
 
     async fn grants_for(state: &AppState, run_id: i64) -> i64 {

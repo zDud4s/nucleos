@@ -341,7 +341,9 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     // already refused for every program by `writes_an_output_file`.
     //
     // Deliberately absent, and each for its own reason rather than for caution in general:
-    //   `sed`  — `-i` edits in place, and the `e` command executes.
+    //   `sed`  — `-i` edits in place, `w` writes and the `e` command executes. The one spelling
+    //            that does none of that, a print by line address under `-n`, is let in by
+    //            `prints_lines_by_address` rather than by a prefix here.
     //   `awk`  — `system()` runs a command and `print > file` writes one.
     //   `tee`  — writing is the whole program.
     //   `xargs`— it exists to run the command it is given.
@@ -1035,8 +1037,19 @@ fn classify_segment(
     // way around them: `shell_form_is_readable` is what refuses `--fix`, `--output`, an `-exec`, a
     // `tail -f` and a `sort -o`, and a line holding one of those is not made safe by its arguments
     // being local.
+    //
+    // **Nor may it widen a git operation the queue performs or refuses**, and that conjunction was
+    // missing until 2026-09-14. A branch in this repository is named `fix/<slug>`, and a token with
+    // a `/` in it is a path to `confined_to_workspace` — a relative one, which resolves inside. So
+    // `git branch -d fix/<slug>`, in every spelling, and `git -C . push --force origin master` came
+    // back `confined-to-workspace` for a job node: allowed on the strength of where they pointed,
+    // past the queue that exists to order exactly them. Found tracing that day's hand-deleted
+    // branch through the run path, which never consults the session gate's refusal and so had only
+    // this to stop it. Whether a segment is the queue's business is asked of the queue's own
+    // function, so the two cannot come to disagree about it.
     if unrecognized == Unrecognized::MayBeConfined
         && shell_form_is_readable(&normalized)
+        && crate::vcs::unqueueable_but_shared(segment).is_none()
         && confined_to_workspace(segment, cwd, shell)
     {
         return Segment::Confined;
@@ -1062,9 +1075,9 @@ fn shell_for(tool_name: &str) -> crate::command_reader::Shell {
 
 /// Whether a piece is one of the commands judged by WHERE IT LANDS, and lands inside the workspace.
 ///
-/// Two so far, and they are here rather than in `SAFE_COMMAND_PREFIXES` for the same reason: a list
-/// answers "which program", and for these the program is not the question. `cd ..` and `cd core` are
-/// the same program and opposite answers.
+/// Three so far, and they are here rather than in `SAFE_COMMAND_PREFIXES` for the same reason: a
+/// list answers "which program", and for these the program is not the question. `cd ..` and
+/// `cd core` are the same program and opposite answers.
 ///
 /// - **`cd`** decides what every piece after it does, so a list entry would hand over the meaning of
 ///   the whole line.
@@ -1072,6 +1085,13 @@ fn shell_for(tool_name: &str) -> crate::command_reader::Shell {
 ///   do — inside the workspace. `mkdir C:\Windows\evil` is not the same act with a different
 ///   argument, it is a different act. Measured: the job-6 dogfood stopped its plan node dead on
 ///   `mkdir -p "<worktree>/.nucleos"`, a directory the job itself needs.
+/// - **`cargo fmt`** rewrites files, and the only ones it reaches are the crate its directory
+///   names. That directory is where the line lands: the run's own, or one a `cd` before it took
+///   deeper — a `cd` that leaves is a piece refused on its own, and the line with it. Measured on
+///   job 27, 2026-09-14: an implement node in its own worktree was refused `cargo fmt --all` three
+///   times, from Bash and from PowerShell, and formatted the file by hand rather than stop. What
+///   could point it anywhere else is in its arguments, and `formats_only_where_it_stands` reads
+///   those.
 ///
 /// A `cd` this returns true for can only go deeper, never out, which is what makes judging the
 /// pieces AFTER it against the outer `cwd` safe rather than merely convenient: the real directory
@@ -1094,6 +1114,11 @@ fn lands_inside_the_workspace(
     let Some(program) = tokens.first() else {
         return false;
     };
+    // `cargo fmt` names no destination: it formats where it stands, which is inside whenever the
+    // line got this far with a workspace to be inside of.
+    if program.eq_ignore_ascii_case("cargo") && tokens.get(1).is_some_and(|word| word == "fmt") {
+        return cwd.is_some() && formats_only_where_it_stands(&tokens[2..]);
+    }
     // `cd` takes one destination; `mkdir` takes as many as you like, and every one has to land
     // inside. Anything else is not judged this way at all.
     let one_target_only = if ["cd", "chdir", "set-location"]
@@ -1151,6 +1176,55 @@ fn lands_inside_the_workspace(
         let target = fold_for_containment(&normalize_path(&target, Some(cwd)));
         target == workspace || target.starts_with(&format!("{workspace}/"))
     })
+}
+
+/// PURE: whether `cargo fmt`'s arguments leave it formatting the crate it stands in, and nothing
+/// else.
+///
+/// A list of what may appear rather than of what may not, because the ways to point rustfmt
+/// somewhere else are open-ended and a missed one is a write outside the workspace:
+/// `--manifest-path` names another crate, `--emit` names a destination, `--print-config` writes the
+/// file it is given, and a bare path after `--` is handed to rustfmt as one more file to rewrite.
+/// Every value this admits names a package, an edition or a colour, never a path.
+///
+/// `--check` is listed so the gate's own spelling reads the same way here, but it was never this
+/// rule's to allow: `checks_formatting_without_writing` answers for it with or without a workspace.
+///
+/// **What this cannot see.** cargo finds its manifest by walking UP from the directory, so a
+/// workspace with no `Cargo.toml` of its own sends it into the nearest one above. This file never
+/// reads the disk and cannot rule that out. `cargo build` and `cargo test`, both on the list, walk
+/// the same way and then run the build scripts they find, which is more than a formatter can do
+/// with the same mistake.
+fn formats_only_where_it_stands(args: &[String]) -> bool {
+    const BARE: &[&str] = &["--", "--all", "--check", "-q", "--quiet", "-v", "--verbose"];
+    const VALUED: &[&str] = &[
+        "-p",
+        "--package",
+        "--edition",
+        "--color",
+        "--message-format",
+    ];
+    let names_nothing = |value: &str| {
+        !value.is_empty() && !value.starts_with('-') && !value.contains(['/', '\\', '~', '$', '%'])
+    };
+
+    let mut tokens = args.iter().map(String::as_str);
+    while let Some(token) = tokens.next() {
+        if BARE.contains(&token) {
+            continue;
+        }
+        if VALUED.contains(&token) {
+            if tokens.next().is_some_and(names_nothing) {
+                continue;
+            }
+            return false;
+        }
+        match token.split_once('=') {
+            Some((flag, value)) if VALUED.contains(&flag) && names_nothing(value) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// PURE: Git bash's spelling of a drive, `/c/Projects`, as the `C:/Projects` it names.
@@ -1466,7 +1540,70 @@ fn is_safe_command(command: &str) -> bool {
     shell_form_is_readable(command)
         && (SAFE_EXACT_COMMANDS.contains(&command)
             || matches_command_prefix(command, SAFE_COMMAND_PREFIXES)
-            || checks_formatting_without_writing(command))
+            || checks_formatting_without_writing(command)
+            || prints_lines_by_address(command))
+}
+
+/// `sed -n` whose script only prints lines by their address — `'1,40p'`, `'5p'`, `'$p'`,
+/// `'10,$p'` — which is `head` and `tail` in another spelling.
+///
+/// Measured on job 27, 2026-09-14: an implement node was refused
+/// `cd "<worktree>/core" && sed -n '1,40p' Cargo.toml`, a read of the first forty lines of a
+/// manifest. `sed` stays off the prefix list for the reasons written there — `-i` edits in place,
+/// `w` writes, `e` executes — and this admits the one spelling that can do none of them. It is a
+/// grammar rather than a blocklist: `-n`, one script of one or two addresses and a `p`, then files.
+/// No other flag in any position (GNU takes options after operands, so `sed -n 1p f -i` edits in
+/// place), so no `-e`, no `-f` and no `--in-place`; no second command; no regex address.
+///
+/// `$` is an address only inside single quotes. Anywhere else the shell expands `$p` before sed
+/// ever sees it, and the script becomes whatever that variable holds.
+///
+/// Read off the normalized command, as the lists are: lowercasing folds `P` into `p`, and `P`
+/// only prints as well.
+fn prints_lines_by_address(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    if tokens.next() != Some("sed") {
+        return false;
+    }
+    let mut quiet = false;
+    let mut script = None;
+    for token in tokens {
+        match token {
+            "-n" | "--quiet" | "--silent" => quiet = true,
+            _ if token.starts_with('-') => return false,
+            _ if script.is_none() => script = Some(token),
+            _ => {}
+        }
+    }
+    quiet && script.is_some_and(prints_by_address)
+}
+
+/// PURE: whether one `sed` script is a single `p` by one or two line addresses.
+fn prints_by_address(script: &str) -> bool {
+    let (body, dollar_is_literal) = match script
+        .strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+    {
+        Some(inner) => (inner, true),
+        None => (
+            script
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+                .unwrap_or(script),
+            false,
+        ),
+    };
+    let address = |value: &str| {
+        (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            || (value == "$" && dollar_is_literal)
+    };
+    let Some(range) = body.strip_suffix('p') else {
+        return false;
+    };
+    match range.split_once(',') {
+        Some((from, to)) => address(from) && address(to),
+        None => address(range),
+    }
 }
 
 /// `cargo fmt` with `--check` anywhere in it: rustfmt reports what it would change and writes
@@ -1479,8 +1616,9 @@ fn is_safe_command(command: &str) -> bool {
 /// nodes, and its first round went red on `core: fmt` alone with every test passing.
 ///
 /// `--emit` is refused beside it: it is how rustfmt is told where to write, and a check has no
-/// business naming a destination. Plain `cargo fmt` stays where `mutating_siblings_remain_pending`
-/// pins it, because without `--check` it rewrites the tree.
+/// business naming a destination. Plain `cargo fmt` rewrites the tree, so it is not this rule's to
+/// answer: since 2026-09-14 it is judged by where it lands (`lands_inside_the_workspace`), and
+/// `mutating_siblings_remain_pending` pins it asking where there is no workspace to land in.
 ///
 /// **It replaced the list's `cargo fmt --check` entry rather than joining it.** The lists are read
 /// as an OR, so the entry let `cargo fmt --check -- --emit files` through whatever the guard here
@@ -2339,6 +2477,11 @@ mod tests {
             "cargo build",
             "cargo build --manifest-path core/Cargo.toml --tests",
             "pwd",
+            // Job 27, 2026-09-14: a print by line address is `head` and `tail` in another spelling.
+            "sed -n '1,40p' Cargo.toml",
+            "sed -n '5p' Cargo.toml",
+            "sed -n '$p' Cargo.toml",
+            "sed -n '10,$p' Cargo.toml",
         ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), None),
@@ -2783,6 +2926,143 @@ mod tests {
         );
     }
 
+    /// Job 27, 2026-09-14: an implement node in its own worktree was refused `cargo fmt --all`
+    /// three times — the first three lines below, verbatim, from Bash and from PowerShell — and
+    /// formatted the file by hand rather than stop. A formatter rewrites only the crate it stands
+    /// in, and where it stands is decided the way a `mkdir`'s target is: inside the workspace, or
+    /// asked about.
+    ///
+    /// The PowerShell line tracks its `cd` the way the Bash one does: its path is read with the
+    /// backslashes it was written with, and folded onto the workspace before it is compared.
+    #[test]
+    fn a_cargo_fmt_that_writes_is_allowed_only_where_it_lands() {
+        let worktree = Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-27");
+        let judge = |tool: &str, command: &str| {
+            super::classify(
+                tool,
+                &json!({ "command": command }),
+                Some(worktree),
+                &crate::github::Policy::empty(),
+                &shell_rules(&[], &[]),
+                Unrecognized::AsksAPerson,
+            )
+        };
+
+        for (tool, command) in [
+            (
+                "Bash",
+                r#"cd "C:/Projects/nucleos/.nucleos/worktrees/job-27" && cargo fmt --all && cargo fmt --all -- --check 2>&1 | head -50"#,
+            ),
+            (
+                "PowerShell",
+                r#"cd "C:\Projects\nucleos\.nucleos\worktrees\job-27"; cargo fmt --all"#,
+            ),
+            ("Bash", "cargo fmt --all"),
+            ("Bash", "cargo fmt"),
+            ("Bash", "cargo fmt -p nucleos-core"),
+            (
+                "Bash",
+                "cd /c/Projects/nucleos/.nucleos/worktrees/job-27/core && cargo fmt",
+            ),
+        ] {
+            assert_classification(judge(tool, command), "allow", "read-local");
+        }
+
+        for command in [
+            // Names another crate, and a manifest path can name one anywhere.
+            "cargo fmt --manifest-path ../other/Cargo.toml",
+            "cargo fmt --manifest-path=../other/Cargo.toml",
+            // Names a destination.
+            "cargo fmt -- --emit files",
+            // Lands outside, so it would format whatever crate it found there.
+            "cd /c/Windows && cargo fmt",
+            // A path after `--` is one more file for rustfmt, wherever it is; `--print-config`
+            // writes the file it names.
+            "cargo fmt -- C:/Windows/x.rs",
+            "cargo fmt -- --print-config default rustfmt.toml",
+        ] {
+            assert_classification(judge("Bash", command), "pending_approval", "unrecognized");
+        }
+    }
+
+    /// Job 27 again, the same day: `cd "<worktree>/core" && sed -n '1,40p' Cargo.toml` was refused,
+    /// and it is `head -40 Cargo.toml` in another spelling. A print by line address under `-n` is
+    /// judged exactly as `head` and `tail` are — asserted as pairs, so the two cannot drift apart
+    /// whatever the list decides about either — and every other `sed` stays where it was.
+    #[test]
+    fn a_sed_that_only_prints_by_line_address_is_judged_as_head_is() {
+        assert_classification(
+            classify(
+                "Bash",
+                &json!({
+                    "command": r#"cd "C:/Projects/nucleos/.nucleos/worktrees/job-27/core" && sed -n '1,40p' Cargo.toml"#
+                }),
+                Some(Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-27")),
+            ),
+            "allow",
+            "read-local",
+        );
+
+        for (sed, twin) in [
+            ("sed -n '1,40p' Cargo.toml", "head -40 Cargo.toml"),
+            ("sed -n '5p' Cargo.toml", "head -5 Cargo.toml"),
+            ("sed -n '$p' Cargo.toml", "tail -1 Cargo.toml"),
+            ("sed -n '10,$p' Cargo.toml", "tail -n +10 Cargo.toml"),
+            ("sed -n 1,40p Cargo.toml", "head -40 Cargo.toml"),
+            (
+                "sed -n '1,10p' ../../../etc/passwd",
+                "head -10 ../../../etc/passwd",
+            ),
+            ("sed -n '1,10p' ~/.ssh/id_rsa", "head -10 ~/.ssh/id_rsa"),
+        ] {
+            let judged = |command: &str| {
+                let got = classify("Bash", &json!({ "command": command }), None);
+                (got.decision.decision, got.action_class)
+            };
+            assert_eq!(
+                judged(sed),
+                judged(twin),
+                "{sed} is not judged as {twin} is"
+            );
+        }
+
+        for (command, decision, action_class) in [
+            ("sed -i 's/a/b/' f", "pending_approval", "unrecognized"),
+            ("sed -n '1,40w out' f", "pending_approval", "unrecognized"),
+            ("sed -n '1e rm -rf x' f", "deny", "destructive"),
+            ("sed -n -e '1,40p' f", "pending_approval", "unrecognized"),
+            ("sed -n -f script.sed f", "pending_approval", "unrecognized"),
+            (
+                "sed -n --in-place '1,40p' f",
+                "pending_approval",
+                "unrecognized",
+            ),
+            // GNU sed takes options after its operands.
+            ("sed -n '1,40p' f -i", "pending_approval", "unrecognized"),
+            ("sed -ni '1,40p' f", "pending_approval", "unrecognized"),
+            // Without `-n` every line prints as well; not the spelling that was asked about.
+            ("sed '1,40p' f", "pending_approval", "unrecognized"),
+            ("sed -n '1,40p;5q' f", "pending_approval", "unrecognized"),
+            ("sed -n '/fn main/p' f", "pending_approval", "unrecognized"),
+            // The shell expands `$p` here before sed sees the script.
+            (r#"sed -n "10,$p" f"#, "pending_approval", "unrecognized"),
+            ("sed -n 10,$p f", "pending_approval", "unrecognized"),
+        ] {
+            assert_classification(
+                classify("Bash", &json!({ "command": command }), None),
+                decision,
+                action_class,
+            );
+        }
+    }
+
+    /// The writing twins of commands allowed elsewhere in this file: the same program, a spelling
+    /// that changes something.
+    ///
+    /// Asked with no workspace, and that is what keeps a writing `cargo fmt` here. Since 2026-09-14
+    /// it is allowed where it lands inside one (`a_cargo_fmt_that_writes_is_allowed_only_where_it_lands`
+    /// pins that half with job 27's own lines); with no workspace there is no inside to land in, and
+    /// it asks exactly as before.
     #[test]
     fn mutating_siblings_remain_pending() {
         for (command, action_class) in [
@@ -2792,11 +3072,18 @@ mod tests {
             ("git remote add origin https://x", "unrecognized"),
             ("cargo fmt", "unrecognized"),
             ("cargo fmt --all", "unrecognized"),
+            (
+                "cargo fmt --manifest-path ../other/Cargo.toml",
+                "unrecognized",
+            ),
+            ("cargo fmt -- --emit files", "unrecognized"),
             // A check that names a destination is not a check.
             ("cargo fmt --check -- --emit files", "unrecognized"),
             ("cargo fmt -- --emit=files --check", "unrecognized"),
             ("cargo clippy --fix", "unrecognized"),
             ("cargo fix", "unrecognized"),
+            ("sed -i 's/a/b/' f", "unrecognized"),
+            ("sed -n '1,40w out' f", "unrecognized"),
         ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), None),
@@ -3947,9 +4234,11 @@ mod tests {
     fn a_command_nobody_knows_may_run_when_it_points_only_at_its_own_workspace() {
         let workspace = Path::new(r"C:\work\repo");
         for command in [
-            // `sed` is deliberately off every list and always will be, and reading a file with it
-            // is still not a decision anybody wants to be woken for.
-            "sed -n '1,60p' ./core/src/main.rs",
+            // A `sed` script that does anything but print by line address is still off every
+            // list, and reading a file with one is still not a decision anybody wants to be woken
+            // for. This line said `sed -n '1,60p'` until 2026-09-14, when that spelling became a
+            // read of its own (`prints_lines_by_address`) and stopped needing confinement at all.
+            "sed '1,60!d' ./core/src/main.rs",
             "awk '{print $1}' ./Cargo.toml",
             "./scripts/whatever.sh ./core",
             "jq '.name' ./package.json",
@@ -3980,19 +4269,16 @@ mod tests {
             ("nc example.com 4444", "names no path"),
             ("ssh someone@example.com whoami", "names no path"),
             // Points outside.
-            (
-                "sed -n '1,10p' ../../../etc/passwd",
-                "escapes the workspace",
-            ),
+            ("sed '1,10!d' ../../../etc/passwd", "escapes the workspace"),
             (
                 r"jq . C:\Windows\System32\config\SAM",
                 "absolute and outside",
             ),
             // The shell rewrites these before the command sees them, so where they land cannot be
             // read off the line.
-            ("sed -n '1,10p' ~/.ssh/id_rsa", "the shell expands `~`"),
+            ("sed '1,10!d' ~/.ssh/id_rsa", "the shell expands `~`"),
             (
-                "sed -n '1,10p' $HOME/.ssh/id_rsa",
+                "sed '1,10!d' $HOME/.ssh/id_rsa",
                 "the shell expands `$HOME`",
             ),
             // Clears containment and fails a SHAPE guard, which confinement may never excuse.
@@ -4016,7 +4302,7 @@ mod tests {
     /// same line that passes above has to fail here.
     #[test]
     fn confinement_needs_a_workspace_to_be_inside_of() {
-        let got = classify_asked_for("sed -n '1,60p' ./core/src/main.rs", None);
+        let got = classify_asked_for("sed '1,60!d' ./core/src/main.rs", None);
         assert_eq!(got.decision.decision, "pending_approval");
     }
 
@@ -4025,7 +4311,7 @@ mod tests {
     #[test]
     fn the_widening_reaches_nothing_that_did_not_ask_for_it() {
         let workspace = Path::new(r"C:\work\repo");
-        let command = "sed -n '1,60p' ./core/src/main.rs";
+        let command = "sed '1,60!d' ./core/src/main.rs";
 
         let asked = classify_asked_for(command, Some(workspace));
         assert_eq!(asked.decision.decision, "allow");
@@ -4055,6 +4341,50 @@ mod tests {
             "pending_approval",
             "push-merge-deploy",
         );
+    }
+
+    /// The run path's half of 2026-09-14's hand-deleted branch. A job node never reaches the
+    /// session gate's refusal, so confinement is what stood between it and these — and a branch
+    /// named `fix/<slug>` reads as a path that resolves inside.
+    ///
+    /// Collected rather than asserted one at a time, so a regression names every spelling it lets
+    /// through instead of the first.
+    #[test]
+    fn confinement_never_widens_a_git_operation_the_queue_performs_or_refuses() {
+        let workspace = Path::new(r"C:\work\repo");
+        let widened: Vec<&str> = [
+            "git branch -d fix/espera-que-responde",
+            "git branch -d fix/espera-que-responde 2>&1",
+            "git branch -D fix/espera-que-responde",
+            "git -C ./core branch -d feature",
+            "git -C . push --force origin master",
+            "git -C . merge fix/x",
+            "git rebase fix/x",
+            "git fetch ./elsewhere",
+        ]
+        .into_iter()
+        .filter(|command| {
+            classify_asked_for(command, Some(workspace))
+                .decision
+                .decision
+                == "allow"
+        })
+        .collect();
+        assert!(
+            widened.is_empty(),
+            "confinement widened a git operation the queue owns: {widened:?}"
+        );
+
+        // What confinement is for is untouched: git spellings the queue has no opinion about.
+        for command in ["git branch --list fix/*", "git -C ./core log --oneline"] {
+            assert_eq!(
+                classify_asked_for(command, Some(workspace))
+                    .decision
+                    .decision,
+                "allow",
+                "{command}"
+            );
+        }
     }
 
     /// The two git reads that cost job 21 two of its four items, in the exact spelling the run

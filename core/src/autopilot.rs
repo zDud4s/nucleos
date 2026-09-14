@@ -1169,7 +1169,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Two proposals of the kinds `wip.rs` excludes: must count in NEITHER reader.
+        // Three proposals of the kinds `wip.rs` excludes: must count in NEITHER reader.
         //
         // This is the dimension the test was missing, and the omission is why the drift survived
         // the guard written to stop it. Every fixture above varies `runs.mode`, which both copies
@@ -1179,7 +1179,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO proposals (kind, status, run_id, project_id, reasoning, created_at)
              VALUES ('skipped-item', 'pending', 1, 'project-a', 'test', '2026-08-24T00:00:00Z'),
-                    ('fleet-exclusion', 'pending', 1, 'project-a', 'test', '2026-08-24T00:00:00Z')",
+                    ('fleet-exclusion', 'pending', 1, 'project-a', 'test', '2026-08-24T00:00:00Z'),
+                    ('refused-action', 'pending', 1, 'project-a', 'test', '2026-08-24T00:00:00Z')",
         )
         .execute(&pool)
         .await
@@ -1239,7 +1240,7 @@ mod tests {
         );
         assert_eq!(
             gate, 2,
-            "1 pending proposal + 1 shadow decision; neither the 5 worktree decisions              nor the 2 excluded-kind proposals may count"
+            "1 pending proposal + 1 shadow decision; neither the 5 worktree decisions              nor the 3 excluded-kind proposals may count"
         );
     }
 

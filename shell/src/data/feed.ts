@@ -299,7 +299,7 @@ export interface FeedReading {
  *   three times.
  */
 export const FEED_KINDS: Record<string, FeedReading> = {
-  /* -- jobs: `job::say`, thirteen kinds ----------------------------------- */
+  /* -- jobs: `job::say`, fifteen kinds ------------------------------------ */
   job_started: { tone: "active", label: "job started" },
   job_planned: { tone: "info", label: "job planned" },
   job_replanned: { tone: "info", label: "job replanned" },
@@ -307,6 +307,18 @@ export const FEED_KINDS: Record<string, FeedReading> = {
   job_item_failed: { tone: "danger", label: "job item failed" },
   job_gate_failed: { tone: "danger", label: "job gate failed" },
   job_waiting: { tone: "pending", label: "job waiting" },
+  /**
+   * A round in which no item passed has nothing for a review to judge, so none
+   * runs (job 27, 2026-09-14: a review read a reverted tree and reported "no work
+   * was done"). Information, not a failure: the red items already said so.
+   */
+  job_review_skipped: { tone: "info", label: "job review skipped" },
+  /**
+   * A review that never reached the API is run once more (job 26, 2026-09-13:
+   * a DNS outage ended it and the next round opened without a verdict). Pending,
+   * because the verdict it stands for is still to come.
+   */
+  job_review_retried: { tone: "pending", label: "job review retried" },
   job_finished: { tone: "active", label: "job finished" },
   job_failed: { tone: "danger", label: "job failed" },
   /**
