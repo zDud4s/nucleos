@@ -9631,20 +9631,47 @@ mod tests {
         );
     }
 
-    struct WorktreeRootEnv(Option<std::ffi::OsString>);
+    /// Points worktree provisioning at a root of the test's own, and switches the disk floor off.
+    ///
+    /// **The floor measures the machine, not the code.** `runs::no_room_on_disk` refuses an item's
+    /// checkout when the volume `NUCLEOS_WORKTREE_ROOT` lives on has less than 5 GiB free, and the
+    /// checkouts these fixtures open are a few kilobytes — so the floor has nothing to say about
+    /// what they exercise, and everything to say about whatever else is filling the disk. On
+    /// 2026-09-13 that was the suite itself, several multi-GB cargo target trees growing under
+    /// load: five team walks failed together with `last status waiting` (one of them again, alone,
+    /// in a gate on 2026-09-14), each an item run refused as `Busy`, a job parked as `slot`, and
+    /// forty parked passes spun through in milliseconds. Every one of them passed run by itself, and
+    /// every one failed on demand with `NUCLEOS_MIN_FREE_DISK_GB=100000`. The refusal is still
+    /// tested — in `runs.rs`, on purpose, with a floor no disk meets.
+    ///
+    /// Both variables come back as they were on drop. Callers hold `test_env_lock`, which is what
+    /// makes a process-wide variable safe to set at all.
+    struct WorktreeRootEnv {
+        root: Option<std::ffi::OsString>,
+        floor: Option<std::ffi::OsString>,
+    }
     impl WorktreeRootEnv {
         fn set(path: &std::path::Path) -> Self {
-            let previous = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
-            unsafe { std::env::set_var("NUCLEOS_WORKTREE_ROOT", path) };
-            Self(previous)
+            let root = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
+            let floor = std::env::var_os("NUCLEOS_MIN_FREE_DISK_GB");
+            unsafe {
+                std::env::set_var("NUCLEOS_WORKTREE_ROOT", path);
+                std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", "0");
+            }
+            Self { root, floor }
         }
     }
     impl Drop for WorktreeRootEnv {
         fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(value) => std::env::set_var("NUCLEOS_WORKTREE_ROOT", value),
-                    None => std::env::remove_var("NUCLEOS_WORKTREE_ROOT"),
+            for (name, previous) in [
+                ("NUCLEOS_WORKTREE_ROOT", &self.root),
+                ("NUCLEOS_MIN_FREE_DISK_GB", &self.floor),
+            ] {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
                 }
             }
         }
@@ -9655,21 +9682,45 @@ mod tests {
     /// Nodes run as spawned tasks, so without this every pass would find its own node still
     /// `running` and answer `Wait` forever — the walk would hang rather than fail, which is the
     /// least useful way for a test to be wrong.
+    ///
+    /// **On a deadline, and not a count.** It was 500 `yield_now()`s, which is a budget in scheduler
+    /// turns rather than time — and how much time a turn is worth is exactly what a loaded machine
+    /// changes. Two minutes of wall clock is purely a hang guard: the scripted nodes finish at once,
+    /// so the ordinary case returns in milliseconds, and when it does fire it names the runs it
+    /// gave up on.
+    ///
+    /// This is not what failed on 2026-09-13. Those walks ended `waiting`, a park, and a parked job
+    /// has no node in flight for this to wait on; `why_it_stands` is where a park shows.
     async fn settle(state: &AppState, job_id: i64) {
-        for _ in 0..500 {
-            let running: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM runs WHERE job_id = ? AND status = 'running'",
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let running: Vec<(i64, Option<String>, Option<i64>)> = sqlx::query_as(
+                "SELECT id, stage, item_id FROM runs
+                  WHERE job_id = ? AND status = 'running' ORDER BY id",
             )
             .bind(job_id)
-            .fetch_one(&state.pool)
+            .fetch_all(&state.pool)
             .await
             .unwrap();
-            if running == 0 {
+            if running.is_empty() {
                 return;
             }
-            tokio::task::yield_now().await;
+            if std::time::Instant::now() >= deadline {
+                let named = running
+                    .iter()
+                    .map(|(id, stage, item)| {
+                        let stage = stage.as_deref().unwrap_or("no stage");
+                        match item {
+                            Some(item) => format!("run {id} ({stage}, item {item})"),
+                            None => format!("run {id} ({stage})"),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                panic!("a node never finished: {named} still running after two minutes");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        panic!("a node never finished");
     }
 
     /// What one walk cost, in the two units that matter.
@@ -9698,6 +9749,10 @@ mod tests {
         /// again, which is the only durable trace an unhappy event leaves: the states it passed
         /// through are gone by the time the walk ends.
         attempts: Vec<i64>,
+        /// The passes that ended with the job `waiting`, each with the reason it gave then. A park
+        /// costs a pass and says nothing about the schedule, so a walk that is going to be compared
+        /// with another must have none — `walk_measured` refuses one that does.
+        parked: Vec<String>,
     }
 
     async fn walk_counting(state: &AppState, job_id: i64) -> Walk {
@@ -9711,6 +9766,7 @@ mod tests {
             .unwrap()
         };
         let mut writing = 0;
+        let mut parked = Vec::new();
         for pass in 1..=40 {
             let before = started(state.pool.clone()).await;
             job_tick(state, Utc::now()).await;
@@ -9719,6 +9775,12 @@ mod tests {
                 writing += 1;
             }
             let status = job_status(&state.pool, job_id).await;
+            if status == "waiting" {
+                parked.push(format!(
+                    "pass {pass}: {}",
+                    why_it_stands(&state.pool, job_id).await
+                ));
+            }
             if !LIVE_STATUSES.contains(&status.as_str()) {
                 let attempts = sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM runs
@@ -9734,13 +9796,56 @@ mod tests {
                     passes: pass,
                     writing,
                     attempts,
+                    parked,
                 };
             }
         }
         panic!(
-            "the job never reached an ending; last status {}",
-            job_status(&state.pool, job_id).await
+            "the job never reached an ending; last {} ({} of 40 passes ended parked)",
+            why_it_stands(&state.pool, job_id).await,
+            parked.len()
         );
+    }
+
+    /// Why a job is standing still, in words a failing assertion can print.
+    ///
+    /// A park leaves its reason in three places and the status is none of them: `wait_reason` on
+    /// the job's row, a `job_waiting` line from `park`, and — when it was a run's provisioning that
+    /// said no — a `worktree_provision_failed` line naming the wall. Only the last tells the slot
+    /// from the disk, because a refused item parks its job as `slot` either way. The walks used to
+    /// print the status alone, and on 2026-09-13 five of them failed with `last status waiting` and
+    /// nothing else: the disk floor refusing every item, and not a word of it on screen.
+    ///
+    /// Newest first, and three lines at most. The pool is the test's own, so every line is this
+    /// job's.
+    async fn why_it_stands(pool: &sqlx::SqlitePool, job_id: i64) -> String {
+        let (status, reason): (String, Option<String>) =
+            sqlx::query_as("SELECT status, wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let lines: Vec<(String, String)> = sqlx::query_as(
+            "SELECT kind, summary FROM feed
+              WHERE kind IN ('job_waiting', 'worktree_provision_failed')
+              ORDER BY id DESC LIMIT 3",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let lines = if lines.is_empty() {
+            "none".to_owned()
+        } else {
+            lines
+                .iter()
+                .map(|(kind, summary)| format!("[{kind}] {summary}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        format!(
+            "status {status}, wait_reason {}, feed: {lines}",
+            reason.as_deref().unwrap_or("none")
+        )
     }
 
     /// A team of one, and a job it directs, over a real repository.
@@ -9940,6 +10045,17 @@ mod tests {
             start_directed_job(&state, &runner, &repo, plan, max_parallel, gate_retries).await;
         let walk = walk_counting(&state, job_id).await;
 
+        // First, because every comparison these walks feed is a `<=` on passes. A park costs a
+        // pass for a reason that is this machine's and not the schedule's, so one on either side
+        // would flip the comparison — or, worse, satisfy it — and the assertion would still read
+        // as a verdict on the design. A park that never lifts already fails in `walk_counting`;
+        // this is the one that lifted and left only a larger number behind.
+        assert!(
+            walk.parked.is_empty(),
+            "the walk at {max_parallel} parked, which is the machine refusing and not the \
+             schedule: {:?}",
+            walk.parked
+        );
         assert_eq!(
             walk.ending, "completed",
             "the walk at {max_parallel} did not finish"
@@ -10306,8 +10422,8 @@ mod tests {
             }
         }
         panic!(
-            "the job never reached an ending; last status {}",
-            job_status(&state.pool, job_id).await
+            "the job never reached an ending; last {}",
+            why_it_stands(&state.pool, job_id).await
         );
     }
 
@@ -12284,10 +12400,16 @@ mod tests {
         let job = load_job(&pool, job_id).await.unwrap();
         advance(&state, &job, Utc::now()).await;
 
+        // Read before the assertion so it can print it. `["pending", "pending", "pending"]` alone
+        // is all 2026-09-13 left to go on, and it reads as the fold choosing nothing — when the
+        // fold chose right, the first run it asked for was refused, and only the job's row and
+        // the feed said why.
+        let why = why_it_stands(&pool, job_id).await;
         assert_eq!(
             item_statuses(&pool, job_id).await,
             vec!["running", "pending", "running"],
-            "one pass started items 0 and 2 together, and left 1 for the file it shares with 0"
+            "one pass started items 0 and 2 together, and left 1 for the file it shares with 0 \
+             (job: {why})"
         );
 
         // And they are two nodes, in two checkouts, not one node counted twice. `item_id` is what
