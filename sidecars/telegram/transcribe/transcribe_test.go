@@ -2,10 +2,56 @@ package transcribe
 
 import (
 	"errors"
-	"runtime"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	args := os.Args
+	for i, arg := range args {
+		if arg == "--" {
+			args = args[i+1:]
+			break
+		}
+	}
+
+	switch os.Getenv("HELPER_MODE") {
+	case "echo":
+		fmt.Println(strings.Join(args, " "))
+	case "sleep":
+		time.Sleep(30 * time.Second)
+	case "print":
+		fmt.Println(os.Getenv("HELPER_TEXT"))
+	}
+	os.Exit(0)
+}
+
+func helperCommand(t *testing.T, mode string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	name := "helper" + filepath.Ext(os.Args[0])
+	helper := filepath.Join(dir, name)
+	bytes, err := os.ReadFile(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(helper, bytes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("HELPER_MODE", mode)
+	return "." + string(filepath.Separator) + name + " -test.run=^TestHelperProcess$ --"
+}
 
 func TestTranscribeWithoutCommand(t *testing.T) {
 	_, err := Transcribe("", "x.ogg")
@@ -15,7 +61,7 @@ func TestTranscribeWithoutCommand(t *testing.T) {
 }
 
 func TestTranscribeRunsConfiguredCommand(t *testing.T) {
-	got, err := Transcribe("cmd /c echo", "hello.ogg")
+	got, err := Transcribe(helperCommand(t, "echo"), "hello.ogg")
 	if err != nil {
 		t.Fatalf("Transcribe() error = %v", err)
 	}
@@ -29,14 +75,8 @@ func TestTranscribeRunsConfiguredCommand(t *testing.T) {
 // forever while the notifier kept announcing events — a bot that looks alive with a dead command
 // path. The deadline is what bounds that.
 func TestATranscriberThatNeverFinishesIsKilled(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("blocks using a Windows shell command")
-	}
-
-	// The audio path is simply the last argument, so here it is the ping target: `ping -n 30
-	// 127.0.0.1` blocks for about half a minute.
 	start := time.Now()
-	_, err := transcribeWithin("cmd /c ping -n 30", "127.0.0.1", 150*time.Millisecond, maxOutputBytes)
+	_, err := transcribeWithin(helperCommand(t, "sleep"), "127.0.0.1", 150*time.Millisecond, maxOutputBytes)
 	if err == nil {
 		t.Fatal("transcribeWithin() error = nil, want the deadline reported")
 	}
@@ -49,11 +89,7 @@ func TestATranscriberThatNeverFinishesIsKilled(t *testing.T) {
 // what keeps a broken one from taking the sidecar down with it; a clipped transcript is still worth
 // relaying, so it is not treated as a failure.
 func TestOutputIsCappedRatherThanReadWithoutLimit(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("runs a Windows shell command")
-	}
-
-	got, err := transcribeWithin("cmd /c echo", "0123456789abcdef", time.Minute, 4)
+	got, err := transcribeWithin(helperCommand(t, "echo"), "0123456789abcdef", time.Minute, 4)
 	if err != nil {
 		t.Fatalf("transcribeWithin() error = %v, want clipped output to be usable", err)
 	}

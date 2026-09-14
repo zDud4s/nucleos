@@ -246,7 +246,21 @@ async fn collect_readout(state: AppState) -> HealthReadout {
     // probe Ollama either — see `speaker_probe`.
     let voice_speaks = state.voice.speaker.is_some() && !state.voice.tts_command.trim().is_empty();
     let tts_command = state.voice.tts_command.clone();
-    let (pool, cli, credentials, disk, echo, telegram, email, web, browser, voice, speaker, github) = tokio::join!(
+    let (
+        pool,
+        cli,
+        credentials,
+        disk,
+        echo,
+        telegram,
+        email,
+        web,
+        browser,
+        voice,
+        speaker,
+        github,
+        hook,
+    ) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
         run_subsystem("credential_manager", credential_manager_probe()),
@@ -277,6 +291,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         run_subsystem("voice_transcriber", voice_probe(voice_armed, stt_command)),
         run_subsystem("voice_speaker", speaker_probe(voice_speaks, tts_command)),
         run_subsystem("github", github_probe(github_asked_for, github_binary)),
+        run_subsystem("hook_interpreter", hook_interpreter_probe()),
     );
     let subsystems = vec![
         pool,
@@ -291,6 +306,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         voice,
         speaker,
         github,
+        hook,
     ];
 
     HealthReadout {
@@ -358,6 +374,28 @@ async fn cli_probe() -> SubsystemReadout {
         exec_probe(resolved.to_string_lossy().into_owned(), "--version").await
     })
     .await
+}
+
+fn hook_interpreter_row(resolved: Option<PathBuf>) -> SubsystemReadout {
+    match resolved {
+        Some(_) => SubsystemReadout::ok("hook_interpreter"),
+        None => SubsystemReadout::down("hook_interpreter", FailureCategory::Missing),
+    }
+}
+
+/// This row exists because a hook whose interpreter is missing is invisible by construction.
+///
+/// Claude Code runs the command, gets 127, and treats every exit but 2 as non-blocking, so the tool
+/// call goes ahead unclassified.
+async fn hook_interpreter_probe() -> SubsystemReadout {
+    match tokio::task::spawn_blocking(|| {
+        resolve_program(std::ffi::OsStr::new(crate::autopilot::HOOK_INTERPRETER))
+    })
+    .await
+    {
+        Ok(resolved) => hook_interpreter_row(resolved),
+        Err(_) => SubsystemReadout::down("hook_interpreter", FailureCategory::Unknown),
+    }
 }
 
 /// Whether the configured transcriber is a program that runs here.
@@ -849,6 +887,17 @@ mod tests {
     }
 
     #[test]
+    fn an_interpreter_that_does_not_resolve_is_a_red_row() {
+        let missing = hook_interpreter_row(None);
+        assert_eq!(missing.status, HealthState::Down);
+        assert_eq!(missing.reason, Some(FailureCategory::Missing));
+
+        let resolved = hook_interpreter_row(Some(PathBuf::from("x")));
+        assert_eq!(resolved.status, HealthState::Ok);
+        assert_eq!(resolved.reason, None);
+    }
+
+    #[test]
     fn health_breach_intent_is_inert_when_the_rule_is_off() {
         let root = tempfile::tempdir().unwrap();
         let result = record_breach_intent(
@@ -946,6 +995,7 @@ mod tests {
     /// with `--help`, which is the program's business and not this regression's. Pinning `== Ok`
     /// would make a test about SPLITTING fail over an exit code — the same category of misdirected
     /// alarm the bug itself was.
+    #[cfg(windows)]
     #[tokio::test]
     async fn a_quoted_transcriber_path_probes_the_program_and_not_the_quote() {
         // `cmd` exists on every Windows host and needs no arguments to resolve.
@@ -960,12 +1010,47 @@ mod tests {
     }
 
     /// And the unquoted form, which every config written before quoting existed uses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_quoted_transcriber_path_probes_the_program_and_not_the_quote_on_unix() {
+        // `sh` exists on every Unix host.
+        let readout = voice_probe(true, "\"sh\" -m model.bin".to_string()).await;
+
+        assert_ne!(
+            readout.reason,
+            Some(FailureCategory::Missing),
+            "a quoted path that resolves must not be reported missing, got {:?}",
+            readout.status
+        );
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn an_unquoted_transcriber_path_still_probes_its_first_token() {
         let readout = voice_probe(true, "cmd -m model.bin".to_string()).await;
         assert_ne!(readout.reason, Some(FailureCategory::Missing));
 
         let missing = voice_probe(true, "definitely-not-a-program-anywhere -x".to_string()).await;
+        assert_eq!(
+            missing.status,
+            HealthState::Down,
+            "a transcriber that does not exist has to be reported"
+        );
+        assert_eq!(missing.reason, Some(FailureCategory::Missing));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unquoted_transcriber_path_still_probes_its_first_token_on_unix() {
+        // `sh` exists on every Unix host.
+        let readout = voice_probe(true, "sh -m model.bin".to_string()).await;
+        assert_ne!(readout.reason, Some(FailureCategory::Missing));
+
+        let missing = voice_probe(
+            true,
+            "/nonexistent-nucleos/definitely-not-a-program -x".to_string(),
+        )
+        .await;
         assert_eq!(
             missing.status,
             HealthState::Down,

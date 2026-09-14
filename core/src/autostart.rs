@@ -141,6 +141,7 @@ fn write_utf16_xml(path: &Path, xml: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn task_xml_embeds_the_exe_path_and_repo_root_working_directory() {
         let xml = task_xml(Path::new(
@@ -150,6 +151,15 @@ mod tests {
         assert!(xml.contains("<RestartOnFailure>"));
         assert!(xml.contains("<LogonTrigger>"));
         assert!(xml.contains(r"<WorkingDirectory>C:\Projects\nucleos</WorkingDirectory>"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_working_directory_is_four_levels_above_a_posix_exe() {
+        assert_eq!(
+            working_directory_for(Path::new("/home/me/nucleos/core/target/debug/nucleos-core")),
+            Path::new("/home/me/nucleos")
+        );
     }
 
     /// `&` is legal in a Windows path, and the XML was built by interpolation — a repository under
