@@ -236,7 +236,8 @@
     --accent: #0b8493;
     --accent-quiet: rgba(11, 132, 147, 0.12);
     --accent-ink: #ffffff;
-    --focus-ring: rgba(11, 132, 147, 0.5);
+    /* A non-text indicator, opaque so it clears 3:1 on every light ground. */
+    --focus-ring: #0b8493;
 
     /* The contrast flips with the ground: near-black fill, light ink. */
     --solid: #12151b;
@@ -244,7 +245,8 @@
 
     /* Foregrounds darken for the light ground; the fills stay the same idea
        at a slightly higher alpha, because a 12% tint disappears on white. */
-    --tone-active-fg: #0d7d5c;
+    /* Text on its own 10% fill, also read over the sunken ground: 4.5:1 there too. */
+    --tone-active-fg: #0a6b4f;
     --tone-active-bg: rgba(13, 125, 92, 0.1);
     --tone-active-border: rgba(13, 125, 92, 0.28);
 

@@ -107,6 +107,19 @@ interface ConfirmButtonBase {
   variant: ButtonVariant;
   intent?: ButtonIntent;
   disabled?: boolean;
+  /**
+   * Cannot be pressed now, and still reachable: `aria-disabled="true"` instead of `disabled`.
+   *
+   * The control stays in the tab order and keeps its `describedBy`, so the sentence that says
+   * WHY it cannot be pressed is attached to something a screen reader can land on. It never
+   * arms and never confirms, and if it turns true while armed the control disarms and says so
+   * — a permission taken away under a finger is the same event as an expiry.
+   *
+   * Native `disabled` keeps its meaning and is still the right answer almost everywhere. This
+   * is for the case it gets wrong: a control that has just been used, or whose refusal is the
+   * point, where `disabled` drops focus to `<body>` and silences the description with it.
+   */
+  unavailable?: boolean;
   title?: string;
   /**
    * An element that says what confirming would do, named for a screen reader.
@@ -169,6 +182,7 @@ export function ConfirmButton({
   variant,
   intent,
   disabled,
+  unavailable,
   title,
   describedBy,
 }: ConfirmButtonProps) {
@@ -316,7 +330,26 @@ export function ConfirmButton({
     disarmTimer.current = setTimeout(disarm, span);
   }, [armed, armedSaid]);
 
+  /*
+    Becoming unavailable while armed is a disarm, said out loud.
+
+    A poll can take the permission away with a finger over the button. Staying armed would keep a
+    live confirm on something that can no longer be done, and standing down silently would be the
+    expiry nobody hears — so it goes through `disarm`, which says "disarmed — nothing changed" and
+    reports the pair's closing half to `onArmedChange`.
+
+    `[unavailable]` alone, for the reason the effect above gives: `disarm` is redefined on every
+    render, and listing it (or `armed`) would re-run this on renders that changed nothing.
+  */
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (unavailable === true && armed) disarm();
+  }, [unavailable]);
+
   function handleClick() {
+    // Unavailable swallows every press: it does not arm, and it cannot confirm either, because
+    // it can never be armed — the effect above stands it down the moment it turns unavailable.
+    if (unavailable === true) return;
     if (!armed) {
       setArmed(true);
       onArmedChange?.(true);
@@ -388,6 +421,7 @@ export function ConfirmButton({
         variant={armed && variant === "danger" ? "danger-solid" : variant}
         intent={intent}
         disabled={disabled}
+        aria-disabled={unavailable === true ? "true" : undefined}
         title={title}
         aria-describedby={describedBy}
         onClick={handleClick}

@@ -15,7 +15,7 @@ const TONES = "active|shadow|off|pending|paused|danger|info";
 const LITERAL = new RegExp(`tone=(?:"(?:${TONES})"|\\{[^}]*"(?:${TONES})"[^}]*\\})`);
 const ALLOWED = new Map<string, { literals: number; tables?: string[]; reason: string }>([
   ["calendar/DaySheet.tsx", { literals: 5, reason: "facts about a day — today, not a working day, a short or long one, a proposed occurrence. No núcleo state machine writes any of them." }],
-  ["pages/Autopilot.tsx", { literals: 2, reason: "`queue full` is a ceiling this page derives, and a shadow decision's action class is an identifier — neither is a domain state." }],
+  ["pages/Autopilot.tsx", { literals: 1, reason: "a shadow decision's action class is an identifier, not a domain state." }],
   ["pages/Browser.tsx", { literals: 3, reason: "a grant's kind and whether it submits forms are permissions the shell decides, and a write's HTTP method is an identifier." }],
   ["pages/Calendar.tsx", { literals: 1, reason: "busy or free right now is computed from the calendar in the browser; the daemon sends no such literal." }],
   ["pages/Contacts.tsx", { literals: 4, reason: "a contact's verdict, whether you write back, and a merge are facts about a person, not a lifecycle." }],

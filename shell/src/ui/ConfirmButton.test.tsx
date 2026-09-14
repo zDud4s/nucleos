@@ -608,4 +608,90 @@ describe("ConfirmButton", () => {
     expect(warnings).toHaveLength(1);
     expect(heard[heard.length - 1]).toBe("disarmed — nothing changed");
   });
+
+  /**
+   * Unavailable is not disabled.
+   *
+   * A native `disabled` takes the control out of the tab order, and a screen reader walking the
+   * page never lands on it — so the one sentence that says WHY it cannot be pressed, the
+   * `describedBy` element, is attached to a control nobody can reach. `unavailable` keeps the
+   * tab stop and says the same thing with `aria-disabled`; what it must not keep is the interlock.
+   */
+  it("an unavailable interlock stays focusable, is described, and never arms", () => {
+    const onConfirm = vi.fn();
+    const onArmedChange = vi.fn();
+    render(
+      <ConfirmButton
+        label="Delete series"
+        confirmLabel="Really delete"
+        variant="danger"
+        unavailable
+        describedBy="why"
+        onConfirm={onConfirm}
+        onArmedChange={onArmedChange}
+      />,
+    );
+
+    const button = screen.getByRole("button", { name: "Delete series" });
+    expect(button.getAttribute("aria-disabled")).toBe("true");
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+    expect(button.getAttribute("aria-describedby")).toBe("why");
+
+    // Two presses past the dwell — exactly the pair that confirms an available control. The same
+    // node both times: an interlock that armed would still be this element, under its armed label.
+    fireEvent.click(button);
+    act(() => {
+      vi.advanceTimersByTime(350);
+    });
+    fireEvent.click(button);
+
+    const showing = button.querySelectorAll(".ui-confirm-stack > :not([aria-hidden])");
+    expect(showing).toHaveLength(1);
+    expect(showing[0].textContent).toBe("Delete series");
+    expect(screen.queryByRole("button", { name: "Delete series" })).not.toBeNull();
+    expect(onConfirm).not.toHaveBeenCalled();
+    expect(onArmedChange).not.toHaveBeenCalled();
+  });
+
+  /**
+   * And becoming unavailable while armed is a disarm, said out loud.
+   *
+   * A poll can take the permission away with a finger over the button. Leaving the control armed
+   * would keep a live confirm on something that can no longer be done; standing it down silently
+   * would be the expiry nobody hears. It is the same event as an expiry, so it says the same thing.
+   */
+  it("an interlock that becomes unavailable while armed disarms and says so", () => {
+    const onConfirm = vi.fn();
+    const onArmedChange = vi.fn();
+    const { rerender } = render(
+      <ConfirmButton
+        label="Delete series"
+        confirmLabel="Really delete"
+        variant="danger"
+        onConfirm={onConfirm}
+        onArmedChange={onArmedChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
+    expect(screen.queryByRole("button", { name: "Really delete" })).not.toBeNull();
+
+    rerender(
+      <ConfirmButton
+        label="Delete series"
+        confirmLabel="Really delete"
+        variant="danger"
+        unavailable
+        onConfirm={onConfirm}
+        onArmedChange={onArmedChange}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Delete series" })).not.toBeNull();
+    expect(onArmedChange.mock.calls.map(([armed]) => armed)).toEqual([true, false]);
+    const said = screen.queryByText("disarmed — nothing changed");
+    expect(said).not.toBeNull();
+    expect(said?.getAttribute("role")).toBe("status");
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
 });

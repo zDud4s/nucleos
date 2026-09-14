@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { promotionConfirmLabel, promotionConsequence } from "./mode";
+import {
+  MODE_REFUSAL_PROSE,
+  MODE_SENTENCES,
+  promotionConfirmLabel,
+  promotionConsequence,
+} from "./mode";
+import type { PrerequisiteList } from "./mode";
 import { project } from "../test/harness";
 
 /**
@@ -92,5 +98,63 @@ describe("promotionConfirmLabel", () => {
     );
     expect(said).toBe("Let bravo act");
     expect(said).not.toMatch(/slot|proposal|approval/);
+  });
+});
+
+/**
+ * What the mode door says when it answers 422, as data.
+ *
+ * The route answers a bare status for four prerequisites and a fifth that only acting needs, and
+ * three of them are files a person has to go and look at. Inside one sentence those paths could
+ * only be read; as a list each one can be drawn as a path, and the words around it stay one copy.
+ */
+describe("MODE_SENTENCES", () => {
+  it("the 422 prerequisites are data, four items and a plus, three of them paths", () => {
+    // Narrowed through `unknown` by the test itself, so what is asserted is the shape and not
+    // whatever the module's own type already promises.
+    const value: unknown = MODE_SENTENCES.unprocessable;
+    expect(typeof value).toBe("object");
+    const list = value as PrerequisiteList;
+
+    expect(list.items).toHaveLength(4);
+    expect(list.plus).toBeDefined();
+
+    const paths = [...list.items, list.plus]
+      .filter((item) => item.path !== undefined)
+      .map((item) => item.path);
+    expect(paths).toEqual([
+      ".ai/workflow/workflow.md",
+      ".claude/hooks/ask_daemon.py",
+      ".claude/settings.json",
+    ]);
+
+    // The other two answers are still sentences: nothing in them is a list.
+    expect(MODE_SENTENCES.bad_request).toBe("that is not one of the three settings");
+    expect(MODE_SENTENCES.internal).toBe("the núcleo hit an error of its own while changing this");
+  });
+});
+
+/**
+ * The 422 as it read before it became a list, pasted byte for byte from `MODE_SENTENCES`.
+ *
+ * A surface that still prints a sentence must print this one, not a re-join of the list that has
+ * drifted by a comma. Two of its characters are not ASCII, and a paste that lost either would pass
+ * against itself — hence the two guards at the top of the case.
+ */
+const OLD_UNPROCESSABLE =
+  "the núcleo would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these: a folder, .ai/workflow/workflow.md inside it, .claude/hooks/ask_daemon.py on disk, and a PreToolUse hook in .claude/settings.json naming that file — plus, to act, a folder that is a git repository.";
+
+describe("MODE_REFUSAL_PROSE", () => {
+  it("the prose form is byte-identical to the sentence it replaces", () => {
+    // Escapes, not the characters: a guard spelled with the same bytes as the paste proves nothing.
+    expect(OLD_UNPROCESSABLE).toContain("\u2014");
+    expect(OLD_UNPROCESSABLE).toContain("n\u00facleo");
+
+    expect(MODE_REFUSAL_PROSE).toBeDefined();
+    expect(MODE_REFUSAL_PROSE.unprocessable).toBe(OLD_UNPROCESSABLE);
+    expect(MODE_REFUSAL_PROSE.bad_request).toBe("that is not one of the three settings");
+    expect(MODE_REFUSAL_PROSE.internal).toBe(
+      "the núcleo hit an error of its own while changing this",
+    );
   });
 });

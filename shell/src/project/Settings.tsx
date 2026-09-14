@@ -10,7 +10,8 @@ import { useSetWipLimit } from "../data/projects";
 import { useProjects, type AutopilotMode, type ProjectSummary } from "../data/system";
 import {
   MODE_MEANING,
-  MODE_SENTENCES,
+  MODE_REFUSAL_PROSE,
+  PROMOTION_EARNED,
   promotionBlocker,
   promotionConfirmLabel,
   promotionConsequence,
@@ -147,15 +148,13 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
       */}
       {project.mode !== "active" ? (
         <p className={project.promotable ? "text-xs text-text-muted" : "text-xs text-text-faint"}>
-          {project.promotable
-            ? "every class it has exercised clears the bar, and at least one is a class the classifier withheld — it has earned this"
-            : blocker}
+          {project.promotable ? PROMOTION_EARNED : blocker}
         </p>
       ) : null}
 
       {refused !== null ? (
         <p className="rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
-          {MODE_SENTENCES[refused.code] ?? refused.detail}
+          {MODE_REFUSAL_PROSE[refused.code] ?? refused.detail}
         </p>
       ) : null}
     </Block>

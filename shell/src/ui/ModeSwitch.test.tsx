@@ -368,4 +368,106 @@ describe("ModeSwitch", () => {
     const outside = /\.ui-confirm-armed\s*>\s*\.ui-button\s*\{([^}]*)\}/.exec(ui);
     expect(outside?.[1]).toMatch(/box-shadow:\s*0\s+0\s+0\s+3px/);
   });
+
+  /**
+   * Focusable when inert: a segment that cannot be pressed still keeps its tab stop.
+   *
+   * A native `disabled` drops a segment out of the tab order, so arrowing or tabbing through the
+   * track skips exactly the segment whose refusal needs explaining — and the blocker sentence the
+   * caller points at through `actDescribedBy` is attached to a control nobody can land on. With
+   * `focusableWhenInert` the locked segment says it is unavailable with `aria-disabled` instead,
+   * is still described, and still does nothing when pressed.
+   */
+  it("focusable when inert, a locked let it act is aria-disabled, described, and does nothing", () => {
+    const onChoose = vi.fn();
+    render(
+      <ModeSwitch
+        value="shadow"
+        actAllowed={false}
+        actArmedLabel={LABEL}
+        actConsequence={CONSEQUENCE}
+        actDescribedBy="gate"
+        focusableWhenInert
+        onChoose={onChoose}
+      />,
+    );
+
+    const locked = screen.getByRole("button", { name: "Let it act" });
+    expect(locked.getAttribute("aria-disabled")).toBe("true");
+    expect((locked as HTMLButtonElement).disabled).toBe(false);
+    expect(locked.getAttribute("aria-describedby")).toBe("gate");
+
+    // The pair that confirms an unlocked segment, on the same node.
+    fireEvent.click(locked);
+    act(() => {
+      vi.advanceTimersByTime(350);
+    });
+    fireEvent.click(locked);
+    expect(onChoose).not.toHaveBeenCalled();
+  });
+
+  it("focusable when inert, the pressed segment and a busy switch keep their tab stops and do nothing", () => {
+    const onChoose = vi.fn();
+    const { rerender } = render(
+      <ModeSwitch
+        value="shadow"
+        actAllowed
+        actArmedLabel={LABEL}
+        actConsequence={CONSEQUENCE}
+        focusableWhenInert
+        onChoose={onChoose}
+      />,
+    );
+
+    // The setting you are already on is still inert — just not unreachable.
+    const pressed = screen.getByRole("button", { name: "Watch in shadow" });
+    expect(pressed.getAttribute("aria-pressed")).toBe("true");
+    expect((pressed as HTMLButtonElement).disabled).toBe(false);
+    expect(pressed.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(pressed);
+    expect(onChoose).not.toHaveBeenCalled();
+
+    rerender(
+      <ModeSwitch
+        value="shadow"
+        actAllowed
+        busy
+        actArmedLabel={LABEL}
+        actConsequence={CONSEQUENCE}
+        focusableWhenInert
+        onChoose={onChoose}
+      />,
+    );
+
+    // A write in flight: every segment keeps its tab stop, none of them does anything.
+    const segments = ["Turn off", "Watch in shadow", "Let it act"].map((name) =>
+      screen.getByRole("button", { name }),
+    );
+    for (const seg of segments) {
+      expect((seg as HTMLButtonElement).disabled).toBe(false);
+      expect(seg.getAttribute("aria-disabled")).toBe("true");
+      fireEvent.click(seg);
+    }
+    // And the interlock's second press, past the dwell, confirms nothing either.
+    act(() => {
+      vi.advanceTimersByTime(350);
+    });
+    fireEvent.click(segments[2]);
+    expect(onChoose).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The paint follows the refusal, whichever attribute says it.
+   *
+   * `ui.css` takes the green off a `:disabled` approve button; a locked segment that keeps its
+   * focus is not `:disabled`, so the same rule has to name `[aria-disabled="true"]` too, or the
+   * refusing segment is Acting Green again. Read out of the sheet because jsdom applies none.
+   */
+  it("a locked segment that keeps its focus is not green either", () => {
+    const ui = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "ui.css"), "utf8");
+    const rule =
+      /\.ui-button-approve\[aria-disabled="true"\],\s*\.ui-button-approve:disabled\s*\{([^}]*)\}/.exec(ui);
+    expect(rule).not.toBeNull();
+    expect(rule?.[1]).toMatch(/background:\s*none/);
+  });
 });

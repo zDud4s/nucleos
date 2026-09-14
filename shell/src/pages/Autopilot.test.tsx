@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 
@@ -16,6 +19,15 @@ import type { FeedEntry } from "../data/feed";
 import type { Job } from "../data/fleet";
 import type { AutopilotMode, ProjectSummary, Proposal } from "../data/system";
 import { daemonState, project, proposal, renderApp, renderWithRouter } from "../test/harness";
+import {
+  MODE_MEANING,
+  MODE_SENTENCES,
+  PROMOTION_ACTING,
+  PROMOTION_EARNED,
+  prerequisiteText,
+  promotionBlocker,
+  promotionConsequence,
+} from "../lib/mode";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -164,10 +176,346 @@ function switchFor(label: string): HTMLElement {
   return row;
 }
 
-/* ------------------------------------------- A17: the promotion 422 -- */
+/* ------------------------------------ the carousel: one project at a time -- */
 
-describe("Autopilot - a refused promotion asks for the one thing the shell can supply", () => {
-  it("opens the project-root input on a bare 422 and does not invent a cause", async () => {
+/**
+ * A roster shaped like the preview's, handed over in an order that is NOT the urgent one.
+ *
+ * bravo acts with a full queue (an exception), alpha has earned the third setting, delta is still
+ * short of the bar and charlie is off — so most urgent first is bravo, alpha, delta, charlie, while
+ * the roster itself says alpha, bravo, charlie, delta. A page that drew the roster as it was sent
+ * would open on alpha, and every case that reads the order would say so.
+ */
+function previewRoster(): ProjectSummary[] {
+  return [
+    project({
+      project_id: "alpha",
+      mode: "shadow",
+      project_root: "C:/repos/alpha",
+      promotable: true,
+      classes_ready: 5,
+      classes_total: 5,
+      withheld_classes_ready: 2,
+      open_proposals: 3,
+      wip_limit: 4,
+    }),
+    project({
+      project_id: "bravo",
+      mode: "active",
+      project_root: "C:/repos/bravo",
+      queue_full: true,
+      classes_ready: 3,
+      classes_total: 3,
+      withheld_classes_ready: 1,
+      open_proposals: 4,
+      wip_limit: 4,
+    }),
+    project({ project_id: "charlie", mode: "off", project_root: "C:/repos/charlie" }),
+    project({
+      project_id: "delta",
+      mode: "shadow",
+      project_root: "C:/repos/delta",
+      classes_ready: 2,
+      classes_total: 5,
+      withheld_classes_ready: 0,
+    }),
+  ];
+}
+
+const ROSTER_IDS = ["alpha", "bravo", "charlie", "delta"];
+
+function rowOf(roster: readonly ProjectSummary[], id: string): ProjectSummary {
+  const found = roster.find((row) => row.project_id === id);
+  if (found === undefined) throw new Error(`no fixture row for ${id}`);
+  return found;
+}
+
+/** The index's tabs, in the order they are drawn. */
+function tabs(): HTMLElement[] {
+  const index = screen.getByRole("tablist", { name: "Projects, most urgent first" });
+  return within(index).getAllByRole("tab");
+}
+
+/**
+ * Which project each tab names, in order.
+ *
+ * A tab's text STARTS with its project's id (`describeProject`), whatever the sentence says after
+ * it, so the id is read off the front rather than matched against the whole description.
+ */
+function tabOrder(): string[] {
+  return tabs().map(
+    (tab) =>
+      ROSTER_IDS.find((id) => tab.textContent?.startsWith(id) === true) ??
+      `unnamed: ${tab.textContent ?? ""}`,
+  );
+}
+
+/** The one selected tab — exactly one, or the index is lying about what the panel shows. */
+function selectedTab(): HTMLElement {
+  const chosen = tabs().filter((tab) => tab.getAttribute("aria-selected") === "true");
+  expect(chosen).toHaveLength(1);
+  return chosen[0];
+}
+
+/** The focus panel under the fan: the selected project's setting, and nobody else's. */
+function panel(): HTMLElement {
+  return screen.getByRole("tabpanel");
+}
+
+/** The panel's gate. Always one, whatever the project's mode. */
+function gate(): HTMLElement {
+  const found = panel().querySelectorAll<HTMLElement>(".ap-fan-gate");
+  expect(found).toHaveLength(1);
+  return found[0];
+}
+
+/** A key pressed on whatever has focus, the way a keyboard presses it. */
+function press(key: string): void {
+  const target = document.activeElement;
+  if (target === null) throw new Error(`nothing has focus to press ${key} on`);
+  fireEvent.keyDown(target, { key });
+}
+
+/**
+ * Focus and selection land together on the tab at `index`.
+ *
+ * Selection follows focus in this index: the arrow that moves the ring also moves what the panel
+ * is about, so a tab that took focus without being selected would be the one mismatch a keyboard
+ * user could not see from where they are.
+ */
+async function landsOn(index: number): Promise<void> {
+  await waitFor(() => {
+    const all = tabs();
+    expect(document.activeElement).toBe(all[index]);
+    expect(all[index].getAttribute("aria-selected")).toBe("true");
+    expect(all.map((tab) => tab.getAttribute("tabindex"))).toEqual(
+      all.map((_, at) => (at === index ? "0" : "-1")),
+    );
+  });
+}
+
+describe("Autopilot - the carousel sets one project at a time, most urgent first", () => {
+  /**
+   * The index above the fan is the keyboard's way in; the stage never takes focus.
+   *
+   * One tab stop and not four: the selected tab is `tabIndex` 0 and every other is -1, so Tab
+   * enters the index once and leaves it on the next press, and the arrows are what walk it. Three
+   * projects or more are a ring, so the arrows wrap; Home and End go to the ends.
+   */
+  it("the index is a tablist with one tab stop, and the arrows, home and end walk it", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: previewRoster() })));
+
+    await renderCockpit();
+
+    const index = await screen.findByRole("tablist", { name: "Projects, most urgent first" });
+    expect(within(index).getAllByRole("tab")).toHaveLength(4);
+    expect(tabs().map((tab) => tab.getAttribute("tabindex"))).toEqual(["0", "-1", "-1", "-1"]);
+    expect(selectedTab()).toBe(tabs()[0]);
+
+    // Every tab controls the one panel, and the panel is labelled by whichever tab is selected.
+    const shown = panel();
+    expect(shown.id).not.toBe("");
+    for (const tab of tabs()) {
+      expect(tab.id).not.toBe("");
+      expect(tab.getAttribute("aria-controls")).toBe(shown.id);
+    }
+    expect(shown.getAttribute("aria-labelledby")).toBe(tabs()[0].id);
+
+    tabs()[0].focus();
+    press("ArrowRight");
+    await landsOn(1);
+    expect(panel().getAttribute("aria-labelledby")).toBe(tabs()[1].id);
+
+    press("ArrowLeft");
+    await landsOn(0);
+    // A ring: left of the first is the last, and right of the last is the first again.
+    press("ArrowLeft");
+    await landsOn(3);
+    press("ArrowRight");
+    await landsOn(0);
+
+    press("End");
+    await landsOn(3);
+    press("Home");
+    await landsOn(0);
+  });
+
+  /**
+   * The fan opens on what needs you, not on whatever the roster happened to list first.
+   *
+   * An exception (a full queue, or a setting the núcleo refused) outranks acting, acting outranks
+   * earned, earned outranks watching, and off comes last — ties keep the roster's order. The card
+   * in focus wears the map's word for its mode: `active`, the daemon's literal, never "acting".
+   */
+  it("orders the roster most urgent first and opens on the most urgent project, whose card wears the map's word", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: previewRoster() })));
+
+    await renderCockpit();
+
+    await screen.findByRole("tablist", { name: "Projects, most urgent first" });
+    expect(tabOrder()).toEqual(["bravo", "alpha", "delta", "charlie"]);
+    expect(selectedTab().textContent?.startsWith("bravo")).toBe(true);
+    expect(panel().querySelector(".ap-fan-focus-title strong")?.textContent).toBe("bravo");
+
+    // The stage is drawing, not controls: hidden from assistive technology as a whole, so the
+    // focused card is read off the page by its class and not by any role.
+    const card = document.querySelector(".ap-fan-card-focus");
+    expect(card).not.toBeNull();
+    expect(card?.closest('[aria-hidden="true"]')).not.toBeNull();
+    expect(card?.textContent).toContain("bravo");
+    const words = Array.from(card?.querySelectorAll(".ui-badge") ?? []).map((badge) => badge.textContent);
+    expect(words).toContain("active");
+    expect(words).not.toContain("acting");
+
+    // And the panels below follow the project the fan opened on.
+    expect(await screen.findByText("nothing is waiting for a verdict on bravo.")).toBeDefined();
+  });
+
+  /**
+   * Re-ranking after a change would move the card somebody just acted on out from under them.
+   *
+   * alpha turned off ranks last on a fresh sort; held, it keeps its place and stays selected. And
+   * the change is not confirmed by a new line on screen — that would push the page down under the
+   * hand that made it — only by the pressed segment, and aloud.
+   */
+  it("does not reorder the index after a mode change and says the change only aloud", async () => {
+    const world = cockpitWorld({ projects: previewRoster() });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    await screen.findByRole("tablist", { name: "Projects, most urgent first" });
+    tabs()[0].focus();
+    press("ArrowRight");
+    await landsOn(1);
+    expect(selectedTab().textContent?.startsWith("alpha")).toBe(true);
+
+    fireEvent.click(within(panel()).getByRole("button", { name: "Turn off" }));
+
+    await waitFor(() => {
+      expect(
+        within(panel()).getByRole("button", { name: "Turn off" }).getAttribute("aria-pressed"),
+      ).toBe("true");
+    });
+    expect(rowOf(world.projects, "alpha").mode).toBe("off");
+
+    expect(tabOrder()).toEqual(["bravo", "alpha", "delta", "charlie"]);
+    expect(selectedTab().textContent?.startsWith("alpha")).toBe(true);
+
+    const said = `alpha is now off — ${MODE_MEANING.off}`;
+    await waitFor(() => {
+      const regions = Array.from(document.querySelectorAll('[aria-live="polite"]'));
+      expect(regions.map((region) => region.textContent)).toContain(said);
+    });
+    for (const element of screen.getAllByText(said)) {
+      expect(element.closest(".sr-only")).not.toBeNull();
+    }
+  });
+
+  /**
+   * The gate is a line every project has, so the panel never grows or shrinks by one as the fan
+   * turns. Acting: how to stop it. Earned: that it has. Otherwise: why not, in the núcleo's terms.
+   * Armed: what confirming would do — in the same line, which "Let it act" is described by.
+   */
+  it("states the gate for every project, an acting one included, and shows the consequence in it while armed", async () => {
+    const roster = previewRoster();
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: roster })));
+
+    await renderCockpit();
+
+    await screen.findByRole("tablist", { name: "Projects, most urgent first" });
+
+    // bravo acts: the gate is passed, and the line says how to take it back.
+    expect(gate().textContent).toBe(PROMOTION_ACTING);
+    expect(gate().className).not.toContain("ap-fan-gate-locked");
+    expect(gate().id).not.toBe("");
+
+    const describedGate = () =>
+      document.getElementById(
+        within(panel()).getByRole("button", { name: "Let it act" }).getAttribute("aria-describedby") ??
+          "",
+      );
+
+    tabs()[0].focus();
+    press("ArrowRight");
+    await landsOn(1);
+    expect(gate().textContent).toBe(PROMOTION_EARNED);
+    expect(gate().className).not.toContain("ap-fan-gate-locked");
+    expect(describedGate()).toBe(gate());
+
+    press("ArrowRight");
+    await landsOn(2);
+    const delta = rowOf(roster, "delta");
+    expect(gate().textContent).toBe(promotionBlocker(delta, delta.withheld_classes_ready ?? 0));
+    expect(gate().className).toContain("ap-fan-gate-locked");
+    expect(describedGate()).toBe(gate());
+
+    press("ArrowRight");
+    await landsOn(3);
+    const charlie = rowOf(roster, "charlie");
+    expect(gate().textContent).toBe(promotionBlocker(charlie, charlie.withheld_classes_ready ?? 0));
+    expect(gate().className).toContain("ap-fan-gate-locked");
+    expect(describedGate()).toBe(gate());
+
+    // Back to alpha, and arm it: the gate now says what confirming would do. Read through the
+    // description and not by text — while armed the sentence is also in the interlock's live
+    // region, and a text query would fail on the ambiguity rather than on anything being wrong.
+    press("Home");
+    await landsOn(0);
+    press("ArrowRight");
+    await landsOn(1);
+    fireEvent.click(within(panel()).getByRole("button", { name: "Let it act" }));
+
+    const armed = within(panel()).getByRole("button", { name: "Let alpha act" });
+    const described = document.getElementById(armed.getAttribute("aria-describedby") ?? "");
+    expect(described).toBe(gate());
+    expect(gate().textContent).toContain(promotionConsequence(rowOf(roster, "alpha")));
+  });
+
+  /**
+   * Locked and still reachable. A native `disabled` takes the button out of the tab order, and
+   * with it the one sentence that says why it is locked; `aria-disabled` keeps both, and the
+   * press does nothing.
+   */
+  it("keeps let it act focusable and inert while the núcleo says the project is not ready", async () => {
+    const beta = project({
+      project_id: "beta",
+      mode: "shadow",
+      project_root: "C:/repos/beta",
+      promotable: false,
+      classes_ready: 0,
+      classes_total: 0,
+      withheld_classes_ready: 0,
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: [beta] })));
+
+    await renderCockpit();
+
+    const offer = (await screen.findByRole("button", { name: "Let it act" })) as HTMLButtonElement;
+    expect(offer.getAttribute("aria-disabled")).toBe("true");
+    expect(offer.disabled).toBe(false);
+    offer.focus();
+    expect(document.activeElement).toBe(offer);
+
+    const why = document.getElementById(offer.getAttribute("aria-describedby") ?? "");
+    expect(why).not.toBeNull();
+    expect(why?.className).toContain("ap-fan-gate");
+    expect(why?.className).toContain("ap-fan-gate-locked");
+    expect(why?.textContent).toBe(promotionBlocker(beta, 0));
+
+    fireEvent.click(offer);
+    expect(screen.queryByRole("button", { name: "Let beta act" })).toBeNull();
+    expect(offer.getAttribute("aria-disabled")).toBe("true");
+    expect(daemon.apiFetch.mock.calls.some(([path]) => path === "/autopilot/state")).toBe(false);
+  });
+
+  /**
+   * The bare 422: four prerequisites share one status with an empty body, so the page lists them
+   * all — each path drawn as a path — and admits it does not know which is missing. Then it hands
+   * focus to the one of them the shell can supply, and the retry sends the refused mode again with
+   * the folder that was typed.
+   */
+  it("a bare 422 lists every prerequisite, moves focus to the folder field, and the retry carries the folder", async () => {
     const world = cockpitWorld({
       projects: [
         project({
@@ -188,68 +536,40 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
 
     await renderCockpit();
 
-    // Nothing asks for a folder until something says one is missing.
-    expect(await screen.findByRole("button", { name: "Let it act" })).toBeDefined();
     expect(screen.queryByLabelText("Folder for alpha")).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Let it act" }));
-    /*
-      Armed, the segment says a short line that names the project — and the consequence
-      is a line of its own, under the row.
-
-      It used to be the armed LABEL: "alpha acts on its own — no ceiling on proposals, no
-      approval", 52 characters inside `.ap-project-row`'s last track (`minmax(0, 1fr)`). It
-      wrapped, and the row grew from 90.6 to 125.0 pixels — the button sliding out from under
-      a pointer that has four seconds left to press it a second time. So the segment says
-      `Let alpha act` and the sentence goes on `.ap-project-consequence`, full width, where
-      it costs the row a line it was going to need anyway and moves nothing above it.
-
-      `alpha` carries a null `wip_limit` here, which is no ceiling and is never written as a
-      zero — the reason the sentence is worth putting anywhere at all.
-
-      Found by class and not by text: the sentence is now in the document twice while armed
-      — once on the visible line and once inside the interlock's live region, which says it
-      rather than showing it — so `getByText` matches two elements and fails on the
-      ambiguity rather than on anything being wrong.
-    */
-    const ARMED = "Let alpha act";
-    const consequence = document.querySelector(".ap-project-consequence");
-    expect(consequence).not.toBeNull();
-    expect(consequence?.textContent).toContain("alpha acts on its own");
-    expect(consequence?.textContent).toContain("no ceiling on proposals");
-
-    // And the interlock claims no pressed state while it is still an offer: in this group
-    // `aria-pressed` means "this IS the setting", and nothing has been set yet.
-    expect(screen.getByRole("button", { name: ARMED }).getAttribute("aria-pressed")).toBeNull();
+    fireEvent.click(await screen.findByRole("button", { name: "Let it act" }));
 
     // Clicks inside the 300 ms dwell are swallowed and leave the control armed,
-    // so retrying until it disarms is safe. The mutation lands a tick later, so
-    // it is a separate wait.
+    // so retrying until it disarms is safe.
+    const ARMED = "Let alpha act";
     await waitFor(() => {
       const armed = screen.queryByRole("button", { name: ARMED });
       if (armed !== null) fireEvent.click(armed);
       expect(screen.queryByRole("button", { name: ARMED })).toBeNull();
     });
 
-    // And the sentence stops being SHOWN with the interlock it belonged to. It does not leave
-    // the document: the switch points at it whether or not it is armed, and an
-    // `aria-describedby` naming an element that is not there describes nothing.
-    expect(document.querySelector(".ap-project-consequence")).toBeNull();
-    expect(screen.getByText(/alpha acts on its own/).closest(".sr-only")).not.toBeNull();
+    await waitFor(() => {
+      expect(document.querySelector(".ap-fan-refusal")).not.toBeNull();
+    });
+    const refusal = document.querySelector<HTMLElement>(".ap-fan-refusal");
+    expect(refusal?.className).toContain("ui-note-refusal");
+    expect(refusal?.getAttribute("role")).toBe("status");
+    expect(refusal?.querySelector(".ui-note-code")?.textContent).toBe("unprocessable");
+    expect(refusal?.textContent).toContain(MODE_SENTENCES.unprocessable.lead);
+    expect(refusal?.textContent).not.toContain("Unprocessable Entity");
 
-    const input = await screen.findByLabelText("Folder for alpha");
+    const every = [...MODE_SENTENCES.unprocessable.items, MODE_SENTENCES.unprocessable.plus];
+    const listed = Array.from(refusal?.querySelectorAll("ul.ap-fan-prereqs > li") ?? []);
+    expect(listed.map((item) => item.textContent)).toEqual(every.map(prerequisiteText));
+    expect(
+      Array.from(refusal?.querySelectorAll("ul.ap-fan-prereqs code") ?? []).map((path) => path.textContent),
+    ).toEqual(every.flatMap((item) => (item.path === undefined ? [] : [item.path])));
 
-    // The message names the whole set and admits which one is unknown. Four
-    // different prerequisites map onto this one bare status in the núcleo, so
-    // naming a single cause would be wrong three times out of four.
-    const said = screen.getByText(/did not say which prerequisite is missing/);
-    expect(said.textContent).toMatch(/\.ai\/workflow\/workflow\.md/);
-    expect(said.textContent).toMatch(/PreToolUse hook/);
-    // And it did not pass the daemon's non-sentence off as an explanation.
-    expect(said.textContent).not.toMatch(/Unprocessable Entity/);
+    const input = screen.getByLabelText("Folder for alpha");
+    await waitFor(() => {
+      expect(document.activeElement).toBe(input);
+    });
 
-    // The retry carries the folder that was typed, on the same mode that was
-    // refused — without that, the input would be a box that does nothing.
     world.refuseMode = null;
     fireEvent.change(input, { target: { value: "C:/repos/alpha" } });
     fireEvent.click(screen.getByRole("button", { name: "Try again with this folder" }));
@@ -266,140 +586,68 @@ describe("Autopilot - a refused promotion asks for the one thing the shell can s
     });
   });
 
-  it("a project that cannot be promoted says why in the row", async () => {
-    const world = cockpitWorld({
-      projects: [
-        project({
-          project_id: "beta",
-          mode: "shadow",
-          project_root: "C:/repos/beta",
-          promotable: false,
-          classes_ready: 0,
-          classes_total: 0,
-          withheld_classes_ready: 0,
-        }),
-      ],
-    });
-    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+  it("says 1 project on the roster, not 1 projects", async () => {
+    daemon.apiFetch.mockImplementation(
+      cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] })),
+    );
 
     await renderCockpit();
 
-    const promote = await screen.findByRole("button", { name: "Let it act" });
-    expect((promote as HTMLButtonElement).disabled).toBe(true);
-    // And it carries no title. The reason used to ride here as a tooltip as well as in
-    // the row below, which made the hover a third copy of one sentence — and the only
-    // copy you had to find with a mouse. The row saying it in words is the answer.
-    expect(promote.getAttribute("title")).toBeNull();
-    expect(
-      screen.getByText(
-        /nothing has been recorded in shadow yet.*no evidence is not the same as good evidence/,
-      ),
-    ).toBeDefined();
+    const card = await screen.findByRole("article", { name: "Acting on their own" });
+    await waitFor(() => {
+      expect(card.querySelector(".ui-stat-detail")?.textContent).toContain("1 project on the roster");
+    });
+    expect(card.textContent).not.toContain("1 projects");
+
+    // One project is the whole index: nothing to choose between, so no tablist is drawn.
+    expect(screen.queryByRole("tablist")).toBeNull();
   });
 
   /**
-   * One decision, one control — and one of it per row, because the roster sets the mode per
-   * project.
-   *
-   * The three verbs used to be three loose buttons here and three different words (`off`,
-   * `shadow`, `active`) on the project's own page. They are one segmented control now, and which
-   * segment is pressed is how a row says what it is set to.
+   * Names only for what a glance must find — a full queue, and whatever is acting — and only while
+   * two of them fit; everything else is a count. Acting, shadow and off partition the roster, so
+   * every project is counted once: the full queue and "ready to be let out" are clauses about
+   * projects already counted, never a fourth or fifth group.
    */
-  it("the roster offers one segmented control per project", async () => {
-    const world = cockpitWorld({
-      projects: [
-        project({
-          project_id: "alpha",
-          mode: "shadow",
-          project_root: "C:/repos/alpha",
-          promotable: true,
-          classes_ready: 2,
-          classes_total: 2,
-          withheld_classes_ready: 1,
-        }),
-        project({
-          project_id: "beta",
-          mode: "off",
-          project_root: "C:/repos/beta",
-        }),
-      ],
+  it("the headline names the full queue and the acting project and still counts every project once", async () => {
+    const roster = previewRoster();
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: roster })));
+
+    const first = await renderCockpit();
+
+    const said =
+      "bravo’s queue is full; bravo acts on its own; 2 watching in shadow, 1 of them ready to be let out; 1 off";
+    await waitFor(() => {
+      expect(document.querySelector(".ap-headline")?.textContent).toBe(said);
     });
-    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+    // 1 acting + 2 in shadow + 1 off is every project on the roster, once.
+    expect(1 + 2 + 1).toBe(roster.length);
+    first.unmount();
+
+    // Three acting is more than a sentence carries by name, so they become a count.
+    const many = ["echo", "foxtrot", "golf"].map((id) => project({ project_id: id, mode: "active" }));
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: many })));
 
     await renderCockpit();
 
-    const groups = await screen.findAllByRole("group", { name: "Autopilot mode" });
-    expect(groups).toHaveLength(2);
-    for (const group of groups) {
-      expect(within(group).getByRole("button", { name: "Turn off" })).toBeDefined();
-      expect(within(group).getByRole("button", { name: "Watch in shadow" })).toBeDefined();
-      expect(within(group).getByRole("button", { name: "Let it act" })).toBeDefined();
-    }
-
-    const row = screen.getByText("beta").closest("li");
-    if (row === null) throw new Error("no row for beta");
-    const group = within(row).getByRole("group", { name: "Autopilot mode" });
-    expect(
-      within(group).getByRole("button", { name: "Turn off" }).getAttribute("aria-pressed"),
-    ).toBe("true");
-    expect(
-      within(group).getByRole("button", { name: "Watch in shadow" }).getAttribute("aria-pressed"),
-    ).toBe("false");
+    await waitFor(() => {
+      expect(document.querySelector(".ap-headline")?.textContent).toBe("3 projects act on their own");
+    });
   });
 
-  /**
-   * The sentence under the row is the armed button's description, and it is one BEFORE the press.
-   *
-   * Sighted, the pairing is obvious: the line appears the moment the segment arms, directly
-   * under the row it belongs to. To a screen reader it was two unrelated things — a button
-   * that had quietly renamed itself, and a sentence somewhere below. The id is `useId`'s
-   * rather than a literal because the roster renders one of these per project, and four rows
-   * sharing one id would point every switch at the first row's sentence.
-   *
-   * Pointing at it only while armed was the same mistake one level down: `aria-describedby`
-   * arriving in the render that swaps a focused button's label is not re-announced by any
-   * major screen reader, so the description was attached at the one moment it could not be
-   * heard. The element is in the document at rest as `.sr-only` — `position: absolute`, so it
-   * takes no grid track and the row keeps the height it was measured at — and arming swaps
-   * the class rather than mounting anything.
-   */
-  it("the consequence describes the switch before the press", async () => {
-    const world = cockpitWorld({
-      projects: [
-        project({
-          project_id: "alpha",
-          mode: "shadow",
-          project_root: "C:/repos/alpha",
-          promotable: true,
-          classes_ready: 2,
-          classes_total: 2,
-          withheld_classes_ready: 1,
-        }),
-      ],
-    });
-    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+  it("the page sheet holds the gate, the headline and the stat detail at two lines", () => {
+    // Read the way `sheet-layout.test.ts` reads a page sheet: comments stripped, one rule's body.
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "autopilot.css"), "utf8").replace(
+      /\/\*[\s\S]*?\*\//g,
+      "",
+    );
+    const body = (rule: RegExp) => rule.exec(css)?.[1] ?? "";
 
-    await renderCockpit();
-
-    const offer = await screen.findByRole("button", { name: "Let it act" });
-    const describedBy = offer.getAttribute("aria-describedby");
-    expect(describedBy).not.toBeNull();
-
-    // Described at rest, and the description resolves: a sentence nobody can see and every
-    // screen reader can, on a control that has not been touched yet.
-    const described = document.getElementById(describedBy ?? "");
-    expect(described).not.toBeNull();
-    expect(described?.className).toBe("sr-only");
-    expect(described?.textContent).toContain("alpha acts on its own");
-
-    fireEvent.click(offer);
-
-    // Arming shows it, on the full-width line under the row — same element, same id, same
-    // sentence. The armed button still points at it.
-    expect(described?.className).toBe("ap-project-consequence");
-    expect(
-      screen.getByRole("button", { name: "Let alpha act" }).getAttribute("aria-describedby"),
-    ).toBe(describedBy);
+    // The gate is always two lines tall, one sentence or two, so the switch below it never moves
+    // as the fan turns from a short gate to a long one.
+    expect(body(/\.ap-fan-gate\s*\{([^}]*)\}/)).toMatch(/min-height:\s*calc\(\s*2lh\s*\+/);
+    expect(body(/\.ap-headline\s*\{([^}]*)\}/)).toMatch(/min-height:\s*2lh\b/);
+    expect(body(/\.ap-stats\s+\.ui-stat-detail\s*\{([^}]*)\}/)).toMatch(/min-height:\s*2lh\b/);
   });
 
   it("the budget period is a word and not a stem", async () => {
@@ -653,38 +901,5 @@ describe("Autopilot - map-authored readings", () => {
     expect(reading.textContent).toBe("released");
     expect(reading.className).toContain("ui-badge-off");
     expect(within(team).queryByText("running")).toBeNull();
-  });
-
-  it("a project's mode is the map's word, not the page's", async () => {
-    const world = cockpitWorld({ projects: [project({ project_id: "alpha", mode: "active" })] });
-    daemon.apiFetch.mockImplementation(cockpitFetch(world));
-    await renderCockpit();
-    const row = (await screen.findByText("alpha")).closest("li");
-    if (row === null) throw new Error("no roster row for alpha");
-    const reading = within(row).getByText("active");
-    expect(reading.textContent).toBe("active");
-    expect(within(row).queryByText("acting")).toBeNull();
-  });
-
-  it("the headline partitions the roster and counts nobody twice", async () => {
-    const world = cockpitWorld({
-      projects: [
-        project({ project_id: "bravo", mode: "active", promotable: false }),
-        project({ project_id: "alpha", mode: "shadow", promotable: true }),
-        project({ project_id: "delta", mode: "shadow", promotable: false }),
-        project({ project_id: "charlie", mode: "off", promotable: false }),
-      ],
-    });
-    daemon.apiFetch.mockImplementation(cockpitFetch(world));
-
-    await renderCockpit();
-
-    const headline = await screen.findByText(
-      "1 acting on its own; 2 watching in shadow, 1 of them ready to leave it; 1 off",
-    );
-    expect(headline.textContent).toBe(
-      "1 acting on its own; 2 watching in shadow, 1 of them ready to leave it; 1 off",
-    );
-    expect(1 + 2 + 1).toBe(world.projects.length);
   });
 });

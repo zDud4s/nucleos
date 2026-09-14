@@ -46,6 +46,19 @@ export interface ModeSwitchProps {
   actDescribedBy?: string;
   /** A write is in flight; every segment is inert. */
   busy?: boolean;
+  /**
+   * Inert segments keep their tab stop: `aria-disabled="true"` and a click that does nothing,
+   * instead of native `disabled`.
+   *
+   * Inert means the pressed segment, all three while `busy`, the pressed "Let it act" once the
+   * project is `active`, and the interlock while `!actAllowed` (which then reaches
+   * `ConfirmButton` as `unavailable`, never as `disabled`). Native `disabled` drops focus to
+   * `<body>` the moment the segment you just pressed becomes the setting, and it takes the
+   * locked interlock out of the tab order together with the `actDescribedBy` sentence that says
+   * why it is locked. Off or absent, the rendered output is exactly what it was before this
+   * existed.
+   */
+  focusableWhenInert?: boolean;
   onChoose: (mode: SwitchMode) => void;
 }
 
@@ -88,6 +101,10 @@ export interface ModeSwitchProps {
  * hardest to take back — and a plain pressed segment once it IS the setting, because there is then
  * nothing left to confirm. What it never is, is green while locked: see `.ui-button-approve:disabled`
  * in `ui.css`. A control that cannot be pressed does not advertise the consequence of pressing it.
+ *
+ * `focusableWhenInert` exists for one caller, the Autopilot carousel: it shows one switch on
+ * screen at a time, so the focus on the segment somebody just pressed has to survive the change
+ * that press made, rather than falling to `<body>` when that segment becomes the setting.
  */
 export function ModeSwitch({
   value,
@@ -97,16 +114,32 @@ export function ModeSwitch({
   onArmedChange,
   actDescribedBy,
   busy,
+  focusableWhenInert,
   onChoose,
 }: ModeSwitchProps) {
+  const focusable = focusableWhenInert === true;
+  // How an inert segment says so. Without the opt-in this is `disabled`, the exact expression
+  // each segment carried before; with it the segment keeps its tab stop and says it with
+  // `aria-disabled` instead, and `choose` below is what makes the press do nothing.
+  function inertness(inert: boolean | undefined) {
+    return focusable
+      ? { "aria-disabled": inert === true ? ("true" as const) : undefined }
+      : { disabled: inert };
+  }
+  function choose(mode: SwitchMode, inert: boolean | undefined) {
+    if (inert === true) return;
+    onChoose(mode);
+  }
+  const offInert = value === "off" || busy;
+  const shadowInert = value === "shadow" || busy;
   return (
     <div className="ui-switch" role="group" aria-label="Autopilot mode">
       <button
         type="button"
         className="ui-switch-seg"
         aria-pressed={value === "off"}
-        disabled={value === "off" || busy}
-        onClick={() => onChoose("off")}
+        {...inertness(offInert)}
+        onClick={() => choose("off", offInert)}
       >
         Turn off
       </button>
@@ -114,13 +147,13 @@ export function ModeSwitch({
         type="button"
         className="ui-switch-seg"
         aria-pressed={value === "shadow"}
-        disabled={value === "shadow" || busy}
-        onClick={() => onChoose("shadow")}
+        {...inertness(shadowInert)}
+        onClick={() => choose("shadow", shadowInert)}
       >
         Watch in shadow
       </button>
       {value === "active" ? (
-        <button type="button" className="ui-switch-seg" aria-pressed disabled>
+        <button type="button" className="ui-switch-seg" aria-pressed {...inertness(true)}>
           Let it act
         </button>
       ) : (
@@ -137,7 +170,8 @@ export function ModeSwitch({
             confirmLabel={actArmedLabel}
             sayAs={actConsequence}
             variant="approve"
-            disabled={!actAllowed || busy}
+            disabled={focusable ? undefined : !actAllowed || busy}
+            unavailable={focusable ? !actAllowed || busy === true : undefined}
             onArmedChange={onArmedChange}
             describedBy={actDescribedBy}
             onConfirm={() => onChoose("active")}

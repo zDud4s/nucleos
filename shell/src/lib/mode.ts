@@ -103,15 +103,91 @@ export function promotionConfirmLabel(project: ProjectSummary): string {
 }
 
 /**
+ * One prerequisite of a mode change: words before a path, the path, words after it.
+ *
+ * The path is its own field so a surface with room can draw it as a path (`<code>`) — three of
+ * the five prerequisites are files a person has to go and look at, and inside a sentence they could
+ * only be read. Any of the three parts may be absent; `prerequisiteText` joins them back into words.
+ */
+export interface Prerequisite {
+  text?: string;
+  path?: string;
+  after?: string;
+}
+
+/**
+ * The 422's prerequisites as data: a lead sentence, the four things every mode needs, and the one
+ * more thing that only acting needs.
+ */
+export interface PrerequisiteList {
+  lead: string;
+  items: readonly Prerequisite[];
+  plus: Prerequisite;
+}
+
+/**
  * What the mode door says when it says no.
  *
  * The 422 is the one worth writing copy for, and the copy is deliberately a *list* rather than a
  * diagnosis: the route answers a bare status with an empty body for four different prerequisites,
- * so the honest sentence names all four and admits which one is unknown.
+ * so the honest answer names all four and admits which one is unknown.
+ *
+ * **The list is data, and each surface renders it the way it can** — as a list where there is room,
+ * each path drawn as a path, or as the prose sentence `MODE_REFUSAL_PROSE` joins from it, inside a
+ * `<p>`. The words stay one copy either way; only the drawing differs.
  */
-export const MODE_SENTENCES: Record<string, string> = {
-  unprocessable:
-    "the núcleo would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these: a folder, .ai/workflow/workflow.md inside it, .claude/hooks/ask_daemon.py on disk, and a PreToolUse hook in .claude/settings.json naming that file — plus, to act, a folder that is a git repository.",
+export const MODE_SENTENCES: {
+  unprocessable: PrerequisiteList;
+  bad_request: string;
+  internal: string;
+} = {
+  unprocessable: {
+    lead: "the núcleo would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these:",
+    items: [
+      { text: "a folder" },
+      { path: ".ai/workflow/workflow.md", after: " inside it" },
+      { path: ".claude/hooks/ask_daemon.py", after: " on disk" },
+      { text: "a PreToolUse hook in ", path: ".claude/settings.json", after: " naming that file" },
+    ],
+    plus: { text: "to act, a folder that is a git repository" },
+  },
   bad_request: "that is not one of the three settings",
   internal: "the núcleo hit an error of its own while changing this",
 };
+
+/** One prerequisite as plain words: its text, its path and what follows the path, joined. */
+export function prerequisiteText(item: Prerequisite): string {
+  return `${item.text ?? ""}${item.path ?? ""}${item.after ?? ""}`;
+}
+
+/** The prerequisite list as the one sentence a surface with no room for a list prints. */
+function prerequisiteProse(list: PrerequisiteList): string {
+  const leading = list.items.slice(0, -1).map(prerequisiteText).join(", ");
+  const last = list.items[list.items.length - 1];
+  const final = last === undefined ? "" : prerequisiteText(last);
+  return `${list.lead} ${leading}, and ${final} — plus, ${prerequisiteText(list.plus)}.`;
+}
+
+/**
+ * The mode door's refusals as sentences, keyed by the refusal code, for a surface that prints one.
+ *
+ * `unprocessable` is joined from the list above, never retyped: byte for byte the sentence the
+ * list replaced, so a page that still prints prose says what it always said.
+ */
+export const MODE_REFUSAL_PROSE: Record<string, string> = {
+  unprocessable: prerequisiteProse(MODE_SENTENCES.unprocessable),
+  bad_request: MODE_SENTENCES.bad_request,
+  internal: MODE_SENTENCES.internal,
+};
+
+/**
+ * The gate, once a project in shadow has earned the third setting.
+ *
+ * Shared because two surfaces state the gate — a project's own settings and the Autopilot fan's
+ * cards — and two copies of a sentence about restraint would eventually say two different things.
+ */
+export const PROMOTION_EARNED =
+  "every class it has exercised clears the bar, and at least one is a class the classifier withheld — it has earned this";
+
+/** What stands where the gate was, once a project acts: how to stop it, not the gate it passed. */
+export const PROMOTION_ACTING = "acting on its own — “Turn off” stops it at once";

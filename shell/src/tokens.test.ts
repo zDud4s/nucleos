@@ -192,3 +192,103 @@ describe("the tokens that do not belong to a theme", () => {
     }
   });
 });
+
+/**
+ * WCAG 2.x contrast, computed from the tokens themselves.
+ *
+ * Only two literal spellings are accepted, `#rrggbb` and `rgba(r, g, b, a)`,
+ * and anything else throws: a token that became a `var()` or a named colour
+ * must fail loudly here rather than be skipped and read as a pass.
+ */
+type Rgba = { r: number; g: number; b: number; a: number };
+
+function colour(v: string | undefined): Rgba {
+  if (v === undefined) throw new Error("colour: token is not declared");
+  const hex = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(v);
+  if (hex) {
+    return { r: parseInt(hex[1], 16), g: parseInt(hex[2], 16), b: parseInt(hex[3], 16), a: 1 };
+  }
+  const rgba = /^rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\d.]+)\s*\)$/.exec(v);
+  if (rgba) {
+    return { r: Number(rgba[1]), g: Number(rgba[2]), b: Number(rgba[3]), a: Number(rgba[4]) };
+  }
+  throw new Error(`colour: not a #rrggbb or rgba() literal: ${v}`);
+}
+
+/** `fg` painted over an opaque `ground`, channel by channel. The result is opaque. */
+function over(fg: Rgba, ground: Rgba): Rgba {
+  if (ground.a !== 1) throw new Error("over: the ground must be opaque");
+  const mix = (f: number, g: number) => f * fg.a + g * (1 - fg.a);
+  return { r: mix(fg.r, ground.r), g: mix(fg.g, ground.g), b: mix(fg.b, ground.b), a: 1 };
+}
+
+/** WCAG 2.x relative luminance of an opaque colour. */
+function luminance(c: Rgba): number {
+  if (c.a !== 1) throw new Error("luminance: composite a translucent colour with over() first");
+  const lin = (v: number) => {
+    const s = v / 255;
+    return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+}
+
+/** (Lmax + 0.05) / (Lmin + 0.05). */
+function contrast(x: Rgba, y: Rgba): number {
+  const [lx, ly] = [luminance(x), luminance(y)];
+  return (Math.max(lx, ly) + 0.05) / (Math.min(lx, ly) + 0.05);
+}
+
+/**
+ * The light theme, where these colours are read on white and near-white.
+ *
+ * AA is 4.5:1 for text at this size and 3:1 for a non-text indicator such as
+ * the focus ring (WCAG 1.4.3 and 1.4.11).
+ */
+describe("the light theme clears AA where it is read", () => {
+  const css = read("tokens.css");
+  const lightTokens = declarations(css.slice(css.indexOf("@media")));
+  const token = (name: string) => colour(lightTokens.get(name));
+
+  it("light --tone-active-fg clears 4.5:1 on its own fill over surface and sunken", () => {
+    const fg = token("--tone-active-fg");
+    const fill = token("--tone-active-bg");
+    for (const groundName of ["--surface", "--surface-sunken"]) {
+      const ratio = contrast(fg, over(fill, token(groundName)));
+      expect(ratio, `--tone-active-fg on --tone-active-bg over ${groundName}: ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  it("light --focus-ring clears 3:1 on surface, bg and sunken", () => {
+    const ring = token("--focus-ring");
+    for (const groundName of ["--surface", "--bg", "--surface-sunken"]) {
+      const ground = token(groundName);
+      const ratio = contrast(over(ring, ground), ground);
+      expect(ratio, `--focus-ring over ${groundName}: ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it("light --text-muted clears 4.5:1 on surface and sunken", () => {
+    const muted = token("--text-muted");
+    for (const groundName of ["--surface", "--surface-sunken"]) {
+      const ratio = contrast(muted, token(groundName));
+      expect(ratio, `--text-muted on ${groundName}: ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  /**
+   * Both rules are set at `--text-xs` (11 px), where `--text-faint` is under
+   * the 4.5:1 floor; `--text-muted` is the step on the ladder that clears it.
+   */
+  it("the stat detail and the stale note wear --text-muted", () => {
+    const ui = read("ui.css");
+    const rules: ReadonlyArray<readonly [string, RegExp]> = [
+      [".ui-stat-detail", /\.ui-stat-detail\s*\{([^}]*)\}/],
+      [".ui-note-stale", /\.ui-note-stale\s*\{([^}]*)\}/],
+    ];
+    for (const [selector, pattern] of rules) {
+      const rule = pattern.exec(ui);
+      expect(rule, `${selector} should have a rule in ui.css`).not.toBeNull();
+      expect(rule![1], `${selector} colour`).toMatch(/(^|[\s;])color\s*:\s*var\(--text-muted\)\s*;/);
+    }
+  });
+});
