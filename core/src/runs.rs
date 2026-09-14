@@ -1814,6 +1814,15 @@ fn spawn_run(
                     warn_on_terminal_write_err(&completed, id, terminal_status);
                     let terminal_write_won =
                         matches!(&completed, Ok(result) if result.rows_affected() == 1);
+                    // A progress deadline kills the CLI before it can report what it spent, so the
+                    // write above just recorded that NULL as final. The wall-clock arm approximates
+                    // such a run from its duration; one cut by its own runner's deadline arrives
+                    // here instead, and was simply free - run 900501 sat silent for half an hour on
+                    // 2026-09-13 and the budget never saw it. Inside the won-the-race guard for the
+                    // wall-clock arm's reason: a lost CAS means another terminator owns the row.
+                    if terminal_status == "timed_out" && terminal_write_won {
+                        record_time_approx_cost(&pool, id).await;
+                    }
                     // The feed row announces this run *finished* — only true if this write won the
                     // CAS race. `Ok` with 0 rows means a concurrent terminator (cancel/timeout) got
                     // there first, so this attempt never actually completed as far as the runs table
@@ -9562,6 +9571,50 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         panic!(
             "silent run did not reach timed_out before its wall clock, last status: {status}"
         );
+    }
+
+    /// The runner's progress deadline is the other way a run ends `timed_out`, and the CLI it kills
+    /// never reports a cost. Run 900501 on 2026-09-13 was recorded with `cost_usd` NULL after half an
+    /// hour of silence, so the budget counted it as free; the wall-clock arm had always approximated
+    /// the same run from its duration, and this is that run arriving through the other door.
+    #[tokio::test]
+    async fn a_run_timed_out_for_silence_is_charged_for_its_time() {
+        let (mut state, runner) = test_state_with_runner(None, Duration::from_secs(10)).await;
+        state.progress_timeout = Duration::from_secs(30);
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: crate::runner::PROGRESS_TIMEOUT_EXIT_CODE,
+            stdout: String::new(),
+            stderr: String::new(),
+            session_id: Some("silent-session".into()),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+        });
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "a run its progress deadline cut short").await;
+
+        let mut status = String::new();
+        let mut cost: Option<f64> = None;
+        for _ in 0..100 {
+            status = get_run_status(&app, created.id).await.status;
+            cost = sqlx::query_scalar("SELECT cost_usd FROM runs WHERE id = ?")
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if status == "timed_out" && cost.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status, "timed_out", "the progress deadline's exit code ends the run timed_out");
+        let cost = cost.expect("a run the CLI never reported a cost for must not be recorded as free");
+        assert!(cost > 0.0, "unmeasured time is never $0, got {cost}");
     }
 
     /// PURE. `email_triage` is the case worth stating: it is autonomous, it spends money, and it
