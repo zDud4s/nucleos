@@ -2820,7 +2820,26 @@ pub fn implement_prompt(
 /// rather than the intent. A synthesis carries no authority here — the deterministic gate already
 /// holds ship/no-ship — so a node told to read it must not read it as a verdict it should agree
 /// with. The council never saw this tree; it deliberated on the task.
-pub fn review_prompt(base: Option<&str>, artifacts: &str, council_file: bool) -> String {
+///
+/// `task` is the job's own prompt, carried here for the reason `plan_prompt` carries it beside the
+/// spec: so the node can see what was actually asked. Without it the queue was the only yardstick
+/// the review had, and a flaw that comes from the queue itself can never be found by checking the
+/// diff against the queue. Measured on job 27, 2026-09-14: the task said, in so many words, that
+/// widening a test's timing margin until it stops failing "loses that property and is not a fix";
+/// the spec restated it under `Done means` and `Not this`; the plan's item told the implementer to
+/// widen `a_finished_request_returns_its_outcome_without_waiting`'s bound from 25ms to 1s anyway,
+/// and the review read the diff against that item and answered "nothing wrong, nothing missing".
+///
+/// `spec` is a boolean for the reason it is one on `plan_prompt`: the node is sent to
+/// [`SPEC_FILE`] only when the file is there, because a sentence naming a missing file costs the
+/// node a turn to find out.
+pub fn review_prompt(
+    task: &str,
+    base: Option<&str>,
+    artifacts: &str,
+    spec: bool,
+    council_file: bool,
+) -> String {
     let diff = match base {
         Some(sha) => {
             format!("Run `git diff {sha}..HEAD` — that is the whole of what this job changed.")
@@ -2842,15 +2861,38 @@ pub fn review_prompt(base: Option<&str>, artifacts: &str, council_file: bool) ->
     } else {
         String::new()
     };
+    // Named with the sections that decide, and not only as a file: `Done means` and `Not this` are
+    // the two a diff can break while satisfying every item of the queue, and `Not this` is the one
+    // the job-27 plan walked straight through.
+    let brief = if spec {
+        format!(
+            " A spec node read the project before anything was planned and wrote down what the \
+             task means, in {artifacts}/{SPEC_FILE}. Read its `Done means` and `Not this` \
+             sections: they say what finished looks like and what the work must not become, and \
+             a diff can satisfy every item of the queue and still break either."
+        )
+    } else {
+        String::new()
+    };
+    let against = if spec {
+        "the task, the spec"
+    } else {
+        "the task"
+    };
     format!(
         "You are the REVIEW node of an autonomous job. Every change on this branch was written by \
          other sessions whose reasoning you cannot see, and you are not going to be shown it. \
          Judge the diff, not the intent.\n\n\
          {diff}\n\n\
-         The queue those changes were meant to satisfy is in {artifacts}/plan.json. Report what is \
-         wrong, what is missing against that queue, and nothing else. Change no files.\
+         The queue those changes were meant to satisfy is in {artifacts}/plan.json. That queue was \
+         written by a node too, and it can be wrong.{brief}\n\n\
+         Report what is wrong and what is missing, judged against {against} and the queue. Where \
+         the diff — or the queue item it follows — departs from what the task asks for or rules \
+         out, say so, and say whether the fault is the queue's: a diff that does exactly what a \
+         wrong item said is not a diff with nothing wrong in it. Nothing else. Change no files.\
          {council}\n\n\
-         {LOOK_WITH_THE_READING_TOOLS}"
+         {LOOK_WITH_THE_READING_TOOLS}\n\n\
+         The task, exactly as it was asked:\n\n{task}"
     )
 }
 
@@ -2871,6 +2913,22 @@ fn artifacts_for(worktree: &Path) -> String {
         .join(crate::worktree::ARTIFACTS_DIR)
         .to_string_lossy()
         .into_owned()
+}
+
+/// Whether the spec node's brief is on disk in this worktree.
+///
+/// Asked of the disk and not of the view, because the view knows a spec NODE ran and the prompts
+/// that name the file are about a spec FILE existing. A node that ended badly, or ended well and
+/// wrote nothing, leaves the two apart — and no node may be sent to a file that is not there. The
+/// plan node and the review are the two sent to it.
+async fn spec_is_written(worktree: &Path) -> bool {
+    tokio::fs::metadata(
+        worktree
+            .join(crate::worktree::ARTIFACTS_DIR)
+            .join(SPEC_FILE),
+    )
+    .await
+    .is_ok()
 }
 
 async fn say(pool: &SqlitePool, job: &JobRow, kind: &str, summary: &str) {
@@ -4899,24 +4957,12 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
         }
         Next::SpawnPlan => {
             let task = job.prompt.clone().unwrap_or_default();
-            // Asked of the disk and not of the view, because the view knows a spec NODE ran and
-            // this sentence is about a spec FILE existing. A node that ended badly, or ended well
-            // and wrote nothing, leaves the two apart — and the planner must not be sent to a file
-            // that is not there.
-            let spec_written = tokio::fs::metadata(
-                worktree
-                    .0
-                    .join(crate::worktree::ARTIFACTS_DIR)
-                    .join(SPEC_FILE),
-            )
-            .await
-            .is_ok();
             let prompt = plan_prompt(
                 &task,
                 job.max_items.max(0) as usize,
                 &artifacts,
                 graph_rules(pool, job).await.as_ref(),
-                spec_written,
+                spec_is_written(&worktree.0).await,
             );
             spawn_node(state, job, "plan", prompt, None, worktree, NoRoom::Park).await
         }
@@ -4968,7 +5014,14 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             // function whose whole value is that it can be tested with a struct literal.
             match council_before_review(state, job, &artifacts).await {
                 BeforeReview::Go { council_file } => {
-                    let prompt = review_prompt(job.head_sha.as_deref(), &artifacts, council_file);
+                    let task = job.prompt.clone().unwrap_or_default();
+                    let prompt = review_prompt(
+                        &task,
+                        job.head_sha.as_deref(),
+                        &artifacts,
+                        spec_is_written(&worktree.0).await,
+                        council_file,
+                    );
                     spawn_node(state, job, "review", prompt, None, worktree, NoRoom::Park).await
                 }
                 BeforeReview::Deliberating => {
@@ -7290,7 +7343,7 @@ mod tests {
     #[test]
     fn the_nodes_that_only_look_are_told_what_to_look_with() {
         let replan = replan_prompt("t", 1, &[], "/wt/.nucleos", None, &[]);
-        let review = review_prompt(Some("abc123"), "/wt/.nucleos", false);
+        let review = review_prompt("t", Some("abc123"), "/wt/.nucleos", false, false);
 
         for prompt in [&replan, &review] {
             assert!(prompt.contains("Read, Grep and Glob"));
@@ -12199,13 +12252,103 @@ mod tests {
     /// builder's session because no builder session is kept for it to resume.
     #[test]
     fn the_review_node_is_given_a_diff_and_no_reasoning() {
-        let with_base = review_prompt(Some("deadbeef"), "/wt/.nucleos", false);
+        let with_base = review_prompt("t", Some("deadbeef"), "/wt/.nucleos", false, false);
         assert!(with_base.contains("git diff deadbeef..HEAD"));
 
         // No recorded base: git would not answer when the job started. Asking for the branch's own
         // commits is worse than naming a sha and better than reviewing a guess.
-        let without = review_prompt(None, "/wt/.nucleos", false);
+        let without = review_prompt("t", None, "/wt/.nucleos", false, false);
         assert!(without.contains("git log --oneline"));
+    }
+
+    /// The review is given the task as it was asked, and the spec when there is one, and is told to
+    /// judge the diff against them and not only against the queue.
+    ///
+    /// Job 27, 2026-09-14: the task said a change that merely widens a test's timing margin until
+    /// it stops failing "loses that property and is not a fix", the spec restated it under
+    /// `Not this`, and the plan told the implementer to widen the bound anyway. The review was
+    /// handed the diff and the queue and nothing else, so it checked one against the other and
+    /// found them agreeing. A flaw that comes from the queue cannot be caught by a reader whose
+    /// only yardstick is the queue.
+    #[test]
+    fn the_review_judges_the_diff_against_the_task_and_not_only_the_queue() {
+        let task = "a change that merely widens the margin until the test stops failing loses that \
+                    property and is not a fix";
+        let with = review_prompt(task, Some("deadbeef"), "/wt/.nucleos", true, false);
+
+        assert!(
+            with.contains(task),
+            "the review has to see what was actually asked, word for word: {with}"
+        );
+        assert!(
+            with.contains("/wt/.nucleos/spec.md"),
+            "the review was not sent to the brief that exists: {with}"
+        );
+        for section in ["Done means", "Not this"] {
+            assert!(
+                with.contains(section),
+                "the review has to be pointed at `{section}`, the part a diff can break while \
+                 satisfying every item of the queue: {with}"
+            );
+        }
+        assert!(
+            with.contains("judged against the task"),
+            "the review has to judge against the task, not only against the queue: {with}"
+        );
+        assert!(
+            with.contains("the fault is the queue's"),
+            "a flaw that comes from the plan has to be reportable as the plan's: {with}"
+        );
+
+        let without = review_prompt(task, Some("deadbeef"), "/wt/.nucleos", false, false);
+        assert!(without.contains(task));
+        assert!(without.contains("judged against the task"));
+        assert!(
+            !without.contains("spec.md"),
+            "the review was sent to a brief that was never written: {without}"
+        );
+
+        // And the rules the node already had are all still there.
+        assert!(with.contains("git diff deadbeef..HEAD"));
+        assert!(with.contains("/wt/.nucleos/plan.json"));
+        assert!(with.contains("Change no files"));
+        assert!(with.contains("Read, Grep and Glob"));
+    }
+
+    /// The wiring the prompt test cannot see: the node that is started is handed the job's own
+    /// prompt, and is sent to the brief because the spec node left one on disk.
+    #[tokio::test]
+    async fn the_review_node_is_handed_the_jobs_task_and_the_brief_on_disk() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = job_ready_to_review(&pool, worktree.path()).await;
+        std::fs::write(
+            worktree
+                .path()
+                .join(crate::worktree::ARTIFACTS_DIR)
+                .join(SPEC_FILE),
+            "## Done means\n\n## Not this\n",
+        )
+        .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        let prompt: String =
+            sqlx::query_scalar("SELECT prompt FROM runs WHERE job_id = ? AND stage = 'review'")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            prompt.contains("pull from the todo list and advance what you can"),
+            "the review node was not handed the task it is to judge against: {prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("{}/{SPEC_FILE}", artifacts_for(worktree.path()))),
+            "the review node was not sent to the brief the spec node wrote: {prompt}"
+        );
     }
 
     // -- The council in front of the review node ---------------------------------------------
@@ -12503,10 +12646,10 @@ mod tests {
     /// COMMON case here rather than the edge one.
     #[test]
     fn the_review_prompt_names_the_council_file_only_when_it_exists() {
-        let without = review_prompt(Some("deadbeef"), "/wt/.nucleos", false);
+        let without = review_prompt("t", Some("deadbeef"), "/wt/.nucleos", false, false);
         assert!(!without.contains(COUNCIL_FILE));
 
-        let with = review_prompt(Some("deadbeef"), "/wt/.nucleos", true);
+        let with = review_prompt("t", Some("deadbeef"), "/wt/.nucleos", false, true);
         assert!(with.contains(&format!("/wt/.nucleos/{COUNCIL_FILE}")));
         // Named as advice, in the same paragraph. The gate holds ship/no-ship and the panel never
         // saw this branch, so a node told to read a synthesis must not read it as a verdict.
