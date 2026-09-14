@@ -5503,9 +5503,12 @@ mod tests {
     /// `git reflog` and job 13 parked its own on a `for` loop, each with all the real work already
     /// done. Both sat until a person cancelled them.
     ///
-    /// The run must end TERMINAL, and that is the whole mechanism — `load_view` already reads any
+    /// The run must end TERMINAL, and that is the whole mechanism — `load_view` already reads a
     /// finished review as `ReviewState::Done` ("a review that failed is still a review that
-    /// happened"), so the round closes with no change to the state machine at all.
+    /// happened"), so the round closes with no change to the state machine at all. The one review
+    /// it runs again is a round's first that failed on a transient API error
+    /// (`runner::failed_on_a_transient_api_error`), and a review given up on here did not end on
+    /// one.
     /// The replan node too, and for the same reason with a different ending behind it.
     ///
     /// Its run ending non-successfully hands the job to `stop_after_replan`, which stops it

@@ -563,6 +563,20 @@ pub enum ReviewState {
     /// but no node ran, so there is no verdict anywhere to quote. `load_view` derives it from the
     /// item rows on every read, so a restart finds the same answer rather than remembering one.
     Skipped,
+    /// The round's first review failed on an API error a second attempt can get past, and it is
+    /// owed again.
+    ///
+    /// Measured on job 26, 2026-09-13: review run 900483 exited 1 after ten `api_retry` events, its
+    /// result line saying `terminal_reason: "api_error"` with no HTTP status — "Can't reach the API
+    /// server — check your internet or DNS (ENOTFOUND)". It read as `Done`, and twenty seconds
+    /// later the replan opened the next round with no verdict on this one. A node that never
+    /// reached the model judged nothing, which is the one failure where "a review that failed is
+    /// still a review that happened" is not true.
+    ///
+    /// Once per round, counted from the rows: the round's second review reads `Done` however it
+    /// ended, so a network that stays down costs one extra node and never a loop. Not a skip — a
+    /// skipped review was never owed, and this one was owed and has not been had.
+    Retry,
 }
 
 /// How a job ended.
@@ -1038,7 +1052,8 @@ pub fn next_step(job: &JobView) -> Next {
     }
 
     match job.review {
-        ReviewState::Pending => Next::SpawnReview,
+        // A review owed again is owed like one not yet had. See `ReviewState::Retry`.
+        ReviewState::Pending | ReviewState::Retry => Next::SpawnReview,
         ReviewState::Running => Next::Wait,
         // A round in which nothing passed goes on exactly as it would have after its review: to
         // the replan, or to the ending. See `ReviewState::Skipped`.
@@ -1606,23 +1621,41 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
     // The column is the honest line because it is written by `open_the_next_round` and by
     // `stop_after_replan` — the two places where a replan's answer has actually been acted on.
     let round_opened_at = opened_by.unwrap_or(0);
-    let review_run: Option<String> = sqlx::query_scalar(
-        "SELECT status FROM runs WHERE job_id = ? AND stage = 'review' AND id > ?
+    // The round's latest review, how many reviews the round has had, and — for a review that
+    // FAILED, and only then — what it printed. The `CASE` is the point of the second column: a
+    // review that completed can carry a long stream, and nothing here reads it, so it is never
+    // loaded.
+    let review_run: Option<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT status, CASE WHEN status = 'failed' THEN stdout END,
+                (SELECT COUNT(*) FROM runs WHERE job_id = ? AND stage = 'review' AND id > ?)
+         FROM runs WHERE job_id = ? AND stage = 'review' AND id > ?
          ORDER BY id DESC LIMIT 1",
     )
+    .bind(job_id)
+    .bind(round_opened_at)
     .bind(job_id)
     .bind(round_opened_at)
     .fetch_optional(pool)
     .await?;
 
-    let review = match (review_wanted != 0, review_run.as_deref()) {
+    let review = match (review_wanted != 0, review_run) {
         (false, _) => ReviewState::NotWanted,
         // Only while the round has no review of its own. One already running, or landed, is read
         // for what it is, which also leaves a job that reviewed such a round before this existed
         // reading exactly as it did.
         (true, None) if passed_this_round == 0 => ReviewState::Skipped,
         (true, None) => ReviewState::Pending,
-        (true, Some(status)) if node_in_flight(status) => ReviewState::Running,
+        (true, Some((status, _, _))) if node_in_flight(&status) => ReviewState::Running,
+        // The one exception to the arm below, and narrow on purpose: the round's FIRST review,
+        // ended `failed` (the stream is only loaded for that status), on an API error the CLI
+        // itself says a second attempt can get past. A node that never reached the model judged
+        // nothing. Everything else — `timed_out`, `cancelled`, a review a hook gave up on, any
+        // other failure, and every second review — stays `Done`. See `ReviewState::Retry`.
+        (true, Some((_, Some(stdout), 1)))
+            if crate::runner::failed_on_a_transient_api_error(&stdout) =>
+        {
+            ReviewState::Retry
+        }
         // A review that failed is still a review that happened. Its verdict is advisory — §5.5 of
         // the design gives ship/no-ship to the gate — so a job does not fail for want of one, and
         // re-running it would spend a whole node to re-derive an opinion nobody is blocked on.
@@ -5097,6 +5130,23 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             // function whose whole value is that it can be tested with a struct literal.
             match council_before_review(state, job, &artifacts).await {
                 BeforeReview::Go { council_file } => {
+                    // Here, where the node actually starts, and once: a review parked behind a
+                    // council comes back through this arm on every tick, and the row belongs to
+                    // the retry rather than to each tick spent waiting for it.
+                    if view.review == ReviewState::Retry {
+                        say_once(
+                            pool,
+                            job,
+                            "job_review_retried",
+                            &format!(
+                                "job {} round {}: its review ended on a transient API error before \
+                                 it could judge anything, so it is run once more",
+                                job.id,
+                                view.rounds.round + 1
+                            ),
+                        )
+                        .await;
+                    }
                     let task = job.prompt.clone().unwrap_or_default();
                     let prompt = review_prompt(
                         &task,
@@ -10919,6 +10969,107 @@ mod tests {
             &[GateFailed],
             ReviewState::NotWanted
         )));
+    }
+
+    /// A review node that has landed, with the stream it printed.
+    async fn seed_review(pool: &sqlx::SqlitePool, job_id: i64, status: &str, stdout: &str) {
+        let run_id = seed_node(pool, job_id, "review", status).await;
+        sqlx::query("UPDATE runs SET stdout = ? WHERE id = ?")
+            .bind(stdout)
+            .bind(run_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// A review that never reached the model has judged nothing, and is run once more.
+    ///
+    /// Measured on job 26, 2026-09-13: review run 900483 ended on "Can't reach the API server —
+    /// check your internet or DNS (ENOTFOUND)", read as `Done`, and twenty seconds later the replan
+    /// opened the next round with no verdict on this one.
+    #[tokio::test]
+    async fn a_review_that_failed_on_a_transient_api_error_is_run_again() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = job_ready_to_review(&pool, worktree.path()).await;
+        seed_review(
+            &pool,
+            job_id,
+            "failed",
+            crate::runner::REVIEW_THAT_NEVER_REACHED_THE_API,
+        )
+        .await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(view.review, ReviewState::Retry);
+        assert_eq!(next_step(&view), Next::SpawnReview);
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(stages_run(&pool, job_id).await, vec!["review", "review"]);
+        let told = feed_texts(&pool).await;
+        assert!(
+            told.iter().any(|line| line.contains("run once more")),
+            "a second review has to be said out loud, with why: {told:?}"
+        );
+    }
+
+    /// Once per round, counted from the rows: a network that stays down costs one extra node, and
+    /// then the round closes exactly as it did before.
+    #[tokio::test]
+    async fn a_second_review_that_fails_the_same_way_closes_the_round() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+        seed_items(&pool, job_id, &["passed", "passed"]).await;
+        for _ in 0..2 {
+            seed_review(
+                &pool,
+                job_id,
+                "failed",
+                crate::runner::REVIEW_THAT_NEVER_REACHED_THE_API,
+            )
+            .await;
+        }
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(
+            view.review,
+            ReviewState::Done,
+            "the round already had its one retry"
+        );
+        assert_eq!(next_step(&view), Next::Finish(Outcome::Completed));
+    }
+
+    /// Every other way a review can end is a review that happened, as it always was: a failure the
+    /// network had nothing to do with, and a transient-looking stream on a review that did not end
+    /// `failed` — a `timed_out`, or a `cancelled` one a person or a hook stopped.
+    #[tokio::test]
+    async fn a_review_that_failed_for_any_other_reason_is_still_done() {
+        let refused = r#"{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":400,"result":"API Error: 400"}"#;
+        let max_turns = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"terminal_reason":"max_turns","result":""}"#;
+        let transient = crate::runner::REVIEW_THAT_NEVER_REACHED_THE_API;
+        for (status, stdout) in [
+            ("failed", refused),
+            ("failed", max_turns),
+            ("failed", ""),
+            ("timed_out", transient),
+            ("cancelled", transient),
+        ] {
+            let pool = test_pool().await;
+            let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+            seed_items(&pool, job_id, &["passed"]).await;
+            seed_review(&pool, job_id, status, stdout).await;
+
+            let view = load_view(&pool, job_id).await.unwrap();
+            assert_eq!(
+                view.review,
+                ReviewState::Done,
+                "a review that ended {status}: {stdout}"
+            );
+            assert_eq!(next_step(&view), Next::Finish(Outcome::Completed));
+        }
     }
 
     /// Ending #1. `completed` and not `stopped`, because the node that just looked at the work is

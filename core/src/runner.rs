@@ -951,6 +951,53 @@ pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
     reply
 }
 
+/// Whether a `claude -p --output-format stream-json` run ended on an API error that says nothing
+/// about the work: the network, or the service being busy or down.
+///
+/// Read from the LAST `result` event and from nowhere else, beside `extract_reply` for the reason
+/// that function gives: knowing the CLI's output format is this module's job. True only when that
+/// event says `is_error: true` with `terminal_reason: "api_error"`, and the status the CLI got back
+/// is one a second attempt can get past — none at all (nothing answered: DNS, a dropped
+/// connection), 408, 429, or any 5xx, 529 "overloaded" among them. Any other 4xx is the request
+/// itself being refused, which it will be again, and a turn that ended for any other reason
+/// (`max_turns`, a hook) ended on something the work did.
+///
+/// Measured on job 26's review, run 900483, 2026-09-13: ten `api_retry` events, then a result line
+/// with `terminal_reason: "api_error"`, `api_error_status: null` and "API Error: Can't reach the
+/// API server — check your internet or DNS (ENOTFOUND)". Its `subtype` said `success`: only
+/// `is_error` and `terminal_reason` told the truth, which is why neither `subtype` nor the exit
+/// code is read.
+pub(crate) fn failed_on_a_transient_api_error(stdout: &str) -> bool {
+    let Some(result) = stdout.lines().rev().find_map(|line| {
+        serde_json::from_str::<serde_json::Value>(line.trim())
+            .ok()
+            .filter(|event| event.get("type").and_then(|kind| kind.as_str()) == Some("result"))
+    }) else {
+        return false;
+    };
+    if result.get("is_error").and_then(|flag| flag.as_bool()) != Some(true)
+        || result
+            .get("terminal_reason")
+            .and_then(|reason| reason.as_str())
+            != Some("api_error")
+    {
+        return false;
+    }
+    match result.get("api_error_status") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(status) => status
+            .as_u64()
+            .is_some_and(|code| code == 408 || code == 429 || (500..=599).contains(&code)),
+    }
+}
+
+/// Job 26's review, run 900483, cut down to what the detector above reads: the first of its ten
+/// retries, and its result line with the zeroed counters left out. Shared with `job.rs`, whose
+/// tests seed a review that printed exactly this.
+#[cfg(test)]
+pub(crate) const REVIEW_THAT_NEVER_REACHED_THE_API: &str = r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":614,"error_status":null,"error":"unknown","session_id":"f4a94b9c-f0fe-484b-9514-9fefa640a6b6"}
+{"stop_reason":"stop_sequence","session_id":"f4a94b9c-f0fe-484b-9514-9fefa640a6b6","total_cost_usd":0,"terminal_reason":"api_error","is_error":true,"num_turns":1,"subtype":"success","api_error_status":null,"result":"API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)","type":"result","duration_ms":172362}"#;
+
 /// A turn as it stands PART WAY THROUGH: what has been written, and what is being done.
 #[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct LiveTurn {
@@ -5855,6 +5902,65 @@ mod tests {
             extract_reply(stdout),
             Some("Here are your projects: alpha, beta.".to_string())
         );
+    }
+
+    /// Job 26's review, as it printed it: a node that never reached the API.
+    #[test]
+    fn a_review_that_never_reached_the_api_failed_on_something_transient() {
+        assert!(failed_on_a_transient_api_error(
+            REVIEW_THAT_NEVER_REACHED_THE_API
+        ));
+    }
+
+    /// No status, a timeout, rate limiting and the 5xx family are worth a second attempt; a request
+    /// the API refused is not, because it will be refused again.
+    #[test]
+    fn only_an_api_error_a_second_attempt_can_get_past_is_transient() {
+        let ended_on = |status: &str| {
+            format!(
+                "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}}\n\
+                 {{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\
+                 \"terminal_reason\":\"api_error\",\"api_error_status\":{status},\
+                 \"result\":\"API Error\"}}"
+            )
+        };
+        for (status, transient) in [
+            ("null", true),
+            ("408", true),
+            ("429", true),
+            ("500", true),
+            ("503", true),
+            ("529", true),
+            ("400", false),
+            ("401", false),
+            ("404", false),
+        ] {
+            assert_eq!(
+                failed_on_a_transient_api_error(&ended_on(status)),
+                transient,
+                "api_error_status {status}"
+            );
+        }
+    }
+
+    /// A turn that ended for any other reason ended on something the work did, and a stream with no
+    /// result at all says nothing about why it stopped.
+    #[test]
+    fn a_turn_that_ended_for_any_other_reason_is_not_transient() {
+        let max_turns = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"terminal_reason":"max_turns","api_error_status":null,"result":""}"#;
+        assert!(!failed_on_a_transient_api_error(max_turns));
+
+        let success = r#"{"type":"result","subtype":"success","is_error":false,"result":"Nothing wrong, nothing missing.","total_cost_usd":0.12}"#;
+        assert!(!failed_on_a_transient_api_error(success));
+
+        let no_result =
+            r#"{"type":"system","subtype":"api_retry","attempt":1,"error_status":null}"#;
+        assert!(!failed_on_a_transient_api_error(no_result));
+        assert!(!failed_on_a_transient_api_error(""));
+
+        // The LAST result decides: an error the CLI went on past is not how the run ended.
+        let recovered = format!("{REVIEW_THAT_NEVER_REACHED_THE_API}\n{success}");
+        assert!(!failed_on_a_transient_api_error(&recovered));
     }
 
     #[test]
