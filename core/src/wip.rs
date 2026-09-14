@@ -86,6 +86,21 @@ pub async fn global_wip_limit(pool: &SqlitePool) -> sqlx::Result<Option<i64>> {
 /// not run together" edges would close the project's autonomy completely, and the person who asked
 /// for restraint would be throttled by their own request — with a reason naming a review backlog
 /// they do not have.
+///
+/// **`refused-action` is the third exclusion, and it is the accidental one the paragraph above
+/// warns about, found the day the accident stopped holding.** A refused action is a record of
+/// something the system was NOT allowed to do: the classifier or the injection barrier said no, the
+/// turn carried on or ended, and nothing was produced for anyone to review. Nor can it be approved
+/// into happening — `approve` answers 409 for it, which is why `get_refused_actions` in `http.rs`
+/// gives it a door of its own. That makes it a note, the same species as `skipped-item`, and not
+/// work waiting on a person.
+///
+/// For as long as it has existed it stayed out of this count only because `create_refused_action`
+/// wrote it with a NULL `project_id` — the unrelated reason above, holding a kind out by accident.
+/// On 2026-09-14 the row learned its run's project, so that a refusal could be attributed at all,
+/// and without this line the skipped item's arithmetic comes back: job 26 on 2026-09-13 recorded six
+/// refusals, and at the default limit of 3 one such night would close the project's autonomy for
+/// work the system was stopped from doing.
 macro_rules! open_proposals_term {
     ($project:literal) => {
         concat!(
@@ -93,7 +108,8 @@ macro_rules! open_proposals_term {
      WHERE project_id = ",
             $project,
             " AND status = 'pending'
-       AND kind <> 'skipped-item' AND kind <> 'fleet-exclusion')"
+       AND kind <> 'skipped-item' AND kind <> 'fleet-exclusion'
+       AND kind <> 'refused-action')"
         )
     };
 }
@@ -367,6 +383,36 @@ mod tests {
         }
     }
 
+    /// Refusals minted by the real constructor, each on a run of its own that belongs to the project
+    /// — one open refusal per run is what `one_open_refused_action_per_run` allows, and job 26's six
+    /// were six nodes. Through `create_refused_action` rather than a hand-written INSERT, so the
+    /// `project_id` the brake sees is the one production writes and not one this fixture chose.
+    async fn add_refused_actions(pool: &SqlitePool, project_id: &str, count: usize) {
+        for _ in 0..count {
+            let run_id = sqlx::query(
+                "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+                 VALUES (?, 'node', 'completed', 'worktree', '2026-09-13T00:00:00Z')",
+            )
+            .bind(project_id)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            crate::proposals::create_refused_action(
+                pool,
+                run_id,
+                None,
+                None,
+                "Bash",
+                "the classifier did not recognise this command",
+                Some(r#"{"command":"cargo fmt --all"}"#),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
     /// A request from the person is not a queue for the person.
     ///
     /// The pair is the test, and neither half is enough on its own: the first would pass with the
@@ -559,6 +605,50 @@ mod tests {
                 WipDecision::Allow
             ),
             "five skipped items must not spend a limit of three"
+        );
+    }
+
+    /// A refusal is a record of what the system was stopped from doing, not work waiting on a
+    /// person, and since it carries its run's project it is in reach of this count.
+    ///
+    /// Six because job 26 on 2026-09-13 recorded six. At the default limit of 3, counting them would
+    /// make the refusals of one night the reason the next job is refused. The first assertion is
+    /// what keeps the rest honest: were the refusals written with no project, they would miss the
+    /// per-project filter and pass for a reason that has nothing to do with the exclusion.
+    #[tokio::test]
+    async fn a_refused_action_is_not_a_review_backlog() {
+        let pool = test_pool().await;
+        add_project(&pool, "project-a").await;
+        add_refused_actions(&pool, "project-a", 6).await;
+
+        let attributed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proposals
+             WHERE kind = 'refused-action' AND status = 'pending' AND project_id = 'project-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attributed, 6, "the refusals must be the project's own");
+
+        assert_eq!(
+            open_review_items(&pool, "project-a").await.unwrap().total(),
+            0,
+            "six refusals are no backlog at all"
+        );
+        assert_eq!(
+            wip_permits_new_run(&pool, "project-a").await,
+            WipDecision::Allow,
+            "six refusals must not spend a limit of three"
+        );
+
+        // And the count is not simply broken: an action approval beside them still counts.
+        add_pending_proposals(&pool, "project-a", 1).await;
+        assert_eq!(
+            open_review_items(&pool, "project-a")
+                .await
+                .unwrap()
+                .proposals,
+            1
         );
     }
 
