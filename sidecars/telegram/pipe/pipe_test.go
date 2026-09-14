@@ -3,10 +3,10 @@ package pipe
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,6 +17,49 @@ import (
 	"nucleostelegram/notifier"
 	"nucleostelegram/telegram"
 )
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	args := os.Args
+	for i, arg := range args {
+		if arg == "--" {
+			args = args[i+1:]
+			break
+		}
+	}
+
+	switch os.Getenv("HELPER_MODE") {
+	case "echo":
+		fmt.Println(strings.Join(args, " "))
+	case "sleep":
+		time.Sleep(30 * time.Second)
+	case "print":
+		fmt.Println(os.Getenv("HELPER_TEXT"))
+	}
+	os.Exit(0)
+}
+
+func helperCommand(t *testing.T, mode string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	name := "helper" + filepath.Ext(os.Args[0])
+	helper := filepath.Join(dir, name)
+	bytes, err := os.ReadFile(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(helper, bytes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("HELPER_MODE", mode)
+	return "." + string(filepath.Separator) + name + " -test.run=^TestHelperProcess$ --"
+}
 
 type sentMessage struct {
 	to   telegram.Destination
@@ -487,6 +530,7 @@ func TestAnUnauthorisedPressCannotApproveAProposal(t *testing.T) {
 func TestAVoiceRecordingDoesNotOutliveItsTranscription(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TMP", dir)
+	t.Setenv("TMPDIR", dir)
 	t.Setenv("TEMP", dir)
 
 	dl := fakeDownloader{remotePath: "voice/file.ogg", data: []byte("voice")}
@@ -534,7 +578,9 @@ func TestOldAttachmentsAreSweptFromTheTempDirectory(t *testing.T) {
 // A photo sent with an instruction in its caption used to reach the orchestrator as "The user sent
 // a photo", instruction discarded — a turn spent on a file with no idea what to do with it.
 func TestACaptionOnAnAttachmentReachesTheOrchestrator(t *testing.T) {
-	t.Setenv("TMP", t.TempDir())
+	dir := t.TempDir()
+	t.Setenv("TMP", dir)
+	t.Setenv("TMPDIR", dir)
 	dl := fakeDownloader{remotePath: "photos/x.jpg", data: []byte("photo")}
 	msg := &telegram.Message{
 		Photo:   []telegram.PhotoSize{{FileID: "p1"}},
@@ -572,16 +618,14 @@ func TestAMessageWithNothingToActOnDoesNotStartATurn(t *testing.T) {
 // A voice note is a speech model's guess. It must not be able to fire a command silently — but the
 // refusal has to be said out loud, or a person is left thinking the kill switch is off.
 func TestASpokenCommandIsRefusedOutLoudInsteadOfExecuted(t *testing.T) {
-	t.Setenv("TMP", t.TempDir())
-	if runtime.GOOS != "windows" {
-		t.Skip("stands in for a transcriber with a Windows shell command")
-	}
+	dir := t.TempDir()
+	t.Setenv("TMP", dir)
+	t.Setenv("TMPDIR", dir)
 
 	bot := &recordingBot{}
 	dc := &recordingDaemon{}
-	// Stands in for a transcriber that heard "kill off": echo prints the transcript, rem swallows
-	// the audio path this package appends.
-	cfg := config.Config{AllowedChatID: 42, TranscribeCmd: "cmd /c echo /kill off&rem"}
+	t.Setenv("HELPER_TEXT", "/kill off")
+	cfg := config.Config{AllowedChatID: 42, TranscribeCmd: helperCommand(t, "print")}
 
 	HandleUpdate(bot, dc, transcribingDownloader{}, cfg, NewTracker(), telegram.Update{
 		Message: &telegram.Message{

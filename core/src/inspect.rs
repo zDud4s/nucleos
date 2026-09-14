@@ -1088,8 +1088,14 @@ pub(crate) mod tests {
             log(repo.path(), "sub/../../secret", 10),
             Err(InspectError::UnsafePath)
         ));
+        #[cfg(windows)]
         assert!(matches!(
             log(repo.path(), "C:/Windows", 10),
+            Err(InspectError::UnsafePath)
+        ));
+        #[cfg(unix)]
+        assert!(matches!(
+            log(repo.path(), "/etc", 10),
             Err(InspectError::UnsafePath)
         ));
     }
@@ -1463,7 +1469,11 @@ pub(crate) mod tests {
         // Skipped rather than silently passing where the OS will not let us build the fixture:
         // unprivileged symlink creation is off by default on some Windows configurations.
         let link = root.join("out");
-        if std::os::windows::fs::symlink_dir(&outside, &link).is_err() {
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(&outside, &link).is_ok();
+        if !made {
             eprintln!("skipping: this machine cannot create a directory symlink unprivileged");
             return;
         }
@@ -1486,7 +1496,11 @@ pub(crate) mod tests {
         std::fs::write(real.join("note.txt"), "inside").unwrap();
 
         let link = root.join("alias");
-        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&real, &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(&real, &link).is_ok();
+        if !made {
             eprintln!("skipping: this machine cannot create a directory symlink unprivileged");
             return;
         }
@@ -1541,7 +1555,27 @@ pub(crate) mod tests {
         let temp = tempdir().unwrap();
         let root = temp.path();
 
-        for path in ["..", "../x", "a/../b", "/etc/passwd", "C:/x"] {
+        for path in ["..", "../x", "a/../b", "/etc/passwd"] {
+            assert!(matches!(
+                safe_join(root, path),
+                Err(InspectError::UnsafePath)
+            ));
+        }
+
+        #[cfg(windows)]
+        assert!(matches!(
+            safe_join(root, "C:/x"),
+            Err(InspectError::UnsafePath)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_join_rejects_an_absolute_posix_path_on_unix() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        for path in ["/root/x", "/x"] {
             assert!(matches!(
                 safe_join(root, path),
                 Err(InspectError::UnsafePath)

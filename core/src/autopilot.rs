@@ -352,6 +352,17 @@ const HOOK_SCRIPT: &str = ".claude/hooks/ask_daemon.py";
 /// itself.
 const HOOK_SOURCE: &str = include_str!("../hooks/ask_daemon.py");
 
+/// The interpreter the classifier hook is registered under, per platform.
+///
+/// `python3` off Windows: macOS has shipped no `python` since 12.3 and Debian/Ubuntu ship only
+/// `python3`. A missing interpreter does not fail closed — the shell exits 127, Claude Code treats
+/// every exit but 2 as a non-blocking error, and the tool call goes ahead unclassified; all the
+/// fail-closed care inside `ask_daemon.py` never runs because the script never starts.
+/// `python` on Windows and NOT `python3`: on a default install `python3` is the Microsoft Store's
+/// App Execution Alias, which opens the Store instead of running the script — the same hole from
+/// the other side. Existing entries are recognised by script path, so changing this orphans none.
+pub(crate) const HOOK_INTERPRETER: &str = if cfg!(windows) { "python" } else { "python3" };
+
 /// How the hook is registered, spelled exactly as `classifier_hook_is_wired` looks for it.
 ///
 /// `${CLAUDE_PROJECT_DIR}` and not an absolute path: the same settings file is read from worktrees
@@ -367,7 +378,7 @@ fn hook_entry() -> serde_json::Value {
         "matcher": "*",
         "hooks": [{
             "type": "command",
-            "command": "python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""
+            "command": format!("{HOOK_INTERPRETER} \"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/ask_daemon.py\"")
         }]
     })
 }
@@ -677,6 +688,56 @@ mod tests {
         let hooks_dir = root.path().join(".claude/hooks");
         fs::create_dir_all(&hooks_dir).unwrap();
         fs::write(hooks_dir.join("ask_daemon.py"), "# hook").unwrap();
+    }
+
+    #[test]
+    fn the_hook_is_registered_under_this_platforms_interpreter() {
+        let entry = hook_entry();
+        let command = entry["hooks"][0]["command"].as_str().unwrap();
+        #[cfg(windows)]
+        let expected_prefix = "python \"";
+        #[cfg(not(windows))]
+        let expected_prefix = "python3 \"";
+
+        assert!(command.starts_with(expected_prefix), "{command}");
+        assert!(command.ends_with(&format!("/{HOOK_SCRIPT}\"")), "{command}");
+    }
+
+    #[test]
+    fn an_entry_under_any_interpreter_is_recognised_and_never_duplicated() {
+        for interpreter in ["python", "python3", "py -3"] {
+            let root = TempDir::new().unwrap();
+            let command = format!("{interpreter} \"${{CLAUDE_PROJECT_DIR}}/{HOOK_SCRIPT}\"");
+            write_settings(
+                &root,
+                &serde_json::json!({
+                    "hooks": {
+                        "PreToolUse": [{
+                            "matcher": "*",
+                            "hooks": [{"type": "command", "command": command}]
+                        }]
+                    }
+                })
+                .to_string(),
+            );
+            let hooks_dir = root.path().join(".claude/hooks");
+            fs::create_dir_all(&hooks_dir).unwrap();
+            fs::write(hooks_dir.join("ask_daemon.py"), "# hook").unwrap();
+
+            assert!(classifier_hook_is_wired(root.path()), "{interpreter}");
+            wire_classifier_hook(root.path()).unwrap();
+
+            let settings: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
+            )
+            .unwrap();
+            let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            let ours = entries
+                .iter()
+                .filter(|entry| serde_json::to_string(entry).unwrap().contains(HOOK_SCRIPT))
+                .count();
+            assert_eq!(ours, 1, "{interpreter}: {entries:?}");
+        }
     }
 
     fn git_init(root: &TempDir) {
