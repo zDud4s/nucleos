@@ -207,6 +207,15 @@ pub trait Assistants: Send + Sync {
         brain: crate::chats::Brain,
         models: &[String],
     ) -> std::collections::HashMap<String, crate::capabilities::Declared>;
+
+    /// Returns the configured command runner for an agent CLI.
+    fn cli_runner(
+        &self,
+        _cli: &str,
+        _model: Option<&str>,
+    ) -> Option<std::sync::Arc<dyn crate::runner::CommandRunner>> {
+        None
+    }
 }
 
 /// Assembles the assistant that answers a turn from what startup already read: one shared
@@ -258,6 +267,8 @@ pub struct ConfiguredAssistants {
     /// 2-second `OLLAMA_TAGS_TIMEOUT` rather than reusing a generation client: a wedged Ollama (or
     /// a slow OpenRouter catalogue read) must cost the menu a brief pause, never a two-minute hang.
     introspection_client: reqwest::Client,
+    claude_cli: Option<std::sync::Arc<dyn crate::runner::CommandRunner>>,
+    codex_model: Option<String>,
 }
 
 impl ConfiguredAssistants {
@@ -294,7 +305,20 @@ impl ConfiguredAssistants {
                 .timeout(CAPABILITY_PROBE_TIMEOUT)
                 .build()
                 .expect("HTTP client for capability discovery (check TLS and proxy environment)"),
+            claude_cli: None,
+            codex_model: None,
         }
+    }
+
+    /// Adds the agent CLI runners configured at daemon startup.
+    pub fn with_agent_clis(
+        mut self,
+        claude: std::sync::Arc<dyn crate::runner::CommandRunner>,
+        codex_model: String,
+    ) -> Self {
+        self.claude_cli = Some(claude);
+        self.codex_model = Some(codex_model);
+        self
     }
 
     /// Test-only seam for `hosted_base_url` — the same reason `local_base_url` is already a
@@ -320,6 +344,22 @@ const CAPABILITY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 #[async_trait::async_trait]
 impl Assistants for ConfiguredAssistants {
+    fn cli_runner(
+        &self,
+        cli: &str,
+        pinned: Option<&str>,
+    ) -> Option<std::sync::Arc<dyn crate::runner::CommandRunner>> {
+        match cli {
+            "codex" => self.codex_model.as_ref().map(|configured| {
+                std::sync::Arc::new(crate::runner::CodexCliRunner::for_chat(
+                    pinned.unwrap_or(configured).to_string(),
+                )) as std::sync::Arc<dyn crate::runner::CommandRunner>
+            }),
+            "claude" => self.claude_cli.clone(),
+            _ => None,
+        }
+    }
+
     fn assistant_for(
         &self,
         brain: crate::chats::Brain,
@@ -696,6 +736,41 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn configured_assistants_hand_each_cli_its_own_runner() {
+        let claude_fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        let expected: std::sync::Arc<dyn crate::runner::CommandRunner> = claude_fake.clone();
+        let configured = ConfiguredAssistants::new(
+            None,
+            None,
+            None,
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            test_pool().await,
+            crate::runner::OLLAMA_BASE_URL.to_string(),
+        )
+        .with_agent_clis(claude_fake, "gpt-5.6-terra".to_string());
+
+        let claude = configured.cli_runner("claude", None);
+        assert!(claude.is_some());
+        assert!(std::sync::Arc::ptr_eq(claude.as_ref().unwrap(), &expected));
+        assert!(configured.cli_runner("codex", Some("gpt-5.5")).is_some());
+        assert!(configured.cli_runner("codex", None).is_some());
+        assert!(configured.cli_runner("mystery", None).is_none());
+
+        let unconfigured = ConfiguredAssistants::new(
+            None,
+            None,
+            None,
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            test_pool().await,
+            crate::runner::OLLAMA_BASE_URL.to_string(),
+        );
+        assert!(unconfigured.cli_runner("claude", None).is_none());
+        assert!(unconfigured.cli_runner("codex", None).is_none());
     }
 
     // --- A. Model resolution — PURE, no pool, no client, no runtime -----------------------------

@@ -2483,13 +2483,15 @@ function ModelMenu({
   onPick,
   disabled = false,
   children,
+  chatId,
 }: {
   model: string | null;
   onPick: (model: string | null) => void;
   disabled?: boolean;
   children?: React.ReactNode;
+  chatId?: string;
 }) {
-  const catalogue = useAssistantModels();
+  const catalogue = useAssistantModels(chatId);
   const localModel = useLocalModel();
   const localUnavailable = localModel.data?.available === false;
   const pull = useLocalPull();
@@ -2675,13 +2677,15 @@ function EffortMenu({
   effort,
   onPick,
   disabled = false,
+  chatId,
 }: {
   model: string | null;
   effort: string | null;
   onPick: (effort: string | null) => void;
   disabled?: boolean;
+  chatId?: string;
 }) {
-  const catalogue = useAssistantModels();
+  const catalogue = useAssistantModels(chatId);
   const chosen = catalogue.data?.choices.find((choice) => choice.id === model);
   // The union stands in only while nothing is pinned — the front door, where the model question is
   // still open. Never empty merely because a fetch is slow: a control greyed out by latency reads
@@ -2757,6 +2761,7 @@ function ChatModelControls({
       <ModelMenu
         model={model}
         disabled={patch.isPending}
+        chatId={chatId}
         onPick={(picked) => patch.mutate({ chatId, model: picked })}
       >
         {patch.isError && <ModelRefusal error={patch.error} />}
@@ -2765,6 +2770,7 @@ function ChatModelControls({
         model={model}
         effort={effort}
         disabled={patch.isPending}
+        chatId={chatId}
         onPick={(picked) => patch.mutate({ chatId, effort: picked })}
       />
     </>

@@ -235,7 +235,7 @@ function chatsFetch(
     if (path === "/assistant/tools") {
       return { tools: ["Bash", "Edit", "Read", "WebFetch"] };
     }
-    if (path === "/assistant/models") {
+    if (path.split("?")[0] === "/assistant/models") {
       return {
         choices: [
           { id: "opus", label: "Opus", brain: "cloud", efforts: CLAUDE_EFFORTS },
@@ -399,7 +399,7 @@ function chatsFetchWithHostedChoice(
     efforts: [],
   };
   return async (path, init) => {
-    if (path === "/assistant/models") {
+    if (path.split("?")[0] === "/assistant/models") {
       const models = (await base(path, init)) as AssistantModels;
       return { ...models, choices: [...models.choices, hosted] };
     }
@@ -429,7 +429,7 @@ function chatsFetchWithToollessChoice(
     tools: false,
   };
   return async (path, init) => {
-    if (path === "/assistant/models") {
+    if (path.split("?")[0] === "/assistant/models") {
       const models = (await base(path, init)) as AssistantModels;
       return { ...models, choices: [...models.choices, toolless] };
     }
@@ -476,7 +476,7 @@ function chatsFetchWithEveryRoute(
     installed: false,
   };
   return async (path, init) => {
-    if (path === "/assistant/models") {
+    if (path.split("?")[0] === "/assistant/models") {
       const models = (await base(path, init)) as AssistantModels;
       const choices = models.choices.map((choice) =>
         choice.brain === "local" ? { ...choice, installed: true } : choice,
@@ -1047,6 +1047,60 @@ describe("Chats - a conversation that grew too long for its window", () => {
 });
 
 describe("Chats - choosing a model", () => {
+  it("the conversation header asks for that conversation's own menu", async () => {
+    const requested: string[] = [];
+    const base = chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      requested.push(path);
+      return base(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+
+    await waitFor(() => {
+      expect(requested).toContain("/assistant/models?chat=c-1");
+    });
+  });
+
+  it("the front door still asks for the daemon-wide menu", async () => {
+    const requested: string[] = [];
+    const base = chatsFetch([], {});
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      requested.push(path);
+      return base(path, init);
+    });
+
+    await renderChats("/chats");
+
+    await waitFor(() => {
+      expect(requested).toContain("/assistant/models");
+      expect(requested.filter((path) => path.includes("?chat="))).toHaveLength(0);
+    });
+  });
+
+  it("a Codex model the daemon offers a rooted conversation is on its picker", async () => {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
+    const codex: ModelChoice = {
+      id: "gpt-5.5",
+      label: "GPT-5.5",
+      brain: "cloud",
+      efforts: ["low", "high"],
+      runner: "codex",
+    };
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      const models = (await base(path, init)) as AssistantModels;
+      if (path === "/assistant/models?chat=c-1") {
+        return { ...models, choices: [...models.choices, codex] };
+      }
+      return models;
+    });
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    expect(await screen.findByRole("menuitemradio", { name: /^GPT-5.5/ })).toBeDefined();
+  });
+
   it("offers the daemon's list rather than a list of its own", async () => {
     daemon.apiFetch.mockImplementation(chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }));
 

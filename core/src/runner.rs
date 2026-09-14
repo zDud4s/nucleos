@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::Engine;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -927,12 +928,24 @@ pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
         if line.is_empty() {
             continue;
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
-            && v.get("type").and_then(|t| t.as_str()) == Some("result")
-            && let Some(text) = v.get("result").and_then(|r| r.as_str())
-            && !text.trim().is_empty()
-        {
-            reply = Some(text.to_string());
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            let text = match v.get("type").and_then(|t| t.as_str()) {
+                Some("result") => v.get("result").and_then(|r| r.as_str()),
+                Some("item.completed")
+                    if v.get("item")
+                        .and_then(|item| item.get("type"))
+                        .and_then(|kind| kind.as_str())
+                        == Some("agent_message") =>
+                {
+                    v.get("item")
+                        .and_then(|item| item.get("text"))
+                        .and_then(|text| text.as_str())
+                }
+                _ => None,
+            };
+            if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+                reply = Some(text.to_string());
+            }
         }
     }
     reply
@@ -2916,6 +2929,131 @@ impl CommandRunner for ClaudeCliRunner {
     }
 }
 
+/// What `run_prompt` prepared before building argv: MCP overrides, staged image paths and the
+/// sandbox the runner pins.
+#[derive(Debug, Default)]
+pub(crate) struct CodexStaged {
+    pub mcp_overrides: Vec<String>,
+    pub images: Vec<std::path::PathBuf>,
+    /// The sandbox this launch pins, or `None` to leave Codex's own resolution.
+    pub sandbox_mode: Option<&'static str>,
+}
+
+/// Translates the daemon's stdio MCP configuration into Codex overrides.
+/// `codex exec` runs with approval policy `never`, so Codex immediately declines an MCP tool call
+/// that needs confirmation ("user cancelled MCP tool call" on 0.144.4). `approve` pre-approves
+/// the daemon's own MCP servers, as the Claude path does with `--allowedTools mcp__nucleos__*`;
+/// an errand's box remains enforced by the server's own arguments.
+pub(crate) fn codex_mcp_overrides(
+    config: &serde_json::Value,
+    env_names: &[String],
+) -> Result<Vec<String>, String> {
+    let servers = config
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "mcp_config must contain an mcpServers object".to_string())?;
+    let mut names: Vec<&String> = servers.keys().collect();
+    names.sort();
+
+    let mut overrides = Vec::new();
+    for name in names {
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(format!(
+                "mcp_config server name {name:?} cannot be expressed"
+            ));
+        }
+        let server = servers
+            .get(name)
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| format!("mcp_config server {name:?} must be an object"))?;
+        if !matches!(
+            server.get("type").and_then(serde_json::Value::as_str),
+            None | Some("stdio")
+        ) {
+            return Err(format!("mcp_config server {name:?} must be stdio"));
+        }
+        let command = server
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("mcp_config server {name:?} must have a string command"))?;
+        let args = match server.get("args") {
+            None => Vec::new(),
+            Some(args) => args
+                .as_array()
+                .and_then(|args| {
+                    args.iter()
+                        .map(|arg| arg.as_str().map(str::to_string))
+                        .collect()
+                })
+                .ok_or_else(|| format!("mcp_config server {name:?} args must be a string array"))?,
+        };
+        overrides.push(format!(
+            "mcp_servers.{name}.command={}",
+            serde_json::to_string(command).expect("serializing a string cannot fail")
+        ));
+        overrides.push(format!(
+            "mcp_servers.{name}.args={}",
+            serde_json::to_string(&args).expect("serializing strings cannot fail")
+        ));
+        if !env_names.is_empty() {
+            overrides.push(format!(
+                "mcp_servers.{name}.env_vars={}",
+                serde_json::to_string(env_names).expect("serializing strings cannot fail")
+            ));
+        }
+        overrides.push(format!(
+            "mcp_servers.{name}.default_tools_approval_mode={}",
+            serde_json::to_string("approve").expect("serializing a string cannot fail")
+        ));
+    }
+    Ok(overrides)
+}
+
+/// Reads the thread id from Codex's thread-started event.
+pub(crate) fn codex_thread_id(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    (value.get("type").and_then(serde_json::Value::as_str) == Some("thread.started"))
+        .then(|| value.get("thread_id").and_then(serde_json::Value::as_str))
+        .flatten()
+        .map(str::to_string)
+}
+
+/// Decodes opening-turn images into files readable by the Codex CLI.
+pub(crate) fn stage_codex_images(
+    dir: &std::path::Path,
+    stem: &str,
+    images: &[Attachment],
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            let extension = match image.media_type.as_str() {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/gif" => "gif",
+                "image/webp" => "webp",
+                _ => {
+                    return Err(std::io::Error::other(
+                        "codex exec cannot honour images: unsupported media type",
+                    ));
+                }
+            };
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .map_err(|error| {
+                    std::io::Error::other(format!("codex exec cannot honour images: {error}"))
+                })?;
+            let path = dir.join(format!("{stem}-{index}.{extension}"));
+            std::fs::write(&path, bytes)?;
+            Ok(path)
+        })
+        .collect()
+}
+
 /// The full `codex exec` argument vector for one run, or the reason this tool cannot perform the
 /// run that was asked for. Pure for the same reason `cli_args` is: the flags deciding which model
 /// answers and where it is allowed to work are asserted in tests instead of inspected on a live
@@ -2928,17 +3066,27 @@ impl CommandRunner for ClaudeCliRunner {
 /// different run than it asked for (one that loses the history it was meant to branch from, or that
 /// answers once and then ignores every steering message) while `runs.rs` recorded it as completed.
 /// Naming the field in the refusal is what tells an operator which request cannot take this path.
-pub(crate) fn codex_cli_args(request: &RunRequest, model: &str) -> Result<Vec<String>, String> {
+pub(crate) fn codex_cli_args(
+    request: &RunRequest,
+    model: &str,
+    staged: &CodexStaged,
+) -> Result<Vec<String>, String> {
     if request.fork_session {
         return Err(
             "codex exec cannot honour fork_session: it has no way to branch an existing session"
                 .to_string(),
         );
     }
-    if request.steerable {
+    if request.steerable && request.messages.is_some() {
         return Err(
             "codex exec cannot honour steerable: it has no stdin a later turn can arrive on"
                 .to_string(),
+        );
+    }
+
+    if !request.images.is_empty() && staged.images.len() != request.images.len() {
+        return Err(
+            "codex exec cannot honour images: staging did not produce every image".to_string(),
         );
     }
 
@@ -2948,16 +3096,71 @@ pub(crate) fn codex_cli_args(request: &RunRequest, model: &str) -> Result<Vec<St
         "exec".to_string(),
         // A run works inside a worktree or a plain folder, and the CLI otherwise refuses to start
         // over the shape of that directory — a refusal about the ground rather than about the work.
-        "--skip-git-repo-check".to_string(),
-        "-m".to_string(),
-        model.to_string(),
+        if request.resume_session_id.is_some() {
+            "resume".to_string()
+        } else {
+            "--json".to_string()
+        },
     ];
-    // `-C` is the only thing keeping a run inside the project it was spawned for: the CLI resolves
-    // its own project root from this flag, so a vector missing it works wherever the daemon happened
-    // to be launched. An absent `cwd` passes no flag rather than inventing a directory.
-    if let Some(dir) = &request.cwd {
-        args.push("-C".to_string());
-        args.push(dir.to_string_lossy().into_owned());
+    if request.resume_session_id.is_some() {
+        args.push("--json".to_string());
+    }
+    args.push("--skip-git-repo-check".to_string());
+    for image in &staged.images {
+        args.push("-i".to_string());
+        args.push(image.to_string_lossy().into_owned());
+    }
+    args.extend(["-m".to_string(), model.to_string()]);
+    if request.resume_session_id.is_none() {
+        // `-C` is the only thing keeping a fresh run inside its project.
+        if let Some(dir) = &request.cwd {
+            args.push("-C".to_string());
+            args.push(dir.to_string_lossy().into_owned());
+        }
+        for dir in &request.add_dirs {
+            args.push("--add-dir".to_string());
+            args.push(dir.to_string_lossy().into_owned());
+        }
+    } else if !request.add_dirs.is_empty() {
+        let roots: Vec<String> = request
+            .add_dirs
+            .iter()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .collect();
+        args.extend([
+            "-c".to_string(),
+            format!(
+                "sandbox_workspace_write.writable_roots={}",
+                serde_json::to_string(&roots).expect("serializing paths cannot fail")
+            ),
+        ]);
+    }
+    // Use `-c`, not `-s`, because `codex exec resume` has no `-s` flag.
+    // It beats `sandbox_mode` in the user's `~/.codex/config.toml`, which exec's default does not.
+    if let Some(mode) = staged.sandbox_mode {
+        args.extend([
+            "-c".to_string(),
+            format!(
+                "sandbox_mode={}",
+                serde_json::to_string(mode).expect("serializing a string cannot fail")
+            ),
+        ]);
+    }
+    if let Some(effort) = &request.effort {
+        args.extend([
+            "-c".to_string(),
+            format!(
+                "model_reasoning_effort={}",
+                serde_json::to_string(effort).expect("serializing a string cannot fail")
+            ),
+        ]);
+    }
+    for override_value in &staged.mcp_overrides {
+        args.push("-c".to_string());
+        args.push(override_value.clone());
+    }
+    if let Some(session_id) = &request.resume_session_id {
+        args.push(session_id.clone());
     }
     // Trailing positional, after every flag that takes a value, so a prompt can never be consumed as
     // the argument of the option before it.
@@ -3016,6 +3219,22 @@ pub(crate) fn codex_extract_usage(stdout: &str) -> RunUsage {
 /// let a control only one of them honours look enforced on both.
 pub struct CodexCliRunner {
     pub model: String,
+    /// The sandbox every launch of this runner pins; `None` leaves Codex's own resolution (the
+    /// user's config, else exec's read-only default).
+    pub sandbox_mode: Option<&'static str>,
+}
+
+impl CodexCliRunner {
+    /// Builds the runner used for a chat turn answered by Codex (`Assistants::cli_runner`).
+    /// The owner's 2026-09-14 decision pins chat turns read-only.
+    /// KNOWN LIMITATION: a daemon whose primary runner is Codex uses its run runner through
+    /// `assistant::runner_for_turn`, so it keeps the user's Codex config as before this branch.
+    pub fn for_chat(model: String) -> Self {
+        Self {
+            model,
+            sandbox_mode: Some("read-only"),
+        }
+    }
 }
 
 #[async_trait]
@@ -3023,7 +3242,7 @@ impl CommandRunner for CodexCliRunner {
     async fn run_prompt(
         &self,
         request: RunRequest,
-        _session_tx: UnboundedSender<String>,
+        session_tx: UnboundedSender<String>,
         transcript: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> std::io::Result<RunOutcome> {
         // Refused before anything is sent, exactly as `OllamaRunner` refuses a policy it cannot
@@ -3060,17 +3279,11 @@ impl CommandRunner for CodexCliRunner {
                 request.permission
             )));
         }
-        // `mcp_config` is half of a pairing: on the Claude path the file arrives with an
-        // `--allowedTools mcp__nucleos__*` that narrows the run to that server alone. Dropping the
-        // flag drops the narrowing with it, so the run keeps every tool it had — the opposite of what
-        // naming an MCP config asks for.
-        if request.mcp_config.is_some() {
-            return Err(std::io::Error::other(
-                "codex exec cannot honour mcp_config: it has no flag that loads one, nor the tool narrowing that comes with it",
-            ));
-        }
-        // Reachable only if the tool-policy guard above is ever loosened, and refused anyway,
-        // because of which way it fails.
+        // MCP config is honoured through `codex_mcp_overrides`, which translates it into
+        // `-c mcp_servers.<name>...` overrides. An errand's tool box travels in the server's own `--mcp-tools` arguments, so it survives that translation.
+        // The daemon's own servers are pre-approved (`default_tools_approval_mode = "approve"`).
+        // Servers in the user's `~/.codex/config.toml` still load with that file's approval because
+        // `codex exec` has no counterpart to the Claude CLI's `--strict-mcp-config`.
         //
         // The barrier this used to stand down is `Permission::Bypass`'s to stand down now, and the
         // guard above refuses that. What is left here is a BELIEF and it is still worth refusing:
@@ -3097,9 +3310,7 @@ impl CommandRunner for CodexCliRunner {
         // conversation can be `Unrestricted` and still have barred a tool for itself — so without
         // this it would be a restriction somebody set, saw drawn back at them, and never had.
         for (asked, control) in [
-            (request.effort.is_some(), "effort"),
             (!request.fallback_model.is_empty(), "fallback_model"),
-            (!request.add_dirs.is_empty(), "add_dirs"),
             (request.max_budget_usd.is_some(), "max_budget_usd"),
             (!request.agents.is_empty(), "agents"),
             (
@@ -3129,32 +3340,68 @@ impl CommandRunner for CodexCliRunner {
         // so a run that loses it is a run with a nameless session, which is what every run on this
         // path has always had.
 
-        // Not a safety control, and refused all the same. A caller asks for partial messages because
-        // something downstream is waiting on them; a stream that silently never emits any is a
-        // feature that looks broken rather than absent.
-        if request.include_partial_messages {
-            return Err(std::io::Error::other(
-                "codex exec cannot honour include_partial_messages: its stream has no partial-message events",
-            ));
-        }
-        // KNOWN LIMITATION, left un-refused on purpose: `resume_session_id` is not honoured here.
-        //
-        // A run resumed on this path gets a FRESH session carrying the continuation prompt — it
-        // re-reads rather than continues — because `codex exec` has no `--resume` flag; resuming is
-        // a separate subcommand with its own argument shape, so it is a launch this builder does not
-        // yet construct rather than a capability the tool lacks. That is a degraded resume, not an
-        // ignored safety control: nothing is loosened by it, and every barrier the run launches
-        // under is unchanged.
-        //
-        // Refusing it would also refuse more than itself. `session_id` — the id the daemon assigns
-        // every run so its record has a name — travels the same pair of fields, and the run's outcome
-        // is filed under whichever of the two is set; a refusal keyed on either would fail runs whose
-        // only unusual property is having been given an identity.
+        // Partial messages are accepted and degrade: Codex's stream has no partial-message events,
+        // so the reply arrives when the turn completes.
+        // Resume is honoured through `codex exec resume`, which has its own argument shape.
         //
         // The args are built before anything is spawned so a refusal reaches the caller as the `Err` that means
         // the CLI never ran — which `runs::spawn_run` reads as "a retry cannot double-apply a
         // mutation", and that is precisely true of a launch that did not happen.
-        let args = codex_cli_args(&request, &self.model).map_err(std::io::Error::other)?;
+        // `codex_cli_args` honours MCP config, effort, and extra directories; partial messages
+        // degrade because the reply arrives when the turn completes.
+        let mcp_overrides = match &request.mcp_config {
+            Some(path) => {
+                let contents = std::fs::read(path).map_err(|error| {
+                    std::io::Error::other(format!("codex exec cannot honour mcp_config: {error}"))
+                })?;
+                let config = serde_json::from_slice(&contents).map_err(|error| {
+                    std::io::Error::other(format!("codex exec cannot honour mcp_config: {error}"))
+                })?;
+                let mut env_names: Vec<String> =
+                    request.env.iter().map(|(name, _)| name.clone()).collect();
+                env_names.sort();
+                codex_mcp_overrides(&config, &env_names).map_err(|why| {
+                    std::io::Error::other(format!("codex exec cannot honour mcp_config: {why}"))
+                })?
+            }
+            None => Vec::new(),
+        };
+        struct StagedFiles(Vec<PathBuf>);
+        impl Drop for StagedFiles {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let staged_files = if request.images.is_empty() {
+            StagedFiles(Vec::new())
+        } else {
+            let stem = format!(
+                "nucleos-codex-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            StagedFiles(stage_codex_images(
+                std::env::temp_dir().as_path(),
+                &stem,
+                &request.images,
+            )?)
+        };
+        let staged = CodexStaged {
+            mcp_overrides,
+            images: staged_files.0.clone(),
+            sandbox_mode: self.sandbox_mode,
+        };
+        let args = codex_cli_args(
+            &request,
+            request.model.as_deref().unwrap_or(&self.model),
+            &staged,
+        )
+        .map_err(std::io::Error::other)?;
 
         // The Codex CLI binary. Overridable via `NUCLEOS_CODEX_BIN` for the same reason
         // `NUCLEOS_CLAUDE_BIN` exists: on Windows the npm-installed `codex` is a `.cmd` shim that
@@ -3204,6 +3451,7 @@ impl CommandRunner for CodexCliRunner {
         let mut progress_timeout_elapsed: Option<Duration> = None;
         let mut turns = TurnCounter::default();
         let mut turns_exceeded: Option<i64> = None;
+        let mut thread_id = None;
 
         loop {
             let next_line = match request.progress_timeout {
@@ -3231,6 +3479,12 @@ impl CommandRunner for CodexCliRunner {
             if let Ok(mut shared) = transcript.lock() {
                 shared.push_str(&line);
                 shared.push('\n');
+            }
+            if thread_id.is_none() {
+                thread_id = codex_thread_id(&line);
+                if let Some(id) = &thread_id {
+                    let _ = session_tx.send(id.clone());
+                }
             }
             // The same brake as the Claude body above, counting `turn.completed` instead of
             // `assistant` — `TurnCounter` knows both, so this path cannot drift out of step
@@ -3295,12 +3549,13 @@ impl CommandRunner for CodexCliRunner {
             exit_code,
             stdout: stdout_acc,
             stderr: stderr_str,
-            // `codex exec` names no session in what it prints, so a run stays known by the id its
-            // caller assigned; inventing one here would file it under an id nothing else holds.
-            session_id: request
-                .session_id
-                .clone()
-                .or_else(|| request.resume_session_id.clone()),
+            // The thread id from `thread.started` when the stream carried one, else the caller's id.
+            session_id: thread_id.or_else(|| {
+                request
+                    .session_id
+                    .clone()
+                    .or_else(|| request.resume_session_id.clone())
+            }),
             // This tool reports no price. Unknown, not free — `budget.rs` bills against this field,
             // and a `Some(0.0)` would make every run on this path look like it spent nothing.
             cost_usd: None,
@@ -6951,7 +7206,7 @@ mod tests {
         let mut request = baseline_run_request();
         request.cwd = Some(std::path::PathBuf::from("C:/work/repo"));
 
-        let args = codex_cli_args(&request, "gpt-5.6-terra")
+        let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default())
             .expect("a baseline request asks for nothing the tool cannot honour");
 
         assert_eq!(
@@ -6979,12 +7234,377 @@ mod tests {
             directoryless.cwd.is_none(),
             "the baseline must name no directory"
         );
-        let directoryless_args = codex_cli_args(&directoryless, "gpt-5.6-terra")
-            .expect("a request without a directory is still honourable");
+        let directoryless_args =
+            codex_cli_args(&directoryless, "gpt-5.6-terra", &CodexStaged::default())
+                .expect("a request without a directory is still honourable");
         assert!(
             !directoryless_args.iter().any(|arg| arg == "-C"),
             "an absent cwd must not invent a directory: {directoryless_args:?}"
         );
+    }
+
+    #[test]
+    fn codex_cli_args_ask_for_the_json_event_stream() {
+        let fresh = codex_cli_args(
+            &baseline_run_request(),
+            "gpt-5.6-terra",
+            &CodexStaged::default(),
+        )
+        .unwrap();
+        assert!(fresh.iter().any(|arg| arg == "--json"), "{fresh:?}");
+
+        let mut resumed = baseline_run_request();
+        resumed.resume_session_id = Some("sess-1".to_string());
+        let resumed = codex_cli_args(&resumed, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        assert!(resumed.iter().any(|arg| arg == "--json"), "{resumed:?}");
+    }
+
+    #[test]
+    fn codex_cli_args_resume_a_session_through_the_resume_subcommand() {
+        let mut request = baseline_run_request();
+        request.resume_session_id = Some("sess-1".to_string());
+        request.cwd = Some(PathBuf::from("C:/work/repo"));
+        request.add_dirs = vec![PathBuf::from("C:/work/other")];
+
+        let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        assert_eq!(&args[..2], ["exec", "resume"], "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "-C"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--add-dir"), "{args:?}");
+        assert_eq!(
+            &args[args.len() - 2..],
+            ["sess-1", "test prompt"],
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn codex_cli_args_carry_effort_as_a_reasoning_override() {
+        let mut request = baseline_run_request();
+        request.effort = Some("high".to_string());
+        let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair[0] == "-c" && pair[1] == r#"model_reasoning_effort="high""# }),
+            "{args:?}"
+        );
+
+        let without_effort = codex_cli_args(
+            &baseline_run_request(),
+            "gpt-5.6-terra",
+            &CodexStaged::default(),
+        )
+        .unwrap();
+        assert!(
+            !without_effort
+                .iter()
+                .any(|arg| arg.contains("model_reasoning_effort")),
+            "{without_effort:?}"
+        );
+    }
+
+    #[test]
+    fn codex_cli_args_carry_extra_dirs_on_both_launch_shapes() {
+        let directories = vec![PathBuf::from("C:/work/a"), PathBuf::from("C:/work/b")];
+        let mut fresh = baseline_run_request();
+        fresh.add_dirs = directories.clone();
+        let fresh = codex_cli_args(&fresh, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        for directory in ["C:/work/a", "C:/work/b"] {
+            assert!(
+                fresh
+                    .windows(2)
+                    .any(|pair| pair[0] == "--add-dir" && pair[1] == directory),
+                "{fresh:?}"
+            );
+        }
+
+        let mut resumed = baseline_run_request();
+        resumed.resume_session_id = Some("sess-1".to_string());
+        resumed.add_dirs = directories;
+        let resumed = codex_cli_args(&resumed, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        let roots = serde_json::to_string(&["C:/work/a", "C:/work/b"]).unwrap();
+        assert!(
+            resumed.windows(2).any(|pair| {
+                pair[0] == "-c"
+                    && pair[1] == format!("sandbox_workspace_write.writable_roots={roots}")
+            }),
+            "{resumed:?}"
+        );
+        assert!(!resumed.iter().any(|arg| arg == "--add-dir"), "{resumed:?}");
+    }
+
+    /// An explicit override beats the user's `~/.codex/config.toml`, which exec's own default does
+    /// not; this is `-c` because `codex exec resume` has no `-s`.
+    #[test]
+    fn codex_cli_args_pin_the_sandbox_on_both_launch_shapes() {
+        let fresh_request = baseline_run_request();
+        let mut resumed_request = baseline_run_request();
+        resumed_request.resume_session_id =
+            Some("123e4567-e89b-42d3-a456-426614174001".to_string());
+        let pinned = CodexStaged {
+            sandbox_mode: Some("read-only"),
+            ..CodexStaged::default()
+        };
+
+        let fresh = codex_cli_args(&fresh_request, "gpt-5.6-terra", &pinned).unwrap();
+        let resumed = codex_cli_args(&resumed_request, "gpt-5.6-terra", &pinned).unwrap();
+        let sandbox = r#"sandbox_mode="read-only""#;
+
+        for args in [&fresh, &resumed] {
+            assert_eq!(
+                args.windows(2)
+                    .filter(|pair| pair[0] == "-c" && pair[1] == sandbox)
+                    .count(),
+                1,
+                "{args:?}"
+            );
+            let sandbox_index = args
+                .windows(2)
+                .position(|pair| pair[0] == "-c" && pair[1] == sandbox)
+                .unwrap();
+            assert!(sandbox_index + 1 < args.len() - 1, "{args:?}");
+        }
+        let resumed_sandbox_index = resumed
+            .windows(2)
+            .position(|pair| pair[0] == "-c" && pair[1] == sandbox)
+            .unwrap();
+        let session_index = resumed
+            .iter()
+            .position(|arg| arg == "123e4567-e89b-42d3-a456-426614174001")
+            .unwrap();
+        assert!(resumed_sandbox_index + 1 < session_index, "{resumed:?}");
+
+        for request in [&fresh_request, &resumed_request] {
+            let args = codex_cli_args(request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("sandbox_mode=")),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// The owner decided a Codex chat turn runs read-only; the run runner in `main.rs` keeps `None`
+    /// so a run keeps the user's Codex configuration.
+    #[test]
+    fn codex_chat_runner_pins_the_read_only_sandbox() {
+        let runner = CodexCliRunner::for_chat("gpt-5.5".to_string());
+
+        assert_eq!(runner.model, "gpt-5.5");
+        assert_eq!(runner.sandbox_mode, Some("read-only"));
+    }
+
+    #[test]
+    fn codex_cli_args_attach_images_without_swallowing_the_prompt() {
+        let mut request = baseline_run_request();
+        request.images = vec![
+            Attachment {
+                media_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+            Attachment {
+                media_type: "image/jpeg".to_string(),
+                data: "d29ybGQ=".to_string(),
+            },
+        ];
+        let staged = CodexStaged {
+            mcp_overrides: Vec::new(),
+            images: vec![
+                PathBuf::from("C:/stage/one.png"),
+                PathBuf::from("C:/stage/two.jpg"),
+            ],
+            sandbox_mode: None,
+        };
+        let args = codex_cli_args(&request, "gpt-5.6-terra", &staged).unwrap();
+        for image in ["C:/stage/one.png", "C:/stage/two.jpg"] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-i" && pair[1] == image),
+                "{args:?}"
+            );
+            assert!(
+                args.windows(3).any(|triple| triple[0] == "-i"
+                    && triple[1] == image
+                    && triple[2].starts_with('-')),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("test prompt"),
+            "{args:?}"
+        );
+
+        let too_few = CodexStaged {
+            mcp_overrides: Vec::new(),
+            images: vec![PathBuf::from("C:/stage/one.png")],
+            sandbox_mode: None,
+        };
+        let error = codex_cli_args(&request, "gpt-5.6-terra", &too_few).unwrap_err();
+        assert!(error.contains("images"), "{error}");
+    }
+
+    #[test]
+    fn codex_mcp_overrides_translate_the_daemons_mcp_config() {
+        let config = serde_json::json!({"mcpServers":{"nucleos":{"type":"stdio","command":"C:/x/nucleos-core.exe","args":["--mcp-tools","a"]}}});
+        let env_names = vec![
+            "NUCLEOS_DAEMON_TOKEN".to_string(),
+            "NUCLEOS_DAEMON_URL".to_string(),
+        ];
+        let overrides = codex_mcp_overrides(&config, &env_names).unwrap();
+        assert_eq!(
+            overrides,
+            vec![
+                r#"mcp_servers.nucleos.command="C:/x/nucleos-core.exe""#.to_string(),
+                r#"mcp_servers.nucleos.args=["--mcp-tools","a"]"#.to_string(),
+                r#"mcp_servers.nucleos.env_vars=["NUCLEOS_DAEMON_TOKEN","NUCLEOS_DAEMON_URL"]"#
+                    .to_string(),
+                r#"mcp_servers.nucleos.default_tools_approval_mode="approve""#.to_string(),
+            ]
+        );
+
+        let mut request = baseline_run_request();
+        request.env = vec![(
+            "NUCLEOS_DAEMON_TOKEN".to_string(),
+            "secret-token-value".to_string(),
+        )];
+        let args = codex_cli_args(
+            &request,
+            "gpt-5.6-terra",
+            &CodexStaged {
+                mcp_overrides: overrides.clone(),
+                images: Vec::new(),
+                sandbox_mode: None,
+            },
+        )
+        .unwrap();
+        for override_value in overrides {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-c" && pair[1] == override_value),
+                "{args:?}"
+            );
+        }
+        assert!(
+            !args.iter().any(|arg| arg.contains("secret-token-value")),
+            "{args:?}"
+        );
+    }
+
+    /// `codex exec` declines an unconfirmed MCP call; Claude pre-approves these same tools.
+    #[test]
+    fn codex_mcp_overrides_pre_approve_the_daemons_own_tools() {
+        let config = serde_json::json!({"mcpServers":{"nucleos":{"type":"stdio","command":"C:/x/nucleos-core.exe","args":["--mcp-tools"]}}});
+        let overrides = codex_mcp_overrides(&config, &[]).unwrap();
+        assert_eq!(
+            overrides,
+            vec![
+                r#"mcp_servers.nucleos.command="C:/x/nucleos-core.exe""#.to_string(),
+                r#"mcp_servers.nucleos.args=["--mcp-tools"]"#.to_string(),
+                r#"mcp_servers.nucleos.default_tools_approval_mode="approve""#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_mcp_overrides_refuse_a_config_they_cannot_express() {
+        let cases = [
+            serde_json::json!({}),
+            serde_json::json!({"mcpServers": []}),
+            serde_json::json!({"mcpServers":{"nucleos":{"type":"http","command":"C:/x"}}}),
+            serde_json::json!({"mcpServers":{"not nucleos":{"type":"stdio","command":"C:/x"}}}),
+            serde_json::json!({"mcpServers":{"nucleos":{"type":"stdio","command":3}}}),
+        ];
+        for config in cases {
+            let error = codex_mcp_overrides(&config, &[]).unwrap_err();
+            assert!(error.contains("mcp_config"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_codex_runner_refuses_an_mcp_config_it_cannot_read() {
+        let runner = CodexCliRunner {
+            model: "gpt-5.6-terra".to_string(),
+            sandbox_mode: None,
+        };
+        let mut request = baseline_run_request();
+        request.mcp_config = Some(PathBuf::from("C:/does-not-exist/mcp.json"));
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let error = runner
+            .run_prompt(
+                request,
+                session_tx,
+                std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mcp_config"), "{error}");
+        assert!(
+            !error.contains("cannot honour mcp_config: it has no flag"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn codex_thread_id_is_read_from_the_thread_started_event() {
+        assert_eq!(
+            codex_thread_id(r#"{"type":"thread.started","thread_id":"t-123"}"#),
+            Some("t-123".to_string())
+        );
+        assert_eq!(codex_thread_id(r#"{"type":"turn.completed"}"#), None);
+        assert_eq!(codex_thread_id("not json"), None);
+    }
+
+    #[test]
+    fn extract_reply_reads_a_codex_agent_message() {
+        let codex = r#"{"type":"item.completed","item":{"type":"agent_message","text":"draft"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"final"}}"#;
+        assert_eq!(extract_reply(codex), Some("final".to_string()));
+        assert_eq!(
+            extract_reply(r#"{"type":"result","result":"olá"}"#),
+            Some("olá".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_cli_args_accept_a_one_turn_steerable_request() {
+        let mut one_turn = baseline_run_request();
+        one_turn.steerable = true;
+        assert!(codex_cli_args(&one_turn, "gpt-5.6-terra", &CodexStaged::default()).is_ok());
+
+        let mut live = baseline_run_request();
+        live.steerable = true;
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<LaterTurn>();
+        live.messages = Some(rx);
+        let error = codex_cli_args(&live, "gpt-5.6-terra", &CodexStaged::default()).unwrap_err();
+        assert!(error.contains("steerable"), "{error}");
+    }
+
+    #[test]
+    fn codex_images_are_staged_as_files_the_cli_can_read() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let images = vec![
+            Attachment {
+                media_type: "image/png".to_string(),
+                data: "cG5n".to_string(),
+            },
+            Attachment {
+                media_type: "image/jpeg".to_string(),
+                data: "anBlZw==".to_string(),
+            },
+        ];
+        let staged = stage_codex_images(temp.path(), "stem", &images).unwrap();
+        assert_eq!(staged.len(), 2, "{staged:?}");
+        assert!(staged[0].ends_with("stem-0.png"), "{staged:?}");
+        assert!(staged[1].ends_with("stem-1.jpg"), "{staged:?}");
+        assert_eq!(std::fs::read(&staged[0]).unwrap(), b"png");
+        assert_eq!(std::fs::read(&staged[1]).unwrap(), b"jpeg");
+
+        let pdf = [Attachment {
+            media_type: "application/pdf".to_string(),
+            data: "cGRm".to_string(),
+        }];
+        let error = stage_codex_images(temp.path(), "stem", &pdf).unwrap_err();
+        assert!(error.to_string().contains("images"), "{error}");
     }
 
     /// A control this tool cannot honour must fail the launch instead of vanishing from it.
@@ -7000,13 +7620,13 @@ mod tests {
     fn codex_cli_args_refuse_what_the_tool_cannot_honour() {
         let honourable = baseline_run_request();
         assert!(
-            codex_cli_args(&honourable, "gpt-5.6-terra").is_ok(),
+            codex_cli_args(&honourable, "gpt-5.6-terra", &CodexStaged::default()).is_ok(),
             "the control case must build, or a refusal proves nothing"
         );
 
         let mut forked = baseline_run_request();
         forked.fork_session = true;
-        let forked_refusal = codex_cli_args(&forked, "gpt-5.6-terra")
+        let forked_refusal = codex_cli_args(&forked, "gpt-5.6-terra", &CodexStaged::default())
             .expect_err("a forked session cannot be honoured here");
         assert!(
             forked_refusal.contains("fork_session"),
@@ -7015,8 +7635,11 @@ mod tests {
 
         let mut steerable = baseline_run_request();
         steerable.steerable = true;
-        let steerable_refusal = codex_cli_args(&steerable, "gpt-5.6-terra")
-            .expect_err("a steerable run cannot be honoured here");
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<LaterTurn>();
+        steerable.messages = Some(rx);
+        let steerable_refusal =
+            codex_cli_args(&steerable, "gpt-5.6-terra", &CodexStaged::default())
+                .expect_err("a steerable run cannot be honoured here");
         assert!(
             steerable_refusal.contains("steerable"),
             "the refusal must name what it could not honour: {steerable_refusal}"
@@ -7036,6 +7659,7 @@ mod tests {
     async fn the_codex_runner_refuses_a_restricted_tool_policy() {
         let runner = CodexCliRunner {
             model: "gpt-5.6-terra".to_string(),
+            sandbox_mode: None,
         };
 
         for policy in [ToolPolicy::None, ToolPolicy::McpOnly] {
@@ -7104,15 +7728,11 @@ mod tests {
     /// converts a deliberately restrained run into an unrestrained one, in the one case where the
     /// operator is not watching. `Bypass` is refused for the opposite reason and it is the sharper
     /// of the two: it stands the CLI's permission barrier down on the strength of a `PreToolUse`
-    /// hook this launch surface has never heard of. `mcp_config` is half of a pairing on the Claude path, where the file arrives
-    /// with the `--allowedTools` narrowing that keeps the run to that server alone; dropping the flag
-    /// drops the narrowing, leaving MORE reachable than was asked for, not less.
+    /// hook this launch surface has never heard of.
     ///
-    /// `resume_session_id` is deliberately NOT here. It is unhonourable too, and documented as such
-    /// on the runner — but a run resumed on this path merely re-reads its prompt in a fresh session,
-    /// which loosens nothing, and refusing it would refuse `session_id` with it: the id the daemon
-    /// assigns every run travels the same pair of fields, so the control below would stop being a
-    /// control and start being a ban on runs that have a name.
+    /// `mcp_config` and `resume_session_id` are deliberately NOT here, because both are honoured now:
+    /// the MCP config becomes `-c mcp_servers.<name>...` overrides (see `codex_mcp_overrides` and its
+    /// tests), and a resumed run continues its own thread through `codex exec resume`.
     ///
     /// Asserted against `run_prompt` rather than `codex_cli_args`, because that builder's purity
     /// contract is frozen. Cheap for the same reason it is safe: every case returns before the
@@ -7121,6 +7741,7 @@ mod tests {
     async fn the_codex_runner_refuses_flags_it_cannot_honour() {
         let runner = CodexCliRunner {
             model: "gpt-5.6-terra".to_string(),
+            sandbox_mode: None,
         };
 
         let mut restrained = baseline_run_request();
@@ -7129,19 +7750,11 @@ mod tests {
         // mean running unbarriered where the daemon believes a classifier took over.
         let mut unbarriered = baseline_run_request();
         unbarriered.permission = Permission::Bypass;
-        let mut narrowed = baseline_run_request();
-        narrowed.mcp_config = Some(std::path::PathBuf::from("C:/nucleos/mcp.json"));
-        let mut streaming = baseline_run_request();
-        streaming.include_partial_messages = true;
         // The per-conversation controls of 0110–0113. Each of these is drawn back at the person in
         // the window as a setting their conversation has, so a launch that dropped one would leave
         // the row claiming something the run never had.
-        let mut thinking = baseline_run_request();
-        thinking.effort = Some("high".to_string());
         let mut degrading = baseline_run_request();
         degrading.fallback_model = vec!["opus".to_string()];
-        let mut reaching = baseline_run_request();
-        reaching.add_dirs = vec![PathBuf::from("/beside")];
         let mut capped = baseline_run_request();
         capped.max_budget_usd = Some(0.5);
         let mut helped = baseline_run_request();
@@ -7156,11 +7769,7 @@ mod tests {
         for (field, request) in [
             ("Permission::Plan", restrained),
             ("Permission::Bypass", unbarriered),
-            ("mcp_config", narrowed),
-            ("include_partial_messages", streaming),
-            ("effort", thinking),
             ("fallback_model", degrading),
-            ("add_dirs", reaching),
             ("max_budget_usd", capped),
             ("agents", helped),
             ("append_system_prompt", instructed),
@@ -7198,17 +7807,16 @@ mod tests {
             "the control must carry the identity the daemon assigns every run"
         );
         assert!(
-            codex_cli_args(&honourable, "gpt-5.6-terra").is_ok(),
+            codex_cli_args(&honourable, "gpt-5.6-terra", &CodexStaged::default()).is_ok(),
             "a request asking for none of the above must still build a launch"
         );
 
-        // The documented limitation, pinned as a limitation: a resumed run is not refused here, so
-        // whoever changes that has to change this line and read why it says so.
+        // Resume is honoured, through `codex exec resume`, and must still build a launch.
         let mut resumed = baseline_run_request();
         resumed.resume_session_id = Some("123e4567-e89b-42d3-a456-426614174001".to_string());
         assert!(
-            codex_cli_args(&resumed, "gpt-5.6-terra").is_ok(),
-            "resume is degraded on this path, not refused — see the comment in `run_prompt`"
+            codex_cli_args(&resumed, "gpt-5.6-terra", &CodexStaged::default()).is_ok(),
+            "resume is honoured through `exec resume`"
         );
 
         // And the other one, for the same reason. A display name reaches the Claude CLI's `--resume`
