@@ -1122,6 +1122,33 @@ fn tag_command_writes(args: &[&str]) -> bool {
     args.iter().any(|token| !token.starts_with('-'))
 }
 
+/// PURE: whether a `git branch` argument list asks for a deletion, in any spelling git accepts.
+///
+/// Not `carries`, whose whole-token match is right where it is used and would be the hole here.
+/// git's option parser takes short flags in clusters and a long option by any unambiguous prefix,
+/// so `-df` is `-d -f` — a forced delete — and `--del` is `--delete`, and a whole-token test reads
+/// neither as a deletion. The `-D` arm in `unqueueable_but_shared` matches `-D` alone, so until
+/// this existed `-df` fell through to `_ => None` with every other spelling nobody listed.
+///
+/// A cluster counts only when every letter in it is one of `git branch`'s own short flags. That is
+/// what keeps a value handed over after a space from reading as flags: `--sort -committerdate` is
+/// a listing, and `-committerdate` holds a `d`.
+fn asks_to_delete(args: &[&str]) -> bool {
+    const SHORT_FLAGS: &str = "acCdDfilmMqrtuv";
+    args.iter().any(|token| {
+        if let Some(long) = token.strip_prefix("--") {
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            !name.is_empty() && "delete".starts_with(name)
+        } else if let Some(cluster) = token.strip_prefix('-') {
+            !cluster.is_empty()
+                && cluster.chars().all(|letter| SHORT_FLAGS.contains(letter))
+                && cluster.contains(['d', 'D'])
+        } else {
+            false
+        }
+    })
+}
+
 /// PURE: why a command the parsers declined must still not be run by hand, or `None`.
 ///
 /// **"Declined by the queue" and "fine to run directly" are not the same sentence, and treating
@@ -1202,7 +1229,7 @@ pub fn unqueueable_but_shared(command: &str) -> Option<String> {
              queue operations, not one: run `git fetch <remote>`, then `git merge <remote>/<branch>`."
                 .to_owned(),
         ),
-        // `-D` only. `-d` reached a parser and never arrives here, and the difference is the whole
+        // `-D` first, for the sentence it earns. The difference between it and `-d` is the whole
         // reason deletion is offerable at all: `-d` asks git to refuse when the branch holds commits
         // nothing else reaches, and `-D` asks git to stop answering that.
         // `-d -f` and `--delete --force` are `-D` written the long way, and git treats them as the
@@ -1219,6 +1246,32 @@ pub fn unqueueable_but_shared(command: &str) -> Option<String> {
                 .to_owned(),
             )
         }
+        // **Every other deletion, and this arm's absence was a hole.** The one above refused the
+        // forced spellings and left the rest to `_ => None`, which `session_git_decision` reads as
+        // "not mine" and ALLOWS. Observed 2026-09-14, from an editor session in the main checkout:
+        // `git worktree remove <path> && echo "worktree removed" && git branch -d <branch> 2>&1 |
+        // tail -6`. The line split as it should, and the deletion arrived as
+        // `git branch -d <branch> 2>&1` — five tokens, where `branch_delete_from_command` reads
+        // exactly four. No parser took it, this function had nothing to say, and the branch was
+        // deleted by hand with no row in `vcs_requests`.
+        //
+        // Refused rather than read more generously, for the reason `merge_from_command` gives for
+        // its own strictness: the parser's exact shape is what keeps `git branch <name>` — a
+        // creation — from ever being queued as a deletion, and a looser second reader is a second
+        // place for that to go wrong. The caller is handed the one spelling the queue does read.
+        //
+        // It answers for that spelling too, the way the arms below answer for theirs. The session
+        // gate asks the parsers first and never brings a segment one of them read down here; the
+        // classifier's confinement rule asks this function whether a segment is the queue's business
+        // at all, and a readable deletion is.
+        "branch" if asks_to_delete(args) => Some(
+            "a branch deletion goes through the queue, and the queue reads one spelling of it: \
+             `git branch -d <branch>`, one local branch, as a command of its own. This one carries \
+             something that spelling does not — a redirection or a pipe after it, a `-C`, a second \
+             name, a combined or abbreviated flag. Run `git branch -d <branch>` alone, as its own \
+             command, and the queue will take it."
+                .to_owned(),
+        ),
         // **What the queue's parsers could not read is refused by default from here down.**
         //
         // The opposite default is what let this route's worst case through, and it was measured
@@ -3729,6 +3782,16 @@ mod tests {
             "git branch -d -f feature",
             "git branch --delete --force feature",
             "git branch -D feature",
+            // A deletion the parser did not read. The first is the segment an editor session ran by
+            // hand on 2026-09-14; the rest are the other ways a `-d` leaves the four-token shape,
+            // the last three in spellings only git's own option parser reads as one.
+            "git branch -d fix/espera-que-responde 2>&1",
+            "git branch -d a b",
+            "git -C path branch -d feature",
+            "git branch --delete a b",
+            "git branch -df feature",
+            "git branch -dr origin/feature",
+            "git branch --del feature",
         ] {
             assert!(unqueueable_but_shared(command).is_some(), "{command}");
         }
@@ -3745,6 +3808,13 @@ mod tests {
             "git branch",
             "git branch --list",
             "git branch -a",
+            "git branch -v",
+            "git branch -vv",
+            "git branch -r",
+            "git branch --show-current",
+            "git branch --sort=-committerdate",
+            // A value handed over after a space, and `-committerdate` holds a `d`.
+            "git branch --sort -committerdate",
             "git status",
             "git log --oneline",
             "cargo test",
@@ -4196,8 +4266,60 @@ mod tests {
             // Shape, and the verb.
             "git branch -d one two",
             "gh branch -d feature",
+            // The two shapes of 2026-09-14's escape: a redirection after the name, and a global flag
+            // before the verb. Declining them is right; what `unqueueable_but_shared` says next is
+            // what decides whether they run.
+            "git branch -d feature 2>&1",
+            "git -C path branch -d feature",
         ] {
             assert_eq!(branch_delete_from_command(command), None, "{command}");
+        }
+    }
+
+    /// **The line that deleted a branch by hand on 2026-09-14**, and the chains that looked like its
+    /// cause.
+    ///
+    /// They were not the cause: split, a chained `git branch -d <branch>` is the four tokens the
+    /// parser reads, and a chain is queued the way
+    /// `a_git_command_behind_a_shell_operator_is_still_the_operation_it_names` says every verb is.
+    /// What escaped was the redirection on the end. Both halves are pinned, because a deletion has
+    /// to land in one of them — read, or refused — and the escape was a line that landed in neither.
+    #[test]
+    fn a_branch_deletion_is_either_read_or_refused_and_never_neither() {
+        let escaped = "git worktree remove C:/Projects/nucleos-espera && echo \"worktree removed\" \
+                       && git branch -d fix/espera-que-responde 2>&1 | tail -6";
+        let segments = shell_segments(escaped);
+        assert_eq!(
+            segments
+                .iter()
+                .copied()
+                .find_map(branch_delete_from_command),
+            None,
+            "the escape was a deletion no parser read: {segments:?}"
+        );
+        assert!(
+            segments
+                .iter()
+                .copied()
+                .find_map(unqueueable_but_shared)
+                .is_some(),
+            "so it has to be refused, or the gate answers `not mine` again: {segments:?}"
+        );
+
+        for chained in [
+            "git worktree remove x && git branch -d feature",
+            "cd repo && git branch -d feature",
+            "cd repo\ngit branch -d feature",
+        ] {
+            assert_eq!(
+                shell_segments(chained)
+                    .into_iter()
+                    .find_map(branch_delete_from_command),
+                Some(Op::BranchDelete {
+                    branch: "feature".into()
+                }),
+                "{chained}"
+            );
         }
     }
 

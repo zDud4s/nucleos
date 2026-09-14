@@ -8650,6 +8650,79 @@ mod tests {
         );
     }
 
+    /// 2026-09-14, through the whole decision rather than through the pure functions it calls. An
+    /// editor session in the main checkout ran the first line below, the hook asked, this route
+    /// answered `allow`, and the branch was deleted by hand with no row: `2>&1` left the deletion
+    /// segment five tokens long, no parser read it, and `unqueueable_but_shared` had no arm for a
+    /// `-d`.
+    ///
+    /// Three outcomes, and each spelling has exactly one: refused with nothing queued, queued, or
+    /// left alone. The listings are the half that keeps this a gate rather than a wall.
+    #[tokio::test]
+    async fn a_branch_deletion_is_queued_or_refused_and_a_listing_is_left_alone() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-branch-delete").await;
+
+        let unreadable = [
+            "git worktree remove C:/Projects/nucleos-espera && echo \"worktree removed\" && \
+             git branch -d fix/espera-que-responde 2>&1 | tail -6"
+                .to_owned(),
+            "git branch -d a b".to_owned(),
+            format!("git -C {} branch -d feature", repo.path().display()),
+            "git branch -df feature".to_owned(),
+        ];
+        for command in &unreadable {
+            let decision = session_decision(&state, command, repo.path()).await;
+            assert_eq!(decision.decision, "deny", "{command}: {}", decision.reason);
+            assert!(
+                decision.reason.contains("`git branch -d <branch>` alone"),
+                "the refusal has to hand back the spelling the queue reads: {command}: {}",
+                decision.reason
+            );
+        }
+        assert!(
+            queued_rows(&state).await.is_empty(),
+            "nothing the queue could not read may be admitted as if it had"
+        );
+
+        for command in [
+            "git branch -d feature",
+            "git branch --delete feature",
+            "git worktree remove x && git branch -d feature",
+            "cd somewhere && git branch -d feature",
+            "cd somewhere\ngit branch -d feature",
+        ] {
+            let decision = session_decision(&state, command, repo.path()).await;
+            assert_eq!(decision.decision, "deny", "{command}: {}", decision.reason);
+            assert!(
+                decision.reason.contains("queued as vcs request"),
+                "{command}: {}",
+                decision.reason
+            );
+        }
+        assert!(
+            queued_rows(&state)
+                .await
+                .iter()
+                .all(|(op, origin)| op == "branch-delete" && origin == "shell"),
+            "every row is the deletion, from a session"
+        );
+
+        for command in [
+            "git branch",
+            "git branch --list",
+            "git branch -a",
+            "git branch -v",
+            "git branch -vv",
+            "git branch -r",
+            "git branch --show-current",
+            "git branch --sort -committerdate",
+        ] {
+            let decision = session_decision(&state, command, repo.path()).await;
+            assert_eq!(decision.decision, "allow", "{command}: {}", decision.reason);
+        }
+    }
+
     /// The difference between a gate and a wall. The classifier sends everything not provably
     /// read-only for approval; refusing on THAT would stop a session at its second command. And a
     /// spelling that touches only the caller's own index has to keep working directly, or it becomes

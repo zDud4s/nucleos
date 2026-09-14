@@ -1035,8 +1035,19 @@ fn classify_segment(
     // way around them: `shell_form_is_readable` is what refuses `--fix`, `--output`, an `-exec`, a
     // `tail -f` and a `sort -o`, and a line holding one of those is not made safe by its arguments
     // being local.
+    //
+    // **Nor may it widen a git operation the queue performs or refuses**, and that conjunction was
+    // missing until 2026-09-14. A branch in this repository is named `fix/<slug>`, and a token with
+    // a `/` in it is a path to `confined_to_workspace` — a relative one, which resolves inside. So
+    // `git branch -d fix/<slug>`, in every spelling, and `git -C . push --force origin master` came
+    // back `confined-to-workspace` for a job node: allowed on the strength of where they pointed,
+    // past the queue that exists to order exactly them. Found tracing that day's hand-deleted
+    // branch through the run path, which never consults the session gate's refusal and so had only
+    // this to stop it. Whether a segment is the queue's business is asked of the queue's own
+    // function, so the two cannot come to disagree about it.
     if unrecognized == Unrecognized::MayBeConfined
         && shell_form_is_readable(&normalized)
+        && crate::vcs::unqueueable_but_shared(segment).is_none()
         && confined_to_workspace(segment, cwd, shell)
     {
         return Segment::Confined;
@@ -4055,6 +4066,50 @@ mod tests {
             "pending_approval",
             "push-merge-deploy",
         );
+    }
+
+    /// The run path's half of 2026-09-14's hand-deleted branch. A job node never reaches the
+    /// session gate's refusal, so confinement is what stood between it and these — and a branch
+    /// named `fix/<slug>` reads as a path that resolves inside.
+    ///
+    /// Collected rather than asserted one at a time, so a regression names every spelling it lets
+    /// through instead of the first.
+    #[test]
+    fn confinement_never_widens_a_git_operation_the_queue_performs_or_refuses() {
+        let workspace = Path::new(r"C:\work\repo");
+        let widened: Vec<&str> = [
+            "git branch -d fix/espera-que-responde",
+            "git branch -d fix/espera-que-responde 2>&1",
+            "git branch -D fix/espera-que-responde",
+            "git -C ./core branch -d feature",
+            "git -C . push --force origin master",
+            "git -C . merge fix/x",
+            "git rebase fix/x",
+            "git fetch ./elsewhere",
+        ]
+        .into_iter()
+        .filter(|command| {
+            classify_asked_for(command, Some(workspace))
+                .decision
+                .decision
+                == "allow"
+        })
+        .collect();
+        assert!(
+            widened.is_empty(),
+            "confinement widened a git operation the queue owns: {widened:?}"
+        );
+
+        // What confinement is for is untouched: git spellings the queue has no opinion about.
+        for command in ["git branch --list fix/*", "git -C ./core log --oneline"] {
+            assert_eq!(
+                classify_asked_for(command, Some(workspace))
+                    .decision
+                    .decision,
+                "allow",
+                "{command}"
+            );
+        }
     }
 
     /// The two git reads that cost job 21 two of its four items, in the exact spelling the run
