@@ -1018,8 +1018,8 @@ describe("Fleet — the slot rack", () => {
     expect(within(charlie).queryByRole("button")).toBeNull();
     expect(within(entryOf(rack, "delta")).getByText("no folder")).toBeDefined();
     expect(within(entryOf(rack, "delta")).queryByRole("button")).toBeNull();
-    expect(within(entryOf(rack, "echo")).queryByText("not active")).toBeNull();
-    expect(within(entryOf(rack, "echo")).queryByRole("button")).toBeNull();
+    // Off and holding nothing is not part of the fleet: not on the rack at all.
+    expect(within(rack).queryByRole("link", { name: "echo" })).toBeNull();
     expect(within(entryOf(rack, "alpha")).getByRole("button", { name: "New job in alpha" })).toBeDefined();
 
     // One answer at two lengths: each option says in full what its entry says short, or leaves to
@@ -1029,7 +1029,38 @@ describe("Fleet — the slot rack", () => {
     const option = (value: string) => select.querySelector(`option[value="${value}"]`)?.textContent;
     expect(option("charlie")).toBe("charlie — in shadow — jobs start only when the autopilot is active");
     expect(option("delta")).toBe("delta — no folder recorded");
-    expect(option("echo")).toBe("echo — autopilot off — jobs start only when it is active");
+    expect(option("echo")).toBeUndefined();
+  });
+
+  it("keeps a switched-off project on the rack only while it still holds a slot", async () => {
+    // Off refuses new work, but work started before the switch still holds what it claimed, and a
+    // rack without it would be capacity vanishing in silence.
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 4, held: 1 },
+            projects: [
+              column({ project_id: "alpha", slots: [slot({ owner_id: 41 })] }),
+              column({ project_id: "echo" }),
+            ],
+          },
+          jobs: [job({ id: 41 })],
+          projects: [
+            project({ project_id: "alpha", mode: "off" }),
+            project({ project_id: "echo", mode: "off" }),
+          ],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    const rack = await findRack();
+
+    await waitFor(() => expect(within(rack).queryByRole("link", { name: "echo" })).toBeNull());
+    expect(within(rack).getByRole("link", { name: "alpha" })).toBeDefined();
+    expect(pipsOf(entryOf(rack, "alpha"))).toEqual(["active", "free"]);
+    expect(within(entryOf(rack, "alpha")).queryByRole("button")).toBeNull();
   });
 
   it("takes every New job out of the rack while the view is stale, and keeps the reasons and the pips", async () => {
@@ -1349,17 +1380,13 @@ describe("Fleet — asking for a job", () => {
     await openComposer();
 
     const select = screen.getByLabelText("Project for the new job") as HTMLSelectElement;
-    await waitFor(() =>
-      expect(select.querySelector('option[value="delta"]')?.textContent).toBe(
-        "delta — autopilot off — jobs start only when it is active",
-      ),
-    );
+    // Off is not offered at all rather than offered disabled: once `/projects` says so, delta goes.
+    await waitFor(() => expect(select.querySelector('option[value="delta"]')).toBeNull());
     const options = Object.fromEntries([...select.options].map((option) => [option.value, option]));
     expect(options.alpha.textContent).toBe("alpha — room for 1 (1 of 2)");
     expect(options.alpha.disabled).toBe(false);
     expect(options.charlie.textContent).toBe("charlie — full (2 of 2)");
     expect(options.charlie.disabled).toBe(true);
-    expect(options.delta.disabled).toBe(true);
     // The most room of the projects that can take one.
     expect(select.value).toBe("bravo");
 

@@ -340,7 +340,7 @@ function ViewSwitch({ view, onChange }: { view: FleetView; onChange: (next: Flee
  * Two idle displays came before this one and neither survived — a column each at `0/N`, then a
  * list of idle rows after the columns — because both treated idle as a kind of project. It is not;
  * it is how full a project is, and every project has a fullness. So every project is here, busy or
- * not, one line each, **in one order that never changes**: by project id, the order `/concurrency`
+ * not — all but one whose autopilot is off and that holds nothing (`isSwitchedOff`) — one line each, **in one order that never changes**: by project id, the order `/concurrency`
  * sends them in (`core/src/concurrency.rs`, `readout`: `ids.sort()`), so a project is always where
  * it was, whatever just went wrong in it. The columns below keep their exceptions-first order and do
  * the ranking; the rack is where a project is found.
@@ -377,10 +377,13 @@ function SlotRack({
   const titleId = useId();
   // Code-unit order, which is how `ids.sort()` compares Rust strings: the rack and the reading agree
   // byte for byte rather than by some locale's idea of alphabetical.
-  const entries = [...columns].sort((left, right) => {
-    const [a, b] = [left.project.project_id, right.project.project_id];
-    return a < b ? -1 : a > b ? 1 : 0;
-  });
+  const entries = [...columns]
+    .filter(({ project, cards }) => cards.length > 0 || !isSwitchedOff(project, projects))
+    .sort((left, right) => {
+      const [a, b] = [left.project.project_id, right.project.project_id];
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+  if (entries.length === 0) return null;
   return (
     <section className="fleet-rack" aria-labelledby={titleId}>
       {/* Named for the ear and not the eye: to anybody looking the pips are the heading, and a
@@ -656,14 +659,30 @@ export interface NoJob {
 }
 
 /**
- * Every project, each with the reason it cannot take a job, if there is one (`whyNoJob`). A
- * disabled option that says why is a refusal the reader never has to earn.
+ * Whether the roster says a project's autopilot is off.
+ *
+ * Off is not part of the fleet: `POST /jobs` and `POST /runs` both refuse it, so it has no room to
+ * show and nothing to offer. Only a known `off` counts — before `/projects` answers nothing is
+ * hidden on a guess. Its slots are another matter: `readout` in `core/src/concurrency.rs` keeps
+ * listing an off project, and work started before the switch still holds what it claimed, so a
+ * caller hides an off project only while it holds nothing.
+ */
+function isSwitchedOff(project: ProjectConcurrency, projects: ProjectSummary[] | undefined): boolean {
+  return projects?.find((row) => row.project_id === project.project_id)?.mode === "off";
+}
+
+/**
+ * Every project but a switched-off one, each with the reason it cannot take a job, if there is one
+ * (`whyNoJob`). A disabled option that says why is a refusal the reader never has to earn; an off
+ * project is not offered at all, because it is not a choice anybody is being refused but one that
+ * is not there.
  */
 export function projectChoices(
   columns: FleetColumn[],
   projects: ProjectSummary[] | undefined,
 ): ProjectChoice[] {
   return [...columns]
+    .filter(({ project }) => !isSwitchedOff(project, projects))
     .sort((left, right) => left.project.project_id.localeCompare(right.project.project_id))
     .map(({ project }) => {
       const held = project.slots.length;

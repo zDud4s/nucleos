@@ -225,7 +225,9 @@
  *
  * **Column-major**, through multi-column layout rather than a grid. A grid flows across — `alpha
  * bravo / charlie delta` — and a list sorted by name is read down, the way a directory is. Columns
- * at least 20rem wide: two at 1280, one at 800, and nothing that scrolls sideways.
+ * at least 27rem wide, which is one whole entry on one line — name, mode, five pips and New job with
+ * their gaps. At 20rem the entry did not fit and New job fell under its pips on every startable
+ * line. Two columns at 1280, one at 800, and nothing that scrolls sideways.
  */
 .fleet-rack {
   margin-bottom: var(--space-6);
@@ -237,7 +239,7 @@
   margin: 0;
   padding: 0;
   list-style: none;
-  column-width: 20rem;
+  column-width: 27rem;
   column-gap: var(--space-6);
 }
 
@@ -254,12 +256,14 @@
  * and the actions stand in a column of their own — which is what makes the rack one instrument
  * rather than a stack of sentences. Not at the right edge: with entries in two columns, an action
  * pushed to its column's edge sat nearer the next column's name than its own pips, and read as
- * belonging to it. A wrapping flex row rather than a grid, so where a line is too narrow the action
- * drops under the pips by itself instead of crushing them.
+ * belonging to it. Never wrapped: an action dropped under its pips broke the line it belongs to and
+ * the rhythm of every line beside it. Where a line is narrower than the column was sized for, the
+ * name gives way — it is the one cell that can be cut and still be whole, in its `title` and to a
+ * screen reader.
  */
 .fleet-rack-entry {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: var(--space-1) var(--space-3);
   min-height: 2rem;
@@ -272,7 +276,7 @@
    ellipsis when an id outruns its cell: a name broken over two lines broke the rhythm of every
    entry beside it. The whole id is still the link's text for a screen reader, and its `title`. */
 .fleet-rack-name {
-  flex: 0 0 10rem;
+  flex: 0 1 10rem;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
