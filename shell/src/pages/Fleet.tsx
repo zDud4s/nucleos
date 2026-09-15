@@ -32,6 +32,7 @@ import {
   buildFleet,
   loadLayout,
   saveLayout,
+  slotReading,
   type Exceptions,
   type FleetColumn,
   type Layout,
@@ -45,6 +46,7 @@ import {
   Panel,
   RefusalNote,
   RelativeTime,
+  SlotPips,
   StaleNote,
   StatCard,
   StateBadge,
@@ -69,9 +71,9 @@ import "./fleet.css";
  *
  * **What is wrong comes first, everywhere on the page.** The headline says the worst fact before
  * the capacity, and the columns are ordered by the same ladder, so a leaked slot in a quiet
- * project is read before three busy projects that are fine. Idle projects come after the columns
- * as a list of their own, one row each: quieter than a column, because the normal recedes, and
- * never less than content, because on a quiet day they are the whole page.
+ * project is read before three busy projects that are fine. Above them, the slot rack keeps every
+ * project in one place that never moves, a lamp per slot lit in the tone of what holds it: the
+ * columns rank, the rack is where a project is found. On a quiet day the rack is the whole page.
  *
  * **The kill switch control is not duplicated here.** It lives in the frame, on every page; a
  * second copy is a second thing to keep in step and a second thing to be wrong. What this page
@@ -99,14 +101,14 @@ export function Fleet() {
   const [layout, setLayout] = useState<Layout>(loadLayout);
   const [composing, setComposing] = useState(false);
   /**
-   * The project the panel's select holds — here and not in the form, so an idle row can open the
+   * The project the panel's select holds — here and not in the form, so a rack entry can open the
    * panel with its own project already chosen. Empty is "nobody picked", which the form reads as
    * the roomiest.
    */
   const [picked, setPicked] = useState("");
   /** One more on every request to open the panel, so focus goes in even when it is already open. */
   const [asked, setAsked] = useState(0);
-  /** The control that opened the panel — the header's New job or a row's — and so where focus goes back. */
+  /** The control that opened the panel — the header's New job or a rack entry's — and so where focus goes back. */
   const returnTo = useRef<HTMLElement | null>(null);
   const panelId = useId();
   const openerId = useId();
@@ -160,8 +162,8 @@ export function Fleet() {
 
   // Focus goes back to the control that opened the panel, which is the standard the project
   // switcher set: a panel that closes and drops focus on `<body>` leaves a keyboard user at the
-  // top of the document. The row that opened it can be gone by the time it closes — its project
-  // took a slot meanwhile and left the idle list — and then the header's New job is the one
+  // top of the document. The rack's button that opened it can be gone by the time it closes — its
+  // project filled up meanwhile, or the view went stale — and then the header's New job is the one
   // control left that means the same thing.
   function closeComposer() {
     setComposing(false);
@@ -268,6 +270,18 @@ export function Fleet() {
         </Teach>
       )}
 
+      {/* Above both views: which project has room, and what is in each slot, is a question
+          neither arrangement answers at a glance, and the rack does not change with the view. */}
+      {hasProjects && (
+        <SlotRack
+          columns={model.columns}
+          projects={projects.data}
+          stale={stale}
+          panelId={panelId}
+          onNewJob={openComposer}
+        />
+      )}
+
       {hasProjects &&
         (view === "canvas" ? (
           <FleetCanvas
@@ -281,13 +295,7 @@ export function Fleet() {
             }}
           />
         ) : (
-          <Columns
-            columns={model.columns}
-            projects={projects.data}
-            stale={stale}
-            panelId={panelId}
-            onNewJob={openComposer}
-          />
+          <Columns columns={model.columns} projects={projects.data} />
         ))}
     </FleetActionsProvider>
   );
@@ -324,76 +332,36 @@ function ViewSwitch({ view, onChange }: { view: FleetView; onChange: (next: Flee
   );
 }
 
-/* ---------------------------------------------------------------- columns -- */
+/* ------------------------------------------------------------------- rack -- */
 
 /**
- * The busy projects as columns, and the idle ones as a list after them.
+ * Every project's slots on one instrument: the rack.
  *
- * An idle project used to keep a full column at `0/N`, on the argument that a column vanishing
- * makes the layout jump. With the columns ordered by what is wrong, position is no longer the
- * thing a reader memorises — the headline is — and four empty columns were pushing the one with
- * a problem in it off the right of the screen. So only a busy project is a column.
+ * Two idle displays came before this one and neither survived — a column each at `0/N`, then a
+ * list of idle rows after the columns — because both treated idle as a kind of project. It is not;
+ * it is how full a project is, and every project has a fullness. So every project is here, busy or
+ * not, one line each, **in one order that never changes**: by project id, the order `/concurrency`
+ * sends them in (`core/src/concurrency.rs`, `readout`: `ids.sort()`), so a project is always where
+ * it was, whatever just went wrong in it. The columns below keep their exceptions-first order and do
+ * the ranking; the rack is where a project is found.
+ *
+ * A pip per slot of the limit (`SlotPips`), lit in the tone of the badge that slot's own card leads
+ * with (`slotReading`), hollow where free — so a leaked slot is red here because it is red on its
+ * card, and room is the hollow ones.
+ *
+ * **An entry's New job is the header's, aimed**: the same panel, with this project chosen. Offered
+ * wherever `POST /jobs` would take a job, busy project or idle, and `whyNoJob` is that rule; where it
+ * would not, the select says why in its long words, and the entry in its short ones only when
+ * nothing on its line already has — a full project's pips say it, and a project in shadow or off
+ * has its mode's badge. Gone while the view is stale, like
+ * every control on this page that acts on capacity, while the reasons stay and the rack dims like
+ * the cards. Kept while the kill switch is engaged, like the header's, because the panel is where
+ * that refusal is said.
+ *
+ * It recedes: no box, a hairline above and below, muted words. The pips are the only colour in it,
+ * and on a quiet day they are hollow.
  */
-function Columns({
-  columns,
-  projects,
-  stale,
-  panelId,
-  onNewJob,
-}: {
-  columns: FleetColumn[];
-  projects: ProjectSummary[] | undefined;
-  stale: boolean;
-  panelId: string;
-  onNewJob: (from: HTMLElement, project: string) => void;
-}) {
-  const busy = columns.filter((column) => !column.idle);
-  const idle = columns.filter((column) => column.idle);
-  return (
-    <>
-      {busy.length > 0 && (
-        <div className="fleet-columns">
-          {busy.map((column) => (
-            <ProjectColumn
-              key={column.project.project_id}
-              column={column}
-              summary={projects?.find((project) => project.project_id === column.project.project_id)}
-            />
-          ))}
-        </div>
-      )}
-      {idle.length > 0 && (
-        <IdleProjects
-          columns={idle}
-          projects={projects}
-          stale={stale}
-          panelId={panelId}
-          onNewJob={onNewJob}
-        />
-      )}
-    </>
-  );
-}
-
-/**
- * The projects with nothing held: a list after the busy columns, or the page's body when nothing
- * is busy anywhere.
- *
- * It was a column each, which is the paragraph above; then one line at the foot of the page, and
- * on a quiet day that line was the page — five projects reduced to a footnote of underlined names.
- * A list is neither. It is the rows idiom (`.ui-rows`), read by scanning down it, with the two
- * facts the column head carried — the autopilot mode and the capacity — the room that capacity
- * leaves, and the one thing an idle project is for.
- *
- * **The row's New job is the header's, aimed.** It opens the same panel with this project already
- * chosen rather than being a second form: one form per page is the rule the panel exists for. It
- * is offered only where `POST /jobs` would take the job, and `whyNoJob` is that rule — the select's
- * rule too, so a row and the list of options can never disagree. Where it would not, the row says
- * why in the select's own words. Gone while the view is stale, like every control on this page
- * that acts on capacity; kept while the kill switch is engaged, like the header's, because the
- * panel is where that refusal is said.
- */
-function IdleProjects({
+function SlotRack({
   columns,
   projects,
   stale,
@@ -407,25 +375,40 @@ function IdleProjects({
   onNewJob: (from: HTMLElement, project: string) => void;
 }) {
   const titleId = useId();
+  // Code-unit order, which is how `ids.sort()` compares Rust strings: the rack and the reading agree
+  // byte for byte rather than by some locale's idea of alphabetical.
+  const entries = [...columns].sort((left, right) => {
+    const [a, b] = [left.project.project_id, right.project.project_id];
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
   return (
-    <section className="fleet-idle-group" aria-labelledby={titleId}>
-      <h2 id={titleId} className="fleet-idle-title">
-        Idle <span className="fleet-idle-count">· {columns.length}</span>
+    <section className="fleet-rack" aria-labelledby={titleId}>
+      {/* Named for the ear and not the eye: to anybody looking the pips are the heading, and a
+          screen reader's list of headings needs a name to jump to. */}
+      <h2 id={titleId} className="sr-only">
+        Slots by project
       </h2>
-      <ul className="fleet-idle ui-rows">
-        {columns.map(({ project }) => {
+      <ul className={stale ? "fleet-rack-list fleet-rack-stale" : "fleet-rack-list"}>
+        {entries.map(({ project, cards }) => {
           const summary = projects?.find((row) => row.project_id === project.project_id);
-          const why = whyNoJob(project, summary);
-          const room = project.limit - project.slots.length;
+          const refusal = whyNoJob(project, summary);
+          // In slot order, so a pip keeps its place for as long as its slot is held.
+          const held = [...cards]
+            .sort((left, right) => left.slot.slot - right.slot.slot)
+            .map((card) => slotReading(card.detail));
           return (
-            <li key={project.project_id} className="ui-rows-row fleet-idle-row">
-              <Link to={`/projects/${project.project_id}/state`} className="fleet-idle-name">
+            <li key={project.project_id} className="fleet-rack-entry">
+              <Link
+                to={`/projects/${project.project_id}/state`}
+                className="fleet-rack-name"
+                title={project.project_id}
+              >
                 {project.project_id}
               </Link>
-              {/* The cell stays when `/projects` has not answered, so the capacity still lines up
-                  under the others — and stays empty, because a guessed mode on a safety control
+              {/* The cell stays when `/projects` has not answered, so the pips still start where
+                  everybody else's do — and stays empty, because a guessed mode on a safety control
                   is worse than none. */}
-              <span className="fleet-idle-mode">
+              <span className="fleet-rack-mode">
                 {summary !== undefined && (
                   <>
                     <span className="sr-only">autopilot </span>
@@ -433,34 +416,62 @@ function IdleProjects({
                   </>
                 )}
               </span>
-              <span className="fleet-idle-capacity">
-                {project.slots.length} of {project.limit}
-              </span>
-              <span className="fleet-idle-room">{room > 0 ? `room for ${room}` : "no room"}</span>
-              <span className="fleet-idle-act">
-                {why !== null ? (
-                  <span className="fleet-idle-why">{why}</span>
-                ) : (
-                  !stale && (
-                    // Named with the project: five buttons all called "New job" are five of the
-                    // same name to anybody not looking at the row they sit in.
-                    <Button
-                      variant="quiet"
-                      intent="go"
-                      aria-label={`New job in ${project.project_id}`}
-                      aria-controls={panelId}
-                      onClick={(event) => onNewJob(event.currentTarget, project.project_id)}
-                    >
-                      New job
-                    </Button>
-                  )
-                )}
+              <SlotPips held={held} limit={project.limit} />
+              <span className="fleet-rack-act">
+                {refusal === null
+                  ? !stale && (
+                      // Named with the project: five buttons all called "New job" are five of the
+                      // same name to anybody not looking at the line they sit on.
+                      <Button
+                        variant="quiet"
+                        intent="go"
+                        aria-label={`New job in ${project.project_id}`}
+                        aria-controls={panelId}
+                        onClick={(event) => onNewJob(event.currentTarget, project.project_id)}
+                      >
+                        New job
+                      </Button>
+                    )
+                  : refusal.short !== null && <span className="fleet-rack-why">{refusal.short}</span>}
               </span>
             </li>
           );
         })}
       </ul>
     </section>
+  );
+}
+
+/* ---------------------------------------------------------------- columns -- */
+
+/**
+ * The busy projects, as columns.
+ *
+ * An idle project used to keep a full column at `0/N`, on the argument that a column vanishing
+ * makes the layout jump. With the columns ordered by what is wrong, position is no longer the
+ * thing a reader memorises here — the headline is — and four empty columns were pushing the one
+ * with a problem in it off the right of the screen. So only a busy project is a column, and where
+ * every project always is, busy or not, is the rack's to say. Nothing busy is no columns at all.
+ */
+function Columns({
+  columns,
+  projects,
+}: {
+  columns: FleetColumn[];
+  projects: ProjectSummary[] | undefined;
+}) {
+  const busy = columns.filter((column) => !column.idle);
+  if (busy.length === 0) return null;
+  return (
+    <div className="fleet-columns">
+      {busy.map((column) => (
+        <ProjectColumn
+          key={column.project.project_id}
+          column={column}
+          summary={projects?.find((project) => project.project_id === column.project.project_id)}
+        />
+      ))}
+    </div>
   );
 }
 
@@ -606,9 +617,10 @@ export interface ProjectChoice {
  * `shadow` included, because shadow is plan-only and a job writes to a worktree — and one with no
  * root recorded, and `concurrency::room_for` refuses a full one.
  *
- * One function, said in two places: an option in the New job select and an idle row on the page.
- * Two copies of these sentences would be two answers to one question the first time either was
- * reworded.
+ * One function, said in two places and at two lengths: in full as an option in the New job
+ * select, and short beside the pips in the slot rack. Two copies of these sentences would be two
+ * answers to one question the first time either was reworded, and the short form is written next
+ * to the long one here so it can never name a reason the long one does not.
  *
  * When `/projects` has not answered, the mode and root are not known, and nothing is refused on
  * their account: guessing would be a claim, and the daemon still refuses what it must.
@@ -616,13 +628,31 @@ export interface ProjectChoice {
 export function whyNoJob(
   project: ProjectConcurrency,
   summary: ProjectSummary | undefined,
-): string | null {
+): NoJob | null {
   const held = project.slots.length;
-  if (summary?.mode === "off") return "autopilot off — jobs start only when it is active";
-  if (summary?.mode === "shadow") return "in shadow — jobs start only when the autopilot is active";
-  if (summary !== undefined && summary.project_root === null) return "no folder recorded";
-  if (project.limit - held <= 0) return `full (${held} of ${project.limit})`;
+  if (summary?.mode === "off") {
+    return { said: "autopilot off — jobs start only when it is active", short: null };
+  }
+  if (summary?.mode === "shadow") {
+    return { said: "in shadow — jobs start only when the autopilot is active", short: null };
+  }
+  if (summary !== undefined && summary.project_root === null) {
+    return { said: "no folder recorded", short: "no folder" };
+  }
+  if (project.limit - held <= 0) return { said: `full (${held} of ${project.limit})`, short: null };
   return null;
+}
+
+/** Why `POST /jobs` would refuse a job in a project, at the two lengths the page says it. */
+export interface NoJob {
+  /** The select's words: what is so, and what would have to change. */
+  said: string;
+  /**
+   * The rack's, a few words beside the pips — or `null` where something on the same line already
+   * says it: a full project's pips are all lit and none hollow, and a project in shadow or off has
+   * that mode's badge a few pixels to the left. A word beside either would say it twice.
+   */
+  short: string | null;
 }
 
 /**
@@ -649,7 +679,7 @@ export function projectChoices(
         label:
           reason === null
             ? `${project.project_id} — room for ${room} (${held} of ${project.limit})`
-            : `${project.project_id} — ${reason}`,
+            : `${project.project_id} — ${reason.said}`,
       };
     });
 }
@@ -688,7 +718,7 @@ function NewJobForm({
   columns: FleetColumn[];
   projects: ProjectSummary[] | undefined;
   engaged: boolean;
-  /** The project somebody chose — in the select or on an idle row — or empty for the roomiest. */
+  /** The project somebody chose — in the select or in the rack — or empty for the roomiest. */
   picked: string;
   onPick: (project: string) => void;
   onStarted: () => void;

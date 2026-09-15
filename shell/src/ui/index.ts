@@ -57,6 +57,7 @@ export {
 } from "./readings";
 export { RefusalNote, type RefusalNoteProps } from "./RefusalNote";
 export { Section, type SectionProps } from "./Section";
+export { SlotPips, type SlotPipsProps } from "./SlotPips";
 export { Sparkline, type SparklineProps } from "./Sparkline";
 export { StaleNote, type StaleNoteProps } from "./StaleNote";
 export { StatCard, type StatCardProps } from "./StatCard";

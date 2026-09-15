@@ -1178,6 +1178,93 @@
   color: var(--text-faint);
 }
 
+/* ------------------------------------------------------------------ pips -- */
+
+/**
+ * `SlotPips` — a project's slots as a row of lamps.
+ *
+ * A status dot, so a circle. Ten pixels rather than the rail's 0.4rem dot, because a pip is read
+ * in a row of up to eight and has to be told from its neighbour; the grid's smallest step between
+ * them.
+ *
+ * A held pip is its tone's foreground inside a one-pixel rim of that tone's edge: the triple, less
+ * the fill, which at this size could not be told from the rim. A free pip is hollow, and its
+ * outline is Faint Text rather than a hairline. Strong Hairline measured 1.85:1 against the ground,
+ * under the 3:1 a meaningful mark needs — and here the outline is the whole difference between
+ * "free" and "nothing drawn". Faint Text is 4.09:1 on the dark ground and 3.60:1 on the light one.
+ */
+.ui-pips {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.ui-pips-row {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.ui-pip {
+  flex: none;
+  width: 0.625rem;
+  height: 0.625rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background-clip: padding-box;
+}
+
+.ui-pip-free {
+  border-color: var(--text-faint);
+}
+
+.ui-pip-active {
+  background-color: var(--tone-active-fg);
+  border-color: var(--tone-active-border);
+}
+
+.ui-pip-shadow {
+  background-color: var(--tone-shadow-fg);
+  border-color: var(--tone-shadow-border);
+}
+
+.ui-pip-off {
+  background-color: var(--tone-off-fg);
+  border-color: var(--tone-off-border);
+}
+
+.ui-pip-pending {
+  background-color: var(--tone-pending-fg);
+  border-color: var(--tone-pending-border);
+}
+
+.ui-pip-paused {
+  background-color: var(--tone-paused-fg);
+  border-color: var(--tone-paused-border);
+}
+
+.ui-pip-danger {
+  background-color: var(--tone-danger-fg);
+  border-color: var(--tone-danger-border);
+}
+
+.ui-pip-info {
+  background-color: var(--tone-info-fg);
+  border-color: var(--tone-info-border);
+}
+
+/* Past eight slots only the held pips are drawn, and this says out of how many — the daemon's
+   numbers, so its face, and tabular so `3/12` and `11/12` hold one width. */
+.ui-pips-count {
+  margin-left: var(--space-1);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 /*
   A per-task rule, as text and not as a chip.
 

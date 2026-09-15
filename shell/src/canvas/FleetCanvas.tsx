@@ -33,7 +33,7 @@ import {
   clamped,
   isValidConnection as endsMayJoin,
   prunedLayout,
-  slotStateLiteral,
+  slotReading,
   zonesFor,
   ZONE_HEAD,
   ZONE_PAD,
@@ -214,7 +214,10 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
               so rather than showing an empty line. */}
           <p className="fleet-card-prompt">{detail.job.rule_name ?? "started by hand"}</p>
           <p className="fleet-card-line">
-            <StateBadge domain="job" state={detail.job.status} />
+            {/* `slotReading`, the reading the slot rack lights this slot's pip with, so the
+                pip and this badge cannot disagree about one slot. The same below for a run,
+                an item and an undescribed slot. */}
+            <StateBadge {...slotReading(detail)} />
             {detail.job.wait_reason !== null && (
               <StateBadge domain="wait_reason" state={detail.job.wait_reason} />
             )}
@@ -242,7 +245,7 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
         <>
           <p className="fleet-card-prompt">{detail.run.prompt_excerpt}</p>
           <p className="fleet-card-line">
-            <StateBadge domain="run" state={detail.run.status} />
+            <StateBadge {...slotReading(detail)} />
             <span className="fleet-card-mode">{detail.run.mode}</span>
           </p>
           {/* A run has no second zoom of its own — its output lives in Runs. */}
@@ -265,7 +268,7 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
                 terminal, so what a reader of a capacity screen needs from this
                 card is whether the slot is busy or stuck — and `conflicted` is
                 the answer only the item can give. */}
-            <StateBadge domain="job_item" state={detail.status} />
+            <StateBadge {...slotReading(detail)} />
             <span className="fleet-card-of">id {slot.owner_id}</span>
           </p>
           {/* Where the conflict is dealt with. Nobody is asked: `batch_of` in
@@ -293,7 +296,7 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
           slot nothing is working in. */}
       {(detail.kind === "unknown" || detail.kind === "orphaned") && (
         <p className="fleet-card-line">
-          <StateBadge domain="slot" state={slotStateLiteral(detail)} />
+          <StateBadge {...slotReading(detail)} />
         </p>
       )}
 

@@ -1,6 +1,7 @@
 /* §spec canvas-da-frota */
 /**
- * The fleet page: the meter, the New job panel, the columns, the slot card and the canvas.
+ * The fleet page: the meter, the New job panel, the slot rack, the columns, the slot card and the
+ * canvas.
  *
  * `fleet-` throughout, and nothing in here styles a design-system primitive —
  * those rules live in `ui.css` behind the `ui-` prefix. Where this file has to
@@ -181,9 +182,7 @@
   border-bottom: 1px solid var(--border);
 }
 
-/* The idle list's heading wears the same rank: its rows are projects, as the columns are. */
-.fleet-column-title,
-.fleet-idle-title {
+.fleet-column-title {
   margin: 0;
   min-width: 0;
   font-family: var(--font-display);
@@ -216,130 +215,103 @@
   margin: 0;
 }
 
-/* ------------------------------------------------------------------ idle -- */
+/* ------------------------------------------------------------------ rack -- */
 
 /**
- * Every project with nothing held: a list after the busy columns, or the page's body.
+ * Every project's slots, one line each, in an order that never moves.
  *
- * `.ui-rows` is the list and this sheet only lays its rows out. The rows share one grid through
- * `subgrid`, so the mode, the capacity and the room line up down the list whatever each project
- * is called — which is what makes it a list rather than a pile of sentences — and the last track
- * holds the row's New job, or the words for why there is none, against the right edge.
+ * It recedes: no box, only a hairline above and below it, and every word in it muted. The pips are
+ * its only colour, and on a quiet day they are hollow.
  *
- * A container and not a window query: the same list is the whole page at 1280 and a strip under
- * the columns at 800, and it is its own width that decides whether a row fits on one line.
+ * **Column-major**, through multi-column layout rather than a grid. A grid flows across — `alpha
+ * bravo / charlie delta` — and a list sorted by name is read down, the way a directory is. Columns
+ * at least 20rem wide: two at 1280, one at 800, and nothing that scrolls sideways.
  */
-.fleet-idle-group {
+.fleet-rack {
+  margin-bottom: var(--space-6);
+  padding-block: var(--space-2);
+  border-block: 1px solid var(--border);
+}
+
+.fleet-rack-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  column-width: 20rem;
+  column-gap: var(--space-6);
+}
+
+/* The last good reading, receded like the cards, and for their reason: a rack gone blank would
+   read as every slot given back. `StaleNote` says how old it is. */
+.fleet-rack-stale {
+  opacity: var(--opacity-quiet);
+}
+
+/**
+ * One project: its name, its mode, its pips, and its New job or the reason there is none.
+ *
+ * The name, the mode and the pips take fixed widths, so the pips start at the same x on every line
+ * and the actions stand in a column of their own — which is what makes the rack one instrument
+ * rather than a stack of sentences. Not at the right edge: with entries in two columns, an action
+ * pushed to its column's edge sat nearer the next column's name than its own pips, and read as
+ * belonging to it. A wrapping flex row rather than a grid, so where a line is too narrow the action
+ * drops under the pips by itself instead of crushing them.
+ */
+.fleet-rack-entry {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  container: fleet-idle / inline-size;
-}
-
-/* After the columns, the same air the columns leave between their own rows. */
-.fleet-columns + .fleet-idle-group {
-  margin-top: var(--space-6);
-}
-
-/* The count beside the heading: the heading's face, one rung down. */
-.fleet-idle-count {
-  font-weight: var(--weight-regular);
-  font-variant-numeric: tabular-nums;
-  color: var(--text-muted);
-}
-
-/* Five tracks: name, mode, capacity, room, and the action. The name track is as wide as the
-   longest name and no wider; the room track takes what is left, which is what puts the action
-   at the right edge. */
-.fleet-idle.ui-rows {
-  display: grid;
-  grid-template-columns: minmax(0, max-content) auto auto minmax(0, 1fr) auto;
-  column-gap: var(--space-4);
-}
-
-/* The row's own gap is restated rather than inherited from `.ui-rows-row`, whose 4px would
-   otherwise be the gutter inside every row while the list's is 16px. */
-.fleet-idle-row {
-  display: grid;
-  grid-column: 1 / -1;
-  grid-template-columns: subgrid;
+  flex-wrap: wrap;
   align-items: center;
-  column-gap: var(--space-4);
+  gap: var(--space-1) var(--space-3);
+  min-height: 2rem;
+  padding-block: var(--space-1);
+  break-inside: avoid;
 }
 
-/* A real destination, in the text colour with a quiet underline — the crumb's idiom. The name is
-   what the row is about, and five cyan names down a list whose other job is to say "nothing in
-   flight here" would make it the loudest thing on the page. */
-.fleet-idle-name {
+/* A real destination, in muted text with a quiet underline — the crumb's idiom. Cyan here would
+   make five names the loudest thing on the one strip whose job is to recede. One line, cut with an
+   ellipsis when an id outruns its cell: a name broken over two lines broke the rhythm of every
+   entry beside it. The whole id is still the link's text for a screen reader, and its `title`. */
+.fleet-rack-name {
+  flex: 0 0 10rem;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
   font-weight: var(--weight-medium);
-  color: var(--text);
+  color: var(--text-muted);
   text-decoration: underline;
   text-decoration-color: var(--border-strong);
   text-underline-offset: 0.2em;
-  overflow-wrap: anywhere;
 }
 
-.fleet-idle-name:hover {
+.fleet-rack-name:hover {
+  color: var(--text);
   text-decoration-color: currentColor;
 }
 
-.fleet-idle-mode {
+.fleet-rack-mode {
   display: inline-flex;
+  flex: 0 0 4.5rem;
 }
 
-/* The daemon's capacity reading, in its face: mono and tabular, so `0 of 3` and `0 of 12` hold
-   one column down the list. */
-.fleet-idle-capacity {
-  font-family: var(--font-mono);
+/* Room for five pips (five at 0.625rem, four gaps of 0.25rem), so the actions line up for every
+   limit up to five — the common case — without holding an eight-pip gap open beside a three-slot
+   project, which set New job adrift from the pips it acts on. A longer limit pushes its own action
+   along, and past eight the pips give way to a count: the lines where alignment yields. */
+.fleet-rack-entry > .ui-pips {
+  min-width: 4.25rem;
+}
+
+.fleet-rack-act {
+  display: inline-flex;
+  align-items: center;
+}
+
+.fleet-rack-why {
   font-size: var(--text-sm);
-  font-variant-numeric: tabular-nums;
   color: var(--text-muted);
   white-space: nowrap;
-}
-
-.fleet-idle-room {
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-
-/* The row's one action, or why there is none, at the edge where a list's action is looked for. */
-.fleet-idle-act {
-  justify-self: end;
-  text-align: end;
-}
-
-.fleet-idle-why {
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
-}
-
-/**
- * Narrow: the name and its readings on one line, the action on the next.
- *
- * Under 40rem the five tracks cannot all hold their content — a reason is a whole clause — so each
- * row leaves the shared grid for a wrapping line of its own, and the action starts its line from
- * the left, where the eye comes back to after the name.
- */
-@container fleet-idle (max-width: 40rem) {
-  .fleet-idle.ui-rows {
-    display: flex;
-  }
-
-  .fleet-idle-row {
-    display: flex;
-    flex-direction: row;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: var(--space-1) var(--space-3);
-  }
-
-  .fleet-idle-act {
-    flex-basis: 100%;
-    text-align: start;
-  }
 }
 
 /* ------------------------------------------------------------- slot card -- */

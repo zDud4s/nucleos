@@ -11,6 +11,7 @@ import {
   type RunSearchResult,
 } from "../data/fleet";
 import type { Proposal } from "../data/system";
+import type { StateDomain } from "../ui/state-map";
 
 /**
  * The fleet as data, with no React in it.
@@ -116,6 +117,27 @@ export function slotStateLiteral(detail: SlotDetail): string | null {
 }
 
 /**
+ * The reading a slot's card leads with: the domain and the literal its badge is handed.
+ *
+ * The job's status, the run's, the item's own — never its job's, which is the item arm's whole
+ * argument in `slotDetail` — or the slot's when nothing describes its owner. One function because
+ * two things draw it: the card's badge, and the pip the slot rack lights for the same slot. Two
+ * copies would be a leaked slot red on its card and some other colour in the rack.
+ */
+export function slotReading(detail: SlotDetail): { domain: StateDomain; state: string | null } {
+  switch (detail.kind) {
+    case "job":
+      return { domain: "job", state: detail.job.status };
+    case "run":
+      return { domain: "run", state: detail.run.status };
+    case "item":
+      return { domain: "job_item", state: detail.status };
+    default:
+      return { domain: "slot", state: slotStateLiteral(detail) };
+  }
+}
+
+/**
  * What is wrong, or waiting, in one project — counted, so the page can say it before it draws it.
  *
  * Five facts and not a severity score: the headline names each one in its own words, and a
@@ -164,9 +186,9 @@ export function severity(found: Exceptions): number {
  * principle 2). Busyness second, because among projects with nothing wrong the one doing the most
  * is the one being watched. The name last, so two equal columns never swap places on a tick.
  *
- * An idle project is not dropped here. It is the page that lists idle projects apart from the
- * busy columns — this order is about which busy column comes first, and a project's position
- * among its peers is still the thing a reader memorises.
+ * An idle project is not dropped here. It is the page that draws only busy projects as columns —
+ * this order is about which busy column comes first. Where a project always is, whatever its news,
+ * is the slot rack's to say, and the rack sorts by id rather than by this.
  */
 export function orderColumns(columns: FleetColumn[]): FleetColumn[] {
   return [...columns].sort((left, right) => {
@@ -581,7 +603,7 @@ export interface FleetColumn {
    * repeating "predicted — overlap not measured" was one fact taking four lines.
    */
   notes: CollisionBadge[];
-  /** Nothing held. The page folds these into one quiet line under the busy columns. */
+  /** Nothing held: no column on the page, and a line of hollow pips in the rack. */
   idle: boolean;
 }
 
