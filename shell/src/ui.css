@@ -469,6 +469,42 @@
   line-height: 1;
 }
 
+/* ------------------------------------------------------------ iconbutton -- */
+
+/* A control that is only a glyph, at `.ui-button-quiet`'s weight: no box at rest and muted, the
+   text colour on a raised ground under the pointer. 1.5rem square because 24px is the smallest
+   target WCAG 2.2 accepts (2.5.8). The focus ring is `base.css`'s, and here it has a box to go
+   round rather than the bare glyph. */
+.ui-icon-button {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.ui-icon-button:hover:not(:disabled) {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.ui-icon-button:disabled {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+.ui-icon-button-glyph {
+  width: 1rem;
+  height: 1rem;
+}
+
 /* --------------------------------------------------------- confirmbutton -- */
 
 /* `position: relative` is for the live region inside, not for the button. That `.sr-only` span

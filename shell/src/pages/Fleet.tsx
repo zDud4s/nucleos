@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import { Link } from "@tanstack/react-router";
+import { Plus } from "lucide-react";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   useCancelSlotOwner,
@@ -41,6 +42,7 @@ import {
   Button,
   ErrorNote,
   Field,
+  IconButton,
   Meter,
   PageHeader,
   Panel,
@@ -423,17 +425,16 @@ function SlotRack({
               <span className="fleet-rack-act">
                 {refusal === null
                   ? !stale && (
-                      // Named with the project: five buttons all called "New job" are five of the
-                      // same name to anybody not looking at the line they sit on.
-                      <Button
-                        variant="quiet"
-                        intent="go"
-                        aria-label={`New job in ${project.project_id}`}
+                      // A `+` rather than the words: "New job" on every startable line was the
+                      // loudest text on a strip whose job is to recede, and it would not fit its
+                      // column. Named with the project, because five buttons all called "New job"
+                      // are five of the same name to anybody not looking at the line they sit on.
+                      <IconButton
+                        label={`New job in ${project.project_id}`}
+                        icon={Plus}
                         aria-controls={panelId}
                         onClick={(event) => onNewJob(event.currentTarget, project.project_id)}
-                      >
-                        New job
-                      </Button>
+                      />
                     )
                   : refusal.short !== null && <span className="fleet-rack-why">{refusal.short}</span>}
               </span>

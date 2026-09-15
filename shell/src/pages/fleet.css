@@ -225,9 +225,10 @@
  *
  * **Column-major**, through multi-column layout rather than a grid. A grid flows across — `alpha
  * bravo / charlie delta` — and a list sorted by name is read down, the way a directory is. Columns
- * at least 27rem wide, which is one whole entry on one line — name, mode, five pips and New job with
- * their gaps. At 20rem the entry did not fit and New job fell under its pips on every startable
- * line. Two columns at 1280, one at 800, and nothing that scrolls sideways.
+ * at least 23rem wide, which is one whole entry on one line — name, mode, five pips and the New job
+ * glyph with their gaps. At 20rem, when New job was still a word, the entry did not fit and the
+ * action fell under its pips on every startable line. Two columns at 1280, one at 800, and nothing
+ * that scrolls sideways.
  */
 .fleet-rack {
   margin-bottom: var(--space-6);
@@ -239,7 +240,7 @@
   margin: 0;
   padding: 0;
   list-style: none;
-  column-width: 27rem;
+  column-width: 23rem;
   column-gap: var(--space-6);
 }
 

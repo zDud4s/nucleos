@@ -14,6 +14,7 @@ export { Count, type CountProps } from "./Count";
 export { Crumb, type CrumbProps } from "./Crumb";
 export { ErrorNote, type ErrorNoteProps } from "./ErrorNote";
 export { Field, type FieldProps } from "./Field";
+export { IconButton, type IconButtonProps } from "./IconButton";
 /**
  * Two primitives in one module — the second recorded exception to one
  * primitive per file. See the header of `Meter.tsx`: the pair exists for the
