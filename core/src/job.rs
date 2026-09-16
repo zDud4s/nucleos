@@ -3895,6 +3895,30 @@ async fn spawn_node(
                 NoRoom::ShrinkTheBatch => Step::Stopped,
             }
         }
+        // The same trade as a held slot — the work is untouched, so the job parks and the next pass
+        // asks again — under a reason of its own. On 2026-09-14 this arm did not exist: a disk below
+        // the floor came back as `Busy`, the job read `wait_reason slot` and fed "another run holds
+        // the project's worktree slot", and anybody reading it went looking for a run that was not
+        // there. Only the `worktree_provision_failed` line after it said the disk was full.
+        //
+        // The detail is the refusal itself, free space and floor, so the job's own line says what
+        // to go and clear. `park` says it once per reason rather than per sentence, so the MiB
+        // figure drifting between ticks does not flood the feed.
+        Err(crate::runs::CreateRunError::NoRoomOnDisk(refusal)) => {
+            release_item(pool, job, item).await;
+            match no_room {
+                NoRoom::Park => {
+                    park(
+                        state,
+                        job,
+                        WAIT_DISK,
+                        &format!("the disk is too full for another checkout: {refusal}"),
+                    )
+                    .await
+                }
+                NoRoom::ShrinkTheBatch => Step::Stopped,
+            }
+        }
         Err(error) => {
             release_item(pool, job, item).await;
             let _ = finish(pool, job.id, Outcome::Failed).await;
@@ -4758,6 +4782,13 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
 /// changed between ticks would flood the feed with one line every thirty seconds for the whole
 /// deliberation; the id it names does not change, so it does not.
 const WAIT_COUNCIL: &str = "council";
+
+/// What the reason column says while a job's next checkout is refused for want of disk.
+///
+/// Apart from `slot` because the two ask different hands: a held slot clears when another run
+/// ends, and a full disk clears only when somebody deletes something. Like the rest, it is a note
+/// and not a latch — the next pass resumes the job and asks the disk again.
+const WAIT_DISK: &str = "disk";
 
 /// What the council has to say before a job's review node starts.
 #[derive(Debug, PartialEq, Eq)]
@@ -9811,8 +9842,9 @@ mod tests {
     ///
     /// A park leaves its reason in three places and the status is none of them: `wait_reason` on
     /// the job's row, a `job_waiting` line from `park`, and — when it was a run's provisioning that
-    /// said no — a `worktree_provision_failed` line naming the wall. Only the last tells the slot
-    /// from the disk, because a refused item parks its job as `slot` either way. The walks used to
+    /// said no — a `worktree_provision_failed` line naming the wall. Until 2026-09-14 only the last
+    /// told the slot from the disk, because a refused item parked its job as `slot` either way; the
+    /// job now parks as `disk`, and the line is still the one with the numbers. The walks used to
     /// print the status alone, and on 2026-09-13 five of them failed with `last status waiting` and
     /// nothing else: the disk floor refusing every item, and not a word of it on screen.
     ///
@@ -9969,6 +10001,157 @@ mod tests {
                 .trim_end(),
             "alpha, again",
             "the later item's alpha is what should be on the branch"
+        );
+    }
+
+    /// Ticks a job until it parks, and hands back the reason on its row and its last waiting line.
+    ///
+    /// Ten passes is far more than a plan node and a first item need; a job that has not parked by
+    /// then is not going to, and the panic says where it stood instead.
+    async fn tick_until_parked(state: &AppState, job_id: i64) -> (String, String) {
+        for _ in 0..10 {
+            job_tick(state, Utc::now()).await;
+            settle(state, job_id).await;
+            if job_status(&state.pool, job_id).await == "waiting" {
+                let reason: Option<String> =
+                    sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
+                        .bind(job_id)
+                        .fetch_one(&state.pool)
+                        .await
+                        .unwrap();
+                let line: String = sqlx::query_scalar(
+                    "SELECT summary FROM feed WHERE kind = 'job_waiting' ORDER BY id DESC LIMIT 1",
+                )
+                .fetch_one(&state.pool)
+                .await
+                .expect("a park says so in the feed");
+                return (reason.unwrap_or_default(), line);
+            }
+        }
+        panic!(
+            "the job never parked; last {}",
+            why_it_stands(&state.pool, job_id).await
+        );
+    }
+
+    /// **A job whose item is refused for disk waits for the disk, says how full, and comes back
+    /// when there is room.**
+    ///
+    /// On 2026-09-14, with the floor raised on purpose, a job read `status waiting, wait_reason
+    /// slot` and fed "another run holds the project's worktree slot" — and only the next line,
+    /// `worktree_provision_failed`, said the disk was the wall. Whoever reads the job goes looking
+    /// for a run holding a slot and finds none. The floor here is a million GiB, which no volume
+    /// meets, so the answer does not depend on the machine.
+    ///
+    /// The second half is the resume: `wait_reason` is a note and not a latch, and a disk park has
+    /// to lift exactly as a slot park does once the condition clears.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_refused_its_item_for_disk_waits_for_the_disk_and_resumes_when_there_is_room() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-disk-park-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        *runner.writes.lock().unwrap() = three_scripted_agents();
+
+        let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, 2, 0).await;
+        // After the guard, which switched the floor off and puts back what stood before it on drop,
+        // so this bare `set_var` is undone with it. The plan node works in the job's own checkout
+        // and is never asked; the first item is.
+        unsafe { std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", "1000000") };
+
+        let (reason, line) = tick_until_parked(&state, job_id).await;
+        assert_eq!(
+            reason, "disk",
+            "a disk refusal is not slot contention: {line}"
+        );
+        assert!(
+            line.contains("disk") && line.contains(" MiB free "),
+            "the job's own line has to name the disk and how much room there was: {line}"
+        );
+        assert!(
+            line.contains("at least 1024000000 MiB"),
+            "and the floor it fell below: {line}"
+        );
+        assert!(
+            !line.contains("slot"),
+            "a reader told about a slot goes looking for a run that is not there: {line}"
+        );
+
+        unsafe { std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", "0") };
+        // One pass first, and read before the walk: a job whose item starts again moves on either
+        // way, so the ending alone cannot tell a park that lifted from a note left standing. A row
+        // reading `implementing / disk` names a wall that is gone, which is `resume`'s to clear.
+        job_tick(&state, Utc::now()).await;
+        settle(&state, job_id).await;
+        let (status, reason): (String, Option<String>) =
+            sqlx::query_as("SELECT status, wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(
+            status, "waiting",
+            "the park did not lift once there was room"
+        );
+        assert_eq!(
+            reason, None,
+            "a job that is moving again is not waiting for the disk (status {status})"
+        );
+        let items_started: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs
+              WHERE job_id = ? AND stage = 'implement' AND item_id IS NOT NULL
+                AND status != 'failed'",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            items_started > 0,
+            "the refused item was never started again"
+        );
+
+        let walk = walk_counting(&state, job_id).await;
+        assert_eq!(
+            walk.ending, "completed",
+            "the park did not lift once there was room"
+        );
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["passed", "passed", "passed"]
+        );
+    }
+
+    /// **The control: an item refused for a slot still waits for a slot.**
+    ///
+    /// The disk got a reason of its own; this is what keeps that change from bleeding into the
+    /// contention it was split from. A ceiling of one, held by the job itself, is a project with no
+    /// room for its first item.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_refused_its_item_for_a_slot_still_waits_for_a_slot() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-slot-park-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        *runner.writes.lock().unwrap() = three_scripted_agents();
+
+        let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, 2, 0).await;
+        sqlx::query("UPDATE autopilot_global SET max_concurrent_slots = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (reason, line) = tick_until_parked(&state, job_id).await;
+        assert_eq!(reason, "slot", "{line}");
+        assert!(
+            line.contains("another run holds the project's worktree slot"),
+            "the slot's sentence is unchanged, and the shell reads it by these words: {line}"
         );
     }
 
