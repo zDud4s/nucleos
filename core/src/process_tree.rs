@@ -148,9 +148,10 @@ impl Drop for TreeKiller {
 /// the handle must not kill, because `disarm()` exists to say "these are yours now". Here, closing
 /// the handle is the only signal that will still be delivered.
 ///
-/// Off Windows this adopts nothing and says so rather than pretending: `kill_on_drop` still covers
-/// the orderly shutdown, and a hard kill still orphans. Naming the gap is better than a no-op that
-/// reads like a guarantee.
+/// Off Windows this adopts nothing: there is no job object. What takes the sidecars down with a
+/// hard-killed daemon there is the stdin lifeline `sidecar::supervise` gives each of them
+/// (`sidecar::LIFELINE_VAR`): the kernel closes this process's end of the pipe however it dies,
+/// and each sidecar shuts down on EOF. On Windows both hold, the job object and the lifeline.
 pub struct Litter {
     #[cfg(windows)]
     job: Option<windows::Job>,

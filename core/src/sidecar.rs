@@ -321,6 +321,26 @@ fn spawn_failure(binary_path: &Path, error: &io::Error) -> String {
     format!("could not start {}: {error}{remedy}", binary_path.display())
 }
 
+/// The variable that tells a sidecar its stdin is the daemon's lifeline (portability spec, D3).
+///
+/// Without it a sidecar reads nothing from stdin: one started by hand, or by a script with stdin at
+/// `/dev/null`, must not take that immediate EOF as its cue to leave.
+pub const LIFELINE_VAR: &str = "NUCLEOS_LIFELINE";
+
+/// Gives a sidecar its lifeline: stdin piped from THIS process, and [`LIFELINE_VAR`] set.
+///
+/// The write end lives here, and `supervise` holds it for as long as the child lives. However this
+/// process dies -- orderly, `SIGKILL`, `TerminateProcess`, a crash -- the kernel closes that end and
+/// the sidecar reads EOF, which each sidecar takes as its cue to shut down. That is what takes the
+/// sidecars down with a hard-killed daemon on macOS and Linux, where `LITTER` adopts nothing; on
+/// Windows the job object holds as well. Rust opens this process's end close-on-exec
+/// (non-inheritable on Windows), so no other child of the daemon can keep a sidecar alive by
+/// holding a copy of it.
+fn arm_lifeline(cmd: &mut Command) {
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.env(LIFELINE_VAR, "1");
+}
+
 pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, String)>) {
     let mut delay = RESTART_BASE;
     let mut attempts: u32 = 0;
@@ -340,6 +360,8 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
         // to make impossible.
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // The lifeline (spec D3); see `arm_lifeline`.
+        arm_lifeline(&mut cmd);
         match cmd.spawn() {
             Ok(mut child) => {
                 // Adopted before anything else is done with it, and while the `Child` is still held
@@ -355,6 +377,11 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
                 if let Some(stderr) = child.stderr.take() {
                     tokio::spawn(pump(name.clone(), "stderr", stderr));
                 }
+                // Held, not dropped: the lifeline must live exactly as long as the child. Taken out
+                // of `child` because tokio's `Child::wait` closes a stdin the `Child` still holds
+                // before waiting, which every sidecar would read as "the daemon is gone". A named
+                // binding, so it drops at the end of this arm, after `wait()` has returned.
+                let _lifeline = child.stdin.take();
                 let started_at = chrono::Utc::now().to_rfc3339();
                 let launched = std::time::Instant::now();
                 let restarts = attempts;
@@ -896,5 +923,51 @@ mod tests {
             &io::Error::from(io::ErrorKind::PermissionDenied),
         );
         assert!(!refused.contains(SIDECAR_DIR_VAR), "{refused}");
+    }
+
+    /// D3: a sidecar reads its lifeline to EOF and leaves, so dropping the write end -- what the
+    /// kernel does to a dead daemon's descriptors, however it died -- ends it. The stand-in honours
+    /// the contract the Go sidecars implement: without `NUCLEOS_LIFELINE=1` it exits 3 before saying
+    /// anything, so a pass cannot come from a bare `cat`.
+    #[tokio::test]
+    async fn a_sidecar_lives_exactly_as_long_as_its_lifeline() {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            r#"[ "$NUCLEOS_LIFELINE" = 1 ] || exit 3; echo up; cat >/dev/null; exit 0"#,
+        ]);
+        command.stdout(std::process::Stdio::piped());
+        command.kill_on_drop(true);
+        arm_lifeline(&mut command);
+        let mut child = command.spawn().expect("`sh` must be on PATH");
+        let lifeline = child.stdin.take().expect("the lifeline must be piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+
+        let mut first = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::BufReader::new(stdout).read_line(&mut first),
+        )
+        .await
+        .expect("the stand-in never started")
+        .expect("reading the stand-in's stdout");
+        assert_eq!(
+            first.trim(),
+            "up",
+            "the stand-in did not see {LIFELINE_VAR}=1"
+        );
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "left while the lifeline was still held"
+        );
+
+        drop(lifeline);
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("the sidecar outlived its lifeline")
+            .expect("wait");
+        assert!(status.success(), "{status}");
     }
 }
