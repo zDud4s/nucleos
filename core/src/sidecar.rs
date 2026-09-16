@@ -277,16 +277,26 @@ where
 /// The variable that says where the sidecar binaries are, for a daemon that does not sit beside them.
 pub const SIDECAR_DIR_VAR: &str = "NUCLEOS_SIDECAR_DIR";
 
-/// Where the sidecar whose executable is called `file` is, for this daemon.
+/// The file name of the sidecar called `name`: `<name>-sidecar` plus this platform's executable
+/// suffix, so `.exe` on Windows and nothing on macOS or Linux.
+///
+/// The one place that name is spelled. `scripts/build-sidecars.sh` writes the same name with
+/// `go env GOEXE`, which is `.exe` on Windows and empty elsewhere; the two change together.
+pub fn binary_file_name(name: &str) -> String {
+    format!("{name}-sidecar{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Where the sidecar called `name` ([`ECHO`], [`BROWSER`], ...) is, for this daemon.
 ///
 /// Beside the daemon's own executable unless [`SIDECAR_DIR_VAR`] says otherwise. The default is the
 /// layout `scripts/build-sidecars.sh` produces and an installation ships; the variable is for a
 /// daemon built anywhere else. That is not rare on this machine: a build that must not overwrite the
 /// running daemon's binary goes to a target directory of its own, which has no sidecars in it, and
 /// on 2026-09-09 a daemon swapped in from one came up with all five down.
-pub fn binary(file: &str) -> PathBuf {
+pub fn binary(name: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("the daemon can name its own executable");
-    binary_in(std::env::var_os(SIDECAR_DIR_VAR).as_deref(), &exe, file)
+    let file = binary_file_name(name);
+    binary_in(std::env::var_os(SIDECAR_DIR_VAR).as_deref(), &exe, &file)
 }
 
 /// PURE: [`binary`], given what the environment and the executable's own path said. An empty
@@ -852,6 +862,23 @@ mod tests {
                 "echo-sidecar.exe"
             ),
             Path::new("C:/Projects/.cargo-target/debug/echo-sidecar.exe")
+        );
+    }
+
+    /// The daemon looks for exactly the name `scripts/build-sidecars.sh` writes, and Go adds `.exe`
+    /// only on Windows (`go env GOEXE` is empty elsewhere). A literal `.exe` was right on one
+    /// platform by coincidence.
+    #[test]
+    fn a_sidecar_binary_carries_this_platforms_executable_suffix() {
+        let expected = if cfg!(windows) {
+            "echo-sidecar.exe"
+        } else {
+            "echo-sidecar"
+        };
+        assert_eq!(binary_file_name(ECHO), expected);
+        assert_eq!(
+            binary_file_name(BROWSER),
+            format!("browser-sidecar{}", std::env::consts::EXE_SUFFIX)
         );
     }
 

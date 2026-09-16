@@ -1247,7 +1247,7 @@ async fn main() {
     // two browser or web sidecars fight over the same fixed ports. A second daemon is for
     // exercising this process's own HTTP and MCP surface, and it does that without any of them.
     let sidecars_wanted = is_primary;
-    let sidecar_path = sidecar::binary("echo-sidecar.exe");
+    let sidecar_path = sidecar::binary(sidecar::ECHO);
     if sidecars_wanted {
         tokio::spawn(sidecar::supervise(
             sidecar::ECHO.to_string(),
@@ -1271,7 +1271,7 @@ async fn main() {
             Err(error) => tracing::error!(%error, "could not retire open browsing sessions"),
         }
 
-        let path = sidecar::binary("browser-sidecar.exe");
+        let path = sidecar::binary(sidecar::BROWSER);
         let env = sidecar::browser_env(
             &daemon_client::daemon_url(),
             &browser_sidecar_token,
@@ -1302,7 +1302,7 @@ async fn main() {
                 String::new()
             }
         };
-        let path = sidecar::binary("web-sidecar.exe");
+        let path = sidecar::binary(sidecar::WEB);
         let env = sidecar::web_env(
             &daemon_client::daemon_url(),
             &web_sidecar_token,
@@ -1339,7 +1339,7 @@ async fn main() {
     }
     match secrets::load_secret(TELEGRAM_TOKEN_KEY) {
         Ok(Some(bot_token)) => {
-            let telegram_path = sidecar::binary("telegram-sidecar.exe");
+            let telegram_path = sidecar::binary(sidecar::TELEGRAM);
             let telegram_env =
                 sidecar::telegram_env(&daemon_client::daemon_url(), &state.token.0, &bot_token);
             if sidecars_wanted {
@@ -1479,7 +1479,7 @@ async fn main() {
                     // everything is the arrangement being removed.
                     match state.email.sidecar_token.as_deref() {
                         Some(token) => {
-                            let path = sidecar::binary("email-sidecar.exe");
+                            let path = sidecar::binary(sidecar::EMAIL);
                             let env = sidecar::email_env(
                                 &daemon_client::daemon_url(),
                                 token,
