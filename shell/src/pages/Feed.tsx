@@ -382,7 +382,7 @@ function FeedRow({
     <Row>
       <div className="feed-row-head">
         <KindBadge kind={entry.kind} />
-        {/* One kind, four situations — and budget and slot contention ask for
+        {/* One kind, five situations — and budget and slot contention ask for
             opposite answers. The reading comes from the one non-collapsing map
             rather than from this page. */}
         {waiting !== null && <StateBadge domain="wait_reason" state={waiting} />}

@@ -68,10 +68,10 @@ function feedCalls(): string[] {
     .filter((path) => path.startsWith("/feed"));
 }
 
-/* ------------------------------- A15: one kind, four different situations -- */
+/* ------------------------------- A15: one kind, five different situations -- */
 
 describe("Feed - a waiting line says what it is waiting for", () => {
-  it("reads budget, slot and exclusion apart, from the same kind", async () => {
+  it("reads budget, slot, exclusion and disk apart, from the same kind", async () => {
     /*
       All three are `job_waiting`. The daemon puts the reason nowhere but the
       summary — `park` writes `job {id} is waiting: {detail}` — so this is the
@@ -82,6 +82,10 @@ describe("Feed - a waiting line says what it is waiting for", () => {
       "job 9 holds a slot and the two are excluded", so anything matching on the
       word "slot" reads it as slot contention and sends somebody looking for
       capacity that is already there.
+
+      The disk row is the other one. Its detail names "this project's
+      worktrees", and on 2026-09-14 the daemon still reported it as slot
+      contention — so it must read as the disk, and never as a slot.
     */
     const rows = [
       entry({
@@ -100,6 +104,12 @@ describe("Feed - a waiting line says what it is waiting for", () => {
         kind: "job_waiting",
         summary: "job 4 is waiting: job 9 holds a slot and the two are excluded",
       }),
+      entry({
+        id: 6,
+        kind: "job_waiting",
+        summary:
+          "job 6 is waiting: the disk is too full for another checkout: only 37559 MiB free where this project's worktrees live, and a new checkout needs at least 102400 MiB",
+      }),
     ];
     daemon.apiFetch.mockImplementation(feedFetch(rows));
 
@@ -107,7 +117,7 @@ describe("Feed - a waiting line says what it is waiting for", () => {
 
     const list = await screen.findByRole("list", { name: "Feed" });
     const items = within(list).getAllByRole("listitem");
-    expect(items.length).toBe(3);
+    expect(items.length).toBe(4);
 
     // Each row carries its own reading, and only its own.
     expect(within(items[0]).getByText("held by budget")).toBeDefined();
@@ -118,6 +128,9 @@ describe("Feed - a waiting line says what it is waiting for", () => {
 
     expect(within(items[2]).getByText("held by an exclusion")).toBeDefined();
     expect(within(items[2]).queryByText("waiting for a slot")).toBeNull();
+
+    expect(within(items[3]).getByText("held by a full disk")).toBeDefined();
+    expect(within(items[3]).queryByText("waiting for a slot")).toBeNull();
   });
 
   it("says nothing extra about a waiting line it cannot read", async () => {
@@ -140,6 +153,7 @@ describe("Feed - a waiting line says what it is waiting for", () => {
     expect(within(list).queryByText("held by budget")).toBeNull();
     expect(within(list).queryByText("waiting for a slot")).toBeNull();
     expect(within(list).queryByText("held by an exclusion")).toBeNull();
+    expect(within(list).queryByText("held by a full disk")).toBeNull();
   });
 });
 

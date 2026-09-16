@@ -116,6 +116,15 @@ describe("StateBadge — wait_reason", () => {
     expect(badge("wait_reason", "excluded")?.text).toMatch(/exclusion/i);
     expect(badge("wait_reason", "excluded")?.text).not.toMatch(/slot/i);
   });
+
+  it("keeps a full disk apart from all three, and never calls it a missing slot", () => {
+    // The fourth literal (`core/src/job.rs`, `WAIT_DISK`). Until 2026-09-14 the
+    // daemon parked it as `slot`, and a reader waited for a run to end when
+    // nothing would clear until somebody freed space.
+    assertAllDistinct("wait_reason", ["budget", "slot", "excluded", "disk"]);
+    expect(badge("wait_reason", "disk")?.text).toMatch(/disk/i);
+    expect(badge("wait_reason", "disk")?.text).not.toMatch(/slot/i);
+  });
 });
 
 describe("StateBadge — collision", () => {

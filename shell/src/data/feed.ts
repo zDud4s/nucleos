@@ -395,7 +395,7 @@ export const FEED_KIND_NAMES: string[] = Object.keys(FEED_KINDS).sort();
 /**
  * Why a `job_waiting` line is waiting, read out of its summary.
  *
- * The kind is one word for four different situations, and two of them ask for
+ * The kind is one word for five different situations, and two of them ask for
  * opposite responses: a job held by the budget wants a ceiling raised, a job
  * behind a worktree slot wants you to wait or to stop something else. The
  * daemon does not put the reason in a column of its own — `park` writes
@@ -407,6 +407,12 @@ export const FEED_KIND_NAMES: string[] = Object.keys(FEED_KINDS).sort();
  * worktree slot"*; a naive match on "slot" would read the first as the second
  * and send somebody looking for capacity that is already there.
  *
+ * The disk detail is *"the disk is too full for another checkout: only … MiB
+ * free …"*, and it is asked before the slot for the same kind of reason: it
+ * names this project's worktrees, and until 2026-09-14 the daemon reported it
+ * as slot contention outright, which sent a reader after a run that was not
+ * there.
+ *
  * The returned string is a `wait_reason` literal, so the badge comes from the
  * one non-collapsing map (`ui/state-map.ts`) rather than from this page.
  * `kill-switch` has no reading there, on purpose: it renders as itself.
@@ -414,6 +420,7 @@ export const FEED_KIND_NAMES: string[] = Object.keys(FEED_KINDS).sort();
 export function waitReasonFromSummary(summary: string): string | null {
   const text = summary.toLowerCase();
   if (text.includes("exclusion") || text.includes("excluded")) return "excluded";
+  if (text.includes("disk is too full")) return "disk";
   if (text.includes("worktree slot")) return "slot";
   if (text.includes("would exceed") || text.includes("budget check failed")) return "budget";
   if (text.includes("emergency stop")) return "kill-switch";
