@@ -10,6 +10,7 @@ package main
 
 import (
 	"log"
+	"os"
 
 	"nucleosweb/config"
 	"nucleosweb/fetch"
@@ -19,6 +20,8 @@ import (
 
 func main() {
 	log.SetPrefix("web-sidecar: ")
+	// Stateless (see the package comment), so the orderly shutdown when the daemon is gone is to exit.
+	watchLifeline(os.Getenv, os.Stdin, func() { os.Exit(0) })
 	cfg, err := config.Load()
 	if err != nil {
 		// The daemon only starts this process once the pillar is enabled, so a missing variable is a
