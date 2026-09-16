@@ -28,6 +28,47 @@ pub fn delete_secret(key: &str) -> keyring::Result<()> {
     }
 }
 
+/// Why the daemon will not start when the system credential store is out of reach.
+///
+/// Said per platform because the fix is per platform. There is deliberately no file fallback: the
+/// daemon's token authorises everything, and a token in a `0600` file is a different security
+/// decision that deserves to be taken on its own (portability spec, D4).
+pub fn unavailable_message(error: &str) -> String {
+    #[cfg(windows)]
+    let missing = "Windows Credential Manager could not be used";
+    #[cfg(target_os = "macos")]
+    let missing = "the macOS login Keychain could not be used (is it locked?)";
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let missing = "no Secret Service is reachable over D-Bus: \
+                   start gnome-keyring or KWallet in this session and unlock it";
+    format!(
+        "nucleos-core cannot start: {missing} ({error}). The daemon keeps its token in the system \
+         credential store and has no file fallback."
+    )
+}
+
+/// The daemon's own token at startup: the stored one, or a fresh one that was stored, or the
+/// sentence to refuse with.
+///
+/// PURE over its inputs so every branch is testable without a credential store: `loaded` is what
+/// [`load_secret`] answered, `mint` makes a token, `persist` stores it. An `Err` is printed and
+/// the daemon exits non-zero -- a refusal, never a panic (portability spec, D4).
+pub fn daemon_token<E: std::fmt::Display>(
+    loaded: Result<Option<String>, E>,
+    mint: impl FnOnce() -> String,
+    persist: impl FnOnce(&str) -> Result<(), E>,
+) -> Result<String, String> {
+    match loaded {
+        Ok(Some(existing)) => Ok(existing),
+        Ok(None) => {
+            let fresh = mint();
+            persist(&fresh).map_err(|error| unavailable_message(&error.to_string()))?;
+            Ok(fresh)
+        }
+        Err(error) => Err(unavailable_message(&error.to_string())),
+    }
+}
+
 /// The credential store, as something a test can stand in for.
 ///
 /// The free functions above talk to the real Windows Credential Manager and there is no fake
@@ -127,5 +168,72 @@ mod tests {
 
         delete_secret(key).unwrap();
         assert_eq!(load_secret(key).unwrap(), None);
+    }
+
+    /// D4: the sentence a daemon prints before refusing to start. It carries the store's own error
+    /// and names what is missing on THIS platform, because the fix differs per platform.
+    #[test]
+    fn the_refusal_to_start_names_what_is_missing_on_this_platform() {
+        let said = unavailable_message("the probe error");
+        assert!(said.starts_with("nucleos-core cannot start: "), "{said}");
+        assert!(said.contains("the probe error"), "{said}");
+        assert!(said.contains("no file fallback"), "{said}");
+        let names = if cfg!(windows) {
+            vec!["Credential Manager"]
+        } else if cfg!(target_os = "macos") {
+            vec!["Keychain"]
+        } else {
+            vec!["Secret Service", "gnome-keyring"]
+        };
+        for name in names {
+            assert!(said.contains(name), "missing {name:?} in {said}");
+        }
+    }
+
+    #[test]
+    fn a_stored_daemon_token_is_used_and_nothing_is_minted_or_persisted() {
+        let token = daemon_token(
+            Ok::<_, String>(Some("stored".to_owned())),
+            || -> String { panic!("minted") },
+            |_: &str| -> Result<(), String> { panic!("persisted") },
+        );
+        assert_eq!(token, Ok("stored".to_owned()));
+    }
+
+    #[test]
+    fn no_stored_daemon_token_mints_one_and_persists_it() {
+        let mut persisted = None;
+        let token = daemon_token(
+            Ok::<_, String>(None),
+            || "fresh".to_owned(),
+            |fresh: &str| {
+                persisted = Some(fresh.to_owned());
+                Ok(())
+            },
+        );
+        assert_eq!(token, Ok("fresh".to_owned()));
+        assert_eq!(persisted.as_deref(), Some("fresh"));
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_refuses_to_start_without_minting() {
+        let refused = daemon_token(
+            Err::<Option<String>, _>("no D-Bus session".to_owned()),
+            || -> String { panic!("minted") },
+            |_: &str| -> Result<(), String> { panic!("persisted") },
+        )
+        .unwrap_err();
+        assert_eq!(refused, unavailable_message("no D-Bus session"));
+    }
+
+    #[test]
+    fn a_token_that_cannot_be_persisted_refuses_to_start() {
+        let refused = daemon_token(
+            Ok::<_, String>(None),
+            || "fresh".to_owned(),
+            |_: &str| Err("store is locked".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(refused, unavailable_message("store is locked"));
     }
 }

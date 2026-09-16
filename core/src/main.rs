@@ -344,7 +344,7 @@ async fn main() {
                 std::process::exit(1);
             }
             Err(e) => {
-                eprintln!("failed to read token from Credential Manager: {e}");
+                eprintln!("failed to read token from the system credential store: {e}");
                 std::process::exit(1);
             }
         }
@@ -488,7 +488,7 @@ async fn main() {
     if std::env::args().any(|a| a == "--set-telegram-token") {
         match read_secret_from_stdin("paste the bot token, then press Enter:") {
             Some(value) => match secrets::store_secret(TELEGRAM_TOKEN_KEY, &value) {
-                Ok(()) => println!("telegram bot token stored in Credential Manager"),
+                Ok(()) => println!("telegram bot token stored in the system credential store"),
                 Err(e) => {
                     eprintln!("failed to store telegram token: {e}");
                     std::process::exit(1);
@@ -514,7 +514,7 @@ async fn main() {
         ) {
             Some(value) => match secrets::store_secret(github::TOKEN_KEY, &value) {
                 Ok(()) => {
-                    println!("github token stored in Credential Manager");
+                    println!("github token stored in the system credential store");
                     // Said here because this is the last moment the person is listening, and the
                     // alternative is discovering it from a health row that says permission-denied.
                     eprintln!(
@@ -537,7 +537,7 @@ async fn main() {
     if std::env::args().any(|a| a == "--set-email-password") {
         match read_secret_from_stdin("paste the app password, then press Enter:") {
             Some(value) => match secrets::store_secret(EMAIL_PASSWORD_KEY, &value) {
-                Ok(()) => println!("email password stored in Credential Manager"),
+                Ok(()) => println!("email password stored in the system credential store"),
                 Err(e) => {
                     eprintln!("failed to store email password: {e}");
                     std::process::exit(1);
@@ -565,7 +565,7 @@ async fn main() {
         match read_secret_from_stdin("paste the OpenRouter API key, then press Enter:") {
             Some(value) => match secrets::store_secret(OPENROUTER_KEY, &value) {
                 Ok(()) => {
-                    println!("openrouter key stored in Credential Manager");
+                    println!("openrouter key stored in the system credential store");
                     // Said here because this is the last moment the person is listening, and the
                     // alternative is a chat that refuses with no visible reason: the key alone
                     // gets a conversation nowhere, and the daemon reads both ONCE, at startup.
@@ -778,16 +778,21 @@ async fn main() {
         Err(error) => tracing::warn!(%error, "orphaned-worktree reconciliation failed"),
     }
 
-    let token_value =
-        match secrets::load_secret(TOKEN_KEY).expect("failed to read Credential Manager") {
-            Some(existing) => existing,
-            None => {
-                let fresh = auth::generate_token();
-                secrets::store_secret(TOKEN_KEY, &fresh).expect("failed to persist daemon token");
-                fresh
-            }
-        };
-    tracing::info!("nucleos-core token loaded from Credential Manager");
+    let token_value = match secrets::daemon_token(
+        secrets::load_secret(TOKEN_KEY),
+        auth::generate_token,
+        |fresh| secrets::store_secret(TOKEN_KEY, fresh),
+    ) {
+        Ok(token) => token,
+        Err(sentence) => {
+            // Said on stderr as well as in the log: whoever launched a daemon that refuses to
+            // start is the one person who can fix the store, and may not be reading the log.
+            tracing::error!("{sentence}");
+            eprintln!("{sentence}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!("nucleos-core token loaded from the system credential store");
 
     let models_config_path = std::path::PathBuf::from(config::MODELS_CONFIG_PATH);
     let models_config = config::load_models_config(&models_config_path).unwrap_or_else(|e| {
@@ -1099,7 +1104,7 @@ async fn main() {
             tracing::warn!(
                 %model,
                 %error,
-                "could not read the OpenRouter key from Credential Manager; \
+                "could not read the OpenRouter key from the system credential store; \
                  chats marked openrouter will refuse rather than answer"
             );
             (Some(model), None)
@@ -1357,7 +1362,7 @@ async fn main() {
             );
         }
         Err(e) => {
-            tracing::warn!("failed to read telegram-token from Credential Manager: {e}");
+            tracing::warn!("failed to read telegram-token from the system credential store: {e}");
         }
     }
     tokio::spawn(scheduler::run_scheduler(state.clone()));
@@ -1504,7 +1509,7 @@ async fn main() {
                     "no email-imap-password stored — the email sidecar will not start (set with --set-email-password)"
                 ),
                 Err(error) => {
-                    tracing::warn!(%error, "could not read the email password from Credential Manager")
+                    tracing::warn!(%error, "could not read the email password from the system credential store")
                 }
             }
         });
