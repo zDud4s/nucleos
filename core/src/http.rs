@@ -8332,7 +8332,9 @@ where
 pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
     match error {
         CreateRunError::Invalid(_) => StatusCode::BAD_REQUEST,
-        CreateRunError::Busy => StatusCode::CONFLICT,
+        // The same 409 as a held slot: both are conditions that pass, and a caller that retries
+        // on one should retry on the other. What tells them apart is the sentence below.
+        CreateRunError::Busy | CreateRunError::NoRoomOnDisk(_) => StatusCode::CONFLICT,
         CreateRunError::Worktree(_) | CreateRunError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -8343,17 +8345,24 @@ pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
 /// deciding what one refusal is CALLED would drift, and a status and a sentence that disagree is
 /// worse than either alone.
 ///
-/// **`Invalid`'s own words travel and the other two's do not**, and that split is the whole of this
-/// function. `Invalid` is a `&'static str` this codebase wrote about the request — "worktree mode
-/// requires project_id and cwd" — and it was being thrown away, so a caller got a bare 400 for a
-/// mistake it could have fixed in a second. A `sqlx::Error` and an `io::Error` are about the inside
-/// of this daemon: they go to the log, where whoever can act on them is reading, and the caller gets
-/// the fact rather than the internals.
+/// **`Invalid`'s and `NoRoomOnDisk`'s own words travel, and the internal errors' do not**, and that
+/// split is the whole of this function. `Invalid` is a `&'static str` this codebase wrote about the
+/// request — "worktree mode requires project_id and cwd" — and it was being thrown away, so a caller
+/// got a bare 400 for a mistake it could have fixed in a second. `NoRoomOnDisk` is about the machine,
+/// not the daemon: how much room there is and how much a checkout asks for. A `sqlx::Error` and an
+/// `io::Error` are about the inside of this daemon: they go to the log, where whoever can act on them
+/// is reading, and the caller gets the fact rather than the internals.
 pub(crate) fn create_run_reason(error: &CreateRunError) -> String {
     match error {
         CreateRunError::Invalid(reason) => (*reason).to_owned(),
         CreateRunError::Busy => {
             "this project has no free slot right now, so nothing was started".to_owned()
+        }
+        // Its words travel, like `Invalid`'s, because they are about the machine rather than the
+        // daemon's internals — how much room there is and how much a checkout asks for — and a
+        // caller told "no free slot" instead goes looking for a run that is not there.
+        CreateRunError::NoRoomOnDisk(refusal) => {
+            format!("the disk is too full for another checkout, so nothing was started: {refusal}")
         }
         CreateRunError::Worktree(_) => {
             "the run's checkout could not be provisioned; the daemon logged why".to_owned()

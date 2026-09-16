@@ -126,11 +126,18 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * and the only thing that changes it is lifting the rule or letting the
    * partner finish. Reading it as slot contention would send somebody looking
    * for capacity that is already there.
+   *
+   * `disk` is the fourth, and until 2026-09-14 it was reported as the second: a
+   * checkout refused because the volume is below the free-space floor parked its
+   * job as `slot`. Somebody reading that waits for a run to finish, or goes
+   * looking for one, and nothing clears until somebody frees space. Paused
+   * rather than pending for that reason — like budget, it waits on a hand.
    */
   wait_reason: {
     budget: { tone: "paused", label: "held by budget" },
     slot: { tone: "pending", label: "waiting for a slot" },
     excluded: { tone: "paused", label: "held by an exclusion" },
+    disk: { tone: "paused", label: "held by a full disk" },
   },
 
   /**

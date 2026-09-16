@@ -813,7 +813,15 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                 //
                 // Released with a compare-and-set on the value just written, so a concurrent tick
                 // that has already claimed the next window is not clobbered.
-                Err(error @ (CreateRunError::Busy | CreateRunError::Invalid(_))) => {
+                //
+                // A disk below the floor is the same trade: refused before any tree, a condition
+                // that passes. The log line's `%error` is the refusal's own sentence, so it says
+                // the disk rather than a slot.
+                Err(
+                    error @ (CreateRunError::Busy
+                    | CreateRunError::NoRoomOnDisk(_)
+                    | CreateRunError::Invalid(_)),
+                ) => {
                     release_window(
                         state,
                         &project_id,

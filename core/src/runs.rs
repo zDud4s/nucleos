@@ -176,7 +176,18 @@ pub async fn search(
 #[derive(Debug)]
 pub enum CreateRunError {
     Invalid(&'static str),
+    /// The project's slot, or the house's, is taken: another run holds what this one needed.
     Busy,
+    /// The volume the checkout would live on is below the free-space floor. The sentence says how
+    /// much room there was and against which floor, and is the one `worktree_provision_failed` also
+    /// carries.
+    ///
+    /// Its own variant rather than a `Busy`, and not because anything retries it differently —
+    /// every caller still treats it as a condition that passes rather than a failure. On 2026-09-14
+    /// a job refused its item this way read `status waiting, wait_reason slot` and fed `another run
+    /// holds the project's worktree slot`; whoever reads that goes looking for the run holding it,
+    /// finds none, and never learns the disk is full. The two refusals ask for different hands.
+    NoRoomOnDisk(String),
     Worktree(std::io::Error),
     Db(sqlx::Error),
 }
@@ -206,6 +217,7 @@ impl std::fmt::Display for CreateRunError {
         match self {
             Self::Invalid(message) => formatter.write_str(message),
             Self::Busy => formatter.write_str("run creation is busy"),
+            Self::NoRoomOnDisk(refusal) => formatter.write_str(refusal),
             Self::Worktree(error) => write!(formatter, "worktree provisioning failed: {error}"),
             Self::Db(error) => write!(formatter, "database error: {error}"),
         }
@@ -217,7 +229,7 @@ impl std::error::Error for CreateRunError {
         match self {
             Self::Worktree(error) => Some(error),
             Self::Db(error) => Some(error),
-            Self::Invalid(_) | Self::Busy => None,
+            Self::Invalid(_) | Self::Busy | Self::NoRoomOnDisk(_) => None,
         }
     }
 }
@@ -2566,9 +2578,10 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
                 }
 
                 // Checked after the slot and before the tree, which is the only order that reports
-                // the two walls apart. A refusal here is `Busy` and not a failure: the disk is a
-                // condition of the machine, the same shape as a full project, and a batch that
-                // cannot have its third item should come out smaller rather than fail.
+                // the two walls apart. A refusal here is not a failure: the disk is a condition of
+                // the machine, the same shape as a full project, and a batch that cannot have its
+                // third item should come out smaller rather than fail. It is not `Busy` either, and
+                // that half was learned the hard way — see `CreateRunError::NoRoomOnDisk`.
                 //
                 // Only for an item, and not because the others are cheaper. A standalone run and a
                 // resolution are asked for one at a time by a person or by the queue; items are
@@ -2577,7 +2590,7 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
                     && let Some(refusal) = no_room_on_disk(std::path::Path::new(project_root)).await
                 {
                     fail_provisioning(state, id, project_id.as_deref(), &refusal).await;
-                    return Err(CreateRunError::Busy);
+                    return Err(CreateRunError::NoRoomOnDisk(refusal));
                 }
 
                 // A resolution's tree is born on the merge's TARGET and an item's on the tip of its
@@ -5813,8 +5826,10 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     /// instead, on purpose, with a floor no volume this runs on comes near. That is what makes the
     /// answer the same on every machine, which the walks' answer never was.
     ///
-    /// The feed line is half the property. A refused item parks its job as `slot` whether the slot
-    /// or the disk said no, so this row is the only place a reader learns which.
+    /// The feed line is half the property, and the error is the other half. Until 2026-09-14 a
+    /// refused item parked its job as `slot` whether the slot or the disk said no, and this row was
+    /// the only place a reader learned which; the refusal now travels as its own variant, carrying
+    /// the same sentence, so the job can say it too.
     #[tokio::test(flavor = "current_thread")]
     async fn an_item_is_refused_its_checkout_on_a_full_disk_and_the_feed_says_how_full() {
         let _lock = crate::worktree::test_env_lock();
@@ -5885,10 +5900,9 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             },
         )
         .await;
-        assert!(
-            matches!(refused, Err(CreateRunError::Busy)),
-            "a full disk is a condition of the machine, answered as `Busy`: {refused:?}"
-        );
+        let Err(CreateRunError::NoRoomOnDisk(refusal)) = refused else {
+            panic!("a full disk is refused as itself, not as a held slot: {refused:?}");
+        };
 
         let (run_id, summary): (i64, String) = sqlx::query_as(
             "SELECT run_id, summary FROM feed WHERE kind = 'worktree_provision_failed'",
@@ -5903,6 +5917,10 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         assert!(
             summary.contains("at least 1024000000 MiB"),
             "and against which floor, or it could be any refusal: {summary}"
+        );
+        assert_eq!(
+            refusal, summary,
+            "the caller is handed the sentence the feed was, so what it says cannot drift from it"
         );
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
             .bind(run_id)

@@ -385,6 +385,19 @@ async fn launch_once(state: &AppState) -> Option<i64> {
             );
             None
         }
+        // Not spent either, for the same reason: the refusal comes before any claim is written. Said
+        // as the disk rather than as a full project, because the two are cleared by different hands.
+        // Only items are asked about the disk today; this is here so the day a resolution is, the
+        // log does not send somebody looking for a slot.
+        Err(crate::runs::CreateRunError::NoRoomOnDisk(refusal)) => {
+            tracing::info!(
+                vcs_request_id = candidate.id,
+                project_id = %candidate.project_id,
+                %refusal,
+                "resolver: the disk is too full for a checkout; its conflict waits"
+            );
+            None
+        }
         // Everything else HAS spent the attempt, because the claim is written before the conflict is
         // staged — see `create_run_with`. `fail_provisioning` has already put the reason in the feed;
         // this is the log line that names the request it was about.
