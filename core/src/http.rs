@@ -8345,12 +8345,13 @@ pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
 /// deciding what one refusal is CALLED would drift, and a status and a sentence that disagree is
 /// worse than either alone.
 ///
-/// **`Invalid`'s own words travel and the other two's do not**, and that split is the whole of this
-/// function. `Invalid` is a `&'static str` this codebase wrote about the request — "worktree mode
-/// requires project_id and cwd" — and it was being thrown away, so a caller got a bare 400 for a
-/// mistake it could have fixed in a second. A `sqlx::Error` and an `io::Error` are about the inside
-/// of this daemon: they go to the log, where whoever can act on them is reading, and the caller gets
-/// the fact rather than the internals.
+/// **`Invalid`'s and `NoRoomOnDisk`'s own words travel, and the internal errors' do not**, and that
+/// split is the whole of this function. `Invalid` is a `&'static str` this codebase wrote about the
+/// request — "worktree mode requires project_id and cwd" — and it was being thrown away, so a caller
+/// got a bare 400 for a mistake it could have fixed in a second. `NoRoomOnDisk` is about the machine,
+/// not the daemon: how much room there is and how much a checkout asks for. A `sqlx::Error` and an
+/// `io::Error` are about the inside of this daemon: they go to the log, where whoever can act on them
+/// is reading, and the caller gets the fact rather than the internals.
 pub(crate) fn create_run_reason(error: &CreateRunError) -> String {
     match error {
         CreateRunError::Invalid(reason) => (*reason).to_owned(),
