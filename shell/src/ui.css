@@ -2244,3 +2244,204 @@ ol.ui-well {
   font-size: var(--text-sm);
   text-align: center;
 }
+
+/* ------------------------------------------------------------- run pipe -- */
+
+/**
+ * A run's four stages, drawn on a line. See `ui/RunPipeline.tsx` for what the
+ * stages are and why the component authors no tone of its own.
+ *
+ * Every tone arrives here as a class the component was handed by `state-map.ts`
+ * and is turned into three custom properties — ink, fill and line — so the box,
+ * its small-caps kind line and the marks travelling into it all take one
+ * decision. A rule that hard-coded `--tone-active-fg` on a box would be this
+ * sheet re-deciding what the map already decided.
+ */
+
+/**
+ * Drawn at its natural size, never stretched to the page.
+ *
+ * An SVG given `width: 100%` scales its TEXT with the window: at 1440px the
+ * viewBox's 14px reading came out at 30 on screen, larger than the `h1` above
+ * it, and the stage labels became the loudest thing on a page whose subject is
+ * the output below them. Capped at the viewBox's own width, the type is the
+ * size it was chosen to be, and a narrow window shrinks the whole row
+ * proportionally rather than reflowing four boxes into a column.
+ */
+.ui-runpipe {
+  display: block;
+  width: 100%;
+  max-width: 720px;
+  height: auto;
+  margin-bottom: var(--space-4);
+}
+
+/* The grey that makes no claim. It is the base for every stage, so a tone class
+   that fails to load leaves a legible box rather than an invisible one. */
+.ui-runpipe-stage,
+.ui-runpipe-neutral {
+  --runpipe-ink: var(--text-faint);
+  --runpipe-fill: var(--surface-raised);
+  --runpipe-line: var(--border);
+}
+
+.ui-runpipe-active {
+  --runpipe-ink: var(--tone-active-fg);
+  --runpipe-fill: var(--tone-active-bg);
+  --runpipe-line: var(--tone-active-border);
+}
+
+.ui-runpipe-shadow {
+  --runpipe-ink: var(--tone-shadow-fg);
+  --runpipe-fill: var(--tone-shadow-bg);
+  --runpipe-line: var(--tone-shadow-border);
+}
+
+.ui-runpipe-off {
+  --runpipe-ink: var(--tone-off-fg);
+  --runpipe-fill: var(--tone-off-bg);
+  --runpipe-line: var(--tone-off-border);
+}
+
+.ui-runpipe-pending {
+  --runpipe-ink: var(--tone-pending-fg);
+  --runpipe-fill: var(--tone-pending-bg);
+  --runpipe-line: var(--tone-pending-border);
+}
+
+.ui-runpipe-paused {
+  --runpipe-ink: var(--tone-paused-fg);
+  --runpipe-fill: var(--tone-paused-bg);
+  --runpipe-line: var(--tone-paused-border);
+}
+
+.ui-runpipe-danger {
+  --runpipe-ink: var(--tone-danger-fg);
+  --runpipe-fill: var(--tone-danger-bg);
+  --runpipe-line: var(--tone-danger-border);
+}
+
+.ui-runpipe-info {
+  --runpipe-ink: var(--tone-info-fg);
+  --runpipe-fill: var(--tone-info-bg);
+  --runpipe-line: var(--tone-info-border);
+}
+
+.ui-runpipe-box {
+  fill: var(--runpipe-fill);
+  stroke: var(--runpipe-line);
+  stroke-width: 1;
+}
+
+.ui-runpipe-kind {
+  fill: var(--runpipe-ink);
+  font-size: 9.5px;
+  letter-spacing: var(--tracking-wide);
+}
+
+/* The reading itself is the app's text colour whatever the tone: colour
+   reinforces the state on the kind line and the border, and text that changes
+   hue with the status is the thing `Badge` refuses to do for the same reason —
+   roughly one reader in twelve cannot separate the red from the green. */
+.ui-runpipe-title {
+  fill: var(--text);
+  font-size: 14px;
+  font-weight: var(--weight-medium);
+}
+
+.ui-runpipe-sub {
+  fill: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.ui-runpipe-edge {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* A stage the run never reached, and the arrow into it: an outline and a dash,
+   which says *not yet* without borrowing a state's colour to say it. */
+.ui-runpipe-unreached {
+  opacity: 0.6;
+}
+
+.ui-runpipe-unreached .ui-runpipe-box,
+.ui-runpipe-edge.ui-runpipe-unreached {
+  fill: none;
+  stroke-dasharray: 4 4;
+}
+
+/**
+ * The marks travelling into the working stage, and the three dots inside it.
+ *
+ * Both start at zero opacity and are brought up by their own keyframes, which
+ * is what makes them disappear rather than freeze when the global
+ * `prefers-reduced-motion` rule in `base.css` clamps every animation to one
+ * 0.01ms iteration. A mark parked mid-gap would read as a stalled run.
+ *
+ * `translateX(40px)` is the gap between two boxes, in viewBox units, and the
+ * boxes in `RunPipeline.tsx` are laid out with that one gap everywhere so this
+ * distance is written once.
+ */
+.ui-runpipe-flow {
+  fill: var(--runpipe-ink, var(--text-muted));
+  opacity: 0;
+  animation: ui-runpipe-travel 1.2s linear infinite;
+}
+
+.ui-runpipe-flow:nth-child(2) {
+  animation-delay: 0.4s;
+}
+
+.ui-runpipe-flow:nth-child(3) {
+  animation-delay: 0.8s;
+}
+
+@keyframes ui-runpipe-travel {
+  0% {
+    transform: translateX(0);
+    opacity: 0;
+  }
+
+  15% {
+    opacity: 1;
+  }
+
+  85% {
+    opacity: 0.7;
+  }
+
+  100% {
+    transform: translateX(40px);
+    opacity: 0;
+  }
+}
+
+.ui-runpipe-workdot {
+  fill: var(--runpipe-ink);
+  opacity: 0;
+  animation: ui-runpipe-work 1.2s ease-in-out infinite;
+}
+
+.ui-runpipe-workdot:nth-child(2) {
+  animation-delay: 0.4s;
+}
+
+.ui-runpipe-workdot:nth-child(3) {
+  animation-delay: 0.8s;
+}
+
+@keyframes ui-runpipe-work {
+  0%,
+  100% {
+    opacity: 0.15;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}

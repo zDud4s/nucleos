@@ -25,7 +25,7 @@ import {
   Panel,
   Quiet,
   RefusalNote,
-  StateBadge,
+  RunPipeline,
 } from "../ui";
 import "./runs.css";
 
@@ -151,6 +151,11 @@ function KnownRun({ id }: { id: number }) {
       {cancel.isError && <MutationNote error={cancel.error} what="that run could not be cancelled" />}
       {release.isError && <MutationNote error={release.error} what="that worktree could not be released" />}
 
+      {/* The shape first, then the figures. Which stage a run is standing at is what somebody
+          opens the page to see, and it was previously assembled by reading a badge here, a
+          second badge beside it and an exit code four blocks down. */}
+      <RunPipeline run={detail} alive={alive} />
+
       <Instruments run={detail} />
 
       {blocks}
@@ -166,7 +171,12 @@ function KnownRun({ id }: { id: number }) {
 /* ----------------------------------------------------------- instruments -- */
 
 /**
- * The four readings of a run, on one line under the header.
+ * The two readings that are figures, on one line under the pipeline.
+ *
+ * It carried the run's state and its gate's as badges too, until `RunPipeline` above it started
+ * drawing both as stages. Two readings of one state on one screen is worse than either alone:
+ * they are a poll apart, and the moment they disagree a person has to work out which of them is
+ * the app being slow. The states are the picture's; the figures are this row's.
  *
  * They were spread over a headline that said them as prose and a panel that said them
  * again as a definition list — "still going; $0.0310 spent; gate passed" above, a badge
@@ -175,14 +185,12 @@ function KnownRun({ id }: { id: number }) {
  * a number in the middle of a sentence where the eye has to parse to find it.
  *
  * So the figures are drawn as themselves, in one row, in the order the questions are
- * asked: is it going, did the gate pass, what has it cost, how full is it.
+ * asked: what has it cost, and how full is it.
  */
 function Instruments({ run }: { run: Run }) {
   return (
     <div className="mb-4">
       <div className="runs-gate-line">
-        <StateBadge domain="run" state={run.status} />
-        <StateBadge domain="gate" state={run.gate_status} />
         <CostLine
           costUsd={run.cost_usd}
           inputTokens={run.input_tokens}

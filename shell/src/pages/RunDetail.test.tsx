@@ -135,10 +135,12 @@ describe("RunDetail — the gate", () => {
 
     // A NULL `gate_status` means no gate was ever configured. Rendered in red it
     // would be the shell telling somebody their tests broke when they never
-    // wrote any.
+    // wrote any. The reading is the pipeline's gate stage — the page says each
+    // state once, and this is the once.
     const reading = await screen.findByText("no gate configured");
-    expect(reading.className).toContain("ui-badge-off");
-    expect(reading.className).not.toContain("ui-badge-danger");
+    const stage = reading.closest("g")!.getAttribute("class");
+    expect(stage).toContain("ui-runpipe-off");
+    expect(stage).not.toContain("ui-runpipe-danger");
     expect(screen.queryByText(/gate failed/i)).toBeNull();
     // And it does not borrow the passing tone either: nothing measured this.
     expect(screen.queryByText(/gate passed/i)).toBeNull();
