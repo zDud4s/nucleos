@@ -196,7 +196,7 @@ function previewRoster(): ProjectSummary[] {
       classes_ready: 5,
       classes_total: 5,
       withheld_classes_ready: 2,
-      open_proposals: 3,
+      open_review_items: 3,
       wip_limit: 4,
     }),
     project({
@@ -207,7 +207,7 @@ function previewRoster(): ProjectSummary[] {
       classes_ready: 3,
       classes_total: 3,
       withheld_classes_ready: 1,
-      open_proposals: 4,
+      open_review_items: 4,
       wip_limit: 4,
     }),
     project({ project_id: "charlie", mode: "off", project_root: "C:/repos/charlie" }),
@@ -838,7 +838,7 @@ describe("Autopilot - the stat cards name what they count", () => {
     // "Waiting on you" is the one queue's phrase, and it belongs to Home and
     // the rail. This card counts open proposals across the roster, which is a
     // different number from the queue's six decision lists, so it says which.
-    const card = await screen.findByRole("article", { name: "Proposals open" });
+    const card = await screen.findByRole("article", { name: "To review" });
     expect(within(card).getByText("5")).toBeDefined();
     expect(within(card).getByText("across the roster")).toBeDefined();
     expect(screen.queryByRole("article", { name: "Waiting on you" })).toBeNull();

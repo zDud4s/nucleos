@@ -352,6 +352,30 @@ pub struct AppState {
     /// variable, which is process-global: two tests setting it would race, and `set_var` is
     /// `unsafe` in this edition for exactly that reason.
     pub workflow_library: Option<std::path::PathBuf>,
+    /// The directory every row in [`crate::machine_config`] is relative to — the daemon's own
+    /// working directory, resolved once at startup.
+    ///
+    /// Once and not per request, for the reason `files_root` is canonicalised once: a process does
+    /// not change its working directory here, so a second reading would be the same answer bought
+    /// again. And a FIELD rather than `std::env::current_dir()` called inline, for exactly the
+    /// reason given for `workflow_library` above — it is what makes this root a thing a test can
+    /// point somewhere else, where the alternative would be a process-global environment variable
+    /// two tests would race on.
+    ///
+    /// `None` means the daemon could not name its own working directory, which is a real failure
+    /// and not a configuration: every route under `/config/machine` refuses rather than guessing at
+    /// a root. It is also what the test state carries, so the hundreds of tests that never touch
+    /// these routes need no directory to exist.
+    pub machine_config_root: Option<std::path::PathBuf>,
+    /// Where this machine's credentials live.
+    ///
+    /// A trait object for the reason `runner` and `assistants` are: there is no fake backend for
+    /// `keyring`, so a route that wrote a secret through the free functions would be a route only
+    /// a real desktop could test — and its refusals, which are the whole of its contract, would be
+    /// asserted by nobody. Production gets `secrets::OsCredentialStore`.
+    ///
+    /// The trait cannot READ a secret back, only answer whether one is set. See its own doc.
+    pub secrets: std::sync::Arc<dyn crate::secrets::SecretStore>,
     /// The standing instructions a Telegram turn is launched with when the chat itself gave none,
     /// resolved once at startup from `.ai/telegram.yaml`.
     ///

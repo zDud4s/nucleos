@@ -3,15 +3,29 @@
  * lists, `voice-` throughout — as `mail-` is for the mail queue and `web-`
  * for the archive.
  *
- * The rule this file lives under: **no class appears in `Voice.tsx` that is
- * not defined below.** `tsc` and vitest both pass happily on a class no
+ * The rule this file lives under: **no `voice-` class appears in `Voice.tsx`
+ * that is not defined below.** `tsc` and vitest both pass happily on a class no
  * stylesheet has ever heard of, and the defect shows up only as something
- * looking wrong on a screen nobody is testing. Grep the component against
- * this file before calling the page done.
+ * looking wrong on a screen nobody is testing. Grep the component against this
+ * file before calling the page done. `ui-` classes are the exception and are
+ * not this file's to define — they arrive with a primitive imported from
+ * `../ui`, which is where their recipe and their argument both live.
  */
 
 /* ================================================================ shared == */
 
+/**
+ * The prose standing above a list, and the line that stands in for a panel
+ * while it is still being read.
+ *
+ * Neither is `Quiet`, and that is a decision rather than an oversight. The note
+ * says what the dictations below it are for; the loading line is a wait, and a
+ * wait wearing the vocabulary of an empty section claims the list is empty when
+ * in truth nobody has answered yet. Faint is right for a line about to be
+ * replaced by the thing it stands for. This page's one genuine absence —
+ * "nothing was heard", the `204` — is a `Quiet` and has no class here at all,
+ * and its two teaching empty states are `Teach` blocks and already were.
+ */
 .voice-loading,
 .voice-note {
   margin: 0;
@@ -34,32 +48,47 @@
   margin-bottom: var(--space-3);
 }
 
-/* What the daemon said about the attempt, after asking — quiet and
-   informational, never the danger tone: a `204` here is a value the daemon
-   sent on purpose, not a fault. */
-.voice-outcome {
-  margin: var(--space-3) 0 0;
+/**
+ * The three one-line answers the capture panel gives — what the attempt came
+ * back as, whether the paste landed, and which hotkeys the machine would not
+ * give up. All three are a rule on the leading edge rather than a frame: the
+ * `.ui-note-refusal` idiom, and the reason none of them is an `ErrorNote`.
+ * Nothing here has failed.
+ *
+ * One recipe and not three. They were written out separately with five
+ * declarations in common; what actually differs is the tone the rule is painted
+ * in and the margin each needs where it sits.
+ */
+.voice-outcome,
+.voice-delivery,
+.voice-hotkey-conflict {
   padding: var(--space-2) var(--space-3);
-  border-left: 2px solid var(--tone-info-border);
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
+  border-left: 2px solid var(--tone-paused-border);
   color: var(--text);
   font-size: var(--text-sm);
   line-height: var(--leading-snug);
+}
+
+/* What the daemon said about the attempt, after asking — quiet and
+   informational, never the danger tone: what comes back here is a value the
+   daemon sent on purpose, not a fault. `align-items: center` is this note's
+   own, because it carries a `StateBadge` inline and the badge would otherwise
+   sit off the line the sentence is read along. */
+.voice-outcome {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 0;
+  border-left-color: var(--tone-info-border);
 }
 
 .voice-delivery {
   margin: var(--space-2) 0 0;
-  padding: var(--space-2) var(--space-3);
-  border-left: 2px solid var(--tone-active-border);
-  color: var(--text);
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
+  border-left-color: var(--tone-active-border);
 }
 
-/* One of the five verbatim `held` sentences — a paste that did not land, not
-   a fault of this shell's own, so it stays the paused tone rather than the
+/* One of the five verbatim `held` sentences — a paste that did not land, not a
+   fault of this shell's own, so it goes back to the paused tone rather than the
    danger one. */
 .voice-delivery-held {
   border-left-color: var(--tone-paused-border);
@@ -67,11 +96,6 @@
 
 .voice-hotkey-conflict {
   margin: 0 0 var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  border-left: 2px solid var(--tone-paused-border);
-  color: var(--text);
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
 }
 
 /* --------------------------------------------------------- configuration -- */
@@ -110,12 +134,26 @@
   text-transform: uppercase;
 }
 
+/**
+ * The literal cleanup prompt — quoted, not boxed.
+ *
+ * It was a bordered box on `--surface-sunken`, and that fill was doing nothing:
+ * the panel it sits in is `variant="dim"`, which *is* `--surface-sunken`, in
+ * both themes. Only the border was left, and a border around a fill that
+ * matches its own ground is the bare outline around nothing — a second box rank
+ * inside a panel body that is not `.ui-panel-inset`.
+ *
+ * `Well` is the primitive by kind, an unbordered recess for verbatim text, and
+ * it cannot be used here for exactly the same reason: `.ui-well` and
+ * `.ui-panel-dim` are the same fill, so there is nothing for the recess to be
+ * cut into. What this system says instead of a frame is a rule on the leading
+ * edge — `.ui-note-refusal` does it, and so does `.voice-row-raw` below, which
+ * quotes the "as heard" text the same way. So does this.
+ */
 .voice-config-prompt {
   margin: 0 0 var(--space-3);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--border-strong);
   color: var(--text);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
@@ -148,27 +186,11 @@
 
 /* ------------------------------------------------------------------ lists -- */
 
-.voice-list {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--border);
-  overflow: hidden;
-}
-
-.voice-row {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3) var(--space-4);
-  background: var(--surface);
-}
-
+/* The head line of one capture row. The row and the column around it are
+   `Rows`/`Row` — this was the fourth byte-identical copy of the hairline-ruled
+   list, beside `contacts`, `feed` and `mail`, and the comment all four wrote
+   about why a column of captures is not a column of cards now lives on the
+   component. Only the arrangement inside the row is this page's. */
 .voice-row-head {
   display: flex;
   flex-wrap: wrap;
@@ -176,19 +198,32 @@
   gap: var(--space-2);
 }
 
-.voice-row-duration {
+/* Two facts the daemon measured, standing beside the badge: how long the
+   capture ran, and which model cleaned it. Both take the faint rung and the
+   mono face — the model name was in the body face, which is a claim that a
+   person wrote it, and it came off a wire. */
+.voice-row-duration,
+.voice-row-model {
   color: var(--text-faint);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+}
+
+/* Tabular on the duration only. These read as a column down the rows, and a
+   figure that reflows as its digits change width is unreadable; a model name
+   has no column to hold. */
+.voice-row-duration {
   font-variant-numeric: tabular-nums;
 }
 
+/* The chip is deliberately not a `Badge`: a badge is a pill in the body face
+   carrying one of the seven state tones, and a model id is none of those. The
+   border is what stops a variable-length identifier reading as a second
+   duration beside the first. */
 .voice-row-model {
   padding: 0 var(--space-2);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
-  color: var(--text-faint);
-  font-size: var(--text-xs);
 }
 
 .voice-row-clean {

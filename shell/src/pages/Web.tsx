@@ -12,7 +12,21 @@ import {
   type ReadView,
   type SearchView,
 } from "../data/web";
-import { Button, ErrorNote, Field, PageHeader, Panel, RefusalNote, RelativeTime, StateBadge, Teach } from "../ui";
+import {
+  Button,
+  ErrorNote,
+  Field,
+  PageHeader,
+  Panel,
+  Quiet,
+  RefusalNote,
+  RelativeTime,
+  Row,
+  Rows,
+  Section,
+  StateBadge,
+  Teach,
+} from "../ui";
 import "./web.css";
 
 /**
@@ -151,6 +165,19 @@ function ReadRefusal({ error }: { error: unknown }) {
 
 /* ------------------------------------------------------------------ search -- */
 
+/**
+ * Searching outward, from the page that is about the archive.
+ *
+ * **It stays `variant="dim"`, and it is not a `Well`.** `dim` means present but
+ * not the thing you came for, which is exactly this: you are here for what has
+ * already been read, and the provider is the way to find what has not. A `Well`
+ * is the other thing entirely — a recess holding something the machine
+ * produced, unbordered, mono, with no heading of its own. This panel has a
+ * title, a form, a button and links in it, and none of that belongs in a hole
+ * cut into a surface. The one thing it is not is `Projects`' `GatePanel`, which
+ * came *out* of `dim` because it carried the page's most consequential
+ * sentence; nothing here alerts anybody.
+ */
 function WebSearchPanel() {
   const search = useWebSearch();
   const [query, setQuery] = useState("");
@@ -189,45 +216,47 @@ function SearchOutcome({ view }: { view: SearchView }) {
   return (
     <div className="web-search-results">
       {/* A 200 with an empty provider — not a failure, and never routed through
-          RefusalNote or ErrorNote. */}
+          RefusalNote or ErrorNote. It is an absence, so the sentence is `Quiet`;
+          the live region stays this page's, because `Quiet` is a sentence and
+          not an announcement, and this one arrives after a mutation lands. */}
       {view.provider === "unavailable" && (
-        <p className="web-search-unavailable" role="status">
-          no search provider is configured on this machine — showing only what is already in the
-          archive
-        </p>
+        <div role="status">
+          <Quiet says="no search provider is configured on this machine — showing only what is already in the archive" />
+        </div>
       )}
 
+      {/* `level={3}`: the `Panel` above has already spent this page's `h2` on
+          "Search", and announcing these two as its siblings would tell a screen
+          reader the opposite of what the page means. */}
       {view.cached.length > 0 && (
-        <>
-          <p className="web-search-subhead">already in the archive</p>
-          <ul className="ui-rows web-search-list" aria-label="Already read">
+        <Section label="already in the archive" level={3}>
+          <Rows label="Already read">
             {view.cached.map((hit) => (
-              <li className="ui-rows-row web-search-row" key={hit.id}>
+              <Row key={hit.id}>
                 <Link to={`/web/pages/${hit.id}`}>{hit.title ?? hit.final_url}</Link>
                 <span className="web-search-snippet">{hit.snippet}</span>
-              </li>
+              </Row>
             ))}
-          </ul>
-        </>
+          </Rows>
+        </Section>
       )}
 
       {view.provider !== "unavailable" && (
-        <>
-          <p className="web-search-subhead">from {view.provider}</p>
+        <Section label={`from ${view.provider}`} level={3}>
           {view.results.length === 0 ? (
-            <p className="web-search-empty">nothing came back</p>
+            <Quiet says="nothing came back" />
           ) : (
-            <ul className="ui-rows web-search-list" aria-label="Search results">
+            <Rows label="Search results">
               {view.results.map((result) => (
-                <li className="ui-rows-row web-search-row" key={result.url}>
+                <Row key={result.url}>
                   <span className="web-search-title">{result.title}</span>
                   <span className="web-search-url">{result.url}</span>
                   <span className="web-search-snippet">{result.snippet}</span>
-                </li>
+                </Row>
               ))}
-            </ul>
+            </Rows>
           )}
-        </>
+        </Section>
       )}
     </div>
   );
@@ -284,19 +313,30 @@ function ArchiveList({
         </Teach>
       )}
       {rows !== undefined && rows.length > 0 && (
-        <ul className="ui-rows web-list" aria-label="Archive">
+        <Rows label="Archive" className="web-list">
           {rows.map((row) => (
             <ArchiveRow key={row.id} row={row} active={row.id === selected} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
 }
 
+/**
+ * One archived page, as a `Row` of the archive's `Rows`: the column is scanned
+ * down for the page to open, and the reader opens beside it.
+ *
+ * `current` and not a border colour of its own. The row used to say "this one"
+ * with `border-color: var(--accent)`, and the accent is the one colour in this
+ * system that means nothing — the wordmark, links and the focus ring. The
+ * neutral answer is `.ui-current`, a 2px rule on the leading edge, which the
+ * owner settled on 2026-09-06 after seeing four candidates rendered in both
+ * themes. `aria-current` stays on the link, where the destination is.
+ */
 function ArchiveRow({ row, active }: { row: Hit; active: boolean }) {
   return (
-    <li className={active ? "ui-rows-row web-row web-row-active" : "ui-rows-row web-row"}>
+    <Row current={active}>
       <Link className="web-row-link" to={`/web/pages/${row.id}`} aria-current={active ? "page" : undefined}>
         <span className="web-row-title">{row.title ?? row.final_url}</span>
         <StateBadge domain="web_trust" state={row.trust_at_fetch} />
@@ -304,7 +344,7 @@ function ArchiveRow({ row, active }: { row: Hit; active: boolean }) {
         <RelativeTime at={row.fetched_at} />
       </Link>
       <p className="web-row-snippet">{row.snippet}</p>
-    </li>
+    </Row>
   );
 }
 

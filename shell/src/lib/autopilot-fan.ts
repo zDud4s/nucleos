@@ -137,7 +137,7 @@ export function describeProject(p: ProjectSummary, refused = false): string {
   if (p.queue_full) bits.push("queue full");
   if (refused) bits.push("setting refused");
   const ceiling = p.wip_limit === null ? ", no ceiling" : ` of ${p.wip_limit}`;
-  return `${p.project_id}: ${bits.join(", ")}; ${evidence(p)}; ${plural(p.pending, "shadow decision")} to review; ${plural(p.open_proposals, "proposal")} open${ceiling}`;
+  return `${p.project_id}: ${bits.join(", ")}; ${evidence(p)}; ${plural(p.pending, "shadow decision")} to review; ${plural(p.open_review_items, "item")} waiting for review${ceiling}`;
 }
 
 /**

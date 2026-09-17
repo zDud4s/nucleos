@@ -18,7 +18,7 @@ import {
   type Installed,
 } from "../data/workflows";
 import { openInVscode } from "../lib/vscode";
-import { Button, Quiet, Teach } from "../ui";
+import { Button, Quiet, RefusalNote, Row, Rows, Section, Teach, Well } from "../ui";
 import { WorkflowChain, WorkflowGraph } from "./WorkflowGraph";
 
 /**
@@ -275,10 +275,16 @@ function InstalledRow({
         </span>
       </div>
 
+      {/*
+        The middle weight, which is what a refusal is. This was a full Wrong Red box — the weight
+        reserved for something being wrong — over a núcleo that declined on purpose and named the
+        reason. `REFUSALS` survives unchanged and is handed in as this route's own sentences, which
+        is the prop that exists for exactly it: same codes, sharper words, because only the route
+        knows which ceiling it hit. What the primitive adds is the code itself, in mono, which none
+        of the eight sentences below can be searched by.
+      */}
       {refused !== undefined && isApiRefusal(refused.error) ? (
-        <p className="rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
-          {REFUSALS[refused.error.code] ?? refused.error.detail}
-        </p>
+        <RefusalNote refusal={refused.error} sentences={REFUSALS} />
       ) : null}
 
       {diffOpen ? <Diff projectId={projectId} name={row.name} /> : null}
@@ -420,8 +426,17 @@ function Diff({ projectId, name }: { projectId: string; name: string }) {
     );
   }
 
+  /*
+    A well, and it was a well with a border — which is the one mistake `Well` exists to stop, because
+    an outline makes a box read as sitting ON the surface rather than as being cut into it, and a
+    third bordered box inside a bordered row inside a page is the boxes-in-boxes the system refuses.
+
+    `reads` because the two halves have two authors. The sentence framing the comparison is prose
+    somebody wrote; the file list under it is the núcleo's answer and carries its own mono, so the
+    face keeps saying which is which instead of setting the whole box in the machine's.
+  */
   return (
-    <div className="rounded-md border border-border bg-surface-sunken p-3">
+    <Well as="div" reads>
       <p className="text-xs text-text-muted">
         Against {diff.data.origin_version} in the library. File by file — the line-by-line answer is
         the editor, one click away.
@@ -441,7 +456,7 @@ function Diff({ projectId, name }: { projectId: string; name: string }) {
           {diff.data.unchanged} other {diff.data.unchanged === 1 ? "file" : "files"} identical.
         </p>
       ) : null}
-    </div>
+    </Well>
   );
 }
 
@@ -469,11 +484,15 @@ function Library({ projectId, installed }: { projectId: string; installed: Insta
 
   const pinned = new Map(installed.map((row) => [row.name, row.version]));
 
+  /*
+    `Section` at rank 3, because this sits under the project mode's own heading rather than beside
+    it. The hand-rolled pair was already the shared recipe to the declaration — display face, 11px,
+    500, `--tracking-wider`, uppercase, faint — which is drift rather than a gap, and the drift is
+    what a seventh copy gets to disagree with by accident. The region now answers to its own
+    heading instead of to "The library", which is a name nothing on screen ever said.
+  */
   return (
-    <section aria-label="The library" className="flex flex-col gap-2">
-      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
-        On this machine
-      </h3>
+    <Section label="On this machine" level={3}>
       {library.data.length === 0 ? (
         <p className="max-w-prose text-sm text-text-muted">
           The library is empty. A bundle is a folder in{" "}
@@ -482,7 +501,13 @@ function Library({ projectId, installed }: { projectId: string; installed: Insta
           authoring is the second half of this design and not this one.
         </p>
       ) : (
-        <ul className="flex flex-col gap-1">
+        /*
+          A hairline-ruled column, and it was a stack of bordered boxes. Every bundle on the machine
+          is one row of one list somebody scans to find the one they want; fifty of them as separate
+          cards is a pile, and the eye stops reading a pile as a list. The rules are a 1px gap over a
+          `--border` ground, which is why a `Row` paints its own fill.
+        */
+        <Rows label="Workflow bundles on this machine">
           {library.data.map((bundle) => (
             <LibraryRow
               key={`${bundle.name}@${bundle.version}`}
@@ -498,14 +523,12 @@ function Library({ projectId, installed }: { projectId: string; installed: Insta
               }
             />
           ))}
-        </ul>
+        </Rows>
       )}
       {install.isError && isApiRefusal(install.error) ? (
-        <p className="rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
-          {REFUSALS[install.error.code] ?? install.error.detail}
-        </p>
+        <RefusalNote refusal={install.error} sentences={REFUSALS} />
       ) : null}
-    </section>
+    </Section>
   );
 }
 
@@ -522,9 +545,15 @@ function LibraryRow({
 }) {
   const isPinned = pinnedVersion === bundle.version;
 
+  /*
+    `layout="line"` because the parts sit on one baseline: name, version, description, and the
+    gesture pushed to the far end. That is an axis the primitive names rather than a `className` it
+    would have had to accept — a row must not be handed the one property it owns, its background,
+    which is what keeps the container's hairline ground from showing through it.
+  */
   return (
-    <li className="flex flex-wrap items-baseline gap-x-3 gap-y-1 rounded-md border border-border bg-surface px-3 py-2 text-sm">
-      <span className="text-text">{bundle.name}</span>
+    <Row layout="line">
+      <span className="text-sm text-text">{bundle.name}</span>
       <span className="font-mono text-xs text-text-faint">{bundle.version}</span>
       {bundle.description !== null ? (
         <span className="text-xs text-text-muted">{bundle.description}</span>
@@ -546,7 +575,7 @@ function LibraryRow({
           {pinnedVersion === null ? "use here" : `use ${bundle.version} instead`}
         </button>
       )}
-    </li>
+    </Row>
   );
 }
 

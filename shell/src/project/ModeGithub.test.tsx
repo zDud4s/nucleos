@@ -11,6 +11,8 @@ import {
   shellRule,
   type DaemonState,
 } from "../test/harness";
+import { ApiRefusal } from "../data/client";
+import type { DeclarableGitOp } from "../data/project-policy";
 import { ModeGithub } from "./ModeGithub";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -20,11 +22,66 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
+/**
+ * The six queue writes compiled into this daemon build.
+ *
+ * Kept as catalogue rows rather than a string list because the component consumes the route's
+ * actual shape, including the declaration flag. Unlike the GitHub fixture there is no `half`:
+ * every one of these operations is a write the queue performs by the same path.
+ */
+const GIT_CATALOGUE: DeclarableGitOp[] = [
+  { kind: "merge", declarable: true },
+  { kind: "push", declarable: true },
+  { kind: "tag", declarable: true },
+  { kind: "fetch", declarable: true },
+  { kind: "rebase", declarable: true },
+  { kind: "branch-delete", declarable: true },
+];
+
+type ModeGithubState = DaemonState & {
+  gitOps: string[];
+  declarableGitOps: DeclarableGitOp[];
+};
+
 /** Mount the mode over a daemon holding exactly these declarations. */
-function open(overrides: Partial<DaemonState> = {}): DaemonState {
-  const state = daemonState(overrides);
+function open(overrides: Partial<ModeGithubState> = {}): ModeGithubState {
+  const state = Object.assign(daemonState(overrides), {
+    gitOps: overrides.gitOps ?? [],
+    declarableGitOps: overrides.declarableGitOps ?? GIT_CATALOGUE,
+  });
+  const fetch = daemonFetch(state);
   daemon.apiFetch.mockReset();
-  daemon.apiFetch.mockImplementation(daemonFetch(state));
+  daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+    if (path === "/vcs/declarable-ops") return state.declarableGitOps;
+
+    if (/^\/projects\/[^/]+\/git-ops$/.test(path)) {
+      const method = init?.method ?? "GET";
+      if (method === "GET") {
+        if (state.policyReadRefusal !== null) {
+          const { status, code, detail } = state.policyReadRefusal;
+          throw new ApiRefusal(status, code, detail);
+        }
+        return [...state.gitOps].sort();
+      }
+
+      const body =
+        typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null;
+      state.policyWrites.push({ path, method, body });
+      if (state.policyRefusal !== null) {
+        const { status, code, detail } = state.policyRefusal;
+        throw new ApiRefusal(status, code, detail);
+      }
+
+      const kind = String(body?.op_kind ?? "");
+      state.gitOps =
+        method === "DELETE"
+          ? state.gitOps.filter((operation) => operation !== kind)
+          : [...state.gitOps.filter((operation) => operation !== kind), kind];
+      return undefined;
+    }
+
+    return fetch(path, init);
+  });
   renderWithQuery(<ModeGithub projectId="nucleos" />);
   return state;
 }
@@ -168,6 +225,62 @@ describe("what runs on its own", () => {
   });
 });
 
+describe("what the queue may do on its own", () => {
+  it("renders one checkbox for each of the six git operation kinds", async () => {
+    open();
+
+    const section = await screen.findByRole("region", { name: "What the queue may do on its own" });
+    const boxes = await within(section).findAllByRole("checkbox");
+
+    expect(boxes).toHaveLength(6);
+    expect(
+      GIT_CATALOGUE.map((operation) =>
+        within(section).getByRole("listitem", { name: `git operation ${operation.kind}` }),
+      ),
+    ).toHaveLength(6);
+  });
+
+  it("ticks with POST and unticks with DELETE", async () => {
+    const state = open({ gitOps: ["merge"] });
+    const section = await screen.findByRole("region", { name: "What the queue may do on its own" });
+    const push = await within(section).findByRole("listitem", { name: "git operation push" });
+
+    fireEvent.click(within(push).getByRole("checkbox"));
+    await waitFor(() => expect(state.gitOps).toEqual(["merge", "push"]));
+
+    fireEvent.click(
+      within(within(section).getByRole("listitem", { name: "git operation merge" })).getByRole(
+        "checkbox",
+      ),
+    );
+    await waitFor(() => expect(state.gitOps).toEqual(["push"]));
+
+    expect(state.policyWrites).toEqual([
+      {
+        path: "/projects/nucleos/git-ops",
+        method: "POST",
+        body: { op_kind: "push" },
+      },
+      {
+        path: "/projects/nucleos/git-ops",
+        method: "DELETE",
+        body: { op_kind: "merge" },
+      },
+    ]);
+  });
+
+  it("renders a declared kind absent from the catalogue as stranded and withdrawable", async () => {
+    open({ gitOps: ["cherry-pick"] });
+
+    const section = await screen.findByRole("region", { name: "What the queue may do on its own" });
+    const row = await within(section).findByRole("listitem", { name: "git operation cherry-pick" });
+
+    expect(row.textContent).toContain("cherry-pick");
+    expect(within(row).queryByRole("checkbox")).toBeNull();
+    expect(within(row).getByRole("button", { name: "withdraw" })).toBeDefined();
+  });
+});
+
 describe("what the worktrees may run", () => {
   /**
    * §5.3 asks for the precedence *on the page* and not only in the code, and the reason is that the
@@ -251,6 +364,9 @@ describe("what the worktrees may run", () => {
     await waitFor(() => expect(state.policyWrites).toHaveLength(1));
     expect(state.policyWrites[0].body).toEqual({
       prefix: "npm ci",
+      // Carried back as it came. A flip of a COMMAND rule must not quietly become a write rule,
+      // nor the other way round: the tool is half the identity of the row being rewritten.
+      tool: null,
       verdict: "deny",
       // Resent, not omitted and not emptied.
       note: "the gate installs before it runs",
@@ -273,7 +389,12 @@ describe("what the worktrees may run", () => {
     fireEvent.click(within(row).getByRole("button", { name: "refuse it instead" }));
 
     await waitFor(() => expect(state.policyWrites).toHaveLength(1));
-    expect(state.policyWrites[0].body).toEqual({ prefix: "npm ci", verdict: "deny", note: null });
+    expect(state.policyWrites[0].body).toEqual({
+      prefix: "npm ci",
+      tool: null,
+      verdict: "deny",
+      note: null,
+    });
   });
 
   /** The same trap at the form, where somebody re-declaring a prefix is about to walk into it. */
@@ -340,6 +461,155 @@ describe("what the worktrees may run", () => {
     expect(note.textContent).toContain("narrowing");
   });
 
+  /**
+   * **Two rules may share a prefix, and they are two rows.**
+   *
+   * The núcleo's unique index is `(project_id, tool, prefix)`: `deny migrations` is a command
+   * nobody may run here and `deny Edit migrations` is a directory nothing may write into, and a
+   * project may hold both. Drawn on the prefix alone they are one name given to two rows — React
+   * resolves the duplicate key by drawing one of them, and a screen reader is handed "rule
+   * migrations" twice with nothing to choose by.
+   *
+   * **The second rule is DECLARED here rather than seeded, and that is the point of the test.** A
+   * seeded pair only proves the page can render two rows it was handed. Writing one through the
+   * form puts the fake daemon's identity rule under test as well, and a fake that identified a rule
+   * by its folded prefix alone silently overwrote the other one — which would leave every
+   * assertion in this section resting on a list the daemon would never have served.
+   */
+  it("draws a rule about a tool and a rule about a command of that name as two rows", async () => {
+    const state = open({
+      shellRules: [
+        shellRule({ prefix: "migrations", verdict: "deny", note: "not from a worktree" }),
+      ],
+    });
+
+    fireEvent.change(await screen.findByLabelText("What this rule is about"), {
+      target: { value: "Edit" },
+    });
+    fireEvent.change(screen.getByLabelText("Path prefix"), { target: { value: "migrations" } });
+    fireEvent.change(screen.getByLabelText("Why it is here"), {
+      target: { value: "nothing writes a migration by hand" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "refuse it here" }));
+
+    await waitFor(() => expect(state.shellRules).toHaveLength(2));
+
+    // Two rows, each naming the whole claim it makes. The write rule is not a rule "about
+    // migrations" — it is a rule about `Edit` writing to `migrations`.
+    const write = await screen.findByRole("listitem", { name: "rule Edit writing to migrations" });
+    const command = screen.getByRole("listitem", { name: "rule migrations" });
+    expect(write).not.toBe(command);
+
+    // And the tool is on the row, which is the whole of the visual grammar: a prefix standing
+    // alone is a command, a prefix with a tool in front of it is a path.
+    expect(write.textContent).toContain("Edit");
+    expect(write.textContent).toContain("may not write to");
+    expect(command.textContent).not.toContain("may not write to");
+  });
+
+  /**
+   * **The flip is not offered on a rule about a tool**, because its opposite is the one verdict the
+   * route refuses. `post_project_shell_rule` answers `unenforceable_allow` to an `allow` beside a
+   * tool — the write chain in `classifier::classify` has no allow side to reach — so a control here
+   * would be a request the page knows will fail, and a refusal on screen that says nothing about
+   * anything the owner did.
+   *
+   * Asserted as ABSENT and not as disabled, for §5.2's reason three sections up: a disabled control
+   * still says "this is a switch, and it is off". The truth is that a write rule has one verdict.
+   */
+  it("does not offer to flip a rule about a tool, the way it does for a command", async () => {
+    open({
+      shellRules: [
+        shellRule({ prefix: "migrations", tool: "Edit", verdict: "deny" }),
+        shellRule({ prefix: "git push", verdict: "deny" }),
+      ],
+    });
+
+    const write = await screen.findByRole("listitem", { name: "rule Edit writing to migrations" });
+    expect(within(write).queryByRole("button", { name: /instead/ })).toBeNull();
+    // Withdrawing it is still offered: a refusal a project can never remove is a different problem.
+    expect(within(write).getByRole("button", { name: "forget" })).toBeDefined();
+
+    // And the command rule beside it keeps the gesture, so this is about the KIND of rule and not
+    // about the section having lost its controls.
+    const command = screen.getByRole("listitem", { name: "rule git push" });
+    expect(within(command).getByRole("button", { name: "allow it instead" })).toBeDefined();
+  });
+
+  /**
+   * Choosing a tool makes `allow` unreachable in the form, and not merely refused on submit.
+   *
+   * A rule about a tool can only deny. Leaving the button and letting the 422 explain would be
+   * teaching the rule by refusal, one owner at a time; taking the control away and saying why is
+   * the same fact stated before anybody spends a request on it.
+   */
+  it("takes the allow away when the rule is about a tool, and says why", async () => {
+    open();
+
+    const kind = await screen.findByLabelText("What this rule is about");
+    expect(screen.getByRole("button", { name: "allow it here" })).toBeDefined();
+
+    fireEvent.change(kind, { target: { value: "Edit" } });
+
+    expect(screen.queryByRole("button", { name: "allow it here" })).toBeNull();
+    expect(screen.getByRole("button", { name: "refuse it here" })).toBeDefined();
+    // The reason stands in its place, which is what stops this reading as a missing feature.
+    expect(screen.getByText(/can only refuse/i)).toBeDefined();
+
+    // Back to a command, and the widening half returns — the control is about the kind of rule
+    // being written and not a switch somebody turned off for the session.
+    fireEvent.change(kind, { target: { value: "" } });
+    expect(screen.getByRole("button", { name: "allow it here" })).toBeDefined();
+  });
+
+  /**
+   * The preview shows what will be STORED, and for a path that means keeping its case.
+   *
+   * `fold_path_prefix` trims, writes `\` as `/` and drops a trailing `/` — and deliberately does
+   * not lower-case, because a path's case is the filesystem's business and the núcleo asks it at
+   * comparison time. A preview that reused the command fold would show an owner a lower-cased path
+   * that is not the one being stored, which is exactly the surprise this preview exists to prevent.
+   */
+  it("previews a path in the spelling it will be stored under, case and all", async () => {
+    open();
+
+    fireEvent.change(await screen.findByLabelText("What this rule is about"), {
+      target: { value: "Write" },
+    });
+    fireEvent.change(screen.getByLabelText("Path prefix"), {
+      target: { value: "  Core\\Migrations/ " },
+    });
+
+    expect(screen.getByText(/stored and enforced as/i).textContent).toContain("Core/Migrations");
+  });
+
+  /**
+   * **A refusal this form can no longer provoke still reaches the screen in the daemon's words.**
+   *
+   * `unenforceable_allow` is the one the tool choice above exists to make unreachable — but the
+   * route is the authority and not this page, and a rule declared from anywhere else, or a control
+   * somebody adds later, can still earn it. `RefusalNote` prefers a NAMED sentence over the
+   * daemon's detail, so page copy for this code would not add to it: it would hide the half that
+   * says what would work instead. This is the test that stops somebody writing one.
+   */
+  it("keeps the núcleo's own sentence about an allow that names a tool", async () => {
+    const detail =
+      "a rule about a tool can only REFUSE. `Edit` allowed to write to `.ai` would be stored and " +
+      "decide nothing: the write chain in `classifier::classify` ends at `read-local`, so there " +
+      "is no allow side for it to reach. Declared as a `deny` the same path WOULD be enforced.";
+    open({ policyRefusal: { status: 422, code: "unenforceable_allow", detail } });
+
+    fireEvent.change(await screen.findByLabelText("What this rule is about"), {
+      target: { value: "Edit" },
+    });
+    fireEvent.change(screen.getByLabelText("Path prefix"), { target: { value: ".ai" } });
+    fireEvent.click(screen.getByRole("button", { name: "refuse it here" }));
+
+    expect(await screen.findByText(detail)).toBeDefined();
+    // The name travels with it: it is the string that survives a rewording of the sentence.
+    expect(screen.getByText("unenforceable_allow")).toBeDefined();
+  });
+
   it("groups the rows by verdict rather than expecting two lists", async () => {
     open({
       shellRules: [
@@ -355,6 +625,89 @@ describe("what the worktrees may run", () => {
     // get right and the only thing that could silently be got wrong.
     expect(allowed.closest("div")?.textContent).toContain("Allowed");
     expect(refused.closest("div")?.textContent).toContain("Refused");
+  });
+
+  /**
+   * **A served `allow` beside a tool is drawn as the dead letter it is, not as a permission.**
+   *
+   * The route refuses one at the door with `unenforceable_allow`, so this row cannot be WRITTEN
+   * from the page — and it can still be READ from it. `project_policy::declared_shell_rules` serves
+   * the table whole on purpose, and a row older than that guard, or written out of band, or landed
+   * by a migration, comes back with the rest. The deciding read drops it with a `tracing::warn!`
+   * nobody standing at a screen will ever see.
+   *
+   * Which is exactly why the screen has to say it. Drawn with the fixed "may not write to" phrase,
+   * this row sat in the **Allowed** panel wearing a refusal's words: a rule that decides nothing,
+   * shown as one in force, in the list of permissions. Seeded and not declared, because declaring
+   * it is the thing the núcleo correctly makes impossible — the fixture is the table's row, which
+   * is what this page is given.
+   */
+  it("says nothing enforces a served allow that names a tool, and keeps it withdrawable", async () => {
+    open({
+      shellRules: [
+        shellRule({ prefix: "migrations", tool: "Edit", verdict: "allow", note: null }),
+        shellRule({ prefix: "npm ci", verdict: "allow" }),
+      ],
+    });
+
+    const stranded = await screen.findByRole("listitem", {
+      name: "rule Edit writing to migrations",
+    });
+
+    // The refusal's words are gone, and the row says what is true of it instead.
+    expect(stranded.textContent).not.toContain("may not write to");
+    expect(stranded.textContent).toContain("nothing enforces this");
+    expect(stranded.textContent).toMatch(/can only refuse/);
+
+    // And it is the owner's to remove — a row that decides nothing and cannot be withdrawn is the
+    // same problem one move further on, and filtering it out of the list would be that too.
+    expect(within(stranded).getByRole("button", { name: "forget" })).toBeDefined();
+
+    // The ordinary permission beside it is untouched: this is about the KIND of row, and not about
+    // the Allowed panel having learned to disclaim everything in it.
+    const real = screen.getByRole("listitem", { name: "rule npm ci" });
+    expect(real.textContent).not.toContain("nothing enforces this");
+  });
+
+  /**
+   * **The caption over a list promises only what every row under it keeps.**
+   *
+   * "Never runs here, and never written to — whatever the compiled lists would have said" sat over
+   * a list holding both kinds of rule, and the second half is not a property of the list. A write
+   * rule is gated on `classifier::WRITE_TOOLS`, the file-writing tools and nothing else, so it
+   * does not stop a `Bash` line redirecting into the same directory. An owner reading
+   * `deny rm -rf` under "and never written to" came away believing the path was closed to writes,
+   * which nothing on this page had said.
+   *
+   * `NotebookEdit` stood here as the example of a writing tool the list did not hold, until it
+   * joined the list on 2026-09-08. The example went and the assertions did not move, which is
+   * the evidence that this test was written about the caption and not about the roster.
+   *
+   * So the guarantee moved onto the row, where the tool is, and the caption keeps what survives
+   * across the list. The wording is pinned because it is the whole of the fix: a caption is the one
+   * thing on this page that is read as a promise over rows nobody scrolled to.
+   */
+  it("does not promise over the whole refused list what only a tool row can give", async () => {
+    open({
+      shellRules: [
+        shellRule({ prefix: "rm -rf", verdict: "deny" }),
+        shellRule({ prefix: "migrations", tool: "Edit", verdict: "deny" }),
+      ],
+    });
+
+    const command = await screen.findByRole("listitem", { name: "rule rm -rf" });
+    const panel = command.closest("div")?.textContent ?? "";
+
+    expect(panel).toContain("Refused");
+    // The over-claim, gone: the list no longer says it about the command prefix beside it.
+    expect(panel).not.toContain("and never written to");
+    // What is left is true of both rows, and it says which half belongs to which.
+    expect(panel).toMatch(/A prefix standing alone never runs/);
+    expect(panel).toMatch(/never written to by that tool/);
+
+    // And the write half is still stated where it is true — on the row that carries the tool.
+    const write = screen.getByRole("listitem", { name: "rule Edit writing to migrations" });
+    expect(write.textContent).toContain("may not write to");
   });
 });
 
@@ -796,7 +1149,7 @@ describe("the page as a whole", () => {
     expect(said).toContain("nucleos");
   });
 
-  it("draws the four sections in the order the design fixes", async () => {
+  it("draws the five sections in the order the designs fix", async () => {
     open();
 
     await screen.findByRole("region", { name: "The remote" });
@@ -804,6 +1157,7 @@ describe("the page as a whole", () => {
       [
         "The remote",
         "What runs on its own",
+        "What the queue may do on its own",
         "What the worktrees may run",
         "Where the work lands",
       ],

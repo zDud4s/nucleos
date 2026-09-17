@@ -10,32 +10,39 @@ import {
 } from "../data/project-github";
 import {
   declaredRule,
+  foldPathPrefix,
   foldPrefix,
+  useDeclarableGitOps,
   useDeclarableGithubOps,
+  useDeclareGitOp,
   useDeclareGithubOp,
   useDeclareLandTarget,
   useDeclareShellRule,
+  useForgetGitOp,
   useForgetGithubOp,
   useForgetLandTarget,
   useForgetShellRule,
+  useProjectGitOps,
   useProjectGithubOps,
   useProjectLandTargets,
   useProjectShellRules,
+  type DeclarableGitOp,
   type DeclarableOp,
   type Note,
   type ShellRule,
   type Verdict,
 } from "../data/project-policy";
-import { Button, Quiet, RefusalNote, Section } from "../ui";
+import { Button, Inset, Quiet, RefusalNote, Section, Well } from "../ui";
 
 /**
  * "What may this project do without asking?"
  *
  * The fifth mode, and it earns the tab by the rule the other four are held to: it has a subject of
- * its own — this project's authority, which is three tables and not a setting — and a shape of its
- * own, four sections read top to bottom rather than a grid of panels. §5 of the design fixes the
- * order and the reason for it: the remote first, because that is what somebody arrives to look at,
- * and the government under it.
+ * its own — this project's authority, which is four tables and not a setting — and a shape of its
+ * own, five sections read top to bottom rather than a grid of panels. §5 of
+ * `.ai/specs/2026-09-03-alcada-por-projecto-design.md` and §7 of
+ * `.ai/specs/2026-09-06-git-ops-declaraveis-design.md` fix the order and the reason for it: the
+ * remote first, because that is what somebody arrives to look at, and the government under it.
  *
  * **Everything below the first section is a live autonomy control and not a configuration edit.**
  * `hooks.rs` reads the shell table per tool call, with no cache and no restart, so a rule declared
@@ -67,6 +74,10 @@ export function ModeGithub({ projectId }: ModeGithubProps) {
 
       <Section label="What runs on its own">
         <AutonomousOps projectId={projectId} />
+      </Section>
+
+      <Section label="What the queue may do on its own">
+        <GitOps projectId={projectId} />
       </Section>
 
       <Section label="What the worktrees may run">
@@ -250,10 +261,10 @@ const MAPPING_SENTENCES: Record<string, string> = {
  */
 function Listing({ title, read }: { title: string; read: UseQueryResult<ReadOutcome> }) {
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+    <Inset>
       <p className="text-xs uppercase tracking-wide text-text-faint">{title}</p>
       <ListingBody read={read} />
-    </div>
+    </Inset>
   );
 }
 
@@ -288,9 +299,16 @@ function ListingBody({ read }: { read: UseQueryResult<ReadOutcome> }) {
         {said === "" ? (
           <p className="text-xs text-text-faint">And it printed nothing at all while failing.</p>
         ) : (
-          <pre className="overflow-x-auto whitespace-pre font-mono text-xs text-text-muted">
+          /*
+            A `Well` and not a bare `pre`: this is a raw payload, and the recess is what says the
+            text was not written here. `capped` because a failing `gh` can print any amount, and a
+            panel whose height is set by the longest thing it has ever printed is one nobody can
+            scan past — the cap scrolls instead, in both directions, which is what keeps the
+            terminal's own column alignment intact.
+          */
+          <Well as="pre" capped>
             {said}
-          </pre>
+          </Well>
         )}
       </div>
     );
@@ -306,8 +324,16 @@ function ListingBody({ read }: { read: UseQueryResult<ReadOutcome> }) {
     );
   }
 
+  /*
+    The listing itself, in the same recess. It is a terminal table — columns aligned with spaces —
+    and any element that reflowed it would turn `gh`'s own formatting into noise, which is why it
+    stays a `pre`; `Well` keeps the mono face that claims the machine produced it and scrolls the
+    overflow rather than growing the panel.
+  */
   return (
-    <pre className="overflow-x-auto whitespace-pre font-mono text-xs text-text">{listed}</pre>
+    <Well as="pre" capped>
+      {listed}
+    </Well>
   );
 }
 
@@ -480,7 +506,7 @@ function AutonomousOps({ projectId }: { projectId: string }) {
           doc says withdrawing narrows and an operation stored before the ceilings moved still has to
           be removable.
         */
-        <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+        <Inset>
           <p className="text-xs uppercase tracking-wide text-text-faint">No longer built</p>
           <p className="max-w-3xl text-xs text-text-muted">
             This project's table names operations this daemon does not build. They decide nothing —
@@ -505,7 +531,7 @@ function AutonomousOps({ projectId }: { projectId: string }) {
               </li>
             ))}
           </ul>
-        </div>
+        </Inset>
       )}
 
       {refused !== null ? (
@@ -544,11 +570,11 @@ function OpHalf({
   onToggle: (kind: string, on: boolean) => void;
 }) {
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+    <Inset>
       <p className="text-xs uppercase tracking-wide text-text-faint">{title}</p>
       <p className="max-w-3xl text-xs text-text-muted">{says}</p>
       {ops.length === 0 ? (
-        <p className="text-xs text-text-faint">This daemon builds none of this half.</p>
+        <Quiet says="This daemon builds none of this half." />
       ) : (
         <ul className="flex flex-col gap-1">
           {ops.map((op) => (
@@ -603,7 +629,7 @@ function OpHalf({
           ))}
         </ul>
       )}
-    </div>
+    </Inset>
   );
 }
 
@@ -619,7 +645,190 @@ const OUTSIDE_THE_CEILING = "outside the compiled ceiling — nothing on this ma
 const OUTSIDE_AND_DECLARED =
   "declared here, and outside the compiled ceiling — it does not run, and the row is still yours to withdraw";
 
-/* -------------------------------------- 3. what the worktrees may run -- */
+/* -------------------------------- 3. what the queue may do on its own -- */
+
+/**
+ * The git operations an autonomous run may hand to the shared queue as already consented.
+ *
+ * **One list and no GitHub halves.** Every row is a write the queue performs in the same way; a
+ * `half` would suggest the live-read versus inert-action distinction that belongs only to GitHub.
+ * The project list is still served raw, so a declaration this build no longer constructs is drawn
+ * below the catalogue and remains withdrawable instead of disappearing from its owner's view.
+ *
+ * **The paragraph is part of the control.** A tick changes who the queue waits for, not who runs the
+ * command, and only after both parsing and shell-rule precedence have admitted that path. The
+ * spellings and rebase caveat are written beside the boxes because they are the cases most likely
+ * to make a truthful grant look broken when an autonomous run meets one.
+ */
+function GitOps({ projectId }: { projectId: string }) {
+  const catalogue = useDeclarableGitOps();
+  const mine = useProjectGitOps(projectId);
+  const declare = useDeclareGitOp();
+  const forget = useForgetGitOp();
+
+  const refused =
+    (declare.isError && isApiRefusal(declare.error) ? declare.error : null) ??
+    (forget.isError && isApiRefusal(forget.error) ? forget.error : null);
+
+  if (catalogue.isPending || mine.isPending) {
+    return <p className="text-sm text-text-faint">Reading what the queue may do…</p>;
+  }
+
+  if (catalogue.data === undefined || mine.data === undefined) {
+    return (
+      <ReadFailed
+        read={catalogue.data === undefined ? catalogue : mine}
+        says="what this project's queue may do on its own"
+      />
+    );
+  }
+
+  const declared = new Set(mine.data);
+  const pending = declare.isPending || forget.isPending;
+  const built = new Set(catalogue.data.map((operation) => operation.kind));
+  const stranded = mine.data.filter((kind) => !built.has(kind)).sort();
+
+  function toggle(kind: string, on: boolean) {
+    if (on) declare.mutate({ projectId, opKind: kind });
+    else forget.mutate({ projectId, opKind: kind });
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+        <p className="max-w-3xl text-xs text-text-muted">
+          Ticking a box never lets the agent run the command. For autonomous runs only, the shared
+          queue executes the declared operation while the agent's tool call still comes back denied
+          with a ticket id; a person never waited for approval, so these grants do not change
+          person-run commands. A matching shell rule <span className="font-mono">deny</span> wins and
+          makes the tick do nothing. A grant covers only spellings the queue can build: bare{" "}
+          <span className="font-mono">git push</span>, <span className="font-mono">-u</span>,{" "}
+          <span className="font-mono">--force</span>, and{" "}
+          <span className="font-mono">git branch -D</span> still stop and ask. A{" "}
+          <span className="font-mono">rebase</span> requested by a run comes back as a blocked ticket
+          because that run holds the branch, and the ticket says which worktree holds it.
+        </p>
+
+        <GitOpList
+          ops={catalogue.data}
+          declared={declared}
+          pending={pending}
+          onToggle={toggle}
+        />
+      </div>
+
+      {stranded.length === 0 ? null : (
+        <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+          <p className="text-xs uppercase tracking-wide text-text-faint">No longer built</p>
+          <p className="max-w-3xl text-xs text-text-muted">
+            This project's table names git operations this daemon does not build. They grant
+            nothing, and the rows remain here so they can be withdrawn.
+          </p>
+          <ul className="flex flex-col gap-1">
+            {stranded.map((kind) => (
+              <li
+                key={kind}
+                aria-label={`git operation ${kind}`}
+                className="flex flex-wrap items-baseline gap-2 text-sm"
+              >
+                <span className="rounded-pill border border-border bg-surface-sunken px-2 py-0.5 font-mono text-xs text-text-muted">
+                  {kind}
+                </span>
+                <button
+                  type="button"
+                  disabled={pending}
+                  onClick={() => toggle(kind, false)}
+                  className="ml-auto text-xs text-text-faint underline-offset-2 hover:underline disabled:opacity-40"
+                >
+                  withdraw
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {refused === null ? null : <RefusalNote refusal={refused} sentences={GIT_OP_SENTENCES} />}
+    </div>
+  );
+}
+
+/**
+ * Draw the machine's single git-operation catalogue without inventing GitHub-style halves.
+ *
+ * `declarable: false` is still handled even though this build's six rows are all true: the route's
+ * shape makes the ceiling explicit, and a future build may narrow it. Such a row is a fact rather
+ * than a disabled control, while a declaration already stored for it keeps the one legal gesture
+ * that narrows authority again.
+ */
+function GitOpList({
+  ops,
+  declared,
+  pending,
+  onToggle,
+}: {
+  ops: DeclarableGitOp[];
+  declared: Set<string>;
+  pending: boolean;
+  onToggle: (kind: string, on: boolean) => void;
+}) {
+  if (ops.length === 0) {
+    return <p className="text-xs text-text-faint">This daemon builds no queue operations.</p>;
+  }
+
+  return (
+    <ul className="flex flex-col gap-1">
+      {ops.map((operation) => (
+        <li
+          key={operation.kind}
+          aria-label={`git operation ${operation.kind}`}
+          className="flex flex-wrap items-baseline gap-2 text-sm"
+        >
+          {operation.declarable ? (
+            <label className="flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={declared.has(operation.kind)}
+                disabled={pending}
+                onChange={(event) => onToggle(operation.kind, event.target.checked)}
+              />
+              <span className="font-mono text-xs text-text">{operation.kind}</span>
+            </label>
+          ) : (
+            <>
+              <span className="rounded-pill border border-border bg-surface-sunken px-2 py-0.5 font-mono text-xs text-text-muted">
+                {operation.kind}
+              </span>
+              <span className="text-xs text-text-faint">
+                {declared.has(operation.kind) ? OUTSIDE_AND_DECLARED : OUTSIDE_THE_CEILING}
+              </span>
+              {declared.has(operation.kind) ? (
+                <button
+                  type="button"
+                  disabled={pending}
+                  onClick={() => onToggle(operation.kind, false)}
+                  className="ml-auto text-xs text-text-faint underline-offset-2 hover:underline disabled:opacity-40"
+                >
+                  withdraw
+                </button>
+              ) : null}
+            </>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+const GIT_OP_SENTENCES: Record<string, string> = {
+  kill_switch:
+    "the emergency stop is engaged, and granting a queue operation widens what autonomous runs may do. Withdrawing one is never blocked by it.",
+  no_such_project: "the núcleo has no project by this name.",
+  no_such_op: "this project had not declared that git operation.",
+  internal: "the núcleo hit an error of its own writing it down.",
+};
+
+/* -------------------------------------- 4. what the worktrees may run -- */
 
 /**
  * The two lists, `allow` and `deny`, with the rule that orders them written on the page.
@@ -662,12 +871,18 @@ function ShellRules({ projectId }: { projectId: string }) {
    * that fell back to the stored one could never be removed. So the note has to be resent, and it is
    * read off the row already on screen. A rule that carried none is `{ erase: true }`, which is the
    * honest way to say there was nothing to keep, and never an empty `write`.
+   *
+   * **Never reached from a write rule, and `RuleList` is where that is enforced rather than here.**
+   * The opposite verdict of a `deny Edit …` is an `allow` the route answers 422 to — a page that
+   * offered the gesture would be making a request it already knows the answer to, and putting a
+   * refusal on screen that says nothing about anything the owner did wrong.
    */
   function flip(rule: ShellRule) {
     const note: Note = rule.note === null ? { erase: true } : { write: rule.note };
     declare.mutate({
       projectId,
       prefix: rule.prefix,
+      tool: rule.tool,
       verdict: rule.verdict === "allow" ? "deny" : "allow",
       note,
     });
@@ -691,21 +906,41 @@ function ShellRules({ projectId }: { projectId: string }) {
         lists. A project with no rules at all classifies exactly as it did before there were any.
       </p>
 
+      {/*
+        **Both captions say only what is true of EVERY row beneath them**, which is a smaller claim
+        than either used to make, and the shrinking is the point.
+
+        One list holds two kinds of rule now, and a caption is read as a guarantee over all of it.
+        "Never runs here, and never written to" sat over a list of command prefixes and promised
+        the second half about them — but a write rule is gated on `classifier::WRITE_TOOLS`, and
+        that list holds the file-writing tools and nothing else: it does not stop a `Bash` or
+        `PowerShell` line redirecting into the same directory. An owner who read the old sentence
+        over `deny rm -rf` came away believing the directory was closed to writes, which no rule
+        on this page says.
+
+        `NotebookEdit` was named here as the example of a writing tool the list did not hold. It
+        holds it since 2026-09-08, so the example is gone and the caption is unchanged — which
+        is the test that the sentence was written about the right thing. A caption that had to
+        be edited because one tool moved was a caption making a claim about the roster.
+
+        So the guarantee is a property of the ROW — the tool is on it, and the sentence beside it
+        names what that tool may not do — and the caption is what remains true across the list.
+      */}
       <RuleList
         title="Allowed"
-        says="Runs without stopping to ask, in this project's worktrees."
+        says="A command prefix here runs without stopping to ask, in this project's worktrees."
         rows={allow}
         pending={pending}
         onFlip={flip}
-        onForget={(prefix) => forget.mutate({ projectId, prefix })}
+        onForget={(rule) => forget.mutate({ projectId, prefix: rule.prefix, tool: rule.tool })}
       />
       <RuleList
         title="Refused"
-        says="Never runs here, whatever the compiled lists would have said."
+        says="Refused here, whatever the compiled lists would have said. A prefix standing alone never runs; a prefix behind a tool is never written to by that tool — a command redirecting into the same path is the command list's business."
         rows={deny}
         pending={pending}
         onFlip={flip}
-        onForget={(prefix) => forget.mutate({ projectId, prefix })}
+        onForget={(rule) => forget.mutate({ projectId, prefix: rule.prefix, tool: rule.tool })}
       />
 
       {/*
@@ -719,10 +954,14 @@ function ShellRules({ projectId }: { projectId: string }) {
 
       {refused !== null ? (
         /*
-          No page copy for `unmatchable_prefix`. Its detail names the prefix, says why an `allow` of
-          that shape would be stored and never fire, and tells the owner that the same prefix
-          declared as a `deny` WOULD be enforced — which is the next thing they want to do, in the
-          núcleo's own words.
+          No page copy for `unmatchable_prefix`, `unenforceable_allow` or `unknown_tool`, and the
+          omission is the decision. `RefusalNote` prefers a named sentence OVER the daemon's detail,
+          so an entry in the table below does not add to those three — it HIDES them. Each of the
+          three details names the offending value and then says what would work instead: the prefix
+          that could never fire and the `deny` that would be enforced; the tool that cannot be
+          allowed and the refusal that can; the tool nobody governs and the two that exist. No
+          sentence this page could write would be better, so it writes none, and this comment is
+          what stops somebody adding one later.
         */
         <RefusalNote refusal={refused} sentences={RULE_SENTENCES} />
       ) : null}
@@ -744,6 +983,22 @@ const RULE_SENTENCES: Record<string, string> = {
   internal: "the núcleo hit an error of its own writing the rule.",
 };
 
+/**
+ * PURE: how one row names itself, to a screen reader and to a test.
+ *
+ * **A prefix stopped being a name the moment two rules could share one.** `deny migrations` and
+ * `deny Edit migrations` are two rules a project may hold at once, and both drawn as "rule
+ * migrations" is one name given to two rows — a label somebody navigating by voice cannot use to
+ * pick between them, and a query that finds whichever came first.
+ *
+ * So a write rule says the whole claim and not the prefix: it is not a rule *about* `migrations`,
+ * it is a rule about `Edit` writing to `migrations`. A command rule keeps the name it has always
+ * had, because it is still the only rule of its kind that can carry that prefix.
+ */
+function ruleLabel(rule: ShellRule): string {
+  return rule.tool === null ? `rule ${rule.prefix}` : `rule ${rule.tool} writing to ${rule.prefix}`;
+}
+
 function RuleList({
   title,
   says,
@@ -757,27 +1012,81 @@ function RuleList({
   rows: ShellRule[];
   pending: boolean;
   onFlip: (rule: ShellRule) => void;
-  onForget: (prefix: string) => void;
+  /** The whole rule and not its prefix: the DELETE needs the tool to name the row — see {@link useForgetShellRule}. */
+  onForget: (rule: ShellRule) => void;
 }) {
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+    <Inset>
       <p className="text-xs uppercase tracking-wide text-text-faint">{title}</p>
       <p className="text-xs text-text-muted">{says}</p>
       {rows.length === 0 ? (
-        <p className="text-xs text-text-faint">None declared.</p>
+        <Quiet says="None declared." />
       ) : (
         <ul className="flex flex-col gap-1">
           {rows.map((rule) => (
             <li
-              key={rule.prefix}
-              aria-label={`rule ${rule.prefix}`}
+              /*
+                The tool and the prefix, because that pair is the rule's identity in the núcleo's
+                own unique index. Keyed on the prefix alone, a project holding both kinds of rule
+                for one name hands React two children with one key — which it resolves by drawing
+                one of them. The separator is a NUL because no prefix and no tool can contain one,
+                so no pair of rules can collide by spelling their way across it.
+              */
+              key={`${rule.tool ?? ""}\u0000${rule.prefix}`}
+              aria-label={ruleLabel(rule)}
               className="flex flex-wrap items-baseline gap-2 text-sm"
             >
               {/*
+                A write rule wears its tool and a command rule does not, and that IS the visual
+                grammar — a prefix standing alone is a command, a prefix with a tool in front of it
+                is a path. It needs no legend because the row reads as the sentence it means.
+
+                **Three cases and not two, and the third is the one this page must not get wrong.**
+                This used to say the sentence "can only be 'may not write to': the route refuses an
+                `allow` beside a tool, so there is no other verb a row here can have" — true of the
+                ROUTE and false of the TABLE, and this list is served from the table. A tool-carrying
+                `allow` can be in it: `post_project_shell_rule` refuses one at the door, but a row
+                written before that guard existed, by an out-of-band write, or by a migration, is
+                still a row — and `project_policy::declared_shell_rules` serves the table whole on
+                purpose, leaving the deciding read (`shell_rules`) to drop it with a `tracing::warn!`
+                nobody standing here will ever see.
+
+                Drawn with the fixed phrase, such a row landed in the **Allowed** panel wearing a
+                refusal's words: a permission nothing enforces, dressed as a rule in force. It is not
+                filtered out either — hiding it would leave the owner unable to find the row they
+                would have to withdraw. So it gets the one sentence that is true of it, the negation
+                FIRST so a fast read cannot take the affirmative half alone, and the `forget` button
+                beside every other row is the way out of it.
+              */}
+              {rule.tool === null ? null : rule.verdict === "deny" ? (
+                <span className="text-xs text-text-muted">
+                  <span className="font-mono text-text">{rule.tool}</span> may not write to
+                </span>
+              ) : (
+                <span className="text-xs text-text-muted">
+                  nothing enforces this —{" "}
+                  <span className="font-mono text-text">{rule.tool}</span> allowed to write to
+                </span>
+              )}
+              {/*
                 The FOLDED spelling, which is what is stored and what is enforced. Echoing what
-                somebody typed would be showing them a rule the classifier has never heard of.
+                somebody typed would be showing them a rule the classifier has never heard of. A
+                path keeps its case here and a command does not, which is the daemon's doing and
+                not this row's — see `foldPathPrefix`.
               */}
               <span className="font-mono text-xs text-text">{rule.prefix}</span>
+              {/*
+                What to DO about it, and only on the row that needs doing something about. The
+                sentence above says the row decides nothing; without this one the owner is left
+                holding that fact and no move. Both moves are named because they are different
+                intentions — the rule was a mistake, or the rule was meant and was written with the
+                wrong verdict — and this page cannot know which.
+              */}
+              {rule.tool !== null && rule.verdict === "allow" ? (
+                <span className="text-xs text-text-faint">
+                  a rule about a tool can only refuse; withdraw it, or declare it as a refusal
+                </span>
+              ) : null}
               {rule.note === null ? (
                 <span className="text-xs text-text-faint">no justification</span>
               ) : (
@@ -792,19 +1101,36 @@ function RuleList({
                 */}
                 declared {declaredDay(rule.created_at)}
               </span>
-              <span className="ml-auto">
-                <Button variant="quiet" disabled={pending} onClick={() => onFlip(rule)}>
-                {rule.verdict === "allow" ? "refuse it instead" : "allow it instead"}
+              <span className="ml-auto flex items-baseline gap-2">
+                {/*
+                  **Not offered on a write rule at all**, and absent rather than disabled. The
+                  opposite verdict of a `deny Edit …` is the one `post_project_shell_rule` refuses
+                  with `unenforceable_allow`, so the control would be a request the page knows will
+                  fail. A disabled button still says "this is a switch, and it is off"; the truth is
+                  that a write rule has one verdict and there is no switch — the same reading §5.2
+                  takes about an operation outside the ceiling, three sections up.
+
+                  It stays absent on the stranded `allow Edit …` above too, where the opposite
+                  verdict WOULD be accepted, and that is deliberate rather than an oversight the
+                  new case walked into. "Allow" is not a verdict a write rule has, so a switch on
+                  such a row would draw it as one end of a pair — which is the very picture the row
+                  now spends a sentence undoing. The move is spelled out beside the prefix instead,
+                  where it can say which of the two things the owner might have meant.
+                */}
+                {rule.tool === null ? (
+                  <Button variant="quiet" disabled={pending} onClick={() => onFlip(rule)}>
+                    {rule.verdict === "allow" ? "refuse it instead" : "allow it instead"}
+                  </Button>
+                ) : null}
+                <Button variant="quiet" disabled={pending} onClick={() => onForget(rule)}>
+                  forget
                 </Button>
               </span>
-              <Button variant="quiet" disabled={pending} onClick={() => onForget(rule.prefix)}>
-                forget
-              </Button>
             </li>
           ))}
         </ul>
       )}
-    </div>
+    </Inset>
   );
 }
 
@@ -824,9 +1150,18 @@ function declaredDay(createdAt: string): string {
 /**
  * Declaring a rule, and re-declaring one that exists.
  *
- * **The identity of a rule is its FOLDED prefix**, so this form folds before it looks: asking with
- * the typed spelling is how a form offers to create a rule that already exists and then overwrites
- * it without saying so. What will be stored is previewed under the box for the same reason.
+ * **The identity of a rule is its tool and its FOLDED prefix**, so this form folds before it looks:
+ * asking with the typed spelling is how a form offers to create a rule that already exists and then
+ * overwrites it without saying so. What will be stored is previewed under the box for the same
+ * reason — and WHICH fold is previewed follows the tool, because a path keeps its case and a
+ * command does not. Previewing a lower-cased path would be the surprise this preview exists to
+ * prevent, told from the other side.
+ *
+ * **Choosing a tool takes `allow` off the form rather than letting the route refuse it.** A rule
+ * about a tool can only deny — `unenforceable_allow`, and the two silent enforcements behind it —
+ * so a form that still offered the button would be inviting somebody to a 422 it could have
+ * answered itself. The control is removed and the reason put in its place, which is what makes
+ * this a fact about write rules rather than a validation somebody trips over.
  *
  * **And the note is the trap.** A second declaration of a prefix rewrites its note from what is
  * sent, so submitting this form with the box empty ERASES the justification that was there. The form
@@ -844,9 +1179,14 @@ function DeclareRule({
 }) {
   const [prefix, setPrefix] = useState("");
   const [note, setNote] = useState("");
+  /** `null` is a rule about a command prefix, which is what this form could only declare before. */
+  const [tool, setTool] = useState<string | null>(null);
 
-  const folded = foldPrefix(prefix);
-  const existing = declaredRule(rows, prefix);
+  // The núcleo folds a path and a command by two different functions, and the difference is the
+  // case: `fold_path_prefix` deliberately does not lower-case, because whether a path's case
+  // matters is the filesystem's question and it is answered at comparison time.
+  const folded = tool === null ? foldPrefix(prefix) : foldPathPrefix(prefix);
+  const existing = declaredRule(rows, prefix, tool);
   const ready = folded !== "";
 
   function submit(verdict: Verdict) {
@@ -854,13 +1194,16 @@ function DeclareRule({
       {
         projectId,
         prefix,
+        tool,
         verdict,
         // Two operations and two members, because the route cannot be told "leave the note alone".
         note: note.trim() === "" ? { erase: true } : { write: note.trim() },
       },
       {
         // Cleared only on success, so a refused declaration leaves what was typed in front of the
-        // person who typed it — the rule `Commands` already follows.
+        // person who typed it — the rule `Commands` already follows. The TOOL is deliberately not
+        // cleared: it is the kind of rule somebody is writing, not the rule, and a project closing
+        // three directories to `Edit` should not have to say `Edit` three times.
         onSuccess: () => {
           setPrefix("");
           setNote("");
@@ -870,13 +1213,41 @@ function DeclareRule({
   }
 
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+    <Inset>
       <p className="text-xs uppercase tracking-wide text-text-faint">Declare a prefix</p>
 
       <div className="flex flex-wrap gap-2">
+        {/*
+          What KIND of rule this is, asked before the prefix because it changes what the prefix
+          means: a command to run, or a path to write into. The tools the núcleo can govern are
+          `classifier::WRITE_TOOLS`, and the route refuses anything else by name — an option
+          here that is not on that list would be a control whose only answer is `unknown_tool`.
+
+          `NotebookEdit` joined the list on 2026-09-08, so it is offered here now. That it had
+          to be added by hand is the shape of this control: the list lives in Rust, this is a
+          third copy of it after the route guard and the column CHECK, and nothing compiles the
+          three together. A tool admitted to the classifier and not added here is enforceable
+          and unsayable, which reads to an owner as the feature simply not existing.
+        */}
+        <select
+          aria-label="What this rule is about"
+          value={tool ?? ""}
+          onChange={(event) => setTool(event.target.value === "" ? null : event.target.value)}
+          className="rounded-md border border-border bg-surface-sunken px-2 py-1 text-sm text-text"
+        >
+          <option value="">a command</option>
+          <option value="Edit">Edit writing to a path</option>
+          <option value="Write">Write writing to a path</option>
+          <option value="NotebookEdit">NotebookEdit writing to a path</option>
+        </select>
         <input
-          aria-label="Command prefix"
-          placeholder="bash scripts/gates.sh"
+          /*
+            The label follows the choice, because with a tool selected this box holds a PATH and
+            "Command prefix" would be naming it after the other kind of rule — to a screen reader,
+            which has nothing else to go on, and to whoever reads the placeholder.
+          */
+          aria-label={tool === null ? "Command prefix" : "Path prefix"}
+          placeholder={tool === null ? "bash scripts/gates.sh" : "core/migrations"}
           value={prefix}
           spellCheck={false}
           onChange={(event) => setPrefix(event.target.value)}
@@ -926,14 +1297,24 @@ function DeclareRule({
       ) : null}
 
       <div className="flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          disabled={!ready || declare.isPending}
-          onClick={() => submit("allow")}
-          className="rounded-md border border-border px-3 py-1.5 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
-        >
-          allow it here
-        </button>
+        {/*
+          **Gone when a tool is chosen, and not merely disabled.** A rule about a tool can only
+          refuse: the write chain in `classifier::classify` has no allow side to reach, so the route
+          answers `unenforceable_allow` and `project_policy::shell_rules` would drop the row anyway.
+          Leaving a disabled button would say "this is a switch, and it is off" about a switch that
+          does not exist — and leaving it enabled would send a request whose refusal is the page's
+          own fault.
+        */}
+        {tool === null ? (
+          <button
+            type="button"
+            disabled={!ready || declare.isPending}
+            onClick={() => submit("allow")}
+            className="rounded-md border border-border px-3 py-1.5 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
+          >
+            allow it here
+          </button>
+        ) : null}
         <button
           type="button"
           disabled={!ready || declare.isPending}
@@ -942,17 +1323,26 @@ function DeclareRule({
         >
           refuse it here
         </button>
-        <span className="text-xs text-text-faint">
-          A refusal may take a shape an allow may not — a pipe, a redirection, an{" "}
-          <span className="font-mono">-exec</span> — because a refusal answers at the whole line and
-          needs no shape the classifier can read.
-        </span>
+        {tool === null ? (
+          <span className="text-xs text-text-faint">
+            A refusal may take a shape an allow may not — a pipe, a redirection, an{" "}
+            <span className="font-mono">-exec</span> — because a refusal answers at the whole line
+            and needs no shape the classifier can read.
+          </span>
+        ) : (
+          <span className="text-xs text-text-faint">
+            A rule about <span className="font-mono">{tool}</span> can only refuse. There is nothing
+            to allow: a write the núcleo does not refuse is already local work it does not stop for,
+            so a permission here would widen nothing and would be enforced by nothing. The path is
+            read from the project root, and everything under it is refused with it.
+          </span>
+        )}
       </div>
-    </div>
+    </Inset>
   );
 }
 
-/* -------------------------------------------- 4. where the work lands -- */
+/* -------------------------------------------- 5. where the work lands -- */
 
 /**
  * The integration branch, and the branches a `--land` may name besides it.
@@ -997,7 +1387,7 @@ function LandTargets({ projectId }: { projectId: string }) {
   const { integration, targets } = landing.data;
 
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+    <Inset>
       <p className="max-w-3xl text-xs text-text-muted">
         <span className="font-mono text-text">nucleos-core --land &lt;branch&gt;</span> sends what is
         in the worktree it is called from. The destination has to be one of these; a name that is not
@@ -1072,7 +1462,7 @@ function LandTargets({ projectId }: { projectId: string }) {
         */
         <RefusalNote refusal={refused} sentences={TARGET_SENTENCES} />
       ) : null}
-    </div>
+    </Inset>
   );
 }
 

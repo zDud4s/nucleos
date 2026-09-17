@@ -451,7 +451,7 @@ export const FEED_KIND_NAMES: string[] = statesOf("feed").sort();
 /**
  * Why a `job_waiting` line is waiting, read out of its summary.
  *
- * The kind is one word for four different situations, and two of them ask for
+ * The kind is one word for five different situations, and two of them ask for
  * opposite responses: a job held by the budget wants a ceiling raised, a job
  * behind a worktree slot wants you to wait or to stop something else. The
  * daemon does not put the reason in a column of its own — `park` writes
@@ -463,6 +463,12 @@ export const FEED_KIND_NAMES: string[] = statesOf("feed").sort();
  * worktree slot"*; a naive match on "slot" would read the first as the second
  * and send somebody looking for capacity that is already there.
  *
+ * The disk detail is *"the disk is too full for another checkout: only … MiB
+ * free …"*, and it is asked before the slot for the same kind of reason: it
+ * names this project's worktrees, and until 2026-09-14 the daemon reported it
+ * as slot contention outright, which sent a reader after a run that was not
+ * there.
+ *
  * The returned string is a `wait_reason` literal, so the badge comes from the
  * one non-collapsing map (`ui/state-map.ts`) rather than from this page.
  * `kill-switch` has no reading there, on purpose: it renders as itself.
@@ -470,6 +476,7 @@ export const FEED_KIND_NAMES: string[] = statesOf("feed").sort();
 export function waitReasonFromSummary(summary: string): string | null {
   const text = summary.toLowerCase();
   if (text.includes("exclusion") || text.includes("excluded")) return "excluded";
+  if (text.includes("disk is too full")) return "disk";
   if (text.includes("worktree slot")) return "slot";
   if (text.includes("would exceed") || text.includes("budget check failed")) return "budget";
   if (text.includes("emergency stop")) return "kill-switch";
@@ -524,4 +531,175 @@ export function readEfficiencySignal(summary: string): EfficiencyReading | null 
     };
   }
   return null;
+}
+
+/* ── The notification selection policy ─────────────────────────────────────
+ *
+ * Which feed kinds still reach Telegram. The preference is stored in the
+ * núcleo (`notify_policy.rs`) and RESOLVED in the sidecar; everything below is
+ * presentation of those two, and decides nothing on its own.
+ */
+
+/** The body of `GET`/`PUT /notifications/policy`, as it is on the wire. */
+export interface NotifyRule {
+  selector: string;
+  enabled: boolean;
+}
+
+export interface NotifyPolicy {
+  families: NotifyRule[];
+  kinds: NotifyRule[];
+}
+
+/**
+ * The three states a kind can be in.
+ *
+ * `inherit` is the ABSENCE of a kind rule — and it is called that rather than
+ * `family` because a loose kind uses it too, and a loose kind has no family to
+ * inherit from. Naming it after the family would make the one case the word
+ * does not cover the case somebody has to special-case.
+ */
+export type KindVerdict = "inherit" | "always" | "never";
+
+export interface KindRow {
+  kind: string;
+  /**
+   * Whether the núcleo has seen this kind in the feed's retention window (90
+   * days). `false` means the row is here only because a stored rule names it —
+   * shown, not hidden: it is a rule somebody wrote, and hiding it would leave
+   * it silencing with nowhere to undo it.
+   */
+  recentlySeen: boolean;
+  verdict: KindVerdict;
+}
+
+export interface FamilyRow {
+  selector: string;
+  /** `null` for a stored family `NOTIFY_FAMILIES` does not know — drawn by its literal prefix. */
+  label: string | null;
+  /** `null` is "no stored rule", which the resolution treats as passes. */
+  rule: boolean | null;
+  kinds: KindRow[];
+}
+
+/**
+ * The one hand-written list in the whole design: a prefix and a human label per
+ * family, and nothing else.
+ *
+ * It contains NO kinds. Which kind belongs to which family is computed by
+ * prefix match, so this list cannot fall behind the núcleo the way a table of
+ * kinds can — the worst it can do is leave a new family without a pretty name.
+ *
+ * One family is exactly one prefix. Two prefixes under one label would make a
+ * single switch write two rules, make a state where the two disagree reachable,
+ * and force the UI to draw "half on" — which is why `errand_` and `schedule_`
+ * are two families and not one "errands and agenda".
+ */
+export const NOTIFY_FAMILIES: { selector: string; label: string }[] = [
+  { selector: "job_", label: "jobs" },
+  { selector: "run_", label: "runs" },
+  { selector: "worktree_", label: "worktrees" },
+  { selector: "vcs_", label: "git queue" },
+  { selector: "council_", label: "council" },
+  { selector: "errand_", label: "errands" },
+  { selector: "schedule_", label: "agenda" },
+  { selector: "email_", label: "e-mail" },
+  { selector: "team_", label: "team" },
+  { selector: "web.", label: "web" },
+];
+
+/**
+ * Everything the notifications tab draws, resolved once.
+ *
+ * Takes the policy as well as the observed kinds because three of the four
+ * things it produces cannot be derived from the kinds alone: families that
+ * exist only as a stored rule (`label: null`), kinds that exist only as a
+ * stored rule (`recentlySeen: false` — the union of §4.2, done here rather than
+ * in the núcleo so that route stays a pure observation), and each switch's
+ * state.
+ *
+ * The component does NOT read the policy again. A second read would be a second
+ * resolution of the same rules, written somewhere else and free to disagree
+ * with this one.
+ *
+ * Nothing here derives from the state map's `feed` domain. That table is held to
+ * the núcleo by `state-map-completeness.test.ts`, but only for kinds this
+ * checkout's source writes; the observed kinds come from the database, which
+ * also holds kinds an older or newer daemon wrote. The map is used for one thing
+ * only, in the component: making a kind's label prettier, where `readFeedKind`
+ * already falls back to the literal.
+ */
+export function groupKinds(
+  observed: string[],
+  policy: NotifyPolicy,
+): { families: FamilyRow[]; loose: KindRow[] } {
+  const kindRules = new Map<string, boolean>();
+  for (const rule of policy.kinds) {
+    if (rule.selector) kindRules.set(rule.selector, rule.enabled);
+  }
+  const familyRules = new Map<string, boolean>();
+  for (const rule of policy.families) {
+    if (rule.selector) familyRules.set(rule.selector, rule.enabled);
+  }
+
+  // The union of §4.2: what the machine wrote in the last ninety days, plus
+  // whatever a stored rule names. Without the second half a rule written a year
+  // ago keeps silencing with no row on screen to undo it.
+  const seen = new Set(observed.filter((kind) => kind));
+  const allKinds = new Set([...seen, ...kindRules.keys()]);
+
+  // Families likewise: the known list, plus any prefix somebody stored that we
+  // have no label for. An unknown one still works — it just draws as itself.
+  const selectors = new Set([
+    ...NOTIFY_FAMILIES.map((family) => family.selector),
+    ...familyRules.keys(),
+  ]);
+  const labels = new Map(NOTIFY_FAMILIES.map((f) => [f.selector, f.label]));
+
+  const verdictOf = (kind: string): KindVerdict => {
+    const rule = kindRules.get(kind);
+    if (rule === undefined) return "inherit";
+    return rule ? "always" : "never";
+  };
+  const rowOf = (kind: string): KindRow => ({
+    kind,
+    recentlySeen: seen.has(kind),
+    verdict: verdictOf(kind),
+  });
+
+  // Longest prefix wins, exactly as the sidecar resolves it — so a kind appears
+  // under the family whose switch actually governs it, and not under a shorter
+  // prefix that would be overruled.
+  const familyOf = (kind: string): string | null => {
+    let best: string | null = null;
+    for (const selector of selectors) {
+      if (!kind.startsWith(selector)) continue;
+      if (best === null || selector.length > best.length) best = selector;
+    }
+    return best;
+  };
+
+  const byFamily = new Map<string, KindRow[]>();
+  for (const selector of selectors) byFamily.set(selector, []);
+  const loose: KindRow[] = [];
+  for (const kind of [...allKinds].sort()) {
+    const selector = familyOf(kind);
+    if (selector === null) loose.push(rowOf(kind));
+    else byFamily.get(selector)!.push(rowOf(kind));
+  }
+
+  // A family with no kinds is SHOWN with a count of zero, not hidden: "team: 0
+  // kinds" says this machine has written none in ninety days, which is
+  // information, where a missing row reads as a bug. Its switch still works —
+  // a prefix matches future lines nobody has seen yet.
+  const families: FamilyRow[] = [...selectors]
+    .sort((a, b) => (labels.get(a) ?? a).localeCompare(labels.get(b) ?? b))
+    .map((selector) => ({
+      selector,
+      label: labels.get(selector) ?? null,
+      rule: familyRules.has(selector) ? familyRules.get(selector)! : null,
+      kinds: byFamily.get(selector) ?? [],
+    }));
+
+  return { families, loose };
 }

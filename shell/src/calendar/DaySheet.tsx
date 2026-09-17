@@ -15,7 +15,7 @@ import {
 } from "../data/calendar";
 import { inputFromStamp, occurrenceMinutes, stampFromInput } from "../lib/calendar-grid";
 import { UI_LOCALE } from "../lib/locale";
-import { Badge, Button, ConfirmButton, ErrorNote, RefusalNote } from "../ui";
+import { Badge, Button, ConfirmButton, ErrorNote, Quiet, RefusalNote, Row, Rows } from "../ui";
 import { placementOf, slotStamp, type Slot } from "./slot";
 
 /**
@@ -72,15 +72,18 @@ export function DaySheet({ slot, occurrences, now, config }: DaySheetProps) {
       </div>
 
       {occurrences.length === 0 ? (
-        <p className="calendar-empty">nothing on this day.</p>
+        <Quiet says="nothing on this day." />
       ) : (
-        <ul className="ui-rows calendar-occurrence-list">
+        <Rows label="Occurrences on this day" className="calendar-occurrence-list">
           {occurrences.map((occurrence) => (
-            <li className="ui-rows-row" key={occurrenceKey(occurrence.event_id, occurrence.occurrence_local)}>
-              <OccurrenceActions occurrence={occurrence} />
-            </li>
+            /* No wrapper `li`: `OccurrenceActions` renders the `Row` itself, so the
+               item is the row rather than a row holding a nested box. */
+            <OccurrenceActions
+              key={occurrenceKey(occurrence.event_id, occurrence.occurrence_local)}
+              occurrence={occurrence}
+            />
           ))}
-        </ul>
+        </Rows>
       )}
 
       <DraftEventForm slot={slot} config={config} />
@@ -258,7 +261,12 @@ export function OccurrenceActions({ occurrence }: { occurrence: EventOccurrence 
   }
 
   return (
-    <div className="calendar-occurrence-actions">
+    /*
+      A `Row` of the day's `Rows`, not a box of its own: the occurrences are
+      scanned down one hairline-ruled column, clock first. `calendar-occurrence-actions`
+      only lays the parts out on one grid line; the fill and the rules are the row's.
+    */
+    <Row className="calendar-occurrence-actions">
       <p className="calendar-occurrence-title">
         <span className="calendar-occurrence-clock">{placement.clock}</span>
         <span className="calendar-occurrence-name">
@@ -309,7 +317,7 @@ export function OccurrenceActions({ occurrence }: { occurrence: EventOccurrence 
       {cancel.isError && <OccurrenceError error={cancel.error} what="not skipped" />}
       {move.isError && <OccurrenceError error={move.error} what="not moved" />}
       {deleteSeries.isError && <OccurrenceError error={deleteSeries.error} what="the series was not deleted" />}
-    </div>
+    </Row>
   );
 }
 

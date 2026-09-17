@@ -17,10 +17,14 @@ import {
   ErrorNote,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
-  Teach,
+  Row,
+  Rows,
   StateBadge,
+  Teach,
+  Well,
 } from "../ui";
 import "./learned.css";
 
@@ -89,21 +93,23 @@ export function Learned() {
             to every later run in its scope; refusing keeps the refusal on the
             record rather than erasing the question.
           </p>
-          <ul className="ui-rows">
+          <Rows label="Waiting for you">
             {[...waiting]
               .sort((left, right) => left.id - right.id)
               .map((row) => (
-                <Row
+                <RefinementRow
                   key={row.id}
                   row={row}
                   decisions={
                     row.proposal_id === null ? (
                       // A proposed row whose question is gone cannot be decided from here, and a
                       // button that 404s is worse than none: it invites a click that teaches the
-                      // person the app is broken when the daemon is merely inconsistent.
-                      <span className="learned-orphan">
-                        no question to answer — decide in the daemon
-                      </span>
+                      // person the app is broken when the daemon is merely inconsistent. Said in
+                      // the row, and said as `Quiet`: what is missing here is the decision, which
+                      // is the one-line absence that component is for. It was set faint, which is
+                      // the rung for metadata standing beside content — here the sentence is all
+                      // the row has to say in place of its two buttons.
+                      <Quiet says="no question to answer — decide in the daemon" />
                     ) : (
                       <>
                         <Button
@@ -128,7 +134,7 @@ export function Learned() {
                   }
                 />
               ))}
-          </ul>
+          </Rows>
         </Panel>
       )}
 
@@ -139,9 +145,9 @@ export function Learned() {
             machine-wide note reaches every project; a project's note reaches
             only that project.
           </p>
-          <ul className="ui-rows">
+          <Rows label="In force">
             {[...inForce].sort(byKindThenId).map((row) => (
-              <Row
+              <RefinementRow
                 key={row.id}
                 row={row}
                 decisions={
@@ -155,7 +161,7 @@ export function Learned() {
                 }
               />
             ))}
-          </ul>
+          </Rows>
         </Panel>
       )}
 
@@ -165,13 +171,13 @@ export function Learned() {
             Kept, not deleted. What was refused, what was taken back, and what a
             later text replaced.
           </p>
-          <ul className="ui-rows">
+          <Rows label="No longer in force">
             {[...over]
               .sort((left, right) => right.id - left.id)
               .map((row) => (
-                <Row key={row.id} row={row} />
+                <RefinementRow key={row.id} row={row} />
               ))}
-          </ul>
+          </Rows>
         </Panel>
       )}
     </>
@@ -192,11 +198,11 @@ const OVER: ReadonlySet<RefinementStatus> = new Set<RefinementStatus>([
  * may do to a refinement is a property of the list it is in — you approve what
  * is waiting, revert what is in force, and do nothing at all to what is over.
  */
-function Row({ row, decisions }: { row: Refinement; decisions?: ReactNode }) {
+function RefinementRow({ row, decisions }: { row: Refinement; decisions?: ReactNode }) {
   const [open, setOpen] = useState(false);
 
   return (
-    <li className="ui-rows-row learned-row">
+    <Row className="learned-row">
       <div className="learned-head">
         <StateBadge domain="refinement" state={row.kind} />
         <span className="learned-scope">
@@ -222,7 +228,7 @@ function Row({ row, decisions }: { row: Refinement; decisions?: ReactNode }) {
       </div>
 
       {open && <Chain id={row.id} />}
-    </li>
+    </Row>
   );
 }
 
@@ -249,7 +255,12 @@ function Chain({ id }: { id: number }) {
   const { events, replaced, replaced_by: replacedBy } = history.data;
 
   return (
-    <div className="learned-chain">
+    // A well and not a box: the chain is the same row seen further back in time,
+    // and the rung below the row is what the system calls a recess cut into a
+    // surface. `reads` because every line of it is somebody's writing, which the
+    // well's default mono face would deny; `capped` because the decisions grow by
+    // one each time a person answers something.
+    <Well as="div" reads capped>
       {replacedBy !== null && (
         <p className="learned-chain-line">
           Replaced by <strong>{replacedBy.title}</strong>.
@@ -270,10 +281,11 @@ function Chain({ id }: { id: number }) {
           </ul>
         </>
       )}
+      {/* The one genuine absence on this page: a chain with no chain in it. One
+          line, nothing to teach, and `Quiet`'s muted rung rather than the faint
+          one — in an empty region the sentence is the content. */}
       {replaced.length === 0 && replacedBy === null && (
-        <p className="learned-chain-line">
-          This one replaced nothing and nothing has replaced it.
-        </p>
+        <Quiet says="This one replaced nothing and nothing has replaced it." />
       )}
       {events.length > 0 && (
         <ul className="learned-events">
@@ -286,7 +298,7 @@ function Chain({ id }: { id: number }) {
           ))}
         </ul>
       )}
-    </div>
+    </Well>
   );
 }
 

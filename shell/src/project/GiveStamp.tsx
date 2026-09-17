@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useGiveStamp, type Anchored } from "../data/project-map";
+import { ErrorNote } from "../ui";
 
 /**
  * The owner's verdict on one decision, as three buttons and a note (§5.2).
@@ -111,31 +112,28 @@ export function GiveStamp({ projectId, row }: GiveStampProps) {
  * is the opposite of what this feature is buying.
  */
 function Refused({ error }: { error: unknown }) {
-  const box =
-    "max-w-prose rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted";
-
   if (!isApiRefusal(error)) {
-    return <p className={box}>The núcleo did not answer, so nothing was recorded.</p>;
+    return <ErrorNote>The núcleo did not answer, so nothing was recorded.</ErrorNote>;
   }
 
   if (error.status === 503) {
     return (
-      <p className={box}>
+      <ErrorNote>
         Git would not say what this decision is anchored to just now, so the green was not
         recorded. Nothing you asked for was wrong — try again in a moment.
-      </p>
+      </ErrorNote>
     );
   }
   if (error.status === 404) {
     return (
-      <p className={box}>
+      <ErrorNote>
         That decision is not yours to stamp now — it belongs to another project, or nobody approved
         it.
-      </p>
+      </ErrorNote>
     );
   }
   if (error.status === 400) {
-    return <p className={box}>An amber needs a note, and this one arrived empty.</p>;
+    return <ErrorNote>An amber needs a note, and this one arrived empty.</ErrorNote>;
   }
-  return <p className={box}>{error.detail}</p>;
+  return <ErrorNote>{error.detail}</ErrorNote>;
 }

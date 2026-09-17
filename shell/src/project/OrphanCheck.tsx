@@ -3,6 +3,7 @@ import { isApiRefusal } from "../data/client";
 import type { Anchored, Loss, Orphan } from "../data/project-map";
 import { useOrphanCheck, useRecordAnchor } from "../data/project-map";
 import { UI_LOCALE } from "../lib/locale";
+import { ErrorNote } from "../ui";
 
 /**
  * §14's guard, on one row of *declared, with no code*.
@@ -79,15 +80,12 @@ export function OrphanCheck({ projectId, row }: { projectId: string; row: Anchor
  * sentence, because the day it does happen the sentence is the only thing that says why.
  */
 function Failed({ error }: { error: unknown }) {
-  const box =
-    "max-w-prose rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted";
-
   if (!isApiRefusal(error)) {
     return (
-      <p className={box}>
+      <ErrorNote>
         The núcleo did not answer, so no history was read. That says nothing about the decision
         either way.
-      </p>
+      </ErrorNote>
     );
   }
 
@@ -98,7 +96,7 @@ function Failed({ error }: { error: unknown }) {
         ? "This project, or the document this decision came from, is not there any more."
         : error.detail;
 
-  return <p className={box}>{sentence}</p>;
+  return <ErrorNote>{sentence}</ErrorNote>;
 }
 
 /**
@@ -224,11 +222,11 @@ function Remember({
         </button>
       </div>
       {record.isError ? (
-        <p className="max-w-prose rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
+        <ErrorNote>
           {isApiRefusal(record.error) && record.error.status === 422
             ? "Those files are not in the project any more, so there is nothing to point at. A record has to name a file that is there."
             : "The núcleo did not take it, so nothing was written down."}
-        </p>
+        </ErrorNote>
       ) : null}
     </div>
   );

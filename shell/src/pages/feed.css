@@ -254,6 +254,13 @@
 
 /* ---------------------------------------------------------------- states -- */
 
+/**
+ * The feed while it is still being read.
+ *
+ * A wait, and deliberately not `Quiet`. An absence and a wait are two different
+ * facts, and a wait wearing the vocabulary of an empty section claims the
+ * núcleo has done nothing when in truth it has not answered yet.
+ */
 .feed-loading {
   margin: 0;
   color: var(--text-muted);

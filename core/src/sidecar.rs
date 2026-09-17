@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
@@ -275,6 +275,43 @@ where
     }
 }
 
+/// The variable that says where the sidecar binaries are, for a daemon that does not sit beside them.
+pub const SIDECAR_DIR_VAR: &str = "NUCLEOS_SIDECAR_DIR";
+
+/// Where the sidecar whose executable is called `file` is, for this daemon.
+///
+/// Beside the daemon's own executable unless [`SIDECAR_DIR_VAR`] says otherwise. The default is the
+/// layout `scripts/build-sidecars.sh` produces and an installation ships; the variable is for a
+/// daemon built anywhere else. That is not rare on this machine: a build that must not overwrite the
+/// running daemon's binary goes to a target directory of its own, which has no sidecars in it, and
+/// on 2026-09-09 a daemon swapped in from one came up with all five down.
+pub fn binary(file: &str) -> PathBuf {
+    let exe = std::env::current_exe().expect("the daemon can name its own executable");
+    binary_in(std::env::var_os(SIDECAR_DIR_VAR).as_deref(), &exe, file)
+}
+
+/// PURE: [`binary`], given what the environment and the executable's own path said. An empty
+/// variable is an unset one, the way a shell that exported `NUCLEOS_SIDECAR_DIR=` meant it.
+fn binary_in(configured: Option<&std::ffi::OsStr>, exe: &Path, file: &str) -> PathBuf {
+    match configured.filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir).join(file),
+        None => exe.parent().unwrap_or(Path::new(".")).join(file),
+    }
+}
+
+/// PURE: what a sidecar that could not start records. It names the path, because "the system cannot
+/// find the file specified" does not say which file, and which file is the whole diagnosis.
+fn spawn_failure(binary_path: &Path, error: &io::Error) -> String {
+    let remedy = if error.kind() == io::ErrorKind::NotFound {
+        format!(
+            " (build it with scripts/build-sidecars.sh, or set {SIDECAR_DIR_VAR} to where it is)"
+        )
+    } else {
+        String::new()
+    };
+    format!("could not start {}: {error}{remedy}", binary_path.display())
+}
+
 pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, String)>) {
     let mut delay = RESTART_BASE;
     let mut attempts: u32 = 0;
@@ -352,7 +389,7 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
                     "sidecar failed to spawn — backing off"
                 );
                 let failed_at = chrono::Utc::now().to_rfc3339();
-                let detail = format!("could not start: {error}");
+                let detail = spawn_failure(&binary_path, &error);
                 let kind = error.kind();
                 record(&name, |entry| {
                     entry.state = DOWN;
@@ -940,5 +977,42 @@ mod tests {
             entry.spawn_error = Some(io::ErrorKind::NotFound);
         });
         assert_eq!(ask_to_restart("test-never-built"), RestartOutcome::Asked);
+    }
+
+    /// Beside the daemon by default, and wherever the variable says when it says anything.
+    #[test]
+    fn a_sidecar_is_found_beside_the_daemon_unless_told_otherwise() {
+        let exe = Path::new("C:/Projects/.cargo-target-branch/debug/nucleos-core.exe");
+        let beside = Path::new("C:/Projects/.cargo-target-branch/debug/echo-sidecar.exe");
+
+        assert_eq!(binary_in(None, exe, "echo-sidecar.exe"), beside);
+        assert_eq!(
+            binary_in(Some(std::ffi::OsStr::new("")), exe, "echo-sidecar.exe"),
+            beside
+        );
+        assert_eq!(
+            binary_in(
+                Some(std::ffi::OsStr::new("C:/Projects/.cargo-target/debug")),
+                exe,
+                "echo-sidecar.exe"
+            ),
+            Path::new("C:/Projects/.cargo-target/debug/echo-sidecar.exe")
+        );
+    }
+
+    /// The failure a missing sidecar records names the file it looked for, and the two ways out.
+    #[test]
+    fn a_sidecar_that_cannot_start_says_where_it_looked() {
+        let missing = io::Error::from(io::ErrorKind::NotFound);
+
+        let said = spawn_failure(Path::new("C:/x/debug/echo-sidecar.exe"), &missing);
+
+        assert!(said.contains("C:/x/debug/echo-sidecar.exe"), "{said}");
+        assert!(said.contains(SIDECAR_DIR_VAR), "{said}");
+        let refused = spawn_failure(
+            Path::new("C:/x/debug/echo-sidecar.exe"),
+            &io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+        assert!(!refused.contains(SIDECAR_DIR_VAR), "{refused}");
     }
 }

@@ -59,7 +59,7 @@ describe("Sidebar", () => {
     });
 
     // A roster badge is open proposals, not the Waiting queue's arithmetic.
-    expect(screen.getByRole("link", { name: "sidecar, 2 proposals open" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "sidecar, 2 items to review" })).toBeTruthy();
   });
 
   /**

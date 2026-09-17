@@ -53,7 +53,7 @@ pub fn ensure_sandbox(root: &Path) -> std::io::Result<PathBuf> {
                 "matcher": "*",
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python \"{}\"", script_path.display()),
+                    "command": format!("{} \"{}\"", crate::autopilot::HOOK_INTERPRETER, script_path.display()),
                 }],
             }],
         }
@@ -148,7 +148,7 @@ async fn probe_hook(sandbox: &Path, env: &[(&str, String)]) -> Result<String, Ba
     })
     .to_string();
 
-    let mut command = tokio::process::Command::new("python");
+    let mut command = tokio::process::Command::new(crate::autopilot::HOOK_INTERPRETER);
     command
         .arg(&script)
         .stdin(std::process::Stdio::piped())
@@ -3128,6 +3128,24 @@ mod tests {
     }
 
     #[test]
+    fn the_sandbox_hook_runs_under_this_platforms_interpreter() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_sandbox(dir.path()).unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            command.starts_with(&format!("{} \"", crate::autopilot::HOOK_INTERPRETER)),
+            "{command}"
+        );
+    }
+
+    #[test]
     fn building_the_sandbox_twice_is_the_same_sandbox() {
         let dir = tempfile::tempdir().unwrap();
         ensure_sandbox(dir.path()).unwrap();
@@ -3229,6 +3247,8 @@ mod tests {
             )),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),

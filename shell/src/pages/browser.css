@@ -3,22 +3,29 @@
  * health, `browser-` throughout — as `waiting-` is for the decision queue
  * and `web-` for the archive.
  *
- * The rule this file lives under: **no class appears in `Browser.tsx` that
- * is not defined below.** `tsc` and vitest both pass happily on a class no
- * stylesheet has ever heard of, and the defect shows up only as something
- * looking wrong on a screen nobody is testing. Grep the component against
- * this file before calling the page done.
+ * The rule this file lives under: **no `browser-` class appears in
+ * `Browser.tsx` that is not defined below.** `tsc` and vitest both pass happily
+ * on a class no stylesheet has ever heard of, and the defect shows up only as
+ * something looking wrong on a screen nobody is testing. Grep the component
+ * against this file before calling the page done. `ui-` classes are the
+ * exception and are not this file's to define — they arrive with a primitive
+ * imported from `../ui`, which is where their recipe and their argument both
+ * live.
  */
 
 /* =============================================================== shared == */
 
-.browser-count {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-variant-numeric: tabular-nums;
-  color: var(--text-faint);
-}
-
+/**
+ * A panel's own prose, in front of a list that has something in it.
+ *
+ * It is **not** an absence, which is why it is not `Quiet`: it stands above a
+ * list that usually has rows in it and says what the reader is about to decide.
+ * Where the list can be empty the same sentences move behind `Quiet`'s
+ * disclosure instead — see `PanelNote` in `Browser.tsx`. A paragraph explaining
+ * rows that are not there makes the page longer the emptier it gets, which is
+ * backwards; the prose is kept rather than cut, because "nothing is open right
+ * now" on its own reads as a list that failed to load.
+ */
 .browser-note {
   margin: 0 0 var(--space-3);
   max-width: var(--measure);
@@ -27,15 +34,21 @@
   color: var(--text-muted);
 }
 
-.browser-loading,
-.browser-empty {
+/**
+ * A reading that has not landed yet — and deliberately **not** `Quiet`.
+ *
+ * `Quiet` is muted because in an empty region the sentence is the content: an
+ * answer set fainter than the labels around it reads as failure rather than as
+ * emptiness. A wait is the other case. This line is a placeholder for the thing
+ * about to replace it, it is never what the panel has to say, and faint is the
+ * rung for something standing beside content rather than being it. The italic
+ * is the second half of the same claim.
+ */
+.browser-loading {
   margin: 0;
   font-size: var(--text-sm);
-  color: var(--text-faint);
-}
-
-.browser-loading {
   font-style: italic;
+  color: var(--text-faint);
 }
 
 .browser-meta {
@@ -46,14 +59,58 @@
   overflow-wrap: anywhere;
 }
 
-/* An origin or a url, read character by character — the same posture
-   Waiting takes: a punycode host is only distinguishable from what it
-   imitates if nothing here truncates it. */
-.browser-url {
+/**
+ * An origin or a url, read character by character — the same posture Waiting
+ * takes: a punycode host is only distinguishable from what it imitates if
+ * nothing here truncates it. Hence `overflow-wrap: anywhere` and no ellipsis.
+ *
+ * Grouped with the fact list's values because a `dd` on this page is the same
+ * claim about origin — mono, because the daemon produced every one of them —
+ * and the two rules had been written out separately down to the property. That
+ * is also why a `dd` holding a url carries no class of its own: it is already
+ * in this selector.
+ */
+.browser-url,
+.browser-fact dd {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   color: var(--text);
   overflow-wrap: anywhere;
+}
+
+/**
+ * The definition list this page reads facts out of — a session's, and the
+ * sidecar's below it. Shared rather than filed under either, because both
+ * screens ask the same question of the same shape.
+ */
+.browser-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: var(--space-2) var(--space-3);
+  margin: 0;
+}
+
+.browser-fact dd {
+  margin: var(--space-1) 0 0;
+}
+
+/**
+ * The label rank — 11px uppercase at `--tracking-wide` — under two names: a
+ * fact's column head and a field's own label.
+ *
+ * Grouped rather than shared with a primitive, because there is nothing to
+ * share with: DESIGN.md records the missing input primitive as the largest
+ * remaining hole in the component layer, and until `ui.css` has one, collecting
+ * the selector is as far as a page can take it. Not the section-title rank,
+ * which is the display face at `--tracking-wider` and belongs to
+ * `.ui-section-title`.
+ */
+.browser-fact dt,
+.browser-field {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
 }
 
 .browser-field {
@@ -62,10 +119,6 @@
   gap: var(--space-1);
   max-width: 20rem;
   margin: 0 0 var(--space-3);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 .browser-field select,
@@ -81,13 +134,35 @@
   letter-spacing: normal;
 }
 
-.browser-actions {
+/**
+ * A line of small things sitting side by side: a card's head, a grant's head,
+ * the row of buttons under either, and the health badge with its reason.
+ *
+ * One recipe and not four. The four were written out separately with the same
+ * declarations between them — the duplication this pass is treating, one file
+ * further down. The only thing that ever differed is the session card's
+ * `baseline`, which it keeps below: a mode name and the mono meta beside it are
+ * read along one line, and centring sits the smaller of the two off it.
+ */
+.browser-card-head,
+.browser-row-head,
+.browser-actions,
+.browser-health-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
 }
 
+.browser-card-head {
+  align-items: baseline;
+}
+
+.browser-health-row {
+  margin: 0 0 var(--space-3);
+}
+
+/* What the last decision did — a receipt, not a state of the machine. */
 .browser-outcome {
   margin: var(--space-2) 0 0;
   font-size: var(--text-sm);
@@ -98,14 +173,10 @@
 
 /* -------------------------------------------------------------- sessions == */
 
-.browser-session {
-  gap: var(--space-2);
-}
-
-.browser-card-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
+/* Sessions, grants and submissions are each a `Row` of their list's `Rows`; the
+   parts of one sit a step further apart than a row's default. */
+.browser-session,
+.browser-row {
   gap: var(--space-2);
 }
 
@@ -116,44 +187,38 @@
   color: var(--text);
 }
 
-.browser-facts {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
-  gap: var(--space-2) var(--space-3);
-  margin: 0;
-}
-
-.browser-fact dt {
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.browser-fact dd {
-  margin: var(--space-1) 0 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  color: var(--text);
-  overflow-wrap: anywhere;
-}
-
-.browser-refusal {
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
-}
-
-/* The link off to the queue this page never duplicates a decision from. */
+/**
+ * Two sentences a card says about itself rather than about the machine: why
+ * this session was refused, and where the decision it is waiting on lives.
+ *
+ * One recipe, because they were two writings of the same three declarations.
+ * The refusal keeps the tighter leading of the pair — it is the only one of the
+ * two that can run to a paragraph.
+ */
+.browser-refusal,
 .browser-waiting-link {
   margin: 0;
   font-size: var(--text-sm);
   color: var(--text-muted);
 }
 
+.browser-refusal {
+  line-height: var(--leading-snug);
+}
+
 /* ---------------------------------------------------------- chain dialogue == */
 
+/**
+ * The hosts the login passed through, in the order it passed through them.
+ *
+ * A well by every property — sunken, unbordered, holding nothing but what the
+ * daemon recorded — and still hand-rolled, because `Well` renders a `div` or a
+ * `pre` and this has to stay an `ol`. The ordering is the content here: the
+ * chain is a route, and a reader deciding whether to grant it is reading which
+ * origin led to which. `Well` has no `as="ol"` on purpose, so this is the
+ * version that keeps the semantics rather than the version that keeps the
+ * import.
+ */
 .browser-chain {
   display: flex;
   flex-direction: column;
@@ -176,6 +241,16 @@
   font-size: var(--text-sm);
 }
 
+/**
+ * The tick, in the contrast fill rather than in the brand colour.
+ *
+ * It was `--accent`, and `--accent` is the one colour in this system that means
+ * nothing: the wordmark, links and the focus ring, and nowhere else. A ticked
+ * box is a selection, and a selection is exactly what the Reserved Cyan Rule
+ * sends to a neutral rung — here the contrast fill, which is how this system
+ * says emphasis without reaching for a hue. It inverts with the theme, so the
+ * tick reads in both.
+ */
 .browser-check input {
   width: 1rem;
   height: 1rem;
@@ -193,52 +268,30 @@
 
 /* ------------------------------------------------------------- site grants == */
 
-.browser-row {
-  gap: var(--space-2);
-}
-
+/* A grant's origin reads across a line and its two buttons stand in columns of
+   their own, so the revokes line up from one grant to the next. The one head of
+   the four above that is a grid rather than a wrapping line. */
 .browser-row-head {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: var(--space-2);
 }
 
-/* What has been submitted under the grants above. Set apart from the grants by
-   a rule rather than by a panel of its own: it is the same decision seen from
-   the other side, and a person looking at "revoke" should not have to go
-   anywhere to see what they would be revoking. */
-.browser-writes {
-  margin-top: var(--space-4);
-  padding-top: var(--space-3);
-  border-top: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
-
-.browser-subhead {
-  margin: 0;
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
+/**
+ * The two things hung below the grants: what has been submitted under them,
+ * and the door that forgets the profile entirely.
+ *
+ * Set apart by a rule rather than by a panel of its own — for the submissions
+ * because it is the same decision seen from the other side, and a person
+ * looking at "revoke" should not have to go anywhere to see what they would be
+ * revoking; for the forget button because it is the end of everything above it
+ * and not a fifth grant. One recipe: both had written the same rule out.
+ * The submissions' own heading and the rhythm under it are `Section`'s.
+ */
+.browser-writes,
 .browser-forget {
   margin-top: var(--space-4);
   padding-top: var(--space-3);
   border-top: 1px solid var(--border);
-}
-
-/* ------------------------------------------------------------------ health == */
-
-.browser-health-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  margin: 0 0 var(--space-3);
 }
 
 /* A submission that carried a file, on the record screen.

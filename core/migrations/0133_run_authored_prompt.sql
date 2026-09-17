@@ -1,0 +1,28 @@
+-- Quanto do prompt de uma execução foi escrito por este daemon, em caracteres.
+--
+-- O que o CLI reporta no fim de uma execução são quatro totais — `input_tokens`,
+-- `cache_read_input_tokens`, `cache_creation_input_tokens` e `num_turns` — e nenhum deles vem
+-- repartido por componente. Não há, em lado nenhum do stream, uma linha que diga quanto custaram
+-- os esquemas das ferramentas MCP, quanto custou o `--append-system-prompt`, ou quanto custou o
+-- CLAUDE.md que o CLI carrega sozinho. Esta coluna é a única metade dessa conta que nos pertence:
+-- o que NÓS escrevemos, medido de onde o escrevemos, antes de o processo arrancar.
+--
+-- Em CARACTERES e não em tokens, e o nome diz isso. Não há tokenizador neste repositório e esta
+-- migração não trouxe nenhum; quem lê divide por quatro, que é a mesma regra grosseira que
+-- `sessions.rs` usa e anuncia como grosseira. Guardar caracteres em vez do quociente deixa a regra
+-- de conversão viver num sítio só — no código que a documenta — em vez de ficar congelada dentro
+-- de linhas escritas por versões diferentes desta aplicação.
+--
+-- Anulável, sem DEFAULT e sem CHECK. Uma execução lançada antes desta coluna existir não reportou
+-- nada, e não reportar nada NÃO é reportar zero — é a mesma disciplina que `token_efficiency.rs`
+-- defende para os quatro totais acima ("a run that reported nothing must not read back as a run
+-- that measured zero"), e é o que faz com que o resíduo calculado a partir daqui seja NULL em vez
+-- de ser o total inteiro atribuído ao CLI.
+--
+-- NULL também para tudo o que não é uma execução do CLI da Anthropic: o modelo local não recebe
+-- nenhum destes argumentos, e o Codex recebe outros. É o mesmo critério que `runs.permission_mode`
+-- segue desde `0129_permission_mode.sql` — NULL para tudo o que não é um turno de conversa.
+--
+-- Um único ALTER TABLE ADD COLUMN, sem reconstrução: não há CHECK para alargar mais tarde, porque
+-- não há aqui nenhum conjunto fechado de valores a defender.
+ALTER TABLE runs ADD COLUMN authored_prompt_chars INTEGER;

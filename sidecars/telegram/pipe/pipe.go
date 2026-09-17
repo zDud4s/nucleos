@@ -75,6 +75,11 @@ type Daemon interface {
 	ApproveProposal(id int64) (map[string]any, error)
 	RejectProposal(id int64) error
 	GetFeed() ([]map[string]any, error)
+	// GetNotifyPolicy is which feed kinds the owner still wants forwarded. Beside GetFeed because
+	// it is read in the same breath, and read only there: the governance lines below — the kill
+	// switch and the budget — never consult it, which is how they stay unsilenceable without an
+	// exception list to remember.
+	GetNotifyPolicy() (notifier.Policy, error)
 	GetBudget() (map[string]any, error)
 	GetKill() (bool, error)
 	TriageEmail() (map[string]any, error)
@@ -654,6 +659,16 @@ func strOr(m map[string]any, key, fallback string) string {
 	return value
 }
 
+// kindOf is the feed row's kind as the policy sees it, and deliberately NOT formatFeed's
+// `strOr(f, "kind", "event")`. That fallback is a LABEL for a line nobody could read; this one is
+// an INPUT to a decision, and "event" would make an unreadable line match a family nobody wrote —
+// silencing it under a switch whose owner never meant it to cover this. The empty string is the
+// honest answer, and Allows passes it.
+//
+// strOr does `m[key].(string)`, so a kind that is not a string falls back exactly as a missing one
+// does. Both cases are tested.
+func kindOf(f map[string]any) string { return strOr(f, "kind", "") }
+
 func parseCallback(data string) (action string, id int64, ok bool) {
 	action, rawID, found := strings.Cut(data, ":")
 	if !found || (action != "approve" && action != "reject") {
@@ -871,7 +886,19 @@ func RunNotifier(ctx context.Context, bot Bot, dc Daemon, to telegram.Destinatio
 			// Read once per round, not once per line: an errand's topic does not change between
 			// two lines of a single poll.
 			topics := errandTopics(dc)
+			policy := notifyPolicy(dc)
+			// AFTER NewFeedItems, never before, and this is the whole reason the ordering is
+			// written down: NewFeedItems marks the entire round as seen — `newItems` rebuilds
+			// `stillPresent` from `current` regardless of what it returns — so a suppressed row
+			// still enters `seen`. Turning a family back on tomorrow therefore affects future
+			// lines only. Filter the feed before this call instead and re-enabling a family dumps
+			// ninety days of backlog into the chat at once.
 			for _, f := range state.NewFeedItems(feed) {
+				if !policy.Allows(kindOf(f)) {
+					// A decision, not a failed send — so no state.Forget. Forgetting would offer
+					// the row again next round, and it would be declined again for ever.
+					continue
+				}
 				where, ok := feedDestination(f, topics, to)
 				if !ok {
 					// An errand line with nowhere to go. Left marked as seen rather than forgotten:
@@ -936,6 +963,24 @@ func errandTopics(dc Daemon) map[int64]telegram.Destination {
 		topics[errand.ID] = where
 	}
 	return topics
+}
+
+// notifyPolicy is the owner's selection, or a policy that allows everything when it cannot be
+// read.
+//
+// FAILS OPEN, which is the opposite of what errandTopics does directly above, and the contrast is
+// the point. There, the failure to avoid is an errand's notes landing in the wrong room, so a
+// failed read drops that round's lines. Here, the failure this whole mechanism exists to prevent
+// is NOISE — and the failure of a mechanism against noise must never be SILENCE, because silence
+// is indistinguishable from everything being fine. It is the direction core/src/notify.rs picks
+// for `busy_at`, for the same reason.
+func notifyPolicy(dc Daemon) notifier.Policy {
+	policy, err := dc.GetNotifyPolicy()
+	if err != nil {
+		log.Printf("notifier: could not read the notification policy; everything passes this round: %v", err)
+		return notifier.Policy{}
+	}
+	return policy
 }
 
 // feedDestination is where one feed line belongs: its errand's topic, or the configured chat.

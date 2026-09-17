@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run an ablation ladder end to end — prepare, launch, approve, watch, score — one cell at a time.
 
-    python scripts/eval/ladder.py T3            # all four layers of T3
+    python scripts/eval/ladder.py T3            # every layer of T3 still runnable: H0, H2, H3
     python scripts/eval/ladder.py T2:H3 T3      # one cell, then a whole ladder
 
 Every step here was done by hand for T1 on 2026-08-17. It is checked in for the reason `base.sh`
@@ -53,6 +53,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ingest  # noqa: E402
+
 # Overridable, because a checked-in script that only runs on the machine it was written on is a
 # personal note with a path in the repository. Defaults are this machine's.
 ROOT = os.environ.get("NUCLEOS_ROOT") or os.path.abspath(
@@ -74,9 +77,26 @@ DAEMON_EXE = next(
     f"{ROOT}/target/debug/nucleos-core.exe",
 )
 
-LAYERS = ["H0", "H1", "H2", "H3"]
+LAYERS = ["H0", "H2", "H3"]
+
+# Retired, not forgotten. H1 is the worktree layer WITHOUT the classifier hook. Since `a840181`
+# (2026-08-26) `create_run` refuses an unattended run for a project in `off`, and putting a project
+# in `shadow` requires that very hook (`activation_prerequisites`, `core/src/autopilot.rs`) — so the
+# daemon no longer runs the configuration H1 describes. The ladder ran on 2026-08-17/19, before that
+# door asked anything; H1's cells from then stay in the ledger as history, and no new one can be
+# measured under this daemon.
+RETIRED = {
+    "H1": "it is the worktree layer without the classifier hook, and since a840181 (2026-08-26) a "
+          "worktree run needs its project in shadow, which requires that hook -- the daemon no "
+          "longer runs what H1 describes",
+}
 MODE = {"H0": "real", "H1": "worktree", "H2": "worktree", "H3": "worktree"}
 TERMINAL = ("succeeded", "completed", "failed", "timed_out", "cancelled", "killed", "errored")
+# How long a chain may run before the watcher stops following it. A worktree chain pays a fresh
+# crate compile, every approval pause and the daemon's own gate before it turns terminal: T4xH3 on
+# 2026-09-13 was still inside that gate at 2400s, and the ladder went on to score a tree the agent
+# was still writing to. An environment override, because a slow machine needs more, not a patch.
+WATCH_CEILING = int(os.environ.get("EVAL_WATCH_CEILING", "5400"))
 
 # `core/src/worktree.rs::worktree_root()`'s default moved from a SIBLING of the project root
 # (`<parent>/nucleos-worktrees/<project>/run-*`) to INSIDE it (`<project>/.nucleos/worktrees/run-*`,
@@ -94,18 +114,115 @@ ENV.update({
     "PATH": "C:\\Projects\\mingw64\\bin;C:\\Projects\\cargo\\bin;" + os.environ.get("PATH", ""),
 })
 
-token = subprocess.run([DAEMON_EXE, "--print-token"], capture_output=True, text=True).stdout.strip()
+_TOKEN = None
+
+
+def daemon_token():
+    """Fetch the daemon token on first use, not at import.
+
+    This used to run at module scope, which meant importing this file spawned the daemon binary --
+    and, with the ladder loop also at module scope, an `import ladder` ran real cells at real cost.
+    Nothing could test any function in here without paying for it. Both are now behind a call.
+    """
+    global _TOKEN
+    if _TOKEN is None:
+        _TOKEN = subprocess.run(
+            [DAEMON_EXE, "--print-token"], capture_output=True, text=True
+        ).stdout.strip()
+    return _TOKEN
 
 
 def say(text):
     print(text, flush=True)
 
 
+Cell = ingest.Cell
+
+
+def record(cell, run_ids):
+    """Append the cell to the durable ledger as it finishes, not at the end of the ladder.
+
+    A ladder that only prints its results loses them when the terminal closes, which is how the
+    nineteen cells of 2026-08-17/19 came to survive only as prose. A failure to write must not kill
+    a cell that already cost real money, so it is shouted with the row inline and the run carries
+    on — the summary below is still printed either way.
+    """
+    try:
+        ingest.append_cell(ingest.LEDGER, cell, run_ids=run_ids, source="ladder")
+    except Exception as error:  # noqa: BLE001 — losing the row is worse than any write failure
+        say(f"    AVISO: a linha do ledger nao foi escrita ({error}); grava-a a mao: {cell}")
+
+
+def start_approver(project):
+    """The approver that answers the H2/H3 classifier, scoped to this cell's project and nothing else.
+
+    A function rather than inline so a test can stand it in: the real one polls the daemon on 8791
+    and answers every pending approval of the project it is given, which no test should do.
+    """
+    return subprocess.Popen(
+        ["python", "scripts/eval/auto-approve.py", "--project", project,
+         "--interval", "3", "--max", "200"],
+        cwd=ROOT, env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def activate(project, tree):
+    """Put the cell's own project in `shadow`, rooted at the cell's own tree.
+
+    Needed since `a840181`: a worktree run for a project in `off` is refused, and a project this
+    daemon has never heard of reads as off. `shadow`, not `active` — the gate refuses only `off`,
+    and `shadow` is the least the door accepts.
+
+    Checked to be inert before it was written. The scheduler, the repo trigger and the webhook all
+    act only on `.ai/autopilot.yaml` rules, and an eval tree has none: H2 has no file at all (the
+    loader answers `AutopilotRules::default()`), and H3's carries `gate_command` and `schedules: []`
+    and no `repo_triggers`. The project exists for exactly one reason — so this cell's run is let in.
+
+    Raises the daemon's `HTTPError` when activation is refused, so the caller records the cell.
+    """
+    call("/autopilot/state", "POST", {"project_id": project, "mode": "shadow", "project_root": tree})
+
+
+def deactivate(project):
+    """Take the cell's project back out: `off` first, then off the owner's roster. Never raises.
+
+    `off` first because it is what shuts the door, and nothing can hold it up. Then
+    `DELETE /projects/{id}` with no query — the removal the daemon calls the reversible one: nothing
+    on disk is touched, and the history the ledger's run ids point into is kept unless
+    `forget_history` is asked for, which it never is here. Without that second step every worktree
+    cell left a row behind, because the roster lists projects in every mode: the probe of 2026-09-11
+    found `eval-T1-H2` there, switched off, where before it there had been nothing.
+
+    The removal answers 409 while the daemon still holds the run's worktree. The daemon releases it,
+    or its half-hourly sweep marks it removed, and the next cell for the same project takes the row
+    out — so a 409 is reported, not fought, and the project it leaves behind is already `off`. Any
+    failure is shouted with the request that fixes it and the ladder goes on: killing a cell that
+    already cost money over a roster entry would be the worse trade.
+    """
+    off = {"project_id": project, "mode": "off"}
+    try:
+        call("/autopilot/state", "POST", off)
+    except Exception as error:  # noqa: BLE001 — a stuck roster entry is worse than no ladder
+        say(f"    AVISO: nao foi possivel desligar {project} ({error}). "
+            f"Desliga-o: POST /autopilot/state {json.dumps(off)}")
+    try:
+        call(f"/projects/{project}", "DELETE")
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return  # never on the roster, or already off it: the state this wants
+        why = ("o daemon ainda tem a worktree ou o slot do run" if error.code == 409
+               else error.read().decode()[:200])
+        say(f"    AVISO: {project} ficou no roster, desligado (HTTP {error.code}: {why}). "
+            f"Inerte; sai na proxima celula deste projecto. Tira-o: DELETE /projects/{project}")
+    except Exception as error:  # noqa: BLE001
+        say(f"    AVISO: {project} ficou no roster ({error}). Tira-o: DELETE /projects/{project}")
+
+
 def call(path, method="GET", body=None):
     request = urllib.request.Request(
         DAEMON + path,
         data=json.dumps(body).encode() if body is not None else None,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {daemon_token()}", "Content-Type": "application/json"},
         method=method,
     )
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -127,7 +244,19 @@ def sh(args, timeout=2400):
     return subprocess.run(args, cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=timeout)
 
 
+def base_of(output):
+    """The commit `base.sh` laid the tree out from, read off its report line.
+
+    Its last line is `task<TAB>kind<TAB>sha<TAB>dest`. `None` when there is no such line, so the
+    row reads as unrecorded rather than the cell dying after its tree was already built.
+    """
+    lines = output.strip().splitlines()
+    fields = lines[-1].split("\t") if lines else []
+    return fields[2] if len(fields) >= 3 else None
+
+
 def prepare(task, layer, tree):
+    """Lay out the cell's tree and return the base commit it was laid out from."""
     # Sweep both addresses a worktree-mode cell may have left something at: the legacy sibling
     # (`nucleos-worktrees/<task>-<layer>`, what a machine that ran the ladder before the daemon's
     # default moved can still have on disk) and the current one, `<tree>/WORKTREES_SUBDIR`.
@@ -144,6 +273,7 @@ def prepare(task, layer, tree):
     done = sh([GIT_BASH, "scripts/eval/base.sh", "--task", task, "--dest", tree])
     if done.returncode != 0:
         raise SystemExit(f"base.sh failed for {task}: {done.stderr[-400:]}")
+    base = base_of(done.stdout)
     done = sh(["python", "scripts/eval/layer.py", "--layer", layer, "--tree", tree])
     if done.returncode != 0:
         raise SystemExit(f"layer.py failed for {task}/{layer}: {done.stderr[-400:]}")
@@ -156,6 +286,7 @@ def prepare(task, layer, tree):
         built = subprocess.run(["cargo", "test", "-p", "nucleos-core", "--no-run"],
                                cwd=tree, env=ENV, capture_output=True, text=True, timeout=2400)
         say(f"    pre-aquecimento H0: exit={built.returncode} {int(time.time()-started)}s")
+    return base
 
 
 def watch(project, first_id):
@@ -196,7 +327,7 @@ def watch(project, first_id):
             last = (row.get("id"), status)
         if status in TERMINAL:
             break
-        if time.time() - started > 2400:
+        if time.time() - started > WATCH_CEILING:
             say("    watcher: a cadeia passou o tecto da worktree")
             break
         time.sleep(10)
@@ -249,6 +380,8 @@ def requested(argv):
     for arg in argv:
         task, _, layer = arg.partition(":")
         for one in ([layer] if layer else LAYERS):
+            if one in RETIRED:
+                raise SystemExit(f"{one} is retired: {RETIRED[one]}")
             if one not in LAYERS:
                 raise SystemExit(f"unknown layer {one!r} in {arg!r}")
             yield task, one
@@ -272,46 +405,67 @@ def turns_of(run_ids):
         return None
 
 
-results = []
-for task, layer in requested(sys.argv[1:]):
-    prompt = prompt_for(task)
-    if True:
-        project = f"eval-{task}-{layer}"
-        tree = f"{TREES}/{task}-{layer}"
-        say(f"\n===== {task} x {layer} =====")
-        prepare(task, layer, tree)
+def main(argv):
+    results = []
+    for task, layer in requested(argv):
+        prompt = prompt_for(task)
+        if True:
+            project = f"eval-{task}-{layer}"
+            tree = f"{TREES}/{task}-{layer}"
+            say(f"\n===== {task} x {layer} =====")
+            base = prepare(task, layer, tree)
 
-        body = {"prompt": prompt, "cwd": tree, "mode": MODE[layer]}
-        if MODE[layer] == "worktree":
-            body["project_id"] = project
-        try:
-            created = call("/runs", "POST", body)
-        except urllib.error.HTTPError as error:
-            say(f"    recusado: HTTP {error.code} {error.read().decode()[:200]}")
-            results.append((task, layer, "refused", None, None, None))
-            continue
-        first_id = created["id"]
-        say(f"    run {first_id} criado")
+            body = {"prompt": prompt, "cwd": tree, "mode": MODE[layer]}
+            worktree = MODE[layer] == "worktree"
+            if worktree:
+                body["project_id"] = project
+                # After `prepare`, not before: activation inspects the tree `layer.py` just wrote.
+                try:
+                    activate(project, tree)
+                except urllib.error.HTTPError as error:
+                    say(f"    ativacao recusada: HTTP {error.code} {error.read().decode()[:200]}")
+                    results.append((task, layer, "refused", None, None, None))
+                    record(Cell(task, layer, "refused", base=base), [])
+                    continue
+            try:
+                try:
+                    created = call("/runs", "POST", body)
+                except urllib.error.HTTPError as error:
+                    say(f"    recusado: HTTP {error.code} {error.read().decode()[:200]}")
+                    results.append((task, layer, "refused", None, None, None))
+                    record(Cell(task, layer, "refused", base=base), [])
+                    continue
+                first_id = created["id"]
+                say(f"    run {first_id} criado")
 
-        approver = None
-        if layer in ("H2", "H3"):
-            approver = subprocess.Popen(
-                ["python", "scripts/eval/auto-approve.py", "--project", project,
-                 "--interval", "3", "--max", "200"],
-                cwd=ROOT, env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        try:
-            outcome = watch(project if MODE[layer] != "real" else None, first_id)
-        finally:
-            if approver:
-                approver.terminate()
+                approver = start_approver(project) if layer in ("H2", "H3") else None
+                try:
+                    outcome = watch(project if MODE[layer] != "real" else None, first_id)
+                finally:
+                    if approver:
+                        approver.terminate()
+            finally:
+                # The chain is over, or never started: back to off either way, and before scoring,
+                # so the project is in shadow for exactly as long as a run needed it.
+                if worktree:
+                    deactivate(project)
 
-        verdict = score(task, layer, tree, first_id)
-        turns = turns_of(outcome["runs"]) if outcome["runs"] else None
-        say(f"    -> {verdict} | {outcome['wall']}s | ${outcome['cost']} | "
-            f"turnos={turns} | runs={outcome['runs']}")
-        results.append((task, layer, verdict, outcome["wall"], outcome["cost"], turns))
+            # A chain the watcher gave up on is still writing to the tree it would score, so any
+            # verdict read from it is about a half-edited file. It is recorded as what it is.
+            verdict = (score(task, layer, tree, first_id) if outcome["status"] in TERMINAL
+                       else "timed_out")
+            turns = turns_of(outcome["runs"]) if outcome["runs"] else None
+            say(f"    -> {verdict} | {outcome['wall']}s | ${outcome['cost']} | "
+                f"turnos={turns} | runs={outcome['runs']}")
+            results.append((task, layer, verdict, outcome["wall"], outcome["cost"], turns))
+            record(Cell(task, layer, verdict, turns, outcome["cost"], outcome["wall"], base),
+                   outcome["runs"] or [first_id])
 
-say("\n================ RESUMO ================")
-for row in results:
-    say("\t".join("" if v is None else str(v) for v in row))
+    say("\n================ RESUMO ================")
+    for row in results:
+        say("\t".join("" if v is None else str(v) for v in row))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

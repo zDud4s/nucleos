@@ -18,7 +18,19 @@ import { moveFromDrop } from "../calendar/drag";
 import { isHeld, usePendingNotifications, type PendingNotification } from "../data/feed";
 import { dayBounds, monthMatrix, weekOf } from "../lib/calendar-grid";
 import { UI_LOCALE } from "../lib/locale";
-import { Badge, Button, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime } from "../ui";
+import {
+  Badge,
+  Button,
+  ErrorNote,
+  PageHeader,
+  Panel,
+  Quiet,
+  RefusalNote,
+  RelativeTime,
+  Row,
+  Rows,
+  Section,
+} from "../ui";
 import "./calendar.css";
 
 /**
@@ -462,27 +474,32 @@ export function HeldNotifications() {
         staying silent, since silence here is a message that never arrived.
       </p>
       {pending.isError && rows.length === 0 && <NotificationsError error={pending.error} />}
-      {pending.data !== undefined && rows.length === 0 && <p className="calendar-empty">nothing has been held.</p>}
-      {held.length > 0 && (
-        <>
-          <p className="calendar-subhead">held right now</p>
-          <ul className="ui-rows calendar-notifications" aria-label="Held notifications">
-            {held.map((row) => (
-              <NotificationRow key={row.id} row={row} />
-            ))}
-          </ul>
-        </>
-      )}
-      {released.length > 0 && (
-        <>
-          <p className="calendar-subhead">held, then let through</p>
-          <ul className="ui-rows calendar-notifications" aria-label="Released notifications">
-            {released.map((row) => (
-              <NotificationRow key={row.id} row={row} />
-            ))}
-          </ul>
-        </>
-      )}
+      {pending.data !== undefined && rows.length === 0 && <Quiet says="nothing has been held." />}
+      {/*
+        `level={3}`, because the `Panel` above already titles this region with
+        an `h2`. A section heading announced as a sibling of the panel that
+        contains it tells a screen reader the opposite of what the page means.
+      */}
+      <div className="calendar-sections">
+        {held.length > 0 && (
+          <Section label="held right now" level={3}>
+            <Rows label="Held notifications" className="calendar-notifications">
+              {held.map((row) => (
+                <NotificationRow key={row.id} row={row} />
+              ))}
+            </Rows>
+          </Section>
+        )}
+        {released.length > 0 && (
+          <Section label="held, then let through" level={3}>
+            <Rows label="Released notifications" className="calendar-notifications">
+              {released.map((row) => (
+                <NotificationRow key={row.id} row={row} />
+              ))}
+            </Rows>
+          </Section>
+        )}
+      </div>
     </Panel>
   );
 }
@@ -494,10 +511,10 @@ function NotificationsError({ error }: { error: unknown }) {
 
 function NotificationRow({ row }: { row: PendingNotification }) {
   return (
-    <li className="ui-rows-row calendar-notification">
+    <Row className="calendar-notification">
       <span className="calendar-notification-kind">{row.kind}</span>
       <p className="calendar-notification-summary">{row.summary}</p>
       <RelativeTime at={row.queued_at} />
-    </li>
+    </Row>
   );
 }

@@ -16,7 +16,7 @@ import {
   promotionConfirmLabel,
   promotionConsequence,
 } from "../lib/mode";
-import { ModeSwitch } from "../ui";
+import { ErrorNote, Inset, ModeSwitch, Quiet } from "../ui";
 
 /**
  * The settings this app is the author of — the ones that live in the database.
@@ -61,7 +61,15 @@ export function Settings({ projectId }: SettingsProps) {
   );
 }
 
-/** The frame the three blocks share, so they cannot drift into three layouts. */
+/**
+ * The frame the three blocks share, so they cannot drift into three layouts.
+ *
+ * `Inset` is that frame now, and the drift it prevents is wider than this file: the same box was
+ * written out eleven times across `project/` and nineteen more across the page stylesheets, in two
+ * flavours that disagreed on fill, radius and padding. Three blocks that cannot drift into three
+ * layouts is the argument this function was written for; sharing the app's one inset is the same
+ * argument at the scale it actually bites.
+ */
 function Block({
   label,
   children,
@@ -70,10 +78,10 @@ function Block({
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+    <Inset>
       <p className="text-xs uppercase tracking-wide text-text-faint">{label}</p>
       {children}
-    </div>
+    </Inset>
   );
 }
 
@@ -153,9 +161,7 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
       ) : null}
 
       {refused !== null ? (
-        <p className="rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
-          {MODE_REFUSAL_PROSE[refused.code] ?? refused.detail}
-        </p>
+        <ErrorNote>{MODE_REFUSAL_PROSE[refused.code] ?? refused.detail}</ErrorNote>
       ) : null}
     </Block>
   );
@@ -177,7 +183,7 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
 function Ceiling({ project }: { project: ProjectSummary }) {
   const setLimit = useSetWipLimit();
   const limit = project.wip_limit;
-  const open = project.open_proposals;
+  const open = project.open_review_items;
 
   function set(next: number | null) {
     setLimit.mutate({ projectId: project.project_id, limit: next });
@@ -266,10 +272,7 @@ function Classes({ projectId, project }: { projectId: string; project: ProjectSu
           Nothing recorded is not "zero of zero clear". A project that has never run in shadow has
           taken no measurement, and saying it failed one would be inventing a result.
         */
-        <p className="text-xs text-text-faint">
-          Nothing recorded in shadow yet — there is no measurement here, which is not the same as a
-          bad one.
-        </p>
+        <Quiet says="Nothing recorded in shadow yet — there is no measurement here, which is not the same as a bad one." />
       ) : (
         <>
           <div className="flex flex-wrap gap-1.5">

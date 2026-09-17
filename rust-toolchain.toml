@@ -1,12 +1,14 @@
-# Pinned to the GNU host toolchain, not MSVC (the Rust default on Windows).
-# This machine's Visual Studio Build Tools install is missing the Windows SDK
-# (no Lib/Include under "Windows Kits/10") and isn't even registered with
-# vswhere, so linking against the MSVC target fails. The GNU host toolchain
-# ships a fully self-contained linker + import libs (rustup's "rust-mingw"
-# component: lib/rustlib/x86_64-pc-windows-gnu/lib/self-contained/*.a), so it
-# needs no external Windows SDK or Visual Studio install at all. Revisit if a
-# working MSVC toolchain is ever set up and there's a concrete reason to prefer
-# it (e.g. an MSVC-only dependency).
+# The version is pinned here; the HOST is not. A channel carrying a host tuple
+# ("1.97.1-x86_64-pc-windows-gnu") names a toolchain that does not run on macOS or Linux, so it
+# made this file unusable anywhere but Windows.
+#
+# On Windows the GNU host is still the right one on the owner's machine: its Visual Studio Build
+# Tools lack the Windows SDK, so the MSVC target cannot link, while the GNU toolchain ships a
+# self-contained linker (rustup's "rust-mingw" component). That choice now lives on the machine:
+#     rustup set default-host x86_64-pc-windows-gnu
+# run once, reversible with `rustup set default-host x86_64-pc-windows-msvc`. A per-directory
+# `rustup override` was rejected because the daemon opens new worktrees under new paths, each of
+# which would start without it. CI's Windows leg runs the same line (.github/workflows/ci.yml).
 
 # Pinned to an exact version, not to "stable", because "stable" is a MOVING target and rustfmt is
 # not stable across it. Twice in two days a tree that was green when it was committed went red on
@@ -24,5 +26,5 @@
 # fetch a toolchain the machine may not have, and a fresh one without these two fails the gate on
 # its first `cargo fmt`/`cargo clippy` rather than on anything the person wrote.
 [toolchain]
-channel = "1.97.1-x86_64-pc-windows-gnu"
+channel = "1.97.1"
 components = ["clippy", "rustfmt"]

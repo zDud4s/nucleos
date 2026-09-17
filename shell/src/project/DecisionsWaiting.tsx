@@ -1,6 +1,7 @@
 // §spec mapa-do-projeto
 import { isApiRefusal } from "../data/client";
 import { useDecideMapLine, useMapDecisions, type MapDecision } from "../data/project-map";
+import { ErrorNote, Inset, Quiet, SectionTitle } from "../ui";
 
 /**
  * The pile nobody has read, and the one gesture that is missing from it.
@@ -25,11 +26,7 @@ export function DecisionsWaiting({ projectId }: DecisionsWaitingProps) {
   const decisions = useMapDecisions(projectId);
 
   if (decisions.isError) {
-    return (
-      <p className="text-sm text-text-faint">
-        The núcleo could not say what is waiting to be read here.
-      </p>
-    );
+    return <ErrorNote>The núcleo could not say what is waiting to be read here.</ErrorNote>;
   }
   if (decisions.data === undefined) {
     return <p className="text-sm text-text-faint">Reading what is waiting…</p>;
@@ -40,12 +37,18 @@ export function DecisionsWaiting({ projectId }: DecisionsWaitingProps) {
     one is the false confidence this whole mode exists to cure.
   */
   if (decisions.data.length === 0) {
+    /*
+      The sentence stays and the reason behind it moves behind the question, which is what `Quiet`
+      is for: the absence itself is one line, and the two ways of arriving at it are worth reading
+      once rather than on every visit. Neither half is cut — cutting the second would leave
+      "nothing is waiting" reading as a list that failed, which is the confusion above.
+    */
     return (
       <section aria-label="Decisions waiting" className="flex flex-col gap-2">
-        <p className="max-w-prose text-sm text-text-muted">
-          Nothing is waiting to be read. Either no spec has been through a model yet, or every line
-          one proposed has already been answered.
-        </p>
+        <Quiet says="Nothing is waiting to be read.">
+          Either no spec has been through a model yet, or every line one proposed has already been
+          answered.
+        </Quiet>
       </section>
     );
   }
@@ -54,9 +57,9 @@ export function DecisionsWaiting({ projectId }: DecisionsWaitingProps) {
 
   return (
     <section aria-label="Decisions waiting" className="flex flex-col gap-3">
-      <h2 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+      <SectionTitle level={2}>
         Waiting on you
-      </h2>
+      </SectionTitle>
       <p className="max-w-prose text-sm text-text-muted">
         {count} {count === 1 ? "line" : "lines"}, answered one at a time. Nothing here is in the map
         yet, and an extraction nobody has read is counted apart from the decisions that are.
@@ -110,7 +113,7 @@ function Line({
   const decide = useDecideMapLine(projectId);
 
   return (
-    <li className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+    <Inset as="li">
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
         <span className="font-mono text-xs text-text-faint">{number}</span>
         <span className="text-xs text-text-muted">{row.section}</span>
@@ -148,7 +151,7 @@ function Line({
       </div>
 
       {decide.isError ? <Refused error={decide.error} /> : null}
-    </li>
+    </Inset>
   );
 }
 
@@ -161,18 +164,14 @@ function Line({
  */
 function Refused({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return (
-      <p className="rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
-        The núcleo did not answer, so this line is still waiting.
-      </p>
-    );
+    return <ErrorNote>The núcleo did not answer, so this line is still waiting.</ErrorNote>;
   }
 
   return (
-    <p className="rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
+    <ErrorNote>
       {error.status === 404
         ? "That line is not yours to answer now — it has been answered already, or it is gone."
         : error.detail}
-    </p>
+    </ErrorNote>
   );
 }

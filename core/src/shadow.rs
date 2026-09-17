@@ -26,6 +26,16 @@ pub struct ShadowDecision {
     pub human_verdict: Option<String>,
     pub reviewed_at: Option<String>,
     pub created_at: String,
+    /// The raw `tool_response` JSON a `PostToolUse`/`PostToolUseFailure` report carried back, or
+    /// `None` until `record_outcome` fills it in — which, for a `real`-mode run with no row to
+    /// fill, is forever.
+    pub outcome: Option<String>,
+    /// When the outcome above landed, mirroring `reviewed_at` beside `human_verdict`.
+    pub outcome_at: Option<String>,
+    /// Which of the two hooks reported it: `PostToolUse` for a success, `PostToolUseFailure` for
+    /// a failure. The CLI never fires the first for a call that failed (measured against the
+    /// installed CLI, 2.1.260), so this is what tells the two apart in the ledger.
+    pub outcome_event: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, FromRow)]
@@ -85,6 +95,56 @@ pub async fn record_decision(
     .await?;
 
     Ok(result.last_insert_rowid())
+}
+
+/// Records what a tool call actually DID, against the decision already taken about it.
+///
+/// **UPDATE-only, and this is the whole of the design.** `record_decision` above is called only
+/// for `shadow` and `worktree` modes (`hooks.rs`), so a `real`-mode run has no `shadow_decisions`
+/// row at all for this tool call. INSERTing one here — the natural instinct for a function named
+/// "record" — would put a decision nobody took into `list_unreviewed` and into `scoreboard`: a
+/// row with an outcome and no decision would look exactly like a shadow decision that was never
+/// reviewed. Matching zero rows is therefore success, not failure — it means this run was never
+/// being shadowed, and there is nothing here for this call to complete. Callers that want to know
+/// whether anything was actually recorded read `rows_affected` off the `Ok(())` — none of the
+/// current ones need to, so it is swallowed rather than returned.
+///
+/// Matched on `(run_id, tool_name, tool_input)` — the same identity `PreToolUse` classified under
+/// — AND `outcome IS NULL`, so a second, later `PostToolUse` for the identical command updates
+/// its OWN row instead of overwriting whichever matching row happens to sort first. Ordered by
+/// `id ASC` and limited to one: outcomes arrive in the same order their decisions were taken, so
+/// the OLDEST still-unfilled row sharing the identity is always the one this outcome belongs to.
+/// `DESC` used to sit here instead, and read as correct only because `auth.rs` and `hooks.rs` both
+/// hold a run to at most one tool call in flight — an invariant this function does not own and,
+/// with `ASC`, no longer needs: ordering by age is right whether that call happens to be the only
+/// one pending or one of several.
+pub async fn record_outcome(
+    pool: &SqlitePool,
+    run_id: i64,
+    tool_name: &str,
+    tool_input: &Value,
+    tool_response: &Value,
+    outcome_event: &str,
+) -> sqlx::Result<()> {
+    let outcome_at = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE shadow_decisions SET outcome = ?, outcome_at = ?, outcome_event = ?
+         WHERE id = (
+             SELECT id FROM shadow_decisions
+             WHERE run_id = ? AND tool_name = ? AND tool_input = ? AND outcome IS NULL
+             ORDER BY id ASC LIMIT 1
+         )",
+    )
+    .bind(tool_response.to_string())
+    .bind(outcome_at)
+    .bind(outcome_event)
+    .bind(run_id)
+    .bind(tool_name)
+    .bind(tool_input.to_string())
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 /// The review queue a human actually works from: unreviewed decisions from `shadow`-mode runs
@@ -519,6 +579,167 @@ mod tests {
         assert_eq!(row.human_verdict, None);
         assert_eq!(row.reviewed_at, None);
         chrono::DateTime::parse_from_rfc3339(&row.created_at).unwrap();
+        // Nothing to join yet — `PostToolUse` has not fired for this call.
+        assert_eq!(row.outcome, None);
+        assert_eq!(row.outcome_at, None);
+        assert_eq!(row.outcome_event, None);
+    }
+
+    /// The ledger's whole point: one `Bash` call, its decision AND its outcome, on the same row.
+    #[tokio::test]
+    async fn record_outcome_joins_a_bash_calls_decision_and_result() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let tool_input = json!({"command": "git push origin main"});
+
+        let id = record_decision(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &classification("allow", "push-merge-deploy"),
+            "digest",
+        )
+        .await
+        .unwrap();
+
+        let tool_response = json!({"success": true, "exit_code": 0});
+        record_outcome(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &tool_response,
+            "PostToolUse",
+        )
+        .await
+        .unwrap();
+
+        let row: ShadowDecision = sqlx::query_as("SELECT * FROM shadow_decisions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // The decision half, untouched by recording the outcome.
+        assert_eq!(row.decision, "allow");
+        // The outcome half, now filled in.
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some(tool_response.to_string().as_str())
+        );
+        assert_eq!(row.outcome_event.as_deref(), Some("PostToolUse"));
+        chrono::DateTime::parse_from_rfc3339(row.outcome_at.as_deref().unwrap()).unwrap();
+    }
+
+    /// Two pending decisions for the identical `(tool_name, tool_input)`, before either outcome
+    /// lands: the ordering has to pick between them, not just find "a" row. Outcomes arrive in the
+    /// same order the decisions were taken, so the first outcome belongs to the first decision and
+    /// the second to the second — never the reverse, which is what `DESC` used to produce.
+    #[tokio::test]
+    async fn record_outcome_matches_the_oldest_unfilled_decision_of_two_identical_ones() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let tool_input = json!({"command": "git push origin main"});
+
+        let first_id = record_decision(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &classification("allow", "push-merge-deploy"),
+            "digest",
+        )
+        .await
+        .unwrap();
+        let second_id = record_decision(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &classification("allow", "push-merge-deploy"),
+            "digest",
+        )
+        .await
+        .unwrap();
+
+        let first_response = json!({"success": true, "exit_code": 0});
+        record_outcome(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &first_response,
+            "PostToolUse",
+        )
+        .await
+        .unwrap();
+
+        let second_response = json!({"success": false, "exit_code": 1});
+        record_outcome(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &second_response,
+            "PostToolUseFailure",
+        )
+        .await
+        .unwrap();
+
+        let first: ShadowDecision = sqlx::query_as("SELECT * FROM shadow_decisions WHERE id = ?")
+            .bind(first_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let second: ShadowDecision = sqlx::query_as("SELECT * FROM shadow_decisions WHERE id = ?")
+            .bind(second_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // The first decision taken gets the first outcome to arrive, not the second.
+        assert_eq!(
+            first.outcome.as_deref(),
+            Some(first_response.to_string().as_str())
+        );
+        assert_eq!(first.outcome_event.as_deref(), Some("PostToolUse"));
+        // The second decision taken gets the second outcome, on its own row.
+        assert_eq!(
+            second.outcome.as_deref(),
+            Some(second_response.to_string().as_str())
+        );
+        assert_eq!(second.outcome_event.as_deref(), Some("PostToolUseFailure"));
+    }
+
+    /// The half of the invariant that keeps `record_outcome` from inventing evidence: a `real`-mode
+    /// run has no `shadow_decisions` row at all (`record_decision` is never called for it), so an
+    /// outcome arriving for one must record nothing — not fail, and not create a row that would
+    /// make `list_unreviewed`/`scoreboard` think a decision was taken when none was.
+    #[tokio::test]
+    async fn an_outcome_with_no_matching_decision_records_nothing_and_does_not_fail() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let tool_input = json!({"command": "git push origin main"});
+
+        record_outcome(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &json!({"success": true}),
+            "PostToolUse",
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shadow_decisions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "no decision row existed, so none must be invented"
+        );
     }
 
     #[tokio::test]

@@ -33,6 +33,11 @@
 //!   which the núcleo has never opened. A glob would have claimed a workflow's config as the
 //!   núcleo's — the precise confusion §7.3 of the design introduced the registry to end.
 //!
+//! Those seven machine-level files are not unowned, they are owned by the DAEMON, and they have
+//! their own table in [`crate::machine_config`] — same shape, same membership rule, different
+//! root. What this module must never do is claim one of them, and a test in that module asserts
+//! the two registries stay disjoint.
+//!
 //! So: `.ai/autopilot.yaml`, and `.ai/workflows.yaml` beside it once there was a module that parses
 //! that one too. That is not a thin registry, it is an accurate one, and the first row is the
 //! load-bearing one — see below.
@@ -197,7 +202,7 @@ pub fn claims_for(project_root: &std::path::Path, library_root: &std::path::Path
 /// because resolving it would necessarily escape, but because this module has no business deciding
 /// that — the path guard refuses traversal first and with its own status code, and an ownership
 /// answer for a path with `..` in it would be an answer about a file nobody named.
-fn normalise(rel: &str) -> Option<String> {
+pub(crate) fn normalise(rel: &str) -> Option<String> {
     let rel = rel.trim();
     if rel.is_empty() || rel.contains('\\') || rel.starts_with('/') {
         return None;

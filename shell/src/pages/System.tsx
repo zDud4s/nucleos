@@ -45,20 +45,25 @@ import {
   ConfirmButton,
   CopyOnce,
   ErrorNote,
+  Inset,
   PageHeader,
   Panel,
   Quiet,
   RefusalNote,
   RelativeTime,
-  StateBadge,
+  Row,
+  Rows,
   Section,
+  StateBadge,
 } from "../ui";
+import { MachineSettings } from "./MachineSettings";
+import { NotificationsView } from "./NotificationsView";
 import "./system.css";
 
 /**
  * System — the machine's own state, not a project's.
  *
- * Three tabs. S1 and S2 built the health view (the daemon's own subsystem
+ * Five tabs. S1 and S2 built the health view (the daemon's own subsystem
  * readout and the sidecars' own liveness) plus, on top of it, the project
  * brakes and the editable budget; and the whole backups view (snapshots,
  * staged restore and the PII tally). Health data is read off
@@ -66,23 +71,38 @@ import "./system.css";
  * the app, which every pillar's own health reading (Browser's included)
  * narrows rather than asking again.
  *
- * This packet (S3) builds the tokens view: minting and revoking API tokens
- * with a show-once secret, plus a config index reading the three `/config/*`-
- * shaped routes that actually exist and naming the four areas that have none.
+ * S3 built the tokens view: minting and revoking API tokens with a show-once
+ * secret, plus a config index reading the three `/config/*`-shaped routes that
+ * existed — and naming, honestly, the four areas that had no route at all.
+ *
+ * The settings view is what answers that confession. `GET`/`POST
+ * /config/machine` now serve the whole of this machine's settings — the nine
+ * `.ai/*.yaml` whose author is the daemon rather than any project — so every
+ * pillar can be configured here instead of in a text editor followed by a
+ * restart. The config index above it stays, narrowed to what it is actually
+ * good at: showing what the daemon is RUNNING, which is a different reading
+ * from what is on disk whenever the two have been allowed to drift.
+ *
+ * The notifications tab is the newest, and belongs here for the same reason the
+ * budget does: it is the machine's own behaviour, not a project's. It edits
+ * which feed kinds still reach Telegram — a preference the núcleo stores and
+ * the sidecar obeys, so nothing on this page decides anything by itself.
  */
 
-/** The three tabs, in the order they read. */
-const VIEWS = ["health", "backups", "tokens"] as const;
+/** The five tabs, in the order they read. */
+const VIEWS = ["health", "backups", "tokens", "notifications", "settings"] as const;
 export type SystemView = (typeof VIEWS)[number];
 
 const VIEW_LABEL: Record<SystemView, string> = {
   health: "Health",
   backups: "Backups",
   tokens: "Tokens",
+  notifications: "Notifications",
+  settings: "Settings",
 };
 
 /**
- * A `$view` param as one of the three.
+ * A `$view` param as one of the five.
  *
  * Falls back to `health` rather than refusing: a route parameter is a string,
  * anybody can type one, and a typo in a path is not a missing page.
@@ -110,6 +130,8 @@ export function System() {
         )}
         {view === "backups" && <BackupsView />}
         {view === "tokens" && <TokensView />}
+        {view === "notifications" && <NotificationsView />}
+        {view === "settings" && <MachineSettings />}
       </div>
     </>
   );
@@ -155,6 +177,28 @@ export function headlineNodeFor(readout: HealthReadout | undefined): ReactNode {
   return <span className="ui-wrong">{parts.join(", ")}</span>;
 }
 
+/**
+ * The three views — links, and deliberately **not** `Tabs` from `../ui`.
+ *
+ * The primitive is the app's one tabs implementation and the reason to reach
+ * for it is real: `Bench` gets Radix's roving focus and its `aria-controls`
+ * wiring, and a second hand-rolled tab bar is how two of them come to behave
+ * differently. It cannot carry this one, and the difference is not cosmetic.
+ * These are routes rather than panels: every trigger here is a real `<a href>`
+ * to `/system/<view>`, which opens in a new window, is announced as a link, and
+ * marks the current one with `aria-current="page"`. Radix's `Trigger` puts
+ * `role="tab"` on whatever it renders — `asChild` and a `Link` included — so
+ * adopting it would replace the link role, swap `aria-current` for
+ * `aria-selected`, collapse three tab stops into one roving one, and leave
+ * `aria-controls` pointing at panels that exist only for the route you are
+ * already on. A tab widget switches panels inside a page. This switches pages.
+ *
+ * What was adopted is the rule underneath the appearance: the current tab is
+ * marked in `--text`, the way `.ui-tab[data-state="active"]` marks its own.
+ * The border used to be `--accent`, which the system reserves for the wordmark,
+ * links and the focus ring — a selection wearing the brand colour reads as a
+ * status.
+ */
 function ViewTabs({ view }: { view: SystemView }) {
   return (
     <nav className="sy-tabs" aria-label="System views">
@@ -212,11 +256,11 @@ function HealthReadoutPanel({
         </p>
       )}
       {health.data !== undefined && !isAggregateTimeout(health.data) && (
-        <ul className="ui-rows" aria-label="Subsystems">
+        <Rows label="Subsystems">
           {[...health.data.subsystems].sort(bySubsystemHealth).map((row) => (
             <SubsystemRow key={row.name} row={row} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
@@ -225,14 +269,14 @@ function HealthReadoutPanel({
 function SubsystemRow({ row }: { row: SubsystemReadout }) {
   const key = sidecarKeyOf(row.name);
   return (
-    <li className="ui-rows-row sy-subsystem-row">
+    <Row className="sy-subsystem-row">
       <span className="sy-subsystem-name">{row.name}</span>
       <StateBadge domain="pillar" state={row.status} />
       <span className="sy-meta">{row.reason !== undefined && <>reason: {row.reason}</>}</span>
       <div className="sy-subsystem-action">
         {key !== null && row.status === "down" && <RestartSidecar name={key} subject={row.name} />}
       </div>
-    </li>
+    </Row>
   );
 }
 
@@ -316,7 +360,7 @@ function SidecarCardsPanel({
 
 function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
   return (
-    <li className="sy-sidecar">
+    <Inset as="li">
       <div className="sy-sidecar-head">
         <span className="sy-sidecar-name">{sidecar.name}</span>
         <span className="sy-sidecar-state">{sidecar.state}</span>
@@ -357,7 +401,7 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
           )}
         </p>
       )}
-    </li>
+    </Inset>
   );
 }
 
@@ -376,32 +420,23 @@ function ScopedKillsPanel() {
   const projects = useProjects();
   const kills = useScopedKills();
   const setKill = useSetScopedKill();
+  const noProjects = projects.data !== undefined && projects.data.length === 0;
 
   return (
     <Panel title="Project brakes">
-      <p className="sy-note">
-        A project brake holds what that project would START; it stops nothing
-        already running. An absent row means the daemon was never told, which
-        reads as released. The trigger brakes — scheduled rules, repo triggers,
-        e-mail triage — live on <Link to="/autopilot">Autopilot</Link>.
-      </p>
-      {kills.isError && kills.data === undefined && (
-        <SystemListError error={kills.error} what="the project brakes" />
-      )}
-      {!kills.isError && kills.data === undefined && (
-        <p className="sy-loading">reading the project brakes…</p>
-      )}
+      <PanelNote empty={noProjects} says="no project is registered.">
+        A project brake holds what that project would START; it stops nothing already running. An
+        absent row means the daemon was never told, which reads as released. The trigger brakes —
+        scheduled rules, repo triggers, e-mail triage — live on <Link to="/autopilot">Autopilot</Link>.
+      </PanelNote>
+      {kills.isError && kills.data === undefined && <SystemListError error={kills.error} what="the project brakes" />}
+      {!kills.isError && kills.data === undefined && <p className="sy-loading">reading the project brakes…</p>}
       {projects.isError && projects.data === undefined && (
         <SystemListError error={projects.error} what="the projects" />
       )}
-      {!projects.isError && projects.data === undefined && (
-        <p className="sy-loading">reading the projects…</p>
-      )}
-      {projects.data !== undefined && projects.data.length === 0 && (
-        <p className="sy-empty">no project is registered.</p>
-      )}
+      {!projects.isError && projects.data === undefined && <p className="sy-loading">reading the projects…</p>}
       {projects.data !== undefined && projects.data.length > 0 && (
-        <ul className="ui-rows" aria-label="Project brakes">
+        <Rows label="Project brakes">
           {projects.data.map((project) => {
             const engaged = scopeEngaged(
               kills.data,
@@ -409,13 +444,8 @@ function ScopedKillsPanel() {
               project.project_id,
             );
             return (
-              <li
-                className="ui-rows-row sy-project-brake-row"
-                key={project.project_id}
-              >
-                <span className="sy-project-brake-name">
-                  {project.project_id}
-                </span>
+              <Row className="sy-project-brake-row" key={project.project_id}>
+                <span className="sy-project-brake-name">{project.project_id}</span>
                 <StateBadge domain="brake" state={engaged ? "held" : "released"} />
                 <Button
                   variant="ghost"
@@ -433,10 +463,10 @@ function ScopedKillsPanel() {
                     ? `Release ${project.project_id}`
                     : `Hold ${project.project_id}`}
                 </Button>
-              </li>
+              </Row>
             );
           })}
-        </ul>
+        </Rows>
       )}
       {setKill.isError && (
         <ErrorNote>
@@ -707,13 +737,13 @@ function BackupsView() {
 function BackupsPanel() {
   const backups = useBackups();
   const takeBackup = useTakeBackup();
+  const noBackups = backups.data !== undefined && backups.data.length === 0;
 
   return (
     <Panel title="Backups">
-      <p className="sy-note">
-        Staging a restore changes nothing yet — the swap happens the next time
-        the núcleo starts.
-      </p>
+      <PanelNote empty={noBackups} says="no backup has been taken yet.">
+        Staging a restore changes nothing yet — the swap happens the next time the núcleo starts.
+      </PanelNote>
       <div className="sy-backups-actions">
         <Button
           variant="ghost"
@@ -734,9 +764,6 @@ function BackupsPanel() {
       {!backups.isError && backups.data === undefined && (
         <p className="sy-loading">reading the backups…</p>
       )}
-      {backups.data !== undefined && backups.data.length === 0 && (
-        <p className="sy-empty">no backup has been taken yet.</p>
-      )}
       {backups.data !== undefined && backups.data.length > 0 && (
         <ul className="sy-backups" aria-label="Backups">
           {backups.data.map((backup) => (
@@ -752,7 +779,7 @@ function BackupRow({ backup }: { backup: BackupInfo }) {
   const stageRestore = useStageRestore();
 
   return (
-    <li className="sy-backup">
+    <Inset as="li">
       <div className="sy-backup-head">
         <span className="sy-backup-name">{backup.name}</span>
         <span className="sy-backup-meta">
@@ -775,7 +802,7 @@ function BackupRow({ backup }: { backup: BackupInfo }) {
         </p>
       )}
       {stageRestore.isError && <RestoreError error={stageRestore.error} />}
-    </li>
+    </Inset>
   );
 }
 
@@ -821,15 +848,9 @@ function PiiObservations() {
 
   return (
     <Panel title="PII observations">
-      {pii.isError && pii.data === undefined && (
-        <SystemListError error={pii.error} what="the PII tally" />
-      )}
-      {!pii.isError && pii.data === undefined && (
-        <p className="sy-loading">reading…</p>
-      )}
-      {pii.data !== undefined && pii.data.length === 0 && (
-        <p className="sy-empty">nothing recorded.</p>
-      )}
+      {pii.isError && pii.data === undefined && <SystemListError error={pii.error} what="the PII tally" />}
+      {!pii.isError && pii.data === undefined && <p className="sy-loading">reading…</p>}
+      {pii.data !== undefined && pii.data.length === 0 && <Quiet says="nothing recorded." />}
       {pii.data !== undefined && pii.data.length > 0 && (
         <table className="sy-pii-table">
           <thead>
@@ -963,7 +984,7 @@ function TokensPanel() {
         <p className="sy-loading">reading the tokens…</p>
       )}
       {tokens.data !== undefined && tokens.data.length === 0 && (
-        <p className="sy-empty">no token has been minted.</p>
+        <Quiet says="no token has been minted." />
       )}
       {tokens.data !== undefined && tokens.data.length > 0 && (
         <ul className="sy-tokens" aria-label="API tokens">
@@ -999,7 +1020,7 @@ function TokenRow({ token }: { token: ApiTokenSummary }) {
   const revokeToken = useRevokeToken();
 
   return (
-    <li className="sy-token">
+    <Inset as="li">
       <div className="sy-token-head">
         <span className="sy-token-name">{token.name}</span>
         <Badge tone="info">{token.level}</Badge>
@@ -1015,7 +1036,7 @@ function TokenRow({ token }: { token: ApiTokenSummary }) {
         onConfirm={() => revokeToken.mutate(token.name)}
       />
       {revokeToken.isError && <RevokeError error={revokeToken.error} />}
-    </li>
+    </Inset>
   );
 }
 
@@ -1038,16 +1059,19 @@ function RevokeError({ error }: { error: unknown }) {
 /* ------------------------------------------------------------------- config -- */
 
 /**
- * Areas with no configuration route at all, verified against `core/src/http.rs`'s
- * `/config/*` set plus the two asymmetric paths above it — `/config/email` is
- * the only `/config/*` route, and nothing serves web, browser, council or
- * models. Named rather than requested: there is nothing to ask for.
- */
-const UNCONFIGURED_AREAS = ["web", "browser", "council", "models"] as const;
-
-/**
- * Readouts for the config routes that exist, and an honest list of the ones
- * that do not.
+ * What the pillars are actually DOING, as the daemon has them in memory.
+ *
+ * These three stay here, and stay read-only, now that the Settings tab can
+ * write the files they come from. They are not the same reading and neither
+ * replaces the other: this is the parsed and running view — clamps applied,
+ * `armed` computed, a malformed file already fallen back to defaults — where
+ * the Settings tab shows the bytes on disk. The two disagree exactly when
+ * somebody has edited a file and not restarted, and that gap is the thing
+ * worth being able to see rather than the thing to design away.
+ *
+ * The panel that used to sit here naming `web`, `browser`, `council` and
+ * `models` as areas with no configuration route is gone, because that is no
+ * longer true of any of them.
  */
 function ConfigIndex() {
   return (
@@ -1055,7 +1079,6 @@ function ConfigIndex() {
       <EmailConfigPanel />
       <VoiceConfigPanel />
       <CalendarConfigPanel />
-      <UnconfiguredAreasPanel />
     </>
   );
 }
@@ -1215,33 +1238,30 @@ function CalendarConfigFacts({ config }: { config: CalendarConfig }) {
   );
 }
 
-/**
- * The four areas the núcleo exposes no configuration route for at all — named
- * plainly, the same way the Teams page names its missing routes, rather than
- * drawing a request that would only 404.
- */
-function UnconfiguredAreasPanel() {
-  return (
-    <Panel title="Not exposed by the núcleo">
-      <p className="sy-note">
-        These areas have no configuration route in the núcleo — there is nothing
-        here to read or write, and this page does not ask.
-      </p>
-      <ul
-        className="sy-unconfigured"
-        aria-label="Areas with no configuration route"
-      >
-        {UNCONFIGURED_AREAS.map((area) => (
-          <li key={area} className="sy-unconfigured-area">
-            {area}
-          </li>
-        ))}
-      </ul>
-    </Panel>
-  );
-}
-
 /* ------------------------------------------------------------------- shared -- */
+
+/**
+ * A panel's own prose — in front of a list that has something in it, one click
+ * behind the line when it has not.
+ *
+ * The sentences are the same either way and what changes is where a reader
+ * meets them. Above a populated list the note is what somebody needs *before*
+ * pressing a button: that a brake holds what a project would start rather than
+ * stopping what it is doing, that staging a restore changes nothing until the
+ * núcleo restarts. Above an empty one it is a paragraph explaining rows that
+ * are not there. Keeping it rather than cutting it is the point of the
+ * disclosure — "no project is registered" on its own reads as a list that
+ * failed to load, and the paragraph is what makes the emptiness a fact.
+ *
+ * Not every note belongs behind one. `TokensPanel`'s explains the mint form
+ * above it and not the list below, and the moment the list is empty is exactly
+ * when somebody is about to mint their first token and most needs the three
+ * levels spelled out.
+ */
+function PanelNote({ empty, says, children }: { empty: boolean; says: string; children: ReactNode }) {
+  if (empty) return <Quiet says={says}>{children}</Quiet>;
+  return <p className="sy-note">{children}</p>;
+}
 
 function SystemListError({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;

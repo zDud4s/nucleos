@@ -10,7 +10,17 @@ import {
   type TeamView,
   type TriggerRequest,
 } from "../data/teams";
-import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, RelativeTime, StateBadge } from "../ui";
+import {
+  Button,
+  ConfirmButton,
+  ErrorNote,
+  Inset,
+  Panel,
+  Quiet,
+  RefusalNote,
+  RelativeTime,
+  StateBadge,
+} from "../ui";
 import { daemonProse } from "./prose";
 
 /**
@@ -77,7 +87,7 @@ export function Routines({ team, rules }: RoutinesProps) {
           A rule cannot be edited — the núcleo has no route for it. Duplicate one to write a
           variant, then delete the original.
         </p>
-        {rules.length === 0 && <p className="teams-empty">no rule is written for this team.</p>}
+        {rules.length === 0 && <Quiet says="no rule is written for this team." />}
         {rules.length > 0 && (
           <ul className="teams-rules" aria-label="Rules">
             {rules.map((rule) => (
@@ -114,7 +124,7 @@ function RuleRow({
   const armed = rule.enabled !== 0;
 
   return (
-    <li className="teams-rule">
+    <Inset as="li">
       <div className="teams-rule-head">
         <span className="teams-rule-name">{rule.name}</span>
         <StateBadge domain="setting" state={armed ? "armed" : "disarmed"} />
@@ -166,7 +176,7 @@ function RuleRow({
           onConfirm={() => del.mutate(rule.id)}
         />
       </div>
-    </li>
+    </Inset>
   );
 }
 

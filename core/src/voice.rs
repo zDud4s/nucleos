@@ -96,6 +96,11 @@ pub enum Kind {
     /// conversation turn is a question addressed to the agent. Every difference below follows from
     /// that one — no cleanup, no row of its own, and an answer.
     Conversation,
+    /// One segment of a turn somebody has not finished: transcribed, judged, and delivered nowhere.
+    ///
+    /// The fourth `Kind` and not a flag because it changes what the recording IS: part of a sentence
+    /// whose speaker has not finished, so it gets no answer, no row, and no cleanup.
+    Segment,
 }
 
 impl Kind {
@@ -104,6 +109,7 @@ impl Kind {
             Kind::Dictation => "dictation",
             Kind::Memo => "memo",
             Kind::Conversation => "conversation",
+            Kind::Segment => "segment",
         }
     }
 }
@@ -154,6 +160,9 @@ pub struct VoiceRuntime {
     /// actually exists. A hotkey that records and then fails is worse than one that was never armed.
     pub stt_command: String,
     pub hints: Vec<String>,
+    pub closing_words: Vec<String>,
+    pub discard_phrase: String,
+    pub confirm_words: Vec<String>,
     pub cleanup_prompt: String,
     pub retain_dictations_days: u8,
     /// The two chords, carried through so `GET /voice/config` can report them.
@@ -190,6 +199,9 @@ impl Default for VoiceRuntime {
             armed: false,
             stt_command: String::new(),
             hints: Vec::new(),
+            closing_words: vec!["câmbio".into()],
+            discard_phrase: "risca isso".into(),
+            confirm_words: vec!["sim".into()],
             cleanup_prompt: crate::config::DEFAULT_CLEANUP_PROMPT.to_string(),
             retain_dictations_days: 7,
             hotkey: String::new(),
@@ -211,6 +223,9 @@ impl VoiceRuntime {
             armed: config.armed(),
             stt_command: config.stt_command.clone(),
             hints: config.hints.clone(),
+            closing_words: config.closing_words.clone(),
+            discard_phrase: config.discard_phrase.clone(),
+            confirm_words: config.confirm_words.clone(),
             cleanup_prompt: config.cleanup_prompt.clone(),
             retain_dictations_days: config.retain_dictations_days,
             hotkey: config.hotkey.clone(),
@@ -289,6 +304,89 @@ fn fold_for_hint(word: &str) -> String {
             other => other,
         })
         .collect()
+}
+
+/// PURE: the form a CONTROL word is compared in — the hint fold, plus the punctuation a
+/// transcriber puts at the end of an utterance.
+///
+/// **Separate from `fold_for_hint` on purpose.** Hints go through that function unmodified, and a
+/// hint like `C#` folds to `c#`, which no word from `apply_hints` can equal — inert, which is what
+/// somebody who wrote it expects. Trimming punctuation there would fold it to `c` and rewrite every
+/// standalone "c" in every dictation. Control words need the trim; hints must not have it.
+///
+/// `!c.is_alphanumeric()` rather than `is_ascii_punctuation`, because whisper emits `…` and `»`.
+fn fold_control(word: &str) -> String {
+    fold_for_hint(word)
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
+        .to_string()
+}
+
+/// What one transcribed segment does to the turn it belongs to.
+///
+/// `Serialize` and lowercase because this crosses the wire to `shell/src/lib/turn-assembly.ts`; a
+/// spelling mismatch there is a runtime surprise and nothing at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    /// Accumulate and keep listening. Silence alone always lands here — that is the whole change.
+    Continues,
+    /// Deliver everything accumulated, this segment included, minus the word itself.
+    Closes,
+    /// Ask to throw away everything since the last delivery.
+    Discards,
+    /// Yes to the question a `Discards` asked.
+    Confirms,
+}
+
+/// PURE: whether a segment ended the turn, asked to discard it, confirmed a discard, or none.
+///
+/// **Order matters and is fixed:** discard, then closing, then confirm. A spelling that somebody
+/// puts in two lists resolves as the earlier one with no diagnostic, and Task 11 will be adding
+/// measured spellings to `closing_words` — so the precedence is written down rather than left to
+/// whoever reads the `if`s in order.
+///
+/// **Whole tokens, last position only, no fuzzy matching** — and the asymmetry is the argument. A
+/// missed closing word leaves the turn open and costs a repetition; a false positive sends half a
+/// thought and cannot be taken back by speaking. The strict side is the default and stays it.
+pub fn segment_verdict(
+    segment: &str,
+    closing: &[String],
+    discard: &str,
+    confirm: &[String],
+) -> Verdict {
+    let tokens: Vec<String> = segment.split_whitespace().map(fold_control).collect();
+    let discard_tokens: Vec<String> = discard.split_whitespace().map(fold_control).collect();
+    if !discard_tokens.is_empty() && tokens.ends_with(&discard_tokens) {
+        return Verdict::Discards;
+    }
+    let Some(last) = tokens.last() else {
+        return Verdict::Continues;
+    };
+    if closing.iter().any(|w| fold_control(w) == *last) {
+        return Verdict::Closes;
+    }
+    if tokens.len() == 1 && confirm.iter().any(|w| fold_control(w) == *last) {
+        return Verdict::Confirms;
+    }
+    Verdict::Continues
+}
+
+/// PURE: the segment without the control word that ended it.
+///
+/// Drops the last token ONLY when it is one of `closing` — handed any other text it returns it
+/// whole, because a function that truncated unconditionally would eat a word off every segment it
+/// was ever called on by mistake.
+pub fn strip_control_tail(segment: &str, closing: &[String]) -> String {
+    let mut tokens: Vec<&str> = segment.split_whitespace().collect();
+    let ends_with_control = tokens.last().is_some_and(|last| {
+        closing
+            .iter()
+            .any(|w| fold_control(w) == fold_control(last))
+    });
+    if ends_with_control {
+        tokens.pop();
+    }
+    tokens.join(" ")
 }
 
 /// PURE: the exact text handed to the cleanup model.
@@ -763,6 +861,31 @@ pub async fn converse(
     }
 }
 
+#[derive(serde::Serialize)]
+pub struct SegmentTranscribed {
+    /// Already stripped of the control word — the shell joins what it is given and never edits it.
+    pub text: String,
+    pub verdict: Verdict,
+}
+
+/// One segment of a turn somebody has not finished: transcribed, judged, and delivered nowhere.
+pub async fn segment(
+    state: &AppState,
+    wav: &[u8],
+    extension: &str,
+    duration: Duration,
+) -> Result<SegmentTranscribed, CaptureError> {
+    let text = heard(&state.voice, wav, extension, duration).await?;
+    let verdict = segment_verdict(
+        &text,
+        &state.voice.closing_words,
+        &state.voice.discard_phrase,
+        &state.voice.confirm_words,
+    );
+    let text = strip_control_tail(&text, &state.voice.closing_words);
+    Ok(SegmentTranscribed { text, verdict })
+}
+
 #[derive(Deserialize)]
 pub struct CaptureQuery {
     pub kind: Kind,
@@ -772,7 +895,7 @@ pub struct CaptureQuery {
     /// Resolved through `transcribe::extension_for`, which answers from an allowlist rather than
     /// echoing this string — the value names a file this process creates.
     pub format: Option<String>,
-    /// Which conversation a `kind=conversation` recording belongs to. Ignored by the other two kinds,
+    /// Which conversation a `kind=conversation` recording belongs to. Ignored by the other kinds,
     /// and required by that one — see `CaptureError::NoChat` for why it has no default.
     pub chat_id: Option<String>,
 }
@@ -823,6 +946,15 @@ pub async fn post_capture(
             Err(error) => capture_error(error).into_response(),
         };
     }
+    // A segment is an unfinished part of a turn, so it is judged and returned without cleanup,
+    // storage, or delivery. It is cancellable: nobody wants the transcript of a half-sentence they
+    // walked away from.
+    if query.kind == Kind::Segment {
+        return match segment(&state, &wav, extension, duration).await {
+            Ok(transcribed) => axum::Json(transcribed).into_response(),
+            Err(error) => capture_error(error).into_response(),
+        };
+    }
 
     let work = capture_and_record(
         state.pool.clone(),
@@ -848,11 +980,11 @@ pub async fn post_capture(
             Ok(outcome) => outcome,
             Err(status) => return status.into_response(),
         },
-        // A dictation dies with its request. A conversation turn would too — but none reaches here:
-        // `Kind::Conversation` returned above, before `work` was built. The arm is written out rather
-        // than folded into a `_` so that a fourth kind is a compile error here instead of silently
-        // inheriting a cancellation policy nobody chose for it.
-        Kind::Dictation | Kind::Conversation => work.await,
+        // A dictation dies with its request. Conversation turns and unfinished segments do too — but
+        // neither reaches here, because both returned above before `work` was built. The arm is
+        // written out rather than folded into a `_` so that a new kind is a compile error here instead
+        // of silently inheriting a cancellation policy nobody chose for it.
+        Kind::Dictation | Kind::Conversation | Kind::Segment => work.await,
     };
 
     match outcome {
@@ -1185,6 +1317,83 @@ mod tests {
 
     fn hints() -> Vec<String> {
         vec!["núcleo".to_string(), "NucleOS".to_string()]
+    }
+
+    #[test]
+    fn the_defaults_name_the_three_control_words() {
+        let config = crate::config::VoiceConfig::default();
+        assert_eq!(config.closing_words, vec!["câmbio".to_string()]);
+        assert_eq!(config.discard_phrase, "risca isso");
+        assert_eq!(config.confirm_words, vec!["sim".to_string()]);
+    }
+
+    #[test]
+    fn a_configured_closing_word_reaches_the_runtime() {
+        // The failure this pins is silent, and this file has already had it once: `from_config` ends
+        // with `..Self::default()`, so a field added to the struct and forgotten here compiles clean,
+        // passes every test, and leaves the config file inert. `voice.rs`'s own comment records the
+        // last time — "both keys existed in the config and nothing anywhere read either one".
+        let config = crate::config::VoiceConfig {
+            closing_words: vec!["terminado".to_string()],
+            ..crate::config::VoiceConfig::default()
+        };
+        let runtime = VoiceRuntime::from_config(&config, None);
+        assert_eq!(runtime.closing_words, vec!["terminado".to_string()]);
+    }
+
+    #[test]
+    fn the_control_fold_trims_a_transcribers_full_stop() {
+        assert_eq!(fold_control("Câmbio."), "cambio");
+        assert_eq!(fold_control("câmbio!"), "cambio");
+        assert_eq!(fold_control("câmbio…"), "cambio");
+        assert_eq!(fold_control("cambio"), "cambio");
+        // A near miss stays a near miss — trimming must never create a match.
+        assert_ne!(fold_control("câmbios"), "cambio");
+        assert_ne!(fold_control("cambial"), "cambio");
+    }
+
+    #[test]
+    fn a_control_word_matches_only_as_the_last_token() {
+        let closing = vec!["câmbio".to_string()];
+        let discard = "risca isso";
+        let confirm = vec!["sim".to_string()];
+        let v = |s: &str| segment_verdict(s, &closing, discard, &confirm);
+
+        assert_eq!(v("está feito Câmbio."), Verdict::Closes);
+        assert_eq!(v("cambio"), Verdict::Closes);
+        assert_eq!(v("não, risca isso"), Verdict::Discards);
+        assert_eq!(v("sim"), Verdict::Confirms);
+
+        // Morphology, and the word anywhere but last.
+        assert_eq!(v("os câmbios subiram"), Verdict::Continues);
+        assert_eq!(v("é cambial"), Verdict::Continues);
+        assert_eq!(v("eu disse-lhe câmbio e ele desligou"), Verdict::Continues);
+        // Half the discard phrase is not the discard phrase.
+        assert_eq!(v("risca"), Verdict::Continues);
+        assert_eq!(v("isso"), Verdict::Continues);
+        assert_eq!(v(""), Verdict::Continues);
+    }
+
+    #[test]
+    fn the_closing_word_never_reaches_the_delivered_text() {
+        let closing = vec!["câmbio".to_string()];
+        assert_eq!(
+            strip_control_tail("está feito Câmbio.", &closing),
+            "está feito"
+        );
+        // Nothing to strip: the text is returned whole rather than losing its last word.
+        assert_eq!(strip_control_tail("está feito", &closing), "está feito");
+        // A segment that was only the word delivers nothing of its own.
+        assert_eq!(strip_control_tail("câmbio", &closing), "");
+    }
+
+    #[test]
+    fn the_hint_fold_is_untouched_so_a_hint_with_punctuation_stays_inert() {
+        // `C#` folds to `c#`, which no alphanumeric word from `apply_hints` can equal. If this ever
+        // becomes "c", every standalone "c" in every dictation is rewritten to `C#`.
+        assert_eq!(fold_for_hint("C#"), "c#");
+        assert_eq!(fold_for_hint("Node.js"), "node.js");
+        assert_eq!(fold_for_hint("NÚCLEO"), "nucleo");
     }
 
     /// Hints must not rewrite the inside of unrelated words.
@@ -1667,12 +1876,38 @@ mod tests {
     /// Paths resolve through `CARGO_MANIFEST_DIR` because cargo runs tests with the working directory
     /// set to the PACKAGE root (`core/`), while the daemon reads `.ai/voice.yaml` relative to wherever
     /// it was launched. A bare relative path here would look for `core/.ai/voice.yaml`.
+    ///
+    /// **And a baked path is a claim about a different checkout whenever the target directory is
+    /// shared.** `CARGO_HOME/config.toml` on this machine points every crate at one
+    /// `build.target-dir`, so a binary compiled inside a worktree is reused by the main checkout and
+    /// the other way round, while `env!` still answers with wherever it was BUILT. The same hole was
+    /// found open in `tests/module_map.rs` on 2026-08-26, reporting PASS having checked nothing;
+    /// `redact.rs` was closed with it, and this was the third reader and the one left.
+    ///
+    /// The damage here is a different shape from those two, which is why the guard is worth having
+    /// even on a test nobody runs by accident. This reads CONFIGURATION rather than sources: aimed
+    /// at another checkout it would arm itself from that checkout's `.ai/voice.yaml` and then
+    /// measure this machine's engine against it. That is a green run about a question nobody asked,
+    /// and green is exactly what somebody deliberately running this wants to see.
+    ///
+    /// An assertion and not a fallback, for the reason the other two give: a test quietly reading
+    /// another checkout's files is worse than one that refuses to run. `current_dir` is the honest
+    /// answer to which checkout this is, because cargo sets it to the package root.
     #[tokio::test]
     #[ignore = "needs a CUDA whisper build, a running Ollama, and a probe recording"]
     async fn real_pipeline_transcribes_and_cleans_an_actual_recording() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("core/ has a parent");
+        let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let running_in = std::env::current_dir().expect("the working directory must be readable");
+        assert_eq!(
+            built_in,
+            running_in.as_path(),
+            "this test binary was compiled in {} and is running in {} — a shared target \
+             directory handed this checkout a binary built somewhere else, so the config below \
+             would arm this run from the other checkout. Touch this file to force a rebuild.",
+            built_in.display(),
+            running_in.display(),
+        );
+        let repo = running_in.parent().expect("core/ has a parent");
         let config = crate::config::load_voice_config(&repo.join(".ai/voice.yaml"));
         assert!(
             config.armed(),
@@ -1850,6 +2085,8 @@ mod tests {
             calendar: Arc::new(crate::calendar::CalendarRuntime::default()),
             council: Arc::new(crate::council::CouncilRuntime::default()),
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
@@ -1872,6 +2109,43 @@ mod tests {
             ))),
             ..VoiceRuntime::default()
         }
+    }
+
+    #[test]
+    fn the_segment_kind_has_the_wire_spelling_the_shell_sends() {
+        assert_eq!(Kind::Segment.as_str(), "segment");
+        assert_eq!(
+            serde_json::from_str::<Kind>("\"segment\"").unwrap(),
+            Kind::Segment
+        );
+    }
+
+    #[tokio::test]
+    async fn a_segment_comes_back_stripped_and_nothing_is_recorded() {
+        // `hearing(text)` (:1862) builds a runtime whose `FakeTranscriber` returns exactly `text`;
+        // `conversing_state` (:1830) wraps it in an `AppState`, and it is async.
+        let state = conversing_state(hearing("muda o ficheiro câmbio")).await;
+        let heard = segment(&state, b"fake wav", "wav", Duration::from_secs(3))
+            .await
+            .unwrap();
+
+        assert_eq!(heard.text, "muda o ficheiro"); // the control word never reaches the caller
+        assert_eq!(heard.verdict, Verdict::Closes);
+        // Nothing was delivered and nothing was stored — the same pair the conversation tests use at
+        // :1894-1895, and here it is what pins the fourth kind's whole reason for existing.
+        assert!(list(&state.pool, Kind::Dictation).await.unwrap().is_empty());
+        assert!(list(&state.pool, Kind::Memo).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_segment_the_transcriber_heard_nothing_in_is_not_an_error() {
+        let state = conversing_state(hearing("")).await;
+        // `NothingHeard`, which `capture_error` answers with 204 — the shell maps that to an empty
+        // `continues` (Task 9), because a cough between two sentences must not end a thought.
+        assert!(matches!(
+            segment(&state, b"fake wav", "wav", Duration::from_secs(1)).await,
+            Err(CaptureError::NothingHeard)
+        ));
     }
 
     /// The turn goes to the chat, and NOTHING is written to `voice_captures`.

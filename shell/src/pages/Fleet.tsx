@@ -144,7 +144,7 @@ export function Fleet() {
   // `create_job`), failing closed — so the daemon stays the authority either way.
   const engaged = kill.data?.engaged === true;
   const hasProjects = capacity !== undefined && capacity.projects.length > 0;
-  const waiting = projects.data?.reduce((total, project) => total + project.open_proposals, 0);
+  const waiting = projects.data?.reduce((total, project) => total + project.open_review_items, 0);
 
   const actions: FleetActions = {
     openJob,
@@ -252,7 +252,7 @@ export function Fleet() {
             ) : undefined
           }
         />
-        <StatCard label="Proposals open" value={waiting} detail="across the roster" />
+        <StatCard label="To review" value={waiting} detail="across the roster" />
       </div>
 
       {concurrency.isError && capacity === undefined && (
@@ -1078,7 +1078,7 @@ function headline({ capacity, totals, engaged, stale, waiting }: HeadlineFacts):
       : `${held} in flight of ${limit} across all projects; ${room <= 0 ? "no room for another" : `room for ${room} more`}`,
   );
   if (waiting !== undefined && waiting > 0) {
-    clauses.push(`${counted(waiting, "proposal", "proposals")} open across the roster`);
+    clauses.push(`${counted(waiting, "item", "items")} to review across the roster`);
   }
 
   return clauses.map((clause, index) => (

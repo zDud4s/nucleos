@@ -473,9 +473,19 @@ mod tests {
             "../outside",
             "../../outside",
             "sub/../../outside",
+            "/etc/passwd",
+        ] {
+            assert_eq!(
+                resolve_within(&root, escape),
+                Err(PathError::Escapes),
+                "accepted {escape:?}"
+            );
+        }
+
+        #[cfg(windows)]
+        for escape in [
             r"..\outside",
             r"sub\..\..\outside",
-            "/etc/passwd",
             r"C:\Windows\System32",
             r"\\server\share",
             // A drive-relative path on Windows resolves against that drive's current directory.
@@ -485,6 +495,28 @@ mod tests {
                 resolve_within(&root, escape),
                 Err(PathError::Escapes),
                 "accepted {escape:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_spellings_are_unsafe_names_on_unix() {
+        let (_guard, root) = temp_root();
+
+        // On Unix `\\` and `:` are filename characters, so these name a file inside the root,
+        // and `email::safe_filename` refuses them as unsafe names.
+        for unsafe_name in [
+            r"..\outside",
+            r"sub\..\..\outside",
+            r"C:\Windows\System32",
+            r"\\server\share",
+            "C:outside",
+        ] {
+            assert_eq!(
+                resolve_within(&root, unsafe_name),
+                Err(PathError::Unsafe),
+                "accepted {unsafe_name:?}"
             );
         }
     }

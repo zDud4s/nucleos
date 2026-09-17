@@ -19,6 +19,7 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 import { System } from "./System";
+import type { MachineConfig, MachineSecret } from "../data/machine-config";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
 import type {
@@ -111,6 +112,42 @@ interface SystemWorld {
   emailConfig: EmailConfig;
   voiceConfig: VoiceConfig;
   calendarConfig: CalendarConfig;
+  machine: MachineConfig;
+  secrets: MachineSecret[];
+}
+
+/**
+ * Every area the núcleo serves a settings row for, in the order it serves them.
+ *
+ * The four at the end are the ones the removed "Not exposed by the núcleo"
+ * panel used to name. They are in this list rather than in a comment because
+ * that is the fact the tests below now assert.
+ */
+const MACHINE_AREAS = [
+  "email",
+  "voice",
+  "calendar",
+  "web",
+  "browser",
+  "telegram",
+  "github",
+  "council",
+  "models",
+] as const;
+
+function machineWorld(): MachineConfig {
+  return {
+    root: "C:/Projects/nucleos",
+    settings: MACHINE_AREAS.map((area) => ({
+      path: `.ai/${area}.yaml`,
+      area,
+      what: `what ${area} does`,
+      takes_effect: "when the daemon restarts",
+      exists: false,
+      contents: null,
+      resolved: `C:/Projects/nucleos/.ai/${area}.yaml`,
+    })),
+  };
 }
 
 function systemWorld(overrides: Partial<SystemWorld> = {}): SystemWorld {
@@ -126,6 +163,11 @@ function systemWorld(overrides: Partial<SystemWorld> = {}): SystemWorld {
     emailConfig: DEFAULT_EMAIL_CONFIG,
     voiceConfig: DEFAULT_VOICE_CONFIG,
     calendarConfig: DEFAULT_CALENDAR_CONFIG,
+    machine: machineWorld(),
+    secrets: [
+      { key: "github-token", area: "github", what: "the token gh is handed", present: false },
+      { key: "web-search-api-key", area: "web", what: "the search provider's key", present: true },
+    ],
     ...overrides,
   };
 }
@@ -168,6 +210,25 @@ function systemFetch(
         const change = JSON.parse(init.body) as Record<string, unknown>;
         world.budget = { ...world.budget, ...change } as BudgetView;
         return world.budget;
+      }
+      if (path === "/config/machine" && typeof init.body === "string") {
+        const write = JSON.parse(init.body) as { path: string; contents: string };
+        const row = world.machine.settings.find((entry) => entry.path === write.path);
+        if (row === undefined) throw new ApiRefusal(403, "not_ours", "not_ours");
+        // The daemon validates before it writes; the double is only as strict as
+        // it needs to be to keep that ordering observable from a test.
+        if (write.contents.includes("!!bad")) {
+          throw new ApiRefusal(422, "invalid", "did not find expected node content");
+        }
+        world.machine = {
+          ...world.machine,
+          settings: world.machine.settings.map((entry) =>
+            entry.path === write.path
+              ? { ...entry, exists: true, contents: write.contents }
+              : entry,
+          ),
+        };
+        return undefined;
       }
       if (path === "/backup") {
         const created: BackupInfo = {
@@ -213,7 +274,33 @@ function systemFetch(
       return await shared(path, init);
     }
 
+    if (init?.method === "PUT") {
+      const putMatch = /^\/config\/secrets\/([^/]+)$/.exec(path);
+      if (putMatch !== null && typeof init.body === "string") {
+        const key = decodeURIComponent(putMatch[1]);
+        const row = world.secrets.find((entry) => entry.key === key);
+        if (row === undefined) throw new ApiRefusal(403, "not_ours", "not_ours");
+        const { value } = JSON.parse(init.body) as { value: string };
+        if (value === "") {
+          throw new ApiRefusal(422, "invalid", "an empty value is not a credential");
+        }
+        world.secrets = world.secrets.map((entry) =>
+          entry.key === key ? { ...entry, present: true } : entry,
+        );
+        return undefined;
+      }
+      return await shared(path, init);
+    }
+
     if (init?.method === "DELETE") {
+      const forgetMatch = /^\/config\/secrets\/([^/]+)$/.exec(path);
+      if (forgetMatch !== null) {
+        const key = decodeURIComponent(forgetMatch[1]);
+        world.secrets = world.secrets.map((entry) =>
+          entry.key === key ? { ...entry, present: false } : entry,
+        );
+        return undefined;
+      }
       const revokeMatch = /^\/api-tokens\/([^/]+)$/.exec(path);
       if (revokeMatch !== null) {
         const name = decodeURIComponent(revokeMatch[1]);
@@ -246,6 +333,10 @@ function systemFetch(
         return world.voiceConfig;
       case "/calendar/config":
         return world.calendarConfig;
+      case "/config/machine":
+        return world.machine;
+      case "/config/secrets":
+        return { secrets: world.secrets };
       default:
         return await shared(path, init);
     }
@@ -869,30 +960,136 @@ describe("System - tokens", () => {
 /* ------------------------------------------------------------ config index -- */
 
 describe("System - config index", () => {
-  it("names the config areas that have no route instead of failing to read them", async () => {
+  it("still reads the three running readouts, and no longer claims four areas cannot be configured", async () => {
     const world = systemWorld();
     daemon.apiFetch.mockImplementation(systemFetch(world));
 
     await renderSystemAt("/system/tokens");
 
-    const areas = await screen.findByRole("list", { name: "Areas with no configuration route" });
-    for (const area of ["web", "browser", "council", "models"]) {
-      expect(within(areas).getByText(area)).toBeDefined();
-    }
-
-    // The three real routes were read...
+    // The three routes that serve the daemon's PARSED view are still read. They
+    // are not what the settings tab shows, and neither replaces the other.
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/config/email");
       expect(daemon.apiFetch).toHaveBeenCalledWith("/voice/config");
       expect(daemon.apiFetch).toHaveBeenCalledWith("/calendar/config");
     });
 
-    // ...and nothing shaped like the four that do not exist was ever asked for.
-    const badCall = daemon.apiFetch.mock.calls.find(([path]) => {
-      const p = path as string;
-      return /\/config\/(web|browser|council|models)\b/.test(p) || /^\/(web|browser|council|models)\/config$/.test(p);
+    // The confession is gone, because it stopped being true.
+    expect(screen.queryByRole("list", { name: "Areas with no configuration route" })).toBeNull();
+  });
+});
+
+/* --------------------------------------------------------- machine settings -- */
+
+describe("System - this machine's settings", () => {
+  it("offers every area the núcleo serves, including the four that had no route", async () => {
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    // The four the removed panel used to name are now editable like the rest.
+    for (const area of ["web", "browser", "council", "models"]) {
+      expect(await screen.findByRole("heading", { name: area })).toBeDefined();
+    }
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/config/machine");
+  });
+
+  it("names the absolute file each row would write, not the relative one", async () => {
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    // There are twenty-odd worktrees on this machine and every one has an
+    // `.ai/`. The relative path alone would let somebody edit settings with
+    // great confidence in the wrong checkout.
+    expect(await screen.findByText("C:/Projects/nucleos/.ai/voice.yaml")).toBeDefined();
+  });
+
+  it("saves a file and shows what the daemon said about when it starts mattering", async () => {
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    const editor = await screen.findByLabelText(".ai/calendar.yaml");
+    fireEvent.change(editor, { target: { value: 'working_hours_start: "10:00"\n' } });
+    fireEvent.click(within(editor.closest("section") as HTMLElement).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(
+        world.machine.settings.find((row) => row.path === ".ai/calendar.yaml")?.contents,
+      ).toContain("10:00");
     });
-    expect(badCall).toBeUndefined();
+    // Saved is not the same as in effect, and the page says which it means. The
+    // marker has to be the SAVED line specifically: every row on the page also
+    // carries this sentence as a standing fact, so a bare match for it would
+    // pass without anything having been saved at all.
+    expect(await screen.findByText(/^saved .* when the daemon restarts/)).toBeDefined();
+  });
+
+  it("shows the parser's own words when a file is refused, and does not claim it saved", async () => {
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    const editor = await screen.findByLabelText(".ai/browser.yaml");
+    fireEvent.change(editor, { target: { value: "!!bad\n" } });
+    fireEvent.click(within(editor.closest("section") as HTMLElement).getByRole("button", { name: "Save" }));
+
+    // The daemon's sentence, not a generic "invalid" that would send somebody
+    // back to a file they cannot see to look for a line nobody named.
+    expect(await screen.findByText(/did not find expected node content/)).toBeDefined();
+    expect(world.machine.settings.find((row) => row.path === ".ai/browser.yaml")?.exists).toBe(false);
+  });
+});
+
+describe("System - credentials", () => {
+  it("puts a credential beside the file it belongs with, and never renders a value", async () => {
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    // The github credential renders inside the github panel, not in a list of
+    // its own: a pillar and its key are one decision.
+    const githubPanel = (await screen.findByRole("heading", { name: "github" })).closest(
+      "section",
+    ) as HTMLElement;
+    expect(within(githubPanel).getByText("github-token")).toBeDefined();
+    expect(within(githubPanel).getByText("not set")).toBeDefined();
+
+    // The input is a password field and starts empty, whatever is stored.
+    const input = within(githubPanel).getByLabelText("github-token");
+    expect(input.getAttribute("type")).toBe("password");
+    expect((input as HTMLInputElement).value).toBe("");
+  });
+
+  it("stores a credential, clears the box, and reports only that it is set", async () => {
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    const githubPanel = (await screen.findByRole("heading", { name: "github" })).closest(
+      "section",
+    ) as HTMLElement;
+    const input = within(githubPanel).getByLabelText("github-token");
+    fireEvent.change(input, { target: { value: "ghp_a_real_looking_token" } });
+    fireEvent.click(within(githubPanel).getByRole("button", { name: "Set" }));
+
+    await waitFor(() => {
+      expect(world.secrets.find((row) => row.key === "github-token")?.present).toBe(true);
+    });
+
+    // The box is cleared and the token is nowhere on the page. A credential that
+    // stayed on screen after being stored is a credential in a screenshot.
+    await waitFor(() => {
+      expect((input as HTMLInputElement).value).toBe("");
+    });
+    expect(document.body.textContent).not.toContain("ghp_a_real_looking_token");
   });
 });
 

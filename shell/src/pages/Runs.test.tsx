@@ -97,6 +97,12 @@ function detail(overrides: Partial<RunDetail> = {}): RunDetail {
     context_fill: 40_000,
     steerable: false,
     successor_run_id: null,
+    // The daemon sends both on every run response, so the fixture carries both.
+    // Nothing on the index reads them — `RunDetail` is the detail route's shape
+    // and this page fetches it for the launcher's sake — but a fixture that
+    // omitted a field the type promises is a row that could not come back.
+    authored_prompt_estimate: null,
+    cli_own_estimate: null,
     ...overrides,
   };
 }

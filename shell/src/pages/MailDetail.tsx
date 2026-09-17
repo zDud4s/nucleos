@@ -14,7 +14,18 @@ import {
   type SavedAttachments,
   type SavedFile,
 } from "../data/mail";
-import { Button, ConfirmButton, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime, StateBadge } from "../ui";
+import {
+  Button,
+  ConfirmButton,
+  ErrorNote,
+  PageHeader,
+  Panel,
+  RefusalNote,
+  RelativeTime,
+  Row,
+  Rows,
+  StateBadge,
+} from "../ui";
 import "./mail.css";
 
 /**
@@ -211,11 +222,11 @@ function AttachmentsPanel({ emailId, attachments }: { emailId: number; attachmen
         ) : undefined
       }
     >
-      <ul className="ui-rows mail-detail-attachments">
+      <Rows label="Attachments" className="mail-detail-attachments">
         {attachments.map((attachment) => (
           <AttachmentRow key={attachment.position} emailId={emailId} attachment={attachment} />
         ))}
-      </ul>
+      </Rows>
       {saveAll.isSuccess && <SavedAllNote result={saveAll.data} />}
       {saveAll.isError && <AttachmentError error={saveAll.error} what="not everything could be saved" />}
     </Panel>
@@ -237,8 +248,11 @@ function AttachmentRow({ emailId, attachment }: { emailId: number; attachment: E
   const download = useDownloadAttachment(emailId);
   const senderName = attachment.filename ?? `attachment ${attachment.position}`;
 
+  // One row of the panel's hairline-ruled list, not a box of its own: name, type
+  // and size, then both actions on the same line, and any outcome spanning the
+  // row underneath.
   return (
-    <li className="ui-rows-row mail-detail-attachment">
+    <Row className="mail-detail-attachment">
       <span className="mail-detail-attachment-name">{senderName}</span>
       <span className="mail-detail-attachment-meta">
         {attachment.mime_type ?? "unknown type"} · {formatBytes(attachment.size_bytes)}
@@ -258,7 +272,7 @@ function AttachmentRow({ emailId, attachment }: { emailId: number; attachment: E
       {save.isSuccess && <SavedOneNote result={save.data} />}
       {save.isError && <AttachmentError error={save.error} what="that attachment could not be saved" />}
       {download.isError && <AttachmentError error={download.error} what="that attachment could not be downloaded" />}
-    </li>
+    </Row>
   );
 }
 

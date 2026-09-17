@@ -19,7 +19,9 @@ import {
   Button,
   ConfirmButton,
   ErrorNote,
+  Inset,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
   StateBadge,
@@ -86,7 +88,7 @@ export function Decisions({ team, runs }: DecisionsProps) {
           <ErrorNote>the núcleo did not answer — nothing is known about what is waiting</ErrorNote>
         )}
         {actions.data !== undefined && theirs.length === 0 && (
-          <p className="teams-empty">nothing is waiting on you for this team.</p>
+          <Quiet says="nothing is waiting on you for this team." />
         )}
         {theirs.length > 0 && (
           <ul className="teams-acts" aria-label="Actions">
@@ -103,7 +105,7 @@ export function Decisions({ team, runs }: DecisionsProps) {
           saying not now leaves nothing behind — the team may ask again.
         </p>
         {recruits.data !== undefined && asked.length === 0 && (
-          <p className="teams-empty">this team has not asked for anybody.</p>
+          <Quiet says="this team has not asked for anybody." />
         )}
         {asked.length > 0 && (
           <ul className="teams-acts" aria-label="Recruitment">
@@ -162,7 +164,7 @@ function ActionCard({ action }: { action: TeamAction }) {
   const payload = parseActionPayload(action.payload);
 
   return (
-    <li className="teams-act">
+    <Inset as="li">
       <div className="teams-act-head">
         <span className="teams-act-kind">{action.kind}</span>
         <StateBadge domain="team_action" state={teamActionState(action)} />
@@ -202,7 +204,7 @@ function ActionCard({ action }: { action: TeamAction }) {
       )}
       {approve.isError && <DecisionRefusal error={approve.error} what="this was not approved" />}
       {reject.isError && <DecisionRefusal error={reject.error} what="this was not refused" />}
-    </li>
+    </Inset>
   );
 }
 
@@ -311,7 +313,7 @@ function RecruitCard({ proposal }: { proposal: Proposal }) {
   const idFor = (name: string) => `team-recruit-${proposal.id}-${name}`;
 
   return (
-    <li className="teams-act">
+    <Inset as="li">
       <div className="teams-act-head">
         <span className="teams-act-kind">recruit #{proposal.id}</span>
         <RelativeTime at={proposal.created_at} />
@@ -405,7 +407,7 @@ function RecruitCard({ proposal }: { proposal: Proposal }) {
       )}
       {hire.isError && <DecisionRefusal error={hire.error} what="nobody was hired" />}
       {reject.isError && <DecisionRefusal error={reject.error} what="this was not refused" />}
-    </li>
+    </Inset>
   );
 }
 

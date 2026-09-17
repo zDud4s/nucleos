@@ -6,35 +6,57 @@
  * not defined below.** `tsc` and vitest both pass happily on a class no
  * stylesheet has ever heard of, and the defect shows up only as something
  * looking wrong on a screen nobody is testing. Grep the component against
- * this file before calling the page done.
+ * this file before calling the page done. `ui-` classes are the exception and
+ * are not this file's to define — they arrive with a primitive imported from
+ * `../ui`, which is where their recipe and their argument both live.
+ *
+ * The boxes are no longer this file's. A sidecar, a snapshot, a token and a
+ * project brake are all `Inset`, and the one-line absences are `Quiet`.
+ * Nothing below draws a card; what is left is the layout around the boxes and
+ * the type inside them.
  */
 
 /* =============================================================== shared == */
 
+/**
+ * The page's stacked panels, at the full width of the page column.
+ *
+ * No cap of its own: the header, the tabs and every panel share one right edge
+ * so the page reads as one surface. A column of controls is narrower than any
+ * panel, and `.sy-budget-form` and `.sy-mint-form` cap themselves below.
+ */
 .sy-sections {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
 }
 
-.sy-loading,
-.sy-empty {
+/**
+ * A reading that has not landed yet — and deliberately **not** `Quiet`.
+ *
+ * `Quiet` is muted because in an empty region the sentence is the content: the
+ * answer set fainter than the labels around it reads as failure rather than as
+ * emptiness. A wait is the other case. This line is a placeholder for the thing
+ * about to replace it, it is never what the panel has to say, and faint is the
+ * rung for something standing beside content rather than being it. The italic
+ * is the second half of the same claim.
+ */
+.sy-loading {
   margin: 0;
   font-size: var(--text-sm);
-  color: var(--text-faint);
-}
-
-.sy-loading {
   font-style: italic;
-}
-
-.sy-meta {
-  margin-left: var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
   color: var(--text-faint);
 }
 
+/**
+ * A panel's own prose, in front of a list that has something in it.
+ *
+ * When the list is empty the same sentences move behind `Quiet`'s disclosure
+ * instead — see `PanelNote` in `System.tsx`. A paragraph explaining rows that
+ * are not there makes the page longer the emptier it gets, which is backwards;
+ * the prose is kept rather than cut, because "no project is registered" on its
+ * own reads as a list that failed to load.
+ */
 .sy-note {
   margin: 0 0 var(--space-3);
   font-size: var(--text-sm);
@@ -42,8 +64,173 @@
   color: var(--text-muted);
 }
 
+/**
+ * The field labels, the column heads and the fieldset legend — one recipe
+ * under four names.
+ *
+ * Grouped rather than shared, because there is nothing to share with:
+ * DESIGN.md records the missing input primitive as the largest remaining hole
+ * in the component layer, and until `ui.css` has one, collecting the selector
+ * is as far as a page can take it. This is the label rank — 11px uppercase at
+ * `--tracking-wide` — and not the section-title rank, which is the display
+ * face at `--tracking-wider` and belongs to `.ui-section-title`.
+ */
+.sy-fact dt,
+.sy-field label,
+.sy-token-levels legend,
+.sy-pii-table th {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/**
+ * The faint annotations standing beside a name: a reason, a state word, a
+ * size, a hint, a last line of output. Six names, one rung — faint is exactly
+ * the rung for metadata beside content, which is what every one of these is.
+ */
+.sy-meta,
+.sy-sidecar-state,
+.sy-sidecar-line,
+.sy-backup-meta,
+.sy-token-meta,
+.sy-field-hint {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* The face is a claim about origin, so only the three the daemon produced
+   carry the mono one. A byte count and a timestamp this page composed itself
+   are not among them. */
+.sy-meta,
+.sy-sidecar-state,
+.sy-sidecar-line {
+  font-family: var(--font-mono);
+}
+
+/* The names: a subsystem, a project, a snapshot, a token. Every one of them is
+   an identifier the daemon chose, so every one of them is mono. */
+.sy-subsystem-name,
+.sy-project-brake-name,
+.sy-backup-name,
+.sy-token-name {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+/**
+ * Two sentences the daemon's own state produced, in a well rather than a box.
+ *
+ * `.sy-timeout` is a timed-out aggregate: one collapsed sentence, never nine
+ * rows reading "missing". `.sy-restore-applied` is what the daemon says about
+ * when a staged swap actually happens. Neither is a card — a well is the shape
+ * for a thing that was said rather than a thing you act on — and the only
+ * property the two ever disagreed about is how much room the sentence needs.
+ */
+.sy-timeout,
+.sy-restore-applied {
+  margin: 0;
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.sy-restore-applied {
+  padding: var(--space-2) var(--space-3);
+}
+
+/**
+ * The three columns of `Inset` boxes: sidecars, snapshots, tokens.
+ *
+ * Not `Rows`, and the question that decides is whether the reader scans the
+ * column or reaches into it. Each of these is read by picking one out — the
+ * sidecar that failed, the snapshot to restore, the token to revoke — which is
+ * the case `Inset` is for. A hairline-ruled column is for the other one.
+ */
+.sy-sidecars,
+.sy-backups,
+.sy-tokens {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* The head line of an inset: a name, and whatever qualifies it. Three copies
+   of one row, which is the whole of what an `Inset` leaves a page to write —
+   the primitive takes no head slot, deliberately, because the nineteen page
+   copies of one had nothing in common but `display: flex`. */
+.sy-sidecar-head,
+.sy-backup-head,
+.sy-token-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+/* A head carrying a badge aligns on the box instead: a pill has no baseline
+   worth sharing with the name beside it. */
+.sy-token-head {
+  align-items: center;
+}
+
+/* Two grids of `<dt>/<dd>` facts, at the two widths the page needs — 13rem
+   where the values are hosts and paths, 10rem where they are money. */
+.sy-sidecar-facts,
+.sy-config-facts,
+.sy-budget-spend {
+  display: grid;
+  gap: var(--space-2) var(--space-3);
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  margin: 0;
+}
+
+.sy-budget-spend {
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  margin-bottom: var(--space-4);
+}
+
+.sy-config-facts {
+  margin-bottom: var(--space-3);
+}
+
+.sy-fact dd {
+  margin: var(--space-1) 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
 /* ------------------------------------------------------------------- tabs == */
 
+/**
+ * The three views, as links.
+ *
+ * **Not `Tabs` from `../ui`, and that is a finding rather than an oversight.**
+ * These are routes: each one is a real `<a href>` to `/system/<view>`, so it
+ * opens in a new window, it is announced as a link, and the current one carries
+ * `aria-current="page"`. Radix's `Trigger` puts `role="tab"` on whatever it
+ * renders — `asChild` included — which replaces the link role, swaps
+ * `aria-current` for `aria-selected`, collapses three tab stops into one roving
+ * one, and points `aria-controls` at panels that only exist for the route you
+ * are already on. A tab widget switches panels inside a page; this switches
+ * pages. The primitive is right for `Bench`, which does the former.
+ *
+ * What was adopted instead is the appearance and the rule underneath it, so the
+ * two read as one thing: `.ui-tab`'s indicator is `--text` and not `--accent`.
+ * The brand colour marks the wordmark, links and the focus ring and nothing
+ * else — a selection wearing it reads as a status, and a status wearing it
+ * reads as something you can click.
+ */
 .sy-tabs {
   display: flex;
   flex-wrap: wrap;
@@ -57,6 +244,7 @@
   font-size: var(--text-sm);
   color: var(--text-muted);
   text-decoration: none;
+  /* Transparent until selected, so nothing moves on selection. */
   border-bottom: 2px solid transparent;
 }
 
@@ -64,6 +252,8 @@
   color: var(--text);
 }
 
+/* The global ring at the -2px offset the system allows an inset case. Colour
+   and width untouched. */
 .sy-tab:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
@@ -71,34 +261,18 @@
 
 .sy-tab-active {
   color: var(--text);
-  border-bottom-color: var(--border-strong);
+  border-bottom-color: var(--text);
 }
 
 /* ------------------------------------------------------------------ health == */
 
-/* A timed-out aggregate: one collapsed sentence, never nine rows reading
-   "missing". */
-.sy-timeout {
-  margin: 0;
-  padding: var(--space-3);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--text-muted);
-}
-
+/* The subsystem readout: ten rows, scanned for the one that is down, on four
+   tracks so the names, badges and reasons line up down the column. */
 .sy-subsystem-row {
   display: grid;
   grid-template-columns: minmax(0, 12rem) 8rem minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--space-3);
-}
-
-.sy-subsystem-name {
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  color: var(--text);
 }
 
 /* The padding is room for a RING that is drawn outside its button.
@@ -126,65 +300,13 @@
 
 /* --------------------------------------------------------------- sidecars == */
 
-.sy-sidecars {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.sy-sidecar {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
-}
-
-.sy-sidecar-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-2);
-}
-
+/* The card title, and the one name on the page set in the display face —
+   a sidecar is a thing with a name, where a subsystem is a field of a readout. */
 .sy-sidecar-name {
   font-family: var(--font-display);
   font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
   color: var(--text);
-}
-
-.sy-sidecar-state {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-
-.sy-sidecar-facts {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
-  gap: var(--space-2) var(--space-3);
-  margin: 0;
-}
-
-.sy-fact dt {
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.sy-fact dd {
-  margin: var(--space-1) 0 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  color: var(--text);
-  overflow-wrap: anywhere;
 }
 
 .sy-sidecar-failure {
@@ -196,9 +318,6 @@
 
 .sy-sidecar-line {
   margin: 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
   overflow-wrap: anywhere;
 }
 
@@ -211,17 +330,19 @@
   gap: var(--space-3);
 }
 
-.sy-project-brake-name {
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  color: var(--text);
-}
-
 /* ------------------------------------------------------------------ budget == */
 
+/**
+ * Autonomous work is held — said in the Held Ember tone, its full triple.
+ *
+ * A state tone is never half of one: fill without its edge is a tint that reads
+ * as decoration, and the border is what makes this a bounded statement about a
+ * condition rather than a coloured paragraph.
+ */
 .sy-budget-paused {
   margin: 0 0 var(--space-3);
   padding: var(--space-3);
+  border: 1px solid var(--tone-paused-border);
   border-radius: var(--radius-sm);
   background: var(--tone-paused-bg);
   color: var(--tone-paused-fg);
@@ -229,14 +350,10 @@
   line-height: var(--leading-normal);
 }
 
-.sy-budget-spend {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
-  gap: var(--space-2) var(--space-3);
-  margin: 0 0 var(--space-4);
-}
-
-.sy-budget-form {
+/* The two forms on the page — the budget's five fields and the mint form —
+   are one column of controls with the same ceiling. */
+.sy-budget-form,
+.sy-mint-form {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
@@ -244,19 +361,17 @@
   max-width: 24rem;
 }
 
+/* The mint form is followed by the list it adds to, and the budget form is the
+   last thing in its panel. That gap is the only difference between the two. */
+.sy-mint-form {
+  margin: 0 0 var(--space-4);
+}
+
 .sy-field {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
   width: 100%;
-}
-
-.sy-field label {
-  font-family: var(--font-body);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 .sy-field-input {
@@ -271,6 +386,8 @@
   border-radius: var(--radius-sm);
 }
 
+/* The global ring at a 1px offset, which is the offset the system allows a
+   tight control. */
 .sy-field-input:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
@@ -278,61 +395,12 @@
 
 .sy-field-hint {
   margin: 0;
-  font-size: var(--text-xs);
-  color: var(--text-faint);
 }
 
 /* ----------------------------------------------------------------- backups == */
 
 .sy-backups-actions {
   margin: 0 0 var(--space-3);
-}
-
-.sy-backups {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.sy-backup {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
-}
-
-.sy-backup-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-2);
-}
-
-.sy-backup-name {
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  color: var(--text);
-}
-
-.sy-backup-meta {
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-
-.sy-restore-applied {
-  margin: 0;
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--text-muted);
 }
 
 /* --------------------------------------------------------------------- pii == */
@@ -350,28 +418,12 @@
   border-bottom: 1px solid var(--border);
 }
 
-.sy-pii-table th {
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
 .sy-pii-table td {
   color: var(--text);
   font-family: var(--font-mono);
 }
 
 /* ----------------------------------------------------------------- tokens == */
-
-.sy-mint-form {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  align-items: flex-start;
-  max-width: 24rem;
-  margin: 0 0 var(--space-4);
-}
 
 .sy-token-levels {
   display: flex;
@@ -384,10 +436,6 @@
 
 .sy-token-levels legend {
   padding: 0;
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 .sy-token-level {
@@ -396,43 +444,6 @@
   gap: var(--space-1);
   font-size: var(--text-sm);
   color: var(--text);
-}
-
-.sy-tokens {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.sy-token {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
-}
-
-.sy-token-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-}
-
-.sy-token-name {
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  color: var(--text);
-}
-
-.sy-token-meta {
-  font-size: var(--text-xs);
-  color: var(--text-faint);
 }
 
 /* ------------------------------------------------------------------ config == */
@@ -450,20 +461,157 @@
   margin: 0 0 var(--space-3);
 }
 
-.sy-unconfigured {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
+.sy-setting-label {
+  display: block;
+  margin: 0 0 var(--space-1);
 }
 
-.sy-unconfigured-area {
-  padding: var(--space-1) var(--space-3);
-  border: 1px dashed var(--border);
-  border-radius: var(--radius-pill);
+.sy-setting-editor {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken, var(--surface));
+  color: var(--text);
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal, 1.5);
+  resize: vertical;
+}
+
+.sy-setting-editor:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.sy-setting-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+
+.sy-secret {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.sy-secret-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-1);
+}
+
+.sy-secret-key {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.sy-secret-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken, var(--surface));
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+/* -- notifications: which feed kinds still reach Telegram ---------------- */
+
+.sy-notify-families {
+  list-style: none;
+  margin: var(--space-3) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.sy-notify-family {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+}
+
+.sy-notify-family-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.sy-notify-switch {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+}
+
+.sy-notify-label {
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+/* Pushed to the right so the count and the disclosure sit at a predictable
+   edge, whatever the label's length. */
+.sy-notify-disclose {
+  margin-left: auto;
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.sy-notify-heading {
+  margin: var(--space-4) 0 var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.sy-notify-kinds {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0 0 0 var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.sy-notify-kind {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* The kind's own name, not its family's — truncated rather than wrapped, with
+   the literal in a title so a long one is still readable in full. */
+.sy-notify-kind-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.sy-notify-kind select {
+  margin-left: auto;
+}
+
+.sy-notify-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
 }

@@ -44,6 +44,11 @@ const PROJECT_SCOPED: &[&str] = &[
     "jobs",
     "map_decisions",
     "project_commands",
+    // The same species as its neighbours, and the resurrection argument below bites hardest here:
+    // a row in this table is a standing grant to perform a git operation — a push, a merge — for an
+    // autonomous run without asking anybody. Forgetting a project and adding the folder back must
+    // not hand its runs that authority again on the strength of a decision nobody remembers making.
+    "project_git_ops",
     "project_github_ops",
     // Per-project configuration, the same species as its three neighbours here: which brain judges
     // what the rules did not recognise, on this project. It is history in the sense this list means
@@ -974,6 +979,7 @@ mod tests {
         assert!(too_big_beside(Path::new("/"), nowhere()));
         assert!(too_big_beside(Path::new("C:/repos"), nowhere()));
         assert!(too_big_beside(Path::new("repos/alpha"), nowhere()));
+        #[cfg(windows)]
         assert!(!too_big_beside(Path::new("C:/repos/alpha"), nowhere()));
 
         // **A POSIX path is not absolute on Windows**, and that is the platform's answer rather
@@ -987,6 +993,14 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_posix_path_near_the_top_of_a_disk_is_never_deleted() {
+        let nowhere = || Vec::<String>::new();
+        assert!(too_big_beside(Path::new("/repos"), nowhere()));
+        assert!(!too_big_beside(Path::new("/repos/alpha"), nowhere()));
+    }
+
     /// The home directory, and everything it is inside.
     ///
     /// Both directions matter and only one is obvious. `~` itself is the obvious one; `C:/Users` is
@@ -996,6 +1010,7 @@ mod tests {
     /// here can predict, and asserting about the real one would pass vacuously wherever the
     /// variable is unset. Setting it for the test is worse still — mutating the environment under a
     /// multi-threaded runner is unsound.
+    #[cfg(windows)]
     #[test]
     fn the_home_directory_and_its_parents_are_never_deleted() {
         let home = || vec!["C:/Users/someone".to_owned()];
@@ -1004,42 +1019,70 @@ mod tests {
         assert!(!too_big_beside(Path::new("C:/Users/someone/repos"), home()));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn the_posix_home_directory_and_its_parents_are_never_deleted() {
+        let home = || vec!["/home/someone".to_owned()];
+        assert!(too_big_beside(Path::new("/home/someone"), home()));
+        assert!(too_big_beside(Path::new("/home"), home()));
+        assert!(!too_big_beside(Path::new("/home/someone/repos"), home()));
+    }
+
     /// **A project registered inside another one, which nothing else would catch.**
     ///
     /// A monorepo and one of its own packages, both on the roster. Deleting the outer folder takes
     /// the inner project's code with it and leaves that project's roster row pointing at nothing —
     /// a row the app would go on polling, and a folder nobody asked to delete.
-    #[tokio::test]
-    async fn a_folder_holding_another_registered_project_is_refused() {
+    async fn assert_a_folder_holding_another_project_is_refused(outer: &str, inner: &str) {
         let pool = pool().await;
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root)
-             VALUES ('outer', 'shadow', 'C:/repos/mono')",
+             VALUES ('outer', 'shadow', ?)",
         )
+        .bind(outer)
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root)
-             VALUES ('inner', 'shadow', 'C:/repos/mono/packages/inner')",
+             VALUES ('inner', 'shadow', ?)",
         )
+        .bind(inner)
         .execute(&pool)
         .await
         .unwrap();
 
-        let refused = folder_check(&pool, "outer", Some("C:/repos/mono"))
-            .await
-            .unwrap();
+        let refused = folder_check(&pool, "outer", Some(outer)).await.unwrap();
         assert_eq!(refused, Err(Unsafe::HoldsAnother("inner".into())));
 
         // And the inner one is deletable on its own, which is the half that must not be broken by
         // the check above: the outer project is not inside it.
         assert!(
-            folder_check(&pool, "inner", Some("C:/repos/mono/packages/inner"))
+            folder_check(&pool, "inner", Some(inner))
                 .await
                 .unwrap()
                 .is_ok()
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_folder_holding_another_registered_project_is_refused() {
+        assert_a_folder_holding_another_project_is_refused(
+            "C:/repos/mono",
+            "C:/repos/mono/packages/inner",
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_posix_folder_holding_another_registered_project_is_refused() {
+        assert_a_folder_holding_another_project_is_refused(
+            "/repos/mono",
+            "/repos/mono/packages/inner",
+        )
+        .await;
     }
 
     /// The real thing, on a real directory, including the file kind that defeats the standard call.

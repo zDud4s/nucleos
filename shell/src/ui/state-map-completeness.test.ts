@@ -55,6 +55,8 @@ const WRITERS: { name: string; position: number }[] = [
   { name: "append_on", position: 3 },
   { name: "append_for_errand", position: 3 },
   { name: "say", position: 3 },
+  // `job.rs::say_once` forwards to `say` only when the same line is not already written.
+  { name: "say_once", position: 3 },
   { name: "deliver_or_defer", position: 2 },
 ];
 
@@ -211,6 +213,7 @@ describe("state-map completeness", () => {
     const { kinds } = writtenFeedKinds();
     expect(kinds.has("job_waiting")).toBe(true);
     expect(kinds.has("job_finished")).toBe(true);
+    expect(kinds.has("job_review_skipped")).toBe(true);
     expect(kinds.has("token_efficiency")).toBe(true);
     expect(kinds.has("land_resolution_failed")).toBe(true);
     expect(kinds.has("shadow_run_completed")).toBe(true);

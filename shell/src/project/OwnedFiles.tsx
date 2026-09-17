@@ -2,7 +2,7 @@ import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useProjectOwnership, useWriteProjectFile, type Claim } from "../data/project-config";
 import { useProjectCat } from "../data/projects";
-import { Quiet } from "../ui";
+import { ErrorNote, Inset, Quiet } from "../ui";
 
 /**
  * The files this app is the legitimate author of, and the editor for them.
@@ -108,8 +108,13 @@ function OwnedFile({ projectId, claim }: { projectId: string; claim: Claim }) {
 
   const refused = write.isError && isApiRefusal(write.error) ? write.error : null;
 
+  /*
+    The shared inset, and the reason the `mt-*` on the three blocks below went with it: `Inset` is
+    a flex column with the system's own gap, so a margin stacked on top of that gap would be this
+    box disagreeing with every other one about how far apart two things sit.
+  */
   return (
-    <div className="rounded-lg border border-border bg-surface p-4">
+    <Inset>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <p className="font-mono text-sm text-text">{claim.path}</p>
         <button
@@ -120,13 +125,13 @@ function OwnedFile({ projectId, claim }: { projectId: string; claim: Claim }) {
           {open ? "close" : "edit"}
         </button>
       </div>
-      <p className="mt-1 text-xs text-text-muted">{claim.what}</p>
+      <p className="text-xs text-text-muted">{claim.what}</p>
 
       {open ? (
         text === null ? (
-          <p className="mt-3 text-xs text-text-faint">Reading the file…</p>
+          <p className="text-xs text-text-faint">Reading the file…</p>
         ) : (
-          <div className="mt-3 flex flex-col gap-2">
+          <div className="flex flex-col gap-2">
             {missing ? (
               <p className="text-xs text-text-faint">
                 There is no such file yet. Saving will create it.
@@ -162,20 +167,18 @@ function OwnedFile({ projectId, claim }: { projectId: string; claim: Claim }) {
               ) : null}
             </div>
 
+            {/*
+              The parser's own words for `invalid`, because "unprocessable entity" sends somebody
+              to a text editor to find out where the file broke — which is the surface this editor
+              exists to replace. Nothing was written: the daemon validates first, so the file on
+              disk is still the one that was there.
+            */}
             {refused !== null ? (
-              <p className="rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
-                {/*
-                  The parser's own words for `invalid`, because "unprocessable entity" sends
-                  somebody to a text editor to find out where the file broke — which is the surface
-                  this editor exists to replace. Nothing was written: the daemon validates first, so
-                  the file on disk is still the one that was there.
-                */}
-                {REFUSALS[refused.code] ?? refused.detail}
-              </p>
+              <ErrorNote>{REFUSALS[refused.code] ?? refused.detail}</ErrorNote>
             ) : null}
           </div>
         )
       ) : null}
-    </div>
+    </Inset>
   );
 }

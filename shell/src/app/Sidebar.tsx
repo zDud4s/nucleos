@@ -120,7 +120,8 @@ const BADGE_NOUN: Record<NavBadge, string> = {
   chats: "unread",
   mail: "untriaged",
 };
-const PROJECT_BADGE_NOUN = "proposals open";
+// The count is `open_review_items` — proposals and shadow decisions both — so the noun is items.
+const PROJECT_BADGE_NOUN = "items to review";
 
 /**
  * One project, as the rail needs it.

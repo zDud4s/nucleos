@@ -2,11 +2,13 @@
  * The Autopilot slice: the governance cockpit, `ap-` throughout — as `waiting-`
  * is for the queue, `runs-` for the runs and `fleet-` for the fleet.
  *
- * The rule this file lives under: **no class appears in `Autopilot.tsx` that is
- * not defined below.** `tsc` and vitest both pass happily on a class no
+ * The rule this file lives under: **no `ap-` class appears in `Autopilot.tsx`
+ * that is not defined below.** `tsc` and vitest both pass happily on a class no
  * stylesheet has ever heard of, and the defect shows up only as something
  * looking wrong on a screen nobody is testing. Grep the component against this
- * file before calling the page done.
+ * file before calling the page done. `ui-` classes are the exception and are
+ * not this file's to define — they arrive with a primitive imported from
+ * `../ui`, which is where their recipe and their argument both live.
  *
  * One column, like the queue and for the same reason: this page is read top to
  * bottom in the order the brakes apply. A two-column layout would put half the
@@ -84,6 +86,14 @@
 
 /* ============================================================ shared text == */
 
+/**
+ * What a panel is for, said once.
+ *
+ * A panel with nothing in it says the same thing through `Quiet`, which keeps
+ * the prose one click behind the line rather than in front of it — a cockpit of
+ * seven panels that each explain themselves in a paragraph gets longer the
+ * quieter it is, which is backwards.
+ */
 .ap-note {
   margin: 0 0 var(--space-3);
   font-size: var(--text-sm);
@@ -109,21 +119,40 @@
   max-width: var(--measure-prose);
 }
 
-.ap-empty,
+/**
+ * A wait, not an absence — which is why this survived while the absences beside
+ * it became `Quiet`.
+ *
+ * The system settled the empty-state rung at `--text-muted`: in an empty region
+ * the sentence *is* the content, and content set fainter than the labels around
+ * it reads as failure rather than as emptiness. A line saying "reading…" is the
+ * other case entirely. It stands in for the thing that is about to replace it,
+ * so it should recede rather than be read, and faint is exactly that rung.
+ */
 .ap-loading {
   margin: 0;
   font-size: var(--text-sm);
   color: var(--text-faint);
 }
 
-/* A heading inside a panel, above a second block. */
-.ap-subhead {
-  margin: var(--space-4) 0 var(--space-2);
-  font-family: var(--font-display);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wider);
-  text-transform: uppercase;
-  color: var(--text-faint);
+/* The one absence still drawn by hand: `FeedEmbed` (Home and this cockpit) says
+   an empty feed with it. Every absence on this page itself is `Quiet`. */
+.ap-empty {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/**
+ * A second group inside a panel, under its own heading.
+ *
+ * The heading is a `Section` rather than the hand-rolled `.ap-subhead` that
+ * used to sit here. A section title brings no margin of its own, because the
+ * container owns the rhythm. This is that container, and the air above it is the
+ * one thing `.ap-subhead` had that the shared heading deliberately does not.
+ */
+.ap-group {
+  margin-top: var(--space-4);
 }
 
 /* The count in a panel's heading corner. Tabular, so a column of them is a
@@ -223,11 +252,14 @@
  * prerequisite is missing — and a root is the one of the four prerequisites the
  * shell can do something about. Laid out as a row that wraps, so a long Windows
  * path does not push the button off the panel.
+ *
+ * An `Inset`, which draws the box and stacks its children; this says only that
+ * these three sit on one line and wrap. None of the box's own properties is
+ * restated here.
  */
 .ap-project-root {
   grid-column: 1 / -1;
-  display: flex;
-  flex-wrap: wrap;
+  flex-flow: row wrap;
   align-items: center;
   gap: var(--space-2);
 }
@@ -778,15 +810,8 @@
 
 /* ============================================================ decision cards == */
 
-.ap-card {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
-}
+/* A decision is an `Inset`: the box is the primitive's, and what is left here is
+   the type inside it. */
 
 .ap-card-head {
   display: flex;
@@ -821,6 +846,12 @@
  * the difference is deliberate: there the question is whether an action may
  * happen, here it is whether the classifier read *this exact text* correctly.
  * Scrolls in its own box rather than stretching the card.
+ *
+ * A well, and not a box with a hairline: it is the third level in, the ladder
+ * has no third card rank, and the frame it used to carry was what made the
+ * nesting visible in the first place. Still this page's own rather than `Well`,
+ * because a payload has to wrap inside the well and `Well as="pre"` keeps the
+ * text on its own lines at whatever width they arrive.
  */
 .ap-raw {
   margin: 0;
@@ -833,7 +864,6 @@
   line-height: var(--leading-snug);
   color: var(--text-muted);
   background: var(--surface-sunken);
-  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   white-space: pre-wrap;
   word-break: break-word;
@@ -911,14 +941,10 @@
 
 /* ================================================================== jobs == */
 
+/* A job is an `Inset`. Its two lines belong together more tightly than the
+   inset's default gap says, and that is the only thing said about it here. */
 .ap-job {
-  display: flex;
-  flex-direction: column;
   gap: var(--space-1);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-raised);
 }
 
 .ap-job .ap-meta {

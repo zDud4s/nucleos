@@ -66,9 +66,47 @@ export const WORKFLOW_EDGE_TYPES = edgeTypes;
 
 /* ------------------------------------------------------------------ node -- */
 
-function WorkflowNode({ data }: NodeProps<WorkflowFlowNode>) {
+function WorkflowNode({ data, selected }: NodeProps<WorkflowFlowNode>) {
   const { node, running } = data as WorkflowNodeData;
   const tone = nodeTone(node.type, node.role);
+
+  /**
+   * One `box-shadow` and two claimants, resolved here instead of by whichever utility Tailwind
+   * happens to emit last. `shadow-*` utilities all write the same property, so a selected fan would
+   * otherwise have shown one of its two marks and silently dropped the other.
+   *
+   * **The selected node had no mark at all, and finding that is the whole of this pass here.**
+   * xyflow's own stylesheet paints `--xy-node-boxshadow-selected` on `.react-flow__node-default`,
+   * `-input`, `-output` and `-group` — the four built-in types, and nothing else. Every node on this
+   * surface is the custom `workflowNode`, so the rule never matched and clicking one changed only
+   * the inspector beside the canvas. Pointing the library variable at a token would not have fixed
+   * it either, which is worth knowing before somebody tries.
+   *
+   * So the mark is drawn on the card, and it is `.ui-current`'s own recipe written out:
+   * `inset 2px 0 0 var(--text)`, the 2px inset rule on the leading edge in the top rung of the
+   * neutral ladder. The class itself cannot be used because it sets `box-shadow` outright and would
+   * take the fan's stack with it; the *geometry* fits here where it did not on the fleet's canvas,
+   * because this card is the thing being marked rather than a wrapper around an opaque one, and an
+   * inset shadow is clipped to the padding box, so it lands just inboard of the tone border rather
+   * than under it.
+   *
+   * `shadow-float` on a running node is gone. DESIGN.md records `--shadow-md` as defined and
+   * applied to nothing, to be treated as unused rather than as an available middle tier, and this
+   * was the line making that false: a lift expressing state, in a system whose depth is a rung.
+   * Nothing is lost — running already says so three ways, in the spring, in the dot, and in the
+   * dot's own `aria-label`.
+   *
+   * `aria-current` below is the other half of the same finding: a mark that exists only as a shadow
+   * is a mark for whoever can see it, and the inspector it opens is a separate region of the page.
+   */
+  const shadow = [
+    // A fan carries a stacked shadow instead of a fifth colour: its question is how many at once,
+    // which is neither of the two the colours answer.
+    node.type === "fan" ? "6px 6px 0 -2px var(--surface), 8px 8px 0 -2px var(--border)" : "",
+    selected ? "inset 2px 0 0 var(--text)" : "",
+  ]
+    .filter((part) => part !== "")
+    .join(", ");
 
   return (
     <>
@@ -98,6 +136,7 @@ function WorkflowNode({ data }: NodeProps<WorkflowFlowNode>) {
         animate={running ? { scale: [1, 1.03, 1] } : { scale: 1 }}
         transition={running ? { duration: 1.6, repeat: Infinity, ease: "easeInOut" } : { duration: 0.2 }}
         aria-label={`${node.label}, ${nodeMeaning(node.type, node.role)}`}
+        aria-current={selected ? true : undefined}
         className={[
           "flex w-[200px] flex-col gap-1 bg-surface px-3 py-2 text-left",
           // Rounded for an agent, square for a command, and a hexagon is beyond a border radius —
@@ -108,12 +147,14 @@ function WorkflowNode({ data }: NodeProps<WorkflowFlowNode>) {
           // taking part. §12: this is not the same as a node the bundle does not have, which is not
           // drawn at all.
           node.disabled ? "border-2 border-dotted opacity-50" : "border-2",
-          // A fan carries a stacked shadow instead of a fifth colour: its question is how many at
-          // once, which is neither of the two the colours answer.
-          node.type === "fan" ? "border-dashed shadow-[6px_6px_0_-2px_var(--surface),8px_8px_0_-2px_var(--border)]" : "",
-          running ? "shadow-float" : "",
+          // The dash is the fan's; its shadow is composed above, where the selected mark can be
+          // composed with it rather than replacing it.
+          node.type === "fan" ? "border-dashed" : "",
         ].join(" ")}
-        style={{ borderColor: `var(--tone-${tone}-border)` }}
+        style={{
+          borderColor: `var(--tone-${tone}-border)`,
+          boxShadow: shadow === "" ? undefined : shadow,
+        }}
       >
         <div className="flex items-baseline gap-2">
           <span

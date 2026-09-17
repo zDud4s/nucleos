@@ -38,10 +38,41 @@ impl NucleosTools {
 
     /// Whether this instance will announce and dispatch one name.
     fn serves(&self, tool: &str) -> bool {
-        match self.errand {
-            None => true,
-            Some(_) => ERRAND_TOOLS.contains(&tool),
-        }
+        served_in_box(self.errand, tool)
+    }
+
+    /// What this server ANNOUNCES for one box, in characters of JSON.
+    ///
+    /// The tool schemas are the largest thing this daemon puts into a run's prompt without writing
+    /// a word of it by hand: `#[tool(...)]` on each method, `schemars` on each parameter struct, and
+    /// the whole block re-sent with the tool list on every request the CLI makes. Nothing in the
+    /// CLI's stream reports its size — `extract_usage` reads four totals, and the `init` event's
+    /// `tools` field is a list of NAMES — so if it is to be priced at all it is priced here, off the
+    /// same router that answers `list_tools`.
+    ///
+    /// It measures what the SERVER announces, which is the only thing a box narrows. Quoting
+    /// `assistant::build_mcp_config`: "`--allowedTools` only ever GRANTS — it cannot take a tool
+    /// away — so an errand is kept to its own surface by the SERVER announcing less, not by the
+    /// launch asking for less." That is why the parameter is the errand and not an allow-list: a run
+    /// handed a narrow `--allowedTools` against an unboxed server still pays for every schema the
+    /// server announced, and pricing it from the allow-list would tell it otherwise.
+    ///
+    /// Pure — no pool, no I/O, no process. `Self::tool_router()` is the static router the
+    /// `#[tool_router]` macro builds, the same one `list_tools` filters through the same
+    /// [`served_in_box`], so this cannot drift from what is served without the filter drifting too.
+    ///
+    /// `serde_json::to_string(&tool).len()` rather than a hand-rolled sum of name, description and
+    /// schema: the wire form is what is paid for, and its punctuation and key names are a real part
+    /// of it. A tool that somehow fails to serialise counts as nothing instead of panicking — this
+    /// is an estimate feeding a display, and no reading here is worth taking a daemon down for.
+    pub fn advertised_schema_chars(errand: Option<i64>) -> usize {
+        Self::tool_router()
+            .list_all()
+            .into_iter()
+            .filter(|tool| served_in_box(errand, &tool.name))
+            .filter_map(|tool| serde_json::to_string(&tool).ok())
+            .map(|json| json.len())
+            .sum()
     }
 
     /// The errand whose folder the `errand_*` tools reach, or the refusal to guess one.
@@ -81,6 +112,22 @@ struct JobParams {
     /// would report `completed`, leaving "the parallelism I asked for never seems to happen" as the
     /// only symptom.
     team_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct CouncilAskParams {
+    question: String,
+}
+
+/// No roster field, and its absence is the decision.
+///
+/// `POST /council` takes a per-question override and the shell offers one, but a turn reaching for
+/// a council has just met a question it could not answer alone. Letting it also pick who gets asked
+/// would let it assemble a panel that agrees with it, which is the one thing a second opinion is
+/// for not doing. The roster stays where a person put it.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct CouncilGetParams {
+    council_id: String,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -359,6 +406,18 @@ struct ProjectPathParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ProjectCatParams {
+    /// Which project's repository. Call list_projects if you do not know it.
+    project_id: String,
+    /// The file, relative to the project's own root.
+    path: Option<String>,
+    /// The first line to show, counting from 1. Absent means the start of the file.
+    offset: Option<usize>,
+    /// How many lines to show at most. Absent means as many as fit in one answer.
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ProjectGrepParams {
     /// Which project's repository. Call list_projects if you do not know it.
     project_id: String,
@@ -394,8 +453,12 @@ impl NucleosTools {
         description = "List projects known to the NucleOS daemon. Each entry carries its autopilot \
                        mode, how far it is from leaving shadow (`classes_ready` of \
                        `classes_total`, `withheld_classes_ready`, and `promotable`) and whether \
-                       its WIP brake is currently holding new work back (`open_proposals`, \
-                       `wip_limit`, `queue_full`). Start here: a project in `shadow` mode can plan \
+                       its WIP brake is currently holding new work back (`open_review_items`, \
+                       `wip_limit`, `queue_full`). `open_review_items` is the SUM of two \
+                       separate queues, served beside it as `open_proposals` and \
+                       `open_shadow_decisions` -- read those first, because a project can sit \
+                       at its ceiling with an EMPTY proposals list when all of it is shadow \
+                       decisions. Start here: a project in `shadow` mode can plan \
                        but cannot act, so work dispatched to one produces a plan and nothing else."
     )]
     async fn list_projects(&self) -> String {
@@ -441,25 +504,37 @@ impl NucleosTools {
 
     #[tool(
         description = "Read one file's contents out of a project's own checkout, as plain text. \
-                       `path` is relative to the project's root."
+                       `path` is relative to the project's root. A long file comes back one \
+                       window at a time, about 20,000 characters: the last line then says which \
+                       lines were shown and the `offset` to pass to read on. `offset` (from 1) \
+                       and `limit` choose the lines yourself — find them with project_grep first \
+                       rather than paging through a whole file."
     )]
     async fn project_cat(
         &self,
-        Parameters(ProjectPathParams { project_id, path }): Parameters<ProjectPathParams>,
+        Parameters(ProjectCatParams {
+            project_id,
+            path,
+            offset,
+            limit,
+        }): Parameters<ProjectCatParams>,
     ) -> String {
         match self
             .client
             .project_cat(&project_id, &path.unwrap_or_default())
             .await
         {
-            Ok(text) => text,
+            Ok(text) => window_of_file(&text, offset, limit),
             Err(msg) => error_json(msg),
         }
     }
 
     #[tool(
         description = "Search for text inside a project's own checkout. `path` narrows the search \
-                       to a file or folder; absent or empty searches the whole project."
+                       to a file or folder; absent or empty searches the whole project. Each \
+                       matching line is quoted up to 300 characters, and a search with more \
+                       matches than fit in one answer comes back as an object with the first \
+                       ones, `total` and `truncated`: narrow it to see the rest."
     )]
     async fn project_grep(
         &self,
@@ -472,7 +547,8 @@ impl NucleosTools {
         json_result(
             self.client
                 .project_grep(&project_id, &query, &path.unwrap_or_default())
-                .await,
+                .await
+                .map(bounded_matches),
         )
     }
 
@@ -538,6 +614,48 @@ impl NucleosTools {
         Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
     ) -> String {
         json_result(self.client.shadow_queue(&project_id).await)
+    }
+
+    // The council, as two tools rather than one. A deliberation takes minutes and `POST /council`
+    // answers `202` the moment the record exists, so a single tool could only ever return an id —
+    // and an id nothing can read back is a receipt for work the caller then goes blind to, which is
+    // the mistake `get_job` was added to undo after `create_job` shipped without it.
+    //
+    // The description has to say the waiting part in the model's own terms. A tool that reads like
+    // "ask several models" gets called as though it answers, and the turn ends with an id in its
+    // mouth and nothing else.
+    #[tool(
+        description = "Convene a NucleOS council: put ONE question to every seat of the roster the \
+                       owner configured, each answering independently, then ranking the others \
+                       blind, then a chairman writing one synthesis. Returns a council_id \
+                       IMMEDIATELY and the deliberation keeps running for minutes afterwards — it \
+                       does NOT return an answer. Read the result with get_council on a later \
+                       turn. Costs several model invocations, so use it for a hard, open question \
+                       where being wrong is expensive and a second opinion is worth paying for, \
+                       not for anything one model can settle."
+    )]
+    async fn ask_council(
+        &self,
+        Parameters(CouncilAskParams { question }): Parameters<CouncilAskParams>,
+    ) -> String {
+        match self.client.ask_council(&question).await {
+            Ok(id) => serde_json::json!({ "council_id": id }).to_string(),
+            Err(msg) => error_json(msg),
+        }
+    }
+
+    #[tool(
+        description = "Read a council convened earlier with ask_council: its status (running, \
+                       done, error, cancelled), which phase it is in, every seat's answer, the \
+                       average-rank leaderboard, and the chairman's synthesis once there is one. \
+                       A council still running has no synthesis yet and is worth asking about \
+                       again later rather than waiting on."
+    )]
+    async fn get_council(
+        &self,
+        Parameters(CouncilGetParams { council_id }): Parameters<CouncilGetParams>,
+    ) -> String {
+        json_result(self.client.get_council(&council_id).await)
     }
 
     #[tool(description = "Create a NucleOS run for a project")]
@@ -1848,6 +1966,20 @@ pub const ERRAND_TOOLS: &[&str] = &[
     "web_search",
 ];
 
+/// Whether a box announces and dispatches one name. `None` is the whole server.
+///
+/// Lifted out of `NucleosTools::serves` when a second caller appeared that has no instance to ask:
+/// `advertised_schema_chars` prices what a box WOULD announce, from a launch site that never builds
+/// a server. Two copies of this three-line match is how the price and the surface would come to
+/// disagree — and the disagreement would be silent in both directions, because neither side has any
+/// way to observe the other.
+fn served_in_box(errand: Option<i64>, tool: &str) -> bool {
+    match errand {
+        None => true,
+        Some(_) => ERRAND_TOOLS.contains(&tool),
+    }
+}
+
 /// The tools a hosted turn may be offered — a third-party model reached over OpenRouter, not a
 /// process this machine runs.
 ///
@@ -1958,6 +2090,12 @@ pub enum ToolEffect {
 /// here. `vcs_ticket` reads back what the owner's own queue did, and acts on nothing.
 const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("approve_proposal", ToolEffect::Acts),
+    // Convening spends money — up to nine model invocations on one question — and `council::start`
+    // reads the budget before it writes a row, which is the same shape as `create_run`'s. Nothing
+    // it starts touches the world outside this daemon, and it is still an act: what it spends is
+    // the owner's, and `permitted_after_untrusted` reads this table BY NAME to keep a turn that has
+    // just read a stranger's words from spending it.
+    ("ask_council", ToolEffect::Acts),
     // The browser's six, all `ReadsUntrusted`, and the classification is an ASSERTION ABOUT THE
     // FENCE rather than an observation about the verbs (spec §6.1a). `browser_act` clicks and types;
     // under the fence of §6.2 nothing it does leaves the machine with a consequence — no non-GET
@@ -2033,6 +2171,10 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("errand_files_write", ToolEffect::WritesOwn),
     ("errand_notebook_read", ToolEffect::ReadsOwn),
     ("get_budget", ToolEffect::ReadsOwn),
+    // The house's own deliberation, read back. Every word in it was written by a model this daemon
+    // launched against a question this daemon was given — no stranger's text reaches it — so this
+    // is a read of our own state in the same sense `get_run` is.
+    ("get_council", ToolEffect::ReadsOwn),
     ("get_email", ToolEffect::ReadsUntrusted),
     ("get_email_queue", ToolEffect::ReadsUntrusted),
     // A job row and a job listing: this daemon's own record of work it started itself. `ReadsOwn`
@@ -2673,6 +2815,116 @@ fn error_json(msg: String) -> String {
     serde_json::json!({"error": msg}).to_string()
 }
 
+/// How much of a project read one tool answer carries, in bytes of text.
+///
+/// The CLI refuses a tool result over its token ceiling, and hands the agent an error instead of
+/// any part of it. Measured on job 25's own reads: a `project_cat` of a 5,348-line file (261,688
+/// characters) and a `project_grep` whose matches serialised to 54,833 characters both came back
+/// as "exceeds maximum allowed tokens", so the agent that asked learned nothing from either.
+/// 20,000 is under that ceiling with room to spare even at two characters a token, which source
+/// code full of punctuation comes close to.
+const READ_BUDGET: usize = 20_000;
+
+/// The longest one grep match's line is quoted. A minified file is a single line holding everything.
+const MATCH_TEXT: usize = 300;
+
+/// PURE: `text` cut to at most `max` bytes, on a character boundary.
+fn clip(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// PURE: the part of a file one `project_cat` answer carries.
+///
+/// A file that fits comes back whole and untouched. Otherwise: lines from `offset` (counting from 1),
+/// at most `limit` of them, within [`READ_BUDGET`], followed by one line saying which lines those
+/// were and the offset to read on from. That last line is the point: a window that ends without
+/// saying so reads as the end of the file.
+fn window_of_file(text: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    if offset.unwrap_or(1) <= 1 && limit.is_none() && text.len() <= READ_BUDGET {
+        return text.to_owned();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let first = offset.unwrap_or(1).max(1);
+    if first > total {
+        return format!("[the file has {total} lines; offset {first} is past its end]");
+    }
+    let mut shown = String::new();
+    let mut last = first - 1;
+    for line in lines
+        .iter()
+        .skip(first - 1)
+        .take(limit.unwrap_or(usize::MAX).max(1))
+    {
+        if last >= first && shown.len() + line.len() + 1 > READ_BUDGET {
+            break;
+        }
+        // Only ever the first line shown, since any later one breaks above: a line longer than
+        // the whole budget is quoted up to it, and marked, rather than skipped as if absent.
+        if line.len() > READ_BUDGET {
+            shown.push_str(clip(line, READ_BUDGET));
+            shown.push_str(" [line cut here]\n");
+        } else {
+            shown.push_str(line);
+            shown.push('\n');
+        }
+        last += 1;
+    }
+    let read_on = if last < total {
+        format!(
+            "; call project_cat again with offset={} to read on",
+            last + 1
+        )
+    } else {
+        String::new()
+    };
+    format!("{shown}[lines {first}-{last} of {total}{read_on}]")
+}
+
+/// PURE: a grep answer that fits one tool result.
+///
+/// Every quoted line is cut to [`MATCH_TEXT`], and matches are kept in order while they fit
+/// [`READ_BUDGET`]. When any were left out, the answer becomes an object that says how many there
+/// were, because a list that silently stops reads as all of them.
+fn bounded_matches(matches: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Array(all) = matches else {
+        return matches;
+    };
+    let total = all.len();
+    let mut kept = Vec::new();
+    let mut used = 2;
+    for mut found in all {
+        if let Some(text) = found.get("text").and_then(serde_json::Value::as_str)
+            && text.len() > MATCH_TEXT
+        {
+            found["text"] = format!("{}…", clip(text, MATCH_TEXT)).into();
+        }
+        let size = found.to_string().len() + 1;
+        if used + size > READ_BUDGET {
+            break;
+        }
+        used += size;
+        kept.push(found);
+    }
+    if kept.len() == total {
+        return serde_json::Value::Array(kept);
+    }
+    serde_json::json!({
+        "matches": kept,
+        "shown": kept.len(),
+        "total": total,
+        "truncated": true,
+        "note": "narrow it with `path` or a more specific query to see the rest",
+    })
+}
+
 /// Which box this process was launched to serve, read from `--box errand --errand <id>`.
 ///
 /// No `--box` is the whole server, which is what the cloud assistant and the council are launched
@@ -3264,6 +3516,7 @@ mod tests {
             names,
             [
                 "approve_proposal",
+                "ask_council",
                 "browser_act",
                 "browser_close",
                 "browser_handoff",
@@ -3280,6 +3533,7 @@ mod tests {
                 "errand_files_write",
                 "errand_notebook_read",
                 "get_budget",
+                "get_council",
                 "get_email",
                 "get_email_queue",
                 "get_job",
@@ -3775,6 +4029,48 @@ mod tests {
         }
     }
 
+    /// Convening is an act and reading the result is not, and the pair is graded apart on purpose.
+    ///
+    /// `permitted_after_untrusted` reads `TOOL_EFFECTS` BY NAME, so one tool doing both would have
+    /// had to carry one grade for two jobs — and the safe grade for a tool that can spend nine
+    /// model invocations is the one that stops a tainted turn from calling it. Grading the pair as
+    /// one `ReadsOwn` would have handed that spend to a turn holding a stranger's words; grading it
+    /// as one `Acts` would have stopped that same turn from ever reading back a council a person
+    /// convened.
+    #[test]
+    fn the_council_pair_is_graded_apart() {
+        assert_eq!(tool_effect("ask_council"), ToolEffect::Acts);
+        assert_eq!(tool_effect("get_council"), ToolEffect::ReadsOwn);
+    }
+
+    /// Neither council tool reaches any narrowed box, and the one that matters is the first.
+    ///
+    /// A council seat holding `ask_council` is a council convening a council. Three things already
+    /// stop that and this is the fourth: `COUNCIL_TOOLS` is an allow-list, `hooks::council_decision`
+    /// filters against that same constant, and `auth::COUNCIL_ROUTES` gives a seat's key a `403` on
+    /// `POST /council` with nobody's cooperation required. The last of those is the one that holds
+    /// if a model ignores everything else, and `the_councils_key_reads_and_cannot_start_anything`
+    /// is where it is pinned.
+    ///
+    /// The other three absences are the ordinary reading of each box: a department node and an
+    /// errand answer to somebody in particular and spend that person's attention, and the hosted
+    /// box is `ReadsOwn` throughout. What is left is the server with no `--box`, which is the
+    /// orchestrator the owner asked for this tool for.
+    #[test]
+    fn no_council_tool_reaches_a_narrowed_box() {
+        for tool in ["ask_council", "get_council"] {
+            for (list, name) in [
+                (LOCAL_TOOLS, "LOCAL_TOOLS"),
+                (COUNCIL_TOOLS, "COUNCIL_TOOLS"),
+                (TEAM_TOOLS, "TEAM_TOOLS"),
+                (ERRAND_TOOLS, "ERRAND_TOOLS"),
+                (HOSTED_TOOLS, "HOSTED_TOOLS"),
+            ] {
+                assert!(!list.contains(&tool), "{tool} must stay off {name}");
+            }
+        }
+    }
+
     /// Nothing a council seat may call can act.
     ///
     /// `COUNCIL_TOOLS` is written out rather than derived, which is what makes this test necessary
@@ -4088,6 +4384,83 @@ mod tests {
             assert!(
                 registered.iter().any(|tool| tool == name),
                 "{name} is in the errand's box and is not a tool this server exposes"
+            );
+        }
+    }
+
+    /// What the schema block costs, and that a box is what makes it cost less.
+    ///
+    /// **The band is wide on purpose and the exact byte count is deliberately not asserted.** Every
+    /// tool added to this server moves the figure by a few thousand characters, and a test pinned to
+    /// today's total would go red on a change that has nothing wrong with it — the loudest kind of
+    /// false alarm, because the fix is to edit the number, which teaches everyone to edit the number.
+    /// What is worth holding is the ORDER OF MAGNITUDE (this block is tens of thousands of
+    /// characters, not hundreds and not millions — that is the fact that makes it worth showing at
+    /// all) and the RELATIONSHIP between the two boxes, which is a property of the design rather
+    /// than of the current tool count.
+    ///
+    /// The relationship is asserted as a ratio for the same reason: `ERRAND_TOOLS` is six names out
+    /// of the whole server, so its surface must be a small fraction of the unboxed one, and that
+    /// stays true however many tools either side gains.
+    ///
+    /// **Measured 2026-09-05: 48 tools and 41,083 characters unboxed; 6 tools and 3,085 under
+    /// `--box errand`.** About 10,270 estimated tokens the model reads before anybody has said
+    /// anything, and about 771 for an errand. Piping a `tools/list` JSON-RPC call into
+    /// `nucleos-core.exe --mcp-tools` answered 41,976 and 3,194 for the same two boxes — the same
+    /// tool COUNTS, 48 and 6, and roughly 18 bytes per tool more. That gap is the wire framing the
+    /// probe measures and this does not: the array's separators and the JSON-RPC envelope around
+    /// them. Two per cent, an order of magnitude inside the error of the ruler this figure is read
+    /// with, and it is recorded rather than chased — the thing that would have mattered, the two
+    /// sides reading different tool sets, is exactly what the matching counts rule out.
+    #[test]
+    fn the_announced_schema_block_is_measured_from_what_the_server_serves() {
+        let unboxed = NucleosTools::advertised_schema_chars(None);
+        let errand = NucleosTools::advertised_schema_chars(Some(7));
+
+        assert!(
+            (20_000..80_000).contains(&unboxed),
+            "the unboxed schema block measured {unboxed} characters, which is outside the order of \
+             magnitude this server has ever had — either a great many tools arrived at once or the \
+             router is no longer being read"
+        );
+        assert!(
+            errand * 4 < unboxed,
+            "an errand box announced {errand} characters against an unboxed {unboxed}: the box is \
+             supposed to be a small fraction of the server, and this one is not"
+        );
+        assert!(
+            errand > 0,
+            "an errand box announced nothing at all, so the filter is matching no tool"
+        );
+    }
+
+    /// The number this feature reports and the number the server announces are the same number.
+    ///
+    /// `advertised_schema_chars` prices what `list_tools` would answer, and the only thing keeping
+    /// them equal is that both go through `served_in_box`. This asserts the tool COUNTS agree, which
+    /// is what would break first if a second copy of that predicate ever appeared.
+    #[test]
+    fn the_priced_surface_is_the_same_surface_the_box_announces() {
+        for errand in [None, Some(7)] {
+            let announced: Vec<String> = NucleosTools::tool_router()
+                .list_all()
+                .into_iter()
+                .filter(|tool| served_in_box(errand, &tool.name))
+                .map(|tool| tool.name.into_owned())
+                .collect();
+            let expected: usize = announced.len();
+
+            assert_eq!(
+                expected,
+                match errand {
+                    None => NucleosTools::tool_router().list_all().len(),
+                    Some(_) => ERRAND_TOOLS.len(),
+                },
+                "the box {errand:?} announced {announced:?}"
+            );
+            assert!(
+                NucleosTools::advertised_schema_chars(errand) > 0,
+                "the box {errand:?} announces {expected} tools and prices them at nothing"
             );
         }
     }
@@ -4932,5 +5305,117 @@ mod tests {
             "get_run carries a run's stdout — for a triage run, a stranger's mail answered back by \
              a local model — which is exactly what an allowlist to a third party must never carry"
         );
+    }
+
+    /// A file that fits is the file, byte for byte: no footer on something that was not cut.
+    #[test]
+    fn a_file_that_fits_comes_back_whole_and_untouched() {
+        assert_eq!(window_of_file("a\r\nb\n", None, None), "a\r\nb\n");
+    }
+
+    /// The case job 25 hit: a file far over the budget comes back a window at a time, each window
+    /// saying where the next one starts, and the windows join up with nothing skipped.
+    #[test]
+    fn a_long_file_comes_back_a_window_at_a_time() {
+        let text: String = (1..=5348)
+            .map(|n| format!("line {n:>5} {}\n", "x".repeat(40)))
+            .collect();
+
+        let mut offset = None;
+        let mut next_line = 1;
+        let mut windows = 0;
+        loop {
+            let window = window_of_file(&text, offset, None);
+            assert!(window.len() <= READ_BUDGET + 200, "{}", window.len());
+            assert!(
+                window.starts_with(&format!("line {next_line:>5} ")),
+                "window {windows} must start where the last one said"
+            );
+            windows += 1;
+            let footer = window.lines().last().unwrap();
+            match footer.split("offset=").nth(1) {
+                Some(rest) => {
+                    let read_on: usize = rest.split(' ').next().unwrap().parse().unwrap();
+                    offset = Some(read_on);
+                    next_line = read_on;
+                }
+                None => {
+                    assert!(footer.ends_with("of 5348]"), "{footer}");
+                    break;
+                }
+            }
+        }
+        assert!(windows > 10, "{windows}");
+    }
+
+    #[test]
+    fn offset_and_limit_choose_the_lines() {
+        let text: String = (1..=10).map(|n| format!("l{n}\n")).collect();
+
+        assert_eq!(
+            window_of_file(&text, Some(3), Some(2)),
+            "l3\nl4\n[lines 3-4 of 10; call project_cat again with offset=5 to read on]"
+        );
+        assert_eq!(
+            window_of_file(&text, Some(9), None),
+            "l9\nl10\n[lines 9-10 of 10]"
+        );
+        assert_eq!(
+            window_of_file(&text, Some(11), None),
+            "[the file has 10 lines; offset 11 is past its end]"
+        );
+    }
+
+    /// A minified file is one line of everything. It is quoted up to the budget, on a character
+    /// boundary, and marked as cut.
+    #[test]
+    fn a_line_longer_than_the_budget_is_cut_inside_it() {
+        let text = "é".repeat(READ_BUDGET);
+
+        let window = window_of_file(&text, None, None);
+
+        assert!(window.len() <= READ_BUDGET + 100, "{}", window.len());
+        assert!(window.contains("[line cut here]"), "{window:.80}");
+        assert!(window.ends_with("[lines 1-1 of 1]"));
+    }
+
+    #[test]
+    fn a_grep_that_fits_is_the_plain_list() {
+        let matches = serde_json::json!([
+            {"path": "a.rs", "line": 1, "text": "one"},
+            {"path": "b.rs", "line": 2, "text": "two"},
+        ]);
+
+        assert_eq!(bounded_matches(matches.clone()), matches);
+    }
+
+    /// The other half of job 25's case: a search with more matches than fit says how many it left
+    /// out, rather than returning a list that looks complete.
+    #[test]
+    fn a_grep_too_long_for_one_answer_says_how_many_it_left_out() {
+        let matches: Vec<serde_json::Value> = (1..=2000)
+            .map(|n| serde_json::json!({"path": "core/src/runner.rs", "line": n, "text": "            max_turns: None,"}))
+            .collect();
+
+        let bounded = bounded_matches(serde_json::Value::Array(matches));
+
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(bounded["total"], 2000);
+        let shown = bounded["shown"].as_u64().unwrap();
+        assert!(shown > 50 && shown < 2000, "{shown}");
+        assert_eq!(bounded["matches"].as_array().unwrap().len() as u64, shown);
+        assert!(bounded.to_string().len() <= READ_BUDGET + 300);
+    }
+
+    #[test]
+    fn a_minified_match_is_quoted_short() {
+        let matches =
+            serde_json::json!([{"path": "app.min.js", "line": 1, "text": "é".repeat(5000)}]);
+
+        let bounded = bounded_matches(matches);
+
+        let text = bounded[0]["text"].as_str().unwrap();
+        assert!(text.len() <= MATCH_TEXT + 3, "{}", text.len());
+        assert!(text.ends_with('…'));
     }
 }

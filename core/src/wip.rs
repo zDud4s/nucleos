@@ -41,28 +41,18 @@ pub async fn global_wip_limit(pool: &SqlitePool) -> sqlx::Result<Option<i64>> {
         .map(Option::flatten)
 }
 
-/// How much a project has waiting on the human right now.
+/// The two terms, each as a scalar subquery, parameterized by the SQL expression naming the
+/// project. `?1` for a bound read; `state.project_id` for a correlated one inside the roster.
 ///
-/// Both kinds of waiting, not just proposals. A shadow run never mints a proposal — it records
-/// `shadow_decisions` for review instead — so counting proposals alone meant the brake was inert in
-/// the one mode whose entire purpose is to accumulate reviewable evidence. A busy watched branch
-/// could pile up an unbounded backlog while this kept answering Allow, which is precisely the
-/// failure §8.4 describes: the system generating faster than the human reviews.
-///
-/// Kept as one query so the roster's `queue_full` flag and this gate stay the same arithmetic.
-///
-/// **The `shadow_decisions` term is scoped to `runs.mode = 'shadow'`, and that scope is not
-/// incidental — it is the fix for a real defect, not a tidy-up.** A `worktree`-mode decision was
-/// already ENFORCED: the command ran, and there is no verdict left for a human to give it. If the
-/// classifier had withheld it instead, it became a `pending_approval` proposal, which the FIRST
-/// term above already counts — so an unfiltered second term either double-counts a proposal or
-/// counts an enforced action as if it were still waiting on someone, and a project that has only
-/// ever run in `worktree` mode can accumulate thousands of such rows with nobody ever able to clear
-/// them. That breaks the promise at the top of this module: this brake is NOT self-clearing without
-/// the filter, because nothing will ever present a `worktree`-mode row for review, so it can never
-/// be reviewed, so it never releases. Restricting the term to `shadow`-mode runs is what makes
-/// "releases the moment the human reviews something" true again — shadow decisions are the only
-/// ones a human can still render a verdict on.
+/// **Macros and not `&str` constants, because the roster cannot bind a parameter.**
+/// [`crate::autopilot::project_roster`] reads every project in one pass, so its copy of this
+/// arithmetic has to correlate against the outer row rather than bind `?1` — and that single
+/// difference is the whole reason two hand-written copies existed at all. They drifted twice.
+/// The first time, the shadow term lost its `runs.mode` scope in one copy; the second, the
+/// proposals term kept every `kind` in one copy while the other had already excluded two, and the
+/// roster showed 19 for a queue the daemon refused work at 13. Both were found in production, by
+/// somebody reading two numbers that disagreed. A macro takes the one difference as an argument
+/// and leaves nothing else to keep in sync: there is now one text, expanded twice.
 ///
 /// **Excluding `skipped-item` is load-bearing and not tidying.** It and `action-approval` arrive
 /// through the same function in `hooks.rs` and say opposite things about the scarce resource this
@@ -96,21 +86,138 @@ pub async fn global_wip_limit(pool: &SqlitePool) -> sqlx::Result<Option<i64>> {
 /// not run together" edges would close the project's autonomy completely, and the person who asked
 /// for restraint would be throttled by their own request — with a reason naming a review backlog
 /// they do not have.
-pub const OPEN_REVIEW_ITEMS_SQL: &str = "SELECT
-    (SELECT COUNT(*) FROM proposals
-     WHERE project_id = ?1 AND status = 'pending'
-       AND kind <> 'skipped-item' AND kind <> 'fleet-exclusion')
-    +
-    (SELECT COUNT(*) FROM shadow_decisions
-     JOIN runs ON shadow_decisions.run_id = runs.id
-     WHERE runs.project_id = ?1 AND shadow_decisions.human_verdict IS NULL
-       AND runs.mode = 'shadow')";
+///
+/// **`refused-action` is the third exclusion, and it is the accidental one the paragraph above
+/// warns about, found the day the accident stopped holding.** A refused action is a record of
+/// something the system was NOT allowed to do: the classifier or the injection barrier said no, the
+/// turn carried on or ended, and nothing was produced for anyone to review. Nor can it be approved
+/// into happening — `approve` answers 409 for it, which is why `get_refused_actions` in `http.rs`
+/// gives it a door of its own. That makes it a note, the same species as `skipped-item`, and not
+/// work waiting on a person.
+///
+/// For as long as it has existed it stayed out of this count only because `create_refused_action`
+/// wrote it with a NULL `project_id` — the unrelated reason above, holding a kind out by accident.
+/// On 2026-09-14 the row learned its run's project, so that a refusal could be attributed at all,
+/// and without this line the skipped item's arithmetic comes back: job 26 on 2026-09-13 recorded six
+/// refusals, and at the default limit of 3 one such night would close the project's autonomy for
+/// work the system was stopped from doing.
+macro_rules! open_proposals_term {
+    ($project:literal) => {
+        concat!(
+            "(SELECT COUNT(*) FROM proposals
+     WHERE project_id = ",
+            $project,
+            " AND status = 'pending'
+       AND kind <> 'skipped-item' AND kind <> 'fleet-exclusion'
+       AND kind <> 'refused-action')"
+        )
+    };
+}
 
-pub async fn open_proposals(pool: &SqlitePool, project_id: &str) -> sqlx::Result<i64> {
-    sqlx::query_scalar(OPEN_REVIEW_ITEMS_SQL)
-        .bind(project_id)
-        .fetch_one(pool)
-        .await
+/// **The `shadow_decisions` term is scoped to `runs.mode = 'shadow'`, and that scope is not
+/// incidental — it is the fix for a real defect, not a tidy-up.** A `worktree`-mode decision was
+/// already ENFORCED: the command ran, and there is no verdict left for a human to give it. If the
+/// classifier had withheld it instead, it became a `pending_approval` proposal, which the FIRST
+/// term above already counts — so an unfiltered second term either double-counts a proposal or
+/// counts an enforced action as if it were still waiting on someone, and a project that has only
+/// ever run in `worktree` mode can accumulate thousands of such rows with nobody ever able to clear
+/// them. That breaks the promise at the top of this module: this brake is NOT self-clearing without
+/// the filter, because nothing will ever present a `worktree`-mode row for review, so it can never
+/// be reviewed, so it never releases. Restricting the term to `shadow`-mode runs is what makes
+/// "releases the moment the human reviews something" true again — shadow decisions are the only
+/// ones a human can still render a verdict on.
+macro_rules! open_shadow_decisions_term {
+    ($project:literal) => {
+        concat!(
+            "(SELECT COUNT(*) FROM shadow_decisions
+     JOIN runs ON shadow_decisions.run_id = runs.id
+     WHERE runs.project_id = ",
+            $project,
+            " AND shadow_decisions.human_verdict IS NULL
+       AND runs.mode = 'shadow')"
+        )
+    };
+}
+
+pub(crate) use {open_proposals_term, open_shadow_decisions_term};
+
+/// How much a project has waiting on the human right now.
+///
+/// Both kinds of waiting, not just proposals. A shadow run never mints a proposal — it records
+/// `shadow_decisions` for review instead — so counting proposals alone meant the brake was inert in
+/// the one mode whose entire purpose is to accumulate reviewable evidence. A busy watched branch
+/// could pile up an unbounded backlog while this kept answering Allow, which is precisely the
+/// failure §8.4 describes: the system generating faster than the human reviews.
+///
+/// Kept as one query so the roster's `queue_full` flag and this gate stay the same arithmetic --
+/// and, since the macros above, literally the same text as the roster's own.
+///
+/// **Carried as its two parts rather than as the total, and that is a real defect fixed rather
+/// than a nicety.**
+/// The brake says "13 items already waiting for review" and the person opens the proposals list,
+/// which is the only screen the word suggests -- and finds it empty. Measured on `nucleos`
+/// 2026-09-08: of the 13, **zero** were proposals and **all 13** were unreviewed shadow decisions,
+/// which live on a different screen entirely. Nothing was broken and nothing was drifting; the
+/// number simply never said which of two queues it was counting, so the only way to find out was
+/// to read this file. Split, it points at the screen that can clear it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenReviewItems {
+    /// Pending proposals, excluding the kinds that are notes rather than queue --
+    /// see [`open_proposals_term`], which is where that exclusion is argued.
+    pub proposals: i64,
+    /// Unreviewed decisions from `shadow`-mode runs -- what `crate::shadow::list_unreviewed`
+    /// serves, scoped identically, which `autopilot.rs` holds with a cross-module test.
+    pub shadow_decisions: i64,
+}
+
+impl OpenReviewItems {
+    /// What the brake compares against the ceiling.
+    pub fn total(self) -> i64 {
+        self.proposals + self.shadow_decisions
+    }
+
+    /// Where to send the person, said in the order that puts the non-empty queue first. `None` when
+    /// there is nothing waiting at all -- a caller with nothing to explain should say nothing.
+    pub fn describe(self) -> Option<String> {
+        match (self.proposals, self.shadow_decisions) {
+            (0, 0) => None,
+            (0, shadow) => Some(format!("{shadow} shadow {}", decisions(shadow))),
+            (proposals, 0) => Some(format!("{proposals} {}", nouns(proposals))),
+            (proposals, shadow) => Some(format!(
+                "{proposals} {} and {shadow} shadow {}",
+                nouns(proposals),
+                decisions(shadow)
+            )),
+        }
+    }
+}
+
+fn nouns(count: i64) -> &'static str {
+    if count == 1 { "proposal" } else { "proposals" }
+}
+
+fn decisions(count: i64) -> &'static str {
+    if count == 1 { "decision" } else { "decisions" }
+}
+
+/// Both terms in one round trip, because the caller that wants the split always wants the total too.
+pub async fn open_review_items(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<OpenReviewItems> {
+    let (proposals, shadow_decisions): (i64, i64) = sqlx::query_as(concat!(
+        "SELECT ",
+        open_proposals_term!("?1"),
+        ", ",
+        open_shadow_decisions_term!("?1")
+    ))
+    .bind(project_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(OpenReviewItems {
+        proposals,
+        shadow_decisions,
+    })
 }
 
 /// PURE: whether a queue at `open` is full against `limit`. Split out so the daemon's decision and
@@ -132,24 +239,37 @@ pub async fn wip_permits_new_run(pool: &SqlitePool, project_id: &str) -> WipDeci
         }
     };
 
-    let open = match open_proposals(pool, project_id).await {
-        Ok(open) => open,
+    let items = match open_review_items(pool, project_id).await {
+        Ok(items) => items,
         Err(error) => {
             return WipDecision::Defer {
                 reason: format!("could not count open proposals: {error}"),
             };
         }
     };
+    let open = items.total();
 
     if queue_full(open, Some(limit)) {
-        // "items", not "proposals". `OPEN_REVIEW_ITEMS_SQL` counts unreviewed `shadow_decisions`
+        // "items", not "proposals". `open_review_items` counts unreviewed `shadow_decisions`
         // too, and for a project that has spent time in shadow mode they are nearly all of it: this
         // said "85 proposals already waiting" for a project whose `/proposals` had exactly one, so
         // the one person who went to look concluded the brake was broken and went hunting. A brake's
         // reason is read precisely when something has stopped — naming the wrong queue sends the
         // reader to a page that disagrees with it.
+        //
+        // And the breakdown, because "items" alone still sends the reader to the wrong screen.
+        // Measured on `nucleos` 2026-09-08, this project's 13 were 0 proposals and 13 shadow
+        // decisions -- so the person who followed the word "review" to the proposals list found it
+        // empty a second time, for a different reason than the first. Naming both queues is what
+        // makes the sentence actionable: it says which page clears the brake.
+        let where_they_are = items
+            .describe()
+            .map(|split| format!(" ({split})"))
+            .unwrap_or_default();
         return WipDecision::Defer {
-            reason: format!("{open} items already waiting for review (limit {limit})"),
+            reason: format!(
+                "{open} items already waiting for review{where_they_are} (limit {limit})"
+            ),
         };
     }
     WipDecision::Allow
@@ -263,6 +383,36 @@ mod tests {
         }
     }
 
+    /// Refusals minted by the real constructor, each on a run of its own that belongs to the project
+    /// — one open refusal per run is what `one_open_refused_action_per_run` allows, and job 26's six
+    /// were six nodes. Through `create_refused_action` rather than a hand-written INSERT, so the
+    /// `project_id` the brake sees is the one production writes and not one this fixture chose.
+    async fn add_refused_actions(pool: &SqlitePool, project_id: &str, count: usize) {
+        for _ in 0..count {
+            let run_id = sqlx::query(
+                "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+                 VALUES (?, 'node', 'completed', 'worktree', '2026-09-13T00:00:00Z')",
+            )
+            .bind(project_id)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            crate::proposals::create_refused_action(
+                pool,
+                run_id,
+                None,
+                None,
+                "Bash",
+                "the classifier did not recognise this command",
+                Some(r#"{"command":"cargo fmt --all"}"#),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
     /// A request from the person is not a queue for the person.
     ///
     /// The pair is the test, and neither half is enough on its own: the first would pass with the
@@ -279,7 +429,7 @@ mod tests {
         add_pending_exclusions(&pool, "project-a", 5).await;
 
         assert_eq!(
-            open_proposals(&pool, "project-a").await.unwrap(),
+            open_review_items(&pool, "project-a").await.unwrap().total(),
             0,
             "five requests from the person are no backlog at all"
         );
@@ -290,7 +440,10 @@ mod tests {
 
         // And the count is not simply broken: an action approval beside them still counts.
         add_pending_proposals(&pool, "project-a", 1).await;
-        assert_eq!(open_proposals(&pool, "project-a").await.unwrap(), 1);
+        assert_eq!(
+            open_review_items(&pool, "project-a").await.unwrap().total(),
+            1
+        );
     }
 
     #[test]
@@ -313,7 +466,10 @@ mod tests {
         add_project(&pool, "project-a").await;
         add_unreviewed_shadow_decisions(&pool, "project-a", 3).await;
 
-        assert_eq!(open_proposals(&pool, "project-a").await.unwrap(), 3);
+        assert_eq!(
+            open_review_items(&pool, "project-a").await.unwrap().total(),
+            3
+        );
         assert!(matches!(
             wip_permits_new_run(&pool, "project-a").await,
             WipDecision::Defer { .. }
@@ -334,7 +490,7 @@ mod tests {
         add_unreviewed_decisions_in_mode(&pool, "project-a", "worktree", 50).await;
 
         assert_eq!(
-            open_proposals(&pool, "project-a").await.unwrap(),
+            open_review_items(&pool, "project-a").await.unwrap().total(),
             0,
             "an enforced worktree decision is not a review backlog"
         );
@@ -354,7 +510,10 @@ mod tests {
         add_project(&pool, "project-a").await;
         add_unreviewed_decisions_in_mode(&pool, "project-a", "shadow", 5).await;
 
-        assert_eq!(open_proposals(&pool, "project-a").await.unwrap(), 5);
+        assert_eq!(
+            open_review_items(&pool, "project-a").await.unwrap().total(),
+            5
+        );
         let WipDecision::Defer { reason } = wip_permits_new_run(&pool, "project-a").await else {
             panic!("unreviewed shadow decisions must still brake new work");
         };
@@ -375,7 +534,7 @@ mod tests {
         add_unreviewed_decisions_in_mode(&pool, "project-a", "worktree", 50).await;
 
         assert_eq!(
-            open_proposals(&pool, "project-a").await.unwrap(),
+            open_review_items(&pool, "project-a").await.unwrap().total(),
             3,
             "2 pending proposals + 1 shadow decision; skipped items, exclusions and the \
              worktree decisions must not count"
@@ -394,7 +553,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(open_proposals(&pool, "project-a").await.unwrap(), 2);
+        assert_eq!(
+            open_review_items(&pool, "project-a").await.unwrap().total(),
+            2
+        );
         assert!(matches!(
             wip_permits_new_run(&pool, "project-a").await,
             WipDecision::Allow
@@ -408,7 +570,10 @@ mod tests {
         add_pending_proposals(&pool, "project-a", 2).await;
         add_unreviewed_shadow_decisions(&pool, "project-a", 1).await;
 
-        assert_eq!(open_proposals(&pool, "project-a").await.unwrap(), 3);
+        assert_eq!(
+            open_review_items(&pool, "project-a").await.unwrap().total(),
+            3
+        );
     }
 
     /// A skipped item is not a review backlog, and counting it as one would close the autonomy this
@@ -430,7 +595,7 @@ mod tests {
         add_skipped_items(&pool, "project-a", 5).await;
 
         assert_eq!(
-            open_proposals(&pool, "project-a").await.unwrap(),
+            open_review_items(&pool, "project-a").await.unwrap().total(),
             1,
             "only the action approval is a review item"
         );
@@ -440,6 +605,50 @@ mod tests {
                 WipDecision::Allow
             ),
             "five skipped items must not spend a limit of three"
+        );
+    }
+
+    /// A refusal is a record of what the system was stopped from doing, not work waiting on a
+    /// person, and since it carries its run's project it is in reach of this count.
+    ///
+    /// Six because job 26 on 2026-09-13 recorded six. At the default limit of 3, counting them would
+    /// make the refusals of one night the reason the next job is refused. The first assertion is
+    /// what keeps the rest honest: were the refusals written with no project, they would miss the
+    /// per-project filter and pass for a reason that has nothing to do with the exclusion.
+    #[tokio::test]
+    async fn a_refused_action_is_not_a_review_backlog() {
+        let pool = test_pool().await;
+        add_project(&pool, "project-a").await;
+        add_refused_actions(&pool, "project-a", 6).await;
+
+        let attributed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proposals
+             WHERE kind = 'refused-action' AND status = 'pending' AND project_id = 'project-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attributed, 6, "the refusals must be the project's own");
+
+        assert_eq!(
+            open_review_items(&pool, "project-a").await.unwrap().total(),
+            0,
+            "six refusals are no backlog at all"
+        );
+        assert_eq!(
+            wip_permits_new_run(&pool, "project-a").await,
+            WipDecision::Allow,
+            "six refusals must not spend a limit of three"
+        );
+
+        // And the count is not simply broken: an action approval beside them still counts.
+        add_pending_proposals(&pool, "project-a", 1).await;
+        assert_eq!(
+            open_review_items(&pool, "project-a")
+                .await
+                .unwrap()
+                .proposals,
+            1
         );
     }
 
@@ -514,7 +723,10 @@ mod tests {
             .unwrap();
 
         // Self-clearing: reviewing ONE item is enough to let work start again.
-        assert_eq!(open_proposals(&pool, "project-a").await.unwrap(), 2);
+        assert_eq!(
+            open_review_items(&pool, "project-a").await.unwrap().total(),
+            2
+        );
         assert_eq!(
             wip_permits_new_run(&pool, "project-a").await,
             WipDecision::Allow
@@ -528,7 +740,10 @@ mod tests {
         add_project(&pool, "project-b").await;
         add_pending_proposals(&pool, "project-a", 3).await;
 
-        assert_eq!(open_proposals(&pool, "project-b").await.unwrap(), 0);
+        assert_eq!(
+            open_review_items(&pool, "project-b").await.unwrap().total(),
+            0
+        );
         assert_eq!(
             wip_permits_new_run(&pool, "project-b").await,
             WipDecision::Allow

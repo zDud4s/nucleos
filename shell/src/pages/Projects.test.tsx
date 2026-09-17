@@ -46,7 +46,7 @@ function rules(overrides: Partial<ProjectRules> = {}): ProjectRules {
     schedules: [],
     repo_triggers: [],
     wip_limit: null,
-    open_proposals: 0,
+    open_review_items: 0,
     queue_full: false,
     ...overrides,
   };
@@ -629,7 +629,7 @@ describe("Projects - the concerns strip", () => {
           gate_command: null,
           gate_before_publish: true,
           wip_limit: 2,
-          open_proposals: 2,
+          open_review_items: 2,
           queue_full: true,
         }),
       }),
@@ -660,7 +660,7 @@ describe("Projects - the concerns strip", () => {
      permanent hole in the top of every healthy project's page — the same reason
      the Teams console's in-flight strip renders nothing when nothing runs. */
   it("draws nothing when there is nothing wrong", async () => {
-    answerWith(projectsWorld({ rules: rules({ wip_limit: 4, open_proposals: 1 }) }));
+    answerWith(projectsWorld({ rules: rules({ wip_limit: 4, open_review_items: 1 }) }));
 
     await renderProjects("/projects/alpha/rules");
 
@@ -678,7 +678,7 @@ describe("Projects - the concerns strip", () => {
         rules: rules({
           project_root: "C:/repos/alpha",
           wip_limit: 4,
-          open_proposals: 3,
+          open_review_items: 3,
           schedules: [
             {
               name: "nightly",

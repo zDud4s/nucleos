@@ -63,7 +63,7 @@ describe("the roster", () => {
   it("puts what needs somebody at the top, whatever it is called", async () => {
     await openRoster([
       fine("ANSup"),
-      fine("zeta", { open_proposals: 4, last_gate: "passed" }),
+      fine("zeta", { open_review_items: 4, last_gate: "passed" }),
       fine("beta", { last_gate: "failed" }),
       fine("gamma", { root_exists: false }),
     ]);
@@ -77,17 +77,17 @@ describe("the roster", () => {
    *
    * `Waiting on you` over `open proposals across the roster` made the label a promise the
    * detail then took back. The bare phrase counts the six decision lists at `/waiting`; this
-   * number is `open_proposals` summed over the rows, so the label says that and the detail is
+   * number is `open_review_items` summed over the rows, so the label says that and the detail is
    * left to say only where they are.
    */
   it("the card names proposals", async () => {
     await openRoster([
-      fine("alpha", { open_proposals: 3 }),
-      fine("beta", { open_proposals: 2 }),
+      fine("alpha", { open_review_items: 3 }),
+      fine("beta", { open_review_items: 2 }),
     ]);
     await screen.findByRole("table");
 
-    const card = screen.getByRole("article", { name: "Proposals open" });
+    const card = screen.getByRole("article", { name: "To review" });
     expect(within(card).getByText("5")).toBeDefined();
     expect(within(card).getByText("across the roster")).toBeDefined();
     expect(screen.queryByRole("article", { name: "Waiting on you" })).toBeNull();
@@ -98,7 +98,7 @@ describe("the roster", () => {
     await openRoster([fine("alpha"), fine("beta")]);
     await screen.findByRole("table");
 
-    const card = screen.getByRole("article", { name: "Proposals open" });
+    const card = screen.getByRole("article", { name: "To review" });
     expect(within(card).getByText("nothing has stopped to ask")).toBeDefined();
   });
 

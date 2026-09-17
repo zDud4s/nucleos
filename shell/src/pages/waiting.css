@@ -2,11 +2,14 @@
  * The Waiting slice: one queue, ten sections, `waiting-` throughout — as
  * `runs-` is for the runs and `fleet-` for the fleet.
  *
- * The rule this file lives under: **no class appears in `Waiting.tsx` that is
- * not defined below.** `tsc` and vitest both pass happily on a class no
- * stylesheet has ever heard of, and the defect shows up only as something
- * looking wrong on a screen nobody is testing. The Calendar tab shipped exactly
- * that once; grep the component against this file before calling the page done.
+ * The rule this file lives under: **no `waiting-` class appears in
+ * `Waiting.tsx` that is not defined below.** `tsc` and vitest both pass happily
+ * on a class no stylesheet has ever heard of, and the defect shows up only as
+ * something looking wrong on a screen nobody is testing. The Calendar tab
+ * shipped exactly that once; grep the component against this file before calling
+ * the page done. `ui-` classes are the exception and are not this file's to
+ * define — they arrive with a primitive imported from `../ui`, which is where
+ * their recipe and their argument both live.
  *
  * The whole page is one column and not a grid. A decision queue is read top to
  * bottom in the order the design put the sections in, and a two-column layout
@@ -40,27 +43,6 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-}
-
-/**
- * The one absence left inside a panel: a git queue with history but nothing
- * waiting on a person. Every other empty section on this page is a `Quiet` line
- * under its own heading, and has no paragraph here at all.
- */
-.waiting-empty {
-  margin: 0;
-  font-size: var(--text-sm);
-  color: var(--text-faint);
-}
-
-/* A heading inside a panel, under the first list. */
-.waiting-subhead {
-  margin: var(--space-4) 0 var(--space-2);
-  font-family: var(--font-display);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wider);
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 /* =================================================================== lists == */
@@ -105,12 +87,12 @@
 }
 
 /**
- * Which record this is. Muted, not accent.
+ * Which card this is — "wheel #91", "approval #11".
  *
- * The accent is identity — the wordmark, a link, the focus ring — and never a
- * state or a label. Six cards each opening with an accent-coloured `#41` made
- * the ids the loudest thing in a queue whose whole job is to say what is being
- * decided; the id is how you refer to the card afterwards, not what it is about.
+ * Mono because the number is the daemon's, and a neutral rung because it is an
+ * identifier. It was the accent for a while, which is the one colour in this
+ * system that means nothing: the wordmark, links and the focus ring, and
+ * nothing else. An id painted in it reads as a link that does not navigate.
  */
 .waiting-card-id {
   font-family: var(--font-mono);
@@ -150,18 +132,18 @@
   color: var(--text-muted);
 }
 
-/* Why the agent says it wants this. A model wrote it, so it is rendered as text
-   and never as markup — there is no `dangerouslySetInnerHTML` in this slice. */
-.waiting-reasoning {
-  margin: 0;
-  max-width: var(--measure-prose);
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
-}
-
-/* A run's prompt, on a row rather than a card. */
+/**
+ * Prose the card is read for, at the card's own rank.
+ *
+ * Two names for one recipe, kept as two because they answer different questions
+ * and only one of them is clamped when a list goes dense:
+ *
+ * - `reasoning` is why the agent says it wants this. A model wrote it, so it is
+ *   rendered as text and never as markup — there is no `dangerouslySetInnerHTML`
+ *   in this slice.
+ * - `excerpt` is a run's prompt, on a row rather than on a card.
+ */
+.waiting-reasoning,
 .waiting-excerpt {
   margin: 0;
   max-width: var(--measure-prose);
@@ -180,7 +162,15 @@
   margin: 0;
 }
 
-.waiting-fact dt {
+/**
+ * A field label: the name of the value under it.
+ *
+ * The *label* rank and deliberately not `.ui-section-title`, which is the
+ * heading rank — display face, 0.14em — and would claim these name a region.
+ * They name a value.
+ */
+.waiting-fact dt,
+.waiting-provenance-head {
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
@@ -213,6 +203,24 @@
 /* ============================================================= tool input == */
 
 /**
+ * The well: a payload shown inside a card, one rung *down* rather than in a box
+ * of its own.
+ *
+ * This is the third level of nesting on the page — panel, inset, this — and it
+ * is deliberately not a third card. The graduation stops at two ranks, and a
+ * bordered, filled box here would be the boxes-in-boxes the anti-references
+ * name. Dropping to the sunken rung with no border at all reads as a well, which
+ * is what a raw payload is.
+ */
+.waiting-input,
+.waiting-payload-raw {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+/**
  * What the action is about to do, field by field.
  *
  * A two-column list rather than a code block, because this is the part of the
@@ -223,10 +231,6 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
-  margin: 0;
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
 }
 
 .waiting-input-line {
@@ -236,6 +240,8 @@
   align-items: baseline;
 }
 
+/* The label rank again, in mono: an argument's name is a key the daemon sent.
+   The recruitment form's labels are the same rank in the body face, below. */
 .waiting-input-name {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
@@ -270,10 +276,6 @@
 
 .waiting-provenance-head {
   margin: 0 0 var(--space-1);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 .waiting-provenance-list {
@@ -309,13 +311,9 @@
  *
  * The daemon's own re-serialisation should always parse; this is the fallback
  * for the case where it does not, so it is deliberately plain — no attempt to
- * make unreadable data look structured.
+ * make unreadable data look structured. The well above is the whole of its box.
  */
 .waiting-payload-raw {
-  margin: 0;
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
@@ -354,20 +352,24 @@
   gap: var(--space-4);
 }
 
+/**
+ * The facts of one side of a merge, stacked tight under its own heading.
+ *
+ * **No box, and that is the decision.** This sits inside a card inside a panel,
+ * and the system graduates exactly twice — a bordered, filled box here is a
+ * third card rank, which is the boxes-in-boxes the anti-references name. It used
+ * to be one: a `--radius-sm` frame on `--surface`, which is a rung *below* the
+ * inset it sits in, so in dark it read as a well pretending to be a card and in
+ * light — where the two surfaces are the same white — as a bare outline.
+ *
+ * What separates the two sides now is the grid gap and the heading each carries.
+ * The heading is the point: the merge is not symmetrical, and which of the two
+ * survives is the whole reason both are shown.
+ */
 .waiting-side {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
-}
-
-/* Which of the two survives. The whole point of showing both sides is that the
-   merge is not symmetrical. */
-.waiting-side-role {
-  margin: 0;
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 .waiting-side-name {
@@ -396,24 +398,6 @@
   margin: 0;
   font-size: var(--text-xs);
   color: var(--text-faint);
-}
-
-/**
- * The refusal this card can see coming.
- *
- * Warm rather than red: nothing has failed, and nothing will fail if the person
- * settles one of the two decisions first. It is the card saying what would
- * happen, which is the opposite of an error.
- */
-.waiting-conflict {
-  margin: 0;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--tone-paused-border);
-  border-radius: var(--radius-sm);
-  background: var(--tone-paused-bg);
-  color: var(--tone-paused-fg);
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
 }
 
 /* =============================================================== decisions == */
@@ -476,15 +460,9 @@
 
 /* ========================================================= recruitment form == */
 
-/**
- * The one card in this queue that is a form, because the recruitment approval
- * is editable at the moment of decision — the corrections travel with it.
- */
-.waiting-recruit-form {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
+/* The one card in this queue that is a form, because the recruitment approval is
+   editable at the moment of decision — the corrections travel with it. Its box is
+   an `Inset`, which already stacks the fields at this gap. */
 
 .waiting-recruit-field {
   display: flex;
@@ -540,6 +518,19 @@
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   color: var(--accent);
+}
+
+/**
+ * The history behind the rows that want a person, under its own heading.
+ *
+ * The heading is a `Section` now rather than a hand-rolled `<p>`, and a section
+ * title brings no margin of its own — the container owns the rhythm. This is
+ * that container: the one thing the old `waiting-subhead` had that the shared
+ * heading does not is the air above it, separating this group from the list it
+ * follows.
+ */
+.waiting-recent {
+  margin-top: var(--space-4);
 }
 
 /**

@@ -3,10 +3,10 @@ package pipe
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,8 +14,52 @@ import (
 
 	"nucleostelegram/config"
 	"nucleostelegram/daemon"
+	"nucleostelegram/notifier"
 	"nucleostelegram/telegram"
 )
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	args := os.Args
+	for i, arg := range args {
+		if arg == "--" {
+			args = args[i+1:]
+			break
+		}
+	}
+
+	switch os.Getenv("HELPER_MODE") {
+	case "echo":
+		fmt.Println(strings.Join(args, " "))
+	case "sleep":
+		time.Sleep(30 * time.Second)
+	case "print":
+		fmt.Println(os.Getenv("HELPER_TEXT"))
+	}
+	os.Exit(0)
+}
+
+func helperCommand(t *testing.T, mode string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	name := "helper" + filepath.Ext(os.Args[0])
+	helper := filepath.Join(dir, name)
+	bytes, err := os.ReadFile(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(helper, bytes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("HELPER_MODE", mode)
+	return "." + string(filepath.Separator) + name + " -test.run=^TestHelperProcess$ --"
+}
 
 type sentMessage struct {
 	to   telegram.Destination
@@ -65,6 +109,11 @@ func (b *recordingBot) AnswerCallbackQuery(callbackID, text string) error {
 type recordingDaemon struct {
 	sendAssistantErr   error
 	sendAssistantCalls int
+	// The notification policy this fake daemon serves, and the error it serves instead. The zero
+	// value is an empty policy, which allows everything — so every test written before the policy
+	// existed keeps the behaviour it was written against.
+	notifyPolicy    notifier.Policy
+	notifyPolicyErr error
 	// refused is what the injection barrier turned away and nobody has read yet.
 	refused []map[string]any
 	// lastChatID is the key the daemon was told to route on, which is the string an errand is
@@ -137,6 +186,10 @@ func (d *recordingDaemon) RejectProposal(int64) error {
 
 func (d *recordingDaemon) GetFeed() ([]map[string]any, error) {
 	return nil, nil
+}
+
+func (d *recordingDaemon) GetNotifyPolicy() (notifier.Policy, error) {
+	return d.notifyPolicy, d.notifyPolicyErr
 }
 
 func (d *recordingDaemon) GetBudget() (map[string]any, error) {
@@ -477,6 +530,7 @@ func TestAnUnauthorisedPressCannotApproveAProposal(t *testing.T) {
 func TestAVoiceRecordingDoesNotOutliveItsTranscription(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TMP", dir)
+	t.Setenv("TMPDIR", dir)
 	t.Setenv("TEMP", dir)
 
 	dl := fakeDownloader{remotePath: "voice/file.ogg", data: []byte("voice")}
@@ -524,7 +578,9 @@ func TestOldAttachmentsAreSweptFromTheTempDirectory(t *testing.T) {
 // A photo sent with an instruction in its caption used to reach the orchestrator as "The user sent
 // a photo", instruction discarded — a turn spent on a file with no idea what to do with it.
 func TestACaptionOnAnAttachmentReachesTheOrchestrator(t *testing.T) {
-	t.Setenv("TMP", t.TempDir())
+	dir := t.TempDir()
+	t.Setenv("TMP", dir)
+	t.Setenv("TMPDIR", dir)
 	dl := fakeDownloader{remotePath: "photos/x.jpg", data: []byte("photo")}
 	msg := &telegram.Message{
 		Photo:   []telegram.PhotoSize{{FileID: "p1"}},
@@ -562,16 +618,14 @@ func TestAMessageWithNothingToActOnDoesNotStartATurn(t *testing.T) {
 // A voice note is a speech model's guess. It must not be able to fire a command silently — but the
 // refusal has to be said out loud, or a person is left thinking the kill switch is off.
 func TestASpokenCommandIsRefusedOutLoudInsteadOfExecuted(t *testing.T) {
-	t.Setenv("TMP", t.TempDir())
-	if runtime.GOOS != "windows" {
-		t.Skip("stands in for a transcriber with a Windows shell command")
-	}
+	dir := t.TempDir()
+	t.Setenv("TMP", dir)
+	t.Setenv("TMPDIR", dir)
 
 	bot := &recordingBot{}
 	dc := &recordingDaemon{}
-	// Stands in for a transcriber that heard "kill off": echo prints the transcript, rem swallows
-	// the audio path this package appends.
-	cfg := config.Config{AllowedChatID: 42, TranscribeCmd: "cmd /c echo /kill off&rem"}
+	t.Setenv("HELPER_TEXT", "/kill off")
+	cfg := config.Config{AllowedChatID: 42, TranscribeCmd: helperCommand(t, "print")}
 
 	HandleUpdate(bot, dc, transcribingDownloader{}, cfg, NewTracker(), telegram.Update{
 		Message: &telegram.Message{
@@ -906,6 +960,40 @@ type bootingDaemon struct {
 	// this instead.
 	feedArriving map[int][]map[string]any
 	errands      []daemon.Errand
+	// policyFrom is the notification policy served from a given poll onwards — the latest entry at
+	// or before the current poll wins. A test needs this to silence a family, watch a line go by,
+	// and then turn the family back on, which is the ordering guarantee the filter's position
+	// after NewFeedItems exists to give.
+	policyFrom map[int]notifier.Policy
+	// killFrom and budgetPausedFrom are the polls from which the kill switch reads as engaged and
+	// the budget as paused. Both exist so a test can prove governance still speaks while the
+	// policy silences everything the feed carries.
+	killFrom         int
+	budgetPausedFrom int
+}
+
+func (d *bootingDaemon) GetNotifyPolicy() (notifier.Policy, error) {
+	if d.notifyPolicyErr != nil {
+		return notifier.Policy{}, d.notifyPolicyErr
+	}
+	latest, at := d.notifyPolicy, -1
+	for poll, policy := range d.policyFrom {
+		if d.calls >= poll && poll > at {
+			latest, at = policy, poll
+		}
+	}
+	return latest, nil
+}
+
+func (d *bootingDaemon) GetKill() (bool, error) {
+	return d.killFrom > 0 && d.calls >= d.killFrom, nil
+}
+
+func (d *bootingDaemon) GetBudget() (map[string]any, error) {
+	if d.budgetPausedFrom > 0 && d.calls >= d.budgetPausedFrom {
+		return map[string]any{"paused": true, "reason": "the ceiling was reached"}, nil
+	}
+	return map[string]any{}, nil
 }
 
 func (d *bootingDaemon) ListErrands() ([]daemon.Errand, error) {
@@ -1539,5 +1627,169 @@ func TestATurnThatFailedForNoStatedReasonStillSaysSo(t *testing.T) {
 	}
 	if strings.Contains(got, "/retomar") {
 		t.Errorf("message = %q, want no invented remedy", got)
+	}
+}
+
+// kindOf answers the empty string for a row whose kind cannot be read, and NOT formatFeed's
+// "event".
+//
+// The distinction is not cosmetic. formatFeed's fallback is a LABEL for a line nobody could read;
+// kindOf's answer is an INPUT to a decision. Reusing "event" would make an unreadable row match a
+// family called "event" that somebody might one day write, and it would be silenced under a switch
+// its owner never meant to cover it.
+func TestKindOfIsEmptyNotEvent(t *testing.T) {
+	cases := []struct {
+		name string
+		row  map[string]any
+	}{
+		{"a row with no kind at all", map[string]any{"id": float64(1)}},
+		{"a kind that is not a string", map[string]any{"id": float64(1), "kind": float64(7)}},
+		{"a null kind, as serde writes one", map[string]any{"id": float64(1), "kind": nil}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := kindOf(c.row); got != "" {
+				t.Fatalf("kindOf = %q, want the empty string", got)
+			}
+		})
+	}
+
+	if got := kindOf(map[string]any{"kind": "job_failed"}); got != "job_failed" {
+		t.Fatalf("kindOf = %q, want the kind it was given", got)
+	}
+	// And the label path is untouched: formatFeed still says "event" for the same unreadable row.
+	if label := formatFeed(map[string]any{"id": float64(1), "summary": "no kind here"}); !strings.HasPrefix(label, "event") {
+		t.Fatalf("formatFeed = %q, want it to still label an unreadable row \"event\"", label)
+	}
+}
+
+// Proposals, the kill switch and the budget are never silenced by the notification policy.
+//
+// Not because there is a list of exemptions to keep in step, but because they do not pass through
+// the place the policy is consulted: the filter lives inside the GetFeed branch and nowhere else.
+// That is the property this test pins — somebody who moves the filter up one level to "cover
+// everything" makes the kill switch silenceable, and this is what tells them.
+func TestGovernanceIsNeverSilenced(t *testing.T) {
+	bot := &recordingBot{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	silenced := []map[string]any{{"id": float64(9), "kind": "job_failed", "summary": "a job failed"}}
+	dc := &bootingDaemon{
+		recordingDaemon: &recordingDaemon{
+			notifyPolicy: notifier.Policy{
+				Families: []notifier.Rule{{Selector: "job_", Enabled: false}},
+			},
+		},
+		stopAfter:        8,
+		stop:             cancel,
+		arriving:         map[int][]map[string]any{3: {{"id": float64(1), "tool_name": "git push"}}},
+		feedArriving:     map[int][]map[string]any{3: silenced, 4: silenced, 5: silenced, 6: silenced, 7: silenced},
+		killFrom:         4,
+		budgetPausedFrom: 5,
+	}
+
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
+
+	var texts []string
+	for _, m := range bot.messages {
+		texts = append(texts, m.text)
+	}
+	for _, m := range bot.htmlMessages {
+		texts = append(texts, m.text)
+	}
+	joined := strings.Join(texts, "\n---\n")
+
+	if strings.Contains(joined, "a job failed") {
+		t.Errorf("the silenced feed line was sent anyway: %s", joined)
+	}
+	for _, wanted := range []string{"git push", "kill switch ENGAGED", "budget: PAUSED"} {
+		if !strings.Contains(joined, wanted) {
+			t.Errorf("governance went quiet: %q missing from\n%s", wanted, joined)
+		}
+	}
+}
+
+// Turning a family back on announces what happens next, never what was missed.
+//
+// The filter runs AFTER state.NewFeedItems, so a suppressed row still enters `seen`; re-enabling
+// the family tomorrow cannot replay it. Move the filter before that call — which reads like the
+// same thing and is cheaper — and flipping one switch dumps up to ninety days of backlog into the
+// chat at once.
+func TestReenablingAFamilyReplaysNothing(t *testing.T) {
+	bot := &recordingBot{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	whileSilenced := map[string]any{"id": float64(1), "kind": "job_failed", "summary": "missed while off"}
+	afterReenabling := map[string]any{"id": float64(2), "kind": "job_failed", "summary": "arrived while on"}
+	both := []map[string]any{whileSilenced, afterReenabling}
+	onlyFirst := []map[string]any{whileSilenced}
+
+	dc := &bootingDaemon{
+		recordingDaemon: &recordingDaemon{},
+		stopAfter:       9,
+		stop:            cancel,
+		feedArriving: map[int][]map[string]any{
+			2: onlyFirst, 3: onlyFirst, 4: onlyFirst,
+			5: both, 6: both, 7: both, 8: both,
+		},
+		policyFrom: map[int]notifier.Policy{
+			0: {Families: []notifier.Rule{{Selector: "job_", Enabled: false}}},
+			5: {Families: []notifier.Rule{{Selector: "job_", Enabled: true}}},
+		},
+	}
+
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
+
+	var joined string
+	for _, m := range bot.messages {
+		joined += m.text + "\n"
+	}
+	if strings.Contains(joined, "missed while off") {
+		t.Errorf("re-enabling the family replayed the backlog:\n%s", joined)
+	}
+	// The counterpart, without which the assertion above would also pass on a notifier that sends
+	// nothing at all.
+	if !strings.Contains(joined, "arrived while on") {
+		t.Errorf("re-enabling the family announced nothing new either:\n%s", joined)
+	}
+}
+
+// A policy that cannot be read lets everything through.
+//
+// The opposite of errandTopics three lines above it, and deliberately so. There, a failed read
+// risks putting an errand's notes in the wrong room, so the round's lines are dropped. Here, the
+// failure the whole mechanism guards against is noise — and a guard against noise must never fail
+// into silence, because silence is indistinguishable from everything being fine.
+func TestPolicyReadFailsOpen(t *testing.T) {
+	bot := &recordingBot{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	arriving := []map[string]any{{"id": float64(1), "kind": "job_failed", "summary": "still gets through"}}
+	dc := &bootingDaemon{
+		recordingDaemon: &recordingDaemon{
+			// A policy that WOULD silence this line, served behind an error — so a read that
+			// quietly succeeded would fail this test rather than pass it by accident.
+			notifyPolicy: notifier.Policy{
+				Families: []notifier.Rule{{Selector: "job_", Enabled: false}},
+			},
+			notifyPolicyErr: errors.New("the daemon went away mid-round"),
+		},
+		stopAfter:    6,
+		stop:         cancel,
+		feedArriving: map[int][]map[string]any{2: arriving, 3: arriving, 4: arriving, 5: arriving},
+	}
+
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
+
+	var joined string
+	for _, m := range bot.messages {
+		joined += m.text + "\n"
+	}
+	if !strings.Contains(joined, "still gets through") {
+		t.Errorf("an unreadable policy silenced the feed:\n%s", joined)
 	}
 }

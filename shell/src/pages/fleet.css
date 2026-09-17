@@ -418,7 +418,6 @@
 .fleet-card-link {
   align-self: flex-start;
   font-size: var(--text-sm);
-  color: var(--accent);
 }
 
 .fleet-card-note .fleet-card-link {
@@ -668,11 +667,29 @@
 
 /* The library's own variables, pointed at this app's tokens so the canvas is
    not a light rectangle in a dark window. */
+/**
+ * The library's own variables, pointed at this app's tokens so the canvas is
+ * not a light rectangle in a dark window.
+ *
+ * **The two selected marks are neutral, and were the brand colour.** A selected
+ * node wore `--focus-ring` and a selected edge wore `--accent`, so "this one"
+ * and "where you are looking" were the same cyan twice — which is the pair the
+ * This-One Rule exists to separate. Both now move to `--text`, the top rung of
+ * the neutral ladder and the same ink `.ui-current` marks a chosen row with,
+ * leaving `--focus-ring` to say the one thing it is reserved for.
+ *
+ * `.ui-current` itself does not fit here and the geometry is where it stops: it
+ * is an *inset* 2px rule on the leading edge, and the inside of a node wrapper
+ * is covered by the opaque card it holds, while an edge is a stroke with no box
+ * to draw inside at all. So the rule's reasoning is what carries — a neutral
+ * rung rather than the hue, and a mark that does not depend on a fill, because
+ * `--surface` and `--surface-raised` are the same white in the light theme.
+ * A ring outside the node and a stroke on the wire are where that lands.
+ */
 .fleet-canvas .react-flow {
   --xy-background-color: var(--surface-sunken);
   --xy-node-background-color: transparent;
   --xy-node-border: none;
-  --xy-node-boxshadow-selected: 0 0 0 2px var(--focus-ring);
   --xy-edge-stroke: var(--border-strong);
   --xy-edge-stroke-selected: var(--text);
   --xy-controls-button-background-color: var(--surface-raised);
@@ -681,6 +698,27 @@
   --xy-controls-button-color-hover: var(--text);
   --xy-controls-button-border-color: var(--border);
   --xy-attribution-background-color: transparent;
+}
+
+/**
+ * The selected slot, marked where the mark actually lands.
+ *
+ * This was `--xy-node-boxshadow-selected`, and it was **inert**: xyflow paints
+ * that variable on `.react-flow__node-default`, `-input`, `-output` and `-group`
+ * only, and every node on this canvas is the custom `slotCard`. So the rule
+ * never matched, and clicking a slot changed the panel and nothing on the
+ * canvas. Found by the agent working `WorkflowCanvas`, which had the identical
+ * hole for the identical reason.
+ *
+ * The wrapper still gets `.selected` from xyflow, so the mark goes on the card
+ * inside it, and there the geometry the This-One Rule asks for works exactly:
+ * `.ui-current`'s own recipe, a 2px inset rule on the leading edge in the top
+ * neutral rung. The class itself is not used because `.fleet-card` carries a
+ * shadow of its own, and `box-shadow` does not merge — it replaces. So the card's
+ * `--shadow-sm` is restated after the rule, or selecting a card would flatten it.
+ */
+.fleet-canvas .react-flow__node.selected .fleet-card {
+  box-shadow: inset 2px 0 0 var(--text), var(--shadow-sm);
 }
 
 /* A node is the card and nothing else — the library's own chrome would be a

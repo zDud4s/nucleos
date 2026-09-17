@@ -19,8 +19,11 @@ import {
   ErrorNote,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
   Section,
   StatCard,
   StateBadge,
@@ -55,7 +58,7 @@ export function TeamRunDetail() {
       <>
         <RunCrumb />
         <PageHeader title="Team run" />
-        {run.isError ? <DetailError error={run.error} /> : <p className="teams-loading">reading the run…</p>}
+        {run.isError ? <DetailError error={run.error} /> : <Quiet says="reading the run…" />}
       </>
     );
   }
@@ -234,7 +237,7 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
 
 function OriginLine({ run }: { run: TeamRunView }) {
   return (
-    <p className="teams-origin">
+    <p className="teams-note">
       <OriginText run={run} />
       {run.root_id !== run.id && (
         <>
@@ -262,15 +265,15 @@ function RoundsPanel({ items }: { items: TeamItem[] }) {
   const rounds = groupByRound(items);
   return (
     <Panel title="Rounds">
-      {rounds.length === 0 && <p className="teams-empty">no item yet.</p>}
+      {rounds.length === 0 && <Quiet says="no item yet." />}
       {rounds.map(([round, rows]) => (
         <div className="teams-round" key={round}>
           <p className="teams-round-head">round {round}</p>
-          <ul className="ui-rows" aria-label={`Round ${round}`}>
+          <Rows label={`Round ${round}`}>
             {rows.map((item) => (
               <ItemRow key={item.ordinal} item={item} />
             ))}
-          </ul>
+          </Rows>
         </div>
       ))}
     </Panel>
@@ -290,7 +293,7 @@ function groupByRound(items: TeamItem[]): [number, TeamItem[]][] {
 
 function ItemRow({ item }: { item: TeamItem }) {
   return (
-    <li className="ui-rows-row teams-item-row">
+    <Row className="teams-item-row">
       {item.run_id !== null ? (
         <Link className="teams-item-agent" to={`/runs/${item.run_id}`}>
           {item.agent_id}
@@ -304,7 +307,7 @@ function ItemRow({ item }: { item: TeamItem }) {
           fetches it, so the path is shown as text. */}
       {item.output_path !== null && <p className="teams-item-output">{item.output_path}</p>}
       {item.run_id !== null && <span className="teams-item-output">run {item.run_id}</span>}
-    </li>
+    </Row>
   );
 }
 
@@ -323,13 +326,13 @@ function ActionsPanel({
   return (
     <Panel title="Actions">
       {isError && actions.length === 0 && <ActionsError error={error} />}
-      {!isError && actions.length === 0 && <p className="teams-empty">nothing asked for yet.</p>}
+      {!isError && actions.length === 0 && <Quiet says="nothing asked for yet." />}
       {actions.length > 0 && (
-        <ul className="ui-rows" aria-label="Actions">
+        <Rows label="Actions">
           {actions.map((action) => (
             <ActionCard key={action.id} action={action} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
@@ -351,7 +354,7 @@ function ActionCard({ action }: { action: TeamAction }) {
   const state = teamActionState(action);
   const payload = parseActionPayload(action.payload);
   return (
-    <li className="ui-rows-row teams-action-row">
+    <Row className="teams-action-row">
       <div className="teams-action-head">
         <span className="teams-action-kind">{action.kind}</span>
         <StateBadge domain="team_action" state={state} />
@@ -376,7 +379,7 @@ function ActionCard({ action }: { action: TeamAction }) {
         {" — "}
         {action.proposal_id === null ? "this team may do that without asking" : "waiting on a decision"}
       </p>
-    </li>
+    </Row>
   );
 }
 

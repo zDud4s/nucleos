@@ -18,10 +18,16 @@
  * Every list on this page needs one, and they are not decoration: "waiting",
  * "in force" and "no longer in force" are three states of the same row, and
  * which one a person is looking at decides what the buttons beside it mean.
+ *
+ * `--measure` and not `--measure-prose`: this is a note standing beside the
+ * thing it explains, which is the narrower of the app's two reading measures and
+ * the one `.ui-teach` already caps its own explanation at. It was written `70ch`
+ * — the prose measure's value, borrowed by a note. What the note explains is the
+ * prose, and the rows below are the wider of the two.
  */
 .learned-lede {
   margin: 0 0 var(--space-4);
-  max-width: 70ch;
+  max-width: var(--measure);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
   color: var(--text-muted);
@@ -52,15 +58,23 @@
 }
 
 .learned-title {
-  margin: var(--space-2) 0 var(--space-1);
   font-size: var(--text-base);
   font-weight: var(--weight-semibold);
   color: var(--text);
 }
 
+/**
+ * The refinement's own text — the body of prose on this page, and the reason
+ * `--measure-prose` rather than `--measure`.
+ *
+ * It was `80ch`, which is past the point where an eye stops finding the start of
+ * the next line reliably, and it was a guess: nothing else in the app is that
+ * wide. 70ch is the measure the system names for prose somebody sits down with,
+ * and this is the only text on the page that qualifies.
+ */
 .learned-body {
   margin: 0;
-  max-width: 80ch;
+  max-width: var(--measure-prose);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
   color: var(--text-muted);
@@ -73,14 +87,6 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  margin-top: var(--space-3);
-}
-
-/* A proposed row whose question is gone. Said in the row rather than left as a
-   button that would 404. */
-.learned-orphan {
-  font-size: var(--text-xs);
-  color: var(--text-faint);
 }
 
 /* ----------------------------------------------------------------- chain -- */
@@ -89,19 +95,26 @@
  * What unfolds under a row: what it replaced, what replaced it, and every
  * decision it went through.
  *
- * Sunken and indented rather than another card. It is the same row seen further
- * back in time, not a second thing on the page.
+ * Sunken rather than another card. It is the same row seen further back in time,
+ * not a second thing on the page — which is `Well` from `../ui`, so the recess
+ * has no class of its own here any more. `reads`, because what is in it is
+ * somebody's writing rather than machine output and the well's default mono face
+ * would say the opposite; `capped`, because the decisions grow by one every time
+ * a person answers something and a row as tall as its own history is a row
+ * nobody can scan past. The 2px left rule went with the class: a recess is read
+ * from being darker than what surrounds it, and an outline is what makes a box
+ * read as sitting *on* a surface rather than cut into it.
  */
-.learned-chain {
-  margin-top: var(--space-3);
-  padding: var(--space-3);
-  border-left: 2px solid var(--border-strong);
-  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-  background: var(--surface-sunken);
-}
 
+/**
+ * A reading that has not landed yet — and deliberately **not** `Quiet`.
+ *
+ * `Quiet` is the one-line absence, and it is muted because there the sentence is
+ * the content. A wait is the other case: this line is a placeholder for the
+ * thing about to replace it, it is never what the row has to say, and faint is
+ * the rung for something standing beside content rather than being it.
+ */
 .learned-chain-loading {
-  margin: var(--space-3) 0 0;
   font-size: var(--text-xs);
   color: var(--text-faint);
 }
@@ -127,12 +140,16 @@
   gap: var(--space-1);
 }
 
-/* The decisions, oldest first — proposed, active, superseded — as one line each. */
+/* The decisions, oldest first — proposed, active, superseded — as one line each.
+   The top margin is for the one case where the only thing above them is the
+   `Quiet` line saying this refinement replaced nothing: a quiet line carries no
+   margin of its own. Against the paragraph and the list above, whose bottom
+   margins are larger, it collapses and changes nothing. */
 .learned-events {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
-  margin: 0;
+  margin: var(--space-2) 0 0;
   padding: 0;
   list-style: none;
   font-size: var(--text-xs);

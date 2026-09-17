@@ -252,6 +252,14 @@ pub(crate) async fn fire_configured_trigger(
             TriggerFireOutcome::Fired(run_id)
         }
         Err(crate::runs::CreateRunError::Busy) => TriggerFireOutcome::Busy,
+        // Deferred and not `Busy`: both outcomes leave the SHA unrecorded and carry on with the
+        // tick, but `Busy` is read out as "project busy" and "work in progress", which is the wrong
+        // thing to go looking for. Only an item is ever refused for disk today, so this arm is for
+        // the day a trigger's run is asked the same question.
+        Err(crate::runs::CreateRunError::NoRoomOnDisk(refusal)) => TriggerFireOutcome::Deferred {
+            reason: refusal,
+            stop_tick: false,
+        },
         Err(error) => TriggerFireOutcome::Failed(error.to_string()),
     }
 }
@@ -580,6 +588,8 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),

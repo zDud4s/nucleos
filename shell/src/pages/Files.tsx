@@ -25,7 +25,23 @@ import {
   type SortColumn,
   type SortDirection,
 } from "../data/files";
-import { Button, ConfirmButton, ErrorNote, Field, PageHeader, Panel, RefusalNote, RelativeTime, StaleNote, Teach } from "../ui";
+import {
+  Button,
+  ConfirmButton,
+  Count,
+  ErrorNote,
+  Field,
+  Inset,
+  PageHeader,
+  Panel,
+  Quiet,
+  RefusalNote,
+  RelativeTime,
+  Row,
+  Rows,
+  StaleNote,
+  Teach,
+} from "../ui";
 import "./files.css";
 
 /**
@@ -486,8 +502,13 @@ function FilesUnavailableTeach() {
 
 function FolderTree({ currentPath, onSelect }: { currentPath: string; onSelect: (path: string) => void }) {
   return (
-    <nav className="fi-tree" aria-label="Folders">
-      <TreeNode path="" label="files" currentPath={currentPath} onSelect={onSelect} depth={0} />
+    // The `nav` wraps the `Inset` rather than wearing it: `Inset` renders a
+    // `div` or an `li` and is deliberately not widened, and the landmark with
+    // its label is what tells a screen reader this column is the folder tree.
+    <nav aria-label="Folders">
+      <Inset className="fi-tree">
+        <TreeNode path="" label="files" currentPath={currentPath} onSelect={onSelect} depth={0} />
+      </Inset>
     </nav>
   );
 }
@@ -517,7 +538,7 @@ function TreeNode({
 
   return (
     <div className="fi-tree-node">
-      <div className={active ? "fi-tree-row fi-tree-row-active" : "fi-tree-row"} style={{ paddingLeft: depth * 12 }}>
+      <div className={active ? "fi-tree-row ui-current" : "fi-tree-row"} style={{ paddingLeft: depth * 12 }}>
         {depth > 0 ? (
           <button
             type="button"
@@ -761,7 +782,7 @@ function FileTable(props: FileTableProps) {
     <div className="fi-table-wrap" tabIndex={0} onKeyDown={handleKeyDown}>
       <Panel
         title="Contents"
-        aside={<Count entries={entries} />}
+        aside={<ContentsCount entries={entries} />}
       >
         {stale && <StaleNote dataUpdatedAt={folder.dataUpdatedAt} />}
         {folder.isError && entries === undefined && <RefusalOrError error={folder.error} sentences={LIST_SENTENCES} what="nothing is known about this folder" />}
@@ -938,14 +959,24 @@ function RenameForm({
   );
 }
 
-function Count({ entries }: { entries: Entry[] | undefined }) {
+/**
+ * How many, and how much — the one count on this page carrying a second fact.
+ *
+ * This was `.fi-count`, a hand-rolled copy of `.ui-count` down to the mono
+ * face and the tabular figures, and the `item`/`items` ternary inside it is
+ * precisely the duplication `Count` was extracted to remove.
+ *
+ * The byte total rides in on `noun`/`plural` rather than beside them, and that
+ * is deliberate rather than clever: `.ui-count` is `white-space: nowrap`, so
+ * the quantity and the size stay one unbroken phrase in the corner of the head
+ * instead of two spans a wrap can separate. The alternative was a second page
+ * class re-deriving `.ui-count` for the half of the phrase the primitive would
+ * not carry, which is the problem rather than the fix.
+ */
+function ContentsCount({ entries }: { entries: Entry[] | undefined }) {
   if (entries === undefined) return null;
-  const totalBytes = entries.reduce((sum, entry) => sum + entry.size_bytes, 0);
-  return (
-    <span className="fi-count">
-      {entries.length} item{entries.length === 1 ? "" : "s"}, {formatBytes(totalBytes)}
-    </span>
-  );
+  const size = formatBytes(entries.reduce((sum, entry) => sum + entry.size_bytes, 0));
+  return <Count n={entries.length} noun={`item, ${size}`} plural={`items, ${size}`} />;
 }
 
 /* -------------------------------------------------------------- search -- */
@@ -961,10 +992,14 @@ function SearchResults({
 }) {
   const hits = result.data?.hits ?? [];
   return (
-    <Panel title="Search results" aside={result.data === undefined ? undefined : <span className="fi-count">{hits.length} hit{hits.length === 1 ? "" : "s"}</span>}>
+    <Panel title="Search results" aside={<Count n={result.data === undefined ? undefined : hits.length} noun="hit" />}>
       {result.isError && <RefusalOrError error={result.error} sentences={SEARCH_SENTENCES} what="that search did not go through" />}
       {!result.isError && result.data === undefined && <p className="fi-loading">searching…</p>}
-      {result.data !== undefined && hits.length === 0 && <p className="fi-empty">nothing under this folder matches.</p>}
+      {/* The one-line absence, and `Quiet` rather than `.fi-loading`'s faint:
+          here the sentence IS what the panel has to say, and an answer set
+          fainter than the labels around it reads as failure rather than as
+          emptiness. The wait above keeps the faint rung for the same reason. */}
+      {result.data !== undefined && hits.length === 0 && <Quiet says="nothing under this folder matches." />}
       {result.data?.truncated === true && (
         <p className="fi-truncated" role="status">
           stopped early — this search hit the daemon's own ceiling before finishing the whole tree. Narrow it to
@@ -972,9 +1007,9 @@ function SearchResults({
         </p>
       )}
       {hits.length > 0 && (
-        <ul className="fi-hits" aria-label="Search hits">
+        <Rows label="Search hits">
           {hits.map((hit) => (
-            <li className="fi-hit" key={hit.path}>
+            <Row key={hit.path} layout="line">
               <Button
                 variant="link"
                 onClick={() => {
@@ -989,9 +1024,9 @@ function SearchResults({
               </Button>
               <span className="fi-hit-path">{hit.path}</span>
               <span className="fi-hit-size">{hit.is_dir ? "" : formatBytes(hit.size_bytes)}</span>
-            </li>
+            </Row>
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
@@ -1013,24 +1048,27 @@ function MoveForm({
   const from = joinPath(path, entry.name);
   const [to, setTo] = useState(from);
   return (
+    // The `form` wraps the `Inset` for the reason the tree's `nav` does:
+    // submit-on-Enter is behaviour, and `Inset` renders a `div` or an `li`.
     <form
-      className="fi-move"
       onSubmit={(event) => {
         event.preventDefault();
         if (to.trim() === "" || move.isPending) return;
         move.mutate({ from, to: to.trim() }, { onSuccess: onClose });
       }}
     >
-      <Field label={`Move ${entry.name} to`}>
-        <input value={to} aria-label="Destination path" onChange={(event) => setTo(event.target.value)} />
-      </Field>
-      <Button type="submit" disabled={move.isPending}>
-        Move
-      </Button>
-      <Button variant="ghost" onClick={onClose}>
-        Cancel
-      </Button>
-      {move.isError && <RefusalOrError error={move.error} sentences={MOVE_SENTENCES} what="that move did not go through" />}
+      <Inset className="fi-move">
+        <Field label={`Move ${entry.name} to`}>
+          <input value={to} aria-label="Destination path" onChange={(event) => setTo(event.target.value)} />
+        </Field>
+        <Button type="submit" disabled={move.isPending}>
+          Move
+        </Button>
+        <Button variant="ghost" onClick={onClose}>
+          Cancel
+        </Button>
+        {move.isError && <RefusalOrError error={move.error} sentences={MOVE_SENTENCES} what="that move did not go through" />}
+      </Inset>
     </form>
   );
 }

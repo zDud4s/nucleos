@@ -16,8 +16,31 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use crate::config::{CouncilConfig, CouncilSeat, SeatAgent, SeatKind, SeatSpec};
+
+/// The roster on this machine, or `None` when there is no home directory to hang it off.
+///
+/// `~/.nucleos` and not the app's data directory, for the reason `workflows::library_root` argues
+/// at length where it made the same choice: a file a person is meant to open, read and edit is the
+/// opposite kind of thing to a database, and putting it where only the app can find it is putting
+/// it where nobody edits it.
+///
+/// And not `.ai/council.yaml`, which is where this started. `.ai/` is the agent harness's own
+/// directory inside one checkout, so the roster only existed for a daemon started from that
+/// directory, and every worktree on this machine was a council that had to be written again. The
+/// pillar is the product's, not the harness's; the file follows.
+pub fn config_path() -> Option<PathBuf> {
+    crate::commands::home().map(|home| home.join(".nucleos").join("council.yaml"))
+}
+
+/// The same file as a person is shown it, and the only spelling any refusal uses.
+///
+/// Deliberately not the absolute path [`config_path`] returns. The absolute one is what the daemon
+/// opens; `~/.nucleos/council.yaml` is what somebody can be told to go and write, on any machine,
+/// without the sentence carrying another person's username.
+pub const CONFIG_DISPLAY_PATH: &str = "~/.nucleos/council.yaml";
 
 /// A council's status. Text in the database, as `runs.status` is.
 pub const STATUS_RUNNING: &str = "running";
@@ -31,8 +54,30 @@ pub const SEAT_OK: &str = "ok";
 pub const SEAT_ERROR: &str = "error";
 pub const SEAT_TIMEOUT: &str = "timeout";
 pub const SEAT_CANCELLED: &str = "cancelled";
-/// Phase 2 only: there was nothing to rank.
+/// Phase 2 and the revision: there was nothing to rank, so there was nothing to revise against.
 pub const SEAT_SKIPPED: &str = "skipped";
+
+/// The phase numbers `council_runs.stage` carries.
+///
+/// The chairman is deliberately NOT among them, and that is the whole reason these are named at
+/// all. It used to be phase 3 and now it is the LAST phase, which is 3 or 4 depending on whether a
+/// second round was asked for — a constant called `STAGE_CHAIRMAN` would have to be a lie in one of
+/// the two shapes. [`stages_total`] is where that number is worked out, once.
+pub const STAGE_ANSWER: i64 = 1;
+pub const STAGE_RANKING: i64 = 2;
+/// The second round, when the roster asked for one. Never reached with `rounds: 1`.
+pub const STAGE_REVISION: i64 = 3;
+
+/// The `rounds` value at which the revision phase exists. See `config::MAX_COUNCIL_ROUNDS`.
+const ROUNDS_WITH_REVISION: i64 = 2;
+
+/// How many phases a council of this many rounds runs — three, or four with a second round.
+///
+/// Derived from `rounds` rather than stored beside it. A column would be a third copy of one fact,
+/// free to disagree with the other two, and the arithmetic is this line.
+pub fn stages_total(rounds: i64) -> i64 {
+    if rounds >= ROUNDS_WITH_REVISION { 4 } else { 3 }
+}
 
 /// Where a local seat's tool box reaches the daemon.
 ///
@@ -72,6 +117,67 @@ pub struct LeaderboardEntry {
     /// over five are not the same claim, and a table that showed only the average would present
     /// them as one.
     pub n: usize,
+}
+
+/// One leaderboard line as a REVISING seat is shown it.
+///
+/// [`LeaderboardEntry`] is keyed on `seat_idx`, which is the seat's identity everywhere in this
+/// system — handing one to a seat would undo in the fourth phase everything the second phase was
+/// built to protect. This is the same standing said in the only vocabulary a seat has: the labels
+/// it was shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Standing {
+    /// The label this line stands for, or `None` for the reader's own answer.
+    ///
+    /// `None` rather than the reader's own label, and it is not a convenience. A seat is never told
+    /// which label it is: phase 2 excluded its own label from what it saw, and naming it here would
+    /// hand back the one fact the shuffle withheld — from which a seat that compares two councils
+    /// could start unpicking the map.
+    pub label: Option<String>,
+    pub avg_rank: f64,
+    pub n: usize,
+}
+
+/// PURE: the leaderboard as one seat may be shown it.
+///
+/// Three narrowings, each of them a leak that would otherwise be one line away. Seat indices become
+/// labels. The reader's own line loses its label. And a seat this reader was never shown is left
+/// out entirely — its label would be a label attached to no answer, which is a peer the reader can
+/// only guess at and a count of the council it was not given.
+pub fn standings_for(
+    viewer: usize,
+    anon: &Anonymized,
+    leaderboard: &[LeaderboardEntry],
+) -> Vec<Standing> {
+    let shown: std::collections::BTreeSet<&str> = anon
+        .for_seat
+        .get(&viewer)
+        .map(|labels| labels.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let label_of: BTreeMap<usize, &str> = anon
+        .anon_map
+        .iter()
+        .map(|(label, seat_idx)| (*seat_idx, label.as_str()))
+        .collect();
+
+    leaderboard
+        .iter()
+        .filter_map(|entry| {
+            if entry.seat_idx == viewer {
+                return Some(Standing {
+                    label: None,
+                    avg_rank: entry.avg_rank,
+                    n: entry.n,
+                });
+            }
+            let label = label_of.get(&entry.seat_idx)?;
+            shown.contains(label).then(|| Standing {
+                label: Some((*label).to_string()),
+                avg_rank: entry.avg_rank,
+                n: entry.n,
+            })
+        })
+        .collect()
 }
 
 /// One label-and-rank pair a seat wrote, after filtering.
@@ -377,6 +483,57 @@ pub fn stage2_prompt(question: &str, shown: &[(String, String)]) -> String {
     prompt.trim_end().to_string() + "\n"
 }
 
+/// The prompt a revising seat receives: the question, its own answer, the SAME anonymised peer
+/// answers it ranked, and where the council placed each of them.
+///
+/// `shown` is the identical `(label, answer)` list [`stage2_prompt`] built for this seat, and that
+/// identity is the property rather than an implementation detail. A second round that widened what
+/// a seat sees would not be a revision of the first — it would be a different question, asked of a
+/// seat that had already been paid for answering the first one.
+///
+/// Its own answer arrives UNLABELLED, under a heading that says it is the reader's. The alternative
+/// — putting it among the peers under its own label — would tell the seat which label it is, and
+/// that is exactly the fact phase 2 withheld.
+///
+/// No tools, like phase 2 and for the same reason: a seat that could go and find targeted evidence
+/// after reading its peers would turn the second round into a measure of who had time left.
+pub fn revision_prompt(
+    question: &str,
+    own_answer: &str,
+    shown: &[(String, String)],
+    standings: &[Standing],
+) -> String {
+    let mut prompt = format!(
+        "Question:\n{question}\n\n\
+         Your own answer:\n{own}\n\n\
+         The anonymous peer responses you ranked:\n\n",
+        own = own_answer.trim()
+    );
+    for (label, answer) in shown {
+        prompt.push_str(&format!("Response {label}:\n{answer}\n\n"));
+    }
+    prompt.push_str("Where the council placed each answer, by average rank — lower is better:\n");
+    if standings.is_empty() {
+        // Said rather than left blank, for the reason `stage3_prompt` gives one function down: a
+        // seat handed an empty section invents what belongs in it.
+        prompt.push_str("No ranking could be read out of the votes.\n");
+    }
+    for standing in standings {
+        // `You` and not the reader's label. See `Standing::label`.
+        let who = standing.label.as_deref().unwrap_or("You");
+        prompt.push_str(&format!(
+            "{who}: {:.2} from {} vote(s)\n",
+            standing.avg_rank, standing.n
+        ));
+    }
+    prompt.push_str(
+        "\nRevise your own answer in the light of the ranking. Reply with the revised answer in \
+         full — it replaces what you wrote, and nothing else you have said is carried forward. Do \
+         not name, or guess at, who wrote any response.\n",
+    );
+    prompt
+}
+
 /// The prompt the chairman receives: the question, the valid answers BY SEAT, and the leaderboard.
 ///
 /// The anonymity ends here on purpose. Phase 2 hid the authors so the ranking measured the argument;
@@ -407,10 +564,10 @@ pub fn stage3_prompt(
 
 /// The council's settings, resolved once at startup.
 ///
-/// `None` inside is the shipped state and means there is no council: `.ai/council.yaml` is absent,
-/// unreadable, or names a roster the daemon will not run. Held as one field on `AppState` for the
-/// same reason `voice` and `web` are — read together, switched on together, and a `Default` that
-/// means "off" so no test that ignores councils has to know this exists.
+/// `None` inside is the shipped state and means there is no council: [`CONFIG_DISPLAY_PATH`] is
+/// absent, unreadable, or names a roster the daemon will not run. Held as one field on `AppState`
+/// for the same reason `voice` and `web` are — read together, switched on together, and a
+/// `Default` that means "off" so no test that ignores councils has to know this exists.
 #[derive(Clone, Default)]
 pub struct CouncilRuntime {
     config: Option<CouncilConfig>,
@@ -456,6 +613,25 @@ impl CouncilRuntime {
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
     }
+
+    /// Whether a job's review node should be given a council's synthesis to read first.
+    ///
+    /// Asked of the runtime rather than of `config().consumers` at the call site, so "there is no
+    /// council at all" and "the council was not asked to advise this" collapse into one answer. A
+    /// consumer reading the flag itself would have to remember the `is_some_and`, and forgetting it
+    /// is a panic on the shipped configuration — no roster is the state this daemon ships in.
+    pub fn advises_job_review(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| config.consumers.job_review)
+    }
+
+    /// Whether a proposal the daemon writes should carry a council's opinion as a note.
+    pub fn advises_proposals(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| config.consumers.proposal_advice)
+    }
 }
 
 /// One seat as it is stored and read back.
@@ -477,6 +653,11 @@ pub struct SeatRow {
     /// The JSON as stored. Parsed on the way out to the client, not here, so a row written by a
     /// future version with a field this one does not know about still reads.
     pub rankings: Option<String>,
+    /// The second round, or the columns a council of one round never touches. `pending` is what
+    /// those keep — see `0136_council_revision.sql`, which argues why that is not tidied.
+    pub revision_run_id: Option<i64>,
+    pub revision_status: String,
+    pub revision_error: Option<String>,
 }
 
 /// One council as it is stored and read back, without its seats.
@@ -487,6 +668,10 @@ pub struct CouncilRow {
     pub question: String,
     pub status: String,
     pub stage: i64,
+    /// 1 or 2, copied off the file when the council convened. What [`stages_total`] is computed
+    /// from, and the reason a reader can tell whether `stage = 3` is the last phase or the third
+    /// of four.
+    pub rounds: i64,
     pub anon_seed: String,
     pub anon_map: Option<String>,
     pub leaderboard: Option<String>,
@@ -509,18 +694,24 @@ pub async fn insert_council(
     question: &str,
     chairman: &CouncilSeat,
     members: &[CouncilSeat],
+    rounds: i64,
 ) -> sqlx::Result<()> {
     let mut transaction = pool.begin().await?;
     sqlx::query(
         "INSERT INTO council_runs
-           (id, created_at, question, status, stage, anon_seed, chairman_kind, chairman_ref,
-            chairman_agent_id)
-         VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
+           (id, created_at, question, status, stage, rounds, anon_seed, chairman_kind,
+            chairman_ref, chairman_agent_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(question)
     .bind(STATUS_RUNNING)
+    .bind(STAGE_ANSWER)
+    // Written rather than left to the column's DEFAULT, as `stage1_status` is below and for the
+    // same reason: the number this module computes `stages_total` from and the number the database
+    // holds must not be able to drift apart.
+    .bind(rounds)
     // The council's own id. Stored again under its own name so the shuffle stays recomputable even
     // if what the seed is derived from ever changes.
     .bind(id)
@@ -564,10 +755,35 @@ pub async fn get_council_row(
         .await
 }
 
+impl CouncilRow {
+    /// Whether this council is over, however it ended.
+    ///
+    /// The positive list, for the reason [`TERMINAL_COUNCIL_STATUSES`] gives: spelled as
+    /// `!= running`, a status added later and forgotten would read as SETTLED, and an internal
+    /// consumer waiting on one would walk on with no synthesis while the council was still
+    /// deliberating. This way the same oversight only makes it wait.
+    pub fn is_settled(&self) -> bool {
+        TERMINAL_COUNCIL_STATUSES.contains(&self.status.as_str())
+    }
+}
+
+/// The chairman's synthesis, or `None` when there is not one to read.
+///
+/// The same read `get_council` does to fill `CouncilView::synthesis`, lifted out because it is now
+/// asked for off the HTTP path too — a job's review node and a proposal's note both want the text
+/// and neither is a client. **The synthesis is not a column**: it is the transcript of the run in
+/// `chairman_run_id`, so a council that ended `error` before phase 3, or one whose transcript has
+/// since been pruned by `runs::prune_transcripts`, answers `None` rather than an empty string. A
+/// caller must treat that as "no advice", never as "the council advised nothing".
+pub async fn synthesis_of(pool: &sqlx::SqlitePool, row: &CouncilRow) -> Option<String> {
+    transcript_of(pool, row.chairman_run_id?).await
+}
+
 pub async fn get_seat_rows(pool: &sqlx::SqlitePool, id: &str) -> sqlx::Result<Vec<SeatRow>> {
     sqlx::query_as::<_, SeatRow>(
         "SELECT seat_idx, kind, model_ref, agent_id, stage1_run_id, stage1_status, stage1_error,
-                stage2_run_id, stage2_status, stage2_error, rankings
+                stage2_run_id, stage2_status, stage2_error, rankings,
+                revision_run_id, revision_status, revision_error
          FROM council_seats WHERE council_id = ? ORDER BY seat_idx",
     )
     .bind(id)
@@ -714,10 +930,37 @@ pub async fn set_stage2(
     .map(|_| ())
 }
 
+/// Records how one seat's second round ended.
+///
+/// No `rankings` counterpart to phase 2's: a revision produces prose, and the prose lives in the
+/// transcript of the run this attaches — the same argument `0065_council.sql` makes for keeping the
+/// answers out of these tables.
+pub async fn set_revision(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    seat_idx: usize,
+    run_id: Option<i64>,
+    status: &str,
+    error: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE council_seats SET revision_run_id = ?, revision_status = ?, revision_error = ?
+         WHERE council_id = ? AND seat_idx = ?",
+    )
+    .bind(run_id)
+    .bind(status)
+    .bind(error)
+    .bind(id)
+    .bind(seat_idx as i64)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
 /// Why a council could not be started. Every variant is a refusal BEFORE anything is spent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartError {
-    /// `.ai/council.yaml` is absent, unreadable, or names a roster the daemon will not run.
+    /// [`CONFIG_DISPLAY_PATH`] is absent, unreadable, or names a roster the daemon will not run.
     NotConfigured,
     /// The roster asks for a local seat and this daemon has no local model to answer with.
     ///
@@ -738,7 +981,7 @@ impl std::fmt::Display for StartError {
         match self {
             StartError::NotConfigured => write!(
                 formatter,
-                "no council is configured — write a roster to .ai/council.yaml and restart"
+                "no council is configured — write a roster to {CONFIG_DISPLAY_PATH} and restart"
             ),
             StartError::NoLocalModel => write!(
                 formatter,
@@ -975,7 +1218,11 @@ pub async fn start(
     }
 
     let id = crate::auth::generate_uuid_v4();
-    insert_council(&state.pool, &id, question, &chairman, &members)
+    // From the FILE, never from the override. A roster override says who sits; how many rounds
+    // they sit for is a council-wide setting the owner made once, and letting a request raise it
+    // would let a caller double the bill without touching configuration.
+    let rounds = i64::from(configured.rounds);
+    insert_council(&state.pool, &id, question, &chairman, &members, rounds)
         .await
         .map_err(|error| StartError::Unavailable(error.to_string()))?;
 
@@ -1011,6 +1258,7 @@ pub async fn start(
         members,
         token,
         timeout: std::time::Duration::from_secs(configured.timeout_seconds),
+        rounds,
     };
     tokio::spawn(async move {
         let _guard = guard;
@@ -1031,6 +1279,10 @@ struct Driver {
     token: String,
     /// The wall clock ONE seat gets.
     timeout: std::time::Duration,
+    /// 1 or 2, as the row records it. Read from the driver rather than from the row at each phase
+    /// boundary, because it cannot change under a running council: the file may be edited mid-flight
+    /// and the deliberation that is already paid for has to finish the shape it started.
+    rounds: i64,
 }
 
 /// Which column of the record a seat's state belongs in.
@@ -1042,6 +1294,8 @@ enum Slot {
     Stage1(usize),
     /// The viewer, and the labels it was shown — the filter `parse_rankings` applies.
     Stage2(usize, Vec<String>),
+    /// The second round. Only the seat index: a revision is prose, and there is no vote to filter.
+    Revision(usize),
     Chairman,
 }
 
@@ -1064,7 +1318,16 @@ impl Driver {
             return;
         }
 
-        self.stage3(&answers, &leaderboard).await;
+        // `None` back means nothing was revised — one round configured, or a ranking that never
+        // happened — and the chairman reads phase 1, which is byte for byte what it read before
+        // this phase existed.
+        let revised = self.revision(&answers, &anon, &leaderboard).await;
+        if self.was_settled().await {
+            return;
+        }
+
+        self.stage3(revised.as_ref().unwrap_or(&answers), &leaderboard)
+            .await;
     }
 
     /// Whether somebody has already closed this council — a cancel, or a write that lost a race.
@@ -1156,7 +1419,7 @@ impl Driver {
             return Vec::new();
         }
 
-        if let Err(error) = set_stage(&self.state.pool, &self.id, 2).await {
+        if let Err(error) = set_stage(&self.state.pool, &self.id, STAGE_RANKING).await {
             tracing::warn!(council = %self.id, %error, "could not advance the council to phase 2");
         }
 
@@ -1206,15 +1469,120 @@ impl Driver {
         leaderboard
     }
 
-    /// Phase 3 — the chairman writes the answer.
+    /// The second round — each seat revises its own answer in the light of the ranking.
+    ///
+    /// Returns the answers the CHAIRMAN should read, or `None` when nothing was revised and phase 1
+    /// stands. `None` is the shipped path and it does no work at all: a council of one round makes
+    /// no query here, writes no row, and leaves `stage` climbing 1, 2, 3 exactly as it always did.
+    ///
+    /// A seat's revised answer replaces its first ONLY when the revision came back `ok`. Every
+    /// other ending — the model refused, the clock ran out, somebody cancelled — leaves the first
+    /// answer standing, because a failed second attempt is not a reason to throw away a first one
+    /// that worked. The predicate is the recorded status and nothing else, exactly as phase 1's is:
+    /// `stage1` counts an `ok` seat as having answered without inspecting what it wrote, and a
+    /// second rule here would make the two phases disagree about what `ok` means.
+    async fn revision(
+        &self,
+        answers: &BTreeMap<usize, String>,
+        anon: &Anonymized,
+        leaderboard: &[LeaderboardEntry],
+    ) -> Option<BTreeMap<usize, String>> {
+        if self.rounds < ROUNDS_WITH_REVISION {
+            return None;
+        }
+
+        // No ranking, no revision. `stage2_should_run` is asked rather than the leaderboard
+        // inspected, so the two phases skip on exactly the same condition and cannot drift: a
+        // council can produce an empty leaderboard with phase 2 having genuinely run, when every
+        // vote was blank, and that is a ranking — a thin one, but one the seats were shown.
+        //
+        // Recorded as `skipped` and not left `pending`, for the reason phase 2 already gives: the
+        // two words mean different things, and only one of them is a council that stopped.
+        if !stage2_should_run(answers.len()) {
+            for seat_idx in 0..self.members.len() {
+                let _ = set_revision(
+                    &self.state.pool,
+                    &self.id,
+                    seat_idx,
+                    None,
+                    SEAT_SKIPPED,
+                    None,
+                )
+                .await;
+            }
+            return None;
+        }
+
+        if let Err(error) = set_stage(&self.state.pool, &self.id, STAGE_REVISION).await {
+            tracing::warn!(council = %self.id, %error, "could not advance the council to the second round");
+        }
+
+        let revising = anon.for_seat.iter().filter_map(|(viewer, labels)| {
+            let seat = self.members.get(*viewer)?;
+            let own = answers.get(viewer)?.clone();
+            // The SAME list phase 2 built, rebuilt the same way from the same shuffle. Not carried
+            // over from phase 2, because carrying it would mean holding every peer's answer for
+            // both phases to keep one `Vec` alive; rebuilt from `anon` and `answers`, which are the
+            // two things that decided it in the first place and neither of which has changed.
+            let shown: Vec<(String, String)> = labels
+                .iter()
+                .filter_map(|label| {
+                    let seat_idx = anon.anon_map.get(label)?;
+                    Some((label.clone(), answers.get(seat_idx)?.clone()))
+                })
+                .collect();
+            let standings = standings_for(*viewer, anon, leaderboard);
+            let prompt = revision_prompt(&self.question, &own, &shown, &standings);
+            Some(async move {
+                // No tools, as in phase 2.
+                let outcome = self
+                    .run_seat(Slot::Revision(*viewer), seat, prompt, false)
+                    .await;
+                (*viewer, outcome)
+            })
+        });
+        let outcomes = crate::join::all(revising).await;
+
+        let mut revised = answers.clone();
+        let mut count = 0usize;
+        for (seat_idx, outcome) in outcomes {
+            if outcome.status == SEAT_OK {
+                revised.insert(seat_idx, outcome.answer);
+                count += 1;
+            }
+        }
+
+        let _ = crate::feed::append(
+            &self.state.pool,
+            None,
+            "council_stage",
+            &format!("council phase {STAGE_REVISION} done: {count} seats revised"),
+            None,
+            Some(&crate::feed::Subject::Council(self.id.clone())),
+        )
+        .await;
+
+        Some(revised)
+    }
+
+    /// The last phase — the chairman writes the answer.
     ///
     /// The failure here is the one that settles the council as `error`, and it is survivable in the
     /// way the others are not: phases 1 and 2 are still readable, and they are the part with value.
     /// The answers and the ranking are worth having without the synthesis; the synthesis is not
     /// worth having without them.
+    ///
+    /// `answers` is whatever the phase before it settled on: the phase-1 answers, or those with a
+    /// seat's revision substituted where the second round produced one. The chairman is not told
+    /// which, and there is nothing useful it could do with the distinction — it is synthesising the
+    /// council's best statement of each position, not auditing how many attempts it took.
     async fn stage3(&self, answers: &BTreeMap<usize, String>, leaderboard: &[LeaderboardEntry]) {
-        if let Err(error) = set_stage(&self.state.pool, &self.id, 3).await {
-            tracing::warn!(council = %self.id, %error, "could not advance the council to phase 3");
+        // The LAST phase, which is 3 or 4. Not the constant `3` it was: with a second round the
+        // chairman is the fourth thing that happens, and a `stage` that went 1, 2, 3, 3 would show
+        // a reader the revision and the synthesis as one phase.
+        let last = stages_total(self.rounds);
+        if let Err(error) = set_stage(&self.state.pool, &self.id, last).await {
+            tracing::warn!(council = %self.id, %error, "could not advance the council to phase {last}");
         }
 
         let prompt = stage3_prompt(&self.question, answers, leaderboard);
@@ -1367,6 +1735,17 @@ impl Driver {
                 )
                 .await
             }
+            Slot::Revision(seat_idx) => {
+                set_revision(
+                    &self.state.pool,
+                    &self.id,
+                    *seat_idx,
+                    run_id,
+                    outcome.status,
+                    outcome.error.as_deref(),
+                )
+                .await
+            }
             // The chairman has no seat row; its run hangs off the council itself. Nothing to write
             // when the row could not even be opened.
             Slot::Chairman => match run_id {
@@ -1420,6 +1799,12 @@ impl Driver {
             permission: crate::runner::Permission::Default,
             resume_session_id: None,
             mcp_config: with_tools.then(|| mcp_config_path(&self.id)),
+            // Unboxed, and said out loud rather than left to a default. The council writes its
+            // config with `build_mcp_config(&exe, None)` above, so a seat that is given tools is
+            // offered the whole surface and pays for the whole surface. Spelling it here is what
+            // puts the pairing on the page: the line above says a server exists, this one says
+            // what it announces, and the two are read together by `runner::authored_prompt`.
+            mcp_box: None,
             tool_policy: if with_tools {
                 crate::runner::ToolPolicy::McpOnly
             } else {
@@ -1506,7 +1891,8 @@ impl Driver {
                     let _ = sqlx::query(
                         "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?,
                                 cost_usd = ?, input_tokens = ?, output_tokens = ?,
-                                cache_read_tokens = ?, num_turns = ?, completed_at = ?
+                                cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?,
+                                completed_at = ?
                          WHERE id = ? AND status = 'running'",
                     )
                     .bind(&run.stdout)
@@ -1514,6 +1900,7 @@ impl Driver {
                     .bind(run.input_tokens)
                     .bind(run.output_tokens)
                     .bind(run.cache_read_tokens)
+                    .bind(run.cache_creation_tokens)
                     .bind(run.num_turns)
                     .bind(&completed_at)
                     .bind(run_id)
@@ -1529,15 +1916,32 @@ impl Driver {
                     // A non-zero exit is still a run that spent money, so its cost is recorded
                     // exactly as a successful one's is. The council counts against the budget, and
                     // a failed seat that cost nothing on paper would understate what was spent.
+                    //
+                    // `num_turns` and the token columns travel here too, and did not used to: a
+                    // seat that answers once and then dies at its turn ceiling —
+                    // `crate::runner::TURN_CEILING_EXIT_CODE`, a non-zero exit, so it lands in
+                    // THIS arm — carries the completed turn's own count and usage in `RunOutcome`
+                    // exactly as the `completed` arm above does, and this `UPDATE` was the one
+                    // place that dropped them on the floor instead of binding them.
+                    //
+                    // Cache creation among them, in both arms: the window a seat spent building its
+                    // cache is spend like any other, and a row without it reads as cheaper than it was.
                     let _ = sqlx::query(
                         "UPDATE runs SET status = 'failed', exit_code = ?, stdout = ?, stderr = ?,
-                                cost_usd = ?, completed_at = ?
+                                cost_usd = ?, input_tokens = ?, output_tokens = ?,
+                                cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?,
+                                completed_at = ?
                          WHERE id = ? AND status = 'running'",
                     )
                     .bind(run.exit_code)
                     .bind(&run.stdout)
                     .bind(&run.stderr)
                     .bind(run.cost_usd)
+                    .bind(run.input_tokens)
+                    .bind(run.output_tokens)
+                    .bind(run.cache_read_tokens)
+                    .bind(run.cache_creation_tokens)
+                    .bind(run.num_turns)
                     .bind(&completed_at)
                     .bind(run_id)
                     .execute(&pool)
@@ -1736,6 +2140,11 @@ pub async fn cancel(state: &crate::state::AppState, id: &str) -> sqlx::Result<bo
     for seat in &seats {
         opened.extend(seat.stage1_run_id);
         opened.extend(seat.stage2_run_id);
+        // The second round is terminated exactly as the other two are. It is `None` on a council of
+        // one round, so this line costs nothing there and is not conditional on `rounds` — a cancel
+        // that had to know the shape of the council it was stopping would be one shape away from
+        // leaving a process running.
+        opened.extend(seat.revision_run_id);
     }
     opened.extend(chairman_run);
     for run_id in opened {
@@ -1903,6 +2312,18 @@ pub struct SeatView {
     pub stage2_status: String,
     pub stage2_error: Option<String>,
     pub rankings: Vec<Ranking>,
+    /// The second round. `pending` on every seat of a one-round council, which `stages_total` on
+    /// the council is what makes readable — a client that knows there are three phases knows this
+    /// column describes a phase that was never going to happen.
+    pub revision_status: String,
+    pub revision_error: Option<String>,
+    /// What the seat wrote the second time, read from its revision run's transcript. `None` until
+    /// there is one, and `None` forever on a council of one round.
+    ///
+    /// Beside `answer` rather than replacing it: the first answer is what the ranking was cast
+    /// over, so a client that showed only the revision would be showing a leaderboard of text it
+    /// never displayed.
+    pub revised_answer: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1912,6 +2333,9 @@ pub struct CouncilView {
     pub question: String,
     pub status: String,
     pub stage: i64,
+    /// How many phases this council runs — 3, or 4 when a second round was configured. Served so a
+    /// client can say "phase n of N" instead of hardcoding a total that is no longer always 3.
+    pub stages_total: i64,
     pub error: Option<String>,
     pub chairman_kind: String,
     #[serde(rename = "chairman_ref")]
@@ -1933,6 +2357,10 @@ pub struct CouncilSummary {
     pub question: String,
     pub status: String,
     pub stage: i64,
+    /// Beside `stage` here as well as on the detail, because the LIST is the other place a phase
+    /// number is drawn and a total is what makes one legible. A row that said `phase 3` with no
+    /// total would read as finished on a council that has a fourth phase still to run.
+    pub stages_total: i64,
 }
 
 pub async fn post_council(
@@ -1983,8 +2411,14 @@ pub async fn get_council(
         ))?;
     let seats = get_seat_rows(&state.pool, &id).await.map_err(internal)?;
 
+    // Both rounds' transcripts in one map, keyed by RUN id rather than by seat, because that is
+    // what the seat rows point at and a seat now points at two of them.
     let mut answers = BTreeMap::new();
-    for run_id in seats.iter().filter_map(|seat| seat.stage1_run_id) {
+    for run_id in seats
+        .iter()
+        .filter_map(|seat| seat.stage1_run_id)
+        .chain(seats.iter().filter_map(|seat| seat.revision_run_id))
+    {
         if let Some(text) = transcript_of(&state.pool, run_id).await {
             answers.insert(run_id, text);
         }
@@ -2031,6 +2465,11 @@ pub async fn get_council(
                 stage1_error: seat.stage1_error,
                 stage2_status: seat.stage2_status,
                 stage2_error: seat.stage2_error,
+                revised_answer: seat
+                    .revision_run_id
+                    .and_then(|run_id| answers.get(&run_id).cloned()),
+                revision_status: seat.revision_status,
+                revision_error: seat.revision_error,
             })
             .collect(),
         anon_map: row
@@ -2049,6 +2488,7 @@ pub async fn get_council(
         question: row.question,
         status: row.status,
         stage: row.stage,
+        stages_total: stages_total(row.rounds),
         error: row.error,
         chairman_kind: row.chairman_kind,
         chairman_ref: row.chairman_ref,
@@ -2087,6 +2527,7 @@ pub async fn list_councils(
                 question: row.question,
                 status: row.status,
                 stage: row.stage,
+                stages_total: stages_total(row.rounds),
             })
             .collect(),
     ))
@@ -2486,6 +2927,128 @@ mod tests {
         assert!(!ranker.contains("Seat "));
     }
 
+    /// The second round shows a seat its own answer, the peers it ranked, and where each landed —
+    /// and the standings travel in the vocabulary the seat has, which is labels.
+    ///
+    /// The reader's own line says `You` and not its label. That is the fact phase 2 withheld: a
+    /// seat is never shown its own label, and giving it back here would hand it the one anchor from
+    /// which the shuffle could start being unpicked.
+    #[test]
+    fn the_revision_prompt_shows_the_ranking_in_labels_and_the_reader_as_itself() {
+        // Three answers; seat 1 is the reader, so it saw A and C and never B, which is itself.
+        let anon = Anonymized {
+            anon_map: [
+                ("A".to_string(), 0),
+                ("B".to_string(), 1),
+                ("C".to_string(), 2),
+            ]
+            .into_iter()
+            .collect(),
+            for_seat: [
+                (0, vec!["B".to_string(), "C".to_string()]),
+                (1, vec!["A".to_string(), "C".to_string()]),
+                (2, vec!["A".to_string(), "B".to_string()]),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let leaderboard = vec![
+            LeaderboardEntry {
+                seat_idx: 2,
+                avg_rank: 1.0,
+                n: 2,
+            },
+            LeaderboardEntry {
+                seat_idx: 1,
+                avg_rank: 1.5,
+                n: 2,
+            },
+            LeaderboardEntry {
+                seat_idx: 0,
+                avg_rank: 2.0,
+                n: 2,
+            },
+        ];
+
+        let standings = standings_for(1, &anon, &leaderboard);
+        assert_eq!(
+            standings,
+            vec![
+                Standing {
+                    label: Some("C".to_string()),
+                    avg_rank: 1.0,
+                    n: 2
+                },
+                Standing {
+                    label: None,
+                    avg_rank: 1.5,
+                    n: 2
+                },
+                Standing {
+                    label: Some("A".to_string()),
+                    avg_rank: 2.0,
+                    n: 2
+                },
+            ],
+            "the order of the leaderboard survives; only the naming changes"
+        );
+
+        let prompt = revision_prompt(
+            "why?",
+            "my own first answer",
+            &[
+                ("A".to_string(), "what A said".to_string()),
+                ("C".to_string(), "what C said".to_string()),
+            ],
+            &standings,
+        );
+        assert!(prompt.contains("Your own answer:\nmy own first answer"));
+        assert!(prompt.contains("Response A:\nwhat A said"));
+        assert!(prompt.contains("Response C:\nwhat C said"));
+        assert!(prompt.contains("You: 1.50 from 2 vote(s)"));
+        assert!(prompt.contains("C: 1.00 from 2 vote(s)"));
+        // Never `B`, which is what this seat is. Not in the responses, because phase 2 did not show
+        // it; not in the standings, because saying it would be saying which one the reader is.
+        assert!(!prompt.contains("Response B"));
+        assert!(!prompt.contains("B: "));
+        assert!(!prompt.contains("Seat "));
+        assert!(!prompt.contains("seat_idx"));
+    }
+
+    /// A standing for an answer the reader never saw is a peer it can only guess at, and a count of
+    /// a council it was not given. Left out rather than shown under a label attached to nothing.
+    #[test]
+    fn a_reader_is_shown_no_standing_for_an_answer_it_never_saw() {
+        let anon = Anonymized {
+            anon_map: [("A".to_string(), 0), ("B".to_string(), 1)]
+                .into_iter()
+                .collect(),
+            // Deliberately narrower than the map: seat 0 was shown nothing at all.
+            for_seat: [(0, Vec::new())].into_iter().collect(),
+        };
+        let leaderboard = vec![
+            LeaderboardEntry {
+                seat_idx: 0,
+                avg_rank: 1.0,
+                n: 1,
+            },
+            LeaderboardEntry {
+                seat_idx: 1,
+                avg_rank: 2.0,
+                n: 1,
+            },
+        ];
+        assert_eq!(
+            standings_for(0, &anon, &leaderboard),
+            vec![Standing {
+                label: None,
+                avg_rank: 1.0,
+                n: 1
+            }],
+            "only the reader's own line survives when it was shown no peer"
+        );
+    }
+
     #[test]
     fn labels_stay_distinct_past_the_alphabet() {
         assert_eq!(label_for(0), "A");
@@ -2556,6 +3119,7 @@ mod tests {
                 seat(SeatKind::Cloud, "claude-opus-4-8"),
                 seat(SeatKind::Local, "qwen3.5:4b"),
             ],
+            1,
         )
         .await
         .unwrap();
@@ -2588,6 +3152,7 @@ mod tests {
             "why?",
             &seat(SeatKind::Cloud, "m"),
             &[seat(SeatKind::Cloud, "m")],
+            1,
         )
         .await
         .unwrap();
@@ -2617,6 +3182,7 @@ mod tests {
             "why?",
             &seat(SeatKind::Cloud, "m"),
             &[seat(SeatKind::Cloud, "m")],
+            1,
         )
         .await
         .unwrap();
@@ -2641,6 +3207,7 @@ mod tests {
                 "why?",
                 &seat(SeatKind::Cloud, "m"),
                 &[seat(SeatKind::Cloud, "m")],
+                1,
             )
             .await
             .unwrap();
@@ -2666,6 +3233,7 @@ mod tests {
             "why?",
             &seat(SeatKind::Cloud, "m"),
             &[seat(SeatKind::Cloud, "m"), seat(SeatKind::Cloud, "m")],
+            1,
         )
         .await
         .unwrap();
@@ -2724,6 +3292,12 @@ mod tests {
         Answers(String),
         /// The CLI ran and exited non-zero: the model refused, or the tool it wanted was denied.
         Fails(String),
+        /// The CLI answered once and then hit its turn ceiling on a later turn: a real, non-zero
+        /// exit — `crate::runner::TURN_CEILING_EXIT_CODE` — carrying the completed turn's own
+        /// `cost_usd`/`num_turns`/token counts, exactly as `runner.rs`'s own ceiling test proves
+        /// `RunOutcome` looks in that case. Distinct from `Fails`, whose fixture leaves every one of
+        /// those `None` and so cannot tell a caller that drops them from one that does not.
+        DiesAtTheCeiling,
         /// The launch itself failed — no work done, nothing spent.
         WillNotLaunch(String),
         /// Never returns, so the seat's own wall clock is what ends it.
@@ -2734,6 +3308,8 @@ mod tests {
     struct ScriptedRunner {
         stage1: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
         stage2: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
+        /// The second round, which only a council with `rounds: 2` ever reaches.
+        revision: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
         chairman: std::sync::Mutex<Option<Scripted>>,
         /// Every request, in the order it arrived, for the assertions about HOW a seat was launched.
         seen: std::sync::Mutex<Vec<SeenRequest>>,
@@ -2750,7 +3326,15 @@ mod tests {
 
     impl ScriptedRunner {
         fn next_for(&self, prompt: &str) -> Scripted {
-            if prompt.contains("Rank the anonymous peer responses") {
+            // Asked FIRST, because a revision prompt also quotes peer responses and a looser marker
+            // would route the second round into phase 2's queue.
+            if prompt.contains("Revise your own answer in the light of the ranking") {
+                self.revision
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Scripted::Answers(String::new()))
+            } else if prompt.contains("Rank the anonymous peer responses") {
                 self.stage2
                     .lock()
                     .unwrap()
@@ -2816,6 +3400,18 @@ mod tests {
                     stderr,
                     ..blank
                 }),
+                Scripted::DiesAtTheCeiling => Ok(crate::runner::RunOutcome {
+                    exit_code: crate::runner::TURN_CEILING_EXIT_CODE,
+                    stderr: "nucleos: stopped after 3 turns; this run's ceiling was 3\n"
+                        .to_string(),
+                    cost_usd: Some(0.05),
+                    input_tokens: Some(11),
+                    output_tokens: Some(22),
+                    cache_read_tokens: Some(0),
+                    cache_creation_tokens: Some(7),
+                    num_turns: Some(1),
+                    ..blank
+                }),
                 Scripted::WillNotLaunch(reason) => Err(std::io::Error::other(reason)),
                 Scripted::Hangs => {
                     std::future::pending::<()>().await;
@@ -2829,6 +3425,8 @@ mod tests {
         CouncilConfig {
             // One second, so a hung seat is a fast test rather than a ten-minute one.
             timeout_seconds: 1,
+            rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+            consumers: crate::config::CouncilConsumers::default(),
             chairman: spec(SeatKind::Cloud, "the-chairman"),
             members: (0..members)
                 .map(|index| spec(SeatKind::Cloud, &format!("model-{index}")))
@@ -2850,6 +3448,8 @@ mod tests {
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -2928,6 +3528,75 @@ mod tests {
         assert_eq!(anon.len(), 2);
         assert!(!anon.values().any(|seat| *seat == 1));
         assert!(row.chairman_run_id.is_some());
+    }
+
+    /// The bug this was filed over, reproduced at a council seat: a seat that answers once and then
+    /// dies at its turn ceiling is a non-zero exit, same as `Fails` above — and that branch's own
+    /// `UPDATE` bound `cost_usd` but not `num_turns` or the token columns, silently dropping numbers
+    /// `RunOutcome` actually carried. `RunDetail.tsx` reads this seat's row exactly as it reads any
+    /// other run's, so what is missing here is the same "none recorded" the owner reported.
+    #[tokio::test]
+    async fn a_seat_that_dies_at_the_ceiling_still_reports_the_turn_before_it() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("the first answer".into()),
+            Scripted::DiesAtTheCeiling,
+            Scripted::Answers("the third answer".into()),
+        ]
+        .into();
+        *runner.stage2.lock().unwrap() = [
+            Scripted::Answers("A: 1\nB: 2".into()),
+            Scripted::Answers("A: 1\nB: 2".into()),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+
+        assert_eq!(row.status, STATUS_DONE);
+        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
+        assert_eq!(seats[1].stage1_status, SEAT_ERROR);
+        let run_id = seats[1]
+            .stage1_run_id
+            .expect("a seat that launched has a run row, whatever it ended with");
+
+        /// `exit_code, cost_usd, num_turns, input_tokens, output_tokens, cache_creation_tokens`.
+        type SeatNumbers = (
+            Option<i32>,
+            Option<f64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let (exit_code, cost_usd, num_turns, input_tokens, output_tokens, cache_creation_tokens): SeatNumbers = sqlx::query_as(
+            "SELECT exit_code, cost_usd, num_turns, input_tokens, output_tokens, cache_creation_tokens
+             FROM runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(exit_code, Some(crate::runner::TURN_CEILING_EXIT_CODE));
+        assert_eq!(
+            cost_usd,
+            Some(0.05),
+            "the completed turn's cost must not be read back NULL"
+        );
+        assert_eq!(
+            num_turns,
+            Some(1),
+            "the completed turn's count must not be read back NULL"
+        );
+        assert_eq!(input_tokens, Some(11));
+        assert_eq!(output_tokens, Some(22));
+        assert_eq!(
+            cache_creation_tokens,
+            Some(7),
+            "the cache the seat built is spend too, and must not be read back NULL"
+        );
     }
 
     /// One answer has nothing to be ranked against, and the phase would ask a seat to order an
@@ -3076,6 +3745,422 @@ mod tests {
         assert!(state.run_handles.lock().unwrap().is_empty());
     }
 
+    /// The same roster, asked to deliberate twice.
+    fn two_round_roster(members: usize) -> CouncilConfig {
+        CouncilConfig {
+            rounds: 2,
+            ..roster(members)
+        }
+    }
+
+    /// Every prompt the council sent, in order.
+    fn prompts(runner: &ScriptedRunner) -> Vec<String> {
+        runner
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.prompt.clone())
+            .collect()
+    }
+
+    fn is_revision(prompt: &str) -> bool {
+        prompt.contains("Revise your own answer in the light of the ranking")
+    }
+
+    fn is_synthesis(prompt: &str) -> bool {
+        prompt.contains("Synthesize one final chairman answer")
+    }
+
+    /// The non-regression test, and the most important one in this file: `rounds: 1` is what ships,
+    /// and it has to be the council that ran before the second round existed — the same three
+    /// phases, the same `stage` values, the same rows.
+    #[tokio::test]
+    async fn with_one_round_nothing_revises_and_the_row_says_three_phases() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("the first answer".into()),
+            Scripted::Answers("the second answer".into()),
+        ]
+        .into();
+        *runner.stage2.lock().unwrap() = [
+            Scripted::Answers("A: 1".into()),
+            Scripted::Answers("A: 1".into()),
+        ]
+        .into();
+        // `roster` and not `two_round_roster`: this is the file saying nothing about rounds.
+        let state = council_state(runner.clone(), Some(roster(2))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+
+        assert_eq!(row.status, STATUS_DONE);
+        assert_eq!(row.rounds, 1);
+        assert_eq!(row.stage, 3, "the chairman is still the third phase");
+        assert_eq!(stages_total(row.rounds), 3);
+
+        for seat in get_seat_rows(&state.pool, &id).await.unwrap() {
+            // `pending` and not `skipped`. A council of one round never had a fourth phase to skip,
+            // and `rounds` on the row is what says so — see `0136_council_revision.sql`.
+            assert_eq!(seat.revision_status, SEAT_PENDING);
+            assert_eq!(seat.revision_run_id, None);
+            assert_eq!(seat.revision_error, None);
+        }
+
+        let sent = prompts(&runner);
+        assert!(
+            !sent.iter().any(|prompt| is_revision(prompt)),
+            "a one-round council must not ask a seat to revise anything"
+        );
+        // Three phases' worth of launches and not four: two answers, two rankings, one synthesis.
+        assert_eq!(sent.len(), 5);
+        let chairman = sent.iter().find(|prompt| is_synthesis(prompt)).unwrap();
+        assert!(chairman.contains("the first answer"));
+        assert!(chairman.contains("the second answer"));
+
+        let view = get_council(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(id.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(view.stages_total, 3);
+        assert!(view.seats.iter().all(|seat| seat.revised_answer.is_none()));
+    }
+
+    /// The point of the second round: what the chairman reads is what the seats wrote AFTER seeing
+    /// where the council placed them.
+    #[tokio::test]
+    async fn a_second_round_hands_the_chairman_the_revised_answers() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("alpha at first".into()),
+            Scripted::Answers("beta at first".into()),
+        ]
+        .into();
+        *runner.stage2.lock().unwrap() = [
+            Scripted::Answers("A: 1".into()),
+            Scripted::Answers("A: 1".into()),
+        ]
+        .into();
+        *runner.revision.lock().unwrap() = [
+            Scripted::Answers("alpha on reflection".into()),
+            Scripted::Answers("beta on reflection".into()),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(two_round_roster(2))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+
+        assert_eq!(row.status, STATUS_DONE);
+        assert_eq!(row.rounds, 2);
+        // The chairman is the FOURTH phase here. A `stage` that stopped at 3 would show a reader
+        // the revision and the synthesis as one thing.
+        assert_eq!(row.stage, 4);
+        assert_eq!(stages_total(row.rounds), 4);
+
+        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
+        for seat in &seats {
+            assert_eq!(seat.revision_status, SEAT_OK);
+            assert!(seat.revision_run_id.is_some());
+        }
+        // A separate `runs` row per round, not a second turn of the first one: cost, cancellation
+        // and reconciliation all hang off that row, and a shared one would have to carry two.
+        assert_ne!(seats[0].revision_run_id, seats[0].stage1_run_id);
+
+        let sent = prompts(&runner);
+        let chairman = sent.iter().find(|prompt| is_synthesis(prompt)).unwrap();
+        assert!(chairman.contains("alpha on reflection"));
+        assert!(chairman.contains("beta on reflection"));
+        assert!(
+            !chairman.contains("alpha at first") && !chairman.contains("beta at first"),
+            "a revised seat is read at its revision, not at both"
+        );
+
+        let view = get_council(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(id.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(view.stages_total, 4);
+        // Both are served. The first answer is what the leaderboard was cast over, so a client
+        // shown only the revision would be shown a ranking of text it never displayed.
+        assert_eq!(view.seats[0].answer.as_deref(), Some("alpha at first"));
+        assert_eq!(
+            view.seats[0].revised_answer.as_deref(),
+            Some("alpha on reflection")
+        );
+        assert_eq!(view.seats[0].revision_status, SEAT_OK);
+    }
+
+    /// A failed second attempt is not a reason to throw away a first one that worked. The chairman
+    /// reads a seat's revision when the revision came back `ok`, and its first answer otherwise.
+    #[tokio::test]
+    async fn a_seat_that_failed_to_revise_is_read_at_its_first_answer() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("alpha at first".into()),
+            Scripted::Answers("beta at first".into()),
+        ]
+        .into();
+        *runner.stage2.lock().unwrap() = [
+            Scripted::Answers("A: 1".into()),
+            Scripted::Answers("A: 1".into()),
+        ]
+        .into();
+        *runner.revision.lock().unwrap() = [
+            Scripted::Answers("alpha on reflection".into()),
+            Scripted::Fails("the model refused to revise".into()),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(two_round_roster(2))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE);
+
+        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
+        assert_eq!(seats[0].revision_status, SEAT_OK);
+        assert_eq!(seats[1].revision_status, SEAT_ERROR);
+        assert_eq!(
+            seats[1].revision_error.as_deref(),
+            Some("the model refused to revise")
+        );
+
+        let sent = prompts(&runner);
+        let chairman = sent.iter().find(|prompt| is_synthesis(prompt)).unwrap();
+        assert!(chairman.contains("alpha on reflection"));
+        assert!(
+            chairman.contains("beta at first"),
+            "the seat that could not revise still has an answer, and it is the one it wrote"
+        );
+    }
+
+    /// Revising in the light of a ranking that does not exist is not revising. Below two valid
+    /// answers phase 2 is skipped whole, and the round that reads its output is skipped with it.
+    #[tokio::test]
+    async fn a_skipped_ranking_skips_the_revision_too() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("the only answer".into()),
+            Scripted::Fails("no".into()),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(two_round_roster(2))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+
+        assert_eq!(row.status, STATUS_DONE);
+        for seat in get_seat_rows(&state.pool, &id).await.unwrap() {
+            assert_eq!(seat.stage2_status, SEAT_SKIPPED);
+            // `skipped` and not `pending`: this council HAD a fourth phase and did not run it,
+            // which is a different sentence from never having had one.
+            assert_eq!(seat.revision_status, SEAT_SKIPPED);
+            assert_eq!(seat.revision_run_id, None);
+        }
+        assert!(
+            !prompts(&runner).iter().any(|prompt| is_revision(prompt)),
+            "no ranking, no revision"
+        );
+        // The chairman is still the fourth phase — the council was configured for four, and one of
+        // them being skipped does not renumber the rest. Phase 2 already behaves this way.
+        assert_eq!(row.stage, 4);
+    }
+
+    /// The anonymity has to survive the second round, and this walks every request the council made
+    /// to say so. The sibling for phase 2 is `a_seat_is_launched_scoped_and_only_phase_one_has_tools`
+    /// plus `the_chairman_sees_the_seats_by_name_and_the_ranker_does_not`; this is their shape,
+    /// applied to a phase that shows a seat MORE than phase 2 did and must leak no more.
+    #[tokio::test]
+    async fn a_revising_seat_is_shown_no_peer_identity() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("quartz".into()),
+            Scripted::Answers("basalt".into()),
+            Scripted::Answers("gneiss".into()),
+        ]
+        .into();
+        // Every label ranked by every seat. Which two of the three a given seat may actually see is
+        // decided by a shuffle over the council's uuid, so the vote is written label-agnostically
+        // and `parse_rankings` drops the one label each seat was not shown. The point is that all
+        // three seats end up ON the leaderboard, which is what gives each of them a standing of its
+        // own to be shown as `You`.
+        *runner.stage2.lock().unwrap() = [
+            Scripted::Answers("A: 1\nB: 2\nC: 3".into()),
+            Scripted::Answers("A: 1\nB: 2\nC: 3".into()),
+            Scripted::Answers("A: 1\nB: 2\nC: 3".into()),
+        ]
+        .into();
+        *runner.revision.lock().unwrap() = [
+            Scripted::Answers("quartz, revised".into()),
+            Scripted::Answers("basalt, revised".into()),
+            Scripted::Answers("gneiss, revised".into()),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(two_round_roster(3))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE);
+
+        let answer_of = ["quartz", "basalt", "gneiss"];
+        let anon_map: BTreeMap<String, usize> =
+            serde_json::from_str(row.anon_map.as_deref().unwrap()).unwrap();
+        let anon = anonymize(&id, &[0, 1, 2]);
+        assert_eq!(
+            anon.anon_map, anon_map,
+            "the row records the shuffle that ran"
+        );
+
+        let sent = prompts(&runner);
+        // Everything except the chairman's. Anonymity ends AT the chairman and nowhere earlier —
+        // that is `stage3_prompt`'s own decision and it has its own test.
+        for prompt in sent.iter().filter(|prompt| !is_synthesis(prompt)) {
+            for model_ref in ["model-0", "model-1", "model-2", "the-chairman"] {
+                assert!(
+                    !prompt.contains(model_ref),
+                    "a seat was told which model wrote something: {prompt}"
+                );
+            }
+            assert!(!prompt.contains("Seat "), "{prompt}");
+            assert!(!prompt.contains("seat_idx"), "{prompt}");
+        }
+
+        let revisions: Vec<&String> = sent.iter().filter(|prompt| is_revision(prompt)).collect();
+        assert_eq!(revisions.len(), 3, "every answering seat revised");
+        let mut readers = std::collections::BTreeSet::new();
+        for prompt in revisions {
+            // Which seat this is, read off the one answer the prompt presents as the reader's own.
+            let reader = (0..3)
+                .find(|seat_idx| {
+                    prompt.contains(&format!("Your own answer:\n{}\n", answer_of[*seat_idx]))
+                })
+                .unwrap_or_else(|| panic!("a revision prompt with no reader: {prompt}"));
+            readers.insert(reader);
+
+            let shown = &anon.for_seat[&reader];
+            assert_eq!(shown.len(), 2);
+            for label in shown {
+                let peer = anon_map[label];
+                assert!(
+                    prompt.contains(&format!("Response {label}:\n{}\n", answer_of[peer])),
+                    "the seat must see the SAME labelled answers it ranked: {prompt}"
+                );
+            }
+            // Its own label appears nowhere — not over its answer, and not in the standings. That
+            // is the one fact phase 2 withheld, and the second round does not give it back.
+            let own_label = anon_map
+                .iter()
+                .find(|(_, seat_idx)| **seat_idx == reader)
+                .map(|(label, _)| label.clone())
+                .unwrap();
+            assert!(
+                !prompt.contains(&format!("Response {own_label}:")),
+                "{prompt}"
+            );
+            assert!(!prompt.contains(&format!("{own_label}: ")), "{prompt}");
+            // Its own standing IS shown — a seat is entitled to know where it came — but as `You`,
+            // which is the one rendering that says it without saying which label it is.
+            assert!(prompt.contains("You: "), "{prompt}");
+            assert_eq!(
+                prompt.matches("Response ").count(),
+                2,
+                "exactly the two peers it ranked, and no third: {prompt}"
+            );
+        }
+        assert_eq!(
+            readers.len(),
+            3,
+            "three distinct readers, not one seat three times"
+        );
+    }
+
+    /// A cancel terminates the second round exactly as it terminates the other three phases. The
+    /// sibling is `cancelling_terminates_the_seats_and_removes_the_mcp_config`, which does this for
+    /// phase 1; a phase `cancel` did not know about would leave two CLI processes running.
+    #[tokio::test]
+    async fn cancelling_terminates_a_revision_in_flight() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("alpha at first".into()),
+            Scripted::Answers("beta at first".into()),
+        ]
+        .into();
+        *runner.stage2.lock().unwrap() = [
+            Scripted::Answers("A: 1".into()),
+            Scripted::Answers("A: 1".into()),
+        ]
+        .into();
+        *runner.revision.lock().unwrap() = [Scripted::Hangs, Scripted::Hangs].into();
+        let mut config = two_round_roster(2);
+        // Long enough that only the cancel can end this.
+        config.timeout_seconds = 600;
+        let state = council_state(runner.clone(), Some(config)).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+
+        // Both revisions in flight: the council has reached the round AND has two live runs.
+        let mut reached = false;
+        for _ in 0..600 {
+            let row = get_council_row(&state.pool, &id).await.unwrap().unwrap();
+            if row.stage == STAGE_REVISION && state.run_handles.lock().unwrap().len() == 2 {
+                reached = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(reached, "the second round never got two seats in flight");
+
+        assert!(cancel(&state, &id).await.unwrap());
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_CANCELLED);
+        assert_eq!(row.error, None);
+        // The chairman never ran, so the phase never moved past the round that was stopped.
+        assert_eq!(row.stage, STAGE_REVISION);
+
+        // Polled and not read once. `cancel` settles the RECORD first and terminates the runs
+        // second, so the row says `cancelled` a moment before the aborted seats have written why —
+        // which is the ordering the whole cancellation design rests on, not a slow test.
+        let mut seats = Vec::new();
+        for _ in 0..300 {
+            seats = get_seat_rows(&state.pool, &id).await.unwrap();
+            if seats
+                .iter()
+                .all(|seat| seat.revision_status == SEAT_CANCELLED)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for seat in &seats {
+            assert_eq!(seat.revision_status, SEAT_CANCELLED);
+        }
+        for run_id in seats.iter().filter_map(|seat| seat.revision_run_id) {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            assert_eq!(status, "cancelled");
+        }
+        for _ in 0..300 {
+            if state.run_handles.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(state.run_handles.lock().unwrap().is_empty());
+        assert!(
+            !prompts(&runner).iter().any(|prompt| is_synthesis(prompt)),
+            "a cancelled round must not be followed by a synthesis"
+        );
+    }
+
     /// One `runs` row per seat, whichever machine answers it. The row is what carries cost,
     /// cancellation and orphan reconciliation, and a seat that skipped it would need all three
     /// written again.
@@ -3085,6 +4170,8 @@ mod tests {
         *runner.stage1.lock().unwrap() = [Scripted::Answers("from the cloud".into())].into();
         let config = CouncilConfig {
             timeout_seconds: 1,
+            rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+            consumers: crate::config::CouncilConsumers::default(),
             chairman: spec(SeatKind::Cloud, "the-chairman"),
             members: vec![
                 spec(SeatKind::Cloud, "a-cloud-model"),
@@ -3268,6 +4355,7 @@ mod tests {
             "why?",
             &seat(SeatKind::Cloud, "m"),
             &[seat(SeatKind::Cloud, "m")],
+            1,
         )
         .await
         .unwrap();
@@ -3277,6 +4365,7 @@ mod tests {
             "why?",
             &seat(SeatKind::Cloud, "m"),
             &[seat(SeatKind::Cloud, "m")],
+            1,
         )
         .await
         .unwrap();
@@ -3479,10 +4568,11 @@ mod tests {
 
     /// The two forms sit in one roster, and neither is on the way out.
     ///
-    /// `.ai/council.yaml` is under `.ai/`, which is gitignored — it is per-developer configuration,
-    /// not a fact of this repository. A form retired here would not error on the machines still
-    /// using it; it would give them a council that silently stops existing at the next daemon
-    /// start. So this asserts coexistence, not migration.
+    /// The roster lives at [`CONFIG_DISPLAY_PATH`], outside any checkout — it is one person's
+    /// configuration on one machine, not a fact of this repository, and nothing here can migrate
+    /// it. A form retired here would not error on the machines still using it; it would give them
+    /// a council that silently stops existing at the next daemon start. So this asserts
+    /// coexistence, not migration.
     #[tokio::test]
     async fn a_roster_may_name_an_agent_in_one_seat_and_a_model_in_the_next() {
         let runner = std::sync::Arc::new(ScriptedRunner::default());
@@ -3495,6 +4585,8 @@ mod tests {
             runner,
             Some(CouncilConfig {
                 timeout_seconds: 1,
+                rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+                consumers: crate::config::CouncilConsumers::default(),
                 chairman: spec(SeatKind::Cloud, "the-chairman"),
                 members: vec![agent_spec("cetico"), spec(SeatKind::Cloud, "a-plain-model")],
             }),
@@ -3607,6 +4699,8 @@ mod tests {
             runner,
             Some(CouncilConfig {
                 timeout_seconds: 1,
+                rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+                consumers: crate::config::CouncilConsumers::default(),
                 chairman: spec(SeatKind::Cloud, "the-chairman"),
                 members: vec![agent_spec("cetico")],
             }),
@@ -3676,6 +4770,8 @@ mod tests {
             runner.clone(),
             Some(CouncilConfig {
                 timeout_seconds: 1,
+                rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+                consumers: crate::config::CouncilConsumers::default(),
                 chairman: spec(SeatKind::Cloud, "the-chairman"),
                 members: vec![agent_spec("cetico")],
             }),
@@ -3724,6 +4820,8 @@ mod tests {
             runner.clone(),
             Some(CouncilConfig {
                 timeout_seconds: 1,
+                rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+                consumers: crate::config::CouncilConsumers::default(),
                 chairman: spec(SeatKind::Cloud, "the-chairman"),
                 members: vec![agent_spec("cetico"), agent_spec("economista")],
             }),
@@ -3825,6 +4923,8 @@ mod tests {
             runner,
             Some(CouncilConfig {
                 timeout_seconds: 1,
+                rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+                consumers: crate::config::CouncilConsumers::default(),
                 chairman: spec(SeatKind::Cloud, "the-chairman"),
                 members: vec![agent_spec("cetico")],
             }),
@@ -3910,6 +5010,33 @@ mod tests {
         ));
     }
 
+    /// The roster is the product's file, so it sits where the workflow library sits.
+    ///
+    /// This asserts the absence as hard as the presence. `.ai/` is the agent harness's directory
+    /// inside one checkout, and a daemon that reads its roster from there has a different council
+    /// per working copy and none at all when started from anywhere else — which is what this move
+    /// ended. A later refactor that reaches back for a repo-relative path fails here.
+    #[test]
+    fn the_roster_lives_beside_the_workflow_library_and_not_in_ai() {
+        let Some(path) = config_path() else {
+            // No home directory on this machine: there is nothing to assert about a path that does
+            // not exist, and `main.rs` treats the same `None` as "no council" rather than an error.
+            return;
+        };
+        let text = path.to_string_lossy().replace('\\', "/");
+        assert!(text.ends_with(".nucleos/council.yaml"), "{text}");
+        assert!(!text.contains("/.ai/"), "{text}");
+
+        // The library made the same choice, and the two must not drift apart into two ideas of
+        // where a person's own files live.
+        let library = crate::workflows::library_root().unwrap();
+        assert_eq!(path.parent(), library.parent());
+
+        // What a refusal prints is the readable form, never the absolute one.
+        assert_eq!(CONFIG_DISPLAY_PATH, "~/.nucleos/council.yaml");
+        assert!(!StartError::NotConfigured.to_string().contains(".ai/"));
+    }
+
     /// A daemon with no council says so, rather than failing in a way the caller has to guess at.
     #[tokio::test]
     async fn without_configuration_the_routes_say_so() {
@@ -3925,7 +5052,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        assert!(message.contains(".ai/council.yaml"), "{message}");
+        assert!(message.contains(CONFIG_DISPLAY_PATH), "{message}");
 
         // The reads still work: a daemon whose council was switched off yesterday still has to be
         // able to show the ones it ran the day before.
@@ -3954,6 +5081,7 @@ mod tests {
                 "why?",
                 &seat(SeatKind::Cloud, "m"),
                 &[seat(SeatKind::Cloud, "m")],
+                1,
             )
             .await
             .unwrap();
@@ -3985,6 +5113,7 @@ mod tests {
             "why?",
             &seat(SeatKind::Cloud, "m"),
             &[seat(SeatKind::Cloud, "m")],
+            1,
         )
         .await
         .unwrap();
@@ -4014,6 +5143,7 @@ mod tests {
             "why?",
             &seat(SeatKind::Cloud, "m"),
             &[seat(SeatKind::Cloud, "m")],
+            1,
         )
         .await
         .unwrap();

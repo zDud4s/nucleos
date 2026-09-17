@@ -37,7 +37,7 @@ async function openWorkspace(options: {
   const state = daemonState({
     kill: { engaged: options.engaged === true },
     projects: [
-      project({ project_id: "nucleos", mode: "shadow", open_proposals: options.openProposals ?? 0 }),
+      project({ project_id: "nucleos", mode: "shadow", open_review_items: options.openProposals ?? 0 }),
     ],
     ...(options.readings === undefined ? {} : { readings: options.readings }),
   });
@@ -732,7 +732,7 @@ describe("the settings this app authors", () => {
    * *never start anything again* — the opposite end of the same axis from "no brake".
    */
   it("says what the ceiling is holding, and clears it without setting it to zero", async () => {
-    const state = settingsState({ wip_limit: 3, open_proposals: 2 });
+    const state = settingsState({ wip_limit: 3, open_review_items: 2 });
     await openState(state);
 
     expect(await screen.findByText("2 of 3 taken")).toBeTruthy();
@@ -832,7 +832,7 @@ describe("the settings this app authors", () => {
         classes_total: 5,
         withheld_classes_ready: 1,
         wip_limit: 4,
-        open_proposals: 3,
+        open_review_items: 3,
       }),
     );
 
@@ -877,7 +877,7 @@ describe("the settings this app authors", () => {
         classes_total: 5,
         withheld_classes_ready: 1,
         wip_limit: 4,
-        open_proposals: 3,
+        open_review_items: 3,
       }),
     );
 

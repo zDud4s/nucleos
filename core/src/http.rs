@@ -16,8 +16,9 @@ use crate::backup;
 use crate::budget;
 use crate::feed::{self, FeedEntry};
 use crate::health;
-use crate::hooks::pretooluse_decision;
+use crate::hooks::{posttooluse_outcome, pretooluse_decision};
 use crate::inspect;
+use crate::notify_policy;
 use crate::presets;
 use crate::runs::{self, AwaitingRun, CreateRunError, cancel_run, create_run, get_run};
 use crate::shadow::{self, ClassTally, ShadowDecision};
@@ -46,6 +47,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/sidecars", get(get_sidecars))
         .route("/sidecars/{name}/restart", post(post_sidecar_restart))
         .route("/config/email", get(get_email_config))
+        .route(
+            "/config/machine",
+            get(get_machine_config).post(post_machine_config),
+        )
+        .route("/config/secrets", get(get_machine_secrets))
+        .route(
+            "/config/secrets/{key}",
+            axum::routing::put(put_machine_secret).delete(delete_machine_secret),
+        )
         .route("/backup", post(post_backup))
         .route("/backups", get(get_backups))
         .route("/backups/{name}/restore", post(post_backup_restore))
@@ -216,32 +226,34 @@ pub fn build_router(state: AppState) -> Router {
             post(post_project_command_run),
         )
         // The reach this project declares for itself: what its worktrees may run unattended, what
-        // the GitHub manager may do on its remote, and where a landing may be sent.
-        // `project_policy.rs` holds all three tables and says why they are one module; until these
-        // routes there was no way into them but SQL typed by hand.
+        // the GitHub manager may do on its remote, what the shared git queue may do on its
+        // repository, and where a landing may be sent. `project_policy.rs` holds all four tables
+        // and says why they are one module; until these routes there was no way into them but SQL
+        // typed by hand.
         //
         // **In no table in `auth.rs`, the GETs included, and that absence is the boundary.** These
         // are not a configuration edit that takes effect at the next start — the hook reads the
         // shell table per decision and caches nothing, so one `allow` row binds the very next tool
         // call of every in-flight run of this project. `a_projects_declared_reach_is_in_no_scope_table`
-        // carries the argument, and is what stops the three GETs being filed beside the
+        // carries the argument, and is what stops the four GETs being filed beside the
         // `/projects/{id}/…` reads they share a prefix with.
         //
         // **The DELETEs carry what they delete in the BODY.** A shell prefix is not a safe path
         // segment: it contains spaces, slashes and dots, and encoding one into a route only to
         // decode it again buys nothing — the same reason `POST /contacts/verdict` takes the address
-        // in the body. The other two follow it rather than splitting the shape three ways, since a
+        // in the body. The other three follow it rather than splitting the shape four ways, since a
         // branch name carries slashes too.
         //
-        // **The emergency stop reaches two of these nine, and that is the one place in this file
+        // **The emergency stop reaches three of these twelve, and that is the one place in this file
         // where `post_project_command`'s argument does not transfer.** It says a route that writes a
         // database row "starts nothing", which holds because every reader of ITS rows is a start
         // point and the stop guards every start point. The rows written here are read by `hooks.rs`,
         // per decision, and `hooks.rs` calls `kill_switch_engaged` nowhere; `set_kill_switch` flips
         // a flag and cancels nothing already running. So `POST shell-rules` with `allow` and `POST
-        // github-ops` are gated — they widen what in-flight runs may do, immediately — while a
-        // `deny`, `POST land-targets` and all three DELETEs stay open, because a stop that stopped
-        // somebody NARROWING autonomy would be holding the door open on the way out.
+        // github-ops` and `POST git-ops` are gated — they widen what in-flight runs may do,
+        // immediately — while a `deny`, `POST land-targets` and all four DELETEs stay open, because
+        // a stop that stopped somebody NARROWING autonomy would be holding the door open on the way
+        // out.
         // `declaration_halted` carries the argument in full.
         //
         // **Two refusal shapes reach a caller here, and the page will need both.** Everything these
@@ -249,7 +261,7 @@ pub fn build_router(state: AppState) -> Router {
         // malformed JSON, a missing field, an unknown one now that all four structs carry
         // `deny_unknown_fields` — is rejected by the extractor before any of this runs, and arrives
         // as axum's own `text/plain`. That is true of every JSON route in this file rather than
-        // something these nine introduce, and it is written down here because these are the routes
+        // something these twelve introduce, and it is written down here because these are the routes
         // whose refusals a person is meant to read.
         .route(
             "/projects/{id}/shell-rules",
@@ -262,6 +274,17 @@ pub fn build_router(state: AppState) -> Router {
             get(get_project_github_ops)
                 .post(post_project_github_op)
                 .delete(delete_project_github_op),
+        )
+        // The git queue's own declarable set, the same trio as the one above with `vcs::GIT_OP_KINDS`
+        // in place of `github::declarable_ops` — see that route's own doc for what stays true wholesale
+        // (the emergency stop on the POST only, the DELETE's body-carried `op_kind`, the 404 off
+        // `rows_affected`) and `GET /vcs/declarable-ops` for the one thing that does not: there is no
+        // ceiling to intersect, so every kind here is declarable, always.
+        .route(
+            "/projects/{id}/git-ops",
+            get(get_project_git_ops)
+                .post(post_project_git_op)
+                .delete(delete_project_git_op),
         )
         .route(
             "/projects/{id}/land-targets",
@@ -663,13 +686,28 @@ pub fn build_router(state: AppState) -> Router {
         // configuration, no repository and no secret — the response is a function of the binary, so
         // two callers on the same version get the same bytes. What keeps it out is that the grant
         // would buy nobody anything: the page that needs it is the shell, which holds the control
-        // token, and the nine routes it exists to explain are themselves in no table. A key that
+        // token, and the twelve routes it exists to explain are themselves in no table. A key that
         // cannot read what a project HAS declared has no use for the list of what MAY be declared —
         // and handing it that list is a map of exactly which capability names to try. An unneeded
         // grant is one more thing to be wrong about later, which is `GET /vcs/requests/{id}/wait`'s
         // argument for its own absence. `the_declarable_ops_catalogue_is_in_no_scope_table` says it
         // where somebody tidying `auth.rs` will read it.
         .route("/github/declarable-ops", get(get_declarable_github_ops))
+        // The catalogue `POST /projects/{id}/git-ops` validates against, read out loud — the git
+        // twin of the route above.
+        //
+        // **No project id, for the same reason and more completely.** `declarable_github_ops` still
+        // intersects two compiled ceilings against a bigger catalogue; `vcs::GIT_OP_KINDS` IS the
+        // catalogue, so `vcs::declarable_git_ops` has nothing project-shaped to consult at all — the
+        // answer is compiled in, identical for every project on the roster, today and until this
+        // binary changes.
+        //
+        // **In no scope table, for `/github/declarable-ops`' reason:** the response is a function of
+        // the binary and discloses no project's configuration, so the grant would buy nobody
+        // anything — the caller who needs it is the shell, which already holds the control token,
+        // and the three routes it exists to explain are themselves in no table.
+        // `the_declarable_ops_catalogue_is_in_no_scope_table` covers both routes together.
+        .route("/vcs/declarable-ops", get(get_declarable_git_ops))
         .route("/worktrees/{run_id}/release", post(post_worktree_release))
         .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
@@ -823,6 +861,16 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::council::post_council_cancel),
         )
         .route("/notifications/pending", get(crate::notify::list_pending))
+        // Which feed kinds may reach a channel — stored, validated and observed here; RESOLVED in
+        // the Telegram sidecar (spec §4, §6), never here. In no scope table in `auth.rs`, so admin
+        // by omission (§5.3): the two callers already hold the daemon's full token — the shell from
+        // the Credential Manager, the sidecar as `NUCLEOS_DAEMON_TOKEN` — and a read-only key buys
+        // no reason to learn which notifications the owner chose to silence.
+        .route(
+            "/notifications/policy",
+            get(get_notify_policy).put(put_notify_policy),
+        )
+        .route("/notifications/kinds", get(get_notify_kinds))
         // The measurement the shadow pass exists to produce. Without somewhere to read it, the
         // table is write-only and the pass becomes the thing it was designed not to be: data
         // accumulating with nobody able to decide anything from it.
@@ -843,6 +891,12 @@ pub fn build_router(state: AppState) -> Router {
         // The blocking half of the same conversation. Beside the gate because it carries the same
         // key and answers the same question, a moment later.
         .route("/hooks/ask-wait", post(post_ask_wait))
+        // The third leg: what the tool call actually did, reported back after the fact. Never a
+        // `Decision` and never a second barrier — by the time this fires the call has already run
+        // (or already failed), so the handler only records and always answers OK. `auth::permits`
+        // gives `Scope::Run` this route beside the two above for the same reason it gives it those:
+        // one run, asking about one tool call of its own.
+        .route("/hooks/posttooluse", post(posttooluse_outcome))
         // The same gate for the sessions nobody launched. It is `Scope::Control` only, and by
         // construction rather than by a list: `permits` gives `Control` everything and answers every
         // other scope from an allowlist, so a route absent from all of them is reachable by the
@@ -2870,6 +2924,79 @@ async fn get_pii_observations(
     ))
 }
 
+/// `GET /notifications/policy` — the stored selection policy, verbatim (spec §5.3). A fresh
+/// database has no rows, so this answers `{"families": [], "kinds": []}` rather than 404: absence
+/// of a rule is the resolution's own "passes" default, not an error.
+async fn get_notify_policy(State(state): State<AppState>) -> impl IntoResponse {
+    match notify_policy::load(&state.pool).await {
+        Ok(policy) => Json(policy).into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "notify_policy: reading the stored policy failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
+/// The refusal name `PUT /notifications/policy` reports for each `ValidationError` variant, kept
+/// beside the status/reason split `create_run_status`/`create_run_reason` already use for
+/// `CreateRunError`: one place decides what a refusal is CALLED, so the name and the message
+/// cannot drift apart.
+fn notify_policy_refusal_name(error: &notify_policy::ValidationError) -> &'static str {
+    match error {
+        notify_policy::ValidationError::EmptySelector { .. } => "empty_selector",
+        notify_policy::ValidationError::MalformedSelector { .. } => "malformed_selector",
+        notify_policy::ValidationError::SelectorTooLong { .. } => "selector_too_long",
+        notify_policy::ValidationError::DuplicateSelector { .. } => "duplicate_selector",
+        notify_policy::ValidationError::TooManyRules { .. } => "too_many_rules",
+    }
+}
+
+/// `PUT /notifications/policy` — replaces the whole policy (spec §5.3). Validates BEFORE writing;
+/// `notify_policy::replace` itself never calls `validate`, so a rejected shape and a database
+/// error cannot share a code path. A `400` names the refusal and the selector in question, so the
+/// shell can point at the offending row instead of saying "invalid" (§7.4). A `500` means the
+/// transaction never committed, so the table is exactly as it was.
+async fn put_notify_policy(
+    State(state): State<AppState>,
+    Json(policy): Json<notify_policy::Policy>,
+) -> impl IntoResponse {
+    if let Err(error) = notify_policy::validate(&policy) {
+        return (
+            StatusCode::BAD_REQUEST,
+            // `detail`, not `message`: the shell's `refusalFrom` reads `body.detail` beside a
+            // `refusal` and never looks at `message`, so naming it wrong throws the selector away
+            // and leaves the page showing the code twice. Same pair every refusal in this file
+            // sends.
+            Json(serde_json::json!({
+                "refusal": notify_policy_refusal_name(&error),
+                "detail": error.to_string(),
+            })),
+        )
+            .into_response();
+    }
+
+    match notify_policy::replace(&state.pool, &policy).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "notify_policy: writing the new policy failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
+/// `GET /notifications/kinds` — the kinds THIS machine has written, deduplicated and ordered
+/// (spec §4.2, §5.2). Only an observation of the feed's retention window; the union with kinds
+/// that only exist as a stored rule is the shell's job (§7.2), not this route's.
+async fn get_notify_kinds(State(state): State<AppState>) -> impl IntoResponse {
+    match notify_policy::observed_kinds(&state.pool).await {
+        Ok(kinds) => Json(kinds).into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "notify_policy: reading observed kinds failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct PressureQuery {
     /// A equipa, por nome. Resolve para o job mais recente dela.
@@ -3244,7 +3371,12 @@ struct ProjectRules {
     /// The effective open-proposal ceiling: the project's own, else the global default. `null` means
     /// the brake is off.
     wip_limit: Option<i64>,
+    open_review_items: i64,
+    /// The two queues that total is made of, so the panel can name the screen that clears it.
+    /// A total alone reads as "the proposals list", which on this project was empty while the
+    /// brake held: all of it was unreviewed shadow decisions (`wip::OpenReviewItems`).
     open_proposals: i64,
+    open_shadow_decisions: i64,
     /// Whether that ceiling is currently refusing new autonomous work.
     queue_full: bool,
 }
@@ -3362,9 +3494,10 @@ async fn get_project_rules(
     let wip_limit = crate::wip::wip_limit(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let open_proposals = crate::wip::open_proposals(&state.pool, &id)
+    let items = crate::wip::open_review_items(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let open_review_items = items.total();
 
     // Read before the struct takes `id`, which is what the borrow checker was pointing at and is
     // also the clearer order: every other field here is gathered above.
@@ -3381,8 +3514,10 @@ async fn get_project_rules(
         schedules,
         repo_triggers,
         wip_limit,
-        open_proposals,
-        queue_full: crate::wip::queue_full(open_proposals, wip_limit),
+        open_review_items,
+        open_proposals: items.proposals,
+        open_shadow_decisions: items.shadow_decisions,
+        queue_full: crate::wip::queue_full(open_review_items, wip_limit),
     }))
 }
 
@@ -3630,6 +3765,287 @@ struct EmailConfigView {
     retain_bodies_days: u8,
     /// Why local triage is unavailable when a local model was configured but could not be trusted.
     local_triage_disabled: Option<String>,
+}
+
+/* --------------------------------------------------- this machine's settings -- */
+
+/// The root every row in [`crate::machine_config`] is relative to, or a refusal when startup could
+/// not name one. See [`crate::state::AppState::machine_config_root`].
+fn machine_config_root(
+    state: &AppState,
+) -> Result<std::path::PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .machine_config_root
+        .clone()
+        .ok_or_else(|| refusal(StatusCode::INTERNAL_SERVER_ERROR, "no_machine_root"))
+}
+
+/// This machine's settings: the fence, and what is currently inside it.
+///
+/// The whole table every time, including rows whose file does not exist, because "this pillar has
+/// never been configured" is the answer the page most needs and an absent row cannot give it. That
+/// is the same reason `GET /projects/{id}/ownership` serves claims rather than files.
+///
+/// `resolved` is served beside each row for a reason this machine makes concrete: there are twenty
+/// worktrees on it, every one of them has an `.ai/`, and `.ai/voice.yaml` names a different file in
+/// each. A page that showed the relative path alone would let somebody edit settings with great
+/// confidence in the wrong checkout.
+///
+/// No secret is in any of these files by construction — every one of them lives in the OS
+/// credential store instead, and each config type's doc says so where the temptation was closest.
+/// So the contents go over the wire as they are.
+async fn get_machine_config(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let root = machine_config_root(&state)?;
+    let read_root = root.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        crate::machine_config::SETTINGS
+            .iter()
+            .map(|setting| {
+                let target = read_root.join(setting.path);
+                let contents = std::fs::read_to_string(&target).ok();
+                serde_json::json!({
+                    "path": setting.path,
+                    "area": setting.area,
+                    "what": setting.what,
+                    "takes_effect": setting.takes_effect,
+                    "exists": contents.is_some(),
+                    "contents": contents,
+                    "resolved": target.display().to_string(),
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+
+    Ok(Json(serde_json::json!({
+        "root": root.display().to_string(),
+        "settings": rows,
+    })))
+}
+
+/// Writes one of this machine's settings files, having first made it prove it parses.
+///
+/// Deliberately the same shape as [`post_project_write`] — same refusal names, same validate-then-
+/// write order, same atomic rename — because it is the same act against a different root, and two
+/// write routes that disagreed about what `invalid` means would be two contracts for one page.
+///
+/// **Admin, by appearing in no table in `auth.rs`.** `permits` is default-deny, which is what
+/// protects a route nobody thought about; this one was thought about, and the answer is the same.
+/// It matters more here than for a project's rules file: `.ai/github.yaml` names what a run may do
+/// on GitHub without asking, and `.ai/nucleos-models.yaml` names the models every route is built
+/// from. The control token reaches this, and `assistant.rs` hands that token to an MCP-only
+/// assistant turn — which is precisely why the kill switch is consulted below.
+///
+/// The global kill switch only. There is no project-scoped one to ask about: this file is not any
+/// project's, which is the whole reason it has its own registry.
+async fn post_machine_config(
+    State(state): State<AppState>,
+    Json(body): Json<WriteRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // Unreadable reads as engaged, the rule `assistant.rs` already pins: a stop nobody can ask
+    // about is not a stop anybody may assume is off.
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let Some(setting) = crate::machine_config::setting_for(&body.path) else {
+        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
+    };
+
+    let root = machine_config_root(&state)?;
+    // `setting.path` and not `body.path`: the caller's spelling has been matched against the table
+    // and has done its job. Joining the table's own string is what makes a path that normalises to
+    // a row unable to reach a file the row does not name.
+    let target = inspect::safe_write_target(&root, setting.path)
+        .map_err(|error| refusal(inspect_status(error), "unwritable"))?;
+
+    if let Err(detail) = (setting.validate)(&body.contents) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "refusal": "invalid", "detail": detail })),
+        ));
+    }
+
+    let contents = body.contents;
+    tokio::task::spawn_blocking(move || write_atomically(&target, &contents))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .map_err(|error| {
+            tracing::warn!(%error, path = %setting.path, "writing a machine settings file failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    // `None` for the project, because there is not one — this is the machine's own line. After the
+    // write and loudly on failure, for the reason `post_project_write` gives: a feed line about a
+    // write that then failed claims something that did not happen.
+    if let Err(error) = feed::append(
+        &state.pool,
+        None,
+        "config_written",
+        &format!("{} written from the app", setting.path),
+        None,
+        // A machine setting or a credential: nothing a run, a job or a council owns.
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, path = %setting.path, "the settings file was written but the feed line was lost");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The credentials this machine holds, by whether they are set — never by what they are.
+///
+/// The listing carries no value and there is no route that serves one, which is enforced a layer
+/// down: [`crate::secrets::SecretStore`] has no method that returns a secret, so a future handler
+/// cannot serve one by accident. Presence is the only question a settings page has.
+async fn get_machine_secrets(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let rows = crate::machine_config::SECRETS
+        .iter()
+        .map(|secret| {
+            // A store that cannot answer is reported as unknown rather than as absent. "Not set"
+            // is a fact somebody would act on by pasting a credential they have already pasted.
+            let present = state.secrets.present(secret.key).ok();
+            serde_json::json!({
+                "key": secret.key,
+                "area": secret.area,
+                "what": secret.what,
+                "present": present,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({ "secrets": rows })))
+}
+
+/// A credential on its way in. Deliberately derives no `Debug`.
+///
+/// `Debug` is how a secret ends up in a log: one `tracing::warn!(?body, …)` written in a hurry by
+/// somebody debugging an unrelated failure, and the credential is on disk in the daemon's rotating
+/// log file. Not deriving it makes that line refuse to compile.
+#[derive(Deserialize)]
+struct SecretRequest {
+    value: String,
+}
+
+/// Stores one credential, or refuses.
+///
+/// **Why the app may write these at all**, given that `--set-*` reads from stdin precisely to keep
+/// a token off a command line: that reasoning is about ARGV. A Windows command line is readable by
+/// any process running as the same user and is recorded verbatim in PSReadLine's history, so a
+/// token passed as an argument lands on disk in cleartext at the moment somebody was securely
+/// storing it. None of that is true of a request body over loopback to the one process that
+/// already holds every one of these credentials and hands them to the sidecars it starts.
+///
+/// Admin, by appearing in no table in `auth.rs`, on the same default-deny footing as everything
+/// else under `/config`. The kill switch is consulted for the same reason the settings write
+/// consults it: the control token reaches here, and a credential is a capability.
+async fn put_machine_secret(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<SecretRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    // `daemon-token` takes this path: it is not in the table, so it is `not_ours` like any other
+    // key nobody declared. That is deliberate rather than incidental — see `SECRETS`.
+    let Some(secret) = crate::machine_config::secret_for(&key) else {
+        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
+    };
+
+    // An empty value is refused rather than stored. Storing one would leave a credential that
+    // exists and does not work, which reads as "configured" everywhere it is asked about — the
+    // worst of the three available states. Forgetting it is what DELETE is for.
+    if body.value.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "invalid",
+                "detail": "an empty value is not a credential; use DELETE to forget one",
+            })),
+        ));
+    }
+
+    state
+        .secrets
+        .store(secret.key, &body.value)
+        .map_err(|error| {
+            // `error` and never the value.
+            tracing::warn!(%error, key = %secret.key, "storing a credential failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    // The key, never the value, and no length either — a length is a hint about a secret.
+    if let Err(error) = feed::append(
+        &state.pool,
+        None,
+        "secret_stored",
+        &format!("the {} credential was set from the app", secret.key),
+        None,
+        // A machine setting or a credential: nothing a run, a job or a council owns.
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, key = %secret.key, "the credential was stored but the feed line was lost");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Forgets one credential.
+///
+/// Idempotent, because [`crate::secrets::delete_secret`] already treats a missing entry as done:
+/// a page that had to distinguish "forgotten" from "was not there" would be asking a question
+/// whose two answers call for the same next step.
+async fn delete_machine_secret(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let Some(secret) = crate::machine_config::secret_for(&key) else {
+        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
+    };
+
+    state.secrets.forget(secret.key).map_err(|error| {
+        tracing::warn!(%error, key = %secret.key, "forgetting a credential failed");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
+
+    if let Err(error) = feed::append(
+        &state.pool,
+        None,
+        "secret_forgotten",
+        &format!("the {} credential was forgotten from the app", secret.key),
+        None,
+        // A machine setting or a credential: nothing a run, a job or a council owns.
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, key = %secret.key, "the credential was forgotten but the feed line was lost");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_email_config(State(state): State<AppState>) -> Json<EmailConfigView> {
@@ -6219,7 +6635,7 @@ async fn project_is_on_the_roster(
 /// stop engaged an `allow` declared here still binds the very next tool call of every in-flight run
 /// of this project. That is a widening the stop was supposed to make impossible.
 ///
-/// **Only the widenings.** A `deny`, and all three DELETEs, stay open with the stop engaged: an
+/// **Only the widenings.** A `deny`, and all four DELETEs, stay open with the stop engaged: an
 /// emergency stop that stopped somebody NARROWING autonomy would be holding the door open on the
 /// way out. It is the asymmetry `hooks::downgrade_if_unreadable` already takes, where only the
 /// `allow` is touched.
@@ -6293,7 +6709,9 @@ fn within_length(
 ///
 /// The prefixes come back FOLDED, because that is how the table stores them and how they are
 /// enforced. Serving the typed spelling would show an owner a `Remove-Item` the classifier knows as
-/// `remove-item`, which is the very lie `project_policy::fold_prefix` exists to stop.
+/// `remove-item`, which is the very lie `project_policy::fold_prefix` exists to stop. WHICH fold a
+/// prefix got follows `tool`: a command is lower-cased and a path is not, so two rows that look
+/// alike on screen were folded by two different functions and only that field says which.
 ///
 /// **`created_at` is served, and it is not padding.** The note says WHY a rule is there; this says
 /// WHEN, and the column's stated purpose is a list nobody can justify *six months from now* — which
@@ -6306,6 +6724,19 @@ fn within_length(
 #[derive(serde::Serialize)]
 struct ShellRuleView {
     prefix: String,
+    /// Which tool this rule governs the writes of, or `null` for a rule about a COMMAND prefix.
+    ///
+    /// **Serialised on every row, `null` included, and that is not a formality.** The two kinds of
+    /// rule live in one list and a prefix alone cannot tell them apart: `deny migrations` is a
+    /// command nobody may run, `deny Edit migrations` is a directory nothing may write into, and
+    /// served without this field the second reads on screen as the first. That was true for exactly
+    /// one chunk — `0131` gave the column to the table and to the classifier, and no route could
+    /// write it — and it stops being true here, where the POST below learns to carry a tool.
+    ///
+    /// `null` and never `""`, for `DeclaredShellRule::tool`'s reason: the empty string is SQLite's
+    /// business, forced by a UNIQUE index that treats every NULL as distinct, and a page made to
+    /// compare against a magic empty string would get it wrong once.
+    tool: Option<String>,
     verdict: crate::project_policy::Verdict,
     /// `null` for a rule declared with no justification — an absent note and not an absent field,
     /// so a page can tell "nobody said why" from a shape it failed to parse.
@@ -6315,8 +6746,12 @@ struct ShellRuleView {
 
 /// What this project's worktrees may run without asking, and what they may never run.
 ///
-/// Ordered by prefix, which is `declared_shell_rules`' `ORDER BY` and not this handler's arithmetic
-/// — the verdict is on every row, so any grouping a page wants is a filter it can do itself.
+/// Ordered by tool and then by prefix, which is `declared_shell_rules`' `ORDER BY` and not this
+/// handler's arithmetic — the verdict and the tool are on every row, so any grouping a page wants
+/// is a filter it can do itself. Nothing is filtered out here either: a write rule and a command
+/// rule come back in one list, because the route serves ROWS and the screen decides how to show
+/// them. That is the argument `ShellRuleView` already makes about the allow/deny split, and the
+/// tool is that same argument one field over.
 async fn get_project_shell_rules(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -6329,6 +6764,7 @@ async fn get_project_shell_rules(
                     .into_iter()
                     .map(|rule| ShellRuleView {
                         prefix: rule.prefix,
+                        tool: rule.tool,
                         verdict: rule.verdict,
                         note: rule.note,
                         created_at: rule.created_at,
@@ -6351,6 +6787,20 @@ async fn get_project_shell_rules(
 #[serde(deny_unknown_fields)]
 struct ShellRuleDeclaration {
     prefix: String,
+    /// The tool whose writes this rule is about, or absent for a rule about a command prefix.
+    ///
+    /// **`#[serde(default)]` because every client that existed before this field sent none**, and a
+    /// body without it is a shell rule — which is what those clients meant and what the route did.
+    /// It has to be DECLARED all the same, and not merely tolerated: this struct carries
+    /// `deny_unknown_fields`, so until the field exists here a client sending `"tool": "Edit"` is
+    /// answered 422 by serde with a sentence about an unknown field, which reads as a malformed
+    /// request rather than as a route that has not learned the word yet.
+    ///
+    /// Which values are admissible is decided in the handler and not by a type, because the answer
+    /// is the migration's `CHECK (tool IN ('', 'Edit', 'Write'))` and a refusal that names the
+    /// offending value is worth more here than an enum's parse error — see `unknown_tool`.
+    #[serde(default)]
+    tool: Option<String>,
     verdict: crate::project_policy::Verdict,
     /// Why, for whoever reads the list next. Never consulted by the classifier.
     #[serde(default)]
@@ -6360,9 +6810,11 @@ struct ShellRuleDeclaration {
 /// Declares one shell rule, or changes the verdict of one already declared.
 ///
 /// **Idempotent, and not by this handler's arithmetic.** `declare_shell_rule`'s
-/// `ON CONFLICT (project_id, prefix) DO UPDATE SET verdict = excluded.verdict, note = excluded.note`
-/// is what makes a second POST of the same prefix an EDIT. The identity of a rule is the prefix it
-/// names and the unique index enforces that, so a redeclaration can never become a second row — the
+/// `ON CONFLICT (project_id, tool, prefix) DO UPDATE SET verdict = excluded.verdict, note =
+/// excluded.note` is what makes a second POST of the same rule an EDIT. The identity of a rule is
+/// the TOOL and the prefix together and the unique index enforces that triple, so a redeclaration
+/// can never become a second row — while `deny migrations` and `deny Edit migrations` are two rules
+/// that may both stand, because they are two claims about two different things. The
 /// two ways of losing the `DO UPDATE` cost something else instead: no `ON CONFLICT` clause at all is
 /// `UNIQUE constraint failed` and a 500, and `DO NOTHING` — the spelling its two siblings in
 /// `project_policy` use — is worse for being silent, leaving the first verdict standing while the
@@ -6391,6 +6843,17 @@ struct ShellRuleDeclaration {
 /// never be enforced while the engine went on enforcing them. Migration `0128` says the same in one
 /// line: "Do lado `deny` não há nada a validar — uma recusa a mais nunca deixou correr nada."
 ///
+/// **A write rule can only DENY, and this route is the third place that says so and the only one a
+/// person meets.** The other two are silent by construction: `classifier::classify` has no allow
+/// branch anywhere on a write path — "there is no `allow` counterpart here, and there must not be
+/// one" — and `project_policy::shell_rules` drops a tool-carrying `allow` on its way out of the
+/// table, with a `tracing::warn!` nobody standing at a screen will ever read. An owner who wrote
+/// one would be holding a permission that decides nothing, believing it decides something. So an
+/// `allow` that names a tool is refused at the door with `unenforceable_allow`, and the sentence
+/// says what a `deny` of the same path WOULD do — the same move `unmatchable_prefix` makes one
+/// paragraph up, for the same reason: a permission that is silently not one is worse than a refusal
+/// somebody can act on.
+///
 /// The refusals name the offending value, because a refusal that does not say what was wrong sends
 /// the owner to read source code to find out which of seven shape guards they tripped.
 async fn post_project_shell_rule(
@@ -6406,6 +6869,17 @@ async fn post_project_shell_rule(
     }
     project_is_on_the_roster(&state, &id).await?;
 
+    // **Emptiness is two questions since the `tool` column existed, and this is the first.**
+    //
+    // What follows asks whether anything ARRIVED, and until there were write rules that was the
+    // whole guard — correctly, because there was one fold and it cannot do this. A command prefix
+    // goes through `project_policy::fold_prefix`, which is `classifier::normalize_command`: it
+    // collapses whitespace and lower-cases, so it can shorten a string and never empty one that
+    // survived `trim()`. A PATH prefix goes through `fold_path_prefix` instead, which rewrites `\`
+    // as `/` and only THEN strips the trailing `/` — so `"/"`, `"\\"` and `"///"` arrive non-empty,
+    // pass this check, and come out of that fold as the empty string. The second question — does
+    // it survive the fold — therefore lives in the `Some(tool)` arm below, beside the fold that is
+    // able to answer it no.
     let prefix = body.prefix.trim();
     within_length("prefix", prefix)?;
     if prefix.is_empty() {
@@ -6418,21 +6892,142 @@ async fn post_project_shell_rule(
         ));
     }
 
-    // See the doc above for why this is inside the `Allow` arm and must stay there.
-    if body.verdict == crate::project_policy::Verdict::Allow
-        && !crate::classifier::shell_form_is_readable(prefix)
+    // Which tool's writes this rule is about, or `None` for a rule about a command prefix — which
+    // is every rule anybody could declare before this handler learned the word.
+    //
+    // Refused BY NAME here rather than left to the table, exactly as `empty_prefix` above stands in
+    // front of the column's `prefix <> ''`: `tool` is stored under a closed `CHECK`, and a value
+    // the CHECK would reject must never reach the CHECK, because a constraint failure comes back
+    // through the `internal` arm below as a 500 that names nothing.
+    //
+    // **Asked of `classifier::WRITE_TOOLS` rather than spelled again here.** This guard carried
+    // its own `["Edit", "Write"]` until 2026-09-08, which is two lists for one fact, and the day
+    // the classifier admitted `NotebookEdit` this door would have gone on refusing a rule the
+    // write chain had just learned to enforce — a refusal nobody could have debugged from the
+    // message, since the message was quoting the wrong list with complete confidence.
+    //
+    // The column's CHECK is still a second copy and cannot be anything else: SQL cannot read a
+    // Rust const. `0138` is the migration that widened it, and the two are kept in step by the
+    // test below that sends every name on this list at the real table.
+    let tool = body.tool.as_deref();
+    if let Some(tool) = tool
+        && !crate::classifier::WRITE_TOOLS.contains(&tool)
     {
+        let governed = crate::classifier::WRITE_TOOLS
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
-                "refusal": "unmatchable_prefix",
+                "refusal": "unknown_tool",
                 "detail": format!(
-                    "`{prefix}` can never be allowed: `classify_segment` guards `rules.allows` \
-                     with the same shape check this just failed, so the permission would be \
-                     stored and never fire. Declared as a `deny` it would be enforced."
+                    "`{tool}` is not a tool whose writes this núcleo governs: only {governed} \
+                     reach the write chain in `classifier::classify`, so a rule about anything \
+                     else would be stored and never consulted. Send no tool at all for a rule \
+                     about a COMMAND prefix."
                 ),
             })),
         ));
+    }
+
+    // The shape a prefix has to be in, and WHICH question that is depends on what kind of prefix
+    // this is. Written as a match on the tool rather than as two conditions in a row, because the
+    // two guards are mutually exclusive as a matter of MEANING and not of ordering: a path is not a
+    // shell line, and running one through `shell_form_is_readable` would refuse ordinary directory
+    // names for looking like flags and redirections.
+    match tool {
+        // See the doc above for why this is inside the `Allow` arm and must stay there.
+        None => {
+            if body.verdict == crate::project_policy::Verdict::Allow
+                && !crate::classifier::shell_form_is_readable(prefix)
+            {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "refusal": "unmatchable_prefix",
+                        "detail": format!(
+                            "`{prefix}` can never be allowed: `classify_segment` guards \
+                             `rules.allows` with the same shape check this just failed, so the \
+                             permission would be stored and never fire. Declared as a `deny` it \
+                             would be enforced."
+                        ),
+                    })),
+                ));
+            }
+        }
+        Some(tool) => {
+            // The rule this whole chunk is built around, refused where somebody can read it. The
+            // doc above names the two silent places that already enforce it.
+            if body.verdict == crate::project_policy::Verdict::Allow {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "refusal": "unenforceable_allow",
+                        "detail": format!(
+                            "a rule about a tool can only REFUSE. `{tool}` allowed to write to \
+                             `{prefix}` would be stored and decide nothing: the write chain in \
+                             `classifier::classify` ends at `read-local`, so there is no allow \
+                             side for it to reach, and `project_policy::shell_rules` drops such a \
+                             row on the way back out of the table. Declared as a `deny` the same \
+                             path WOULD be enforced — `{tool}` would be refused at it and at \
+                             everything under it."
+                        ),
+                    })),
+                ));
+            }
+            // The second half of `empty_prefix`, and it is here because only this fold can reach
+            // it. `fold_path_prefix` writes `\` as `/` and then strips the trailing `/`, so a
+            // prefix of nothing but separators — `/`, `//`, `\`, `\\`, `///` — survives the trim
+            // check above and lands on the column's `prefix CHECK (prefix <> '')` as the empty
+            // string. A CHECK failure comes back through the `internal` arm below as a 500 that
+            // names nothing, which is precisely what the guard above promises cannot happen: a
+            // value the CHECK would reject must never reach the CHECK.
+            //
+            // Asked by CALLING the fold, not by restating what it does. A condition written to
+            // match a fold is a second source of truth that stops matching in silence the day the
+            // fold learns to strip something else, and what it lets back through is this same
+            // nameless 500. `fold_for` is `pub(crate)` for exactly that reason: one function
+            // answers what gets stored, and every guard about what gets stored asks that function.
+            if crate::project_policy::fold_for(Some(tool), prefix).is_empty() {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "refusal": "empty_prefix",
+                        "detail": format!(
+                            "`{prefix}` names no path: a path prefix is stored with `\\` written \
+                             as `/` and the trailing `/` dropped, so a prefix of nothing but \
+                             separators folds to the empty string and there is no rule left to \
+                             enforce. Write the path out, relative to the project root — there is \
+                             no prefix that means the whole worktree."
+                        ),
+                    })),
+                ));
+            }
+            // The three characters `classifier::lands_inside_the_workspace` refuses in a `cd` or
+            // `mkdir` target, refused here for the same reason and against the same code. Nothing
+            // expands them on the way to a comparison: `write_denied_by_project` puts the stored
+            // prefix through `normalize_path`, which GLUES an ordinary-looking `~`, `$HOME` or
+            // `%USERPROFILE%` onto the workspace — so `~/notes` would be stored as a refusal of
+            // `<workspace>/~/notes`, a directory no write can ever land in. A refusal that cannot
+            // match is an allow, which is why this is a 422 and not a warning.
+            if prefix.starts_with('~') || prefix.contains('$') || prefix.contains('%') {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "refusal": "unmatchable_prefix",
+                        "detail": format!(
+                            "`{prefix}` can never match a write: a leading `~`, a `$` or a `%` \
+                             arrives UNEXPANDED, and `normalize_path` joins it onto the workspace \
+                             as an ordinary name — so the refusal would be about a directory that \
+                             cannot exist, and a refusal that cannot match is an allow. Write the \
+                             path out, relative to the project root."
+                        ),
+                    })),
+                ));
+            }
+        }
     }
 
     // A note of nothing but whitespace is NO note, and it is folded to `NULL` here rather than
@@ -6447,7 +7042,9 @@ async fn post_project_shell_rule(
         .map(str::trim)
         .filter(|note| !note.is_empty());
 
-    crate::project_policy::declare_shell_rule(&state.pool, &id, prefix, body.verdict, note)
+    // The tool goes down as it arrived — `None` is a shell rule and `Some` is a write rule, and
+    // `declare_shell_rule` folds the prefix by whichever of the two folds that answer picks.
+    crate::project_policy::declare_shell_rule(&state.pool, &id, tool, prefix, body.verdict, note)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "declaring a project shell rule failed");
@@ -6457,10 +7054,25 @@ async fn post_project_shell_rule(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Which rule to withdraw, and it takes TWO fields for a reason worth stating.
+///
+/// **A prefix alone no longer names a row.** The unique index is `(project_id, tool, prefix)`, so a
+/// project may hold `deny migrations` — a command — and `deny Edit migrations` — a directory — at
+/// once, and they are two rules. A DELETE that carried only the prefix would have to pick one of
+/// them, and whichever it picked would be right half the time; `forget_shell_rule`'s `WHERE` names
+/// the triple, so the tool has to arrive for the statement to be able to name the row.
+///
+/// **Absent means the SHELL rule, and that is the answer that keeps the old clients honest.** Every
+/// DELETE written before this field existed meant a command prefix, because a command prefix was
+/// the only thing that could be declared. `#[serde(default)]` makes that reading the default one,
+/// rather than "whichever row sorts first" — which is a delete that lands on a rule nobody named.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ShellRuleTarget {
     prefix: String,
+    /// The tool whose rule to withdraw, or absent for the rule about a command prefix.
+    #[serde(default)]
+    tool: Option<String>,
 }
 
 /// Withdraws one shell rule.
@@ -6473,7 +7085,10 @@ struct ShellRuleTarget {
 ///
 /// **No shape guard and no kill switch.** A rule stored before either existed still has to be
 /// withdrawable, and an emergency stop must never stand between somebody and narrowing what their
-/// project may do.
+/// project may do. That covers the tool as well: `unknown_tool` guards the POST because a value
+/// outside the CHECK cannot be STORED, while here an unknown tool simply matches no row and earns
+/// the 404 it deserves — refusing it by name would put a shape guard in front of a withdrawal, and
+/// the one row it could keep somebody from removing is a row written before the guard existed.
 async fn delete_project_shell_rule(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -6493,22 +7108,36 @@ async fn delete_project_shell_rule(
         ));
     }
 
-    let forgotten = crate::project_policy::forget_shell_rule(&state.pool, &id, prefix)
+    let tool = body.tool.as_deref();
+    let forgotten = crate::project_policy::forget_shell_rule(&state.pool, &id, tool, prefix)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "forgetting a project shell rule failed");
             refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
         })?;
     if !forgotten {
+        // **The sentence names the tool as well as the prefix**, because with two rules able to
+        // share a prefix "there is no rule for `migrations`" is a claim that can be false on the
+        // very screen it is read on: the other one is still listed, and "I deleted it and it is
+        // still there" has no answer without the missing word.
+        //
+        // The COMMAND half names the folded spelling — the answer somebody who typed the wrong case
+        // needs — through `normalize_command`, which is the function `project_policy::fold_prefix`
+        // wraps and therefore not a second spelling of the fold. The write half deliberately echoes
+        // what was sent instead: `fold_path_prefix` is private to `project_policy`, and restating
+        // its three steps here to decorate a 404 would be exactly the second spelling of a key that
+        // module exists to prevent. It keeps its case either way, which is the part of a path
+        // somebody could get wrong and needs to see.
+        let detail = match tool {
+            None => format!(
+                "{id} has declared no rule for `{}`",
+                crate::classifier::normalize_command(prefix)
+            ),
+            Some(tool) => format!("{id} has declared no `{tool}` rule for `{prefix}`"),
+        };
         return Err((
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "refusal": "no_such_rule",
-                "detail": format!(
-                    "{id} has declared no rule for `{}`",
-                    crate::classifier::normalize_command(prefix)
-                ),
-            })),
+            Json(serde_json::json!({ "refusal": "no_such_rule", "detail": detail })),
         ));
     }
 
@@ -6739,6 +7368,140 @@ async fn delete_project_github_op(
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "forgetting a project github op failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+    if !forgotten {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "refusal": "no_such_op",
+                "detail": format!("{id} has not declared `{op_kind}`"),
+            })),
+        ));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Every operation the shared git queue performs, and whether a project may declare it.
+///
+/// **The git twin of `get_declarable_github_ops`, and simpler by exactly the gap `vcs::DeclarableGitOp`'s
+/// own doc names.** The GitHub catalogue has to serve operations the ceilings refuse, so a caller can
+/// draw them as facts rather than as controls; the git queue has no ceiling narrower than
+/// `GIT_OP_KINDS` to intersect, so `declarable_git_ops` returns everything it performs and every row
+/// comes back `declarable: true`. Nothing here computes a `half` either — every operation in this
+/// family is a write the queue performs the same way, never a read in force.
+///
+/// No project id, for the reason the route comment gives: the answer is compiled into `GIT_OP_KINDS`
+/// and is the same for every project on the roster.
+async fn get_declarable_git_ops() -> Json<Vec<vcs::DeclarableGitOp>> {
+    Json(vcs::declarable_git_ops())
+}
+
+/// What the shared git queue may do on this project's repository, for an autonomous run, without
+/// asking.
+///
+/// `try_git_ops` and not `git_ops`, for `get_project_github_ops`'s reason: this is a DISPLAY, and
+/// `[]` has to mean "nothing declared" rather than stand in for a read that failed.
+async fn get_project_git_ops(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    crate::project_policy::try_git_ops(&state.pool, &id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading a project's git ops failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitOpTarget {
+    op_kind: String,
+}
+
+/// Refuses a blank op kind before anything else can name it — `named_op_kind`'s own reason, worded
+/// for this family instead of GitHub's: reusing that message verbatim would tell somebody declaring
+/// a git operation that their GitHub declaration was malformed.
+fn named_git_op_kind(op_kind: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if op_kind.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "empty_op_kind",
+                "detail": "a git declaration has to name an operation",
+            })),
+        ));
+    }
+    Ok(())
+}
+
+/// Grants one git operation to this project's autonomous runs without asking.
+///
+/// The git twin of `post_project_github_op`, and the checks run in the same order: the emergency
+/// stop first, because this widens exactly as a GitHub `allow` does; then the roster; then the
+/// length cap; then the blank-kind refusal; then the catalogue. Unlike its sibling there is no
+/// inert-until-elsewhere caveat to record — `GIT_OP_KINDS` is exactly what the shared git queue
+/// consults, with nothing standing between a declared row and the queue honouring it.
+async fn post_project_git_op(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitOpTarget>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    declaration_halted(&state, &id).await?;
+    project_is_on_the_roster(&state, &id).await?;
+
+    let op_kind = body.op_kind.trim();
+    within_length("op kind", op_kind)?;
+    named_git_op_kind(op_kind)?;
+
+    if !vcs::GIT_OP_KINDS.contains(&op_kind) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "undeclarable_op",
+                "detail": format!(
+                    "`{op_kind}` is not an operation a project may declare; the queue admits: {}",
+                    vcs::GIT_OP_KINDS.join(", ")
+                ),
+            })),
+        ));
+    }
+
+    crate::project_policy::declare_git_op(&state.pool, &id, op_kind)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "declaring a project git op failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Withdraws one git operation. 404 when it was never declared, off the DELETE's own
+/// `rows_affected` — `delete_project_github_op`'s reason, unchanged here: a presence check through
+/// `git_ops` would read an unreadable table as an empty list and report a false 404 while the row,
+/// and the operation, stand.
+///
+/// No kill switch: withdrawing narrows, and an operation declared before this route existed still
+/// has to be removable.
+async fn delete_project_git_op(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitOpTarget>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    project_is_on_the_roster(&state, &id).await?;
+
+    let op_kind = body.op_kind.trim();
+    within_length("op kind", op_kind)?;
+    named_git_op_kind(op_kind)?;
+
+    let forgotten = crate::project_policy::forget_git_op(&state.pool, &id, op_kind)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "forgetting a project git op failed");
             refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
         })?;
     if !forgotten {
@@ -7652,7 +8415,9 @@ where
 pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
     match error {
         CreateRunError::Invalid(_) => StatusCode::BAD_REQUEST,
-        CreateRunError::Busy => StatusCode::CONFLICT,
+        // The same 409 as a held slot: both are conditions that pass, and a caller that retries
+        // on one should retry on the other. What tells them apart is the sentence below.
+        CreateRunError::Busy | CreateRunError::NoRoomOnDisk(_) => StatusCode::CONFLICT,
         CreateRunError::Worktree(_) | CreateRunError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -7663,17 +8428,24 @@ pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
 /// deciding what one refusal is CALLED would drift, and a status and a sentence that disagree is
 /// worse than either alone.
 ///
-/// **`Invalid`'s own words travel and the other two's do not**, and that split is the whole of this
-/// function. `Invalid` is a `&'static str` this codebase wrote about the request — "worktree mode
-/// requires project_id and cwd" — and it was being thrown away, so a caller got a bare 400 for a
-/// mistake it could have fixed in a second. A `sqlx::Error` and an `io::Error` are about the inside
-/// of this daemon: they go to the log, where whoever can act on them is reading, and the caller gets
-/// the fact rather than the internals.
+/// **`Invalid`'s and `NoRoomOnDisk`'s own words travel, and the internal errors' do not**, and that
+/// split is the whole of this function. `Invalid` is a `&'static str` this codebase wrote about the
+/// request — "worktree mode requires project_id and cwd" — and it was being thrown away, so a caller
+/// got a bare 400 for a mistake it could have fixed in a second. `NoRoomOnDisk` is about the machine,
+/// not the daemon: how much room there is and how much a checkout asks for. A `sqlx::Error` and an
+/// `io::Error` are about the inside of this daemon: they go to the log, where whoever can act on them
+/// is reading, and the caller gets the fact rather than the internals.
 pub(crate) fn create_run_reason(error: &CreateRunError) -> String {
     match error {
         CreateRunError::Invalid(reason) => (*reason).to_owned(),
         CreateRunError::Busy => {
             "this project has no free slot right now, so nothing was started".to_owned()
+        }
+        // Its words travel, like `Invalid`'s, because they are about the machine rather than the
+        // daemon's internals — how much room there is and how much a checkout asks for — and a
+        // caller told "no free slot" instead goes looking for a run that is not there.
+        CreateRunError::NoRoomOnDisk(refusal) => {
+            format!("the disk is too full for another checkout, so nothing was started: {refusal}")
         }
         CreateRunError::Worktree(_) => {
             "the run's checkout could not be provisioned; the daemon logged why".to_owned()
@@ -8367,6 +9139,7 @@ async fn run_preset(
             // steering existed, so `false` is the answer each of them was saved with — a preset must
             // not become a way to obtain a listening run that its author never asked for.
             steerable: false,
+            permission_mode: None,
         }),
     )
     .await
@@ -9729,7 +10502,7 @@ async fn get_local_model_size(
 async fn post_local_model_pull(
     Json(body): Json<PullRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
-    let (_, choices) = menu().await;
+    let (_, choices) = menu(Asking::Daemon).await;
     if !choices
         .iter()
         .any(|choice| choice.brain == "local" && choice.id == body.model)
@@ -10002,7 +10775,7 @@ async fn post_project_judge(
     // model beside it — so a model there is not a judge's model and has nothing to be checked
     // against.
     if let (Some(named), Some(model)) = (brain, model) {
-        match chosen_brain(&state, model).await {
+        match chosen_brain(&state, model, Asking::Daemon).await {
             Ok(route) if route == named => {}
             Ok(route) => {
                 return Err(unusable_judge(format!(
@@ -10015,6 +10788,9 @@ async fn post_project_judge(
                 return Err(unusable_judge(format!(
                     "nothing on this daemon's model menu is called `{model}`"
                 )));
+            }
+            Err(BrainRefusal::NeedsRoot) => {
+                return Err(unusable_judge(CODEX_NEEDS_A_ROOT.to_string()));
             }
             // `can_serve`'s own words, carried through rather than summarised — it is the layer that
             // knows WHY, and the two cases that reach here are the ordinary ones: a local model
@@ -10225,7 +11001,7 @@ async fn create_chat(
     // precedence `patch_chat` applies, for the same reason: a row saying `local` while naming a
     // cloud model would be sent to Ollama under a name it has never heard.
     let brain = match body.model.as_deref() {
-        Some(id) => chosen_brain(&state, id).await?,
+        Some(id) => chosen_brain(&state, id, Asking::Chat { rooted: false }).await?,
         None => crate::chats::Brain::from_wire(body.brain.as_deref().unwrap_or("cloud")),
     };
     // Checked before the row exists, so a bad level leaves no conversation behind to explain. The
@@ -10442,8 +11218,7 @@ async fn create_chat(
 /// what startup does: a picker that fails closed leaves somebody unable to change a model because
 /// of a typo in a key that has nothing to do with models.
 fn models_config() -> crate::config::ModelsConfig {
-    crate::config::load_models_config(std::path::Path::new(crate::config::MODELS_CONFIG_PATH))
-        .unwrap_or_default()
+    crate::config::models_config_now()
 }
 
 /// Every named model is on the menu AND is one the agent CLI could take over, or a refusal.
@@ -10495,6 +11270,13 @@ fn cloud_choice(
 /// over the line `CreateProcess` fails with an error about nothing in particular and the turn looks
 /// broken rather than too big. Somebody who needs more has the CLI's own answer: files in the
 /// project's `.claude/agents/`, which this merges with rather than replaces.
+///
+/// A helper's `tools` list counts toward this same total — it is serialised inside the same object,
+/// on the way to the same argv element — but does not move the number. Measured against 49 built-in
+/// names at up to 22 characters each, granting a helper every one of them costs roughly 1,200
+/// characters; the ceiling was sized for prompts, which dwarf that, so it stays unchanged. A
+/// conversation defining enough helpers with a full list each to approach 8,000 hits the refusal
+/// this constant already gives, which is the ceiling doing its one job, not a new failure mode.
 const AGENTS_JSON_CEILING: usize = 8_000;
 
 /// The longest standing instructions this daemon will write, in characters.
@@ -10572,6 +11354,18 @@ fn checked_agents(agents: &[crate::runner::Subagent]) -> Result<(), StatusCode> 
         // without one is defined, listed, and never used.
         if agent.description.trim().is_empty() || agent.prompt.trim().is_empty() {
             return Err(StatusCode::BAD_REQUEST);
+        }
+
+        // Reuses `BUILTIN_TOOLS` for a different job than `checked_denials` puts it to: there it is
+        // the vocabulary of what a CONVERSATION may be denied, here it is the vocabulary of what a
+        // HELPER may be granted — same list, because both are naming the one set of tools this
+        // daemon knows about. Names only, never the CLI's `Bash(git *)` patterns, for the reason
+        // `checked_denials` already gives: a pattern is a rule language, and a typo in one is a
+        // restriction that silently is not one. `Some(vec![])` is checked and accepted here, not
+        // skipped — a helper granted no tools at all is a coherent, explicit thing to ask for, and
+        // treating it like `None` would make that restriction vanish.
+        if let Some(tools) = &agent.tools {
+            checked_denials(tools)?;
         }
 
         // A helper runs INSIDE the agent CLI, so its model has to be one that CLI can take — the
@@ -10683,7 +11477,9 @@ fn ollama_tags_client() -> &'static reqwest::Client {
 /// empty list on failure, `catalogue_with_installed` with an empty list IS `catalogue()`, and
 /// `OLLAMA_TAGS_CLIENT` — built once and reused, never a fresh client per call — bounds how long a
 /// wedged Ollama can hold up either caller to `OLLAMA_TAGS_TIMEOUT`.
-async fn menu() -> (
+async fn menu(
+    asking: Asking,
+) -> (
     crate::config::ModelsConfig,
     Vec<crate::config::AssistantChoice>,
 ) {
@@ -10693,7 +11489,10 @@ async fn menu() -> (
         crate::runner::OLLAMA_BASE_URL,
     )
     .await;
-    let choices = config.catalogue_with_installed(&installed);
+    let choices = match asking {
+        Asking::Daemon => config.catalogue_with_installed(&installed),
+        Asking::Chat { rooted } => config.catalogue_for_chat(&installed, rooted),
+    };
     (config, choices)
 }
 
@@ -10701,11 +11500,26 @@ async fn menu() -> (
 enum BrainRefusal {
     /// No catalogue entry — the current `menu()`, installed models included — names this id.
     UnknownModel,
+    /// A Codex model needs a rooted conversation with its classifier hook wired.
+    NeedsRoot,
     /// The id names a real choice, but this machine cannot serve what it names —
     /// `Assistants::can_serve`'s own reason, carried verbatim into the refusal body of both
     /// doors that ask — opening a conversation and re-pointing one — so somebody who picked a
     /// model this machine cannot run is told which one and why, not handed a bare 503.
     CannotServe(String),
+}
+
+/// The reason Codex cannot answer an unrooted conversation.
+const CODEX_NEEDS_A_ROOT: &str =
+    "A Codex model answers only a conversation rooted in a project whose classifier hook is wired.";
+
+/// The caller whose available models are being selected.
+#[derive(Clone, Copy, Debug)]
+enum Asking {
+    /// The daemon's project-independent model menu.
+    Daemon,
+    /// A chat menu constrained by whether the conversation is rooted.
+    Chat { rooted: bool },
 }
 
 /// Which route a choice id names and can actually run, or a refusal.
@@ -10734,16 +11548,33 @@ enum BrainRefusal {
 /// (`assistants::NoAssistants`) may, and treating that as a capability refusal here would refuse
 /// every cloud pick the moment `state.assistants` is not fully wired — the wrong door, not a
 /// capability gap.
-async fn chosen_brain(state: &AppState, id: &str) -> Result<crate::chats::Brain, BrainRefusal> {
-    let config = models_config();
-    let brain = if let Some(choice) = config
-        .catalogue()
-        .into_iter()
-        .find(|choice| choice.id == id)
-    {
+async fn chosen_brain(
+    state: &AppState,
+    id: &str,
+    asking: Asking,
+) -> Result<crate::chats::Brain, BrainRefusal> {
+    chosen_brain_in(state, &models_config(), id, asking).await
+}
+
+/// Resolves a model choice for one caller using a supplied model configuration.
+async fn chosen_brain_in(
+    state: &AppState,
+    config: &crate::config::ModelsConfig,
+    id: &str,
+    asking: Asking,
+) -> Result<crate::chats::Brain, BrainRefusal> {
+    if matches!(asking, Asking::Chat { rooted: false }) && config.runner_of(id) == Some("codex") {
+        return Err(BrainRefusal::NeedsRoot);
+    }
+
+    let cheap_choices = match asking {
+        Asking::Daemon => config.catalogue(),
+        Asking::Chat { rooted } => config.catalogue_for_chat(&[], rooted),
+    };
+    let brain = if let Some(choice) = cheap_choices.into_iter().find(|choice| choice.id == id) {
         crate::chats::Brain::from_wire(&choice.brain)
     } else {
-        let (_, choices) = menu().await;
+        let (_, choices) = menu(asking).await;
         choices
             .into_iter()
             .find(|choice| choice.id == id)
@@ -10760,6 +11591,12 @@ async fn chosen_brain(state: &AppState, id: &str) -> Result<crate::chats::Brain,
     Ok(brain)
 }
 
+/// Query parameters for the assistant model menu.
+#[derive(serde::Deserialize)]
+struct ModelsQuery {
+    chat: Option<String>,
+}
+
 /// Which models a conversation may be moved to, and how hard each can be asked to think.
 ///
 /// Built from the same `menu()` `chosen_brain` uses, above — installed models included, over
@@ -10773,8 +11610,23 @@ async fn chosen_brain(state: &AppState, id: &str) -> Result<crate::chats::Brain,
 /// (the common case for the hosted route, and for local when nothing is configured) is skipped
 /// rather than asked with an empty slice, so an untouched install costs this route nothing beyond
 /// the network read `menu()` already pays for.
-async fn get_assistant_models(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let (config, choices) = menu().await;
+async fn get_assistant_models(
+    State(state): State<AppState>,
+    Query(query): Query<ModelsQuery>,
+) -> Json<serde_json::Value> {
+    let asking = match query.chat {
+        Some(chat_id) => Asking::Chat {
+            rooted: crate::assistant::may_answer_on_codex(
+                crate::chats::cwd_of(&state.pool, &chat_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            ),
+        },
+        None => Asking::Daemon,
+    };
+    let (config, choices) = menu(asking).await;
 
     let mut declared: std::collections::HashMap<String, crate::capabilities::Declared> =
         std::collections::HashMap::new();
@@ -11063,6 +11915,9 @@ impl From<BrainRefusal> for ChatRefusal {
     fn from(refusal: BrainRefusal) -> Self {
         match refusal {
             BrainRefusal::UnknownModel => ChatRefusal::Status(StatusCode::BAD_REQUEST),
+            BrainRefusal::NeedsRoot => {
+                ChatRefusal::WithDetail(StatusCode::BAD_REQUEST, CODEX_NEEDS_A_ROOT.to_string())
+            }
             // Not a 500, for the same reason `BrainRefusal`'s own `From<StatusCode>` impl gives:
             // nothing broke, this machine simply cannot run what was asked for.
             BrainRefusal::CannotServe(reason) => {
@@ -11174,7 +12029,16 @@ async fn patch_chat(
     // name it has never heard.
     if let Some(model) = &body.model {
         let brain = match model {
-            Some(id) => Some(chosen_brain(&state, id).await?),
+            Some(id) => {
+                let cwd = crate::chats::cwd_of(&state.pool, &chat_id)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(%error, "reading a conversation's project failed");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+                let rooted = crate::assistant::may_answer_on_codex(cwd.as_deref());
+                Some(chosen_brain(&state, id, Asking::Chat { rooted }).await?)
+            }
             // Unpinning says nothing about the route. The conversation goes back to following the
             // configured model, and `brain` keeps whatever it already had — changing it here would
             // be this route inventing a decision nobody expressed.
@@ -13154,6 +14018,8 @@ mod tests {
                 run_tails: Default::default(),
                 files_root: None,
                 workflow_library: None,
+                machine_config_root: None,
+                secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -14059,6 +14925,8 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -15119,6 +15987,8 @@ mod tests {
         AppState {
             files_root: Some(root),
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             ..state
         }
     }
@@ -19440,6 +20310,335 @@ mod tests {
         assert!(installed[0]["update_available"].is_null());
     }
 
+    /// A credential goes in, and only its presence ever comes back.
+    ///
+    /// The value is asserted absent from the whole response body rather than from the field it
+    /// would have been put in: a future handler that added `"value"` beside `"present"` would pass
+    /// a narrower check, and the point of this one is that no shape of leak passes it.
+    #[tokio::test]
+    async fn a_credential_is_stored_and_only_its_presence_is_ever_reported() {
+        let state = test_state().await;
+
+        let (_, before) = workflow_call(state.clone(), "GET", "/config/secrets", None).await;
+        let row = |body: &serde_json::Value| {
+            body["secrets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["key"] == "github-token")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row(&before)["present"], false);
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "PUT",
+            "/config/secrets/github-token",
+            Some(serde_json::json!({ "value": "ghp_a_real_looking_token" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, after) = workflow_call(state, "GET", "/config/secrets", None).await;
+        assert_eq!(row(&after)["present"], true);
+        assert!(
+            !after.to_string().contains("ghp_a_real_looking_token"),
+            "no route may serve a credential back"
+        );
+    }
+
+    /// The daemon's own token is not a credential this app may set.
+    ///
+    /// It is the app's key to the daemon: overwriting it through the API would lock out the caller
+    /// making the request, and the recovery is a restart plus a credential the app can no longer be
+    /// told. It is absent from `SECRETS`, so it refuses by the ordinary path rather than by a
+    /// special case somebody could delete.
+    #[tokio::test]
+    async fn the_daemon_token_cannot_be_written_through_the_api() {
+        let state = test_state().await;
+        for method in ["PUT", "DELETE"] {
+            let (status, body) = workflow_call(
+                state.clone(),
+                method,
+                "/config/secrets/daemon-token",
+                Some(serde_json::json!({ "value": "a-new-token" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} must be refused");
+            assert_eq!(body["refusal"], "not_ours");
+        }
+
+        // And it is not listed either, so nothing invites somebody to try.
+        let (_, listing) = workflow_call(state, "GET", "/config/secrets", None).await;
+        assert!(!listing.to_string().contains("daemon-token"));
+    }
+
+    /// An empty value is refused rather than stored.
+    ///
+    /// Storing one leaves a credential that exists and does not work, which reads as "configured"
+    /// everywhere it is asked about — the worst of the three available states.
+    #[tokio::test]
+    async fn an_empty_value_is_refused_rather_than_stored() {
+        let state = test_state().await;
+        let (status, body) = workflow_call(
+            state.clone(),
+            "PUT",
+            "/config/secrets/openrouter-api-key",
+            Some(serde_json::json!({ "value": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["refusal"], "invalid");
+        assert!(body["detail"].as_str().unwrap().contains("DELETE"));
+
+        let (_, listing) = workflow_call(state, "GET", "/config/secrets", None).await;
+        let row = listing["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["key"] == "openrouter-api-key")
+            .unwrap()
+            .clone();
+        assert_eq!(row["present"], false, "nothing was stored");
+    }
+
+    /// Forgetting is idempotent, because "forgotten" and "was not there" call for the same next
+    /// step and a page that had to tell them apart would be asking a question with one answer.
+    #[tokio::test]
+    async fn forgetting_a_credential_is_idempotent() {
+        let state = test_state().await;
+        for _ in 0..2 {
+            let (status, _) = workflow_call(
+                state.clone(),
+                "DELETE",
+                "/config/secrets/telegram-token",
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+    }
+
+    /// The kill switch stops a credential being written, for the reason it stops a settings write:
+    /// the control token reaches here, and a credential is a capability.
+    #[tokio::test]
+    async fn the_kill_switch_stops_a_credential_being_written() {
+        let state = test_state().await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/kill",
+            Some(serde_json::json!({ "engaged": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = workflow_call(
+            state,
+            "PUT",
+            "/config/secrets/github-token",
+            Some(serde_json::json!({ "value": "ghp_something" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
+    }
+
+    /// A state whose machine-settings root is a directory this test owns.
+    ///
+    /// The `TempDir` is returned rather than dropped, for the reason the other helpers here give:
+    /// its drop is what deletes the directory, so a test that let it fall would be asserting
+    /// against a root that had already gone.
+    async fn state_with_machine_root() -> (AppState, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = test_state().await;
+        state.machine_config_root = Some(temp.path().to_path_buf());
+        (state, temp)
+    }
+
+    /// The fence lists every row, including the pillars nobody has ever configured.
+    ///
+    /// "This has never been set up" is the answer the page most needs and an absent row cannot
+    /// give it — the same reason `GET /projects/{id}/ownership` serves claims rather than files.
+    /// The resolved path is asserted too, because on a machine with twenty worktrees the relative
+    /// path alone would let somebody edit settings with great confidence in the wrong checkout.
+    #[tokio::test]
+    async fn the_fence_lists_every_setting_including_the_ones_never_configured() {
+        let (state, temp) = state_with_machine_root().await;
+        let (status, body) = workflow_call(state, "GET", "/config/machine", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let rows = body["settings"].as_array().unwrap();
+        assert_eq!(rows.len(), crate::machine_config::SETTINGS.len());
+        for row in rows {
+            assert_eq!(row["exists"], false, "{} should not exist yet", row["path"]);
+            assert!(row["contents"].is_null());
+            assert!(!row["what"].as_str().unwrap().is_empty());
+            assert!(!row["takes_effect"].as_str().unwrap().is_empty());
+            assert!(
+                row["resolved"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(temp.path().to_str().unwrap()),
+                "every row must name the file it would actually write"
+            );
+        }
+    }
+
+    /// A write lands, and the next read is the file rather than what the caller said it was.
+    #[tokio::test]
+    async fn a_setting_is_written_and_read_back() {
+        let (state, temp) = state_with_machine_root().await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({
+                "path": ".ai/calendar.yaml",
+                "contents": "working_hours_start: \"10:00\"\n",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // On disk, under the root the state named — not merely in the answer.
+        let written = std::fs::read_to_string(temp.path().join(".ai/calendar.yaml")).unwrap();
+        assert!(written.contains("10:00"));
+
+        let (_, body) = workflow_call(state, "GET", "/config/machine", None).await;
+        let row = body["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == ".ai/calendar.yaml")
+            .unwrap()
+            .clone();
+        assert_eq!(row["exists"], true);
+        assert!(row["contents"].as_str().unwrap().contains("10:00"));
+    }
+
+    /// A file that does not parse is refused, and — the half that matters — the good file that was
+    /// already there is still there.
+    ///
+    /// Validate-then-write is the whole contract of this route. A route that wrote first and
+    /// validated after would turn one bad keystroke into a pillar that stays off after the next
+    /// restart, and the loaders are fail-soft precisely so that nobody would be told.
+    #[tokio::test]
+    async fn a_file_that_does_not_parse_is_refused_and_the_old_one_survives() {
+        let (state, temp) = state_with_machine_root().await;
+        let good = "enabled: true\nmax_sessions: 3\n";
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({ "path": ".ai/browser.yaml", "contents": good })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({
+                "path": ".ai/browser.yaml",
+                "contents": "max_sessions: \"not a number\"\n",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["refusal"], "invalid");
+        // The parser's own words, so somebody can fix the line rather than guess at it.
+        assert!(!body["detail"].as_str().unwrap().is_empty());
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".ai/browser.yaml")).unwrap(),
+            good,
+            "a refused write must not have touched the file"
+        );
+    }
+
+    /// A path this machine does not configure is refused, whichever way it is spelled.
+    ///
+    /// The three here are three different mistakes: a file that belongs to the `.ai/` workflow
+    /// harness, a file that is a PROJECT's and has its own door, and traversal. All three get
+    /// `not_ours` because from this route's point of view they are the same answer — the table
+    /// does not name them.
+    #[tokio::test]
+    async fn a_path_this_machine_does_not_configure_is_refused() {
+        let (state, temp) = state_with_machine_root().await;
+        for path in [
+            ".ai/project.yaml",
+            ".ai/autopilot.yaml",
+            "../.ai/voice.yaml",
+        ] {
+            let (status, body) = workflow_call(
+                state.clone(),
+                "POST",
+                "/config/machine",
+                Some(serde_json::json!({ "path": path, "contents": "enabled: true\n" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path} must be refused");
+            assert_eq!(body["refusal"], "not_ours");
+        }
+        assert!(
+            !temp.path().join(".ai").exists(),
+            "a refused write must not have created so much as a directory"
+        );
+    }
+
+    /// The kill switch stops a settings write, and the reason is not symmetry with the project
+    /// route — it is that the control token reaches here and `assistant.rs` hands that token to an
+    /// MCP-only assistant turn. `.ai/github.yaml` names what a run may do without asking.
+    #[tokio::test]
+    async fn the_kill_switch_stops_a_settings_write() {
+        let (state, _temp) = state_with_machine_root().await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/kill",
+            Some(serde_json::json!({ "engaged": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({ "path": ".ai/calendar.yaml", "contents": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
+    }
+
+    /// Without a root, both routes refuse by name rather than guessing at one.
+    ///
+    /// A daemon that cannot name its own working directory has no idea which of this machine's
+    /// twenty checkouts it would be editing, and picking one would be the worst available answer.
+    #[tokio::test]
+    async fn without_a_root_every_settings_route_refuses() {
+        let state = test_state().await;
+        assert!(state.machine_config_root.is_none());
+
+        let (status, body) = workflow_call(state.clone(), "GET", "/config/machine", None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["refusal"], "no_machine_root");
+
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({ "path": ".ai/calendar.yaml", "contents": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["refusal"], "no_machine_root");
+    }
+
     /// An installed workflow's declared file is in the fence and cannot be written from here.
     ///
     /// §12's middle state, end to end: `writable: false` on the row, and `another_author` rather
@@ -20457,7 +21656,7 @@ mod tests {
         .unwrap();
     }
 
-    /// One request to the nine, body and all.
+    /// One request to the twelve, body and all.
     ///
     /// One helper for the DELETEs as well as the POSTs, because a DELETE here carries what it
     /// deletes in the body — a shell prefix is not a safe path segment.
@@ -20644,13 +21843,16 @@ mod tests {
         let rules = listed.as_array().unwrap();
         assert_eq!(rules.len(), 2);
 
-        // `ORDER BY prefix`, so `cargo fmt` is first. The row is asserted whole: the four fields
-        // together are what makes a rule editable without losing anything, and asserting the note
-        // alone would pass a shape that had dropped the verdict.
+        // `ORDER BY tool, prefix`, and both rules are about a command, so `cargo fmt` is first. The
+        // row is asserted WHOLE: the five fields together are what makes a rule editable without
+        // losing anything, and asserting the note alone would pass a shape that had dropped the
+        // verdict. `tool` is `null` here and it is asserted rather than skipped — a rule about a
+        // command has no tool, and an omitted field is a shape a page would have to guess at.
         assert_eq!(
             rules[0],
             serde_json::json!({
                 "prefix": "cargo fmt",
+                "tool": serde_json::Value::Null,
                 "verdict": "allow",
                 "note": "formatting cannot break anything",
                 "created_at": "2020-01-01 00:00:00",
@@ -20888,6 +22090,456 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::NO_CONTENT);
         }
+    }
+
+    /// A write rule comes back naming the tool it governs, in the spelling a PATH is stored under.
+    ///
+    /// **The defect this whole chunk had to close, asserted from the outside.** `0131` gave the
+    /// table a `tool` column and taught the classifier to honour it, and the GET went on serving
+    /// `{prefix, verdict, note, created_at}` — so a `deny Edit core/migrations` came back looking
+    /// exactly like a rule about a command called `core/migrations`. It was unreachable while no
+    /// route could write a tool, and it stopped being unreachable in the same commit as this test.
+    ///
+    /// The prefix is typed with a leading space, a Windows separator, a trailing slash AND a
+    /// capital, and only the first three come back folded. That asymmetry is the assertion: a path
+    /// goes through `fold_path_prefix`, which deliberately does not lower-case, because
+    /// `write_denied_by_project` asks the containment question against the real filesystem and a
+    /// case folded at storage time would hard-code Windows' answer into the table.
+    #[tokio::test]
+    async fn a_write_rule_comes_back_naming_the_tool_it_governs() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({
+                "prefix": "  Core\\Migrations/ ",
+                "tool": "Edit",
+                "verdict": "deny",
+                "note": "sqlx checksums a migration that has already been applied",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, listed) =
+            reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let rules = listed
+            .as_array()
+            .expect("the route serves an array of rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["tool"], "Edit");
+        assert_eq!(
+            rules[0]["prefix"], "Core/Migrations",
+            "a path is folded by `fold_path_prefix`, which keeps its case"
+        );
+        assert_eq!(rules[0]["verdict"], "deny");
+        assert_eq!(
+            rules[0]["note"],
+            "sqlx checksums a migration that has already been applied"
+        );
+    }
+
+    /// A rule about a command still comes back with the field, saying `null`.
+    ///
+    /// Asserted as PRESENT-and-null rather than merely not `"Edit"`, because the two shapes are
+    /// different promises to a page: an omitted field is one a client has to guess about, and a
+    /// `null` says the daemon looked and there is no tool. `serde` would omit it under a
+    /// `skip_serializing_if`, which is the one edit that could make this quietly wrong again.
+    #[tokio::test]
+    async fn a_shell_rule_still_comes_back_with_no_tool_at_all() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "npm ci", "verdict": "allow" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        let rule = &listed.as_array().expect("an array of rules")[0];
+        assert!(
+            rule.get("tool").is_some(),
+            "the field is SERVED on every row: an absent field is a shape a page has to guess at"
+        );
+        assert_eq!(rule["tool"], serde_json::Value::Null);
+    }
+
+    /// An `allow` that names a tool is refused at the door, and told what would have worked.
+    ///
+    /// **The rule this chunk is built around, at the only place a person meets it.** The núcleo
+    /// enforces it twice already and silently both times: `classify` has no allow branch on a write
+    /// path, and `shell_rules` drops such a row on the way out with a log line. Stored, the rule
+    /// would leave an owner holding a permission that decides nothing — which is worse than a
+    /// refusal, because there is nothing to act on.
+    ///
+    /// The detail is asserted for the ESCAPE and not only for the complaint: `unmatchable_prefix`
+    /// set the house style by naming what would be enforced instead, and a refusal that only says
+    /// no sends somebody to read `classifier.rs` to find out what to type next.
+    #[tokio::test]
+    async fn an_allow_that_names_a_tool_is_refused_and_told_what_would_work() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, refused) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({
+                "prefix": ".ai",
+                "tool": "Edit",
+                "verdict": "allow",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused["refusal"], "unenforceable_allow");
+        let detail = refused["detail"]
+            .as_str()
+            .expect("a sentence to put on screen");
+        assert!(detail.contains("`Edit`"), "{detail}");
+        assert!(detail.contains("`.ai`"), "{detail}");
+        assert!(
+            detail.contains("`deny`"),
+            "the refusal has to say what WOULD be enforced: {detail}"
+        );
+
+        // And nothing was written. A 422 over a row that landed anyway is the failure this guard
+        // exists to prevent, and only the table can say.
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(listed.as_array().expect("an array").len(), 0);
+    }
+
+    /// A tool this núcleo cannot deny for is refused by name, before the column's CHECK sees it.
+    ///
+    /// `NotebookEdit` used to be the value worth using here and stopped being one on 2026-09-08,
+    /// when it joined `classifier::WRITE_TOOLS`. It moved to the test below rather than being
+    /// deleted: a name that crosses from the refused list to the accepted one is the single case
+    /// where both halves have to be asserted, or the widening is only half-done in exactly the
+    /// way nobody notices — the door opens and the column still says no, or the reverse.
+    ///
+    /// `Bash` is what remains of the same idea and is the better example anyway: it is a real
+    /// tool, it is governed by this file, and its rules are COMMAND rules, so naming it as the
+    /// subject of a write rule is a category error somebody will make. The empty string is the
+    /// other half — `''` is what the column stores for "no tool", and a client that sent it
+    /// explicitly would otherwise have declared a shell rule by a spelling
+    /// `DeclaredShellRule::tool` exists to keep out of everyone's hands.
+    ///
+    /// Refused HERE and not at the table, for `empty_prefix`'s reason: a `CHECK` failure comes back
+    /// through the `internal` arm as a 500 that names nothing.
+    #[tokio::test]
+    async fn a_tool_nobody_can_deny_is_refused_by_name() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        for tool in ["Bash", "edit", ""] {
+            let (status, refused) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(serde_json::json!({
+                    "prefix": "core/migrations",
+                    "tool": tool,
+                    "verdict": "deny",
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{tool}");
+            assert_eq!(refused["refusal"], "unknown_tool", "{tool}");
+            let detail = refused["detail"].as_str().expect("a sentence");
+            assert!(detail.contains(&format!("`{tool}`")), "{detail}");
+            // Every tool that DOES exist, named — otherwise the next thing to try is a guess.
+            // Read off the list the guard itself asks, so a name added there without being
+            // offered in the refusal fails here rather than shipping a sentence one short.
+            for governed in crate::classifier::WRITE_TOOLS {
+                assert!(detail.contains(&format!("`{governed}`")), "{detail}");
+            }
+        }
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(listed.as_array().expect("an array").len(), 0);
+    }
+
+    /// Every tool the write chain governs can be named in a rule, and the column agrees.
+    ///
+    /// The other half of the refusal above, and it exists because the two lists cannot be one:
+    /// the guard asks `classifier::WRITE_TOOLS`, the column carries a `CHECK` written in SQL, and
+    /// SQL cannot read a Rust const. Nothing but a round trip can tell whether they still agree.
+    ///
+    /// The loop is over the const rather than over a literal list, so admitting the next write
+    /// tool fails HERE — with a 500 from the CHECK that a migration was not written — instead
+    /// of in a project six weeks later. That 500 is the failure mode `a_tool_nobody_can_deny` is
+    /// positioned to prevent for a REFUSED name; this is the same trap on the accepted side,
+    /// where no guard stands in front of the column at all.
+    ///
+    /// Read back rather than trusted: a 201 over a row that did not land is the mirror of the 422
+    /// over a row that did, and only the table can say which happened.
+    #[tokio::test]
+    async fn every_tool_the_write_chain_governs_can_carry_a_rule() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        for tool in crate::classifier::WRITE_TOOLS {
+            let (status, _) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(serde_json::json!({
+                    "prefix": format!("core/{tool}"),
+                    "tool": tool,
+                    "verdict": "deny",
+                })),
+            )
+            .await;
+            assert!(status.is_success(), "{tool}: {status}");
+        }
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        let listed = listed.as_array().expect("an array");
+        assert_eq!(listed.len(), crate::classifier::WRITE_TOOLS.len());
+        for tool in crate::classifier::WRITE_TOOLS {
+            assert!(
+                listed.iter().any(|rule| rule["tool"] == *tool),
+                "{tool} was accepted and is not in the table: {listed:?}"
+            );
+        }
+    }
+
+    /// A path prefix that the fold empties is refused BY NAME, and never by a 500.
+    ///
+    /// **The one input that could still reach the column's CHECK.** `empty_prefix` guards the raw
+    /// trim, which was the whole of it while there was one fold: `fold_prefix` is
+    /// `classifier::normalize_command`, and collapsing whitespace cannot empty a string that
+    /// survived `trim()`. `fold_path_prefix` can — it rewrites `\` as `/` and only then drops the
+    /// trailing `/`, so every spelling below arrives non-empty, passes the trim check and folds to
+    /// `""` on its way into `prefix CHECK (prefix <> '')`. That failure comes back through the
+    /// `internal` arm as a 500 that names nothing, and a 500 is the one answer this handler's
+    /// refusals exist to prevent: the owner is told the núcleo broke when what happened is that
+    /// they typed a prefix it cannot store.
+    ///
+    /// Both halves of the fold are exercised on purpose. `/` reaches the empty through the trailing
+    /// strip alone; `\` reaches it only because the rewrite runs FIRST, so a guard written against
+    /// `/` alone would pass this test and still 500 on the Windows spelling — which is the spelling
+    /// somebody pasting a path on this machine will produce.
+    #[tokio::test]
+    async fn a_path_prefix_that_folds_to_nothing_is_refused_by_name_and_not_by_a_five_hundred() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        for prefix in ["/", "//", "\\", "\\\\", "///", " / ", "/\\/"] {
+            let (status, refused) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(serde_json::json!({
+                    "prefix": prefix,
+                    "tool": "Edit",
+                    "verdict": "deny",
+                })),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "`{prefix}` folds to nothing and has to be refused by name, not by a 500: {refused}"
+            );
+            assert_eq!(refused["refusal"], "empty_prefix", "{prefix}");
+            let detail = refused["detail"]
+                .as_str()
+                .expect("a sentence to put on screen");
+            // The house style: name the offending value, then say what would work instead.
+            assert!(detail.contains(prefix.trim()), "{detail}");
+            assert!(detail.contains("project root"), "{detail}");
+        }
+
+        // A path that only LOOKS like one of those keeps working — the guard is about a prefix made
+        // of nothing but separators, and `/core` is a directory somebody may well want to close.
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({
+                "prefix": "/core",
+                "tool": "Edit",
+                "verdict": "deny",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // And nothing but that one landed. A 422 over a row stored anyway is the failure the guard
+        // exists to prevent, and only the table can say.
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        let rows = listed.as_array().expect("an array");
+        assert_eq!(rows.len(), 1, "{listed}");
+        assert_eq!(rows[0]["prefix"], "/core");
+    }
+
+    /// A path that could never match is refused the way an unmatchable command is, and for the
+    /// same reason said about a different comparison.
+    ///
+    /// `~`, `$` and `%` are the three `classifier::lands_inside_the_workspace` refuses in a `cd` or
+    /// `mkdir` target: nothing expands them on this side of the decision, so `normalize_path` glues
+    /// them onto the workspace as ordinary names and the stored refusal is about a directory that
+    /// cannot exist. A refusal that cannot match is an ALLOW — the asymmetry `fold_prefix` was
+    /// written to close, arrived at from the path side.
+    ///
+    /// **The other half is the assertion that keeps the guard honest**: a path is not a shell line,
+    /// so it is not asked to look like one. `docs/r&d` is a perfectly ordinary directory and
+    /// `shell_form_is_readable` refuses it for the `&`, which is why that guard stays on the shell
+    /// arm — and a `$` in a COMMAND deny is still stored, because a deny is compared at the line
+    /// level with no shape guard above it.
+    #[tokio::test]
+    async fn a_path_that_could_never_match_is_refused_the_way_an_unmatchable_command_is() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        for prefix in ["~/notes", "$HOME/notes", "%USERPROFILE%/notes"] {
+            let (status, refused) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(serde_json::json!({
+                    "prefix": prefix,
+                    "tool": "Write",
+                    "verdict": "deny",
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{prefix}");
+            assert_eq!(refused["refusal"], "unmatchable_prefix", "{prefix}");
+            assert!(
+                refused["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains(prefix)),
+                "the refusal names the value: {refused}"
+            );
+        }
+
+        // A directory whose name a shell would read as two commands is still a directory.
+        for body in [
+            serde_json::json!({ "prefix": "docs/r&d", "tool": "Edit", "verdict": "deny" }),
+            serde_json::json!({ "prefix": "echo $HOME", "verdict": "deny" }),
+        ] {
+            let (status, _) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "each guard belongs to one kind of prefix and must not reach the other: {body}"
+            );
+        }
+    }
+
+    /// Two rules may share a prefix, and a DELETE that names no tool takes the command one.
+    ///
+    /// **The row a delete lands on is decided by the tool, and there is no safe default but this
+    /// one.** The unique index is `(project_id, tool, prefix)`, so `migrations` as a command and
+    /// `migrations` as a path are two rules a project may hold at once. Every DELETE written before
+    /// the field existed meant the command — it was the only thing that could be declared — so an
+    /// absent tool has to mean exactly that, and never "whichever row sorts first", which is a
+    /// delete that lands on a rule nobody named while answering 204.
+    ///
+    /// The 404s at the end are the other half: with two rules able to share a prefix, "there is no
+    /// rule for `migrations`" is a sentence that can be false on the very screen it is read on.
+    #[tokio::test]
+    async fn a_delete_that_names_no_tool_takes_the_command_rule_and_leaves_the_write_rule() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        for body in [
+            serde_json::json!({ "prefix": "migrations", "verdict": "deny" }),
+            serde_json::json!({ "prefix": "migrations", "tool": "Edit", "verdict": "deny" }),
+        ] {
+            assert_eq!(
+                reach_request(
+                    state.clone(),
+                    "POST",
+                    "/projects/alpha/shell-rules",
+                    Some(body.clone()),
+                )
+                .await
+                .0,
+                StatusCode::NO_CONTENT,
+                "{body}"
+            );
+        }
+
+        // Both stand. `ON CONFLICT (project_id, tool, prefix)` names the triple, so the second
+        // declaration is not an edit of the first — they are two claims about two different things.
+        let (_, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(listed.as_array().expect("an array").len(), 2);
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "migrations" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
+        let rules = listed.as_array().expect("an array");
+        assert_eq!(rules.len(), 1, "only the command rule was named");
+        assert_eq!(rules[0]["tool"], "Edit");
+
+        // Asked again, the command rule is gone and the sentence says so without a tool in it.
+        let (status, refused) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "migrations" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(refused["refusal"], "no_such_rule");
+        let detail = refused["detail"].as_str().expect("a sentence");
+        assert!(detail.contains("no rule for `migrations`"), "{detail}");
+
+        // A tool that declared nothing here is a 404 that NAMES it, which is what answers "I
+        // deleted it and it is still there" — the rule still on screen belongs to the other tool.
+        let (status, refused) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "migrations", "tool": "Write" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            refused["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("`Write` rule")),
+            "the 404 names the tool: {refused}"
+        );
+
+        // And named, the write rule goes.
+        let (status, _) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "migrations", "tool": "Edit" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(listed.as_array().expect("an array").len(), 0);
     }
 
     /// The declarable set is the ops intersected with the ceilings, computed rather than listed.
@@ -21140,6 +22792,163 @@ mod tests {
 
         let (_, listed) = reach_request(state, "GET", "/projects/alpha/github-ops", None).await;
         assert_eq!(listed, serde_json::json!([]));
+    }
+
+    /// `GET /vcs/declarable-ops` names every operation the git queue performs, all six declarable.
+    ///
+    /// Unlike the GitHub catalogue, there is nothing here to exclude: `vcs::declarable_git_ops` says
+    /// its own doc that everything the queue performs is something a project may declare, in
+    /// lockstep, so this is an exact-set assertion rather than a `contains`.
+    #[tokio::test]
+    async fn the_git_op_catalogue_names_six_operations() {
+        let state = test_state().await;
+
+        let (status, listed) = reach_request(state, "GET", "/vcs/declarable-ops", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let served = listed.as_array().unwrap();
+        assert_eq!(served.len(), 6, "{listed}");
+
+        let mut names: Vec<&str> = served
+            .iter()
+            .map(|op| op["kind"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        let mut expected: Vec<&str> = crate::vcs::GIT_OP_KINDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+
+        for op in served {
+            assert_eq!(op["declarable"], serde_json::json!(true), "{op}");
+        }
+    }
+
+    /// Declared, listed, and withdrawn — the git twin of `a_declared_github_op_comes_back_and_then_goes`.
+    #[tokio::test]
+    async fn a_declared_git_op_is_listed_and_can_be_withdrawn() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "push" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/git-ops", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed, serde_json::json!(["push"]));
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "push" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/git-ops", None).await;
+        assert_eq!(listed, serde_json::json!([]));
+    }
+
+    /// An operation outside `GIT_OP_KINDS` is refused, and the refusal names all six.
+    #[tokio::test]
+    async fn an_unknown_git_op_kind_is_refused_naming_the_six() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, refused) = reach_request(
+            state,
+            "POST",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "bisect" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused["refusal"], "undeclarable_op");
+        let detail = refused["detail"].as_str().unwrap();
+        assert!(detail.contains("bisect"), "{detail}");
+        for kind in crate::vcs::GIT_OP_KINDS {
+            assert!(detail.contains(kind), "{detail} must name {kind}");
+        }
+    }
+
+    /// The emergency stop reaches this POST exactly as it reaches `POST /github-ops` — a widening,
+    /// refused while engaged. `the_emergency_stop_reaches_a_widening_and_never_a_narrowing` already
+    /// carries the full argument; this is the family's own pair of tests for the same behaviour.
+    #[tokio::test]
+    async fn declaring_a_git_op_is_refused_while_the_stop_is_engaged() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let (status, refused) = reach_request(
+            state,
+            "POST",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "push" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(refused["refusal"], "kill_switch");
+    }
+
+    /// A withdrawal narrows, so the stop never stands in its way.
+    #[tokio::test]
+    async fn withdrawing_a_git_op_is_not_refused_by_the_stop() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "push" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let (status, _) = reach_request(
+            state,
+            "DELETE",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "push" })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "narrowing must survive an engaged stop"
+        );
+    }
+
+    /// 404, off the DELETE's own `rows_affected` — `delete_project_github_op`'s reason, applied to
+    /// an operation this project never declared.
+    #[tokio::test]
+    async fn forgetting_a_git_op_never_declared_is_a_404() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, refused) = reach_request(
+            state,
+            "DELETE",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "push" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(refused["refusal"], "no_such_op");
     }
 
     /// Declared, listed, and withdrawn — for a branch that exists nowhere.
@@ -22491,6 +24300,46 @@ mod tests {
         assert_eq!(after, before, "a refused spelling opened a conversation");
     }
 
+    /// The same refusal on the way into a conversation that is already open.
+    ///
+    /// `PatchChatRequest::permission_mode` claims in as many words that a spelling outside the list
+    /// "fails the whole request rather than falling to a default", and nothing held it to that. The
+    /// claim needs its own test rather than leaning on the opening call's: these are two structs,
+    /// and a `#[serde(other)]` arm or a hand-written `Deserialize` added to one would not be added
+    /// to both. The route matters more here than at the front door — the conversation exists, it
+    /// already has a rung, and there is something to widen.
+    ///
+    /// The pair is the assertion, and the second half is the point. A 422 on its own is satisfied
+    /// by a handler that refuses AFTER writing, so the rung is read back and has to still be the
+    /// one somebody deliberately set. A conversation parked on `plan` becoming `auto` because of a
+    /// typo is the failure, and it is silent: the caller sees a refusal and assumes nothing moved.
+    #[tokio::test]
+    async fn a_rung_nobody_can_spell_moves_no_conversation() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        // Set rather than opened on, so the rung under test is one a person chose and not the
+        // column's default — `auto` is what a dropped field also produces.
+        assert_eq!(
+            patch_chat_request(state.clone(), &chat_id, r#"{"permission_mode":"plan"}"#).await,
+            StatusCode::NO_CONTENT
+        );
+
+        assert_eq!(
+            patch_chat_request(state.clone(), &chat_id, r#"{"permission_mode":"bypasss"}"#).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        assert_eq!(
+            crate::chats::permission_mode_of(&state.pool, &chat_id)
+                .await
+                .unwrap(),
+            crate::chats::PermissionMode::Plan,
+            "a refused spelling moved the rung anyway"
+        );
+    }
+
     /// A chat opened with no `brain` at all is a cloud chat, matching the column default and every
     /// caller written before the field existed.
     #[tokio::test]
@@ -23578,6 +25427,104 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_door_takes_a_codex_pick_only_for_a_rooted_conversation() {
+        let state = test_state().await;
+        let config = crate::config::ModelsConfig {
+            primary_runner: None,
+            assistant_choices: vec![
+                crate::config::AssistantChoice {
+                    id: "sonnet".to_string(),
+                    label: "Sonnet".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: vec![],
+                    runner: Some("claude".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+                crate::config::AssistantChoice {
+                    id: "opus".to_string(),
+                    label: "Opus".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: vec![],
+                    runner: Some("claude".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+                crate::config::AssistantChoice {
+                    id: "gpt-5.6-terra".to_string(),
+                    label: "GPT-5.6 Terra".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: vec![],
+                    runner: Some("codex".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+                crate::config::AssistantChoice {
+                    id: "gpt-5.5".to_string(),
+                    label: "GPT-5.5".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: vec![],
+                    runner: Some("codex".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            chosen_brain_in(&state, &config, "gpt-5.5", Asking::Chat { rooted: false }).await,
+            Err(BrainRefusal::NeedsRoot)
+        ));
+        assert!(matches!(
+            chosen_brain_in(&state, &config, "gpt-5.5", Asking::Chat { rooted: true }).await,
+            Ok(crate::chats::Brain::Cloud)
+        ));
+        assert!(matches!(
+            chosen_brain_in(&state, &config, "gpt-5.5", Asking::Daemon).await,
+            Err(BrainRefusal::UnknownModel)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_codex_refusal_reaches_the_window_as_a_sentence() {
+        let response = ChatRefusal::from(BrainRefusal::NeedsRoot).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        assert_eq!(body["detail"].as_str(), Some(CODEX_NEEDS_A_ROOT));
+    }
+
+    #[tokio::test]
+    async fn the_menu_route_takes_a_conversation() {
+        let state = test_state().await;
+        let (created, body) = call(
+            state.clone(),
+            "POST",
+            "/assistant/chats",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(created, StatusCode::OK);
+        let id = body["chat_id"].as_str().unwrap();
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/assistant/models?chat={id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["choices"].is_array());
+
+        let (status, _) = call(state, "GET", "/assistant/models?chat=nope", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
     /// What the window builds its picker from. An empty list would be a menu with nothing on it —
     /// the feature silently absent rather than visibly broken.
     #[tokio::test]
@@ -24273,6 +26220,10 @@ mod tests {
             // A model nobody offers, and a level the named model does not take.
             r#"{"agents":[{"name":"reviewer","description":"d","prompt":"p","model":"gpt-4-turbo"}]}"#,
             r#"{"agents":[{"name":"reviewer","description":"d","prompt":"p","effort":"colossal"}]}"#,
+            // A tool this daemon does not know, and a pattern rather than a name — both refused for
+            // the same reason `checked_denials` refuses them for a conversation's own denials.
+            r#"{"agents":[{"name":"reviewer","description":"d","prompt":"p","tools":["NoSuchTool"]}]}"#,
+            r#"{"agents":[{"name":"reviewer","description":"d","prompt":"p","tools":["Bash(git *)"]}]}"#,
         ] {
             assert_eq!(
                 patch_chat_request(state.clone(), &id, body).await,
@@ -26631,6 +28582,8 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -27824,6 +29777,85 @@ mod tests {
         assert_eq!(parsed["num_turns"], 12);
     }
 
+    /// The two derived readings on the run response: what this daemon wrote, and everything else.
+    ///
+    /// Both are estimates and both are named so on the wire. The residual is the whole reported
+    /// prompt — input plus cache reads plus cache creation — minus the authored estimate; taking it
+    /// off `input_tokens` alone would be wrong by omission, and wrong in the flattering direction.
+    ///
+    /// The second half of this test is the half that matters: a run that recorded nothing about what
+    /// it authored answers `null` for BOTH, not zero for one and the whole prompt for the other. A
+    /// run launched before the column existed is exactly that run, and there are a great many of
+    /// them.
+    #[tokio::test]
+    async fn the_run_response_carries_what_we_wrote_and_what_we_did_not() {
+        let state = test_state().await;
+        let measured = sqlx::query(
+            "INSERT INTO runs
+             (prompt, status, mode, input_tokens, output_tokens, cache_read_tokens,
+              cache_creation_tokens, authored_prompt_chars, created_at)
+             VALUES ('measured run', 'completed', 'real', 1000, 500, 20000, 9000, 44000,
+                     '2026-09-05T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let unrecorded = sqlx::query(
+            "INSERT INTO runs
+             (prompt, status, mode, input_tokens, output_tokens, cache_read_tokens,
+              cache_creation_tokens, created_at)
+             VALUES ('older run', 'completed', 'real', 1000, 500, 20000, 9000,
+                     '2026-09-05T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let router = build_router(state);
+
+        let parsed = read_run(&router, measured).await;
+        assert_eq!(parsed["authored_prompt_estimate"], 11_000);
+        assert_eq!(parsed["cli_own_estimate"], 19_000);
+        assert!(
+            parsed.get("authored_prompt_chars").is_none(),
+            "the wire contract is estimates; characters are an implementation detail of the column"
+        );
+
+        let parsed = read_run(&router, unrecorded).await;
+        assert_eq!(
+            parsed.get("authored_prompt_estimate"),
+            Some(&serde_json::Value::Null),
+            "a run that recorded nothing must not read back as a run that wrote nothing"
+        );
+        assert_eq!(
+            parsed.get("cli_own_estimate"),
+            Some(&serde_json::Value::Null),
+            "with no authored figure there is nothing to subtract, so there is no residual — and \
+             certainly not the whole prompt attributed to the CLI"
+        );
+    }
+
+    /// `GET /runs/{id}`, parsed. Two reads in one test is what this exists for.
+    async fn read_run(router: &Router, id: i64) -> serde_json::Value {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/runs/{id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
     /// A runner that publishes a context fill and then never returns.
     ///
     /// Parked rather than slow: the test needs a run that is genuinely mid-stream when the request
@@ -28261,6 +30293,7 @@ mod tests {
                 cwd: None,
                 mode: "real".to_owned(),
                 steerable: false,
+                permission_mode: None,
             },
         )
         .await
@@ -31049,5 +33082,105 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(origin, None, "no run declared it, so no run is named");
+    }
+
+    /// The whole life of a `PUT /notifications/policy`, at the route level: it replaces (never
+    /// merges), a refusal names the offending selector, and — the property `replace` not calling
+    /// `validate` exists for — a rejected payload leaves the stored policy exactly as it was.
+    #[tokio::test]
+    async fn a_policy_put_replaces_and_a_refusal_writes_nothing() {
+        let state = test_state().await;
+
+        async fn put_policy(
+            state: &AppState,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/notifications/policy")
+                        .header("Authorization", "Bearer test-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = if status == StatusCode::NO_CONTENT {
+                serde_json::Value::Null
+            } else {
+                json_body(response).await
+            };
+            (status, body)
+        }
+
+        // A brand-new install answers empty arrays, not 404.
+        let fresh = get_json(&state, "/notifications/policy").await;
+        assert_eq!(fresh, serde_json::json!({"families": [], "kinds": []}));
+
+        // Write a first policy.
+        let (status, _) = put_policy(
+            &state,
+            serde_json::json!({
+                "families": [{"selector": "job_", "enabled": false}],
+                "kinds": []
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let after_first = get_json(&state, "/notifications/policy").await;
+        assert_eq!(
+            after_first,
+            serde_json::json!({
+                "families": [{"selector": "job_", "enabled": false}],
+                "kinds": []
+            })
+        );
+
+        // A refusal: an empty selector. Names the scope, and writes nothing.
+        let (status, body) = put_policy(
+            &state,
+            serde_json::json!({
+                "families": [{"selector": "", "enabled": true}],
+                "kinds": []
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["refusal"], "empty_selector");
+        // Under `detail`, because that is the key the shell reads beside a `refusal`. Named
+        // `message` this field is silently dropped and the page shows the code twice.
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("family"),
+            "the refusal must name what it objected to: {body}"
+        );
+        assert_eq!(
+            get_json(&state, "/notifications/policy").await,
+            after_first,
+            "the refused write left the stored policy untouched"
+        );
+
+        // A second, different policy REPLACES rather than merges: the family rule above is gone.
+        let (status, _) = put_policy(
+            &state,
+            serde_json::json!({
+                "families": [],
+                "kinds": [{"selector": "job_failed", "enabled": true}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            get_json(&state, "/notifications/policy").await,
+            serde_json::json!({
+                "families": [],
+                "kinds": [{"selector": "job_failed", "enabled": true}]
+            })
+        );
     }
 }

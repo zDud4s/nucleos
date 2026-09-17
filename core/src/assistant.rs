@@ -1606,7 +1606,25 @@ async fn send_message_inner(
     };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().to_string();
-    let config = build_mcp_config(&exe, errand.as_ref().map(|turn| turn.errand.id));
+    // The box this turn's server will serve, named ONCE and then used twice: it is the argument
+    // `build_mcp_config` is called with on the next line, and the value that travels to the launch
+    // as `RunRequest::mcp_box`, where `runner::authored_prompt` prices the schema block by it.
+    //
+    // A local variable rather than the same expression written out again at the launch, and that is
+    // the whole point of it existing. The config file and the price have to describe the same
+    // server, and the only way to guarantee that is for both to read one evaluation. Recovering the
+    // box at the far end — from `mcp_path`, from the file's contents, or from the chat's errand row
+    // read a second time — would be a number that looks measured, agrees with the file until
+    // somebody changes one side, and announces its disagreement to nobody. An errand's server
+    // advertises 6 tools where an unboxed one advertises 48, so the two answers differ by roughly
+    // twelve to one, and the wrong one is not obviously wrong on the page.
+    //
+    // `notebook` on `TurnLaunch` carries this same errand's row, and is deliberately not what the
+    // box is read from: it is set by its own expression for its own purpose — where the answer is
+    // written afterwards — and two expressions that happen to agree today are exactly the drift
+    // this variable exists to prevent.
+    let mcp_box = errand.as_ref().map(|turn| turn.errand.id);
+    let config = build_mcp_config(&exe, mcp_box);
     let mcp_path = mcp_config_path(chat_id);
     write_mcp_config(&mcp_path, &config).map_err(|e| e.to_string())?;
 
@@ -1755,6 +1773,10 @@ async fn send_message_inner(
             resume,
             session_id,
             mcp_path,
+            // The same value `build_mcp_config` was given above, handed on unchanged. Moved here
+            // BEFORE `errand` is consumed by `notebook` below, which is why it was taken as a
+            // local in the first place.
+            mcp_box,
             cwd,
             tool_policy,
             notebook: errand.map(|turn| turn.errand),
@@ -2278,6 +2300,62 @@ pub(crate) fn tool_policy_for(
     }
 }
 
+/// Chooses the CLI that should answer a conversation turn.
+pub(crate) fn answering_cli(
+    config: &crate::config::ModelsConfig,
+    pinned: Option<&str>,
+) -> &'static str {
+    pinned
+        .and_then(|id| config.runner_of(id))
+        .unwrap_or_else(|| {
+            if config.active_runner() == "codex" {
+                "codex"
+            } else {
+                "claude"
+            }
+        })
+}
+
+/// Chooses a runner for a turn without replacing the daemon's default unnecessarily.
+pub(crate) fn runner_for_turn(
+    daemon: &std::sync::Arc<dyn crate::runner::CommandRunner>,
+    assistants: &dyn crate::assistants::Assistants,
+    config: &crate::config::ModelsConfig,
+    pinned: Option<&str>,
+) -> (
+    std::sync::Arc<dyn crate::runner::CommandRunner>,
+    &'static str,
+) {
+    let cli = answering_cli(config, pinned);
+    if pinned.is_none() || cli == config.active_runner() {
+        (daemon.clone(), cli)
+    } else {
+        (
+            assistants
+                .cli_runner(cli, pinned)
+                .unwrap_or_else(|| daemon.clone()),
+            cli,
+        )
+    }
+}
+
+/// Whether this turn may retain a live CLI process for a later turn.
+pub(crate) fn may_keep_process(policy: crate::runner::ToolPolicy, cli: &str) -> bool {
+    matches!(policy, crate::runner::ToolPolicy::Unrestricted) && cli == "claude"
+}
+
+/// Whether a rooted shell conversation may answer through Codex.
+pub(crate) fn may_answer_on_codex(cwd: Option<&str>) -> bool {
+    tool_policy_for(
+        cwd,
+        Origin::Shell,
+        cwd.is_some_and(|directory| {
+            crate::autopilot::classifier_hook_is_wired(std::path::Path::new(directory))
+        }),
+        false,
+    ) == crate::runner::ToolPolicy::Unrestricted
+}
+
 /// Everything one orchestrator turn is launched with.
 ///
 /// A struct rather than a row of parameters, for the reason `RunRequest` gives about its own: at
@@ -2298,6 +2376,20 @@ struct TurnLaunch {
     /// The id this turn is recorded under, which is `resume` when there is one.
     session_id: String,
     mcp_path: std::path::PathBuf,
+    /// Which surface the server at `mcp_path` announces — an errand id, or `None` for the whole
+    /// tool list.
+    ///
+    /// Beside `mcp_path` because it is the other half of the same fact, and carried from
+    /// `send_message_inner` rather than recomputed here because it is literally the argument
+    /// `build_mcp_config` was called with. The launch pays for what its server announces
+    /// (`runner::authored_prompt`), so a box that disagreed with the file would be an accounting
+    /// error of roughly twelve to one on every errand turn — and one that no test of the config
+    /// file, and no test of the price, could see on its own.
+    ///
+    /// Not derived from `notebook` below, which happens to hold the same errand today. That field
+    /// answers a different question — where this turn's answer gets written afterwards — and two
+    /// fields free to be set from two expressions are two things that can drift apart.
+    mcp_box: Option<i64>,
     cwd: Option<std::path::PathBuf>,
     tool_policy: crate::runner::ToolPolicy,
     /// The errand whose notebook this turn's answer is appended to, if it belongs to one.
@@ -2325,13 +2417,15 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         resume,
         session_id,
         mcp_path,
+        mcp_box,
         cwd,
         tool_policy,
         notebook,
         doctrine,
     } = launch;
     let pool = state.pool.clone();
-    let runner = state.runner.clone();
+    let daemon_runner = state.runner.clone();
+    let assistants = state.assistants.clone();
     let run_timeout = state.run_timeout;
     let control_token = state.token.0.clone();
     let files_root = state.files_root.clone();
@@ -2450,17 +2544,6 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             });
         }
 
-        // Which door this turn goes through. Decided once and named, because the two are not
-        // interchangeable and the reason is a security one before it is a speed one.
-        //
-        // A rooted turn carries a key scoped to its CONVERSATION, minted just above, which stays
-        // true as the turns change under it. An `McpOnly` turn carries the daemon's control token —
-        // safe only because that policy leaves it no Bash, no Read and no Write to look at its own
-        // environment with — and a process holding THAT key, kept alive and idle between turns, is
-        // a different and much worse proposition. So only rooted conversations keep a process, and
-        // the barrier that makes it safe is the same one that earned it the tools.
-        let may_live = matches!(tool_policy, crate::runner::ToolPolicy::Unrestricted);
-
         // Read here rather than carried in from the request that started the turn: it is a property
         // of the conversation at the moment it answers, and somebody who moved the selector while
         // reading the last reply means this turn.
@@ -2530,6 +2613,25 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         let answering = crate::chats::answering(&pool, &turn.slot.chat_id)
             .await
             .unwrap_or_default();
+        let config = crate::config::models_config_now();
+        let (runner, cli) = runner_for_turn(
+            &daemon_runner,
+            assistants.as_ref(),
+            &config,
+            answering.model.as_deref(),
+        );
+
+        // Which door this turn goes through. Decided once and named, because the two are not
+        // interchangeable and the reason is a security one before it is a speed one.
+        //
+        // A rooted turn carries a key scoped to its CONVERSATION, minted just above, which stays
+        // true as the turns change under it. An `McpOnly` turn carries the daemon's control token —
+        // safe only because that policy leaves it no Bash, no Read and no Write to look at its own
+        // environment with — and a process holding THAT key, kept alive and idle between turns, is
+        // a different and much worse proposition. So only rooted Claude conversations keep a
+        // process, and the barrier that makes it safe is the same one that earned it the tools. A
+        // Codex turn has no stdin a later turn can arrive on.
+        let may_live = may_keep_process(tool_policy, cli);
 
         // A turn with no `resume` is a conversation that was deliberately let go of — it read
         // third-party text, or somebody asked for a fresh context — so a process still holding the
@@ -2556,6 +2658,13 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             permission,
             resume_session_id: resume,
             mcp_config: Some(turn.mcp_path.clone()),
+            // What that server announces, which is not the same for every turn: an errand's is
+            // boxed to its own four tools plus the handful every box keeps, an ordinary chat's
+            // serves the lot. The number arrives from `send_message_inner`, where it was the
+            // argument to the `build_mcp_config` call that wrote the file named on the line above —
+            // so the file and this are one expression read twice, and `authored_prompt` charges
+            // this turn for the surface its own server really offers.
+            mcp_box,
             // Decided by `tool_policy_for`, which is where the rule is written out. The
             // default remains what it always was — the orchestrator talks to NucleOS and to
             // nothing else, and the MCP allowlist does not enforce that on its own, because
@@ -2647,6 +2756,25 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             allowed_mcp_tools: None,
         };
 
+        // What this turn itself wrote into the model's prompt, priced off the request that is about
+        // to become an argument vector, and priced HERE because `request` is moved into `serve_turn`
+        // on the very next statement and nothing downstream sees these values again.
+        //
+        // This is the launcher the measurement exists for. `runs::spawn_run` records the same thing
+        // and sets `mcp_config: None`, so every row it writes carries a schema cost of zero — a
+        // real zero, and correct, but it means the largest term in the sum was measured against the
+        // one launcher that never pays it. A chat turn carries `--mcp-config` on every single turn,
+        // and the schema block it pays for is the biggest thing the daemon puts in front of the
+        // model.
+        //
+        // Best effort by way of `record_authored_prompt`, which writes nothing on `None` and
+        // swallows its own database error: this is bookkeeping about a turn somebody is waiting
+        // for, and it may not be the reason that turn fails. The runner decides whether there is
+        // anything to say at all — a chat answered by a fake or by the Codex CLI authors no prompt
+        // this daemon can price, and answers `None`, which leaves the column NULL rather than
+        // claiming a zero.
+        crate::runs::record_authored_prompt(&pool, id, runner.authored_prompt(&request)).await;
+
         let result = serve_turn(
             &runner,
             request,
@@ -2720,14 +2848,22 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // answers, and this is a fact about ONE of them. `RunOutcome` is where the
                     // splitter already put the right turn's copy.
                     let compacted = o.compacted;
+                    // The tokens and the turn count too, which every other terminal write in the
+                    // core already takes off the outcome and this one did not: a chat turn read back
+                    // "none recorded" under numbers the runner had measured and handed it.
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(o.exit_code)
                     .bind(&reply)
                     .bind(&o.stderr)
                     .bind(&o.session_id)
                     .bind(o.cost_usd)
+                    .bind(o.input_tokens)
+                    .bind(o.output_tokens)
+                    .bind(o.cache_read_tokens)
+                    .bind(o.cache_creation_tokens)
+                    .bind(o.num_turns)
                     .bind(&tools_used)
                     .bind(&thought)
                     .bind(thought_tokens)
@@ -2778,14 +2914,22 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                 // turn killed at the tool-policy barrier died before it could call anything, so the
                 // session it leaves has read nothing and is safe to resume; the read-side check in
                 // `get_session` is what decides that, and it decides it the same way here.
+                //
+                // The measurements are kept for the reason the cost is: a turn that answered nothing
+                // still spent what it spent, and one stopped at its ceiling has read the most.
                 None => {
                     let failed = sqlx::query(
-                        "UPDATE runs SET status = 'failed', exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'failed', exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(o.exit_code)
                     .bind(&o.stderr)
                     .bind(&o.session_id)
                     .bind(o.cost_usd)
+                    .bind(o.input_tokens)
+                    .bind(o.output_tokens)
+                    .bind(o.cache_read_tokens)
+                    .bind(o.cache_creation_tokens)
+                    .bind(o.num_turns)
                     .bind(&completed_at)
                     .bind(id)
                     .execute(&pool)
@@ -2835,6 +2979,110 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    struct CliAssistants {
+        claude: Option<Arc<dyn crate::runner::CommandRunner>>,
+        codex: Option<Arc<dyn crate::runner::CommandRunner>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::assistants::Assistants for CliAssistants {
+        fn assistant_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: Option<&str>,
+        ) -> Result<Arc<crate::local_agent::LocalAssistant>, crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::RouteNotConfigured)
+        }
+
+        fn serves(&self, _brain: crate::chats::Brain) -> Result<(), crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::RouteNotConfigured)
+        }
+
+        async fn can_serve(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: &str,
+        ) -> Result<(), crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::RouteNotConfigured)
+        }
+
+        async fn declared_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _models: &[String],
+        ) -> std::collections::HashMap<String, crate::capabilities::Declared> {
+            std::collections::HashMap::new()
+        }
+
+        fn cli_runner(
+            &self,
+            cli: &str,
+            _model: Option<&str>,
+        ) -> Option<Arc<dyn crate::runner::CommandRunner>> {
+            match cli {
+                "claude" => self.claude.clone(),
+                "codex" => self.codex.clone(),
+                _ => None,
+            }
+        }
+    }
+
+    fn turn_config() -> crate::config::ModelsConfig {
+        crate::config::ModelsConfig {
+            assistant_choices: vec![
+                crate::config::AssistantChoice {
+                    id: "sonnet".to_string(),
+                    label: "Sonnet".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: ["low", "medium", "high", "xhigh", "max"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    runner: Some("claude".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+                crate::config::AssistantChoice {
+                    id: "opus".to_string(),
+                    label: "Opus".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: ["low", "medium", "high", "xhigh", "max"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    runner: Some("claude".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+                crate::config::AssistantChoice {
+                    id: "gpt-5.6-terra".to_string(),
+                    label: "GPT-5.6 Terra".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: ["low", "medium", "high", "xhigh", "max", "ultra"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    runner: Some("codex".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+                crate::config::AssistantChoice {
+                    id: "gpt-5.5".to_string(),
+                    label: "GPT-5.5".to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: ["low", "medium", "high", "xhigh"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    runner: Some("codex".to_string()),
+                    tools: None,
+                    installed: None,
+                },
+            ],
+            ..crate::config::ModelsConfig::default()
+        }
+    }
+
     async fn test_pool() -> SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -2863,6 +3111,8 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -3052,6 +3302,72 @@ mod tests {
     /// What `FakeCommandRunner::default` answers, so a test can say "this went down the CLI path"
     /// without asserting on a string whose meaning is not obvious at the call site.
     const CLI_FAKE_REPLY: &str = "fake output";
+
+    #[test]
+    fn a_pinned_codex_model_is_answered_by_the_codex_runner() {
+        let daemon: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let codex: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let assistants = CliAssistants {
+            claude: None,
+            codex: Some(codex.clone()),
+        };
+        let config = turn_config();
+
+        let (runner, cli) = runner_for_turn(&daemon, &assistants, &config, Some("gpt-5.5"));
+        assert!(Arc::ptr_eq(&runner, &codex));
+        assert_eq!(cli, "codex");
+        assert_eq!(answering_cli(&config, Some("gpt-5.5")), "codex");
+
+        let without_codex = CliAssistants {
+            claude: None,
+            codex: None,
+        };
+        let (runner, cli) = runner_for_turn(&daemon, &without_codex, &config, Some("gpt-5.5"));
+        assert!(Arc::ptr_eq(&runner, &daemon));
+        assert_eq!(cli, "codex");
+    }
+
+    #[test]
+    fn an_unpinned_or_claude_pinned_turn_keeps_the_daemons_runner() {
+        let daemon: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let assistants = CliAssistants {
+            claude: Some(Arc::new(FakeCommandRunner::default())),
+            codex: Some(Arc::new(FakeCommandRunner::default())),
+        };
+        let config = turn_config();
+
+        for pinned in [None, Some("sonnet"), Some("not-in-the-catalogue")] {
+            let (runner, cli) = runner_for_turn(&daemon, &assistants, &config, pinned);
+            assert!(Arc::ptr_eq(&runner, &daemon), "{pinned:?}");
+            assert_eq!(cli, "claude", "{pinned:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_rooted_conversation_may_answer_on_codex() {
+        assert!(!may_answer_on_codex(None));
+        let root = tempfile::TempDir::new().unwrap();
+        let cwd = root.path().to_str().unwrap();
+        assert!(!may_answer_on_codex(Some(cwd)));
+        crate::autopilot::wire_classifier_hook(root.path()).unwrap();
+        assert!(may_answer_on_codex(Some(cwd)));
+    }
+
+    #[test]
+    fn a_codex_turn_never_keeps_a_live_process() {
+        assert!(!may_keep_process(
+            crate::runner::ToolPolicy::Unrestricted,
+            "codex"
+        ));
+        assert!(may_keep_process(
+            crate::runner::ToolPolicy::Unrestricted,
+            "claude"
+        ));
+        assert!(!may_keep_process(
+            crate::runner::ToolPolicy::McpOnly,
+            "claude"
+        ));
+    }
 
     #[test]
     fn only_an_explicit_telegram_origin_is_telegram() {
@@ -3749,6 +4065,103 @@ mod tests {
         assert_eq!(fill, Some(96_000), "the turn recorded no context fill");
     }
 
+    /// The columns a chat turn's terminal write reads off its outcome, and the numbers it hands in.
+    type Measured = (
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
+
+    /// Runs one chat turn against `outcome` and reads back what its row recorded.
+    async fn measured_turn(chat_id: &str, outcome: crate::runner::RunOutcome) -> Measured {
+        let mut state = test_state().await;
+        state.runner = Arc::new(FakeCommandRunner {
+            canned: Mutex::new(Some(outcome)),
+            ..Default::default()
+        });
+        let id = send_message(&state, chat_id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+        sqlx::query_as(
+            "SELECT status, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    num_turns FROM runs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    fn measured_outcome(exit_code: i32, stdout: &str) -> crate::runner::RunOutcome {
+        crate::runner::RunOutcome {
+            exit_code,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            session_id: Some("s".to_string()),
+            cost_usd: Some(0.01),
+            input_tokens: Some(3),
+            output_tokens: Some(40),
+            cache_read_tokens: Some(900),
+            cache_creation_tokens: Some(15),
+            num_turns: Some(2),
+            compacted: false,
+        }
+    }
+
+    /// A finished turn records what it read and how many turns it took.
+    ///
+    /// Found by measurement: every chat turn read back `num_turns` and every token column NULL,
+    /// while `runs.rs`, the council and the team all stored them. The runner had them; this write
+    /// was the one that did not ask.
+    #[tokio::test]
+    async fn a_finished_turn_records_its_tokens_and_turns() {
+        let stream = r#"{"type":"result","subtype":"success","result":"pronto"}"#;
+
+        let row = measured_turn("tokens-chat", measured_outcome(0, stream)).await;
+
+        assert_eq!(
+            row,
+            (
+                "completed".to_string(),
+                Some(3),
+                Some(40),
+                Some(900),
+                Some(15),
+                Some(2)
+            )
+        );
+    }
+
+    /// A turn that answered nothing still spent what it spent. The ceiling is the sharpest case: the
+    /// turn stopped there read the most, and was the one whose row said the least.
+    #[tokio::test]
+    async fn a_turn_stopped_before_it_answered_still_records_what_it_read() {
+        let stream =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a meio"}]}}"#;
+
+        let row = measured_turn(
+            "ceiling-chat",
+            measured_outcome(crate::runner::TURN_CEILING_EXIT_CODE, stream),
+        )
+        .await;
+
+        assert_eq!(
+            row,
+            (
+                "failed".to_string(),
+                Some(3),
+                Some(40),
+                Some(900),
+                Some(15),
+                Some(2)
+            )
+        );
+    }
+
     /// What a Telegram user actually received when the tool-policy barrier killed a turn: the CLI's
     /// own stream, `SessionStart` hook payload and all, delivered as though it were the answer.
     ///
@@ -4124,9 +4537,9 @@ mod tests {
 
     /// Every run carries a daemon-assigned session id, and an assistant turn is a run. Its first
     /// turn had nothing to resume, so it was launched with neither `--resume` nor `--session-id`:
-    /// the run had an id only if the CLI's stream volunteered one. `budget.rs` deduplicates spend by
-    /// `session_id`, so a first turn whose stream carried no `init` event — the case `runner.rs`
-    /// already has a test for — was money charged against nothing at all.
+    /// the run had an id only if the CLI's stream volunteered one, so a first turn whose stream
+    /// carried no `init` event — the case `runner.rs` already has a test for — was spend no
+    /// conversation owned.
     ///
     /// Asserted on the row and on what the runner was handed, because either alone is satisfiable
     /// without the other: a row written and never passed to the CLI leaves the two disagreeing about
@@ -4388,6 +4801,8 @@ mod tests {
         AppState {
             files_root: Some(root),
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             ..state
         }
     }
@@ -4477,6 +4892,149 @@ mod tests {
             .unwrap();
 
         assert_eq!(answered_by(&state.pool, id).await.as_deref(), Some("local"));
+    }
+
+    /* ------------------------------------------ what a turn's prompt cost -- */
+
+    /// Waits for the turn's own accounting of its prompt to land, and answers `None` if it never
+    /// does.
+    ///
+    /// A poll rather than a single read, because the recording happens inside the task
+    /// `spawn_assistant_turn` spawns and `send_message` returns the moment the row exists. `None` is
+    /// distinguishable from a recorded zero on purpose — the column is nullable and NULL is a real
+    /// answer there, so a test asking whether anything was recorded at all must be able to tell the
+    /// two apart.
+    async fn await_authored_chars(pool: &SqlitePool, id: i64) -> Option<i64> {
+        for _ in 0..100 {
+            let recorded: Option<i64> =
+                sqlx::query_scalar("SELECT authored_prompt_chars FROM runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            if recorded.is_some() {
+                return recorded;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// A fake that stands in for the CLI runner on the one question these two tests ask: what the
+    /// launch site recorded about the prompt it wrote. See `FakeCommandRunner::prices_its_prompt`.
+    fn pricing_fake() -> Arc<FakeCommandRunner> {
+        Arc::new(FakeCommandRunner {
+            prices_its_prompt: true,
+            ..Default::default()
+        })
+    }
+
+    /// A chat turn records what it authored, and the schema block is in the number.
+    ///
+    /// **This is the launcher the measurement exists for.** `runs::spawn_run` records the same thing
+    /// and sets no `mcp_config` at all, so every row it writes carries a schema cost of zero — a
+    /// real zero, correctly recorded, and completely beside the point: the tool schemas are the
+    /// largest thing this daemon puts in front of a model, and until this turn was wired they were
+    /// measured, tested and stored against the only launcher that never pays for them.
+    ///
+    /// The assertion is arithmetic over values the test can name — the surface, asked of the same
+    /// function that priced it, plus the prompt — rather than a literal. The surface moves whenever
+    /// a tool's description changes, and a pinned byte count would be a test that fails on every
+    /// honest edit while proving nothing about the wiring.
+    #[tokio::test]
+    async fn a_chat_turn_records_what_it_authored_including_the_schema_block() {
+        let mut state = test_state().await;
+        let runner = pricing_fake();
+        state.runner = runner.clone();
+
+        let id = send_message(&state, "authored-chat", "hello", Origin::Shell)
+            .await
+            .unwrap();
+        let recorded = await_authored_chars(&state.pool, id)
+            .await
+            .expect("a chat turn must record what the daemon wrote into its prompt");
+
+        assert!(
+            runner.last_mcp_config.lock().unwrap().is_some(),
+            "the premise of this test is that a chat turn IS offered a server — if that stops \
+             being true, the figure below stops being about anything"
+        );
+        // This chat is not an errand, so its server announces the whole tool list.
+        let surface = crate::mcp_tools::NucleosTools::advertised_schema_chars(None) as i64;
+        assert!(surface > 0, "the daemon's server announces nothing at all");
+        assert_eq!(
+            recorded,
+            surface + "hello".len() as i64,
+            "a chat turn's authored prompt is the schema block its server announces plus the \
+             prompt itself; nothing else was set on this turn"
+        );
+    }
+
+    /// An errand turn is charged for the surface ITS server announces, and not for the whole one.
+    ///
+    /// The error this pins is a factor of roughly twelve. `assistant::build_mcp_config` gives an
+    /// errand's server `--box errand`, so it advertises the four errand tools and the handful every
+    /// box keeps; charging that turn the unboxed figure would report an errand as costing an order
+    /// of magnitude more prompt than it does — a number that looks measured, is wrong, and has
+    /// nothing anywhere to disagree with it.
+    ///
+    /// The prompt is read back off the launch rather than written out here, because an errand's
+    /// turn is not the text somebody typed: the preamble and the notebook are prepended to it, and
+    /// re-deriving that in the test would be a second copy of `ErrandTurn::prompt_for`.
+    #[tokio::test]
+    async fn an_errand_turn_records_the_surface_its_own_server_announces() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = pricing_fake();
+        let state = AppState {
+            runner: runner.clone(),
+            ..with_files_root(test_state().await, dir.path().to_path_buf())
+        };
+        let errand = open_errand(&state, "carros", "errand-authored").await;
+        crate::errands::set_brain(&state.pool, errand.id, crate::errands::Brain::Cloud)
+            .await
+            .unwrap();
+
+        let id = send_message(&state, "errand-authored", "procura", Origin::Shell)
+            .await
+            .unwrap();
+        let recorded = await_authored_chars(&state.pool, id)
+            .await
+            .expect("an errand turn must record what the daemon wrote into its prompt");
+
+        let boxed = crate::mcp_tools::NucleosTools::advertised_schema_chars(Some(errand.id)) as i64;
+        let whole = crate::mcp_tools::NucleosTools::advertised_schema_chars(None) as i64;
+        assert!(
+            boxed > 0 && boxed * 8 < whole,
+            "the premise: an errand's box is a small, non-empty part of the whole surface. It \
+             said {boxed} against {whole}"
+        );
+
+        // The property first, and the diagnosis after it, deliberately in that order: this is the
+        // assertion that fails when the box goes missing, and what it prints — the boxed figure
+        // against the whole one — is the whole difference between a measured number and a
+        // plausible one.
+        let prompt = runner
+            .last_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the launch was handed a prompt");
+        assert_eq!(
+            recorded,
+            boxed + prompt.len() as i64,
+            "an errand turn was charged for tools its own server never announced: it recorded \
+             {recorded} where the box is {boxed} and the whole surface is {whole}"
+        );
+        assert!(
+            recorded < whole,
+            "the whole surface alone is {whole}, so {recorded} cannot be a boxed turn's prompt"
+        );
+        assert_eq!(
+            *runner.last_mcp_box.lock().unwrap(),
+            Some(Some(errand.id)),
+            "the launch must carry the same errand `build_mcp_config` was given, or the price and \
+             the config file are describing two different servers"
+        );
     }
 
     #[tokio::test]
@@ -4773,6 +5331,7 @@ mod tests {
                 name: "reviewer".to_string(),
                 description: "Reviews code".to_string(),
                 prompt: "You are a code reviewer".to_string(),
+                tools: None,
                 model: Some("opus".to_string()),
                 effort: None,
             }],
@@ -6716,6 +7275,7 @@ mod tests {
             permission: crate::runner::Permission::Default,
             resume_session_id: resume,
             mcp_config: None,
+            mcp_box: None,
             tool_policy: crate::runner::ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,

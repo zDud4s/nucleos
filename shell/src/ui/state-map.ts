@@ -48,6 +48,8 @@ export type StateDomain =
   | "autopilot"
   | "brake"
   | "setting"
+  | "machine_file"
+  | "credential"
   | "department"
   | "feed"
   | "rule"
@@ -94,6 +96,26 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     unarmed: { tone: "off", label: "unarmed" },
     disarmed: { tone: "off", label: "disarmed" },
   },
+  /**
+   * Whether one of this machine's settings files exists (`MachineSetting.exists`, served by
+   * `core/src/machine_config.rs`). The núcleo sends a boolean, so the two words are this shell's
+   * derivation, allowed by this docstring. Never configured is a switch nobody set, not a fault.
+   */
+  machine_file: {
+    configured: { tone: "info", label: "configured" },
+    unconfigured: { tone: "off", label: "never configured" },
+  },
+  /**
+   * Whether a credential is in the store (`MachineSecret.present`: true, false, or null when the
+   * store could not be asked). A shell derivation, allowed by this docstring. `unknown` is amber
+   * and not grey: unlike `unset`, which wants a credential pasted, it wants somebody to look at the
+   * store.
+   */
+  credential: {
+    set: { tone: "info", label: "set" },
+    unset: { tone: "off", label: "not set" },
+    unknown: { tone: "pending", label: "could not be asked" },
+  },
   /** The núcleo does not write department states: this shell derivation keeps Teams and Bench in one vocabulary. */
   department: {
     working: { tone: "active", label: "at work" },
@@ -135,8 +157,17 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     job_item_conflicted: { tone: "paused", label: "job item did not merge" },
     job_item_orphaned: { tone: "off", label: "job item never attempted" },
     job_gate_failed: { tone: "danger", label: "job gate failed" },
-    // Stated Blue, not Awaiting-You Amber. `job.rs::brakes` parks a job for exactly five reasons —
-    // `kill-switch`, `budget`, `excluded`, `attention` and `slot` (`park` writes the line) — and
+    // A round in which no item passed has nothing for a review to judge, so none runs (job 27,
+    // 2026-09-14: a review read a reverted tree and reported "no work was done"). A fact, not a
+    // failure: the red items already said so.
+    job_review_skipped: { tone: "info", label: "job review skipped" },
+    // A review that never reached the API is run once more (job 26, 2026-09-13: a DNS outage ended
+    // it and the next round opened without a verdict). Stated Blue and not amber: the verdict it
+    // stands for is still to come, but it comes from the job, not from the reader — the same
+    // argument `job_waiting` makes below. The sequence stays open (`lanes.ts`) until it lands.
+    job_review_retried: { tone: "info", label: "job review retried" },
+    // Stated Blue, not Awaiting-You Amber. `job.rs::brakes` parks a job for exactly six reasons —
+    // `kill-switch`, `budget`, `excluded`, `attention`, `slot` and `disk` (`park` writes the line) — and
     // none of them is a question put to the reader: an approval is `awaiting_approval`, a status
     // and not a park. Amber on every parked job taught the Feed to summon somebody for a slot that
     // frees itself. The verdict, where there is one, is the `wait_reason` badge beside it.
@@ -203,6 +234,9 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     action_authorized: { tone: "info", label: "action authorised by a grant" },
     proposal_record_failed: { tone: "danger", label: "proposal not recorded" },
     promotion_ready: { tone: "pending", label: "promotion ready" },
+    // A credential set or forgotten from the app. The line names the key and never the value.
+    secret_stored: { tone: "info", label: "credential set" },
+    secret_forgotten: { tone: "info", label: "credential forgotten" },
     "web.read": { tone: "info", label: "web page read" },
   },
   /** Rule settings are shell derivations: armed is stated, capped is a ceiling, and never-fires is a fault. */
@@ -313,6 +347,9 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     skipped: { tone: "pending", label: "skipped, needs a decision" },
     conflicted: { tone: "paused", label: "did not merge" },
     orphaned: { tone: "off", label: "never attempted" },
+    // Taken over by an item of a later round (`job.rs`, `STATUS_SUPERSEDED`): terminal, and its
+    // work continues in the successor — quiet, as `run.superseded` is.
+    superseded: { tone: "off", label: "taken over by a later round" },
   },
 
   /**
@@ -370,14 +407,21 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * partner finish. Reading it as slot contention would send somebody looking
    * for capacity that is already there.
    *
+   * `disk` is the fourth, and until 2026-09-14 it was reported as the second: a
+   * checkout refused because the volume is below the free-space floor parked its
+   * job as `slot`. Somebody reading that waits for a run to finish, or goes
+   * looking for one, and nothing clears until somebody frees space. Paused
+   * rather than pending for that reason — like budget, it waits on a hand.
+   *
    * `slot` is Stated Blue and not amber: the slot frees itself when the run holding it ends, so the
-   * wait asks nothing of the reader — it is a fact about the queue. Budget and exclusion keep Held
-   * Ember, because each is a rule or a ceiling somebody could lift.
+   * wait asks nothing of the reader — it is a fact about the queue. Budget, exclusion and disk keep
+   * Held Ember, because each is a rule or a ceiling somebody could lift.
    */
   wait_reason: {
     budget: { tone: "paused", label: "held by budget" },
     slot: { tone: "info", label: "waiting for a slot" },
     excluded: { tone: "paused", label: "held by an exclusion" },
+    disk: { tone: "paused", label: "held by a full disk" },
   },
 
   /**

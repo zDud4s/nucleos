@@ -157,10 +157,12 @@ const BASE_ONLY: readonly string[] = [
 
   "--opacity-disabled",
   "--opacity-quiet",
+  "--opacity-ghost",
 
   "--measure",
   "--measure-prose",
   "--width-column",
+  "--well-cap",
   "--hairline",
 ];
 

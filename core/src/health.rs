@@ -18,8 +18,9 @@
 use serde::Serialize;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::future::Future;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -79,6 +80,101 @@ pub struct SubsystemReadout {
 pub struct HealthReadout {
     pub status: HealthState,
     pub subsystems: Vec<SubsystemReadout>,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct HealthBreachIntent {
+    task_id: &'static str,
+    problem: String,
+    outcome: &'static str,
+    constraints: &'static str,
+    open_questions: &'static str,
+    accepted_by: &'static str,
+    accepted_at: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl HealthReadout {
+    /// A degraded or down aggregate is the health signal's breach; disabled is not a breach.
+    pub fn is_breach(&self) -> bool {
+        matches!(self.status, HealthState::Degraded | HealthState::Down)
+    }
+}
+
+/// Records one breached health signal without starting any autonomous work.
+///
+/// This is deliberately a seam rather than a call from [`readout`]: health polling has no project
+/// rules, and wiring this recorder into a trigger is an owner-approved follow-up. When enabled by
+/// the caller, one JSONL record matching the intent packet's fields is appended to the project's
+/// local ledger.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn record_breach_intent(
+    project_root: &Path,
+    rules: &crate::config::AutopilotRules,
+    readout: &HealthReadout,
+) -> io::Result<bool> {
+    if !rules.health_breach_intent || !readout.is_breach() {
+        return Ok(false);
+    }
+
+    let ledger = project_root.join(".ai/local/ledgers/intents.jsonl");
+    if let Some(parent) = ledger.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let problem = format!(
+        "Health signal breached: status={}; {}",
+        health_state_name(readout.status),
+        readout
+            .subsystems
+            .iter()
+            .filter(|entry| matches!(entry.status, HealthState::Degraded | HealthState::Down))
+            .map(|entry| {
+                format!(
+                    "{} ({})",
+                    entry.name,
+                    entry.reason.map(failure_category_name).unwrap_or("unknown")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let record = HealthBreachIntent {
+        task_id: "health-breach",
+        problem,
+        outcome: "Review the breached health signal before taking action.",
+        constraints: "Recording only; do not enqueue a job, start a run, or touch the approval queue.",
+        open_questions: "none",
+        accepted_by: "health-monitor",
+        accepted_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let mut file = OpenOptions::new().create(true).append(true).open(ledger)?;
+    let serialized = serde_json::to_string(&record).map_err(io::Error::other)?;
+    file.write_all(serialized.as_bytes())?;
+    file.write_all(b"\n")?;
+    Ok(true)
+}
+
+fn health_state_name(state: HealthState) -> &'static str {
+    match state {
+        HealthState::Ok => "ok",
+        HealthState::Degraded => "degraded",
+        HealthState::Down => "down",
+        HealthState::Disabled => "disabled",
+    }
+}
+
+fn failure_category_name(category: FailureCategory) -> &'static str {
+    match category {
+        FailureCategory::Timeout => "timeout",
+        FailureCategory::NotConfigured => "not-configured",
+        FailureCategory::Unreachable => "unreachable",
+        FailureCategory::PermissionDenied => "permission-denied",
+        FailureCategory::Missing => "missing",
+        FailureCategory::NotRunning => "not-running",
+        FailureCategory::LowDiskSpace => "low-disk-space",
+        FailureCategory::Unknown => "unknown",
+    }
 }
 
 impl HealthReadout {
@@ -150,7 +246,21 @@ async fn collect_readout(state: AppState) -> HealthReadout {
     // probe Ollama either — see `speaker_probe`.
     let voice_speaks = state.voice.speaker.is_some() && !state.voice.tts_command.trim().is_empty();
     let tts_command = state.voice.tts_command.clone();
-    let (pool, cli, credentials, disk, echo, telegram, email, web, browser, voice, speaker, github) = tokio::join!(
+    let (
+        pool,
+        cli,
+        credentials,
+        disk,
+        echo,
+        telegram,
+        email,
+        web,
+        browser,
+        voice,
+        speaker,
+        github,
+        hook,
+    ) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
         run_subsystem("credential_manager", credential_manager_probe()),
@@ -181,6 +291,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         run_subsystem("voice_transcriber", voice_probe(voice_armed, stt_command)),
         run_subsystem("voice_speaker", speaker_probe(voice_speaks, tts_command)),
         run_subsystem("github", github_probe(github_asked_for, github_binary)),
+        run_subsystem("hook_interpreter", hook_interpreter_probe()),
     );
     let subsystems = vec![
         pool,
@@ -195,6 +306,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         voice,
         speaker,
         github,
+        hook,
     ];
 
     HealthReadout {
@@ -262,6 +374,28 @@ async fn cli_probe() -> SubsystemReadout {
         exec_probe(resolved.to_string_lossy().into_owned(), "--version").await
     })
     .await
+}
+
+fn hook_interpreter_row(resolved: Option<PathBuf>) -> SubsystemReadout {
+    match resolved {
+        Some(_) => SubsystemReadout::ok("hook_interpreter"),
+        None => SubsystemReadout::down("hook_interpreter", FailureCategory::Missing),
+    }
+}
+
+/// This row exists because a hook whose interpreter is missing is invisible by construction.
+///
+/// Claude Code runs the command, gets 127, and treats every exit but 2 as non-blocking, so the tool
+/// call goes ahead unclassified.
+async fn hook_interpreter_probe() -> SubsystemReadout {
+    match tokio::task::spawn_blocking(|| {
+        resolve_program(std::ffi::OsStr::new(crate::autopilot::HOOK_INTERPRETER))
+    })
+    .await
+    {
+        Ok(resolved) => hook_interpreter_row(resolved),
+        Err(_) => SubsystemReadout::down("hook_interpreter", FailureCategory::Unknown),
+    }
 }
 
 /// Whether the configured transcriber is a program that runs here.
@@ -742,6 +876,65 @@ fn classify_error<E>(_error: E) -> FailureCategory {
 mod tests {
     use super::*;
 
+    fn breached_readout() -> HealthReadout {
+        HealthReadout {
+            status: HealthState::Down,
+            subsystems: vec![SubsystemReadout::down(
+                "cli_binary",
+                FailureCategory::Missing,
+            )],
+        }
+    }
+
+    #[test]
+    fn an_interpreter_that_does_not_resolve_is_a_red_row() {
+        let missing = hook_interpreter_row(None);
+        assert_eq!(missing.status, HealthState::Down);
+        assert_eq!(missing.reason, Some(FailureCategory::Missing));
+
+        let resolved = hook_interpreter_row(Some(PathBuf::from("x")));
+        assert_eq!(resolved.status, HealthState::Ok);
+        assert_eq!(resolved.reason, None);
+    }
+
+    #[test]
+    fn health_breach_intent_is_inert_when_the_rule_is_off() {
+        let root = tempfile::tempdir().unwrap();
+        let result = record_breach_intent(
+            root.path(),
+            &crate::config::AutopilotRules::default(),
+            &breached_readout(),
+        )
+        .unwrap();
+
+        assert!(!result);
+        assert!(!root.path().join(".ai/local/ledgers/intents.jsonl").exists());
+    }
+
+    #[test]
+    fn an_enabled_health_breach_writes_one_intent_packet_record() {
+        let root = tempfile::tempdir().unwrap();
+        let rules = crate::config::AutopilotRules {
+            health_breach_intent: true,
+            ..Default::default()
+        };
+        let readout = breached_readout();
+
+        assert!(record_breach_intent(root.path(), &rules, &readout).unwrap());
+
+        let ledger =
+            std::fs::read_to_string(root.path().join(".ai/local/ledgers/intents.jsonl")).unwrap();
+        assert_eq!(ledger.lines().count(), 1);
+        let record: serde_json::Value = serde_json::from_str(ledger.trim()).unwrap();
+        assert_eq!(record["task_id"], "health-breach");
+        assert_eq!(
+            record["outcome"],
+            "Review the breached health signal before taking action."
+        );
+        assert!(record["problem"].as_str().unwrap().contains("cli_binary"));
+        assert!(record["accepted_at"].as_str().unwrap().contains('T'));
+    }
+
     #[test]
     fn disabled_subsystems_do_not_drag_the_aggregate_down() {
         let entries = [
@@ -802,6 +995,7 @@ mod tests {
     /// with `--help`, which is the program's business and not this regression's. Pinning `== Ok`
     /// would make a test about SPLITTING fail over an exit code — the same category of misdirected
     /// alarm the bug itself was.
+    #[cfg(windows)]
     #[tokio::test]
     async fn a_quoted_transcriber_path_probes_the_program_and_not_the_quote() {
         // `cmd` exists on every Windows host and needs no arguments to resolve.
@@ -816,12 +1010,47 @@ mod tests {
     }
 
     /// And the unquoted form, which every config written before quoting existed uses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_quoted_transcriber_path_probes_the_program_and_not_the_quote_on_unix() {
+        // `sh` exists on every Unix host.
+        let readout = voice_probe(true, "\"sh\" -m model.bin".to_string()).await;
+
+        assert_ne!(
+            readout.reason,
+            Some(FailureCategory::Missing),
+            "a quoted path that resolves must not be reported missing, got {:?}",
+            readout.status
+        );
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn an_unquoted_transcriber_path_still_probes_its_first_token() {
         let readout = voice_probe(true, "cmd -m model.bin".to_string()).await;
         assert_ne!(readout.reason, Some(FailureCategory::Missing));
 
         let missing = voice_probe(true, "definitely-not-a-program-anywhere -x".to_string()).await;
+        assert_eq!(
+            missing.status,
+            HealthState::Down,
+            "a transcriber that does not exist has to be reported"
+        );
+        assert_eq!(missing.reason, Some(FailureCategory::Missing));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unquoted_transcriber_path_still_probes_its_first_token_on_unix() {
+        // `sh` exists on every Unix host.
+        let readout = voice_probe(true, "sh -m model.bin".to_string()).await;
+        assert_ne!(readout.reason, Some(FailureCategory::Missing));
+
+        let missing = voice_probe(
+            true,
+            "/nonexistent-nucleos/definitely-not-a-program -x".to_string(),
+        )
+        .await;
         assert_eq!(
             missing.status,
             HealthState::Down,

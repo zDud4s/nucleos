@@ -20,14 +20,16 @@ import {
 import {
   Badge,
   Button,
-  Count,
   ConfirmButton,
+  Count,
   ErrorNote,
   PageHeader,
   Panel,
   Quiet,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
   StaleNote,
   StateBadge,
   Teach,
@@ -398,10 +400,20 @@ function CaptureButtons({
 function CaptureOutcomeNote({ outcome }: { outcome: CaptureOutcome | null }) {
   if (outcome === null) return null;
   if (outcome.kind === "silent") {
+    /**
+     * A `204` is the one success-family status in this shell that is a negative
+     * answer — see `data/voice.ts`'s header — so it is named rather than left as
+     * the silence of a successful mutation. It is an absence and not a fault,
+     * which is why it is a `Quiet` rather than an `ErrorNote`: nothing failed,
+     * there was simply nothing there. `announce` is the `role="status"` the
+     * hand-rolled line carried, and it is right here for the reason the prop
+     * exists — this line is the answer to the stop the reader just pressed.
+     */
     return (
-      <p className="voice-outcome" role="status">
-        nothing was heard — check the microphone is not muted and the right input device is selected
-      </p>
+      <Quiet
+        says="nothing was heard — check the microphone is not muted and the right input device is selected"
+        announce
+      />
     );
   }
   if (outcome.kind === "done") {
@@ -545,7 +557,7 @@ function MemoList({
       {memos.isError && rows === undefined && <MemosError error={memos.error} />}
       {rows === undefined && !memos.isError && <p className="voice-loading">reading the memos…</p>}
       {rows !== undefined && rows.length > 0 && (
-        <ul className="voice-list" aria-label="Memos">
+        <Rows label="Memos">
           {rows.map((row) => (
             <CaptureRow
               key={row.id}
@@ -554,7 +566,7 @@ function MemoList({
               deleting={deleteMemo.isPending}
             />
           ))}
-        </ul>
+        </Rows>
       )}
       {deleteMemo.isError && <DeleteMemoError error={deleteMemo.error} />}
     </Panel>
@@ -591,11 +603,11 @@ function DictationList({ dictations }: { dictations: ReturnType<typeof useDictat
       {dictations.isError && rows === undefined && <DictationsError error={dictations.error} />}
       {rows === undefined && !dictations.isError && <p className="voice-loading">reading the dictations…</p>}
       {rows !== undefined && rows.length > 0 && (
-        <ul className="voice-list" aria-label="Dictations">
+        <Rows label="Dictations">
           {rows.map((row) => (
             <CaptureRow key={row.id} row={row} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
       )}
@@ -610,7 +622,7 @@ function DictationsError({ error }: { error: unknown }) {
 
 function CaptureRow({ row, onDelete, deleting }: { row: Capture; onDelete?: () => void; deleting?: boolean }) {
   return (
-    <li className="voice-row">
+    <Row>
       <div className="voice-row-head">
         <StateBadge domain="voice_cleanup" state={row.cleanup_state} />
         <RelativeTime at={row.created_at} />
@@ -636,6 +648,6 @@ function CaptureRow({ row, onDelete, deleting }: { row: Capture; onDelete?: () =
           onConfirm={onDelete}
         />
       )}
-    </li>
+    </Row>
   );
 }

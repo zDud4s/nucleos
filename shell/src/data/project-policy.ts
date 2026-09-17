@@ -3,17 +3,17 @@ import { apiFetch } from "./client";
 import { keys } from "./keys";
 
 /**
- * The three lists a project declares about itself: what its worktrees may run without asking, what
- * the GitHub manager may do on its remote, and where a landing may be sent. And, because a form
- * offering a choice has to know what the choices are, the machine-wide catalogue of what MAY be
- * declared of the second one.
+ * The four lists a project declares about itself: what its worktrees may run without asking, what
+ * the GitHub manager may do on its remote, what the shared git queue may do on its repository, and
+ * where a landing may be sent. And, because a form offering a choice has to know what the choices
+ * are, the machine-wide catalogues of what MAY be declared of the second and third ones.
  *
  * **Not `project-commands.ts`.** That one holds commands somebody presses a button to run — `gate`,
  * `fmt`, `typecheck`. Nothing here is ever executed. These are permissions, and the two modules
  * share a first word and nothing else. `core/src/project_policy.rs` makes the same distinction in
  * the same words, and this is the shell's half of it.
  *
- * Ten routes, read off `core/src/http.rs` rather than inferred from the names:
+ * Fourteen routes, read off `core/src/http.rs` rather than inferred from the names:
  *
  * | what                          | route                                     |
  * |-------------------------------|-------------------------------------------|
@@ -26,16 +26,22 @@ import { keys } from "./keys";
  * | the extra landing targets     | `GET /projects/{id}/land-targets`         |
  * | open one                      | `POST /projects/{id}/land-targets`        |
  * | close one                     | `DELETE /projects/{id}/land-targets`      |
- * | what MAY be declared          | `GET /github/declarable-ops`              |
+ * | what MAY be declared remotely | `GET /github/declarable-ops`              |
+ * | the autonomous git ops        | `GET /projects/{id}/git-ops`              |
+ * | grant one                     | `POST /projects/{id}/git-ops`             |
+ * | withdraw one                  | `DELETE /projects/{id}/git-ops`           |
+ * | what MAY be declared locally  | `GET /vcs/declarable-ops`                 |
  *
- * **The tenth hangs off no project, and that is a fact about the answer rather than about the URL.**
- * The declarable set is compiled into the daemon — two ceilings intersected with the operations it
- * can build — so it is the same for every project on the roster and changes only when the daemon is
- * rebuilt. A route under `/projects/{id}/…` would have taken an id that changed nothing.
+ * **The tenth and fourteenth hang off no project, and that is a fact about the answer rather than
+ * about the URL.** The declarable sets are compiled into the daemon — two ceilings intersected with
+ * the operations it can build remotely, and every operation the shared git queue can build locally
+ * — so they are the same for every project on the roster and change only when the daemon is rebuilt.
+ * A route under `/projects/{id}/…` would have taken an id that changed nothing.
  *
- * **The three DELETEs carry what they delete in the BODY.** A shell prefix contains spaces, slashes
- * and dots and is not a safe path segment; the other two follow it rather than splitting one shape
- * three ways. That is unusual enough that every `forget` hook below says so again at its own door.
+ * **The four DELETEs carry what they delete in the BODY.** A shell prefix contains spaces, slashes
+ * and dots and is not a safe path segment; the other three follow it rather than splitting one
+ * shape four ways. That is unusual enough that every `forget` hook below says so again at its own
+ * door.
  *
  * **Not polled.** A declaration list changes when a person edits it and at no other time — the same
  * reading `useProjectCommands` takes about its own rows, minus the running command that makes it
@@ -80,8 +86,27 @@ export type Verdict = "allow" | "deny";
  * {@link Verdict} — which is now a sentence a page can put beside a rule rather than beside a heading.
  */
 export interface ShellRule {
-  /** FOLDED, as stored and as enforced — see {@link foldPrefix}. */
+  /** FOLDED, as stored and as enforced — see {@link foldPrefix} and {@link foldPathPrefix}. */
   prefix: string;
+  /**
+   * Which tool's writes this rule governs — `"Edit"` or `"Write"` — or `null` for a rule about a
+   * COMMAND prefix.
+   *
+   * **The field that tells the two kinds of rule apart, and nothing else can.** `deny migrations`
+   * is a command nobody may run here; `deny Edit migrations` is a directory nothing may write into.
+   * They may both be declared at once — the núcleo's unique index is `(project_id, tool, prefix)` —
+   * so a page keying a row on the prefix alone draws one row where there are two, and a page
+   * showing the prefix alone shows a path as if it were a command.
+   *
+   * **A write rule can only ever say `deny`.** `POST /projects/{id}/shell-rules` refuses an `allow`
+   * that names a tool with `unenforceable_allow`, because the write chain in `classifier::classify`
+   * has no allow side to reach and `project_policy::shell_rules` drops such a row on the way out.
+   * A control offering to flip one is a control that knows the request will be refused.
+   *
+   * It also says which FOLD the prefix went through: `null` was lower-cased by
+   * {@link foldPrefix}, a tool name means {@link foldPathPrefix}, which keeps a path's case.
+   */
+  tool: string | null;
   verdict: Verdict;
   /** `null` for a rule nobody justified. An absent justification, never an absent field. */
   note: string | null;
@@ -129,6 +154,20 @@ export interface DeclarableOp {
 }
 
 /**
+ * One git operation the shared queue can build — `DeclarableGitOpView` in `core/src/http.rs`.
+ *
+ * Unlike {@link DeclarableOp}, this has no `half`: every operation here is a write performed by the
+ * queue, so the GitHub distinction between a live read and a recorded, inert action has no meaning.
+ * `declarable` remains explicit because the catalogue is a fact about this daemon build.
+ */
+export interface DeclarableGitOp {
+  /** The typed name, as `op_kind` goes over the wire — `push`, `branch-delete`. */
+  kind: string;
+  /** Whether a project may declare this operation on this daemon build. */
+  declarable: boolean;
+}
+
+/**
  * What a declaration does to the rule's note, spelled as a choice the caller has to make.
  *
  * **This union exists to close a trap, and the trap is worth stating in full.**
@@ -161,6 +200,19 @@ export type Note =
 export interface ShellRuleDeclaration {
   projectId: string;
   prefix: string;
+  /**
+   * `"Edit"` or `"Write"` for a rule about writes to a PATH, `null` for one about a command prefix.
+   *
+   * Not optional, for {@link Note}'s reason in a smaller key: the two mean different things to the
+   * daemon and the field is the only thing that says which was meant. A `null` written out is a
+   * caller saying "a command", where an omitted field would be a caller who did not think about it
+   * — and the route reads both the same way, so the compiler is the only place the difference can
+   * still be asked about.
+   *
+   * `unknown_tool` (422) for anything else, and `unenforceable_allow` (422) for a tool beside an
+   * `allow` — see {@link ShellRule.tool}.
+   */
+  tool: string | null;
   verdict: Verdict;
   note: Note;
 }
@@ -216,6 +268,22 @@ export function useProjectGithubOps(projectId: string | null) {
 }
 
 /**
+ * Which git operations this project lets the shared queue perform for an autonomous run.
+ *
+ * A tick does not let the agent run the command in its shell: the tool call is still denied and
+ * returns a ticket id, while the queue receives that ticket as already consented and performs the
+ * operation. This raw list is what the project HAS declared; {@link useDeclarableGitOps} says what
+ * this daemon can build, and a picker needs both so a stranded declaration remains withdrawable.
+ */
+export function useProjectGitOps(projectId: string | null) {
+  return useQuery({
+    queryKey: keys.projects.gitOps(projectId ?? ""),
+    queryFn: () => apiFetch<string[]>(`/projects/${encodeURIComponent(projectId ?? "")}/git-ops`),
+    enabled: projectId !== null,
+  });
+}
+
+/**
  * Every GitHub operation this daemon can build, and whether a project may declare it —
  * `GET /github/declarable-ops`.
  *
@@ -232,7 +300,7 @@ export function useProjectGithubOps(projectId: string | null) {
  * that cannot be ticked, which is a lie about who decides. `declarable: false` is how it gets drawn
  * as what it is.
  *
- * **Machine-wide, so it takes no project id and is keyed apart from the three lists.** A declaration
+ * **Machine-wide, so it takes no project id and is keyed apart from the four lists.** A declaration
  * write invalidates `keys.projects.all` and must not throw this away — it cannot have changed, and
  * it cannot change while the daemon is running.
  *
@@ -243,6 +311,21 @@ export function useDeclarableGithubOps() {
   return useQuery({
     queryKey: keys.github.declarableOps,
     queryFn: () => apiFetch<DeclarableOp[]>("/github/declarable-ops"),
+  });
+}
+
+/**
+ * Every git operation this daemon's shared queue can build, and whether a project may declare it —
+ * `GET /vcs/declarable-ops`.
+ *
+ * Machine-wide and compiled into the daemon, so it takes no project id and has a cache root apart
+ * from project declarations. The project read stays raw on purpose: if a later build drops a kind,
+ * its stored row must remain visible as a fact its owner can withdraw.
+ */
+export function useDeclarableGitOps() {
+  return useQuery({
+    queryKey: keys.vcs.declarableOps,
+    queryFn: () => apiFetch<DeclarableGitOp[]>("/vcs/declarable-ops"),
   });
 }
 
@@ -303,17 +386,17 @@ export function useProjectLandTargets(projectId: string | null) {
 /**
  * Every declaration write settles the same way, so it is written once.
  *
- * **The three lists by name, and NOT the `keys.projects.all` prefix they share.** It used to be the
- * prefix, on the argument that the three live under it and one form can move more than one of them —
+ * **The four lists by name, and NOT the `keys.projects.all` prefix they share.** It used to be the
+ * prefix, on the argument that the four live under it and one form can move more than one of them —
  * which was true while they were the only things there. `keys.projects.githubRepo` is under it now,
  * and that read spawns `git remote get-url` against the project root; a prefix invalidation made
  * every tick of a checkbox re-run a subprocess for a fact no declaration can change. Naming the
- * three is also the honest statement of what these writes touch.
+ * four is also the honest statement of what these writes touch.
  *
  * `onSettled` rather than `onSuccess` because a 404 or a 423 means the picture on screen is wrong
  * either way.
  *
- * `retry: false`, and here it is not merely the house default restated. Every refusal these nine
+ * `retry: false`, and here it is not merely the house default restated. Every refusal these twelve
  * routes give is settled — the stop is engaged, the project is not on the roster, the prefix could
  * never fire, the rule was never declared — and asking again gets the same sentence one second
  * later. The one thing a retry would change is the record: a POST that half-landed and was sent
@@ -333,6 +416,7 @@ function useDeclarationWrite<Input extends { projectId: string }>(
       for (const key of [
         keys.projects.shellRules(projectId),
         keys.projects.githubOps(projectId),
+        keys.projects.gitOps(projectId),
         keys.projects.landTargets(projectId),
       ]) {
         void queryClient.invalidateQueries({ queryKey: key });
@@ -362,10 +446,10 @@ function useDeclarationWrite<Input extends { projectId: string }>(
  * carries a `detail` worth putting on screen verbatim.
  */
 export function useDeclareShellRule() {
-  return useDeclarationWrite(({ projectId, prefix, verdict, note }: ShellRuleDeclaration) =>
+  return useDeclarationWrite(({ projectId, prefix, tool, verdict, note }: ShellRuleDeclaration) =>
     apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/shell-rules`, {
       method: "POST",
-      body: JSON.stringify({ prefix, verdict, note: noteField(note) }),
+      body: JSON.stringify({ prefix, tool, verdict, note: noteField(note) }),
     }),
   );
 }
@@ -377,13 +461,20 @@ export function useDeclareShellRule() {
  * and encoding one into a path segment only to decode it again buys nothing. `no_such_rule` (404)
  * when nothing matched, and its `detail` names the prefix in its FOLDED spelling — which is the
  * answer a caller who typed the wrong case needs to see.
+ *
+ * **And the tool goes with it, because a prefix alone no longer names a rule.** A project may hold
+ * `deny migrations` and `deny Edit migrations` at the same time; the daemon's `WHERE` matches on
+ * `(project_id, tool, prefix)`, so a DELETE that left the tool out would take the command rule
+ * while the write rule stayed on screen. Sending it is how a caller says which of the two it meant,
+ * and `null` says the command one — the reading every DELETE written before the field existed had.
  */
 export function useForgetShellRule() {
-  return useDeclarationWrite(({ projectId, prefix }: { projectId: string; prefix: string }) =>
-    apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/shell-rules`, {
-      method: "DELETE",
-      body: JSON.stringify({ prefix }),
-    }),
+  return useDeclarationWrite(
+    ({ projectId, prefix, tool }: { projectId: string; prefix: string; tool: string | null }) =>
+      apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/shell-rules`, {
+        method: "DELETE",
+        body: JSON.stringify({ prefix, tool }),
+      }),
   );
 }
 
@@ -417,6 +508,37 @@ export function useDeclareGithubOp() {
 export function useForgetGithubOp() {
   return useDeclarationWrite(({ projectId, opKind }: { projectId: string; opKind: string }) =>
     apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/github-ops`, {
+      method: "DELETE",
+      body: JSON.stringify({ op_kind: opKind }),
+    }),
+  );
+}
+
+/**
+ * Grant one git operation to the shared queue for this project's autonomous runs.
+ *
+ * Presence is the grant, and a second declaration is idempotent. The emergency stop refuses this
+ * widening with 423; an unknown project is 404 and a kind outside the compiled catalogue is 422.
+ * None of those refusals should be retried: each describes settled authority, not a transient read.
+ */
+export function useDeclareGitOp() {
+  return useDeclarationWrite(({ projectId, opKind }: { projectId: string; opKind: string }) =>
+    apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/git-ops`, {
+      method: "POST",
+      body: JSON.stringify({ op_kind: opKind }),
+    }),
+  );
+}
+
+/**
+ * Withdraw one git operation from this project's autonomous queue grants.
+ *
+ * The kind travels in the body like the other declaration families. Withdrawal narrows authority,
+ * so the emergency stop does not gate it; 404 means there was no stored declaration to remove.
+ */
+export function useForgetGitOp() {
+  return useDeclarationWrite(({ projectId, opKind }: { projectId: string; opKind: string }) =>
+    apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/git-ops`, {
       method: "DELETE",
       body: JSON.stringify({ op_kind: opKind }),
     }),
@@ -486,11 +608,41 @@ export function foldPrefix(prefix: string): string {
 }
 
 /**
- * PURE: the rule already declared for a typed prefix, or `null` for one that is not.
+ * PURE: what the núcleo will actually store for a typed PATH prefix, and deliberately not
+ * {@link foldPrefix}.
  *
- * Folds before it looks, because case is not part of a rule's identity — asking with the typed
- * spelling is how a form would offer to "create" a rule that already exists and then silently
- * overwrite it.
+ * A mirror of `project_policy::fold_path_prefix`: trim, write `\` as `/` so a Windows spelling and
+ * a POSIX one are one prefix, drop a trailing `/` so `migrations` and `migrations/` are one prefix
+ * — and **no lower-casing**, which is the whole reason there are two of these.
+ *
+ * `foldPrefix` lower-cases because a command is case-insensitive to us: `Remove-Item` and
+ * `remove-item` are one cmdlet whatever the filesystem thinks. A path's case is the FILESYSTEM's
+ * business, and the núcleo answers that question at comparison time, in `write_denied_by_project`,
+ * with the fold the filesystem itself uses. A preview that lower-cased would be showing an owner a
+ * path that is not the one being stored — which is the lie the preview exists to prevent, told from
+ * the other side.
+ *
+ * A preview and never the decision, like its sibling: what comes back from the daemon is the folded
+ * truth.
+ */
+export function foldPathPrefix(prefix: string): string {
+  return prefix.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+/**
+ * PURE: the rule already declared for a typed prefix under a given tool, or `null` for one that is
+ * not.
+ *
+ * Folds before it looks, because the typed spelling is not a rule's identity — asking with it is how
+ * a form would offer to "create" a rule that already exists and then silently overwrite it. WHICH
+ * fold follows the tool, exactly as it does in the núcleo: a command goes through
+ * {@link foldPrefix} and loses its case, a path through {@link foldPathPrefix} and keeps it.
+ *
+ * **The tool is part of what is being asked, and defaults to `null` because that is the older
+ * question.** `deny migrations` and `deny Edit migrations` are two rules the daemon lets a project
+ * hold at once, so a lookup that ignored the tool would answer about the wrong one — telling a form
+ * that the `Edit` rule it is about to declare already exists, and offering it the command rule's
+ * justification to keep.
  *
  * **The whole row and not just the verdict, because the row is what an edit has to send back.**
  * `POST /projects/{id}/shell-rules` rewrites `verdict` and `note` from what it is given, so
@@ -504,9 +656,13 @@ export function foldPrefix(prefix: string): string {
  * table that has ended up disagreeing with itself, and the same direction `shell_rules` takes about
  * a verdict it cannot parse.
  */
-export function declaredRule(rules: ShellRule[], prefix: string): ShellRule | null {
-  const folded = foldPrefix(prefix);
-  const matching = rules.filter((rule) => rule.prefix === folded);
+export function declaredRule(
+  rules: ShellRule[],
+  prefix: string,
+  tool: string | null = null,
+): ShellRule | null {
+  const folded = tool === null ? foldPrefix(prefix) : foldPathPrefix(prefix);
+  const matching = rules.filter((rule) => rule.tool === tool && rule.prefix === folded);
   return matching.find((rule) => rule.verdict === "deny") ?? matching[0] ?? null;
 }
 

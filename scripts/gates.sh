@@ -16,6 +16,83 @@
 # Usage: scripts/gates.sh [core|sidecars|shell|hooks|security|all]   (default: all)
 set -uo pipefail
 
+failures=""
+
+# Every step's output is streamed exactly as it always was AND kept, so that a red step's own last
+# lines can be repeated under its name in the closing summary. The daemon hands the node that must
+# answer a red gate only the last 4096 bytes of its output (`GATE_OUTPUT_TAIL` in core/src/job.rs),
+# and the summary is the one part of the output certain to be inside them. Job 27, 2026-09-14:
+# `core: fmt` failed first and `core: test` then printed about a megabyte, so the retry saw
+# `core: fmt` only as a name in a list and never rustfmt's diff. Beside an unrelated flaky test it
+# decided the red was not its own, left the file unformatted, and the next gate failed on fmt again.
+#
+# Twelve lines of at most 200 bytes, and no more than 800 bytes per step all told: three red steps
+# — every step `core` has — come to about 2.5 KB with their labels, well inside that tail.
+summary_lines=12
+summary_width=200
+summary_bytes=800
+
+# One file, overwritten by each step: only the step that has just run is ever read back.
+captures="$(mktemp -d 2>/dev/null)" || captures=""
+trap 'rm -rf "$captures"' EXIT
+
+run() {
+  # run <label> <dir> <command...>
+  local label="$1" dir="$2" capture=/dev/null status
+  shift 2
+  [ -n "$captures" ] && capture="$captures/step"
+  printf '\n=== %s ===\n' "$label"
+  # stderr joins stdout on its way into `tee`, because the kept lines need both in the order they
+  # were printed: rustfmt's diff goes to one and cargo's `error:` to the other. The daemon already
+  # reads the two as one stream. The cost: a step that leaves a background process holding its
+  # output now holds the gate until that process lets go, since `tee` waits for every writer.
+  ( cd "$dir" && "$@" ) 2>&1 | tee "$capture"
+  status="${PIPESTATUS[0]}"
+  if [ "$status" -eq 0 ]; then
+    printf 'ok   %s\n' "$label"
+  else
+    printf 'FAIL %s\n' "$label"
+    failures="$failures  $label"$'\n'"$(kept_lines "$capture")"$'\n'
+  fi
+}
+
+kept_lines() {
+  # kept_lines <capture>: the last non-blank lines of a step's output, indented to sit under its
+  # label. Blank lines go before counting, so twelve lines are twelve lines of evidence. Counted in
+  # bytes (LC_ALL=C) because the budget is the daemon's and it counts bytes; a character cut in half
+  # at the width comes out as one U+FFFD from the daemon's lossy decoding, not as an error.
+  LC_ALL=C tail -n 200 "$1" 2>/dev/null | LC_ALL=C awk \
+    -v lines="$summary_lines" -v width="$summary_width" -v budget="$summary_bytes" '
+      { gsub(/\r/, ""); if ($0 !~ /[^[:space:]]/) next; kept[++n] = substr($0, 1, width) }
+      END {
+        if (n == 0) { print "      (no output)"; exit }
+        first = n + 1
+        for (i = n; i >= 1 && n - i < lines; i--) {
+          used += length(kept[i]) + 7
+          if (used > budget) break
+          first = i
+        }
+        for (i = first; i <= n; i++) print "      " kept[i]
+      }'
+}
+
+print_summary() {
+  if [ -n "$failures" ]; then
+    printf '\ngates FAILED:\n%s' "$failures" >&2
+    return 1
+  fi
+  printf '\nall gates green.\n'
+}
+
+# Sourced rather than run: stop here, with the functions above defined and no gate started. That is
+# how scripts/test-gates-summary.py drives them with fake steps. They live in this file and not in
+# one it sources because the daemon's tamper check (`worktree_scripts` in core/src/gate.rs) compares
+# only the files the gate command names — a sourced helper would be the one part of the gate a run
+# could rewrite unseen, and it would be the part that decides between `ok` and `FAIL`.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
+
 target="${1:-all}"
 case "$target" in
   core|sidecars|shell|hooks|security|all) ;;
@@ -31,21 +108,6 @@ cd "$repo_root"
 case "$repo_root" in
   *\ *) echo "warning: repo path contains a space ($repo_root) — the worktree tests will fail on it" >&2 ;;
 esac
-
-failures=""
-
-run() {
-  # run <label> <dir> <command...>
-  local label="$1" dir="$2"
-  shift 2
-  printf '\n=== %s ===\n' "$label"
-  if ( cd "$dir" && "$@" ); then
-    printf 'ok   %s\n' "$label"
-  else
-    printf 'FAIL %s\n' "$label"
-    failures="$failures  $label"$'\n'
-  fi
-}
 
 gofmt_gate() {
   # Runs in whatever directory `run` cd'd into. `gofmt -l` lists unformatted files and still
@@ -148,7 +210,13 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     failures="$failures  hooks: python not installed"$'\n'
   else
     run "hooks: filter"   . "$py" scripts/test-hook-filter.py
+    run "hooks: evidence" . "$py" scripts/test-evidence-gate.py
+    run "gates: summary"  . "$py" scripts/test-gates-summary.py
+    run "gates: own target" . "$py" scripts/test-own-cargo-target.py
     run "eval: approver"  . "$py" scripts/eval/test-auto-approve.py
+    run "eval: promote"   . "$py" scripts/eval/test-promote.py
+    run "eval: ingest"    . "$py" scripts/eval/test-ingest.py
+    run "eval: layer"     . "$py" scripts/eval/test-layer.py
     run "usage: split"    . "$py" scripts/test-usage-split.py
     run "usage: statusline" . "$py" scripts/test-statusline-context.py
     # Hermetic like its neighbours: the network is behind one seam the test swaps out, so this
@@ -177,8 +245,4 @@ if [ "$target" = security ]; then
   fi
 fi
 
-if [ -n "$failures" ]; then
-  printf '\ngates FAILED:\n%s' "$failures" >&2
-  exit 1
-fi
-printf '\nall gates green.\n'
+print_summary || exit 1

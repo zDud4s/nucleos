@@ -694,7 +694,7 @@ function project(overrides: Partial<ProjectSummary>): ProjectSummary {
     classes_ready: 0,
     classes_total: 0,
     promotable: false,
-    open_proposals: 0,
+    open_review_items: 0,
     wip_limit: null,
     queue_full: false,
     root_exists: null,
@@ -710,7 +710,7 @@ export const PROJECTS: ProjectSummary[] = [
     mode: "shadow",
     project_root: "C:/repos/alpha",
     root_exists: true,
-    open_proposals: 3,
+    open_review_items: 3,
     wip_limit: 4,
     // Every class clears the bar and two are classes the classifier withheld — the daemon's
     // own conditions for offering promotion. `promotable` is still carried, never derived:
@@ -728,7 +728,7 @@ export const PROJECTS: ProjectSummary[] = [
     project_root: "C:/repos/bravo-servicos-partilhados",
     root_exists: true,
     // At the ceiling: the brake is holding, which is one of the five findings.
-    open_proposals: 2,
+    open_review_items: 2,
     wip_limit: 2,
     queue_full: true,
     last_gate: "failed",
@@ -850,7 +850,7 @@ function rules(overrides: Partial<ProjectRules>): ProjectRules {
     schedules: [],
     repo_triggers: [],
     wip_limit: null,
-    open_proposals: 0,
+    open_review_items: 0,
     queue_full: false,
     ...overrides,
   };
@@ -863,7 +863,7 @@ const ALPHA_RULES: ProjectRules = rules({
   gate_command: "cargo test -p nucleos-core --all-features",
   gate_before_publish: true,
   wip_limit: 4,
-  open_proposals: 3,
+  open_review_items: 3,
   schedules: [
     {
       name: "nightly-tidy",
@@ -936,7 +936,7 @@ const BRAVO_RULES: ProjectRules = rules({
   gate_command: null,
   gate_before_publish: true,
   wip_limit: 2,
-  open_proposals: 2,
+  open_review_items: 2,
   queue_full: true,
 });
 
@@ -1742,6 +1742,9 @@ const RUN_DETAIL = {
   context_fill: 132_000,
   steerable: false,
   successor_run_id: null,
+  // The prompt budget's two halves: what the daemon wrote, and the CLI's own residual.
+  authored_prompt_estimate: 2_400,
+  cli_own_estimate: 18_600,
 } satisfies RunDetail;
 
 /*
@@ -2231,7 +2234,7 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (/^\/projects\/[^/]+\/map\/silenced$/.test(route)) return { rows: [], total: 0 };
 
   if (path === "/assistant/chats") return CHATS;
-  if (path === "/assistant/models") return CHAT_MODELS;
+  if (splitQuery(path)[0] === "/assistant/models") return CHAT_MODELS;
   if (path === "/assistant/ide-sessions") return [];
   /* The project block, and the permission rung with it. `tools: true` so the menu photographs with
      all five reachable -- see the note on `CHATS`. */

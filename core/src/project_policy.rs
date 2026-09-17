@@ -1,7 +1,8 @@
 //! §spec alcada-por-projecto
 //!
-//! The three lists a project keeps about itself: what its worktrees may run, what the GitHub
-//! manager may do on its remote, and where a landing may be sent.
+//! The four lists a project keeps about itself: what its worktrees may run, what the GitHub
+//! manager may do on its remote, what the shared git queue may do on its repository, and where a
+//! landing may be sent.
 //!
 //! **Not `project_commands.rs`.** That module holds commands a project declares ABOUT itself —
 //! `gate`, `fmt`, `typecheck` — things somebody presses a button to run. These are not commands,
@@ -9,20 +10,20 @@
 //! the same first word, and the filename is the only place the difference can be stated before
 //! somebody opens the wrong one.
 //!
-//! One module for four tables because the four answer ONE question — what may this project do
-//! without asking — and splitting them would put the same `project_id` resolution in four places.
+//! One module for five tables because the five answer ONE question — what may this project do
+//! without asking — and splitting them would put the same `project_id` resolution in five places.
 //!
-//! The fourth is the judge, and it is the only one that does not name an OPERATION. The other three
+//! The fifth is the judge, and it is the only one that does not name an OPERATION. The other four
 //! say what may be done; this one says WHO may say yes when a conversation on `auto` would
 //! otherwise stop and ask a person. Same question, answered one step further back — which is why it
 //! belongs here and not beside the conversation settings, where the mode that consults it lives: a
 //! judge is a property of the codebase being worked in, not of the chat window open on it.
 //!
 //! **Every read here fails in the safe direction, and the direction is not the same for all
-//! three.** An unreadable GitHub list or land-target list yields nothing, which withholds autonomy
-//! — safe. An unreadable shell list cannot do that: yielding an empty `deny` would LOSE a refusal
-//! somebody wrote down. So `shell_rules` returns a `Result` and its caller treats the error as
-//! "I cannot say this is safe", which is an approval prompt and never an allow.
+//! four.** An unreadable GitHub list, git list or land-target list yields nothing, which withholds
+//! autonomy — safe. An unreadable shell list cannot do that: yielding an empty `deny` would LOSE a
+//! refusal somebody wrote down. So `shell_rules` returns a `Result` and its caller treats the error
+//! as "I cannot say this is safe", which is an approval prompt and never an allow.
 
 use sqlx::SqlitePool;
 
@@ -79,15 +80,58 @@ fn fold_prefix(prefix: &str) -> String {
     crate::classifier::normalize_command(prefix)
 }
 
-/// One project's two lists, already split by verdict so the classifier does no filtering.
+/// The fold a declared PATH prefix gets, and it is deliberately not `fold_prefix`.
+///
+/// Trims, writes `\` as `/` so a Windows spelling and a POSIX one are one prefix, and drops a
+/// trailing `/` so `migrations` and `migrations/` are one prefix too. What it does NOT do is
+/// lower-case, and that omission is the whole reason this exists beside the other fold.
+///
+/// `fold_prefix` lower-cases because a command is case-insensitive TO US: `Remove-Item` and
+/// `remove-item` are one cmdlet whatever the filesystem thinks. A path is not ours to fold that
+/// way. `classifier.rs` already argues the point twice about its own inputs — `deletes_outside_cwd`
+/// keeps its delete targets raw because folding them "would widen the workspace behind the
+/// containment check's back", and `confined_to_workspace` reads raw tokens beside it. A path's case
+/// is the FILESYSTEM's business, and the filesystem is consulted at comparison time by
+/// `fold_for_containment`, which folds only where the filesystem itself does.
+///
+/// Folding here would hard-code Windows' answer into the table, and it would be wrong for the
+/// decision and not merely for the display: on a case-sensitive filesystem a stored `migrations`
+/// could never match a write to `Migrations/x.sql`, and a refusal that cannot match is an allow —
+/// which is the same asymmetry `fold_prefix` was written to close, arrived at from the other side.
+fn fold_path_prefix(prefix: &str) -> String {
+    prefix
+        .trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+/// One project's lists, already split so the classifier does no filtering.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShellRules {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
+    /// The paths a named tool may not write to in this project: `(tool_name, path_prefix)`.
+    ///
+    /// **Deny-only, and there is deliberately no `allow_writes` beside it.** The write chain in
+    /// `classifier::classify` ends at `("allow", "read-local")`, so the only things a write `allow`
+    /// could reach are the compiled `outside-workspace` refusal and the three governance prompts —
+    /// and a project that could allow `Edit .ai/` would be waiving the guard over its own autopilot
+    /// files. The shell side's rule is the same one said about commands: an `allow` widens what
+    /// this file would have ASKED about, and lifts nothing that was refused.
+    ///
+    /// A `Vec` of pairs rather than a map keyed by tool, because `hooks.rs`'s `NO_SHELL_RULES` is a
+    /// `static` initialised in a const context and `Vec::new()` is the only empty collection
+    /// available there. It is a handful of rows, walked once per write.
+    pub deny_writes: Vec<(String, String)>,
 }
 
 impl ShellRules {
-    /// Whether this project declared nothing at all — both lists empty.
+    /// Whether this project declared nothing at all — every list empty.
+    ///
+    /// `deny_writes` counts, and it has to: the day a project's only declaration was a write
+    /// refusal, a method that answered "declared nothing" would be saying the false thing about
+    /// precisely the rule somebody had just written down.
     ///
     /// **The one item in this module that only the tests reach**, which is why the suppression is
     /// here and not over the file. It was over the file from the day the module was written, on the
@@ -102,7 +146,7 @@ impl ShellRules {
     /// build, so the day this stops being exercised it has to say so.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
-        self.allow.is_empty() && self.deny.is_empty()
+        self.allow.is_empty() && self.deny.is_empty() && self.deny_writes.is_empty()
     }
 
     /// Measured as a PREFIX, which is `SAFE_COMMAND_PREFIXES`'s form and reuses its comparison
@@ -140,6 +184,15 @@ impl ShellRules {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredShellRule {
     pub prefix: String,
+    /// Which tool this rule is about, or `None` for the shell rule `0128` could only express.
+    ///
+    /// **`None` and not `""`.** The column is `NOT NULL DEFAULT ''` for a reason that belongs
+    /// entirely to SQLite — a NULL in a UNIQUE index is distinct from every other NULL, so a
+    /// nullable column would stop `ON CONFLICT (project_id, tool, prefix)` firing for shell rules
+    /// and let two contradictory verdicts for one prefix sit in the table at once. That is a
+    /// storage detail, and letting it leak up here would make every caller compare against a magic
+    /// empty string and get it wrong once. The migration says the same thing from its own side.
+    pub tool: Option<String>,
     pub verdict: Verdict,
     /// Why, in the words of whoever declared it. `None` is a rule with no justification, which is a
     /// state the column really has and not a read failure.
@@ -167,9 +220,9 @@ pub async fn declared_shell_rules(
     pool: &SqlitePool,
     project_id: &str,
 ) -> Result<Vec<DeclaredShellRule>, String> {
-    let rows = sqlx::query_as::<_, (String, String, Option<String>, String)>(
-        "SELECT prefix, verdict, note, created_at FROM project_shell_rules
-         WHERE project_id = ? ORDER BY prefix",
+    let rows = sqlx::query_as::<_, (String, String, Option<String>, String, String)>(
+        "SELECT prefix, verdict, note, created_at, tool FROM project_shell_rules
+         WHERE project_id = ? ORDER BY tool, prefix",
     )
     .bind(project_id)
     .fetch_all(pool)
@@ -177,11 +230,22 @@ pub async fn declared_shell_rules(
     .map_err(|error| format!("could not read {project_id}'s shell rules: {error}"))?;
 
     let mut declared = Vec::with_capacity(rows.len());
-    for (prefix, verdict, note, created_at) in rows {
+    for (prefix, verdict, note, created_at, tool) in rows {
+        // `''` becomes `None` here and nowhere else, so nothing downstream ever compares against
+        // the empty string. See `DeclaredShellRule::tool` for why the column cannot be nullable.
+        let tool = (!tool.is_empty()).then_some(tool);
         // Folded before the verdict is read rather than after, so no later branch can be added that
         // forgets to. The unreadable-verdict arm below needs the fold as much as the two real
         // verdicts do: the row it turns into a `deny` is precisely the one nobody vetted.
-        let prefix = fold_prefix(&prefix);
+        //
+        // WHICH fold follows the tool, because the two kinds of prefix are two kinds of thing: a
+        // shell rule's prefix is a command and goes through `fold_prefix`, a write rule's is a path
+        // and goes through `fold_path_prefix`, which keeps its case. Reading the tool first is what
+        // makes that choice possible at all.
+        let prefix = match &tool {
+            None => fold_prefix(&prefix),
+            Some(_) => fold_path_prefix(&prefix),
+        };
         let verdict = match Verdict::from_db_str(&verdict) {
             Some(verdict) => verdict,
             // The migration's `CHECK (verdict IN ('allow', 'deny'))` should make this arm
@@ -198,6 +262,7 @@ pub async fn declared_shell_rules(
         };
         declared.push(DeclaredShellRule {
             prefix,
+            tool,
             verdict,
             note,
             created_at,
@@ -206,17 +271,32 @@ pub async fn declared_shell_rules(
     Ok(declared)
 }
 
-/// Both lists, split by verdict — the DECIDING half, and the only shape `classifier` is given.
+/// Every list, split by tool and verdict — the DECIDING half, and the only shape `classifier` is
+/// given.
 ///
 /// The two extra columns are dropped here rather than never fetched, and the cost is a `String` per
 /// rule per decision over a list of a handful of rows. What it buys is the paragraph above: the
 /// picture and the decision cannot disagree, because there is nothing for them to disagree with.
+///
+/// **A write rule that says `allow` does not come out of here at all.** `ShellRules::deny_writes`
+/// gives the argument for why there is no allow side to put it on; what this arm adds is that a row
+/// saying `allow` beside a tool name still EXISTS — the migration's CHECK constrains the tool and
+/// the verdict separately, and nothing in the schema can express "not this combination". Keeping it
+/// would mean carrying a permission that no code path reads, which is the shape of a rule an owner
+/// believes is in force and that refuses nothing; dropping it silently would be the same thing with
+/// the evidence removed. So it is dropped and it says so, in the same shape as the unreadable
+/// verdict above — fail-closed, and loudly.
 pub async fn shell_rules(pool: &SqlitePool, project_id: &str) -> Result<ShellRules, String> {
     let mut rules = ShellRules::default();
     for rule in declared_shell_rules(pool, project_id).await? {
-        match rule.verdict {
-            Verdict::Allow => rules.allow.push(rule.prefix),
-            Verdict::Deny => rules.deny.push(rule.prefix),
+        match (rule.tool, rule.verdict) {
+            (None, Verdict::Allow) => rules.allow.push(rule.prefix),
+            (None, Verdict::Deny) => rules.deny.push(rule.prefix),
+            (Some(tool), Verdict::Deny) => rules.deny_writes.push((tool, rule.prefix)),
+            (Some(tool), Verdict::Allow) => {
+                let prefix = rule.prefix;
+                tracing::warn!(%prefix, %tool, project_id, "write rule: allow is not a verdict a tool rule can carry; dropped");
+            }
         }
     }
     Ok(rules)
@@ -224,14 +304,21 @@ pub async fn shell_rules(pool: &SqlitePool, project_id: &str) -> Result<ShellRul
 
 /// Declares a rule, or changes the verdict of one already declared.
 ///
-/// `ON CONFLICT (project_id, prefix)` — the pair the unique index names — because the IDENTITY of a
-/// rule is the prefix it names. Without it, changing your mind about a verdict would leave BOTH
-/// answers in the table and the reader would pick one of them.
+/// `ON CONFLICT (project_id, tool, prefix)` — the triple the unique index names — because the
+/// IDENTITY of a rule is the tool and the prefix together. Without it, changing your mind about a
+/// verdict would leave BOTH answers in the table and the reader would pick one of them.
+///
+/// **The tool is part of the key and not a qualifier on it.** `None` is a shell rule and `Some`
+/// is a write rule, and the two are allowed to name the same string without colliding: `migrations`
+/// as a command prefix and `migrations` as a path are different claims about different things, and
+/// a project may hold both. That is the whole reason `tool` sits inside the `ON CONFLICT` rather
+/// than beside it.
 ///
 /// Stores the FOLDED prefix, not the typed one, so that what is written is what will be enforced —
-/// see `fold_prefix`. Folding only on the way out would work for the classifier and lie to
-/// everything else: the table, and the page a later chunk builds on it, would go on showing a
-/// `Remove-Item` that is in fact enforced as `remove-item`.
+/// see `fold_prefix`, and `fold_path_prefix` for why a path is folded by a different function that
+/// keeps its case. Folding only on the way out would work for the classifier and lie to everything
+/// else: the table, and the page a later chunk builds on it, would go on showing a `Remove-Item`
+/// that is in fact enforced as `remove-item`.
 ///
 /// **What was validated before a row got here depends on the verdict, and the asymmetry is the
 /// thing not to tidy up.** `POST /projects/{id}/shell-rules` refuses an `allow` whose prefix fails
@@ -252,18 +339,20 @@ pub async fn shell_rules(pool: &SqlitePool, project_id: &str) -> Result<ShellRul
 pub async fn declare_shell_rule(
     pool: &SqlitePool,
     project_id: &str,
+    tool: Option<&str>,
     prefix: &str,
     verdict: Verdict,
     note: Option<&str>,
 ) -> Result<(), String> {
     sqlx::query(
-        "INSERT INTO project_shell_rules (project_id, prefix, verdict, note, created_at)
-         VALUES (?, ?, ?, ?, datetime('now'))
-         ON CONFLICT (project_id, prefix)
+        "INSERT INTO project_shell_rules (project_id, tool, prefix, verdict, note, created_at)
+         VALUES (?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT (project_id, tool, prefix)
          DO UPDATE SET verdict = excluded.verdict, note = excluded.note",
     )
     .bind(project_id)
-    .bind(fold_prefix(prefix))
+    .bind(tool.unwrap_or_default())
+    .bind(fold_for(tool, prefix))
     .bind(verdict.as_db_str())
     .bind(note)
     .execute(pool)
@@ -272,9 +361,26 @@ pub async fn declare_shell_rule(
     .map_err(|error| format!("could not declare {prefix} for {project_id}: {error}"))
 }
 
+/// The one place that decides WHICH fold a prefix gets, so declare and forget cannot answer that
+/// question differently.
+///
+/// `forget_shell_rule` exists to compute the key `declare_shell_rule` wrote; two call sites each
+/// picking a fold from the tool is how one of them ends up picking the other one, matching zero
+/// rows, and reporting a delete that never happened. `declared_shell_rules` makes the same choice
+/// on the way out and cannot share this helper — it holds an `Option<String>` rather than an
+/// `Option<&str>` and its comment says why the choice is made there at all.
+pub(crate) fn fold_for(tool: Option<&str>, prefix: &str) -> String {
+    match tool {
+        None => fold_prefix(prefix),
+        Some(_) => fold_path_prefix(prefix),
+    }
+}
+
 /// Undeclares one rule, leaving the rest of the project's shell list untouched. The `WHERE` names
-/// exactly the pair `declare_shell_rule`'s `ON CONFLICT` would have matched — the identity of a rule
-/// is the prefix, and only that row goes.
+/// exactly the triple `declare_shell_rule`'s `ON CONFLICT` would have matched — the identity of a
+/// rule is the tool and the prefix, and only that row goes. Naming the tool is what keeps a
+/// project's `deny Edit migrations` and its `deny migrations` command rule from taking each other
+/// down: they are two rules, and forgetting one has to leave the other standing.
 ///
 /// **`Ok(false)` means there was no such rule**, off `rows_affected`. It is the shape
 /// `project_commands::remove` already uses, and it exists so a caller can tell a delete that
@@ -284,7 +390,7 @@ pub async fn declare_shell_rule(
 /// to close. Answering from the statement that does the work is what makes the two unable to
 /// disagree.
 ///
-/// Folds for the same reason `declare_shell_rule` does, and with the SAME function: forget must
+/// Folds for the same reason `declare_shell_rule` does, and through the SAME `fold_for`: forget must
 /// compute the same key declare wrote, or the argument matches zero rows — which now SAYS so
 /// instead of wearing the face of a real delete. A `declare` that folded and a `forget` that only
 /// trimmed would rebuild exactly that bug one level up from where it was first found, which is why
@@ -293,11 +399,13 @@ pub async fn declare_shell_rule(
 pub async fn forget_shell_rule(
     pool: &SqlitePool,
     project_id: &str,
+    tool: Option<&str>,
     prefix: &str,
 ) -> Result<bool, String> {
-    sqlx::query("DELETE FROM project_shell_rules WHERE project_id = ? AND prefix = ?")
+    sqlx::query("DELETE FROM project_shell_rules WHERE project_id = ? AND tool = ? AND prefix = ?")
         .bind(project_id)
-        .bind(fold_prefix(prefix))
+        .bind(tool.unwrap_or_default())
+        .bind(fold_for(tool, prefix))
         .execute(pool)
         .await
         .map(|done| done.rows_affected() > 0)
@@ -378,6 +486,94 @@ pub async fn forget_github_op(
     op_kind: &str,
 ) -> Result<bool, String> {
     sqlx::query("DELETE FROM project_github_ops WHERE project_id = ? AND op_kind = ?")
+        .bind(project_id)
+        .bind(op_kind.trim())
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected() > 0)
+        .map_err(|error| format!("could not forget {op_kind} for {project_id}: {error}"))
+}
+
+/// The git operations the queue may perform for this project's autonomous runs without stopping to
+/// ask a person, with a read failure still in hand. `try_github_ops`' twin, for the same two
+/// callers: the display half — `GET /projects/{id}/git-ops` — needs the error raised, because to an
+/// owner checking what their project may do on its own, `[]` is a positive claim that nothing is
+/// declared, and serving that claim out of a database error tells them something false in the one
+/// place they go to look.
+///
+/// Serves the table RAW, with no narrowing against the operation catalogue. A row naming an
+/// operation this build no longer constructs is exactly what the page must be able to draw — as
+/// stranded, so somebody can withdraw it — and a read that quietly dropped it would hide the only
+/// evidence that it is there.
+pub async fn try_git_ops(pool: &SqlitePool, project_id: &str) -> Result<Vec<String>, String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT op_kind FROM project_git_ops WHERE project_id = ? ORDER BY op_kind",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("could not read {project_id}'s git ops: {error}"))
+}
+
+/// The deciding half's answer, and the swallow is the whole point: an unreadable table yields
+/// nothing, so the run declares nothing and every operation goes back to asking a person. That is
+/// the safe direction — withholding autonomy costs an approval prompt, whereas the other direction
+/// spends a grant nobody wrote down.
+///
+/// **Do not "fix" this into a `Result`.** `shell_rules` returns one, and it is the OPPOSITE case
+/// for the opposite reason: there an empty answer would lose a `deny` somebody recorded, so the
+/// error must survive to the caller. Here an empty answer loses only permission, which is where a
+/// failure should land. A `Result` on this side would push the error to a caller that has no safer
+/// thing to do with it than refuse anyway — and the likelier outcome, judging by every handler that
+/// already treats an error as "carry on", is that a database blip becomes an autonomy grant.
+pub async fn git_ops(pool: &SqlitePool, project_id: &str) -> Vec<String> {
+    try_git_ops(pool, project_id).await.unwrap_or_else(|error| {
+        tracing::warn!(%error, project_id, "git ops: unreadable; this project asks about every git operation");
+        Vec::new()
+    })
+}
+
+/// Grants one git operation without asking, in this project. Presence in the table IS the grant —
+/// there is no verdict to attach, because there is nothing to say beyond yes — so a repeat
+/// declaration finds a row already saying what it came to say. `DO NOTHING` leaves that row and its
+/// original `created_at` alone, for `declare_github_op`'s reason: `DO UPDATE` would turn "when this
+/// was declared" into "when it was last redeclared", which nothing reads today and would mislead
+/// whoever later takes the column's name at face value.
+pub async fn declare_git_op(
+    pool: &SqlitePool,
+    project_id: &str,
+    op_kind: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO project_git_ops (project_id, op_kind, created_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT (project_id, op_kind)
+         DO NOTHING",
+    )
+    .bind(project_id)
+    .bind(op_kind.trim())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("could not declare {op_kind} for {project_id}: {error}"))
+}
+
+/// Withdraws one git operation from the project's autonomous set. After this the queue goes back to
+/// asking about it — the safe direction, and the only one a forget can take here.
+///
+/// `Ok(false)` for an operation that was never declared, so the route can answer 404. Reading
+/// presence through `git_ops` instead could never say this honestly: that function swallows a read
+/// failure into an empty `Vec`, so an unreadable table would look like "never declared" and the
+/// route would report a clean 404 while the row stands and the operation goes on running unattended.
+///
+/// Trims like `declare_git_op` does, so the two agree on what a key is; a declare that folded and a
+/// forget that did not would leave a row nobody could reach by the name they typed.
+pub async fn forget_git_op(
+    pool: &SqlitePool,
+    project_id: &str,
+    op_kind: &str,
+) -> Result<bool, String> {
+    sqlx::query("DELETE FROM project_git_ops WHERE project_id = ? AND op_kind = ?")
         .bind(project_id)
         .bind(op_kind.trim())
         .execute(pool)
@@ -676,6 +872,7 @@ mod tests {
         ShellRules {
             allow: allow.iter().map(|entry| (*entry).to_owned()).collect(),
             deny: deny.iter().map(|entry| (*entry).to_owned()).collect(),
+            ..Default::default()
         }
     }
 
@@ -763,6 +960,7 @@ mod tests {
         declare_shell_rule(
             &pool,
             "alpha",
+            None,
             "bash scripts/gates.sh",
             Verdict::Allow,
             None,
@@ -772,6 +970,7 @@ mod tests {
         declare_shell_rule(
             &pool,
             "alpha",
+            None,
             "git push",
             Verdict::Deny,
             Some("never from a worktree"),
@@ -788,7 +987,9 @@ mod tests {
         // withdrawing exactly one rule and leaving the rest is the behaviour, and nothing else
         // asserts it.
         assert!(
-            forget_shell_rule(&pool, "alpha", "git push").await.unwrap(),
+            forget_shell_rule(&pool, "alpha", None, "git push")
+                .await
+                .unwrap(),
             "a rule that was there reports that it went"
         );
         let rules = shell_rules(&pool, "alpha").await.unwrap();
@@ -800,10 +1001,10 @@ mod tests {
         // stored value, match zero rows, and still return `Ok(())` -- indistinguishable from a real
         // delete. That is the worst shape of this bug: the caller believes a refusal was lifted and
         // it was not.
-        declare_shell_rule(&pool, "alpha", "cargo run", Verdict::Allow, None)
+        declare_shell_rule(&pool, "alpha", None, "cargo run", Verdict::Allow, None)
             .await
             .unwrap();
-        forget_shell_rule(&pool, "alpha", "  cargo run  ")
+        forget_shell_rule(&pool, "alpha", None, "  cargo run  ")
             .await
             .unwrap();
         let rules = shell_rules(&pool, "alpha").await.unwrap();
@@ -818,6 +1019,7 @@ mod tests {
         declare_shell_rule(
             &pool,
             "alpha",
+            None,
             "  Remove-Item   -Recurse ",
             Verdict::Deny,
             None,
@@ -826,7 +1028,7 @@ mod tests {
         .unwrap();
         let rules = shell_rules(&pool, "alpha").await.unwrap();
         assert_eq!(rules.deny, vec!["remove-item -recurse".to_owned()]);
-        forget_shell_rule(&pool, "alpha", "REMOVE-ITEM  -recurse")
+        forget_shell_rule(&pool, "alpha", None, "REMOVE-ITEM  -recurse")
             .await
             .unwrap();
         let rules = shell_rules(&pool, "alpha").await.unwrap();
@@ -885,13 +1087,14 @@ mod tests {
         declare_shell_rule(
             &pool,
             "alpha",
+            None,
             "Remove-Item  -Recurse",
             Verdict::Deny,
             Some("nothing here deletes recursively"),
         )
         .await
         .unwrap();
-        declare_shell_rule(&pool, "alpha", "npm ci", Verdict::Allow, None)
+        declare_shell_rule(&pool, "alpha", None, "npm ci", Verdict::Allow, None)
             .await
             .unwrap();
 
@@ -921,10 +1124,10 @@ mod tests {
     #[tokio::test]
     async fn declaring_the_same_prefix_again_changes_its_verdict() {
         let pool = pool().await;
-        declare_shell_rule(&pool, "alpha", "git push", Verdict::Allow, None)
+        declare_shell_rule(&pool, "alpha", None, "git push", Verdict::Allow, None)
             .await
             .unwrap();
-        declare_shell_rule(&pool, "alpha", "git push", Verdict::Deny, None)
+        declare_shell_rule(&pool, "alpha", None, "git push", Verdict::Deny, None)
             .await
             .unwrap();
 
@@ -933,14 +1136,252 @@ mod tests {
         assert_eq!(rules.deny, vec!["git push".to_owned()]);
     }
 
-    /// One project's rules are not another's, in ANY of the three tables. Stated as a test because
+    /// The tool is part of the key, and this is what says so. `migrations` as a command prefix and
+    /// `migrations` as a path an `Edit` may not touch are two different claims about two different
+    /// things, and a project is entitled to hold both — which it can only do because `ON CONFLICT`
+    /// names the triple. With the pair `0128` had, the second declaration would have OVERWRITTEN
+    /// the first, and the owner would be left holding one of the two refusals they wrote down.
+    #[tokio::test]
+    async fn a_write_rule_and_a_shell_rule_share_a_prefix_without_sharing_a_row() {
+        let pool = pool().await;
+        declare_shell_rule(&pool, "alpha", None, "migrations", Verdict::Deny, None)
+            .await
+            .unwrap();
+        declare_shell_rule(
+            &pool,
+            "alpha",
+            Some("Edit"),
+            "migrations",
+            Verdict::Deny,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let declared = declared_shell_rules(&pool, "alpha").await.unwrap();
+        assert_eq!(
+            declared.len(),
+            2,
+            "two rules, not one overwritten by the other"
+        );
+        // `ORDER BY tool, prefix`, and `''` sorts before `Edit`, so the shell rule comes first.
+        assert_eq!(declared[0].tool, None);
+        assert_eq!(declared[1].tool, Some("Edit".to_owned()));
+
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert_eq!(rules.deny, vec!["migrations".to_owned()]);
+        assert_eq!(
+            rules.deny_writes,
+            vec![("Edit".to_owned(), "migrations".to_owned())]
+        );
+    }
+
+    /// `declaring_the_same_prefix_again_changes_its_verdict`'s twin on the write side, and not a
+    /// copy of it: the two share a statement but not a key. This is the only thing that pins `tool`
+    /// as being INSIDE the `ON CONFLICT` rather than merely bound by the INSERT — outside it, the
+    /// second declaration is a second row and the table holds both answers about one rule.
+    #[tokio::test]
+    async fn declaring_the_same_write_rule_again_changes_its_verdict_instead_of_adding_a_row() {
+        let pool = pool().await;
+        declare_shell_rule(
+            &pool,
+            "alpha",
+            Some("Write"),
+            "docs",
+            Verdict::Allow,
+            Some("first"),
+        )
+        .await
+        .unwrap();
+        declare_shell_rule(
+            &pool,
+            "alpha",
+            Some("Write"),
+            "docs",
+            Verdict::Deny,
+            Some("second"),
+        )
+        .await
+        .unwrap();
+
+        let declared = declared_shell_rules(&pool, "alpha").await.unwrap();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].verdict, Verdict::Deny);
+        assert_eq!(declared[0].note.as_deref(), Some("second"));
+
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert_eq!(
+            rules.deny_writes,
+            vec![("Write".to_owned(), "docs".to_owned())]
+        );
+    }
+
+    /// A path prefix goes through `fold_path_prefix` and never `fold_prefix`, which is the whole
+    /// difference between the two kinds of rule this table now holds. The separators and the ends
+    /// are tidied — a backslash becomes a slash, a trailing slash goes — and the CASE survives,
+    /// because whether `Core/Migrations` and `core/migrations` are one directory is the
+    /// filesystem's answer and `classifier::fold_for_containment` is where it gets asked.
+    ///
+    /// The shell rule declared beside it is the control: nearly the same string, on the other side
+    /// of the tool column, comes back lower-cased. One test for both folds, so neither can quietly
+    /// become the other.
+    #[tokio::test]
+    async fn a_path_prefix_keeps_the_case_it_was_written_in() {
+        let pool = pool().await;
+        declare_shell_rule(
+            &pool,
+            "alpha",
+            Some("Edit"),
+            r"  Core\Migrations\  ",
+            Verdict::Deny,
+            None,
+        )
+        .await
+        .unwrap();
+        declare_shell_rule(
+            &pool,
+            "alpha",
+            None,
+            "  Core  Migrations ",
+            Verdict::Deny,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert_eq!(
+            rules.deny_writes,
+            vec![("Edit".to_owned(), "Core/Migrations".to_owned())]
+        );
+        assert_eq!(rules.deny, vec!["core migrations".to_owned()]);
+
+        // And forget computes the same key declare wrote, through the same `fold_for`. A forget
+        // that reached for `fold_prefix` here would lower-case, match zero rows, and report
+        // `Ok(false)` about a refusal that is still very much in force.
+        assert!(
+            forget_shell_rule(&pool, "alpha", Some("Edit"), r"Core\Migrations")
+                .await
+                .unwrap(),
+            "a rule that was there reports that it went"
+        );
+        assert!(
+            shell_rules(&pool, "alpha")
+                .await
+                .unwrap()
+                .deny_writes
+                .is_empty()
+        );
+    }
+
+    /// Tool rules are deny-only — `ShellRules::deny_writes` carries the argument — and the schema
+    /// cannot say so: the migration's CHECKs constrain `tool` and `verdict` separately, and no
+    /// column constraint can express "not this combination". So the row CAN exist, and this is what
+    /// happens to it.
+    ///
+    /// Written out of band on purpose, which is the only honest way to produce one. It is the same
+    /// case `a_prefix_written_out_of_band_is_folded_on_the_way_out` covers for the fold, and the
+    /// same direction: a row nobody vetted must not turn into a permission that nothing can be seen
+    /// refusing. The DISPLAY read still shows it, and the asymmetry is deliberate — an owner
+    /// looking at their own list should see every row their table holds, including the one that is
+    /// doing nothing.
+    #[tokio::test]
+    async fn a_write_rule_that_says_allow_is_dropped_on_the_way_out() {
+        let pool = pool().await;
+        sqlx::query(
+            "INSERT INTO project_shell_rules (project_id, tool, prefix, verdict, created_at)
+             VALUES (?, ?, ?, ?, datetime('now'))",
+        )
+        .bind("alpha")
+        .bind("Edit")
+        .bind("src")
+        .bind("allow")
+        .execute(&pool)
+        .await
+        .unwrap();
+        declare_shell_rule(
+            &pool,
+            "alpha",
+            Some("Edit"),
+            "migrations",
+            Verdict::Deny,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let declared = declared_shell_rules(&pool, "alpha").await.unwrap();
+        assert_eq!(
+            declared.len(),
+            2,
+            "the display half shows what the table actually holds"
+        );
+
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert_eq!(
+            rules.deny_writes,
+            vec![("Edit".to_owned(), "migrations".to_owned())],
+            "the allow is gone, and it did not take the deny beside it"
+        );
+        assert!(
+            rules.allow.is_empty(),
+            "nor did it fall through onto the shell side"
+        );
+    }
+
+    /// The `WHERE` names the same triple the `ON CONFLICT` does, and this pair is what proves it. A
+    /// DELETE that forgot the `tool` column would take both rows on its way past: the owner
+    /// withdraws one refusal and silently loses a second one they never mentioned, which is
+    /// `forget_shell_rule`'s own "worst shape of this bug" arriving through the new column.
+    #[tokio::test]
+    async fn forgetting_a_write_rule_leaves_the_shell_rule_of_the_same_name() {
+        let pool = pool().await;
+        declare_shell_rule(&pool, "alpha", None, "migrations", Verdict::Deny, None)
+            .await
+            .unwrap();
+        declare_shell_rule(
+            &pool,
+            "alpha",
+            Some("Edit"),
+            "migrations",
+            Verdict::Deny,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            forget_shell_rule(&pool, "alpha", Some("Edit"), "migrations")
+                .await
+                .unwrap()
+        );
+
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert!(rules.deny_writes.is_empty());
+        assert_eq!(
+            rules.deny,
+            vec!["migrations".to_owned()],
+            "the shell rule of the same name stayed where it was"
+        );
+
+        // And the other way round, off the surviving row: forgetting the shell rule still finds it,
+        // which it could not do if the delete above had already carried it off.
+        assert!(
+            forget_shell_rule(&pool, "alpha", None, "migrations")
+                .await
+                .unwrap()
+        );
+        assert!(shell_rules(&pool, "alpha").await.unwrap().is_empty());
+    }
+
+    /// One project's rules are not another's, in ANY of the four tables. Stated as a test because
     /// the `project_id` is a bind parameter and a missing `WHERE` is the cheapest possible way to
-    /// leak a whole machine's policy — all three tables share the same shape, and nothing pins
+    /// leak a whole machine's policy — all four tables share the same shape, and nothing pins
     /// `github_ops`'s and `land_targets`'s own `WHERE` beyond this.
     #[tokio::test]
     async fn one_projects_rules_do_not_reach_another() {
         let pool = pool().await;
-        declare_shell_rule(&pool, "alpha", "cargo run", Verdict::Allow, None)
+        declare_shell_rule(&pool, "alpha", None, "cargo run", Verdict::Allow, None)
             .await
             .unwrap();
         declare_github_op(&pool, "alpha", "run_list").await.unwrap();
@@ -997,10 +1438,52 @@ mod tests {
         // The unforgotten rule reports the same way, so `Ok(false)` is about THIS row and not about
         // the table having gone empty.
         assert!(
-            !forget_shell_rule(&pool, "alpha", "never declared")
+            !forget_shell_rule(&pool, "alpha", None, "never declared")
                 .await
                 .unwrap()
         );
+    }
+
+    /// The git-ops family is `github_ops`' twin, and its four tests stay separate rather than
+    /// folding into one round-trip like the pair above: each names the single property it pins, so
+    /// a failure reads as which guarantee broke rather than as "the git ops test".
+    #[tokio::test]
+    async fn a_declared_git_op_comes_back() {
+        let pool = pool().await;
+        declare_git_op(&pool, "alpha", "push").await.unwrap();
+        assert_eq!(git_ops(&pool, "alpha").await, vec!["push".to_owned()]);
+    }
+
+    /// `declare_git_op`'s `ON CONFLICT ... DO NOTHING`. Without this a regression to a bare
+    /// `INSERT` would surface only as `UNIQUE constraint failed`, and nothing else here would
+    /// catch it.
+    #[tokio::test]
+    async fn declaring_the_same_git_op_twice_is_one_row() {
+        let pool = pool().await;
+        declare_git_op(&pool, "alpha", "push").await.unwrap();
+        declare_git_op(&pool, "alpha", "push").await.unwrap();
+        assert_eq!(git_ops(&pool, "alpha").await.len(), 1);
+    }
+
+    /// The second forget answering `false` is what the route turns into a 404, asserted here rather
+    /// than only through HTTP because this is where `rows_affected` is read.
+    #[tokio::test]
+    async fn a_forgotten_git_op_is_gone_and_forgetting_it_twice_says_so() {
+        let pool = pool().await;
+        declare_git_op(&pool, "alpha", "merge").await.unwrap();
+        assert!(forget_git_op(&pool, "alpha", "merge").await.unwrap());
+        assert!(git_ops(&pool, "alpha").await.is_empty());
+        assert!(!forget_git_op(&pool, "alpha", "merge").await.unwrap());
+    }
+
+    /// `project_git_ops` shares its shape with the tables above, so a missing `WHERE` would leak one
+    /// project's declared operations to every other — the same cheap mistake
+    /// `one_projects_rules_do_not_reach_another` pins for the three that came first.
+    #[tokio::test]
+    async fn one_projects_git_ops_are_not_anothers() {
+        let pool = pool().await;
+        declare_git_op(&pool, "alpha", "push").await.unwrap();
+        assert!(git_ops(&pool, "beta").await.is_empty());
     }
 
     /// `shell_rules`' `None` arm and this module's header both lean on the migration's `CHECK`s

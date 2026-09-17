@@ -71,7 +71,7 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
       : {
           killSwitch: killSwitch.data?.engaged === true,
           budgetPaused: budget.data?.paused === true,
-          openProposals: project.open_proposals,
+          openProposals: project.open_review_items,
           failedGatesWithoutRescue: 0,
           interruptedRuns: 0,
           workflowDrift: driftingWorkflows(workflows.data).length > 0,
@@ -143,9 +143,15 @@ const CONCERN_TEXT: Record<string, string> = {
  * The first paragraph — the one section whose weight changes.
  *
  * Calm is a sentence with air around it: no box, no border, no colour, because the design says the
- * normal disappears. Anything demanding a decision becomes the page's **one** elevated layer —
- * glass, shadow, a border in the state's tone — which is the rule the whole visual language rests
- * on: elevation is scarce, so it means something.
+ * normal disappears. Anything demanding a decision becomes the page's **one** raised layer, and
+ * that rule survives whole — elevation is scarce, so it means something.
+ *
+ * What changed is what "raised" is made of. It used to be a shadow (`--shadow-float`) under a
+ * bordered box, and this system is flat: depth is the neutral ladder, not a shadow stack, and
+ * `--shadow-float` is applied to nothing else in the app. So the raise is a rung — Working up to
+ * Raised — plus the state's own edge, which is the one thing on the page wearing a tone. In the
+ * light theme that rung is not a colour change at all (Working and Raised are both `#ffffff`) and
+ * the border carries the whole boundary, which is exactly why the border is not optional here.
  *
  * `unknown` is neither. A project the shell has not heard about is not calm, and saying it is would
  * be reporting a measurement nobody took.

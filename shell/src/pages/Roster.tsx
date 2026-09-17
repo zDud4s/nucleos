@@ -116,7 +116,7 @@ function RosterError({ error }: { error: unknown }) {
 function Readings({ rows }: { rows: ProjectSummary[] }) {
   const acting = rows.filter((row) => row.mode === "active").length;
   const failing = rows.filter((row) => gateOf(row) === "failed").length;
-  const waiting = rows.reduce((total, row) => total + row.open_proposals, 0);
+  const waiting = rows.reduce((total, row) => total + row.open_review_items, 0);
 
   return (
       <div className="mb-6 grid gap-3 [grid-template-columns:repeat(auto-fit,minmax(11rem,1fr))]">
@@ -130,7 +130,7 @@ function Readings({ rows }: { rows: ProjectSummary[] }) {
           was never read, which is what `none` means and is a different piece of news. */}
       <StatCard label="Failing the gate" value={failing} detail="the last run said no" />
       <StatCard
-        label="Proposals open"
+        label="To review"
         value={waiting}
         detail={waiting === 0 ? "nothing has stopped to ask" : "across the roster"}
       />
@@ -244,7 +244,7 @@ function Row({
         </th>
 
         <td className="px-3 py-2 text-right">
-          {project.open_proposals === 0 ? (
+          {project.open_review_items === 0 ? (
             <Nothing />
           ) : (
             /* `Count` and not a bare number: this is how many things are in a list, which
@@ -254,7 +254,7 @@ function Row({
               to="/projects/$projectId/$view"
               params={{ projectId: project.project_id, view: "state" }}
             >
-              <Count n={project.open_proposals} />
+              <Count n={project.open_review_items} />
             </Link>
           )}
         </td>

@@ -190,6 +190,7 @@ export const keys = {
      */
     shellRules: (projectId: string) => ["projects", projectId, "shell-rules"] as const,
     githubOps: (projectId: string) => ["projects", projectId, "github-ops"] as const,
+    gitOps: (projectId: string) => ["projects", projectId, "git-ops"] as const,
     landTargets: (projectId: string) => ["projects", projectId, "land-targets"] as const,
     /**
      * Which repository on GitHub this project is — `GET /projects/{id}/github-repo`.
@@ -283,6 +284,18 @@ export const keys = {
   },
 
   /**
+   * What any project MAY declare about the shared git queue — `GET /vcs/declarable-ops`.
+   *
+   * Its own root, and pointedly NOT under `projects`, for the same reason as the GitHub catalogue:
+   * this is the machine's answer, identical for every project and fixed for the life of the daemon.
+   * A declaration write must not throw away a compiled catalogue that it cannot have changed.
+   */
+  vcs: {
+    all: ["vcs"] as const,
+    declarableOps: ["vcs", "declarable-ops"] as const,
+  },
+
+  /**
    * What the agent has been told, and what it asked to be told — `GET
    * /refinements`.
    *
@@ -340,11 +353,11 @@ export const keys = {
     /**
      * The models a conversation may be moved to — `GET /assistant/models`.
      *
-     * Its own key and not a child of `detail`, because it is the same answer for
-     * every conversation: one fetch feeds every picker on the page, and a
-     * per-chat key would refetch it once per row.
+     * Its own key and not a child of `detail`, because it is the daemon-wide
+     * answer. A conversation picker uses `modelsFor` so its menu can differ.
      */
     models: ["chats", "models"] as const,
+    modelsFor: (chatId: string) => ["chats", "models", chatId] as const,
     /**
      * The tools a conversation may be told not to reach for — `GET /assistant/tools`.
      *
@@ -520,6 +533,32 @@ export const keys = {
     backups: ["system", "backups"] as const,
     tokens: ["system", "tokens"] as const,
     pii: ["system", "pii"] as const,
+    /**
+     * Which feed kinds still reach Telegram — `GET /notifications/policy` — and
+     * which kinds this machine has actually written — `GET /notifications/kinds`.
+     *
+     * Two keys and not one, because they are two different things that happen to
+     * be drawn on one screen: the first is a PREFERENCE the owner edits and a
+     * save invalidates, the second an OBSERVATION of the feed that a save cannot
+     * change. Sharing a key would make every save refetch the kind list for
+     * nothing.
+     */
+    notifyPolicy: ["system", "notify-policy"] as const,
+    notifyKinds: ["system", "notify-kinds"] as const,
     config: (area: string) => ["system", "config", area] as const,
+    /**
+     * This machine's settings files — `GET /config/machine`.
+     *
+     * A sibling of `config` above rather than a child of it, and the difference
+     * is not cosmetic: that one keys the daemon's PARSED view of a pillar — what
+     * it is actually doing, clamps applied — and this one keys the files on
+     * disk. The two disagree exactly when somebody has edited a file and not
+     * restarted, which is the state the settings page exists to show. A write
+     * invalidating this must not also throw away the running readout it is
+     * about to be compared against.
+     */
+    machine: ["system", "machine"] as const,
+    /** The credentials this machine holds, by presence only -- `GET /config/secrets`. */
+    secrets: ["system", "secrets"] as const,
   },
 } as const;

@@ -2996,6 +2996,12 @@ async fn spawn_agent(
         permission: crate::runner::Permission::Default,
         resume_session_id: None,
         mcp_config,
+        // Unboxed, like the council seat this launch is modelled on: `write_mcp_config` above
+        // calls `assistant::build_mcp_config(&exe, None)`, so a member with tools is offered the
+        // whole surface. `allowed_mcp_tools` below narrows what the member may CALL, which is a
+        // different question from what its server announces — and it is the announcement that is
+        // paid for in the prompt.
+        mcp_box: None,
         tool_policy: if with_tools {
             crate::runner::ToolPolicy::McpOnly
         } else {
@@ -4807,6 +4813,8 @@ mod tests {
             run_tails: Default::default(),
             files_root: Some(root),
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: Arc::new(crate::state::EmailRuntime::default()),
             voice: Arc::new(crate::voice::VoiceRuntime::default()),
             // Off, like `web` beside it: no test in this module drives a browser, and a department
@@ -6765,6 +6773,8 @@ mod tests {
         let state = AppState {
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             ..state
         };
 

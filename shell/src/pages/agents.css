@@ -9,6 +9,12 @@
  * a screen nobody is testing. Grep the component against this file, in both
  * directions, before calling the page done.
  *
+ * Two names in `Agents.tsx` are deliberately outside that rule, because they are
+ * not this page's to define. `.sr-only` is the app's visually-hidden utility and
+ * lives in `base.css`; `.ui-current` is the shared "this one" mark and lives in
+ * `ui.css`. Both used to be written out here under private names, which is how
+ * an app ends up with one behaviour and several recipes for it.
+ *
  * Every colour here is a token, so light comes free with dark — and none of the
  * seven state tones appears at all. Nothing on this page is a state: an engine
  * is identity, a model is identity, a tool policy is a capability, and a
@@ -18,6 +24,17 @@
 
 /* ================================================================ shared == */
 
+/**
+ * The catalogue has not answered yet — and deliberately **not** `Quiet`.
+ *
+ * `Quiet` is the one-line *absence*, and it is muted because in an empty region
+ * the sentence is the content: an answer set fainter than the labels around it
+ * reads as failure rather than as emptiness. A wait is the other case. This line
+ * is a placeholder for the table about to replace it, it is never what the page
+ * has to say, and faint is the rung for something standing beside content rather
+ * than being it. The absence this page does have is the empty catalogue, and
+ * that one has something to teach, so it is `Teach`.
+ */
 .agents-loading {
   margin: 0;
   font-size: var(--text-sm);
@@ -25,21 +42,64 @@
   color: var(--text-faint);
 }
 
-/*
-  The same fact the glyphs carry, in words, for anything that does not render
-  one — a screen reader, a font with no geometric shapes, a copy-paste into a
-  plain-text note.
-*/
-.agents-said {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip-path: inset(50%);
+/* ------------------------------------------------------------ type roles -- */
+
+/**
+ * The column heads and the field names — the label rank, under two names.
+ *
+ * 11px uppercase at `--tracking-wide` in faint, which is the same recipe
+ * sixteen sites across the app had each written out. It is **not** the
+ * section-title rank (`.ui-section-title`, the display face at
+ * `--tracking-wider`) and must not be folded into it: a section title names a
+ * group of content, and these name a column of values and a control. At 11px
+ * the 0.08em-against-0.14em difference is precisely what stops the two ranks
+ * being told apart, so writing them as one would erase the distinction rather
+ * than share it.
+ *
+ * Grouped rather than shared with `ui.css`, because there is nothing to share
+ * with: DESIGN.md records the missing input primitive as the largest remaining
+ * hole in the component layer, and until there is one, collecting the selector
+ * is as far as a page can take it.
+ */
+.agents-table thead th,
+.agents-field {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/**
+ * Everything the daemon produced: an id, an engine, a model, a policy, a
+ * standing, a timestamp. The mono face is a claim about origin, so it is the
+ * one property every cell in this table's right-hand columns has in common.
+ *
+ * **Never wrapped**, and that is not a preference. A model name is one token
+ * with nothing to break at, and the words that stand in for an absent one broke
+ * across two lines the first time this page was photographed — which drew the
+ * dashed underline twice and made those rows taller than the ones around them,
+ * for no reason a reader could see. The same is true of `◉ 2 ● 1` and of a
+ * relative time.
+ */
+.agents-id,
+.agents-engine,
+.agents-model,
+.agents-tools,
+.agents-figure,
+.agents-changed {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
   white-space: nowrap;
-  border: 0;
+}
+
+/* Mark plus number, the grammar the console uses for a granted power and for a
+   standing. Baseline and not centre: the glyph and the digits beside it are
+   read as one word, and a box-aligned pair reads as two. */
+.agents-tools,
+.agents-figure,
+.agents-standing {
+  display: inline-flex;
+  align-items: baseline;
 }
 
 /* ================================================================= table == */
@@ -65,16 +125,14 @@
   font-size: var(--text-sm);
 }
 
+/* The type is the label group above; what is left here is the rule under the
+   heads and the room they stand in. */
 .agents-table thead th {
   padding: 0 var(--space-3) var(--space-2);
   border-bottom: 1px solid var(--border-strong);
-  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
   text-align: left;
   white-space: nowrap;
-  color: var(--text-faint);
 }
 
 .agents-table tbody th,
@@ -96,15 +154,27 @@
 }
 
 /*
-  The open row, marked by contrast alone. Not the accent — that is identity, and
-  a selection is not one — and not a state tone, because the seven belong to the
-  núcleo's state machines. Sunken recedes below the panel in dark and in light
-  alike, which is the one direction that reads as "this is the one being worked
-  on" in both.
+  The open row is marked by `.ui-current` — a 2px inset rule on the leading
+  edge, in `--text` — and by nothing else. It was `background:
+  var(--surface-sunken)`, argued for here on the grounds that sunken recedes
+  below the panel in dark and in light alike; that argument was sound and is no
+  longer the point. The app says "this one" one way everywhere now (the This-One
+  Rule, decided by the owner on 2026-09-06), and a page keeping its own good
+  answer is exactly how six pages each arrived at a different one.
+
+  **The class goes on the leading cell, not on the `tr`.** In a
+  `border-collapse: collapse` table a row is not a box that paints a shadow of
+  its own, so an inset rule asked for on the `tr` is a mark nobody sees. The row
+  header IS the row's leading edge and is a box, so the geometry the rule asks
+  for lands there unchanged. `agents-row-open` stays on the `tr` because the
+  weight below is a fact about the whole row rather than about one cell.
+
+  The weight is emphasis and not a second mark: `.ui-current` says which row,
+  and the semibold name says which agent the editor below is holding. What the
+  rule forbids is restating the choice as a fill, and this is not one.
 */
-.agents-row-open,
-.agents-row-open:hover {
-  background: var(--surface-sunken);
+.agents-row-open .agents-name {
+  font-weight: var(--weight-semibold);
 }
 
 /* ------------------------------------------------------------ row header -- */
@@ -133,6 +203,12 @@
   `color` on a button, so anything that does not say otherwise keeps the user
   agent's `buttonface` — which is how a control ends up a pale slab in a dark
   app.
+
+  No `:focus-visible` of its own. The global ring in `base.css` is already
+  `2px solid var(--focus-ring)` at `2px` offset on `--radius-sm`, and the copy
+  that stood here restated all three without changing one of them. The four
+  local overrides the app does keep all move the offset for a tight control —
+  see the field rule below, which is one of them.
 */
 .agents-name {
   padding: 0;
@@ -149,16 +225,6 @@
   text-decoration: underline;
 }
 
-.agents-name:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-  border-radius: var(--radius-sm);
-}
-
-.agents-row-open .agents-name {
-  font-weight: var(--weight-semibold);
-}
-
 /*
   What the machine calls it. Drawn on every row: this is the address the roster
   matrix, the specialist chips, both work tables and every council seat point
@@ -167,8 +233,6 @@
 */
 .agents-id {
   margin-left: var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
   color: var(--text-faint);
 }
 
@@ -197,24 +261,9 @@
 /* ---------------------------------------------------------------- cells -- */
 
 .agents-engine,
+.agents-model,
 .agents-changed {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
   color: var(--text-muted);
-  white-space: nowrap;
-}
-
-/*
-  Never wrapped. A model name is one token and has nothing to break at, and the
-  words that stand in for an absent one broke across two lines the first time
-  this was photographed — which drew the dashed underline twice and made those
-  rows taller than the ones around them, for no reason a reader could see.
-*/
-.agents-model {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-muted);
-  white-space: nowrap;
 }
 
 /*
@@ -228,14 +277,8 @@
   color: var(--text-faint);
 }
 
-/* Mark plus word, the grammar the console uses for a granted power. */
 .agents-tools {
-  display: inline-flex;
-  align-items: baseline;
   gap: var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  white-space: nowrap;
 }
 
 .agents-tools-tools {
@@ -254,20 +297,13 @@
 /* --------------------------------------------------------------- figure -- */
 
 .agents-figure {
-  display: inline-flex;
-  align-items: baseline;
   justify-content: flex-end;
   gap: var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
-  white-space: nowrap;
 }
 
 .agents-standing {
-  display: inline-flex;
-  align-items: baseline;
   gap: var(--space-1);
 }
 
@@ -303,15 +339,12 @@
   align-items: end;
 }
 
+/* The type is the label group at the top of this file. */
 .agents-field {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
   grid-column: span 3;
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 /* The prompt: the whole row, because it is the only field that is a document. */
@@ -362,6 +395,8 @@
   resize: vertical;
 }
 
+/* One of the app's four local rings, and it changes only the offset: at 2px a
+   ring around a field inside a twelve-column grid touches its neighbour. */
 .agents-field input:focus-visible,
 .agents-field select:focus-visible,
 .agents-field textarea:focus-visible {

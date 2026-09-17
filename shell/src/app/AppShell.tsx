@@ -104,7 +104,7 @@ function Frame() {
           projects={projects.data?.map((project) => ({
             id: project.project_id,
             mode: project.mode,
-            pending: project.open_proposals,
+            pending: project.open_review_items,
           }))}
           systemAlert={wantsAttention(health.data)}
         >

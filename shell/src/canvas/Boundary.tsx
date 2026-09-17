@@ -2,6 +2,7 @@
 import { useMemo } from "react";
 import type { ForeignFile, MapImport, MapModule, Seam } from "../data/project-map";
 import { buildSides, isBlindSpot } from "./map-sides";
+import { Quiet } from "../ui";
 
 /**
  * What this reading could not see, above every view of the map.
@@ -124,10 +125,14 @@ export function Boundary({ modules, imports, unread, foreign, seam }: BoundaryPr
           </>
         ) : null}
       </p>
+      {/*
+        A one-line absence, in the primitive. Muted and not faint, which is the rung the shared
+        component settles: faint is for metadata standing beside content, and here the sentence IS
+        the content — a panel whose answer is set fainter than its own labels reads as though it
+        failed rather than as though there was nothing to report.
+      */}
       {seam === undefined ? (
-        <p className="max-w-prose text-sm text-text-faint">
-          This daemon does not report the boundary, so what runs between these sides is unread here.
-        </p>
+        <Quiet says="This daemon does not report the boundary, so what runs between these sides is unread here." />
       ) : (
         <Routes seam={seam} />
       )}
@@ -171,13 +176,14 @@ function Routes({ seam }: { seam: Seam }) {
   // núcleo already refuses to compare against an empty list; this says so where somebody can see it.
   if (seam.served.length === 0) {
     return (
-      <p className="max-w-prose text-sm text-text-faint">
-        Nothing here registers a route this map knows how to read, so the boundary could not be read
-        from the daemon&apos;s side.
-        {seam.calls > 0
-          ? ` The ${seam.calls} calls the shell makes are left uncompared: a call cannot miss a route in a project where no route was found.`
-          : ""}
-      </p>
+      <Quiet
+        says={
+          "Nothing here registers a route this map knows how to read, so the boundary could not be read from the daemon's side." +
+          (seam.calls > 0
+            ? ` The ${seam.calls} calls the shell makes are left uncompared: a call cannot miss a route in a project where no route was found.`
+            : "")
+        }
+      />
     );
   }
   return (
@@ -188,9 +194,21 @@ function Routes({ seam }: { seam: Seam }) {
         shell makes {seam.calls} calls to them and{" "}
         <span className="text-text">{seam.matched}</span> match a route exactly.
       </p>
+      {/*
+        The finding, in the danger tone as its full triple — foreground, fill and edge — and it was
+        in none of them. The old border and fill utilities named a bare `danger` colour this app
+        does not have, so
+        the box shipped with the ground it stands on and a border falling back to the ordinary
+        hairline: the one thing on this panel worth looking at, drawn as though it were the rest.
+        Hand-diluting an opacity was the second half of the same mistake — the tone already carries
+        its own 12% fill and ~30% edge, and mixing a third pair is how two reds appear.
+
+        Not `ErrorNote`, which is a paragraph with `role="alert"`: this holds a list, and it is a
+        measurement taken every read rather than something that just went wrong.
+      */}
       {seam.unmatched.length > 0 ? (
         <div className="rounded-lg border border-tone-danger-border bg-tone-danger-bg px-3 py-2">
-          <p className="text-sm text-text">
+          <p className="ui-wrong text-sm">
             {seam.unmatched.length} call{seam.unmatched.length === 1 ? "" : "s"} ask for a route this
             daemon does not serve.
           </p>

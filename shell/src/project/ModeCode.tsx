@@ -13,7 +13,7 @@ import {
 } from "../data/project-code";
 import { openInVscode, vscodeUrl } from "../lib/vscode";
 import { isApiRefusal } from "../data/client";
-import { Teach } from "../ui";
+import { Count, Quiet, Teach } from "../ui";
 
 /**
  * "What is this?" — a review surface, not an IDE.
@@ -94,9 +94,15 @@ export function ModeCode({ projectId, run, onPickRun }: ModeCodeProps) {
               type="button"
               onClick={() => onPickRun(candidate)}
               aria-current={candidate === selected ? "true" : undefined}
+              /*
+                The run being reviewed is `.ui-current`, a 2px rule on the leading edge. It was the
+                brand colour over a raised fill: cyan marks identity, links and focus and never a
+                selection, and a fill marks nothing at all in the light theme, where `--surface` and
+                `--surface-raised` are both white.
+              */
               className={
                 candidate === selected
-                  ? "rounded-md border border-border-strong bg-surface-raised px-3 py-1 font-mono text-xs text-text"
+                  ? "ui-current rounded-md border border-border px-3 py-1 font-mono text-xs text-text"
                   : "rounded-md border border-border px-3 py-1 font-mono text-xs text-text-muted hover:text-text"
               }
             >
@@ -220,10 +226,10 @@ function ChangedFiles({
   return (
     <div className="flex flex-col gap-2">
       <p className="text-xs uppercase tracking-wide text-text-faint">
-        Changed {paths.length}
+        Changed <Count n={paths.length} />
       </p>
       {paths.length === 0 ? (
-        <p className="text-sm text-text-muted">This run has changed nothing yet.</p>
+        <Quiet says="This run has changed nothing yet." />
       ) : (
         <ul className="flex flex-col">
           {asTree(paths).map((node) => (

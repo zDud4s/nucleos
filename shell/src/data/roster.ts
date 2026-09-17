@@ -78,7 +78,7 @@ export function rankOf(project: ProjectSummary): number {
   if (project.mode === "off") return 4;
   if (folderOf(project) !== "ok") return 0;
   if (gateOf(project) === "failed") return 1;
-  if (project.open_proposals > 0) return 2;
+  if (project.open_review_items > 0) return 2;
   return 3;
 }
 
@@ -96,7 +96,7 @@ export function inAttentionOrder(rows: ProjectSummary[]): ProjectSummary[] {
   return [...rows].sort((a, b) => {
     const rank = rankOf(a) - rankOf(b);
     if (rank !== 0) return rank;
-    const waiting = b.open_proposals - a.open_proposals;
+    const waiting = b.open_review_items - a.open_review_items;
     if (waiting !== 0) return waiting;
     return a.project_id.localeCompare(b.project_id);
   });
@@ -128,15 +128,41 @@ export function headline(rows: ProjectSummary[]): string {
   const missing = rows.filter((row) => folderOf(row) === "missing").length;
   const unset = rows.filter((row) => folderOf(row) === "unset").length;
   const failing = rows.filter((row) => gateOf(row) === "failed").length;
-  const waiting = rows.reduce((total, row) => total + row.open_proposals, 0);
+  const waiting = rows.reduce((total, row) => total + row.open_review_items, 0);
 
   if (active > 0) parts.push(`${active} acting`);
   if (missing > 0) parts.push(`${missing} with the folder gone`);
   if (unset > 0) parts.push(`${unset} with no folder named`);
   if (failing > 0) parts.push(`${failing} failing the gate`);
-  if (waiting > 0) parts.push(`${waiting} proposal${waiting === 1 ? "" : "s"} open`);
+  // The number is `open_review_items`, which is proposals and shadow decisions together, so the
+  // word cannot be "proposal": master renamed the field precisely because the two are not the same.
+  if (waiting > 0) parts.push(`${waiting} item${waiting === 1 ? "" : "s"} to review`);
 
   return parts.join(" · ");
+}
+
+/**
+ * Where a project's waiting items actually are, as a phrase, or `null` when it cannot be said.
+ *
+ * **The total was the whole bug report.** A project whose brake was holding showed a full queue and
+ * an empty proposals list, and both were right: every waiting item was an unreviewed shadow
+ * decision, which lives on another screen. Measured on `nucleos` — 0 proposals, 13 shadow
+ * decisions. The word "review" pointed at the one page that could never clear it.
+ *
+ * `null` when the daemon is older than this shell and served no split, so the caller keeps saying
+ * only the total rather than claiming a zero it was not told.
+ */
+export function whereWaiting(project: {
+  open_proposals?: number;
+  open_shadow_decisions?: number;
+}): string | null {
+  const { open_proposals: proposals, open_shadow_decisions: shadow } = project;
+  if (proposals === undefined || shadow === undefined) return null;
+  const parts: string[] = [];
+  if (proposals > 0) parts.push(`${proposals} ${proposals === 1 ? "proposal" : "proposals"}`);
+  if (shadow > 0) parts.push(`${shadow} shadow ${shadow === 1 ? "decision" : "decisions"}`);
+  if (parts.length === 0) return null;
+  return parts.join(" and ");
 }
 
 /* ------------------------------------------------------------------ the exit -- */

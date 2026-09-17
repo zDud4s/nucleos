@@ -14,18 +14,69 @@
 
 /* ================================================================ shared == */
 
-.teams-note,
-.teams-empty,
-.teams-loading {
+/**
+ * A sentence this slice says in its own voice — what a route answered, what a
+ * control will not do, where a run came from. It is the one that is left:
+ * `.teams-empty` and `.teams-loading` beside it were the one-line absence, and
+ * that is `Quiet` now. `.teams-origin` and `.teams-section-note` were this same
+ * rule written twice more under other names.
+ *
+ * Muted and not faint, for the reason `.ui-quiet` gives: faint is the rung for
+ * metadata standing beside content, and here the sentence IS the content.
+ */
+.teams-note {
   margin: 0;
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
   color: var(--text-muted);
 }
 
-.teams-loading,
-.teams-empty {
-  color: var(--text-faint);
+/* ------------------------------------------------------- the box family -- */
+
+/**
+ * A rule, a finished task, a round item and an action were four boxes drawn to
+ * one recipe four times; the box itself is `Inset` now. What follows is what
+ * was left of them, and it was duplicated the same way.
+ */
+
+/* The top line of a box — a name, a badge, whatever else that kind carries —
+   and the row of controls at its foot, which is the same row with a lift. */
+.teams-rule-head,
+.teams-act-head,
+.teams-actions,
+.teams-act-controls,
+.teams-rule-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Lifted off the sentence above them. A form's own row sits in the form's gap. */
+.teams-act-controls,
+.teams-rule-controls {
+  margin-top: var(--space-1);
+}
+
+/* The identifier at the head of a box. Mono because the daemon named it. A
+   specialist and an action kind are not this: they read as names, and take the
+   body face further down. */
+.teams-grant-name {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+/* What the box is, in a sentence. `.teams-act-why` adds the quotation rule to
+   this and nothing else — see the decisions section. */
+.teams-rule-what,
+.teams-item-what,
+.teams-act-why {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
 
 /* =============================================================== console == */
@@ -271,24 +322,6 @@
   min-width: 120px;
 }
 
-/*
-  A mark's meaning in words, for anything that does not render. `.ui-who-said`
-  and `.ui-spark-label-said` are the same treatment; there is no shared class
-  in this app, and each stylesheet carries its own.
-*/
-.teams-said,
-.teams-matrix-said {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-  border: 0;
-}
-
 /* ========================================================= charter bits == */
 
 /*
@@ -312,13 +345,6 @@
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2);
-}
-
-/* The per-task ceilings. Text now, not chips — the run reads as a sentence. */
-.teams-charter-limits {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2) var(--space-4);
 }
 
 /* ============================================================== live task == */
@@ -426,19 +452,24 @@
   font-variant-numeric: tabular-nums;
 }
 
-/*
-  The director. Carried by weight and not by hue: accent is the app's one pointer and
-  a matrix that spends it on every director spends it dozens of times per screen, at
-  which point it points at nothing. Semibold against the staff's regular says the same
-  thing and says it in a chart printed in grey.
-*/
+/**
+ * Three standings, three rungs of ink — and the glyph, not the colour, is what
+ * says which is which (`◉`, `●`, `·` in `RosterMatrix.tsx`).
+ *
+ * This followed `.ui-who-leads` off the accent on 2026-09-06, by the same
+ * owner decision. Dropping the hue cost nothing here: the mark already carried
+ * the fact, so the colour only had to keep the three apart, and full ink over
+ * muted over `--border-strong` does that in both themes. The director also takes
+ * semibold against the staff's regular, so the chart still says who leads when
+ * it is printed in grey.
+ */
 .teams-matrix-leads {
   color: var(--text);
   font-weight: var(--weight-semibold);
 }
 
 .teams-matrix-staff {
-  color: var(--text);
+  color: var(--text-muted);
 }
 
 /* Not on staff. Quiet enough that the filled cells are the shape you see. */
@@ -474,12 +505,6 @@
   background: var(--surface);
 }
 
-.teams-grant-name {
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  color: var(--text);
-}
-
 .teams-grant-modes {
   display: flex;
   gap: var(--space-2);
@@ -497,36 +522,11 @@
   list-style: none;
 }
 
-.teams-rule {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-}
-
-.teams-rule-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-}
-
 .teams-rule-name {
   font-family: var(--font-display);
   font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
   color: var(--text);
-}
-
-.teams-rule-what {
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
 }
 
 .teams-rule-next {
@@ -615,14 +615,23 @@
   color: var(--text);
 }
 
-/*
-  Chosen, on the achromatic ladder: a raised surface and a rule down the leading edge,
-  which is the same way a selected row is said everywhere else here. Accent stays the
-  one pointer rather than the paint on every picked option.
-*/
+/**
+ * A chosen option in a native multi-select.
+ *
+ * The one place in the app where the This-One Rule's *mark* cannot be used. An
+ * `option` is rendered by the platform, not by us: it takes a `background` and a
+ * `color` and ignores `box-shadow` outright, so there is no leading edge to draw
+ * on and no shadow to draw with.
+ *
+ * What carries instead is the rule's other half — a rung of the neutral ladder
+ * rather than the brand hue. `--border` is the one that works on this ground in
+ * both themes: the select's own fill is `--surface-sunken`, and `--border` sits
+ * clear of it at `#262b35` on `#08090c` in dark and `#dcdfe6` on `#eceef3` in
+ * light. It was `--accent-quiet`, which is the Reserved Cyan Rule broken and, at
+ * 12% alpha over a sunken ground, very nearly invisible besides.
+ */
 .teams-select[multiple] option:checked {
-  background: var(--surface-raised);
-  border-left: 2px solid var(--border-strong);
+  background: var(--border);
   color: var(--text);
 }
 
@@ -631,13 +640,6 @@
 .teams-textarea:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
-}
-
-.teams-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
 }
 
 /* ================================================================== runs == */
@@ -838,6 +840,16 @@
   margin: 0 0 var(--space-1);
 }
 
+/*
+  The round after the current one, standing where its chips would be. A value
+  that is absent, not a region that is empty — `Quiet` is the region case, and
+  it is a flex block, which is the wrong shape inside a line the row is already
+  making. Same reasoning as `.teams-alone-none` and `.teams-matrix-none`.
+*/
+.teams-round-none {
+  color: var(--text-faint);
+}
+
 /* ============================================================== routines == */
 
 .teams-rule-source,
@@ -856,14 +868,6 @@
   color: var(--text-muted);
 }
 
-.teams-rule-controls {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  margin-top: var(--space-1);
-}
-
 /* ============================================================ decisions == */
 
 .teams-decisions {
@@ -880,29 +884,17 @@
 }
 
 /* The director's own sentence — a quotation, because it is what a person
-   actually reads before answering, not a field of the payload. */
+   actually reads before answering, not a field of the payload. The rule is all
+   it adds to the shared sentence recipe at the top of this file. */
 .teams-act-why {
-  margin: 0;
   padding-left: var(--space-3);
   border-left: 2px solid var(--border-strong);
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
 }
 
 .teams-act-field-name {
   flex: none;
   width: 5rem;
   color: var(--text-faint);
-}
-
-.teams-act-controls {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  margin-top: var(--space-1);
 }
 
 .teams-act-outcome {
@@ -950,13 +942,6 @@
   }
 }
 
-.teams-section-note {
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--text-muted);
-}
-
 .teams-section-fields {
   display: flex;
   flex-direction: column;
@@ -964,6 +949,7 @@
   min-width: 0;
 }
 
+/* The per-task ceilings. Text now, not chips — the run reads as a sentence. */
 .teams-charter-limits {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
@@ -1065,13 +1051,7 @@
 
 /* ============================================================= run detail == */
 
-.teams-origin {
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--text-muted);
-}
-
+/* One round of a run: its label, then its items as rows. */
 .teams-round {
   display: flex;
   flex-direction: column;
@@ -1084,12 +1064,14 @@
 }
 
 .teams-round-head {
+  margin: 0;
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
   color: var(--text-faint);
 }
 
+/* A specialist's name reads as a name here, not as an identifier: the body face. */
 .teams-item-agent {
   font-family: var(--font-body);
   font-size: var(--text-sm);
@@ -1101,14 +1083,6 @@
   grid-template-columns: auto auto minmax(0, 1fr) auto;
   align-items: baseline;
   gap: var(--space-2) var(--space-3);
-}
-
-.teams-item-what {
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
 }
 
 .teams-item-output {
@@ -1130,23 +1104,8 @@
   list-style: none;
 }
 
-.teams-act {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-}
-
-.teams-act-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-}
-
+/* The kind of action at the head of an `Inset`, in the body face for the same reason
+   as `.teams-item-agent`. */
 .teams-act-kind {
   font-family: var(--font-body);
   font-size: var(--text-sm);
@@ -1405,12 +1364,6 @@
 /* Not started is a resting state and has no tone. */
 .teams-org-pending .teams-org-box {
   stroke-dasharray: 3 3;
-}
-
-.teams-org-empty {
-  margin: var(--space-2) 0 0;
-  font-size: var(--text-sm);
-  color: var(--text-faint);
 }
 
 /**

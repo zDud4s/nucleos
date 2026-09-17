@@ -11,7 +11,23 @@ import {
   type MergeSuggestion,
 } from "../data/contacts";
 import { useDecideContactMerge, type ApprovalOutcome } from "../data/waiting";
-import { Badge, Button, ConfirmButton, Count, ErrorNote, PageHeader, Panel, Quiet, RefusalNote, RelativeTime, Section, StaleNote } from "../ui";
+import {
+  Badge,
+  Button,
+  ConfirmButton,
+  ConflictNote,
+  Count,
+  ErrorNote,
+  PageHeader,
+  Panel,
+  Quiet,
+  RefusalNote,
+  RelativeTime,
+  Row,
+  Rows,
+  Section,
+  StaleNote,
+} from "../ui";
 import "./contacts.css";
 
 /**
@@ -123,11 +139,11 @@ function IdentityQuestions({ view }: { view: ReturnType<typeof useContactMerges>
       </p>
       {view.isError && rows.length === 0 && <MergesError error={view.error} />}
       {rows.length > 0 && (
-        <ul className="ui-rows contacts-questions" aria-label="Identity questions">
+        <Rows label="Identity questions" className="contacts-questions">
           {rows.map((suggestion) => (
             <IdentityQuestion key={suggestion.proposal_id} suggestion={suggestion} decide={decide} />
           ))}
-        </ul>
+        </Rows>
       )}
       <DecisionNotes outcome={decide.data} error={decide.isError ? decide.error : null} />
     </Panel>
@@ -147,7 +163,7 @@ function IdentityQuestion({
   decide: ReturnType<typeof useDecideContactMerge>;
 }) {
   return (
-    <li className="ui-rows-row contacts-question">
+    <Row className="contacts-question">
       <div className="contacts-question-head">
         <span className="contacts-question-id">question #{suggestion.proposal_id}</span>
         <RelativeTime at={suggestion.created_at} />
@@ -158,10 +174,10 @@ function IdentityQuestion({
         <MergeSideView side={suggestion.absorb} role="absorbed" />
       </div>
       {mergeVerdictsConflict(suggestion) && (
-        <p className="contacts-conflict">
+        <ConflictNote>
           These two carry standing decisions that disagree, so approving will be refused — settle one
           of them and decide this again.
-        </p>
+        </ConflictNote>
       )}
       <p className="contacts-permanent">Refusing below is permanent — this exact pair is never suggested again.</p>
       <div className="contacts-actions">
@@ -180,22 +196,36 @@ function IdentityQuestion({
           onConfirm={() => decide.mutate({ proposalId: suggestion.proposal_id, verdict: "reject" })}
         />
       </div>
-    </li>
+    </Row>
   );
 }
 
+/**
+ * One side of a suggested merge, under the word for what happens to it.
+ *
+ * `kept` and `absorbed` are a heading and not a field label — the whole point
+ * of showing both sides is that the merge is not symmetrical, and which of the
+ * two survives is the first thing a reader has to know. `Section` is the
+ * heading rank; the label rank it used to be written in is what a `dt` gets,
+ * and at 11px the two are told apart by 0.06em of tracking and nothing else.
+ *
+ * `level={3}` because the `Panel` above already spends the `h2` on "Identity
+ * questions". Announced as an `h2` these would be that panel's siblings, which
+ * is the opposite of what the page means.
+ */
 function MergeSideView({ side, role }: { side: MergeSide; role: string }) {
   return (
-    <div className="contacts-side">
-      <p className="contacts-side-role">{role}</p>
-      <p className="contacts-side-name">{side.display_name ?? "no name recorded"}</p>
-      <ul className="contacts-side-addresses">
-        {side.addresses.map((address) => (
-          <li key={address}>{address}</li>
-        ))}
-      </ul>
-      <p className="contacts-meta">{side.messages_in} messages in</p>
-    </div>
+    <Section label={role} level={3}>
+      <div className="contacts-side">
+        <p className="contacts-side-name">{side.display_name ?? "no name recorded"}</p>
+        <ul className="contacts-side-addresses">
+          {side.addresses.map((address) => (
+            <li key={address}>{address}</li>
+          ))}
+        </ul>
+        <p className="contacts-meta">{side.messages_in} messages in</p>
+      </div>
+    </Section>
   );
 }
 
@@ -250,18 +280,21 @@ function IdentityRefusal({ error }: { error: unknown }) {
 
 function PeopleRoster({ rows }: { rows: Correspondent[] }) {
   const merged = mergedContactIds(rows);
+  // Hairline-ruled and not a column of cards: this is read by scanning down it,
+  // not by picking rows out of it — the same posture the mail queue takes, and
+  // the argument `.ui-rows` now carries for all four lists that had it.
   return (
-    <ul className="contacts-roster" aria-label="People">
+    <Rows label="People">
       {rows.map((row) => (
         <PersonRow key={row.address} row={row} merged={merged.has(row.contact_id)} />
       ))}
-    </ul>
+    </Rows>
   );
 }
 
 function PersonRow({ row, merged }: { row: Correspondent; merged: boolean }) {
   return (
-    <li className="contacts-row">
+    <Row>
       <div className="contacts-row-head">
         <span className="contacts-row-address">{row.address}</span>
         <span className="contacts-row-name">{row.display_name ?? "no name recorded"}</span>
@@ -280,7 +313,7 @@ function PersonRow({ row, merged }: { row: Correspondent; merged: boolean }) {
         <SenderVerdictToggles address={row.address} verdict={row.verdict} />
         <UnmergeButton address={row.address} linkedBy={row.linked_by} />
       </div>
-    </li>
+    </Row>
   );
 }
 
@@ -289,7 +322,7 @@ function PersonRow({ row, merged }: { row: Correspondent; merged: boolean }) {
 function SenderVerdictToggles({ address, verdict }: { address: string; verdict: string | null }) {
   const mutate = useSenderVerdict();
   return (
-    <div className="contacts-verdict-actions">
+    <div className="contacts-actions">
       <Button
         variant={verdict === "pin" ? "approve" : "ghost"}
         disabled={mutate.isPending}
@@ -335,7 +368,7 @@ function UnmergeButton({ address, linkedBy }: { address: string; linkedBy: strin
   if (linkedBy !== "human") return null;
 
   return (
-    <div className="contacts-unmerge">
+    <div className="contacts-actions">
       <ConfirmButton
         label="Not the same person"
         confirmLabel="Pull this address back apart"

@@ -23,6 +23,24 @@ pub struct CreateRunRequest {
     /// being created a particular way.
     #[serde(default)]
     pub steerable: bool,
+    /// What this run may do without stopping to ask, when there is nobody to ask.
+    ///
+    /// Absent means what it has always meant: the column stays NULL, `pretooluse_decision`
+    /// reads NULL as `Auto`, and a call the classifier will not decide parks the run for a
+    /// person. The one value that changes anything today is `dont_ask`, and what it changes is
+    /// a PARK into a REFUSAL — the run keeps going and does the rest of the work.
+    ///
+    /// It is a tightening and never a widening, which is why this field is safe to expose on a
+    /// route that starts unattended work. `dont_ask` permits precisely what `auto` permits
+    /// (`allowed_at`) and refuses everything `auto` would have stopped to ask about; there is no
+    /// spelling here that lets a run do something it could not do before.
+    ///
+    /// A spelling outside the six fails the whole request rather than falling back to `auto`,
+    /// for the reason the two chat routes give: the READER is lenient so that rows written
+    /// before the column existed still parse, and applying that leniency to a REQUEST would let
+    /// a typo quietly widen what an unattended run may do.
+    #[serde(default)]
+    pub permission_mode: Option<crate::chats::PermissionMode>,
 }
 
 fn default_run_mode() -> String {
@@ -158,7 +176,18 @@ pub async fn search(
 #[derive(Debug)]
 pub enum CreateRunError {
     Invalid(&'static str),
+    /// The project's slot, or the house's, is taken: another run holds what this one needed.
     Busy,
+    /// The volume the checkout would live on is below the free-space floor. The sentence says how
+    /// much room there was and against which floor, and is the one `worktree_provision_failed` also
+    /// carries.
+    ///
+    /// Its own variant rather than a `Busy`, and not because anything retries it differently —
+    /// every caller still treats it as a condition that passes rather than a failure. On 2026-09-14
+    /// a job refused its item this way read `status waiting, wait_reason slot` and fed `another run
+    /// holds the project's worktree slot`; whoever reads that goes looking for the run holding it,
+    /// finds none, and never learns the disk is full. The two refusals ask for different hands.
+    NoRoomOnDisk(String),
     Worktree(std::io::Error),
     Db(sqlx::Error),
 }
@@ -188,6 +217,7 @@ impl std::fmt::Display for CreateRunError {
         match self {
             Self::Invalid(message) => formatter.write_str(message),
             Self::Busy => formatter.write_str("run creation is busy"),
+            Self::NoRoomOnDisk(refusal) => formatter.write_str(refusal),
             Self::Worktree(error) => write!(formatter, "worktree provisioning failed: {error}"),
             Self::Db(error) => write!(formatter, "database error: {error}"),
         }
@@ -199,7 +229,7 @@ impl std::error::Error for CreateRunError {
         match self {
             Self::Worktree(error) => Some(error),
             Self::Db(error) => Some(error),
-            Self::Invalid(_) | Self::Busy => None,
+            Self::Invalid(_) | Self::Busy | Self::NoRoomOnDisk(_) => None,
         }
     }
 }
@@ -232,6 +262,90 @@ pub struct RunStatusResponse {
     /// The run that continued this one after a context handoff, when there was one. Without it the
     /// link the handoff records is reachable only by reading the database directly.
     pub successor_run_id: Option<i64>,
+    /// How much of this run's prompt this daemon wrote itself, as an estimated token count.
+    ///
+    /// The MCP tool schemas, `--append-system-prompt`, the `--agents` JSON and the prompt — the four
+    /// things `runner::authored_prompt` prices off the argument vector. `null` for a run this daemon
+    /// did not author a prompt for, and for every run launched before the column existed; neither is
+    /// a run that wrote nothing, which is why this is not defaulted to zero anywhere on the way out.
+    ///
+    /// `estimate` and not `tokens` in the name, and the label on screen says the same. Four
+    /// characters to the token — see `prompt_budget`, which holds the ruler and the argument for it.
+    #[sqlx(default)]
+    pub authored_prompt_estimate: Option<i64>,
+    /// Everything else in the prompt, as an estimate: the CLI's own.
+    ///
+    /// The whole reported prompt minus the part above. **One residual and never a breakdown** — the
+    /// CLI's system prompt, its built-in tool definitions, whatever it loaded from CLAUDE.md, the
+    /// by-name tool listing a deferring run gets instead of schemas, and the conversation itself are
+    /// all in here, undivided, because nothing in the stream separates them and this daemon does not
+    /// send the one people ask about. `prompt_budget`'s header is where that refusal is argued; this
+    /// field is where it shows.
+    ///
+    /// `null` whenever either side is unknown, which includes every run that reported no usage at
+    /// all. A zero here means the estimate above met or exceeded the whole reported prompt.
+    ///
+    /// **What dominates that is DEFERRAL, and this doc used to blame the wrong thing.** It said a
+    /// zero "happens on a short run because chars/4 overshoots on schema JSON", which is not the
+    /// cause on the ordinary case: a chat turn is `ToolPolicy::Unrestricted`, the CLI keeps
+    /// `ToolSearch` and advertises MCP tools by name, and the schema JSON is not in the prompt at all
+    /// — so charging it here subtracted roughly 10,250 estimated tokens that were never paid, and
+    /// understated this residual by exactly that. `runner::authored_prompt` now charges the schemas
+    /// only when they are shipped, and holds the rule and the measurements. Nor does the old
+    /// sentence survive being checked in the SHIPPED regime, where it would at least be on topic:
+    /// measured there, chars/4 put the schema block at 10,250 against ~11,160 attributable, so it
+    /// runs about 8% LOW rather than high. A residual can still reach zero on a genuinely short run,
+    /// where the prompt this daemon authored is most of what the model read — but the ruler's few
+    /// percent is not the reason, and deferral is the mechanism that used to force it.
+    #[sqlx(default)]
+    pub cli_own_estimate: Option<i64>,
+    /// The stored character count, read only so the estimate above can be derived from it.
+    ///
+    /// Not serialised: the wire contract is estimates, and offering characters beside them would
+    /// invite a second reader to divide by four somewhere else.
+    #[serde(skip)]
+    #[sqlx(default)]
+    pub authored_prompt_chars: Option<i64>,
+    /// Read only to complete the reported prompt total, which is input + cache reads + cache
+    /// creation and not the first of the three — `token_efficiency::Measures::total_prompt_tokens`
+    /// makes the same argument: "any ratio taken from `input_tokens` alone is wrong by omission".
+    ///
+    /// Not serialised, because adding a fourth token count to this response is a separate decision
+    /// from computing a residual with it.
+    #[serde(skip)]
+    #[sqlx(default)]
+    pub cache_creation_tokens: Option<i64>,
+}
+
+impl RunStatusResponse {
+    /// The whole prompt this run reported, or `None` if any of its three parts is missing.
+    ///
+    /// Deliberately the same shape as `token_efficiency::Measures::total_prompt_tokens`, which is
+    /// private to that module and belongs to a different feature. Any of the three being unknown
+    /// makes the total unknown rather than smaller — a run that reported two of three and had the
+    /// third counted as zero would show a residual that is too small by exactly the missing part.
+    fn reported_prompt_tokens(&self) -> Option<i64> {
+        let input = self.input_tokens?;
+        let read = self.cache_read_tokens?;
+        let created = self.cache_creation_tokens?;
+        input.checked_add(read)?.checked_add(created)
+    }
+
+    /// Fills the two derived fields from the columns just read.
+    ///
+    /// Derived on the way out rather than stored: the residual is the difference between something
+    /// written at launch and something written at the end, so a stored copy would be wrong for the
+    /// whole life of a running run and would have to be rewritten to stop being.
+    fn with_prompt_budget(mut self) -> Self {
+        self.authored_prompt_estimate = self
+            .authored_prompt_chars
+            .map(crate::prompt_budget::estimate_from_chars);
+        self.cli_own_estimate = crate::prompt_budget::residual_estimate(
+            self.reported_prompt_tokens(),
+            self.authored_prompt_estimate,
+        );
+        self
+    }
 }
 
 pub async fn create_run(
@@ -332,13 +446,21 @@ pub async fn create_run(
     // the GC skips it, and it holds one of the project's concurrency slots, narrowing the whole
     // project until the daemon restarts, the only thing that reconciles `running` rows.
     let id = crate::http::uncancellable(async move {
-        create_run_inner(
+        // `create_run_with` rather than `create_run_inner`, which is the same funnel with this
+        // one argument fixed at `None`. The three callers outside this module (the scheduler,
+        // the repo trigger, the triage loop) go on using the wrapper and go on getting NULL,
+        // which is what every run they have ever made carried.
+        create_run_with(
             &state,
-            req.prompt,
-            req.project_id,
-            req.cwd,
-            &req.mode,
-            req.steerable,
+            NewRun {
+                prompt: req.prompt,
+                project_id: req.project_id,
+                cwd: req.cwd,
+                mode: &req.mode,
+                steerable: req.steerable,
+                provisioning: None,
+                permission_mode: req.permission_mode,
+            },
         )
         .await
     })
@@ -806,6 +928,39 @@ async fn append_run_events(pool: &sqlx::SqlitePool, run_id: i64, stdout: &str) {
     }
 }
 
+/// Records how much of this run's prompt the daemon itself wrote, in characters.
+///
+/// `None` writes nothing at all, and that is the whole reason this takes an `Option` rather than an
+/// `AuthoredPrompt`: the column is NULL for every run whose prompt is not one this daemon authored —
+/// the local model, the Codex CLI, every fake — and NULL there is a real answer. Writing `0` instead
+/// would say those runs were launched with an empty prompt and no tools, which is a claim about
+/// their contents rather than an admission of not knowing.
+///
+/// In CHARACTERS, not in the estimate. The four-characters-to-the-token ruler belongs to whoever
+/// reads the column, so a row written today is not stuck with today's ruler if the ruler improves.
+///
+/// Best effort, like `append_run_events` above and for the same reason: this is bookkeeping about a
+/// run, and a failure to write it must not turn a launch that is otherwise fine into a failed one.
+///
+/// `pub(crate)` because `spawn_run` is not the only launcher that writes a `runs` row. An assistant
+/// turn inserts its own and spawns its own CLI, and it is the launcher that actually carries an
+/// `--mcp-config` — so a column wired only here would be non-null on every run whose schema cost is
+/// a real zero and null on every run that pays one, which is exactly backwards.
+pub(crate) async fn record_authored_prompt(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+    authored: Option<crate::prompt_budget::AuthoredPrompt>,
+) {
+    let Some(authored) = authored else {
+        return;
+    };
+    let _ = sqlx::query("UPDATE runs SET authored_prompt_chars = ? WHERE id = ?")
+        .bind(authored.total_chars() as i64)
+        .bind(run_id)
+        .execute(pool)
+        .await;
+}
+
 /// How often a LIVE run's context fill is copied from the stream mirror into its row.
 ///
 /// Throttled on purpose. The mirror is rewritten on every streamed line — many per second — and the
@@ -1214,13 +1369,18 @@ async fn prepare_handoff_successor(
     // across a handoff — so the successor keeps it, and `spawn_handoff_if_needed` launches
     // listening. Row and launch move together: a launch that listened while its row refused would
     // hold stdin open with no way to close it, which is the failure the old comment here feared.
+    // `permission_mode` travels with the rest, and it has to: a successor is the SAME work
+    // carried on in a fresh window, so a rung the predecessor was given and the successor was
+    // not would be a run that quietly went back to parking halfway through. Nothing sets the
+    // column on this path today — the assistant writes it and the assistant does not hand off
+    // — which is exactly why it is copied now, while the answer is still "nothing changes".
     let inserted = sqlx::query(
         "INSERT INTO runs (
              project_id, cwd, prompt, status, mode, session_id, read_untrusted, created_at,
-             job_id, stage, item_id, steerable
+             job_id, stage, item_id, steerable, permission_mode
          )
          SELECT project_id, cwd, ?, 'running', mode, ?, read_untrusted, ?, job_id, stage, item_id,
-                steerable
+                steerable, permission_mode
          FROM runs WHERE id = ?",
     )
     .bind(&prompt)
@@ -1489,6 +1649,11 @@ fn spawn_run(
                 permission,
                 resume_session_id: resume_session_id.clone(),
                 mcp_config: None,
+                // No server, so no surface for one to announce. Written out beside its pair rather
+                // than left to a default, because the two fields are only ever true together: a box
+                // named here would describe tools this run is never offered, and `authored_prompt`
+                // would charge it for them.
+                mcp_box: None,
                 tool_policy,
                 progress_timeout: Some(progress_timeout),
                 // The brake that was missing. These are the runs nobody is watching, and the
@@ -1534,6 +1699,20 @@ fn spawn_run(
                 run_messages.lock().unwrap().insert(id, messages_tx);
                 request.messages = Some(messages_rx);
             }
+            // What this launch itself wrote into the model's prompt, priced from the request that is
+            // about to become an argument vector — and priced HERE, in the last statement before the
+            // spawn, because `request` is moved into the runner on the very next line and nothing
+            // downstream ever sees those values again.
+            //
+            // The runner decides whether there is anything to say: `authored_prompt` answers `None`
+            // for every runner whose prompt this daemon does not author, and a `None` writes no row
+            // rather than a zero. Recomputing this later from the run's stored `prompt` would be a
+            // second source of truth that omits the three flags — which are most of the number.
+            //
+            // Re-written on every attempt, deliberately: a retry starts a fresh CLI on a fresh
+            // context and pays for the whole prompt again, so the column describes the attempt that
+            // is running rather than the first one that was tried.
+            record_authored_prompt(&pool, id, runner.authored_prompt(&request)).await;
             let result = tokio::time::timeout(
                 run_timeout,
                 runner.run_prompt_with_context_fill(
@@ -1647,6 +1826,15 @@ fn spawn_run(
                     warn_on_terminal_write_err(&completed, id, terminal_status);
                     let terminal_write_won =
                         matches!(&completed, Ok(result) if result.rows_affected() == 1);
+                    // A progress deadline kills the CLI before it can report what it spent, so the
+                    // write above just recorded that NULL as final. The wall-clock arm approximates
+                    // such a run from its duration; one cut by its own runner's deadline arrives
+                    // here instead, and was simply free - run 900501 sat silent for half an hour on
+                    // 2026-09-13 and the budget never saw it. Inside the won-the-race guard for the
+                    // wall-clock arm's reason: a lost CAS means another terminator owns the row.
+                    if terminal_status == "timed_out" && terminal_write_won {
+                        record_time_approx_cost(&pool, id).await;
+                    }
                     // The feed row announces this run *finished* — only true if this write won the
                     // CAS race. `Ok` with 0 rows means a concurrent terminator (cancel/timeout) got
                     // there first, so this attempt never actually completed as far as the runs table
@@ -1949,17 +2137,27 @@ pub async fn create_run_inner(
     mode: &str,
     steerable: bool,
 ) -> Result<i64, CreateRunError> {
-    create_run_with(state, prompt, project_id, cwd, mode, steerable, None).await
+    create_run_with(
+        state,
+        NewRun {
+            prompt,
+            project_id,
+            cwd,
+            mode,
+            steerable,
+            provisioning: None,
+            permission_mode: None,
+        },
+    )
+    .await
 }
 
 /// Starts the one run that is given its work already staged: a merge conflict, put there by the
 /// daemon, in a worktree born on the branch the merge was going into.
 ///
-/// `mode = "worktree"` and nothing else, like every other autonomous run that touches code — it
-/// carries the tool policy, the gate, and migration 0009's exclusivity, none of which a fourth mode
-/// would inherit. Never steerable, for `create_job_node_run`'s reason and one of its own: the work
-/// is a conflict the queue found, and text typed into it mid-flight would change what gets published
-/// with nothing recording the substitution.
+/// Shape and shared reasoning in [`NewRun::provisioned`]. Its "never steerable" holds here for one
+/// reason of its own besides: the work is a conflict the queue found, and text typed into it
+/// mid-flight would change what gets published with nothing recording the substitution.
 pub async fn create_resolution_run(
     state: &AppState,
     prompt: String,
@@ -1969,21 +2167,22 @@ pub async fn create_resolution_run(
 ) -> Result<i64, CreateRunError> {
     create_run_with(
         state,
-        prompt,
-        Some(project_id),
-        Some(project_root),
-        "worktree",
-        false,
-        Some(Provisioning::Resolution(resolution)),
+        NewRun::provisioned(
+            prompt,
+            project_id,
+            project_root,
+            Provisioning::Resolution(resolution),
+        ),
     )
     .await
 }
 
 /// Starts one node of a job inside that job's existing worktree.
 ///
-/// Deliberately `mode = "worktree"` rather than a mode of its own: `plan_only`, the tool policy,
-/// `max_attempts` and migration 0009's exclusivity index all branch on `mode`, and a fourth value
-/// would have to be excluded from each of them. Missing one would be silent.
+/// Shape and shared reasoning in [`NewRun::provisioned`]. Its `mode = "worktree"` is deliberate
+/// rather than a mode of its own: `plan_only`, the tool policy, `max_attempts` and migration 0009's
+/// exclusivity index all branch on `mode`, and a fourth value would have to be excluded from each
+/// of them. Missing one would be silent.
 pub async fn create_job_node_run(
     state: &AppState,
     prompt: String,
@@ -1993,16 +2192,7 @@ pub async fn create_job_node_run(
 ) -> Result<i64, CreateRunError> {
     create_run_with(
         state,
-        prompt,
-        Some(project_id),
-        Some(project_root),
-        "worktree",
-        // Never steerable. A node is one step of a plan the job is executing, and text typed into it
-        // mid-flight would change what that step does with nothing recording the substitution — the
-        // queue would still claim the item it was given. Steering belongs to a run somebody started
-        // and is watching.
-        false,
-        Some(Provisioning::Node(node)),
+        NewRun::provisioned(prompt, project_id, project_root, Provisioning::Node(node)),
     )
     .await
 }
@@ -2023,12 +2213,7 @@ pub async fn create_job_item_run(
 ) -> Result<i64, CreateRunError> {
     create_run_with(
         state,
-        prompt,
-        Some(project_id),
-        Some(project_root),
-        "worktree",
-        false,
-        Some(Provisioning::Item(item)),
+        NewRun::provisioned(prompt, project_id, project_root, Provisioning::Item(item)),
     )
     .await
 }
@@ -2153,15 +2338,68 @@ async fn no_room_on_disk(project_root: &std::path::Path) -> Option<String> {
     })
 }
 
-async fn create_run_with(
-    state: &AppState,
+/// Everything a new run IS, apart from the daemon it is created in.
+///
+/// **One argument and not seven, and the lint that asked for this was right about more than
+/// counting.** Four of the callers below pass the same five values in the same order, three of
+/// them pass a literal `"worktree"`, `false`, and a `None` carrying six lines of explanation
+/// apiece — repeated verbatim, three times, because there was nowhere else to put it. A struct
+/// gives the shared shape a name ([`NewRun::provisioned`]) and the shared reasoning one home.
+struct NewRun<'a> {
     prompt: String,
     project_id: Option<String>,
     cwd: Option<String>,
-    mode: &str,
+    mode: &'a str,
     steerable: bool,
     provisioning: Option<Provisioning>,
-) -> Result<i64, CreateRunError> {
+    permission_mode: Option<crate::chats::PermissionMode>,
+}
+
+impl NewRun<'static> {
+    /// The shape the daemon starts its OWN work in: a job's node, a job's item, and the queue's
+    /// conflict resolution. All three agree on every field but the provisioning, and the agreement
+    /// is not a coincidence -- each one is the daemon acting on a plan it already holds.
+    ///
+    /// `mode = "worktree"` and nothing else, like every other autonomous run that touches code: it
+    /// carries the tool policy, the gate, and migration 0009's exclusivity, none of which a fourth
+    /// mode would inherit.
+    ///
+    /// Never steerable. Each is one step of a plan already agreed, and text typed into it mid-flight
+    /// would change what that step does with nothing recording the substitution -- the queue would
+    /// still claim the item it was given. Steering belongs to a run somebody started and is watching.
+    ///
+    /// No rung asked for. These are started by the daemon rather than by a caller who could have an
+    /// opinion -- and the park is the RIGHT answer for them: `a_park_here_would_only_destroy`
+    /// already refuses the cases where it is not, on evidence, and a blanket rung here would take
+    /// that judgement away from it.
+    fn provisioned(
+        prompt: String,
+        project_id: String,
+        project_root: String,
+        provisioning: Provisioning,
+    ) -> Self {
+        Self {
+            prompt,
+            project_id: Some(project_id),
+            cwd: Some(project_root),
+            mode: "worktree",
+            steerable: false,
+            provisioning: Some(provisioning),
+            permission_mode: None,
+        }
+    }
+}
+
+async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, CreateRunError> {
+    let NewRun {
+        prompt,
+        project_id,
+        cwd,
+        mode,
+        steerable,
+        provisioning,
+        permission_mode,
+    } = run;
     let node = provisioning.as_ref().and_then(Provisioning::node);
     let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
     let item = provisioning.as_ref().and_then(Provisioning::item);
@@ -2217,9 +2455,13 @@ async fn create_run_with(
 
     let now = chrono::Utc::now().to_rfc3339();
     let session_id = crate::auth::generate_uuid_v4();
+    // `permission_mode` binds NULL for every caller that says nothing, which is every caller
+    // that existed before the field did. `0129` documents NULL on this column as "no CLI turn
+    // wrote one", and that reading survives: a run that ASKS for a rung is a run somebody
+    // deliberately gave one to, and the hook tells the two apart by `Option`, not by spelling.
     let inserted = sqlx::query(
-        "INSERT INTO runs (project_id, cwd, prompt, status, mode, session_id, steerable, created_at)
-         VALUES (?, ?, ?, 'running', ?, ?, ?, ?)",
+        "INSERT INTO runs (project_id, cwd, prompt, status, mode, session_id, steerable, permission_mode, created_at)
+         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)",
     )
     .bind(&project_id)
     .bind(&cwd)
@@ -2227,6 +2469,7 @@ async fn create_run_with(
     .bind(mode)
     .bind(&session_id)
     .bind(i64::from(steerable))
+    .bind(permission_mode.map(crate::chats::PermissionMode::as_str))
     .bind(&now)
     .execute(&state.pool)
     .await;
@@ -2342,9 +2585,10 @@ async fn create_run_with(
                 }
 
                 // Checked after the slot and before the tree, which is the only order that reports
-                // the two walls apart. A refusal here is `Busy` and not a failure: the disk is a
-                // condition of the machine, the same shape as a full project, and a batch that
-                // cannot have its third item should come out smaller rather than fail.
+                // the two walls apart. A refusal here is not a failure: the disk is a condition of
+                // the machine, the same shape as a full project, and a batch that cannot have its
+                // third item should come out smaller rather than fail. It is not `Busy` either, and
+                // that half was learned the hard way — see `CreateRunError::NoRoomOnDisk`.
                 //
                 // Only for an item, and not because the others are cheaper. A standalone run and a
                 // resolution are asked for one at a time by a person or by the queue; items are
@@ -2353,7 +2597,7 @@ async fn create_run_with(
                     && let Some(refusal) = no_room_on_disk(std::path::Path::new(project_root)).await
                 {
                     fail_provisioning(state, id, project_id.as_deref(), &refusal).await;
-                    return Err(CreateRunError::Busy);
+                    return Err(CreateRunError::NoRoomOnDisk(refusal));
                 }
 
                 // A resolution's tree is born on the merge's TARGET and an item's on the tip of its
@@ -3358,9 +3602,14 @@ pub async fn get_run(
     Path(id): Path<i64>,
 ) -> Result<Json<RunStatusResponse>, StatusCode> {
     let run = sqlx::query_as::<_, RunStatusResponse>(
+        // `cache_creation_tokens` and `authored_prompt_chars` are read and not answered: they are
+        // the two inputs `with_prompt_budget` needs to derive the pair of estimates this response
+        // does answer. Selecting them here rather than in a second query keeps the residual and the
+        // numbers it was computed from as one read of one row.
         "SELECT id, project_id, status, gate_status, gate_exit_code, gate_output, exit_code, stdout,
                 stderr, session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens,
-                num_turns, context_fill, steerable, successor_run_id
+                num_turns, context_fill, steerable, successor_run_id, cache_creation_tokens,
+                authored_prompt_chars
          FROM runs WHERE id = ?",
     )
     .bind(id)
@@ -3369,7 +3618,7 @@ pub async fn get_run(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(Json(run))
+    Ok(Json(run.with_prompt_budget()))
 }
 
 /// `?leading=` on `GET /runs/{id}/stop`: how many decisions accompany the last one. Absent is
@@ -3569,6 +3818,47 @@ pub const TERMINAL_RUN_STATUSES: &[&str] = &[
     "superseded",
 ];
 
+/// Writes what a run's stream showed before a terminator cut it off: the transcript itself, and the
+/// turns and prompt tokens `runner::usage_without_a_result` rebuilds from it.
+///
+/// The record the wall-clock branch of `spawn_run` already keeps for a timed-out run, for the same
+/// reason — there is no `RunOutcome` to read — and it was missing for exactly the run that reaches
+/// here most: one paused for approval, which left `stdout`, `num_turns` and every token count NULL
+/// and no `run_events` at all.
+///
+/// `stdout IS NULL` keeps it from replacing anything a body already recorded, and the events follow
+/// only a write that landed, so a second call cannot duplicate them. Best-effort, like the rest of
+/// termination: the run is terminated either way.
+async fn record_the_cut_stream(pool: &sqlx::SqlitePool, id: i64, seen: &str) {
+    if seen.is_empty() {
+        return;
+    }
+    let usage = crate::runner::usage_without_a_result(seen);
+    let written = sqlx::query(
+        "UPDATE runs SET stdout = ?, num_turns = ?, input_tokens = ?, cache_read_tokens = ?, \
+         cache_creation_tokens = ?, context_peak = ?, tools_used = ? WHERE id = ? AND stdout IS NULL",
+    )
+    .bind(seen)
+    .bind(usage.num_turns)
+    .bind(usage.input_tokens)
+    .bind(usage.cache_read_tokens)
+    .bind(usage.cache_creation_tokens)
+    .bind(peak_of(seen))
+    .bind(tools_of(seen))
+    .bind(id)
+    .execute(pool)
+    .await;
+    match written {
+        Ok(done) if done.rows_affected() == 1 => append_run_events(pool, id, seen).await,
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            run_id = id,
+            %error,
+            "could not record the stream of a run cut off before its result"
+        ),
+    }
+}
+
 /// Terminates an in-flight run: aborts its task (which, via `kill_on_drop`, kills the CLI process)
 /// and records `status`. Removing the entry from the handle map is the atomic arbiter when several
 /// termination reasons race (user cancel, timeout, or Chunk 3's §8.4 approval-pause): whoever removes
@@ -3585,6 +3875,14 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
     let handle = state.run_handles.lock().unwrap().remove(&id);
     match handle {
         Some(h) => {
+            // Taken BEFORE the abort. The task's `Registration` removes this entry when it drops, and
+            // dropping it is exactly what the abort does — read afterwards, the stream the run wrote
+            // is already gone, which is how every paused run came to leave no transcript.
+            let stream = state
+                .run_tails
+                .lock()
+                .ok()
+                .and_then(|tails| tails.get(&id).cloned());
             h.abort();
             let now = chrono::Utc::now().to_rfc3339();
             // First writer wins: no rows means the run finalised itself while this call was on its
@@ -3598,19 +3896,34 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
             .execute(&state.pool)
             .await;
             warn_on_terminal_write_err(&result, id, status);
+            // Only for the terminator that won. No rows means the body finished on its own and wrote
+            // its own stdout and usage, read off a real `result` — those are the ones to keep.
+            let won = matches!(&result, Ok(done) if done.rows_affected() == 1);
+            if won && let Some(stream) = stream {
+                let seen = stream
+                    .lock()
+                    .map(|shared| shared.clone())
+                    .unwrap_or_default();
+                record_the_cut_stream(&state.pool, id, &seen).await;
+            }
             // The run is over; anything it queued and never started goes with it (spec §7). After
             // the status write, because this is a consequence of the run ending — and best-effort,
             // because the run IS terminated either way and a queue row that outlives its run is a
             // stale request a human can cancel, not a broken run.
-            if ends_the_run(status) {
-                if let Err(error) = crate::vcs::cancel_for_run(&state.pool, id).await {
-                    tracing::warn!(run_id = id, %error, "could not cancel the run's queued vcs requests");
-                }
-                // Every status that ends a run also ends its chance to report a cost: the abort
-                // above dropped the future, so `cancelled`, `failed`, `interrupted` and `timed_out`
-                // all leave the same silent `$0`. Sharing `ends_the_run` is what keeps
-                // `awaiting_approval` out — that run resumes, and the resume carries the real cost
-                // for the whole session; approximating the pause would bill the same time twice.
+            if ends_the_run(status)
+                && let Err(error) = crate::vcs::cancel_for_run(&state.pool, id).await
+            {
+                tracing::warn!(run_id = id, %error, "could not cancel the run's queued vcs requests");
+            }
+            // Every terminator here stops the run before its `result`, the only line that carries a
+            // cost, so every one of them leaves a run that spent money and reported none — the pause
+            // included. It was left out once, on the belief that the resume "carries the real cost
+            // for the whole session". It does not: a resume reports its own invocation and nothing
+            // before it. Run 900475 resumed a session of 31 turns and reported 5 turns and $0.12, and
+            // every total that reads `runs` — the budget, the ablation — lost the paused half.
+            // `ends_the_run` still decides the queue above, where the pause must stay out; it does
+            // not decide this.
+            if won || ends_the_run(status) {
                 record_time_approx_cost(&state.pool, id).await;
             }
             true
@@ -3845,8 +4158,9 @@ pub async fn run_retention_loop(state: AppState) {
             Err(error) => tracing::warn!(%error, "feed: retention sweep failed"),
         }
         // Unconditional, unlike the pillar's other work: a council is deleted whether or not
-        // `.ai/council.yaml` still names a roster. Gating the sweep on the pillar being configured
-        // would make a roster somebody removed the way their history stops being collected.
+        // `~/.nucleos/council.yaml` still names a roster. Gating the sweep on the pillar being
+        // configured would make a roster somebody removed the way their history stops being
+        // collected.
         match crate::council::prune(&state.pool, crate::council::retention_days(), now).await {
             Ok(0) => {}
             Ok(pruned) => {
@@ -4318,6 +4632,8 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
 browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -4353,26 +4669,41 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             .expect("create space-free tempdir")
     }
 
+    /// Points worktree provisioning at a root of the test's own, and switches the disk floor off.
+    ///
+    /// The floor for the reason `job.rs`'s guard of the same name gives: it measures the machine,
+    /// and on 2026-09-13 a machine filling up under a loaded suite refused five team walks' item
+    /// runs. `an_item_run_gets_its_own_tree_and_pays_one_slot_for_every_attempt` opens an item's
+    /// checkout through this guard and would have been refused the same way. The one test that
+    /// wants the floor sets it after this, and this puts back what stood before either.
     struct WorktreeRootEnv {
-        previous: Option<OsString>,
+        root: Option<OsString>,
+        floor: Option<OsString>,
     }
 
     impl WorktreeRootEnv {
         fn set(path: &FsPath) -> Self {
-            let previous = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
+            let root = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
+            let floor = std::env::var_os("NUCLEOS_MIN_FREE_DISK_GB");
             unsafe {
                 std::env::set_var("NUCLEOS_WORKTREE_ROOT", path);
+                std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", "0");
             }
-            Self { previous }
+            Self { root, floor }
         }
     }
 
     impl Drop for WorktreeRootEnv {
         fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var("NUCLEOS_WORKTREE_ROOT", value),
-                    None => std::env::remove_var("NUCLEOS_WORKTREE_ROOT"),
+            for (name, previous) in [
+                ("NUCLEOS_WORKTREE_ROOT", &self.root),
+                ("NUCLEOS_MIN_FREE_DISK_GB", &self.floor),
+            ] {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
                 }
             }
         }
@@ -5494,6 +5825,133 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
 
     }
 
+    /// An item on a disk too full for another checkout is refused before the checkout exists, and
+    /// the feed says how full.
+    ///
+    /// The floor had no test of its own until 2026-09-14, and what found it was the job suite: team
+    /// walks parked on a machine whose cargo target trees had eaten the free space, and reported it
+    /// as nothing more than `last status waiting`. Those fixtures now switch the floor off — it
+    /// measures the machine, not the code they exercise — so this is where it is exercised
+    /// instead, on purpose, with a floor no volume this runs on comes near. That is what makes the
+    /// answer the same on every machine, which the walks' answer never was.
+    ///
+    /// The feed line is half the property, and the error is the other half. Until 2026-09-14 a
+    /// refused item parked its job as `slot` whether the slot or the disk said no, and this row was
+    /// the only place a reader learned which; the refusal now travels as its own variant, carrying
+    /// the same sentence, so the job can say it too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_item_is_refused_its_checkout_on_a_full_disk_and_the_feed_says_how_full() {
+        let _lock = crate::worktree::test_env_lock();
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let container = crate::git_exec::tests::space_free_tempdir("nucleos-item-full-");
+        let root = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&root);
+        let trees = crate::git_exec::tests::space_free_tempdir("nucleos-item-full-trees-");
+        let _trees_env = WorktreeRootEnv::set(trees.path());
+        // After the guard, which switched the floor off and puts back whatever stood before it when
+        // it drops — so this bare `set_var` is undone with it. A million GiB is a floor no disk
+        // meets, which is what keeps this from depending on the machine it runs on.
+        unsafe { std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", "1000000") };
+
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: &root.to_string_lossy(),
+                rule_name: Some("nightly"),
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+            },
+        )
+        .await
+        .expect("start a job");
+        let item_id = sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status)
+             VALUES (?, 0, 'the item', 'running')",
+        )
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let base = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .arg("rev-parse")
+                .arg("HEAD")
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_owned();
+
+        let refused = create_job_item_run(
+            &state,
+            "do the item".to_owned(),
+            "proj".to_owned(),
+            root.to_string_lossy().into_owned(),
+            JobItem {
+                job_id,
+                item_id,
+                stage: "implement",
+                base,
+            },
+        )
+        .await;
+        let Err(CreateRunError::NoRoomOnDisk(refusal)) = refused else {
+            panic!("a full disk is refused as itself, not as a held slot: {refused:?}");
+        };
+
+        let (run_id, summary): (i64, String) = sqlx::query_as(
+            "SELECT run_id, summary FROM feed WHERE kind = 'worktree_provision_failed'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("the refusal is in the feed");
+        assert!(
+            summary.starts_with("only ") && summary.contains(" MiB free "),
+            "the refusal has to say how much room there was: {summary}"
+        );
+        assert!(
+            summary.contains("at least 1024000000 MiB"),
+            "and against which floor, or it could be any refusal: {summary}"
+        );
+        assert_eq!(
+            refusal, summary,
+            "the caller is handed the sentence the feed was, so what it says cannot drift from it"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "a refused run is retired, not left `running` for a restart to find"
+        );
+
+        let opened: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM worktrees WHERE owner_kind = 'item'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            opened, 0,
+            "the floor is read before the tree, so no checkout was opened"
+        );
+    }
+
     async fn grants_for(state: &AppState, run_id: i64) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM action_grants WHERE run_id = ?")
             .bind(run_id)
@@ -6045,6 +6503,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         crate::project_policy::declare_shell_rule(
             &state.pool,
             "proj",
+            None,
             "bash scripts/gates.sh",
             crate::project_policy::Verdict::Allow,
             None,
@@ -6895,6 +7354,99 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         );
     }
 
+    /// The rung asked for on the way in is the rung on the row.
+    ///
+    /// Through the ROUTE and not through the handler, which is the whole point of the second
+    /// half: a body reaches `CreateRunRequest` by deserialisation, and that is where a spelling
+    /// outside the six is refused. A test that built the struct in Rust would have proved the
+    /// column and skipped the guard, and the guard is the part that could quietly go missing —
+    /// `PermissionMode`'s READER is lenient on purpose, so that rows written before the column
+    /// existed still parse as something, and leniency reaching a REQUEST is how a typo widens
+    /// what an unattended run may do.
+    ///
+    /// Counted before and after rather than asserted at zero, because the fixture starts runs of
+    /// its own and an absolute count would be measuring the fixture.
+    #[tokio::test]
+    async fn a_run_may_be_started_on_a_rung_and_never_on_a_misspelt_one() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"prompt":"a run that asks nobody","permission_mode":"dont_ask"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(created.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: CreateRunResponse = serde_json::from_slice(&body).unwrap();
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT permission_mode FROM runs WHERE id = ?")
+                .bind(created.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.as_deref(), Some("dont_ask"));
+
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"prompt":"a typo is not a rung","permission_mode":"dont_askk"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "a refused spelling started a run");
+    }
+
+    /// A run that says nothing keeps the column NULL, which is what every run before this field
+    /// carried and what `0129` documents as "no CLI turn wrote one".
+    ///
+    /// The pair to the test above, and it is the half that keeps the change from being a
+    /// default: an assertion on `dont_ask` alone would pass just as well against a route that
+    /// stamped every run with a rung.
+    #[tokio::test]
+    async fn a_run_that_names_no_rung_is_stored_without_one() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+
+        let created = create_run_via_http(&app, "an ordinary run").await;
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT permission_mode FROM runs WHERE id = ?")
+                .bind(created.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, None);
+    }
+
     #[tokio::test]
     async fn create_then_get_run_reaches_completed_status() {
         let app = test_router(test_state().await);
@@ -6913,6 +7465,63 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("run did not reach completed status in time, last status: {status}");
+    }
+
+    /// The persistence half of the turn-ceiling bug: a run that dies at the ceiling after one full
+    /// turn had already answered must not read back `num_turns`/`cost_usd` as unknown. `runner.rs`
+    /// keeps `usage`/`cost_usd` from the last completed turn across a ceiling break — see
+    /// `a_ceiling_death_after_one_full_turn_still_reports_that_turns_cost_and_count` in that module
+    /// — so a real number reaches `RunOutcome` here on purpose, and this test is the other half of
+    /// the claim: that the UPDATE this module runs on a `TURN_CEILING_EXIT_CODE` outcome actually
+    /// binds the columns it was handed rather than dropping them, the way `assistant.rs`'s `failed`
+    /// arm drops the token columns for a chat turn.
+    #[tokio::test]
+    async fn a_run_that_dies_at_the_ceiling_still_reports_the_turn_before_it() {
+        let (state, runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: crate::runner::TURN_CEILING_EXIT_CODE,
+            stdout: r#"{"type":"result","total_cost_usd":0.05,"num_turns":1}"#.to_string(),
+            stderr: "nucleos: stopped after 3 turns; this run's ceiling was 3\n".to_string(),
+            session_id: Some("fake-session-id".into()),
+            cost_usd: Some(0.05),
+            input_tokens: Some(11),
+            output_tokens: Some(22),
+            cache_read_tokens: Some(0),
+            cache_creation_tokens: Some(0),
+            num_turns: Some(1),
+            compacted: false,
+        });
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "keep going past the ceiling").await;
+
+        let mut status = String::new();
+        for _ in 0..100 {
+            let parsed = get_run_status(&app, created.id).await;
+            status = parsed.status.clone();
+            if status == "failed" {
+                assert_eq!(
+                    parsed.exit_code,
+                    Some(crate::runner::TURN_CEILING_EXIT_CODE),
+                    "a ceiling death is not a launch failure and must carry its own exit code"
+                );
+                assert_eq!(
+                    parsed.cost_usd,
+                    Some(0.05),
+                    "the completed turn's cost must not be read back NULL"
+                );
+                assert_eq!(
+                    parsed.num_turns,
+                    Some(1),
+                    "the completed turn's count must not be read back NULL"
+                );
+                assert_eq!(parsed.input_tokens, Some(11));
+                assert_eq!(parsed.output_tokens, Some(22));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run did not reach failed status in time, last status: {status}");
     }
 
     /// A run that ran out of time is the one that MOST needs measuring: it went too far.
@@ -8224,6 +8833,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 cwd: None,
                 mode: "real".to_owned(),
                 steerable: false,
+                permission_mode: None,
             }),
         )
         .await;
@@ -8251,6 +8861,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 cwd: None,
                 mode: "real".to_owned(),
                 steerable: false,
+                permission_mode: None,
             }),
         )
         .await;
@@ -8280,6 +8891,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 cwd: None,
                 mode: "worktree".to_owned(),
                 steerable: false,
+                permission_mode: None,
             }),
         )
         .await;
@@ -8325,6 +8937,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 cwd: None,
                 mode: "worktree".to_owned(),
                 steerable: false,
+                permission_mode: None,
             }),
         )
         .await;
@@ -8367,6 +8980,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 cwd: None,
                 mode: "real".to_owned(),
                 steerable: false,
+                permission_mode: None,
             }),
         )
         .await;
@@ -8429,6 +9043,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 cwd: Some(repo.to_string_lossy().into_owned()),
                 mode: "worktree".to_owned(),
                 steerable: false,
+                permission_mode: None,
             }),
         ));
 
@@ -9128,6 +9743,50 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         panic!(
             "silent run did not reach timed_out before its wall clock, last status: {status}"
         );
+    }
+
+    /// The runner's progress deadline is the other way a run ends `timed_out`, and the CLI it kills
+    /// never reports a cost. Run 900501 on 2026-09-13 was recorded with `cost_usd` NULL after half an
+    /// hour of silence, so the budget counted it as free; the wall-clock arm had always approximated
+    /// the same run from its duration, and this is that run arriving through the other door.
+    #[tokio::test]
+    async fn a_run_timed_out_for_silence_is_charged_for_its_time() {
+        let (mut state, runner) = test_state_with_runner(None, Duration::from_secs(10)).await;
+        state.progress_timeout = Duration::from_secs(30);
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: crate::runner::PROGRESS_TIMEOUT_EXIT_CODE,
+            stdout: String::new(),
+            stderr: String::new(),
+            session_id: Some("silent-session".into()),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+        });
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "a run its progress deadline cut short").await;
+
+        let mut status = String::new();
+        let mut cost: Option<f64> = None;
+        for _ in 0..100 {
+            status = get_run_status(&app, created.id).await.status;
+            cost = sqlx::query_scalar("SELECT cost_usd FROM runs WHERE id = ?")
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if status == "timed_out" && cost.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status, "timed_out", "the progress deadline's exit code ends the run timed_out");
+        let cost = cost.expect("a run the CLI never reported a cost for must not be recorded as free");
+        assert!(cost > 0.0, "unmeasured time is never $0, got {cost}");
     }
 
     /// PURE. `email_triage` is the case worth stating: it is autonomous, it spends money, and it
@@ -10174,5 +10833,252 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
 
         let ids: std::collections::HashSet<i64> = live.iter().map(|row| row.id).collect();
         assert_eq!(ids, std::collections::HashSet::from([running, parked]));
+    }
+
+    /* --------------------------------------------- what the prompt cost us -- */
+
+    /// A request shaped like the one a launch builds, with the three authored flags filled in.
+    ///
+    /// Written out here rather than borrowed from `runner`'s own test helper because that one is
+    /// private to its module — and because the point of this test is that the numbers come off THIS
+    /// struct, so the struct being visible in the test is part of what is being read.
+    fn authored_request() -> crate::runner::RunRequest {
+        crate::runner::RunRequest {
+            prompt: "do the thing".to_string(),
+            env: Vec::new(),
+            cwd: None,
+            permission: crate::runner::Permission::Default,
+            resume_session_id: None,
+            mcp_config: None,
+            mcp_box: None,
+            tool_policy: crate::runner::ToolPolicy::Unrestricted,
+            progress_timeout: None,
+            max_turns: None,
+            session_id: None,
+            fork_session: false,
+            include_partial_messages: false,
+            images: Vec::new(),
+            steerable: false,
+            classifier_governs_tools: false,
+            ambient_mcp: false,
+            model: None,
+            effort: None,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            append_system_prompt: Some("stand up straight".to_string()),
+            denied_tools: Vec::new(),
+            session_name: None,
+            context_window: None,
+            messages: None,
+            allowed_mcp_tools: None,
+        }
+    }
+
+    async fn a_run_row(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('do the thing', 'running', 'real', '2026-09-05T00:00:00+00:00')
+             RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn stored_authored_chars(pool: &sqlx::SqlitePool, id: i64) -> Option<i64> {
+        sqlx::query_scalar("SELECT authored_prompt_chars FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// What the CLI runner says it authored is what lands in the column, in characters.
+    ///
+    /// The assertion is on the ARITHMETIC and not on a literal: the prompt and the instructions are
+    /// both in this test, so their lengths are readable from it, and pinning a byte count would only
+    /// restate them in a form that goes stale when somebody rewords the fixture.
+    #[tokio::test]
+    async fn a_cli_run_records_what_it_authored() {
+        let pool = retention_pool().await;
+        let id = a_run_row(&pool).await;
+        let request = authored_request();
+        let runner = crate::runner::ClaudeCliRunner {
+            model: "claude-sonnet-5".to_string(),
+            plan_model: None,
+            review_model: None,
+        };
+
+        let authored = crate::runner::CommandRunner::authored_prompt(&runner, &request)
+            .expect("the CLI runner authors the prompt it launches");
+        record_authored_prompt(&pool, id, Some(authored)).await;
+
+        assert_eq!(
+            authored.prompt_chars,
+            "do the thing".len(),
+            "the prompt is charged whichever way it travels"
+        );
+        assert_eq!(authored.system_prompt_chars, "stand up straight".len());
+        assert_eq!(
+            authored.schema_chars, 0,
+            "a launch with no --mcp-config is offered no tools, so there is no schema block to pay \
+             for — a real zero rather than an unknown"
+        );
+        assert_eq!(
+            stored_authored_chars(&pool, id).await,
+            Some(authored.total_chars() as i64)
+        );
+    }
+
+    /// Every other runner writes NULL, and NULL is the answer rather than the absence of one.
+    ///
+    /// The local model sends none of these flags and the Codex CLI sends different ones, so a zero
+    /// here would be a claim about their prompts — that they were launched empty — made by a module
+    /// that has never seen either argument vector. This is the same distinction
+    /// `runs.permission_mode` keeps for anything that is not a chat turn.
+    #[tokio::test]
+    async fn a_run_that_is_not_a_cli_run_records_nothing_at_all() {
+        let pool = retention_pool().await;
+        let id = a_run_row(&pool).await;
+        let request = authored_request();
+        let local = crate::runner::OllamaRunner::new(
+            "http://localhost:11434".to_string(),
+            "qwen3:4b".to_string(),
+        );
+
+        let authored = crate::runner::CommandRunner::authored_prompt(&local, &request);
+        assert!(
+            authored.is_none(),
+            "a runner this daemon does not build an argument vector for claimed to author one"
+        );
+        record_authored_prompt(&pool, id, authored).await;
+
+        assert_eq!(
+            stored_authored_chars(&pool, id).await,
+            None,
+            "a run whose prompt we did not write read back as one we wrote nothing into"
+        );
+    }
+
+    /// The two derived readings, and the run that is entitled to neither.
+    ///
+    /// The residual is the whole reported prompt — input plus cache reads plus cache CREATION, never
+    /// the first of the three — minus what we wrote. A run that reported no usage gets `null` for it
+    /// rather than a number, which is the difference between "we do not know" and "the CLI read
+    /// nothing but us".
+    #[tokio::test]
+    async fn the_residual_is_the_whole_reported_prompt_minus_what_we_wrote() {
+        let measured = RunStatusResponse {
+            id: 1,
+            project_id: None,
+            status: "completed".to_string(),
+            gate_status: None,
+            gate_exit_code: None,
+            gate_output: None,
+            exit_code: Some(0),
+            stdout: None,
+            stderr: None,
+            session_id: None,
+            cost_usd: None,
+            input_tokens: Some(1_000),
+            output_tokens: Some(500),
+            cache_read_tokens: Some(20_000),
+            num_turns: Some(3),
+            context_fill: None,
+            steerable: false,
+            successor_run_id: None,
+            authored_prompt_estimate: None,
+            cli_own_estimate: None,
+            authored_prompt_chars: Some(44_000),
+            cache_creation_tokens: Some(9_000),
+        }
+        .with_prompt_budget();
+
+        assert_eq!(measured.authored_prompt_estimate, Some(11_000));
+        assert_eq!(
+            measured.cli_own_estimate,
+            Some(19_000),
+            "the residual must be taken off input + cache reads + cache creation, not off input"
+        );
+
+        let silent = RunStatusResponse {
+            input_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            ..measured
+        }
+        .with_prompt_budget();
+
+        assert_eq!(silent.authored_prompt_estimate, Some(11_000));
+        assert_eq!(
+            silent.cli_own_estimate, None,
+            "a run that reported no usage has no residual, and certainly not the whole of what we \
+             wrote"
+        );
+    }
+
+    /// A run paused for approval is cut off before its `result`, the only line that reports what the
+    /// invocation used, and its resume reports its own invocation and nothing before it — measured:
+    /// 900475 said 5 turns and $0.12 for a session that had taken 31. So the paused half is recorded
+    /// here, off its own stream, or no total that reads `runs` ever sees it.
+    #[tokio::test]
+    async fn a_run_paused_for_approval_keeps_what_it_did_before_the_pause() {
+        let state = test_state().await;
+        let started = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'real', ?)",
+        )
+        .bind(started.to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let stream = [
+            r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":1000}}}"#,
+            r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":1000}}}"#,
+            r#"{"type":"user","message":{"content":[]}}"#,
+            r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":2,"cache_read_input_tokens":1100}}}"#,
+        ]
+        .join("\n")
+            + "\n";
+        state
+            .run_tails
+            .lock()
+            .unwrap()
+            .insert(id, std::sync::Arc::new(std::sync::Mutex::new(stream)));
+        spawn_registered(&state, id, std::future::pending::<()>());
+
+        assert!(finalize_termination(&state, id, "awaiting_approval").await);
+
+        let (status, turns, cache_read, cost, stdout): (
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<f64>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, num_turns, cache_read_tokens, cost_usd, stdout FROM runs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "awaiting_approval");
+        assert_eq!(turns, Some(2), "the turns taken before the pause");
+        assert_eq!(cache_read, Some(2100));
+        assert!(stdout.is_some(), "the transcript the pause used to throw away");
+        assert!(
+            cost.is_some_and(|cost| cost > 0.0),
+            "ten minutes of work before the pause is not free: {cost:?}"
+        );
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_events WHERE run_id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(events, 4);
     }
 }

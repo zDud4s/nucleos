@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::Engine;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -36,24 +37,61 @@ pub const TURN_CEILING_EXIT_CODE: i32 = i32::MIN + 1;
 /// worth reading rather than a quota to spend.
 pub const DEFAULT_MAX_TURNS: i64 = 200;
 
-/// PURE: how many model responses this stream has carried, folded one line at a time.
+/// PURE fold: how many model responses this stream has carried, one line at a time.
 ///
-/// One function for both CLIs. Claude says `assistant` once per completed model message; `codex
-/// exec` says `turn.completed`. Neither name appears in the other's stream, so a single fold cannot
-/// double-count — and the alternative, a counter per CLI, is how a ceiling ends up enforced on one
-/// path and quietly absent on the other, which is worse than no ceiling because somebody will
-/// believe it is there.
+/// One counter for both CLIs. `codex exec` says `turn.completed` once per turn. Claude says
+/// `assistant` once per content BLOCK, not once per message: an answer holding some text and two
+/// tool calls arrives as three `assistant` events carrying the same `message.id` and the same
+/// `usage`. Measured on this daemon's own runs against CLI 2.1.263: 32 events for 14 messages on
+/// run 900473, 200 for 125 on run 900463. Counting events is what stopped 900463 at 125 responses
+/// under a ceiling that says 200, and it fell hardest on the runs that call the most tools at once,
+/// which is nothing a brake on motion should care about.
+///
+/// So a Claude event counts once per id. A set rather than only the last id seen: nothing here then
+/// depends on the blocks of one message arriving next to each other, and the price is one short
+/// string per response. An `assistant` event with no id counts on its own, as every event did
+/// before ids were read.
+///
+/// Neither event name appears in the other CLI's stream, so one fold cannot double-count — and the
+/// alternative, a counter per CLI, is how a ceiling ends up enforced on one path and quietly absent
+/// on the other, which is worse than no ceiling because somebody will believe it is there.
 ///
 /// Counted from the transcript rather than asked of the CLI: measured against CLI 2.1.198, there is
 /// no `--max-turns` flag to delegate this to. `--max-budget-usd` exists and is a different brake —
 /// money, which the job already has, rather than motion, which nothing had.
-pub(crate) fn turns_from_line(line: &str, current: i64) -> i64 {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-        return current;
-    };
-    match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("assistant") | Some("turn.completed") => current.saturating_add(1),
-        _ => current,
+#[derive(Debug, Default)]
+pub(crate) struct TurnCounter {
+    count: i64,
+    seen: std::collections::HashSet<String>,
+}
+
+impl TurnCounter {
+    /// Folds one line in, and answers whether it began a response this counter had not seen yet.
+    pub(crate) fn line(&mut self, line: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            return false;
+        };
+        let began = match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("turn.completed") => true,
+            Some("assistant") => match value
+                .get("message")
+                .and_then(|message| message.get("id"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(id) => self.seen.insert(id.to_string()),
+                None => true,
+            },
+            _ => false,
+        };
+        if began {
+            self.count = self.count.saturating_add(1);
+        }
+        began
+    }
+
+    /// The responses counted so far.
+    pub(crate) fn count(&self) -> i64 {
+        self.count
     }
 }
 
@@ -132,10 +170,10 @@ pub enum ToolPolicy {
 /// that must not act cannot be handed `bypassPermissions` because there is one field and it holds
 /// one value, chosen once, at the call that starts the run.
 ///
-/// Deliberately NOT `chats::PermissionMode`, which has five values and is the CONVERSATION's
-/// policy. `Manual` and `Auto` both project onto `Default` here, because what separates them lives
-/// in the `PreToolUse` hook and not on a command line. Keeping the two types apart is what stops
-/// somebody answering one question with the other.
+/// Deliberately NOT `chats::PermissionMode`, which has six values and is the CONVERSATION's
+/// policy. `Manual`, `Auto` and `DontAsk` all three project onto `Default` here, because what
+/// separates them lives in the `PreToolUse` hook and not on a command line. Keeping the two types
+/// apart is what stops somebody answering one question with the other.
 ///
 /// Called `Default` and not `Auto` so nobody has to wonder why an autopilot run carries a
 /// conversation's policy: it is the rung with no elevation, which is what every run that is not a
@@ -176,6 +214,13 @@ impl Permission {
     /// for both would be paying twice for two judgements. `manual` is exactly "decide nothing, the
     /// hook decides" — which is the posture we want FROM THE CLI whatever rung the conversation is
     /// on.
+    ///
+    /// **`dontAsk` on that list is not our `dont_ask` either**, and the collision of names is the
+    /// reason this paragraph exists. `chats::PermissionMode::DontAsk` is a rung of THIS house,
+    /// enforced entirely by the hook, and it launches `manual` like the two rungs beside it. The
+    /// CLI's `dontAsk` is the CLI's own idea of not asking, decided by a surface we do not control
+    /// and cannot see the reasons of. Selecting it would move the decision off the classifier and
+    /// onto that surface, which is the one thing every value in this enum is arranged to avoid.
     pub fn cli_value(self) -> &'static str {
         match self {
             Self::Default => "manual",
@@ -187,13 +232,15 @@ impl Permission {
 
     /// Which rung a conversation's policy launches the CLI on.
     ///
-    /// Lossy on purpose, and the loss is the point: `Manual` and `Auto` are the same command line
-    /// and differ only in what the hook lets through.
+    /// Lossy on purpose, and the loss is the point: `Manual`, `Auto` and `DontAsk` are the same
+    /// command line and differ only in what the hook lets through — `Manual` asks about every
+    /// mutation, `Auto` asks only about what the classifier does not recognise, and `DontAsk`
+    /// refuses that same remainder instead of asking about it. Three policies, one command line.
     pub fn for_chat(mode: crate::chats::PermissionMode) -> Self {
         match mode {
-            crate::chats::PermissionMode::Manual | crate::chats::PermissionMode::Auto => {
-                Self::Default
-            }
+            crate::chats::PermissionMode::Manual
+            | crate::chats::PermissionMode::Auto
+            | crate::chats::PermissionMode::DontAsk => Self::Default,
             crate::chats::PermissionMode::AcceptEdits => Self::AcceptEdits,
             crate::chats::PermissionMode::Plan => Self::Plan,
             crate::chats::PermissionMode::Bypass => Self::Bypass,
@@ -220,6 +267,23 @@ pub struct RunRequest {
     pub permission: Permission,
     pub resume_session_id: Option<String>,
     pub mcp_config: Option<PathBuf>,
+    /// Which surface the server named by `mcp_config` announces: an errand id for a boxed server,
+    /// `None` for one that serves the whole tool list.
+    ///
+    /// **The other half of a pair.** `mcp_config` says a server is offered at all; this says what
+    /// that server offers. The two are set together or not at all, and a `Some` here beside a
+    /// `None` there is a state no caller builds — nothing is announced by a server that does not
+    /// exist.
+    ///
+    /// **It is the ARGUMENT, carried, and never a re-derivation.** The value is the `errand` that
+    /// `assistant::build_mcp_config(exe, errand)` was called with, passed along from that same call
+    /// site — so the box this field names and the box the config file describes are one expression
+    /// evaluated once, and cannot drift. The alternatives were to read the box back out of the
+    /// config path, out of the file, or out of the chat's errand row; each is a second source of
+    /// truth for a fact the launch already holds in a local variable, and each goes quietly wrong
+    /// the day one side changes. [`authored_prompt`] is the only reader, and its doc says what such
+    /// a guess would cost.
+    pub mcp_box: Option<i64>,
     pub tool_policy: ToolPolicy,
     pub progress_timeout: Option<Duration>,
     /// How many model responses this run may take before the daemon stops it. `None` is no ceiling.
@@ -540,9 +604,20 @@ fn policy_unverified_after_stream(policy: ToolPolicy, init_seen: bool) -> Option
 /// advertises it and `advertised_tools_violate` kills the run at the `init` event. The tool set can
 /// move underneath a version that never changed, which means the version number is not the signal:
 /// the stderr line naming the offending tools is.
+///
+/// Re-measured 2026-09-05, reading a live session's advertised tool surface rather than a version
+/// number, for the same reason the paragraph above gives: `TaskCreate`, `TaskGet`, `TaskList` and
+/// `TaskUpdate` had already moved inside a single version, so pinning this list to a version string
+/// again would not have caught the next four either. That pass added `ArtifactCheck`,
+/// `ArtifactComments`, `ArtifactData` (siblings of `Artifact`, already here) and `ListAgents`
+/// (sibling of `ListMcpResourcesTool`). `scripts/tool-surface.mjs` automates this measurement by
+/// hand after a `claude update`; it is not wired into any gate because it needs the CLI installed.
 pub(crate) const BUILTIN_TOOLS: &[&str] = &[
     "Agent",
     "Artifact",
+    "ArtifactCheck",
+    "ArtifactComments",
+    "ArtifactData",
     "AskUserQuestion",
     "Bash",
     "BashOutput",
@@ -558,6 +633,7 @@ pub(crate) const BUILTIN_TOOLS: &[&str] = &[
     "Glob",
     "Grep",
     "KillShell",
+    "ListAgents",
     "ListMcpResourcesTool",
     "LSP",
     "Monitor",
@@ -613,6 +689,16 @@ pub struct Subagent {
     pub description: String,
     /// The system prompt this helper runs under.
     pub prompt: String,
+    /// The tools this helper may call, or `None` to inherit the conversation's whole surface.
+    ///
+    /// Absent is today's behaviour, preserved: a helper defined before this field existed, or one
+    /// defined since without naming it, gets everything the parent run has — every call it makes
+    /// still comes back through the same `PreToolUse` hook under the parent's `run_id`, which is the
+    /// second barrier this field is the first half of. Present grants the CLI exactly this list and
+    /// nothing else; `Some(vec![])` is a helper granted no tools at all, a coherent and different
+    /// thing from absent, not a shorthand for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
     /// Which model answers as this helper, or `None` to inherit the conversation's.
     ///
     /// Absent rather than the CLI's literal `"inherit"`: absence already means it, and offering two
@@ -842,16 +928,75 @@ pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
         if line.is_empty() {
             continue;
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
-            && v.get("type").and_then(|t| t.as_str()) == Some("result")
-            && let Some(text) = v.get("result").and_then(|r| r.as_str())
-            && !text.trim().is_empty()
-        {
-            reply = Some(text.to_string());
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            let text = match v.get("type").and_then(|t| t.as_str()) {
+                Some("result") => v.get("result").and_then(|r| r.as_str()),
+                Some("item.completed")
+                    if v.get("item")
+                        .and_then(|item| item.get("type"))
+                        .and_then(|kind| kind.as_str())
+                        == Some("agent_message") =>
+                {
+                    v.get("item")
+                        .and_then(|item| item.get("text"))
+                        .and_then(|text| text.as_str())
+                }
+                _ => None,
+            };
+            if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+                reply = Some(text.to_string());
+            }
         }
     }
     reply
 }
+
+/// Whether a `claude -p --output-format stream-json` run ended on an API error that says nothing
+/// about the work: the network, or the service being busy or down.
+///
+/// Read from the LAST `result` event and from nowhere else, beside `extract_reply` for the reason
+/// that function gives: knowing the CLI's output format is this module's job. True only when that
+/// event says `is_error: true` with `terminal_reason: "api_error"`, and the status the CLI got back
+/// is one a second attempt can get past — none at all (nothing answered: DNS, a dropped
+/// connection), 408, 429, or any 5xx, 529 "overloaded" among them. Any other 4xx is the request
+/// itself being refused, which it will be again, and a turn that ended for any other reason
+/// (`max_turns`, a hook) ended on something the work did.
+///
+/// Measured on job 26's review, run 900483, 2026-09-13: ten `api_retry` events, then a result line
+/// with `terminal_reason: "api_error"`, `api_error_status: null` and "API Error: Can't reach the
+/// API server — check your internet or DNS (ENOTFOUND)". Its `subtype` said `success`: only
+/// `is_error` and `terminal_reason` told the truth, which is why neither `subtype` nor the exit
+/// code is read.
+pub(crate) fn failed_on_a_transient_api_error(stdout: &str) -> bool {
+    let Some(result) = stdout.lines().rev().find_map(|line| {
+        serde_json::from_str::<serde_json::Value>(line.trim())
+            .ok()
+            .filter(|event| event.get("type").and_then(|kind| kind.as_str()) == Some("result"))
+    }) else {
+        return false;
+    };
+    if result.get("is_error").and_then(|flag| flag.as_bool()) != Some(true)
+        || result
+            .get("terminal_reason")
+            .and_then(|reason| reason.as_str())
+            != Some("api_error")
+    {
+        return false;
+    }
+    match result.get("api_error_status") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(status) => status
+            .as_u64()
+            .is_some_and(|code| code == 408 || code == 429 || (500..=599).contains(&code)),
+    }
+}
+
+/// Job 26's review, run 900483, cut down to what the detector above reads: the first of its ten
+/// retries, and its result line with the zeroed counters left out. Shared with `job.rs`, whose
+/// tests seed a review that printed exactly this.
+#[cfg(test)]
+pub(crate) const REVIEW_THAT_NEVER_REACHED_THE_API: &str = r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":614,"error_status":null,"error":"unknown","session_id":"f4a94b9c-f0fe-484b-9514-9fefa640a6b6"}
+{"stop_reason":"stop_sequence","session_id":"f4a94b9c-f0fe-484b-9514-9fefa640a6b6","total_cost_usd":0,"terminal_reason":"api_error","is_error":true,"num_turns":1,"subtype":"success","api_error_status":null,"result":"API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)","type":"result","duration_ms":172362}"#;
 
 /// A turn as it stands PART WAY THROUGH: what has been written, and what is being done.
 #[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -1039,8 +1184,16 @@ pub(crate) fn detail_of(input: &serde_json::Value) -> Option<String> {
     // `description` last, and last on purpose: it is what a `Task` carries and nothing else does,
     // and a tool that also says where it acted must answer with that instead. A key ordered above
     // it would make the sentence a model wrote win over the file it opened.
-    const KEYS: [&str; 7] = [
+    //
+    // `notebook_path` is here because `NotebookEdit` names its target with it and nothing else in
+    // this list matched, so every notebook write showed as a bare tool name with no file beside
+    // it. That is cosmetic on an allow and it is not cosmetic on an approval: a person was being
+    // asked to permit a write without being told what it writes, which is not a question anyone
+    // can answer. It sits beside `file_path` because it IS the file path, under the one tool that
+    // spells it differently.
+    const KEYS: [&str; 8] = [
         "file_path",
+        "notebook_path",
         "path",
         "command",
         "pattern",
@@ -1331,6 +1484,85 @@ pub(crate) fn window_env(request: &RunRequest) -> Option<(&'static str, String)>
         .map(|window| ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", window.to_string()))
 }
 
+/// The environment that takes background tasks away from a run nothing can wake, or nothing for a
+/// run something can.
+///
+/// A background task reports back by waking the session that started it, and a run with no later
+/// turn has no session left to wake: once its turn ends the CLI exits and kills the task with it.
+/// Measured on run 900473 (CLI 2.1.263): the model launched the gate's build in the background,
+/// ended its turn with "I'll wait for the background gate build (task `b84qqcytz`) to finish before
+/// continuing — it'll notify automatically when done", and the stream closed on that task being
+/// `killed`. The run was recorded `completed`, its work half done and uncommitted. A `sleep 20`
+/// launched the same way reproduces it in thirteen seconds.
+///
+/// With `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` the CLI takes `run_in_background` out of the
+/// `Bash` schema, so the same request is refused as an unexpected parameter and nothing is left
+/// running when the turn ends — measured with the same prompt against the same CLI.
+///
+/// Only a steerable run with somewhere its later turns come from keeps them: its process outlives
+/// the turn, which is what a task's notification needs. A steerable run with no channel closes its
+/// stdin after the opening turn, and for this purpose is a headless run.
+///
+/// Set before `request.env` at the spawn site, like [`window_env`], so an explicit entry still wins.
+pub(crate) fn background_env(request: &RunRequest) -> Option<(&'static str, &'static str)> {
+    let can_be_woken = request.steerable && request.messages.is_some();
+    (!can_be_woken).then_some(("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1"))
+}
+
+/// PURE: the background tasks this stream reports killed after its last answer, each named once.
+///
+/// The signature, read off run 900473's own stream:
+///
+/// ```text
+/// {"type":"result","subtype":"success","stop_reason":"end_turn",...}
+/// {"type":"system","subtype":"task_updated","task_id":"b84qqcytz","patch":{"status":"killed",...}}
+/// {"type":"system","subtype":"task_notification","task_id":"b84qqcytz","status":"stopped",...}
+/// ```
+///
+/// After the `result` and never before it: a task stopped mid-turn was stopped by the model, which
+/// is a decision; one killed after the last answer was killed by the process ending under it.
+///
+/// The second line behind [`background_env`], not the first. With background tasks taken away this
+/// finds nothing, and it exists for the day it would: a CLI that renames the variable would
+/// otherwise bring back a run recorded `completed` with its work abandoned, and nothing saying so.
+pub(crate) fn orphaned_background_tasks(stdout: &str) -> Vec<String> {
+    let mut answered = false;
+    let mut orphaned: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("result") => {
+                answered = true;
+                continue;
+            }
+            Some("system") if answered => {}
+            _ => continue,
+        }
+        let killed = match value.get("subtype").and_then(serde_json::Value::as_str) {
+            Some("task_updated") => {
+                value
+                    .pointer("/patch/status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("killed")
+            }
+            Some("task_notification") => matches!(
+                value.get("status").and_then(serde_json::Value::as_str),
+                Some("stopped" | "killed")
+            ),
+            _ => false,
+        };
+        if killed
+            && let Some(task) = value.get("task_id").and_then(serde_json::Value::as_str)
+            && !orphaned.iter().any(|seen| seen == task)
+        {
+            orphaned.push(task.to_string());
+        }
+    }
+    orphaned
+}
+
 /// Whether this line says the CLI compacted its own context.
 ///
 /// The event, read off a real headless stream rather than inferred from the source:
@@ -1530,6 +1762,63 @@ pub(crate) fn extract_usage(stdout: &str) -> RunUsage {
             };
         }
     }
+    usage
+}
+
+/// PURE: what a stream that never reached a `result` still says it used.
+///
+/// [`extract_usage`] reads the `result` event, and a headless run emits exactly one, at the very
+/// end. A run stopped before it — a turn ceiling, a progress deadline, a stream that broke — used to
+/// write NULL in every column, whatever it had burned: run 900463 was stopped at its ceiling after
+/// 125 responses and nearly ten million cache-read tokens, and recorded none of them.
+///
+/// Every `assistant` event carries its message's `usage`, and three of its fields are exact,
+/// because the input side is settled before the model writes a word. Summed once per message — the
+/// blocks of one message repeat the same figures, so summing events would count an answer once per
+/// block — they matched the `result` of run 900473 to the token: 28 input, 1,023,866 cache read,
+/// 68,996 cache creation.
+///
+/// `output_tokens` is not one of them and stays `None`. The figure on an `assistant` event is a
+/// count taken while the message was still being written: the same run's messages summed to 40
+/// against a `result` of 8,124. Written down, that would read as measured and be wrong by two
+/// orders of magnitude; unknown is the honest value, as it is everywhere else in [`RunUsage`].
+///
+/// `num_turns` is counted by the same [`TurnCounter`] the ceiling reads, so a run stopped at its
+/// ceiling records the number that stopped it. It is not the CLI's own `num_turns`, which counts
+/// something else (16 against 14 messages on 900473) and never arrived here anyway.
+///
+/// And no cost. Nothing here prices tokens, and the budget already charges a run with no cost by
+/// how long it ran (`budget::compute_spend`); a figure built from the input side alone would
+/// displace that estimate with a smaller one.
+pub(crate) fn usage_without_a_result(stdout: &str) -> RunUsage {
+    let mut turns = TurnCounter::default();
+    let mut usage = RunUsage::default();
+    for line in stdout.lines() {
+        if !turns.line(line) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let Some(reported) = value
+            .get("message")
+            .and_then(|message| message.get("usage"))
+        else {
+            continue;
+        };
+        let add = |total: &mut Option<i64>, field: &str| {
+            if let Some(tokens) = reported.get(field).and_then(serde_json::Value::as_i64) {
+                *total = Some(total.unwrap_or(0).saturating_add(tokens));
+            }
+        };
+        add(&mut usage.input_tokens, "input_tokens");
+        add(&mut usage.cache_read_tokens, "cache_read_input_tokens");
+        add(
+            &mut usage.cache_creation_tokens,
+            "cache_creation_input_tokens",
+        );
+    }
+    usage.num_turns = (turns.count() > 0).then_some(turns.count());
     usage
 }
 
@@ -1747,6 +2036,138 @@ pub trait CommandRunner: Send + Sync {
     fn model_for_stage(&self, _stage: Option<&str>) -> Option<String> {
         None
     }
+
+    /// What this runner would itself write into the model's prompt for `request`, or `None` for a
+    /// runner whose prompt this daemon does not author.
+    ///
+    /// **`None` is the default, and every runner but the Anthropic CLI one keeps it.** The four
+    /// pieces `AuthoredPrompt` counts are the four `cli_args` puts on the command line, and they are
+    /// facts about THAT argument vector: `OllamaRunner` sends no tool schemas and has no notion of a
+    /// subagent, `CodexCliRunner` builds a different vector entirely, and the fakes build none. A
+    /// default that answered `Some(…)` by measuring the request anyway would attribute this daemon's
+    /// argv to processes that never received it, which is the one thing this accounting must not do.
+    /// Silence is the honest answer, and the column behind it stays NULL — exactly as
+    /// `runs.permission_mode` is NULL for anything that is not a chat turn.
+    fn authored_prompt(
+        &self,
+        _request: &RunRequest,
+    ) -> Option<crate::prompt_budget::AuthoredPrompt> {
+        None
+    }
+}
+
+/// The part of one CLI run's prompt that this daemon wrote, measured off the same values
+/// [`cli_args`] puts on the command line.
+///
+/// Read this beside `cli_args` and not from anywhere else. Every field below names a flag written
+/// there, under the same condition it is written under, so the two go wrong together or not at all;
+/// a second source of truth for any of them is a number that quietly stops matching the day somebody
+/// changes a flag.
+///
+/// **The schema block is priced from `mcp_config` being present, and priced BY THE BOX that config
+/// names.** A run with no `--mcp-config` is offered no tools by this daemon, so its schema cost is a
+/// real zero rather than an unknown. A run that has one pays for whatever its own server announces,
+/// which is not the same figure for every run: an unboxed server advertises the whole tool list, an
+/// errand's server advertises four errand tools and the handful every box keeps, and the two differ
+/// by roughly twelve to one. Charging every server the unboxed figure — which this did while the
+/// only launcher recording a row never set `mcp_config` at all — would have overstated an errand
+/// turn by that factor the moment a chat turn started being recorded, which is what it now is.
+///
+/// **Which box is a fact the launch holds, not one this function may infer.** It arrives on
+/// `RunRequest::mcp_box`, carried from the `assistant::build_mcp_config(exe, errand)` call that
+/// wrote the config file, so the price and the surface are two readings of one expression. The
+/// tempting shortcut — recover the box from the config path, or parse the file, or look up the
+/// chat's errand — is the thing this pair of fields exists to forbid: every one of those produces a
+/// number that LOOKS measured, agrees with the file only for as long as nobody edits either side,
+/// and reports its disagreement to nobody when it stops. `served_in_box` in `mcp_tools` is the same
+/// argument one layer down, and says why the price and the fold must not be two copies of a rule.
+///
+/// **A server that is ANNOUNCED is not a server whose schemas are SENT, and only the second is
+/// charged.** When the CLI keeps its `ToolSearch` built-in it advertises MCP tools by NAME and
+/// fetches a schema only when the model asks for one, so the block this function prices is not in
+/// the prompt at all and the run owes nothing for it. When `ToolSearch` is denied the CLI cannot
+/// defer, ships every schema, and the whole announcement is the right price. [`schemas_are_deferred`]
+/// is where that question is asked, and where the measurements are written down — this rule was
+/// taken off a live CLI, not reasoned from its documentation.
+///
+/// Not a display nicety. `runs::RunStatusResponse::with_prompt_budget` derives "the CLI's own" by
+/// SUBTRACTING this estimate from the reported prompt total, so charging the authored side for a
+/// ~10,250-character schema block that was never sent understates the residual by exactly as much.
+/// And the common case is the deferring one: a shell chat turn is `ToolPolicy::Unrestricted`
+/// (`assistant::tool_policy_for`), so this arm is the one an ordinary turn takes.
+pub(crate) fn authored_prompt(request: &RunRequest) -> crate::prompt_budget::AuthoredPrompt {
+    crate::prompt_budget::AuthoredPrompt {
+        schema_chars: match request.mcp_config {
+            None => 0,
+            // Announced but never sent: charged nothing, because nothing was read. This zero is a
+            // different fact from the one above it, and `AuthoredPrompt::schema_chars` is where the
+            // two are told apart for whoever reads the stored number.
+            Some(_) if schemas_are_deferred(request) => 0,
+            Some(_) => crate::mcp_tools::NucleosTools::advertised_schema_chars(request.mcp_box),
+        },
+        // Only counted when the flag is actually written. `Some("")` is not a state any caller
+        // builds, but counting an absent value as zero and a present one by its length is what keeps
+        // this in step with the `if let` in `cli_args`.
+        system_prompt_chars: request.append_system_prompt.as_ref().map_or(0, String::len),
+        // Empty writes NO flag — not `{}` — so an empty helper set costs nothing, and calling
+        // `agents_json` on it would charge two characters for a flag that was never written.
+        agents_chars: if request.agents.is_empty() {
+            0
+        } else {
+            agents_json(&request.agents).len()
+        },
+        // Charged whether it travels as a positional argument or on stdin. `steerable` decides which
+        // of the two, and the model reads the same characters either way.
+        prompt_chars: request.prompt.len(),
+    }
+}
+
+/// Whether this run's MCP tool schemas are DEFERRED — announced by name, fetched only if the model
+/// asks — rather than shipped whole inside the prompt.
+///
+/// **Asked of `denied_tools`, and never of the policy.** The expression below is the one `cli_args`
+/// writes onto `--disallowedTools`, so the price and the flag go wrong together or not at all. A
+/// `match` on `ToolPolicy` variants would answer the same for today's two policies and still be the
+/// wrong contract: a run that is `Unrestricted` and names `"ToolSearch"` in its own `denied_tools`
+/// has had the deferral taken away from it by name, ships every schema, and a variant match would
+/// charge it nothing.
+///
+/// Measured on 2026-09-07 against CLI 2.1.263 — one prompt, one flag different per arm, input
+/// tokens as the CLI reported them:
+///
+/// | offered | tools | input tokens |
+/// |---|---|---|
+/// | nothing at all | 0 | 3,612 |
+/// | 48 nucleos tools, every built-in denied | 48 | 15,837 |
+/// | 32 built-ins, no MCP server | 32 | 29,756 |
+/// | 32 built-ins + the same 48 nucleos tools | 80 | 30,606 |
+///
+/// The same 48 tools cost 12,225 tokens in one row and 850 in the other. In the shipped regime
+/// `advertised_schema_chars / 4` is right to within 9% (10,250 estimated against ~11,160
+/// attributable); in the deferred one it overstates the truth by more than an order of magnitude.
+///
+/// **`ToolSearch` is the single variable, and that was tested directly rather than inferred.** The
+/// rows above differ by a whole built-in set, which leaves open the rival explanation that the CLI
+/// defers once some TOOL COUNT is passed. A further arm denied every built-in EXCEPT `ToolSearch`,
+/// against the same 48-tool server: 49 tools, 5,578 input tokens — deferred — where 48 tools with
+/// no `ToolSearch` cost 15,837 and shipped. A count threshold cannot make 49 defer while 48 ships.
+/// `"ToolSearch"` is itself on `BUILTIN_TOOLS`, which is how denying the built-ins denies it.
+///
+/// `ToolPolicy::None` answers `["*"]`, which names no tool literally, so it reads as deferred and is
+/// charged nothing. That is the right answer by a different road — such a run is advertised NO tools
+/// at all, so there is no schema block in its prompt either — and it is unreachable regardless:
+/// every `None`-policy request in this codebase pairs the policy with `mcp_config: None`
+/// (`council::run_cloud_seat` makes the config `with_tools.then(…)`, `map_intent` sets neither, and
+/// `create_run_inner` never sets a config at all). It is left to the literal question above rather
+/// than special-cased, because the moment this stops being one reading of what `cli_args` writes, it
+/// starts being a second source of truth.
+fn schemas_are_deferred(request: &RunRequest) -> bool {
+    // Deferral is a CAPABILITY, so the question is whether the run still has it: `ToolSearch` on
+    // the denied list is the CLI being unable to fetch a schema on demand, which is the shipped
+    // regime. Reading the same list the flag is built from is the whole point of asking here.
+    !denied_tools(&request.tool_policy, &request.denied_tools)
+        .iter()
+        .any(|name| name == "ToolSearch")
 }
 
 /// A tool-free Ollama boundary for local triage.
@@ -2140,6 +2561,15 @@ impl CommandRunner for ClaudeCliRunner {
         }
     }
 
+    /// The one runner that authors a prompt this daemon can price, because it is the one whose
+    /// argument vector `cli_args` builds. See the trait's default for why nobody else answers.
+    fn authored_prompt(
+        &self,
+        request: &RunRequest,
+    ) -> Option<crate::prompt_budget::AuthoredPrompt> {
+        Some(authored_prompt(request))
+    }
+
     async fn run_prompt(
         &self,
         request: RunRequest,
@@ -2186,6 +2616,12 @@ impl CommandRunner for ClaudeCliRunner {
         // needs to force a window the CLI would otherwise clamp away, and it costs nothing here:
         // no caller sets both.
         if let Some((name, value)) = window_env(&request) {
+            cmd.env(name, value);
+        }
+        // Read now, while `request.messages` is still there to be asked about: the steering task
+        // takes it once the process is running.
+        let background_off = background_env(&request);
+        if let Some((name, value)) = background_off {
             cmd.env(name, value);
         }
         for (k, v) in &request.env {
@@ -2310,6 +2746,7 @@ impl CommandRunner for ClaudeCliRunner {
         // the only place the running total lives.
         let mut splitter = TurnSplitter::new();
         let mut usage = RunUsage::default();
+        let mut turn_ended = false;
         let mut running_context_fill: Option<i64> = None;
         let mut compacted = false;
 
@@ -2317,7 +2754,7 @@ impl CommandRunner for ClaudeCliRunner {
         let mut policy_violation: Option<String> = None;
         let mut init_seen = false;
         let mut progress_timeout_elapsed: Option<Duration> = None;
-        let mut turns: i64 = 0;
+        let mut turns = TurnCounter::default();
         let mut turns_exceeded: Option<i64> = None;
 
         loop {
@@ -2359,9 +2796,9 @@ impl CommandRunner for ClaudeCliRunner {
             // After the line is accumulated and mirrored, never before: a run stopped here still has
             // to leave the transcript of the turn that stopped it, or the evidence for why it was
             // stopped is the one thing missing from the record.
-            turns = turns_from_line(&line, turns);
-            if over_turn_ceiling(turns, request.max_turns) {
-                turns_exceeded = Some(turns);
+            turns.line(&line);
+            if over_turn_ceiling(turns.count(), request.max_turns) {
+                turns_exceeded = Some(turns.count());
                 break;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -2394,6 +2831,7 @@ impl CommandRunner for ClaudeCliRunner {
                 // and `usage` still describes the turn that ended last.
                 for event in splitter.line(line.clone()) {
                     if let TurnEvent::Ended(turn) = &event {
+                        turn_ended = true;
                         usage = turn.usage;
                         if turn.cost_usd.is_some() {
                             cost_usd = Some(splitter.spent());
@@ -2474,6 +2912,24 @@ impl CommandRunner for ClaudeCliRunner {
                 request.max_turns.unwrap_or_default()
             ));
         }
+        // Only for a run nothing can wake, which is the run background tasks were taken from: a
+        // conversation that keeps its process is still there when its task finishes.
+        let orphaned = if background_off.is_some() {
+            orphaned_background_tasks(&stdout_acc)
+        } else {
+            Vec::new()
+        };
+        if !orphaned.is_empty() {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            stderr_str.push_str(&format!(
+                "nucleos: this run ended its turn with background task(s) {} still running, and \
+                 they died with the process; nothing can deliver their result to a run with no \
+                 later turn, so the work they were doing never finished\n",
+                orphaned.join(", ")
+            ));
+        }
         let exit_code = match (
             progress_timeout_elapsed,
             turns_exceeded,
@@ -2492,8 +2948,17 @@ impl CommandRunner for ClaudeCliRunner {
                 stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
                 -1
             }
+            // The CLI's zero is a claim about the turn, and says nothing about the work it left
+            // running when the turn ended.
+            (None, None, None, None) if !orphaned.is_empty() => -1,
             (None, None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
         };
+
+        // Only when no turn ended: a `result` is the CLI's own account and is never second-guessed,
+        // and a stream without one still said, message by message, what it read.
+        if !turn_ended {
+            usage = usage_without_a_result(&stdout_acc);
+        }
 
         Ok(RunOutcome {
             exit_code,
@@ -2511,6 +2976,131 @@ impl CommandRunner for ClaudeCliRunner {
     }
 }
 
+/// What `run_prompt` prepared before building argv: MCP overrides, staged image paths and the
+/// sandbox the runner pins.
+#[derive(Debug, Default)]
+pub(crate) struct CodexStaged {
+    pub mcp_overrides: Vec<String>,
+    pub images: Vec<std::path::PathBuf>,
+    /// The sandbox this launch pins, or `None` to leave Codex's own resolution.
+    pub sandbox_mode: Option<&'static str>,
+}
+
+/// Translates the daemon's stdio MCP configuration into Codex overrides.
+/// `codex exec` runs with approval policy `never`, so Codex immediately declines an MCP tool call
+/// that needs confirmation ("user cancelled MCP tool call" on 0.144.4). `approve` pre-approves
+/// the daemon's own MCP servers, as the Claude path does with `--allowedTools mcp__nucleos__*`;
+/// an errand's box remains enforced by the server's own arguments.
+pub(crate) fn codex_mcp_overrides(
+    config: &serde_json::Value,
+    env_names: &[String],
+) -> Result<Vec<String>, String> {
+    let servers = config
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "mcp_config must contain an mcpServers object".to_string())?;
+    let mut names: Vec<&String> = servers.keys().collect();
+    names.sort();
+
+    let mut overrides = Vec::new();
+    for name in names {
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(format!(
+                "mcp_config server name {name:?} cannot be expressed"
+            ));
+        }
+        let server = servers
+            .get(name)
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| format!("mcp_config server {name:?} must be an object"))?;
+        if !matches!(
+            server.get("type").and_then(serde_json::Value::as_str),
+            None | Some("stdio")
+        ) {
+            return Err(format!("mcp_config server {name:?} must be stdio"));
+        }
+        let command = server
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("mcp_config server {name:?} must have a string command"))?;
+        let args = match server.get("args") {
+            None => Vec::new(),
+            Some(args) => args
+                .as_array()
+                .and_then(|args| {
+                    args.iter()
+                        .map(|arg| arg.as_str().map(str::to_string))
+                        .collect()
+                })
+                .ok_or_else(|| format!("mcp_config server {name:?} args must be a string array"))?,
+        };
+        overrides.push(format!(
+            "mcp_servers.{name}.command={}",
+            serde_json::to_string(command).expect("serializing a string cannot fail")
+        ));
+        overrides.push(format!(
+            "mcp_servers.{name}.args={}",
+            serde_json::to_string(&args).expect("serializing strings cannot fail")
+        ));
+        if !env_names.is_empty() {
+            overrides.push(format!(
+                "mcp_servers.{name}.env_vars={}",
+                serde_json::to_string(env_names).expect("serializing strings cannot fail")
+            ));
+        }
+        overrides.push(format!(
+            "mcp_servers.{name}.default_tools_approval_mode={}",
+            serde_json::to_string("approve").expect("serializing a string cannot fail")
+        ));
+    }
+    Ok(overrides)
+}
+
+/// Reads the thread id from Codex's thread-started event.
+pub(crate) fn codex_thread_id(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    (value.get("type").and_then(serde_json::Value::as_str) == Some("thread.started"))
+        .then(|| value.get("thread_id").and_then(serde_json::Value::as_str))
+        .flatten()
+        .map(str::to_string)
+}
+
+/// Decodes opening-turn images into files readable by the Codex CLI.
+pub(crate) fn stage_codex_images(
+    dir: &std::path::Path,
+    stem: &str,
+    images: &[Attachment],
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            let extension = match image.media_type.as_str() {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/gif" => "gif",
+                "image/webp" => "webp",
+                _ => {
+                    return Err(std::io::Error::other(
+                        "codex exec cannot honour images: unsupported media type",
+                    ));
+                }
+            };
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .map_err(|error| {
+                    std::io::Error::other(format!("codex exec cannot honour images: {error}"))
+                })?;
+            let path = dir.join(format!("{stem}-{index}.{extension}"));
+            std::fs::write(&path, bytes)?;
+            Ok(path)
+        })
+        .collect()
+}
+
 /// The full `codex exec` argument vector for one run, or the reason this tool cannot perform the
 /// run that was asked for. Pure for the same reason `cli_args` is: the flags deciding which model
 /// answers and where it is allowed to work are asserted in tests instead of inspected on a live
@@ -2523,17 +3113,27 @@ impl CommandRunner for ClaudeCliRunner {
 /// different run than it asked for (one that loses the history it was meant to branch from, or that
 /// answers once and then ignores every steering message) while `runs.rs` recorded it as completed.
 /// Naming the field in the refusal is what tells an operator which request cannot take this path.
-pub(crate) fn codex_cli_args(request: &RunRequest, model: &str) -> Result<Vec<String>, String> {
+pub(crate) fn codex_cli_args(
+    request: &RunRequest,
+    model: &str,
+    staged: &CodexStaged,
+) -> Result<Vec<String>, String> {
     if request.fork_session {
         return Err(
             "codex exec cannot honour fork_session: it has no way to branch an existing session"
                 .to_string(),
         );
     }
-    if request.steerable {
+    if request.steerable && request.messages.is_some() {
         return Err(
             "codex exec cannot honour steerable: it has no stdin a later turn can arrive on"
                 .to_string(),
+        );
+    }
+
+    if !request.images.is_empty() && staged.images.len() != request.images.len() {
+        return Err(
+            "codex exec cannot honour images: staging did not produce every image".to_string(),
         );
     }
 
@@ -2543,16 +3143,71 @@ pub(crate) fn codex_cli_args(request: &RunRequest, model: &str) -> Result<Vec<St
         "exec".to_string(),
         // A run works inside a worktree or a plain folder, and the CLI otherwise refuses to start
         // over the shape of that directory — a refusal about the ground rather than about the work.
-        "--skip-git-repo-check".to_string(),
-        "-m".to_string(),
-        model.to_string(),
+        if request.resume_session_id.is_some() {
+            "resume".to_string()
+        } else {
+            "--json".to_string()
+        },
     ];
-    // `-C` is the only thing keeping a run inside the project it was spawned for: the CLI resolves
-    // its own project root from this flag, so a vector missing it works wherever the daemon happened
-    // to be launched. An absent `cwd` passes no flag rather than inventing a directory.
-    if let Some(dir) = &request.cwd {
-        args.push("-C".to_string());
-        args.push(dir.to_string_lossy().into_owned());
+    if request.resume_session_id.is_some() {
+        args.push("--json".to_string());
+    }
+    args.push("--skip-git-repo-check".to_string());
+    for image in &staged.images {
+        args.push("-i".to_string());
+        args.push(image.to_string_lossy().into_owned());
+    }
+    args.extend(["-m".to_string(), model.to_string()]);
+    if request.resume_session_id.is_none() {
+        // `-C` is the only thing keeping a fresh run inside its project.
+        if let Some(dir) = &request.cwd {
+            args.push("-C".to_string());
+            args.push(dir.to_string_lossy().into_owned());
+        }
+        for dir in &request.add_dirs {
+            args.push("--add-dir".to_string());
+            args.push(dir.to_string_lossy().into_owned());
+        }
+    } else if !request.add_dirs.is_empty() {
+        let roots: Vec<String> = request
+            .add_dirs
+            .iter()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .collect();
+        args.extend([
+            "-c".to_string(),
+            format!(
+                "sandbox_workspace_write.writable_roots={}",
+                serde_json::to_string(&roots).expect("serializing paths cannot fail")
+            ),
+        ]);
+    }
+    // Use `-c`, not `-s`, because `codex exec resume` has no `-s` flag.
+    // It beats `sandbox_mode` in the user's `~/.codex/config.toml`, which exec's default does not.
+    if let Some(mode) = staged.sandbox_mode {
+        args.extend([
+            "-c".to_string(),
+            format!(
+                "sandbox_mode={}",
+                serde_json::to_string(mode).expect("serializing a string cannot fail")
+            ),
+        ]);
+    }
+    if let Some(effort) = &request.effort {
+        args.extend([
+            "-c".to_string(),
+            format!(
+                "model_reasoning_effort={}",
+                serde_json::to_string(effort).expect("serializing a string cannot fail")
+            ),
+        ]);
+    }
+    for override_value in &staged.mcp_overrides {
+        args.push("-c".to_string());
+        args.push(override_value.clone());
+    }
+    if let Some(session_id) = &request.resume_session_id {
+        args.push(session_id.clone());
     }
     // Trailing positional, after every flag that takes a value, so a prompt can never be consumed as
     // the argument of the option before it.
@@ -2611,6 +3266,22 @@ pub(crate) fn codex_extract_usage(stdout: &str) -> RunUsage {
 /// let a control only one of them honours look enforced on both.
 pub struct CodexCliRunner {
     pub model: String,
+    /// The sandbox every launch of this runner pins; `None` leaves Codex's own resolution (the
+    /// user's config, else exec's read-only default).
+    pub sandbox_mode: Option<&'static str>,
+}
+
+impl CodexCliRunner {
+    /// Builds the runner used for a chat turn answered by Codex (`Assistants::cli_runner`).
+    /// The owner's 2026-09-14 decision pins chat turns read-only.
+    /// KNOWN LIMITATION: a daemon whose primary runner is Codex uses its run runner through
+    /// `assistant::runner_for_turn`, so it keeps the user's Codex config as before this branch.
+    pub fn for_chat(model: String) -> Self {
+        Self {
+            model,
+            sandbox_mode: Some("read-only"),
+        }
+    }
 }
 
 #[async_trait]
@@ -2618,7 +3289,7 @@ impl CommandRunner for CodexCliRunner {
     async fn run_prompt(
         &self,
         request: RunRequest,
-        _session_tx: UnboundedSender<String>,
+        session_tx: UnboundedSender<String>,
         transcript: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> std::io::Result<RunOutcome> {
         // Refused before anything is sent, exactly as `OllamaRunner` refuses a policy it cannot
@@ -2655,17 +3326,11 @@ impl CommandRunner for CodexCliRunner {
                 request.permission
             )));
         }
-        // `mcp_config` is half of a pairing: on the Claude path the file arrives with an
-        // `--allowedTools mcp__nucleos__*` that narrows the run to that server alone. Dropping the
-        // flag drops the narrowing with it, so the run keeps every tool it had — the opposite of what
-        // naming an MCP config asks for.
-        if request.mcp_config.is_some() {
-            return Err(std::io::Error::other(
-                "codex exec cannot honour mcp_config: it has no flag that loads one, nor the tool narrowing that comes with it",
-            ));
-        }
-        // Reachable only if the tool-policy guard above is ever loosened, and refused anyway,
-        // because of which way it fails.
+        // MCP config is honoured through `codex_mcp_overrides`, which translates it into
+        // `-c mcp_servers.<name>...` overrides. An errand's tool box travels in the server's own `--mcp-tools` arguments, so it survives that translation.
+        // The daemon's own servers are pre-approved (`default_tools_approval_mode = "approve"`).
+        // Servers in the user's `~/.codex/config.toml` still load with that file's approval because
+        // `codex exec` has no counterpart to the Claude CLI's `--strict-mcp-config`.
         //
         // The barrier this used to stand down is `Permission::Bypass`'s to stand down now, and the
         // guard above refuses that. What is left here is a BELIEF and it is still worth refusing:
@@ -2692,9 +3357,7 @@ impl CommandRunner for CodexCliRunner {
         // conversation can be `Unrestricted` and still have barred a tool for itself — so without
         // this it would be a restriction somebody set, saw drawn back at them, and never had.
         for (asked, control) in [
-            (request.effort.is_some(), "effort"),
             (!request.fallback_model.is_empty(), "fallback_model"),
-            (!request.add_dirs.is_empty(), "add_dirs"),
             (request.max_budget_usd.is_some(), "max_budget_usd"),
             (!request.agents.is_empty(), "agents"),
             (
@@ -2724,32 +3387,68 @@ impl CommandRunner for CodexCliRunner {
         // so a run that loses it is a run with a nameless session, which is what every run on this
         // path has always had.
 
-        // Not a safety control, and refused all the same. A caller asks for partial messages because
-        // something downstream is waiting on them; a stream that silently never emits any is a
-        // feature that looks broken rather than absent.
-        if request.include_partial_messages {
-            return Err(std::io::Error::other(
-                "codex exec cannot honour include_partial_messages: its stream has no partial-message events",
-            ));
-        }
-        // KNOWN LIMITATION, left un-refused on purpose: `resume_session_id` is not honoured here.
-        //
-        // A run resumed on this path gets a FRESH session carrying the continuation prompt — it
-        // re-reads rather than continues — because `codex exec` has no `--resume` flag; resuming is
-        // a separate subcommand with its own argument shape, so it is a launch this builder does not
-        // yet construct rather than a capability the tool lacks. That is a degraded resume, not an
-        // ignored safety control: nothing is loosened by it, and every barrier the run launches
-        // under is unchanged.
-        //
-        // Refusing it would also refuse more than itself. `session_id` — the id the daemon assigns
-        // every run so its record has a name — travels the same pair of fields, and the run's outcome
-        // is filed under whichever of the two is set; a refusal keyed on either would fail runs whose
-        // only unusual property is having been given an identity.
+        // Partial messages are accepted and degrade: Codex's stream has no partial-message events,
+        // so the reply arrives when the turn completes.
+        // Resume is honoured through `codex exec resume`, which has its own argument shape.
         //
         // The args are built before anything is spawned so a refusal reaches the caller as the `Err` that means
         // the CLI never ran — which `runs::spawn_run` reads as "a retry cannot double-apply a
         // mutation", and that is precisely true of a launch that did not happen.
-        let args = codex_cli_args(&request, &self.model).map_err(std::io::Error::other)?;
+        // `codex_cli_args` honours MCP config, effort, and extra directories; partial messages
+        // degrade because the reply arrives when the turn completes.
+        let mcp_overrides = match &request.mcp_config {
+            Some(path) => {
+                let contents = std::fs::read(path).map_err(|error| {
+                    std::io::Error::other(format!("codex exec cannot honour mcp_config: {error}"))
+                })?;
+                let config = serde_json::from_slice(&contents).map_err(|error| {
+                    std::io::Error::other(format!("codex exec cannot honour mcp_config: {error}"))
+                })?;
+                let mut env_names: Vec<String> =
+                    request.env.iter().map(|(name, _)| name.clone()).collect();
+                env_names.sort();
+                codex_mcp_overrides(&config, &env_names).map_err(|why| {
+                    std::io::Error::other(format!("codex exec cannot honour mcp_config: {why}"))
+                })?
+            }
+            None => Vec::new(),
+        };
+        struct StagedFiles(Vec<PathBuf>);
+        impl Drop for StagedFiles {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let staged_files = if request.images.is_empty() {
+            StagedFiles(Vec::new())
+        } else {
+            let stem = format!(
+                "nucleos-codex-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            StagedFiles(stage_codex_images(
+                std::env::temp_dir().as_path(),
+                &stem,
+                &request.images,
+            )?)
+        };
+        let staged = CodexStaged {
+            mcp_overrides,
+            images: staged_files.0.clone(),
+            sandbox_mode: self.sandbox_mode,
+        };
+        let args = codex_cli_args(
+            &request,
+            request.model.as_deref().unwrap_or(&self.model),
+            &staged,
+        )
+        .map_err(std::io::Error::other)?;
 
         // The Codex CLI binary. Overridable via `NUCLEOS_CODEX_BIN` for the same reason
         // `NUCLEOS_CLAUDE_BIN` exists: on Windows the npm-installed `codex` is a `.cmd` shim that
@@ -2797,8 +3496,9 @@ impl CommandRunner for CodexCliRunner {
         let mut stdout_acc = String::new();
         let mut post_launch_error: Option<std::io::Error> = None;
         let mut progress_timeout_elapsed: Option<Duration> = None;
-        let mut turns: i64 = 0;
+        let mut turns = TurnCounter::default();
         let mut turns_exceeded: Option<i64> = None;
+        let mut thread_id = None;
 
         loop {
             let next_line = match request.progress_timeout {
@@ -2827,12 +3527,18 @@ impl CommandRunner for CodexCliRunner {
                 shared.push_str(&line);
                 shared.push('\n');
             }
+            if thread_id.is_none() {
+                thread_id = codex_thread_id(&line);
+                if let Some(id) = &thread_id {
+                    let _ = session_tx.send(id.clone());
+                }
+            }
             // The same brake as the Claude body above, counting `turn.completed` instead of
-            // `assistant` — `turns_from_line` knows both, so this path cannot drift out of step
+            // `assistant` — `TurnCounter` knows both, so this path cannot drift out of step
             // with the other by being edited on its own.
-            turns = turns_from_line(&line, turns);
-            if over_turn_ceiling(turns, request.max_turns) {
-                turns_exceeded = Some(turns);
+            turns.line(&line);
+            if over_turn_ceiling(turns.count(), request.max_turns) {
+                turns_exceeded = Some(turns.count());
                 break;
             }
         }
@@ -2890,12 +3596,13 @@ impl CommandRunner for CodexCliRunner {
             exit_code,
             stdout: stdout_acc,
             stderr: stderr_str,
-            // `codex exec` names no session in what it prints, so a run stays known by the id its
-            // caller assigned; inventing one here would file it under an id nothing else holds.
-            session_id: request
-                .session_id
-                .clone()
-                .or_else(|| request.resume_session_id.clone()),
+            // The thread id from `thread.started` when the stream carried one, else the caller's id.
+            session_id: thread_id.or_else(|| {
+                request
+                    .session_id
+                    .clone()
+                    .or_else(|| request.resume_session_id.clone())
+            }),
             // This tool reports no price. Unknown, not free — `budget.rs` bills against this field,
             // and a `Some(0.0)` would make every run on this path look like it spent nothing.
             cost_usd: None,
@@ -2938,6 +3645,11 @@ pub struct FakeCommandRunner {
     pub last_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub last_resume: std::sync::Mutex<Option<String>>,
     pub last_mcp_config: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// Which box the launch said its server serves. Recorded beside `last_mcp_config` because the
+    /// two are one fact in two halves, and this is the half that is easy to get wrong: a path is
+    /// obviously present or absent, whereas a box that quietly disagrees with the config file looks
+    /// exactly like an honest `None` and is charged as the whole tool surface.
+    pub last_mcp_box: std::sync::Mutex<Option<Option<i64>>>,
     pub last_tool_policy: std::sync::Mutex<Option<ToolPolicy>>,
     pub last_session_id: std::sync::Mutex<Option<String>>,
     pub last_fork_session: std::sync::Mutex<Option<bool>>,
@@ -2972,6 +3684,21 @@ pub struct FakeCommandRunner {
     pub last_append_system_prompt: std::sync::Mutex<Option<Option<String>>>,
     pub last_denied_tools: std::sync::Mutex<Option<Vec<String>>>,
     pub last_session_name: std::sync::Mutex<Option<Option<String>>>,
+    /// Test-only: whether this double answers `authored_prompt` the way `ClaudeCliRunner` does.
+    ///
+    /// `false` by default, and that default is the honest one: a fake builds no argument vector, so
+    /// the trait's own reasoning applies to it unchanged — it leaves `runs.authored_prompt_chars`
+    /// NULL, exactly as the local model and the Codex CLI do, and every existing test here wants
+    /// precisely that.
+    ///
+    /// Turned on by the handful of tests asking a question about a LAUNCH SITE rather than about a
+    /// runner: does this launcher record what it wrote into the prompt, and does it record the right
+    /// figure? There is no other way to ask it. The one runner that answers `Some(_)` is the one
+    /// that spawns a real `claude`, so a test wanting the recording to happen would have to spawn a
+    /// process — and what it would then be testing is the CLI's presence on the machine, not the
+    /// call this daemon makes. The arithmetic itself is not on trial here; it is pinned against the
+    /// real function in `runner`'s own tests.
+    pub prices_its_prompt: bool,
     /// Test-only: return an `Err` (simulated launch failure — no work done) for the first N calls.
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
@@ -3023,6 +3750,20 @@ pub struct FakeCommandRunner {
 #[cfg(test)]
 #[async_trait]
 impl CommandRunner for FakeCommandRunner {
+    /// `None` unless a test has explicitly asked this double to stand in for the CLI runner here —
+    /// see [`FakeCommandRunner::prices_its_prompt`] for why that is opt-in and what it is for.
+    ///
+    /// When it is asked, it answers through the very same free function `ClaudeCliRunner` calls, so
+    /// the double cannot come to price a request differently from the runner it is standing in for.
+    /// A second copy of that arithmetic living in the test double would be a test that keeps passing
+    /// after the production rule changes underneath it.
+    fn authored_prompt(
+        &self,
+        request: &RunRequest,
+    ) -> Option<crate::prompt_budget::AuthoredPrompt> {
+        self.prices_its_prompt.then(|| authored_prompt(request))
+    }
+
     /// The live-process door, so a conversation that keeps its CLI is exercised in tests rather than
     /// only in production.
     ///
@@ -3165,6 +3906,7 @@ impl CommandRunner for FakeCommandRunner {
         *self.last_permission.lock().unwrap() = Some(request.permission);
         *self.last_resume.lock().unwrap() = request.resume_session_id.clone();
         *self.last_mcp_config.lock().unwrap() = request.mcp_config.clone();
+        *self.last_mcp_box.lock().unwrap() = Some(request.mcp_box);
         *self.last_tool_policy.lock().unwrap() = Some(request.tool_policy);
         *self.last_session_id.lock().unwrap() = request.session_id.clone();
         *self.last_fork_session.lock().unwrap() = Some(request.fork_session);
@@ -3262,6 +4004,28 @@ mod tests {
         std::sync::Arc::new(std::sync::Mutex::new(String::new()))
     }
 
+    /// A notebook write says which notebook, like every other write says which file.
+    ///
+    /// `detail_of` is what `ask_about` puts beside a tool name, so while `notebook_path` was off
+    /// the list a `manual` rung asking about a `NotebookEdit` showed the tool and nothing else
+    /// — a question about a write with the write left out, which is not a question anybody
+    /// can answer. The second case pins the ORDER rather than restating the first: `description`
+    /// is deliberately last, and a path must beat the sentence a model wrote about it.
+    #[test]
+    fn a_notebook_write_says_which_notebook() {
+        assert_eq!(
+            detail_of(&serde_json::json!({"notebook_path": "C:/repo/notes.ipynb"})),
+            Some("C:/repo/notes.ipynb".to_owned())
+        );
+        assert_eq!(
+            detail_of(&serde_json::json!({
+                "description": "tidy the notebook up a bit",
+                "notebook_path": "notes.ipynb",
+            })),
+            Some("notes.ipynb".to_owned())
+        );
+    }
+
     #[test]
     fn cli_args_always_assigns_a_session_id() {
         let request = baseline_run_request();
@@ -3338,6 +4102,7 @@ mod tests {
             name: name.to_string(),
             description: "Reviews code".to_string(),
             prompt: "You are a code reviewer".to_string(),
+            tools: None,
             model: None,
             effort: None,
         }
@@ -3382,6 +4147,53 @@ mod tests {
 
         assert!(sent["reviewer"].get("model").is_none(), "{}", args[at + 1]);
         assert!(sent["reviewer"].get("effort").is_none(), "{}", args[at + 1]);
+    }
+
+    /// Absent, not `null` and not `[]`: a helper that named no restriction inherits the parent's
+    /// whole tool surface, today's behaviour, and the object sent to the CLI says nothing at all
+    /// rather than saying "no restriction" in a way that could later be confused with "no tools".
+    #[test]
+    fn a_helper_that_named_no_tools_sends_no_tools_key() {
+        let mut request = baseline_run_request();
+        request.agents = vec![a_helper("reviewer")];
+
+        let args = cli_args(&request, "sonnet");
+        let at = args.iter().position(|arg| arg == "--agents").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+
+        assert!(sent["reviewer"].get("tools").is_none(), "{}", args[at + 1]);
+    }
+
+    /// A helper that named a restriction sends exactly that list, so the CLI grants it those tools
+    /// and nothing else.
+    #[test]
+    fn a_helper_may_be_restricted_to_named_tools() {
+        let mut request = baseline_run_request();
+        let mut helper = a_helper("reviewer");
+        helper.tools = Some(vec!["Read".to_string(), "Grep".to_string()]);
+        request.agents = vec![helper];
+
+        let args = cli_args(&request, "sonnet");
+        let at = args.iter().position(|arg| arg == "--agents").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+
+        assert_eq!(
+            sent["reviewer"]["tools"],
+            serde_json::json!(["Read", "Grep"])
+        );
+    }
+
+    /// A helper stored before this field existed — its JSON object has no `tools` key at all —
+    /// deserialises identically to one that named no restriction, and runs the same way: inheriting
+    /// the parent's whole surface, exactly as it did before this field was added.
+    #[test]
+    fn a_helper_stored_before_tools_existed_still_deserialises() {
+        let stored = r#"{"description":"Reviews code","prompt":"You are a code reviewer"}"#;
+        let agent: Subagent = serde_json::from_str(stored).unwrap();
+
+        assert_eq!(agent.tools, None);
+        assert_eq!(agent.description, "Reviews code");
+        assert_eq!(agent.prompt, "You are a code reviewer");
     }
 
     #[test]
@@ -3913,6 +4725,149 @@ mod tests {
         );
     }
 
+    /// A run offered no server is charged nothing for schemas, and that zero is an answer rather
+    /// than a gap.
+    ///
+    /// This daemon writes `--mcp-config` or it does not; when it does not, the model is offered no
+    /// tools by us and there is no schema block in its prompt to pay for. The second half of the
+    /// test is the state the pairing forbids: a box named with no server to announce it still costs
+    /// nothing, because it is `mcp_config` that decides whether anything is announced at all.
+    #[test]
+    fn a_request_offered_no_server_is_charged_nothing_for_schemas() {
+        let mut request = baseline_run_request();
+        // `McpOnly` and not the baseline's `Unrestricted`, so that the zeros below are attributable
+        // to the ABSENT SERVER. An unrestricted run defers its schemas and reads 0 whatever its
+        // config says, which would make both assertions pass without touching what they are about.
+        request.tool_policy = ToolPolicy::McpOnly;
+        assert!(request.mcp_config.is_none());
+        assert_eq!(authored_prompt(&request).schema_chars, 0);
+
+        request.mcp_box = Some(7);
+        assert_eq!(
+            authored_prompt(&request).schema_chars,
+            0,
+            "a box with no server behind it announced nothing, so it may not be charged for"
+        );
+    }
+
+    /// A boxed server announces a fraction of the surface, and the price follows the box rather
+    /// than the mere presence of the flag.
+    ///
+    /// **The assertions are relationships and not byte counts, on purpose.** The figure is
+    /// `serde_json` run over the live tool router, so it moves whenever a tool is added, renamed, or
+    /// has a sentence added to its description — and a hardcoded literal here would fail on every
+    /// honest edit and teach its next reader to paste in whatever the failure printed. What has to
+    /// hold is the property: the boxed price is the box's own, it is a small part of the whole, and
+    /// it is what a boxed request is charged.
+    ///
+    /// The order-of-magnitude bound is the one that would have caught the bug this pair of fields
+    /// exists to prevent. Pricing every server unboxed overstated an errand turn by roughly twelve
+    /// to one, which is invisible in a total and enormous in a bill.
+    #[test]
+    fn a_boxed_request_is_charged_for_the_box_and_not_the_whole_surface() {
+        let mut request = baseline_run_request();
+        request.mcp_config = Some(PathBuf::from("mcp.json"));
+        // `McpOnly` is the only policy under which a schema price is non-zero at all: it denies the
+        // built-ins, `ToolSearch` among them, so the CLI cannot defer and the schemas really are in
+        // the prompt. Under the baseline's `Unrestricted` every assertion below would read 0 against
+        // 0 and the box-versus-whole comparison would be vacuous.
+        request.tool_policy = ToolPolicy::McpOnly;
+        let whole = authored_prompt(&request).schema_chars;
+
+        request.mcp_box = Some(7);
+        let boxed = authored_prompt(&request).schema_chars;
+
+        assert_eq!(
+            boxed,
+            crate::mcp_tools::NucleosTools::advertised_schema_chars(Some(7)),
+            "the price must be the box's own announcement, taken from the one function that folds it"
+        );
+        assert!(
+            boxed > 0,
+            "an errand's server announces four errand tools and the handful every box keeps, so \
+             its surface is small and is not empty"
+        );
+        assert!(
+            boxed * 8 < whole,
+            "a boxed server must announce a small part of the whole surface — measured at roughly \
+             twelve to one — and this said {boxed} against {whole}"
+        );
+    }
+
+    /// The same server, announced twice, charged once — because only one of the two runs was sent
+    /// the schemas.
+    ///
+    /// **The assertion is the SPLIT, not either half.** One `RunRequest` with one `mcp_config` is
+    /// read under both policies, so nothing but the regime differs between the two readings; a test
+    /// that only pinned the zero would pass against code that charged nobody, and one that only
+    /// pinned the price would pass against the old code that charged everybody.
+    ///
+    /// Measured on 2026-09-07 against CLI 2.1.263, on one prompt with one flag moved per arm. The
+    /// same 48 nucleos tools cost **850** input tokens when the CLI kept `ToolSearch` and advertised
+    /// them by name, and **~12,225** when every built-in was denied and it had to ship the schemas.
+    /// That is the whole of why the daemon may not charge both alike: on the deferred run
+    /// `advertised_schema_chars / 4` claims ~10,250 tokens for a block the model never read, and
+    /// `runs::with_prompt_budget` subtracts it, so the CLI's own share is understated by as much.
+    #[test]
+    fn a_deferred_schema_is_not_charged_to_the_prompt_that_never_held_it() {
+        let mut request = baseline_run_request();
+        request.mcp_config = Some(PathBuf::from("mcp.json"));
+
+        // The ordinary chat turn: `assistant::tool_policy_for` returns this for a turn with a cwd,
+        // so the deferring regime is the common one and not the exotic one.
+        request.tool_policy = ToolPolicy::Unrestricted;
+        assert_eq!(
+            authored_prompt(&request).schema_chars,
+            0,
+            "the CLI keeps `ToolSearch` here, advertises the tools by name and fetches a schema only \
+             when asked — so the schema block is not in this prompt and may not be billed to it"
+        );
+
+        // One flag different. Same request, same server, same announcement.
+        request.tool_policy = ToolPolicy::McpOnly;
+        assert_eq!(
+            authored_prompt(&request).schema_chars,
+            crate::mcp_tools::NucleosTools::advertised_schema_chars(request.mcp_box),
+            "denying the built-ins denies `ToolSearch` with them, the CLI cannot defer, and the run \
+             really does read every schema its server announces"
+        );
+    }
+
+    /// Taking `ToolSearch` away BY NAME puts an unrestricted run back in the shipped regime, and it
+    /// must be charged like one.
+    ///
+    /// This is the test that makes the helper's contract "ask `denied_tools`" rather than "match the
+    /// policy": the policy here is `Unrestricted`, so a variant match would call this deferred and
+    /// charge it nothing, while the flag `cli_args` writes says otherwise and the CLI obeys the flag.
+    ///
+    /// It is also where the count hypothesis dies. The regime could in principle have been chosen by
+    /// how many tools were on offer rather than by which ones — so a further arm on 2026-09-07 denied
+    /// every built-in EXCEPT `ToolSearch`, against the same 48-tool server: **49 tools, 5,578 input
+    /// tokens, deferred**, where **48 tools with no `ToolSearch` cost 15,837 and shipped**. No count
+    /// threshold makes 49 defer while 48 ships. `ToolSearch` is the variable.
+    #[test]
+    fn denying_tool_search_by_name_is_charged_as_a_shipped_run() {
+        let mut request = baseline_run_request();
+        request.mcp_config = Some(PathBuf::from("mcp.json"));
+        assert!(
+            matches!(request.tool_policy, ToolPolicy::Unrestricted),
+            "the point of this test is a policy that would otherwise defer"
+        );
+        assert_eq!(
+            authored_prompt(&request).schema_chars,
+            0,
+            "untouched, this request defers"
+        );
+
+        request.denied_tools = vec!["ToolSearch".to_string()];
+        assert_eq!(
+            authored_prompt(&request).schema_chars,
+            crate::mcp_tools::NucleosTools::advertised_schema_chars(request.mcp_box),
+            "one name on `--disallowedTools` and the CLI has no way to fetch a schema on demand, so \
+             it ships them all — the price must follow the flag, not the policy the flag sits under"
+        );
+    }
+
     fn baseline_run_request() -> RunRequest {
         RunRequest {
             prompt: "test prompt".to_string(),
@@ -3921,6 +4876,7 @@ mod tests {
             permission: Permission::Default,
             resume_session_id: None,
             mcp_config: None,
+            mcp_box: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,
@@ -4038,6 +4994,74 @@ mod tests {
         );
     }
 
+    /// Points `NUCLEOS_CLAUDE_BIN` at a program for as long as it lives, and puts the previous value
+    /// back on drop.
+    ///
+    /// Under `worktree::test_env_lock`, which every test that writes the process environment takes:
+    /// the variable is process-wide, and a second test pointing it elsewhere mid-run would hand this
+    /// one a CLI it did not write.
+    struct FakeClaudeBin {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl FakeClaudeBin {
+        fn set(program: &str) -> Self {
+            let lock = crate::worktree::test_env_lock();
+            let previous = std::env::var_os("NUCLEOS_CLAUDE_BIN");
+            unsafe { std::env::set_var("NUCLEOS_CLAUDE_BIN", program) };
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for FakeClaudeBin {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("NUCLEOS_CLAUDE_BIN", value),
+                    None => std::env::remove_var("NUCLEOS_CLAUDE_BIN"),
+                }
+            }
+        }
+    }
+
+    /// A shell script that prints `lines` verbatim, one per line.
+    fn printing(lines: &[&str]) -> String {
+        let mut script = String::from("cat <<'STREAM'\n");
+        for line in lines {
+            script.push_str(line);
+            script.push('\n');
+        }
+        script.push_str("STREAM\n");
+        script
+    }
+
+    /// A request whose CLI is `script`, spawned through the real runner loop with `sh` as the
+    /// program — so the test holds a [`FakeClaudeBin`] set to `"sh"`.
+    ///
+    /// It works because of where the runner puts things: `-p` first and a non-steerable run's
+    /// prompt second, so a prompt that is the script's path makes `sh -p <script> <flags...>` run
+    /// it, every flag after arriving as a positional argument it ignores. `-p` is `sh`'s own
+    /// privileged-mode switch and harmless here. One script for every platform where a `.bat` would
+    /// serve one, and `sh` is the program the gate tests already need.
+    fn fake_cli(dir: &std::path::Path, script: &str) -> RunRequest {
+        let path = dir.join("fake-claude.sh");
+        std::fs::write(&path, script).expect("write the fake CLI");
+        // Forward slashes: on Windows `sh` is MSYS, which reads `C:/...` reliably.
+        test_run_request(&path.display().to_string().replace('\\', "/"))
+    }
+
+    fn claude_runner() -> ClaudeCliRunner {
+        ClaudeCliRunner {
+            model: "sonnet".to_owned(),
+            plan_model: None,
+            review_model: None,
+        }
+    }
+
     fn test_run_request(prompt: &str) -> RunRequest {
         RunRequest {
             prompt: prompt.to_string(),
@@ -4046,6 +5070,7 @@ mod tests {
             permission: Permission::Default,
             resume_session_id: None,
             mcp_config: None,
+            mcp_box: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,
@@ -4069,6 +5094,65 @@ mod tests {
             messages: None,
             allowed_mcp_tools: None,
         }
+    }
+
+    /// The regression this bug was filed over. `usage` and `cost_usd` are set from the last `Ended`
+    /// turn and never reset — see the `TurnEvent::Ended` arm inside `run_prompt_with_turns` — so a
+    /// process that answers once and then loops into the ceiling on its NEXT turn must still report
+    /// what the first one cost. Before this test existed, that property was pinned only by
+    /// `a_real_cli_answers_a_second_turn_down_the_same_stdin`, which needs a paid, authenticated CLI
+    /// and is `#[ignore]`d for exactly that reason — this is the same claim, proven deterministically
+    /// against a real spawned process reading a scripted stream, so it runs in the gate.
+    ///
+    /// `steerable: false`, matching the run this bug was actually filed against: an ordinary
+    /// autopilot/job run, the kind `runs.rs` spawns, not a chat turn, a council seat or a team
+    /// member. What still lets a second turn exist without this request opting into steering is
+    /// nothing the request controls — the CLI's own stream decides where a `result` line falls —
+    /// and this fake reproduces a transcript where one already had, exactly as
+    /// `create_run_inner(..., steerable: true)` lets an operator-messaged run on the Runs page do.
+    #[tokio::test]
+    async fn a_ceiling_death_after_one_full_turn_still_reports_that_turns_cost_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut request = fake_cli(
+            dir.path(),
+            &printing(&[
+                r#"{"type":"system","subtype":"init","session_id":"fake-session","tools":[]}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"turn one"}]}}"#,
+                r#"{"type":"result","subtype":"success","total_cost_usd":0.05,"num_turns":1,"session_id":"fake-session","usage":{"input_tokens":11,"output_tokens":22,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"loop one"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"loop two"}]}}"#,
+            ]),
+        );
+        let _bin = FakeClaudeBin::set("sh");
+        // One answer for the turn that ends, two more to trip the ceiling mid-way through the turn
+        // that never does: an `assistant` event with no `message.id` is an answer of its own to
+        // [`TurnCounter`], so "turn one", "loop one" and "loop two" are three, and
+        // `over_turn_ceiling` fires once the count reaches 3.
+        request.max_turns = Some(3);
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let outcome = claude_runner()
+            .run_prompt(request, session_tx, discard_transcript())
+            .await
+            .expect("the fake CLI spawns and runs to the ceiling");
+
+        assert_eq!(
+            outcome.exit_code, TURN_CEILING_EXIT_CODE,
+            "the fake transcript must trip the ceiling before its second turn ends"
+        );
+        assert_eq!(
+            outcome.cost_usd,
+            Some(0.05),
+            "the first turn's cost must survive a ceiling death in the turn after it — this is \
+             the NULL the owner reported, and a real number exists here to lose"
+        );
+        assert_eq!(
+            outcome.num_turns,
+            Some(1),
+            "the first turn's own turn count must survive, not read back as unknown"
+        );
+        assert_eq!(outcome.input_tokens, Some(11));
+        assert_eq!(outcome.output_tokens, Some(22));
     }
 
     #[tokio::test]
@@ -4820,6 +5904,65 @@ mod tests {
         );
     }
 
+    /// Job 26's review, as it printed it: a node that never reached the API.
+    #[test]
+    fn a_review_that_never_reached_the_api_failed_on_something_transient() {
+        assert!(failed_on_a_transient_api_error(
+            REVIEW_THAT_NEVER_REACHED_THE_API
+        ));
+    }
+
+    /// No status, a timeout, rate limiting and the 5xx family are worth a second attempt; a request
+    /// the API refused is not, because it will be refused again.
+    #[test]
+    fn only_an_api_error_a_second_attempt_can_get_past_is_transient() {
+        let ended_on = |status: &str| {
+            format!(
+                "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}}\n\
+                 {{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\
+                 \"terminal_reason\":\"api_error\",\"api_error_status\":{status},\
+                 \"result\":\"API Error\"}}"
+            )
+        };
+        for (status, transient) in [
+            ("null", true),
+            ("408", true),
+            ("429", true),
+            ("500", true),
+            ("503", true),
+            ("529", true),
+            ("400", false),
+            ("401", false),
+            ("404", false),
+        ] {
+            assert_eq!(
+                failed_on_a_transient_api_error(&ended_on(status)),
+                transient,
+                "api_error_status {status}"
+            );
+        }
+    }
+
+    /// A turn that ended for any other reason ended on something the work did, and a stream with no
+    /// result at all says nothing about why it stopped.
+    #[test]
+    fn a_turn_that_ended_for_any_other_reason_is_not_transient() {
+        let max_turns = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"terminal_reason":"max_turns","api_error_status":null,"result":""}"#;
+        assert!(!failed_on_a_transient_api_error(max_turns));
+
+        let success = r#"{"type":"result","subtype":"success","is_error":false,"result":"Nothing wrong, nothing missing.","total_cost_usd":0.12}"#;
+        assert!(!failed_on_a_transient_api_error(success));
+
+        let no_result =
+            r#"{"type":"system","subtype":"api_retry","attempt":1,"error_status":null}"#;
+        assert!(!failed_on_a_transient_api_error(no_result));
+        assert!(!failed_on_a_transient_api_error(""));
+
+        // The LAST result decides: an error the CLI went on past is not how the run ended.
+        let recovered = format!("{REVIEW_THAT_NEVER_REACHED_THE_API}\n{success}");
+        assert!(!failed_on_a_transient_api_error(&recovered));
+    }
+
     #[test]
     fn extract_reply_returns_none_without_result_event() {
         let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
@@ -4987,17 +6130,19 @@ mod tests {
 
     /// One fold for both CLIs, because their per-turn events cannot appear in the same stream.
     ///
-    /// Claude says `assistant` once per completed model message; `codex exec` says `turn.completed`.
-    /// Counting both in one function is what keeps the ceiling from being a Claude-only brake — a
-    /// limit that silently does not apply on one of the two paths is worse than no limit, because
-    /// somebody will believe it is there.
+    /// Claude says `assistant` once per content block of a model message; `codex exec` says
+    /// `turn.completed` once per turn. Counting both in one place is what keeps the ceiling from
+    /// being a Claude-only brake — a limit that silently does not apply on one of the two paths is
+    /// worse than no limit, because somebody will believe it is there.
     #[test]
     fn a_turn_is_counted_once_per_model_response_on_either_cli() {
-        let claude = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#;
+        let claude = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"hi"}]}}"#;
         let codex = r#"{"type":"turn.completed","usage":{"input_tokens":10}}"#;
 
-        assert_eq!(turns_from_line(claude, 0), 1);
-        assert_eq!(turns_from_line(codex, 4), 5);
+        let mut turns = TurnCounter::default();
+        assert!(turns.line(claude));
+        assert!(turns.line(codex));
+        assert_eq!(turns.count(), 2);
 
         // Everything else in either stream is not a turn. `stream_event` in particular arrives by
         // the hundred for a single message — counting it would trip a ceiling of 200 inside one
@@ -5011,8 +6156,241 @@ mod tests {
             "not json at all",
             "",
         ] {
-            assert_eq!(turns_from_line(quiet, 7), 7, "counted a turn for: {quiet}");
+            assert!(!turns.line(quiet), "counted a turn for: {quiet}");
         }
+        assert_eq!(turns.count(), 2);
+    }
+
+    /// The shape of a real answer, and the reason the counter reads ids at all: one response that
+    /// says something and calls two tools is three `assistant` events with one `message.id`. Counted
+    /// as three, run 900463 was stopped at 125 responses under a ceiling of 200.
+    #[test]
+    fn the_blocks_of_one_answer_are_one_turn_however_many_tools_it_calls() {
+        let block = |id: &str, kind: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"{id}","content":[{{"type":"{kind}"}}]}}}}"#
+            )
+        };
+        let mut turns = TurnCounter::default();
+
+        assert!(turns.line(&block("msg_a", "text")));
+        assert!(!turns.line(&block("msg_a", "tool_use")));
+        assert!(!turns.line(&block("msg_a", "tool_use")));
+        assert_eq!(turns.count(), 1, "three blocks of one answer are one turn");
+
+        // The tool results in between are not turns, and the next answer is one.
+        assert!(!turns.line(r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#));
+        assert!(turns.line(&block("msg_b", "text")));
+        // An id already counted stays counted, even with another answer's blocks in between.
+        assert!(!turns.line(&block("msg_a", "text")));
+        assert_eq!(turns.count(), 2);
+
+        // With no id there is nothing to join events by, so each counts, as every event did before.
+        let anonymous =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#;
+        assert!(turns.line(anonymous));
+        assert!(turns.line(anonymous));
+        assert_eq!(turns.count(), 4);
+    }
+
+    /// The input side of a stream, once per answer; the output side, not at all.
+    #[test]
+    fn a_stream_with_no_result_reports_its_input_side_once_per_answer() {
+        let stdout = [
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"output_tokens":1},"content":[{"type":"text"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"output_tokens":1},"content":[{"type":"tool_use"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":2,"cache_read_input_tokens":200,"output_tokens":4},"content":[{"type":"text"}]}}"#,
+        ]
+        .join("\n");
+
+        let usage = usage_without_a_result(&stdout);
+
+        assert_eq!(usage.input_tokens, Some(5), "m1 once, not once per block");
+        assert_eq!(usage.cache_read_tokens, Some(300));
+        assert_eq!(usage.cache_creation_tokens, Some(10));
+        assert_eq!(
+            usage.output_tokens, None,
+            "an assistant event's output count is taken mid-message; it is not the answer's total"
+        );
+        assert_eq!(usage.num_turns, Some(2));
+    }
+
+    /// Unknown is not zero: a stream that never answered has not reported reading nothing.
+    #[test]
+    fn a_stream_that_never_answered_reports_nothing_rather_than_zero() {
+        let usage =
+            usage_without_a_result(r#"{"type":"system","subtype":"init","session_id":"s"}"#);
+        assert_eq!(usage, RunUsage::default());
+    }
+
+    /// The run this was filed over, through the real loop against a spawned process: stopped at
+    /// its ceiling with no `result` ever written. A pure test of `usage_without_a_result` would
+    /// pass with the function never called, and not being called is what left 900463 all NULL.
+    #[tokio::test]
+    async fn a_run_stopped_before_its_result_still_reports_what_its_stream_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut request = fake_cli(
+            dir.path(),
+            &printing(&[
+                r#"{"type":"system","subtype":"init","session_id":"fake","tools":[]}"#,
+                r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"output_tokens":1},"content":[{"type":"text","text":"looking"}]}}"#,
+                r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"output_tokens":1},"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#,
+                r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":2,"cache_read_input_tokens":200,"cache_creation_input_tokens":0,"output_tokens":1},"content":[{"type":"text","text":"again"}]}}"#,
+                r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":1,"cache_read_input_tokens":300,"cache_creation_input_tokens":5,"output_tokens":1},"content":[{"type":"text","text":"and again"}]}}"#,
+                r#"{"type":"assistant","message":{"id":"m4","usage":{"input_tokens":1000,"cache_read_input_tokens":1000,"cache_creation_input_tokens":1000,"output_tokens":1},"content":[{"type":"text","text":"never read"}]}}"#,
+            ]),
+        );
+        // Three responses in four events: counted by event, the ceiling would trip on m2.
+        request.max_turns = Some(3);
+        let _bin = FakeClaudeBin::set("sh");
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let outcome = claude_runner()
+            .run_prompt(request, session_tx, discard_transcript())
+            .await
+            .expect("the fake CLI spawns");
+
+        assert_eq!(
+            outcome.exit_code, TURN_CEILING_EXIT_CODE,
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(outcome.num_turns, Some(3), "the count that stopped it");
+        assert_eq!(
+            outcome.input_tokens,
+            Some(6),
+            "m1 once, m2, m3 — and never m4"
+        );
+        assert_eq!(outcome.cache_read_tokens, Some(600));
+        assert_eq!(outcome.cache_creation_tokens, Some(15));
+        assert_eq!(outcome.output_tokens, None);
+        assert_eq!(
+            outcome.cost_usd, None,
+            "the budget's own time estimate covers this"
+        );
+    }
+
+    /// The other side of the same line: once a `result` has arrived, its figures are the run's,
+    /// and the stream's partial ones never overwrite them.
+    #[tokio::test]
+    async fn a_run_that_reached_its_result_reports_the_results_figures() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = fake_cli(
+            dir.path(),
+            &printing(&[
+                r#"{"type":"system","subtype":"init","session_id":"fake","tools":[]}"#,
+                r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"output_tokens":1},"content":[{"type":"text","text":"done"}]}}"#,
+                r#"{"type":"result","subtype":"success","result":"done","total_cost_usd":0.02,"num_turns":1,"session_id":"fake","usage":{"input_tokens":7,"output_tokens":50,"cache_read_input_tokens":900,"cache_creation_input_tokens":40}}"#,
+            ]),
+        );
+        let _bin = FakeClaudeBin::set("sh");
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let outcome = claude_runner()
+            .run_prompt(request, session_tx, discard_transcript())
+            .await
+            .expect("the fake CLI spawns");
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(outcome.input_tokens, Some(7));
+        assert_eq!(outcome.output_tokens, Some(50));
+        assert_eq!(outcome.cache_read_tokens, Some(900));
+        assert_eq!(outcome.cache_creation_tokens, Some(40));
+        assert_eq!(outcome.num_turns, Some(1));
+        assert_eq!(outcome.cost_usd, Some(0.02));
+    }
+
+    /// Who keeps background tasks: only a run whose process outlives its turn.
+    #[test]
+    fn a_run_nothing_can_wake_is_given_no_background_tasks() {
+        let taken = Some(("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1"));
+
+        assert_eq!(background_env(&test_run_request("p")), taken);
+
+        let mut steerable_alone = test_run_request("p");
+        steerable_alone.steerable = true;
+        assert_eq!(
+            background_env(&steerable_alone),
+            taken,
+            "with no channel, stdin closes after the opening turn and nothing can wake it either"
+        );
+
+        let (_later, turns) = tokio::sync::mpsc::unbounded_channel::<LaterTurn>();
+        let mut conversation = test_run_request("p");
+        conversation.steerable = true;
+        conversation.messages = Some(turns);
+        assert_eq!(background_env(&conversation), None);
+    }
+
+    /// The signature, as run 900473's own stream wrote it.
+    #[test]
+    fn a_task_killed_after_the_last_answer_is_named_as_orphaned() {
+        let stdout = [
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"I'll wait for the background gate build to finish"}]}}"#,
+            r#"{"type":"result","subtype":"success","stop_reason":"end_turn","session_id":"s"}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"session_id":"s"}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"b84qqcytz","patch":{"status":"killed","end_time":1789005221034},"session_id":"s"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"b84qqcytz","tool_use_id":"toolu_1","status":"stopped","session_id":"s"}"#,
+        ]
+        .join("\n");
+
+        assert_eq!(
+            orphaned_background_tasks(&stdout),
+            vec!["b84qqcytz".to_string()],
+            "one task, named once although two events report it"
+        );
+    }
+
+    /// Stopped by the model mid-turn is a decision; finishing after the answer is not dying.
+    #[test]
+    fn a_task_stopped_mid_turn_or_finished_after_it_is_not_orphaned() {
+        let stdout = [
+            r#"{"type":"system","subtype":"task_updated","task_id":"early","patch":{"status":"killed"}}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"late","status":"completed"}"#,
+        ]
+        .join("\n");
+
+        assert!(orphaned_background_tasks(&stdout).is_empty());
+    }
+
+    /// Both lines of defence, through the real loop: the variable reaches the spawned process, and
+    /// a clean exit that left a task behind is recorded as the failure it is.
+    #[tokio::test]
+    async fn a_headless_run_that_leaves_a_task_running_is_not_a_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = printing(&[
+            r#"{"type":"system","subtype":"init","session_id":"fake","tools":[]}"#,
+        ]) + r#"printf '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"background-off=%s"}]}}\n' "$CLAUDE_CODE_DISABLE_BACKGROUND_TASKS""#
+            + "\n"
+            + &printing(&[
+                r#"{"type":"result","subtype":"success","result":"waiting","stop_reason":"end_turn","session_id":"fake"}"#,
+                r#"{"type":"system","subtype":"task_updated","task_id":"b84qqcytz","patch":{"status":"killed"},"session_id":"fake"}"#,
+                r#"{"type":"system","subtype":"task_notification","task_id":"b84qqcytz","status":"stopped","session_id":"fake"}"#,
+            ]);
+        let request = fake_cli(dir.path(), &script);
+        let _bin = FakeClaudeBin::set("sh");
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let outcome = claude_runner()
+            .run_prompt(request, session_tx, discard_transcript())
+            .await
+            .expect("the fake CLI spawns");
+
+        assert!(
+            outcome.stdout.contains(r#""text":"background-off=1""#),
+            "the variable must reach the process it is meant for: {}",
+            outcome.stdout
+        );
+        assert_eq!(outcome.exit_code, -1, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("b84qqcytz"),
+            "the stderr names the task: {}",
+            outcome.stderr
+        );
     }
 
     /// Off by one is the entire bug class of a ceiling, so it is asserted on both sides of the edge.
@@ -5509,6 +6887,28 @@ mod tests {
         }
     }
 
+    /// The two tests above assert hand-picked subsets — the ones that already cost a dead run — and
+    /// that is documentation worth keeping, but it left the other ~31 names in `BUILTIN_TOOLS` with
+    /// no assertion at all: a name could fall out of the list on an edit and nothing here would
+    /// notice. This iterates the whole const instead, so the list and the flag it produces can never
+    /// drift apart silently again.
+    #[test]
+    fn every_built_in_name_reaches_the_deny_flag() {
+        let args = args_for(ToolPolicy::McpOnly, None);
+        let denied = args
+            .windows(2)
+            .find(|w| w[0] == "--disallowedTools")
+            .map(|w| w[1].clone())
+            .expect("McpOnly must deny built-ins");
+        let denied: std::collections::HashSet<&str> = denied.split(',').collect();
+        for tool in BUILTIN_TOOLS {
+            assert!(
+                denied.contains(tool),
+                "{tool} is in BUILTIN_TOOLS but missing from --disallowedTools: {denied:?}"
+            );
+        }
+    }
+
     /// Every MCP server the user happens to have configured is ambient to a spawned run, including
     /// file-writing connectors. Only the server the daemon passes in may survive.
     #[test]
@@ -5912,7 +7312,7 @@ mod tests {
         let mut request = baseline_run_request();
         request.cwd = Some(std::path::PathBuf::from("C:/work/repo"));
 
-        let args = codex_cli_args(&request, "gpt-5.6-terra")
+        let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default())
             .expect("a baseline request asks for nothing the tool cannot honour");
 
         assert_eq!(
@@ -5940,12 +7340,377 @@ mod tests {
             directoryless.cwd.is_none(),
             "the baseline must name no directory"
         );
-        let directoryless_args = codex_cli_args(&directoryless, "gpt-5.6-terra")
-            .expect("a request without a directory is still honourable");
+        let directoryless_args =
+            codex_cli_args(&directoryless, "gpt-5.6-terra", &CodexStaged::default())
+                .expect("a request without a directory is still honourable");
         assert!(
             !directoryless_args.iter().any(|arg| arg == "-C"),
             "an absent cwd must not invent a directory: {directoryless_args:?}"
         );
+    }
+
+    #[test]
+    fn codex_cli_args_ask_for_the_json_event_stream() {
+        let fresh = codex_cli_args(
+            &baseline_run_request(),
+            "gpt-5.6-terra",
+            &CodexStaged::default(),
+        )
+        .unwrap();
+        assert!(fresh.iter().any(|arg| arg == "--json"), "{fresh:?}");
+
+        let mut resumed = baseline_run_request();
+        resumed.resume_session_id = Some("sess-1".to_string());
+        let resumed = codex_cli_args(&resumed, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        assert!(resumed.iter().any(|arg| arg == "--json"), "{resumed:?}");
+    }
+
+    #[test]
+    fn codex_cli_args_resume_a_session_through_the_resume_subcommand() {
+        let mut request = baseline_run_request();
+        request.resume_session_id = Some("sess-1".to_string());
+        request.cwd = Some(PathBuf::from("C:/work/repo"));
+        request.add_dirs = vec![PathBuf::from("C:/work/other")];
+
+        let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        assert_eq!(&args[..2], ["exec", "resume"], "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "-C"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--add-dir"), "{args:?}");
+        assert_eq!(
+            &args[args.len() - 2..],
+            ["sess-1", "test prompt"],
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn codex_cli_args_carry_effort_as_a_reasoning_override() {
+        let mut request = baseline_run_request();
+        request.effort = Some("high".to_string());
+        let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair[0] == "-c" && pair[1] == r#"model_reasoning_effort="high""# }),
+            "{args:?}"
+        );
+
+        let without_effort = codex_cli_args(
+            &baseline_run_request(),
+            "gpt-5.6-terra",
+            &CodexStaged::default(),
+        )
+        .unwrap();
+        assert!(
+            !without_effort
+                .iter()
+                .any(|arg| arg.contains("model_reasoning_effort")),
+            "{without_effort:?}"
+        );
+    }
+
+    #[test]
+    fn codex_cli_args_carry_extra_dirs_on_both_launch_shapes() {
+        let directories = vec![PathBuf::from("C:/work/a"), PathBuf::from("C:/work/b")];
+        let mut fresh = baseline_run_request();
+        fresh.add_dirs = directories.clone();
+        let fresh = codex_cli_args(&fresh, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        for directory in ["C:/work/a", "C:/work/b"] {
+            assert!(
+                fresh
+                    .windows(2)
+                    .any(|pair| pair[0] == "--add-dir" && pair[1] == directory),
+                "{fresh:?}"
+            );
+        }
+
+        let mut resumed = baseline_run_request();
+        resumed.resume_session_id = Some("sess-1".to_string());
+        resumed.add_dirs = directories;
+        let resumed = codex_cli_args(&resumed, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        let roots = serde_json::to_string(&["C:/work/a", "C:/work/b"]).unwrap();
+        assert!(
+            resumed.windows(2).any(|pair| {
+                pair[0] == "-c"
+                    && pair[1] == format!("sandbox_workspace_write.writable_roots={roots}")
+            }),
+            "{resumed:?}"
+        );
+        assert!(!resumed.iter().any(|arg| arg == "--add-dir"), "{resumed:?}");
+    }
+
+    /// An explicit override beats the user's `~/.codex/config.toml`, which exec's own default does
+    /// not; this is `-c` because `codex exec resume` has no `-s`.
+    #[test]
+    fn codex_cli_args_pin_the_sandbox_on_both_launch_shapes() {
+        let fresh_request = baseline_run_request();
+        let mut resumed_request = baseline_run_request();
+        resumed_request.resume_session_id =
+            Some("123e4567-e89b-42d3-a456-426614174001".to_string());
+        let pinned = CodexStaged {
+            sandbox_mode: Some("read-only"),
+            ..CodexStaged::default()
+        };
+
+        let fresh = codex_cli_args(&fresh_request, "gpt-5.6-terra", &pinned).unwrap();
+        let resumed = codex_cli_args(&resumed_request, "gpt-5.6-terra", &pinned).unwrap();
+        let sandbox = r#"sandbox_mode="read-only""#;
+
+        for args in [&fresh, &resumed] {
+            assert_eq!(
+                args.windows(2)
+                    .filter(|pair| pair[0] == "-c" && pair[1] == sandbox)
+                    .count(),
+                1,
+                "{args:?}"
+            );
+            let sandbox_index = args
+                .windows(2)
+                .position(|pair| pair[0] == "-c" && pair[1] == sandbox)
+                .unwrap();
+            assert!(sandbox_index + 1 < args.len() - 1, "{args:?}");
+        }
+        let resumed_sandbox_index = resumed
+            .windows(2)
+            .position(|pair| pair[0] == "-c" && pair[1] == sandbox)
+            .unwrap();
+        let session_index = resumed
+            .iter()
+            .position(|arg| arg == "123e4567-e89b-42d3-a456-426614174001")
+            .unwrap();
+        assert!(resumed_sandbox_index + 1 < session_index, "{resumed:?}");
+
+        for request in [&fresh_request, &resumed_request] {
+            let args = codex_cli_args(request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("sandbox_mode=")),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// The owner decided a Codex chat turn runs read-only; the run runner in `main.rs` keeps `None`
+    /// so a run keeps the user's Codex configuration.
+    #[test]
+    fn codex_chat_runner_pins_the_read_only_sandbox() {
+        let runner = CodexCliRunner::for_chat("gpt-5.5".to_string());
+
+        assert_eq!(runner.model, "gpt-5.5");
+        assert_eq!(runner.sandbox_mode, Some("read-only"));
+    }
+
+    #[test]
+    fn codex_cli_args_attach_images_without_swallowing_the_prompt() {
+        let mut request = baseline_run_request();
+        request.images = vec![
+            Attachment {
+                media_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+            Attachment {
+                media_type: "image/jpeg".to_string(),
+                data: "d29ybGQ=".to_string(),
+            },
+        ];
+        let staged = CodexStaged {
+            mcp_overrides: Vec::new(),
+            images: vec![
+                PathBuf::from("C:/stage/one.png"),
+                PathBuf::from("C:/stage/two.jpg"),
+            ],
+            sandbox_mode: None,
+        };
+        let args = codex_cli_args(&request, "gpt-5.6-terra", &staged).unwrap();
+        for image in ["C:/stage/one.png", "C:/stage/two.jpg"] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-i" && pair[1] == image),
+                "{args:?}"
+            );
+            assert!(
+                args.windows(3).any(|triple| triple[0] == "-i"
+                    && triple[1] == image
+                    && triple[2].starts_with('-')),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("test prompt"),
+            "{args:?}"
+        );
+
+        let too_few = CodexStaged {
+            mcp_overrides: Vec::new(),
+            images: vec![PathBuf::from("C:/stage/one.png")],
+            sandbox_mode: None,
+        };
+        let error = codex_cli_args(&request, "gpt-5.6-terra", &too_few).unwrap_err();
+        assert!(error.contains("images"), "{error}");
+    }
+
+    #[test]
+    fn codex_mcp_overrides_translate_the_daemons_mcp_config() {
+        let config = serde_json::json!({"mcpServers":{"nucleos":{"type":"stdio","command":"C:/x/nucleos-core.exe","args":["--mcp-tools","a"]}}});
+        let env_names = vec![
+            "NUCLEOS_DAEMON_TOKEN".to_string(),
+            "NUCLEOS_DAEMON_URL".to_string(),
+        ];
+        let overrides = codex_mcp_overrides(&config, &env_names).unwrap();
+        assert_eq!(
+            overrides,
+            vec![
+                r#"mcp_servers.nucleos.command="C:/x/nucleos-core.exe""#.to_string(),
+                r#"mcp_servers.nucleos.args=["--mcp-tools","a"]"#.to_string(),
+                r#"mcp_servers.nucleos.env_vars=["NUCLEOS_DAEMON_TOKEN","NUCLEOS_DAEMON_URL"]"#
+                    .to_string(),
+                r#"mcp_servers.nucleos.default_tools_approval_mode="approve""#.to_string(),
+            ]
+        );
+
+        let mut request = baseline_run_request();
+        request.env = vec![(
+            "NUCLEOS_DAEMON_TOKEN".to_string(),
+            "secret-token-value".to_string(),
+        )];
+        let args = codex_cli_args(
+            &request,
+            "gpt-5.6-terra",
+            &CodexStaged {
+                mcp_overrides: overrides.clone(),
+                images: Vec::new(),
+                sandbox_mode: None,
+            },
+        )
+        .unwrap();
+        for override_value in overrides {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-c" && pair[1] == override_value),
+                "{args:?}"
+            );
+        }
+        assert!(
+            !args.iter().any(|arg| arg.contains("secret-token-value")),
+            "{args:?}"
+        );
+    }
+
+    /// `codex exec` declines an unconfirmed MCP call; Claude pre-approves these same tools.
+    #[test]
+    fn codex_mcp_overrides_pre_approve_the_daemons_own_tools() {
+        let config = serde_json::json!({"mcpServers":{"nucleos":{"type":"stdio","command":"C:/x/nucleos-core.exe","args":["--mcp-tools"]}}});
+        let overrides = codex_mcp_overrides(&config, &[]).unwrap();
+        assert_eq!(
+            overrides,
+            vec![
+                r#"mcp_servers.nucleos.command="C:/x/nucleos-core.exe""#.to_string(),
+                r#"mcp_servers.nucleos.args=["--mcp-tools"]"#.to_string(),
+                r#"mcp_servers.nucleos.default_tools_approval_mode="approve""#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_mcp_overrides_refuse_a_config_they_cannot_express() {
+        let cases = [
+            serde_json::json!({}),
+            serde_json::json!({"mcpServers": []}),
+            serde_json::json!({"mcpServers":{"nucleos":{"type":"http","command":"C:/x"}}}),
+            serde_json::json!({"mcpServers":{"not nucleos":{"type":"stdio","command":"C:/x"}}}),
+            serde_json::json!({"mcpServers":{"nucleos":{"type":"stdio","command":3}}}),
+        ];
+        for config in cases {
+            let error = codex_mcp_overrides(&config, &[]).unwrap_err();
+            assert!(error.contains("mcp_config"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_codex_runner_refuses_an_mcp_config_it_cannot_read() {
+        let runner = CodexCliRunner {
+            model: "gpt-5.6-terra".to_string(),
+            sandbox_mode: None,
+        };
+        let mut request = baseline_run_request();
+        request.mcp_config = Some(PathBuf::from("C:/does-not-exist/mcp.json"));
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let error = runner
+            .run_prompt(
+                request,
+                session_tx,
+                std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mcp_config"), "{error}");
+        assert!(
+            !error.contains("cannot honour mcp_config: it has no flag"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn codex_thread_id_is_read_from_the_thread_started_event() {
+        assert_eq!(
+            codex_thread_id(r#"{"type":"thread.started","thread_id":"t-123"}"#),
+            Some("t-123".to_string())
+        );
+        assert_eq!(codex_thread_id(r#"{"type":"turn.completed"}"#), None);
+        assert_eq!(codex_thread_id("not json"), None);
+    }
+
+    #[test]
+    fn extract_reply_reads_a_codex_agent_message() {
+        let codex = r#"{"type":"item.completed","item":{"type":"agent_message","text":"draft"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"final"}}"#;
+        assert_eq!(extract_reply(codex), Some("final".to_string()));
+        assert_eq!(
+            extract_reply(r#"{"type":"result","result":"olá"}"#),
+            Some("olá".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_cli_args_accept_a_one_turn_steerable_request() {
+        let mut one_turn = baseline_run_request();
+        one_turn.steerable = true;
+        assert!(codex_cli_args(&one_turn, "gpt-5.6-terra", &CodexStaged::default()).is_ok());
+
+        let mut live = baseline_run_request();
+        live.steerable = true;
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<LaterTurn>();
+        live.messages = Some(rx);
+        let error = codex_cli_args(&live, "gpt-5.6-terra", &CodexStaged::default()).unwrap_err();
+        assert!(error.contains("steerable"), "{error}");
+    }
+
+    #[test]
+    fn codex_images_are_staged_as_files_the_cli_can_read() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let images = vec![
+            Attachment {
+                media_type: "image/png".to_string(),
+                data: "cG5n".to_string(),
+            },
+            Attachment {
+                media_type: "image/jpeg".to_string(),
+                data: "anBlZw==".to_string(),
+            },
+        ];
+        let staged = stage_codex_images(temp.path(), "stem", &images).unwrap();
+        assert_eq!(staged.len(), 2, "{staged:?}");
+        assert!(staged[0].ends_with("stem-0.png"), "{staged:?}");
+        assert!(staged[1].ends_with("stem-1.jpg"), "{staged:?}");
+        assert_eq!(std::fs::read(&staged[0]).unwrap(), b"png");
+        assert_eq!(std::fs::read(&staged[1]).unwrap(), b"jpeg");
+
+        let pdf = [Attachment {
+            media_type: "application/pdf".to_string(),
+            data: "cGRm".to_string(),
+        }];
+        let error = stage_codex_images(temp.path(), "stem", &pdf).unwrap_err();
+        assert!(error.to_string().contains("images"), "{error}");
     }
 
     /// A control this tool cannot honour must fail the launch instead of vanishing from it.
@@ -5961,13 +7726,13 @@ mod tests {
     fn codex_cli_args_refuse_what_the_tool_cannot_honour() {
         let honourable = baseline_run_request();
         assert!(
-            codex_cli_args(&honourable, "gpt-5.6-terra").is_ok(),
+            codex_cli_args(&honourable, "gpt-5.6-terra", &CodexStaged::default()).is_ok(),
             "the control case must build, or a refusal proves nothing"
         );
 
         let mut forked = baseline_run_request();
         forked.fork_session = true;
-        let forked_refusal = codex_cli_args(&forked, "gpt-5.6-terra")
+        let forked_refusal = codex_cli_args(&forked, "gpt-5.6-terra", &CodexStaged::default())
             .expect_err("a forked session cannot be honoured here");
         assert!(
             forked_refusal.contains("fork_session"),
@@ -5976,8 +7741,11 @@ mod tests {
 
         let mut steerable = baseline_run_request();
         steerable.steerable = true;
-        let steerable_refusal = codex_cli_args(&steerable, "gpt-5.6-terra")
-            .expect_err("a steerable run cannot be honoured here");
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<LaterTurn>();
+        steerable.messages = Some(rx);
+        let steerable_refusal =
+            codex_cli_args(&steerable, "gpt-5.6-terra", &CodexStaged::default())
+                .expect_err("a steerable run cannot be honoured here");
         assert!(
             steerable_refusal.contains("steerable"),
             "the refusal must name what it could not honour: {steerable_refusal}"
@@ -5997,6 +7765,7 @@ mod tests {
     async fn the_codex_runner_refuses_a_restricted_tool_policy() {
         let runner = CodexCliRunner {
             model: "gpt-5.6-terra".to_string(),
+            sandbox_mode: None,
         };
 
         for policy in [ToolPolicy::None, ToolPolicy::McpOnly] {
@@ -6065,15 +7834,11 @@ mod tests {
     /// converts a deliberately restrained run into an unrestrained one, in the one case where the
     /// operator is not watching. `Bypass` is refused for the opposite reason and it is the sharper
     /// of the two: it stands the CLI's permission barrier down on the strength of a `PreToolUse`
-    /// hook this launch surface has never heard of. `mcp_config` is half of a pairing on the Claude path, where the file arrives
-    /// with the `--allowedTools` narrowing that keeps the run to that server alone; dropping the flag
-    /// drops the narrowing, leaving MORE reachable than was asked for, not less.
+    /// hook this launch surface has never heard of.
     ///
-    /// `resume_session_id` is deliberately NOT here. It is unhonourable too, and documented as such
-    /// on the runner — but a run resumed on this path merely re-reads its prompt in a fresh session,
-    /// which loosens nothing, and refusing it would refuse `session_id` with it: the id the daemon
-    /// assigns every run travels the same pair of fields, so the control below would stop being a
-    /// control and start being a ban on runs that have a name.
+    /// `mcp_config` and `resume_session_id` are deliberately NOT here, because both are honoured now:
+    /// the MCP config becomes `-c mcp_servers.<name>...` overrides (see `codex_mcp_overrides` and its
+    /// tests), and a resumed run continues its own thread through `codex exec resume`.
     ///
     /// Asserted against `run_prompt` rather than `codex_cli_args`, because that builder's purity
     /// contract is frozen. Cheap for the same reason it is safe: every case returns before the
@@ -6082,6 +7847,7 @@ mod tests {
     async fn the_codex_runner_refuses_flags_it_cannot_honour() {
         let runner = CodexCliRunner {
             model: "gpt-5.6-terra".to_string(),
+            sandbox_mode: None,
         };
 
         let mut restrained = baseline_run_request();
@@ -6090,19 +7856,11 @@ mod tests {
         // mean running unbarriered where the daemon believes a classifier took over.
         let mut unbarriered = baseline_run_request();
         unbarriered.permission = Permission::Bypass;
-        let mut narrowed = baseline_run_request();
-        narrowed.mcp_config = Some(std::path::PathBuf::from("C:/nucleos/mcp.json"));
-        let mut streaming = baseline_run_request();
-        streaming.include_partial_messages = true;
         // The per-conversation controls of 0110–0113. Each of these is drawn back at the person in
         // the window as a setting their conversation has, so a launch that dropped one would leave
         // the row claiming something the run never had.
-        let mut thinking = baseline_run_request();
-        thinking.effort = Some("high".to_string());
         let mut degrading = baseline_run_request();
         degrading.fallback_model = vec!["opus".to_string()];
-        let mut reaching = baseline_run_request();
-        reaching.add_dirs = vec![PathBuf::from("/beside")];
         let mut capped = baseline_run_request();
         capped.max_budget_usd = Some(0.5);
         let mut helped = baseline_run_request();
@@ -6117,11 +7875,7 @@ mod tests {
         for (field, request) in [
             ("Permission::Plan", restrained),
             ("Permission::Bypass", unbarriered),
-            ("mcp_config", narrowed),
-            ("include_partial_messages", streaming),
-            ("effort", thinking),
             ("fallback_model", degrading),
-            ("add_dirs", reaching),
             ("max_budget_usd", capped),
             ("agents", helped),
             ("append_system_prompt", instructed),
@@ -6159,17 +7913,16 @@ mod tests {
             "the control must carry the identity the daemon assigns every run"
         );
         assert!(
-            codex_cli_args(&honourable, "gpt-5.6-terra").is_ok(),
+            codex_cli_args(&honourable, "gpt-5.6-terra", &CodexStaged::default()).is_ok(),
             "a request asking for none of the above must still build a launch"
         );
 
-        // The documented limitation, pinned as a limitation: a resumed run is not refused here, so
-        // whoever changes that has to change this line and read why it says so.
+        // Resume is honoured, through `codex exec resume`, and must still build a launch.
         let mut resumed = baseline_run_request();
         resumed.resume_session_id = Some("123e4567-e89b-42d3-a456-426614174001".to_string());
         assert!(
-            codex_cli_args(&resumed, "gpt-5.6-terra").is_ok(),
-            "resume is degraded on this path, not refused — see the comment in `run_prompt`"
+            codex_cli_args(&resumed, "gpt-5.6-terra", &CodexStaged::default()).is_ok(),
+            "resume is honoured through `exec resume`"
         );
 
         // And the other one, for the same reason. A display name reaches the Claude CLI's `--resume`

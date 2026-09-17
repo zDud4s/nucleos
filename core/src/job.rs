@@ -67,6 +67,10 @@ struct PlanFile {
 
 #[derive(Debug, Deserialize)]
 struct PlanItem {
+    /// The unfinished items this one takes over, numbered as the replan prompt lists them
+    /// (one-based). Only a replan is shown any, so only a replan's items carry this.
+    #[serde(default)]
+    replaces: Vec<i64>,
     description: String,
     /// `Option`, and the distinction it carries is the whole of decision 10: **an absent key is not
     /// an empty list**.
@@ -121,6 +125,8 @@ pub struct PlannedItem {
 /// A validated work queue, plus however much of it did not fit.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PlannedItems {
+    /// Every unfinished item the plan says it takes over, as zero-based ordinals.
+    pub replaces: Vec<usize>,
     pub items: Vec<PlannedItem>,
     /// Items the daemon's ceiling cut. Carried rather than discarded so the feed can say what was
     /// left out — a queue silently trimmed reads downstream as the whole of what the planner found.
@@ -394,13 +400,22 @@ pub fn parse_plan(
 
     let total = parsed.items.len();
     let mut items = Vec::with_capacity(total.min(max_items));
+    let mut replaced: Vec<usize> = Vec::new();
     for (index, item) in parsed.items.into_iter().take(max_items).enumerate() {
         let PlanItem {
             description,
+            replaces,
             files,
             depends_on,
             agent_id,
         } = item;
+        // A zero or a negative names no item the prompt listed, so it names nothing.
+        replaced.extend(
+            replaces
+                .into_iter()
+                .filter(|number| *number >= 1)
+                .map(|number| (number - 1) as usize),
+        );
         let (files, depends_on, agent_id) = match graph {
             Some(graph) => {
                 let (files, depends_on, agent_id) =
@@ -420,7 +435,10 @@ pub fn parse_plan(
         });
     }
 
+    replaced.sort_unstable();
+    replaced.dedup();
     Ok(PlannedItems {
+        replaces: replaced,
         dropped: total - items.len(),
         items,
         // `done` wins over any items alongside it, and the alternative would be worse in both
@@ -498,6 +516,8 @@ pub enum ItemState {
     /// person was asked to decide about; nobody is being asked anything about an orphan, and the
     /// thing that broke is already in the queue saying so.
     Orphaned,
+    /// Taken over by an item of a later round. Stored as [`STATUS_SUPERSEDED`].
+    Superseded,
 }
 
 /// Every variant of [`ItemState`], for the tests that have to say something about all of them.
@@ -506,7 +526,7 @@ pub enum ItemState {
 /// derive macro for the sake of one array, and the alternative to both — tests that enumerate the
 /// states inline — is what lets a new variant be born untested everywhere at once.
 #[cfg(test)]
-const EVERY_ITEM_STATE: [ItemState; 14] = [
+const EVERY_ITEM_STATE: [ItemState; 15] = [
     ItemState::Pending,
     ItemState::Running,
     ItemState::Implemented,
@@ -521,6 +541,7 @@ const EVERY_ITEM_STATE: [ItemState; 14] = [
     ItemState::Conflicted,
     ItemState::Reverted,
     ItemState::Orphaned,
+    ItemState::Superseded,
 ];
 
 /// Whether the job still owes a review node.
@@ -530,6 +551,32 @@ pub enum ReviewState {
     Pending,
     Running,
     Done,
+    /// Wanted, and not had, because no item of this round reached `passed`.
+    ///
+    /// A review exists to judge what the round produced, and a round in which nothing passed has
+    /// put nothing on the branch: every red item was reverted to its footing before the queue moved
+    /// on. Measured on job 27, 2026-09-14: round 0's only item ended `gate_failed`, its work was
+    /// reverted, and the review (run 900513, $0.12) found `HEAD` at the base and a clean tree and
+    /// reported "no work was done" — about work that had been done, measured, and taken back.
+    ///
+    /// Not a failed review, and nothing reads it as one: it closes the round the way `Done` does,
+    /// but no node ran, so there is no verdict anywhere to quote. `load_view` derives it from the
+    /// item rows on every read, so a restart finds the same answer rather than remembering one.
+    Skipped,
+    /// The round's first review failed on an API error a second attempt can get past, and it is
+    /// owed again.
+    ///
+    /// Measured on job 26, 2026-09-13: review run 900483 exited 1 after ten `api_retry` events, its
+    /// result line saying `terminal_reason: "api_error"` with no HTTP status — "Can't reach the API
+    /// server — check your internet or DNS (ENOTFOUND)". It read as `Done`, and twenty seconds
+    /// later the replan opened the next round with no verdict on this one. A node that never
+    /// reached the model judged nothing, which is the one failure where "a review that failed is
+    /// still a review that happened" is not true.
+    ///
+    /// Once per round, counted from the rows: the round's second review reads `Done` however it
+    /// ended, so a network that stays down costs one extra node and never a loop. Not a skip — a
+    /// skipped review was never owed, and this one was owed and has not been had.
+    Retry,
 }
 
 /// How a job ended.
@@ -1005,10 +1052,29 @@ pub fn next_step(job: &JobView) -> Next {
     }
 
     match job.review {
-        ReviewState::Pending => Next::SpawnReview,
+        // A review owed again is owed like one not yet had. See `ReviewState::Retry`.
+        ReviewState::Pending | ReviewState::Retry => Next::SpawnReview,
         ReviewState::Running => Next::Wait,
-        ReviewState::NotWanted | ReviewState::Done => close_the_round(job),
+        // A round in which nothing passed goes on exactly as it would have after its review: to
+        // the replan, or to the ending. See `ReviewState::Skipped`.
+        ReviewState::NotWanted | ReviewState::Done | ReviewState::Skipped => close_the_round(job),
     }
+}
+
+/// PURE: whether `next_step` answered what it did only because the round's review was skipped.
+///
+/// Asked by putting the review back and asking again, rather than by restating the conditions under
+/// which `next_step` reaches the review: a second copy of those would agree with the first only
+/// until one of them was edited. `ReviewState::Skipped` alone is not enough, because the view reads
+/// it all through a round in which nothing has passed YET. While items are still to run the skip
+/// has decided nothing, and a job cancelled mid-round ends at the short-circuit, review or no
+/// review.
+fn the_skip_decided(view: &JobView) -> bool {
+    view.review == ReviewState::Skipped
+        && next_step(&JobView {
+            review: ReviewState::Pending,
+            ..view.clone()
+        }) == Next::SpawnReview
 }
 
 /// Who the director gave this item to, in their own words, or `None`.
@@ -1155,6 +1221,8 @@ fn never_lands(state: ItemState) -> bool {
             | ItemState::Cancelled
             | ItemState::Skipped
             | ItemState::Orphaned
+            // Its own work never lands: the item that took it over is a different item.
+            | ItemState::Superseded
     )
 }
 
@@ -1277,6 +1345,9 @@ fn ending(job: &JobView) -> Outcome {
 ///
 /// `Cancelled` is deliberately absent. It stops the job at the short-circuit, team or no team, and
 /// never reaches here.
+///
+/// `Superseded` is absent too, and that absence is the point of the state: a later round took the
+/// failure over, and the item that did is the one read here.
 fn failed_ending(job: &JobView) -> Option<Outcome> {
     if job
         .items
@@ -1343,6 +1414,7 @@ fn item_state_from(status: &str, gate_attempts: i64, gate_retries: i64) -> ItemS
         "gate_failed" => ItemState::GateFailed,
         "gate_errored" => ItemState::GateErrored,
         STATUS_SKIPPED => ItemState::Skipped,
+        STATUS_SUPERSEDED => ItemState::Superseded,
         // The four states of parallel items. Nothing writes these rows yet, and they are read
         // ahead of the writer on purpose: the `_ =>` below would take any of them for `pending`
         // and hand the item back to the queue as work nobody had started.
@@ -1395,7 +1467,8 @@ impl ItemState {
             | ItemState::Skipped
             | ItemState::Merging
             | ItemState::Reverted
-            | ItemState::Orphaned => None,
+            | ItemState::Orphaned
+            | ItemState::Superseded => None,
         }
     }
 }
@@ -1513,6 +1586,16 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
             .bind(round)
             .fetch_one(pool)
             .await?;
+    // And the one after it: did anything this round queued PASS. Asked of the rows for the same
+    // reason, and asked on every read rather than written down, so a round spared its review is
+    // spared it again after a restart — see `ReviewState::Skipped`.
+    let passed_this_round: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM job_items WHERE job_id = ? AND round = ? AND status = 'passed'",
+    )
+    .bind(job_id)
+    .bind(round)
+    .fetch_one(pool)
+    .await?;
 
     let plan_run = latest_node("plan").await?;
     let spec_run = latest_node("spec").await?;
@@ -1538,19 +1621,41 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
     // The column is the honest line because it is written by `open_the_next_round` and by
     // `stop_after_replan` — the two places where a replan's answer has actually been acted on.
     let round_opened_at = opened_by.unwrap_or(0);
-    let review_run: Option<String> = sqlx::query_scalar(
-        "SELECT status FROM runs WHERE job_id = ? AND stage = 'review' AND id > ?
+    // The round's latest review, how many reviews the round has had, and — for a review that
+    // FAILED, and only then — what it printed. The `CASE` is the point of the second column: a
+    // review that completed can carry a long stream, and nothing here reads it, so it is never
+    // loaded.
+    let review_run: Option<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT status, CASE WHEN status = 'failed' THEN stdout END,
+                (SELECT COUNT(*) FROM runs WHERE job_id = ? AND stage = 'review' AND id > ?)
+         FROM runs WHERE job_id = ? AND stage = 'review' AND id > ?
          ORDER BY id DESC LIMIT 1",
     )
+    .bind(job_id)
+    .bind(round_opened_at)
     .bind(job_id)
     .bind(round_opened_at)
     .fetch_optional(pool)
     .await?;
 
-    let review = match (review_wanted != 0, review_run.as_deref()) {
+    let review = match (review_wanted != 0, review_run) {
         (false, _) => ReviewState::NotWanted,
+        // Only while the round has no review of its own. One already running, or landed, is read
+        // for what it is, which also leaves a job that reviewed such a round before this existed
+        // reading exactly as it did.
+        (true, None) if passed_this_round == 0 => ReviewState::Skipped,
         (true, None) => ReviewState::Pending,
-        (true, Some(status)) if node_in_flight(status) => ReviewState::Running,
+        (true, Some((status, _, _))) if node_in_flight(&status) => ReviewState::Running,
+        // The one exception to the arm below, and narrow on purpose: the round's FIRST review,
+        // ended `failed` (the stream is only loaded for that status), on an API error the CLI
+        // itself says a second attempt can get past. A node that never reached the model judged
+        // nothing. Everything else — `timed_out`, `cancelled`, a review a hook gave up on, any
+        // other failure, and every second review — stays `Done`. See `ReviewState::Retry`.
+        (true, Some((_, Some(stdout), 1)))
+            if crate::runner::failed_on_a_transient_api_error(&stdout) =>
+        {
+            ReviewState::Retry
+        }
         // A review that failed is still a review that happened. Its verdict is advisory — §5.5 of
         // the design gives ship/no-ship to the gate — so a job does not fail for want of one, and
         // re-running it would spend a whole node to re-derive an opinion nobody is blocked on.
@@ -1652,6 +1757,13 @@ pub const STATUS_CANCELLED: &str = "cancelled";
 /// [`TERMINAL_STATUSES`] below: that list is job endings, and a skipped item ends nothing — the job
 /// carries on to the next one, which is the whole point of it.
 pub const STATUS_SKIPPED: &str = "skipped";
+
+/// An unfinished item a later round's replan said it takes over. Terminal, and not a failure: the
+/// item that replaced it is judged in its place, which is what lets a job that went round again
+/// after a failure end as something other than `failed`. Measured on job 26, 2026-09-13: its round-0
+/// item failed, round 1 redid the same work and passed the gate, and the job was still reported
+/// `failed` because nothing told the ending that the failure had been answered.
+pub const STATUS_SUPERSEDED: &str = "superseded";
 
 /// Every ending this module can write.
 ///
@@ -2641,7 +2753,18 @@ pub fn replan_prompt(
                 ),
             }
         }
+        lines.push_str(
+            "\nAn item of yours that takes one of these over says so with \"replaces\": [N], N \
+             being the number it has above. The job then judges it by that item instead of by the \
+             old failure. Leave \"replaces\" out for new work; a failure nothing takes over still \
+             decides how the job ends.\n",
+        );
         lines
+    };
+    let replaces_key = if unfinished.is_empty() {
+        ""
+    } else {
+        ", \"replaces\": []"
     };
     // The graph rules are repeated here word for word rather than referred to, and the reason is
     // that the node reading them is not the node that read them before. A replan writes items into
@@ -2673,7 +2796,7 @@ pub fn replan_prompt(
          Decide whether the task below is finished. Write ONE of these to {artifacts}/plan.json and \
          change nothing else:\n\n\
          {{\"done\": true, \"why\": \"...\"}}\n\
-         {{\"items\": [{{\"description\": \"...\"{shape}}}]}}\n\n\
+         {{\"items\": [{{\"description\": \"...\"{shape}{replaces_key}}}]}}\n\n\
          {rules}\
          That file is the only thing that is read; anything you print is discarded. Prefer \
          {{\"done\": true}} when the task is met — saying so ends the job in one node, where \
@@ -2727,6 +2850,9 @@ pub fn implement_prompt(
          {description}\n\n\
          The full queue is in {artifacts}/plan.json for context. Do not start another item and do \
          not edit that file. Your work is verified after you finish, so leave the tree building. \
+         That check is the project's gate, and it runs the whole test suite the moment you stop, \
+         so do not run the whole suite yourself: run the narrowest check that tells you your change \
+         works. A command that prints nothing for long is taken for a hang, and it ends this item. \
          Leave it UNCOMMITTED: the job commits for you once the gate agrees, and committing by hand \
          stops this item to ask permission for something already arranged.",
         ordinal + 1
@@ -2750,7 +2876,8 @@ pub fn implement_prompt(
             "\n\nThis item has been attempted before. That attempt finished, the project's gate ran \
              over the tree, and the gate said no — this is the tail of what it printed:\n\n{output}\n\n\
              The work that attempt left is still in the tree: nothing was undone, so you are \
-             continuing it rather than starting again. Make the gate agree."
+             continuing it rather than starting again. Make the gate agree: the tail says which \
+             step went red, so re-run that step, not the whole gate."
         ));
     }
     prompt
@@ -2760,7 +2887,38 @@ pub fn implement_prompt(
 ///
 /// Advisory by design: §5.5 gives ship/no-ship to the deterministic gate, and this opinion travels
 /// with the proposal as information.
-pub fn review_prompt(base: Option<&str>, artifacts: &str) -> String {
+///
+/// `council_file` says whether a council deliberated first and left [`COUNCIL_FILE`] beside the
+/// queue. It is a parameter and not a sentence written unconditionally, because a prompt that names
+/// a file which is not there is an instruction that fails by omission: the node reads nothing, gets
+/// an error it was not warned about, and either spends turns hunting for the file or quietly
+/// decides the whole paragraph was wrong. The consumer is off by default and a council can fail, so
+/// "absent" is the common case rather than the edge one.
+///
+/// And it is named as ADVICE, in the same breath as the sentence telling the node to judge the diff
+/// rather than the intent. A synthesis carries no authority here — the deterministic gate already
+/// holds ship/no-ship — so a node told to read it must not read it as a verdict it should agree
+/// with. The council never saw this tree; it deliberated on the task.
+///
+/// `task` is the job's own prompt, carried here for the reason `plan_prompt` carries it beside the
+/// spec: so the node can see what was actually asked. Without it the queue was the only yardstick
+/// the review had, and a flaw that comes from the queue itself can never be found by checking the
+/// diff against the queue. Measured on job 27, 2026-09-14: the task said, in so many words, that
+/// widening a test's timing margin until it stops failing "loses that property and is not a fix";
+/// the spec restated it under `Done means` and `Not this`; the plan's item told the implementer to
+/// widen `a_finished_request_returns_its_outcome_without_waiting`'s bound from 25ms to 1s anyway,
+/// and the review read the diff against that item and answered "nothing wrong, nothing missing".
+///
+/// `spec` is a boolean for the reason it is one on `plan_prompt`: the node is sent to
+/// [`SPEC_FILE`] only when the file is there, because a sentence naming a missing file costs the
+/// node a turn to find out.
+pub fn review_prompt(
+    task: &str,
+    base: Option<&str>,
+    artifacts: &str,
+    spec: bool,
+    council_file: bool,
+) -> String {
     let diff = match base {
         Some(sha) => {
             format!("Run `git diff {sha}..HEAD` — that is the whole of what this job changed.")
@@ -2771,14 +2929,49 @@ pub fn review_prompt(base: Option<&str>, artifacts: &str) -> String {
                  and review their combined diff."
             .to_owned(),
     };
+    let council = if council_file {
+        format!(
+            "\n\nA panel of models was asked about this task before you started, and its synthesis \
+             is in {artifacts}/{COUNCIL_FILE}. Read it as ADVICE and nothing more: the panel never \
+             saw this branch, it deliberated on the task, and the verdict on the tree is the \
+             project's gate rather than anyone's opinion. Where it disagrees with what you find in \
+             the diff, the diff is what is real."
+        )
+    } else {
+        String::new()
+    };
+    // Named with the sections that decide, and not only as a file: `Done means` and `Not this` are
+    // the two a diff can break while satisfying every item of the queue, and `Not this` is the one
+    // the job-27 plan walked straight through.
+    let brief = if spec {
+        format!(
+            " A spec node read the project before anything was planned and wrote down what the \
+             task means, in {artifacts}/{SPEC_FILE}. Read its `Done means` and `Not this` \
+             sections: they say what finished looks like and what the work must not become, and \
+             a diff can satisfy every item of the queue and still break either."
+        )
+    } else {
+        String::new()
+    };
+    let against = if spec {
+        "the task, the spec"
+    } else {
+        "the task"
+    };
     format!(
         "You are the REVIEW node of an autonomous job. Every change on this branch was written by \
          other sessions whose reasoning you cannot see, and you are not going to be shown it. \
          Judge the diff, not the intent.\n\n\
          {diff}\n\n\
-         The queue those changes were meant to satisfy is in {artifacts}/plan.json. Report what is \
-         wrong, what is missing against that queue, and nothing else. Change no files.\n\n\
-         {LOOK_WITH_THE_READING_TOOLS}"
+         The queue those changes were meant to satisfy is in {artifacts}/plan.json. That queue was \
+         written by a node too, and it can be wrong.{brief}\n\n\
+         Report what is wrong and what is missing, judged against {against} and the queue. Where \
+         the diff — or the queue item it follows — departs from what the task asks for or rules \
+         out, say so, and say whether the fault is the queue's: a diff that does exactly what a \
+         wrong item said is not a diff with nothing wrong in it. Nothing else. Change no files.\
+         {council}\n\n\
+         {LOOK_WITH_THE_READING_TOOLS}\n\n\
+         The task, exactly as it was asked:\n\n{task}"
     )
 }
 
@@ -2801,6 +2994,22 @@ fn artifacts_for(worktree: &Path) -> String {
         .into_owned()
 }
 
+/// Whether the spec node's brief is on disk in this worktree.
+///
+/// Asked of the disk and not of the view, because the view knows a spec NODE ran and the prompts
+/// that name the file are about a spec FILE existing. A node that ended badly, or ended well and
+/// wrote nothing, leaves the two apart — and no node may be sent to a file that is not there. The
+/// plan node and the review are the two sent to it.
+async fn spec_is_written(worktree: &Path) -> bool {
+    tokio::fs::metadata(
+        worktree
+            .join(crate::worktree::ARTIFACTS_DIR)
+            .join(SPEC_FILE),
+    )
+    .await
+    .is_ok()
+}
+
 async fn say(pool: &SqlitePool, job: &JobRow, kind: &str, summary: &str) {
     // A job is not a run, so the feed row carries no run id — writing the job's id into that column
     // would point every reader at whatever run happens to share the number.
@@ -2813,6 +3022,28 @@ async fn say(pool: &SqlitePool, job: &JobRow, kind: &str, summary: &str) {
         Some(&crate::feed::Subject::Job(job.id)),
     )
     .await;
+}
+
+/// `say`, unless the feed already carries this exact line for this job's project.
+///
+/// For a row written on the way INTO a step that can still be refused after it: a replan parked for
+/// want of a slot, or a review parked behind a council, comes back through the same arm on every
+/// tick until it starts, and a row said on each pass is the feed of one sentence repeated that
+/// `park` already refuses to write. The summaries this is given name the job and the round, so
+/// "already said" is exact.
+async fn say_once(pool: &SqlitePool, job: &JobRow, kind: &str, summary: &str) {
+    let said: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM feed WHERE project_id = ? AND kind = ? AND summary = ? LIMIT 1",
+    )
+    .bind(&job.project_id)
+    .bind(kind)
+    .bind(summary)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    if said.is_none() {
+        say(pool, job, kind, summary).await;
+    }
 }
 
 /// Folds a finished node's outcome back into the job.
@@ -3091,6 +3322,17 @@ pub const PLAN_FILE: &str = "plan.json";
 /// is allowed to be.
 pub const SPEC_FILE: &str = "spec.md";
 
+/// The council's synthesis, written into the job's artifacts directory for the review node to read.
+///
+/// Markdown for the reason `SPEC_FILE` is: nothing parses it. It is a deliberation written for a
+/// reader, and giving it a schema would only invite the chairman to fill fields.
+///
+/// Only ever present when the `job_review` consumer is on AND a council actually settled with a
+/// synthesis, which is why `review_prompt` is told whether it exists rather than assuming it. See
+/// that function: a prompt naming a file that is not there is an instruction that fails by
+/// omission, and the node spends a tool call discovering it.
+pub const COUNCIL_FILE: &str = "council.md";
+
 /// Copies a round's plan aside and lists every archive the job has, newest last.
 ///
 /// Best-effort, and deliberately so: a copy that fails costs the replan node its history, which the
@@ -3282,6 +3524,22 @@ async fn open_the_next_round(
         .bind(files)
         .bind(edges(&item.depends_on))
         .bind(item.agent_id.as_deref())
+        .execute(pool)
+        .await?;
+    }
+
+    // A failure the new round takes over stops deciding how the job ends; its replacement does.
+    // Only an item that is actually unfinished, from an earlier round, can be superseded - a number
+    // naming anything else is ignored rather than trusted, which is what the `WHERE` is for.
+    for ordinal in &planned.replaces {
+        sqlx::query(
+            "UPDATE job_items SET status = ?
+             WHERE job_id = ? AND ordinal = ? AND round < ? AND status IN ('gate_failed', 'failed')",
+        )
+        .bind(STATUS_SUPERSEDED)
+        .bind(job.id)
+        .bind(*ordinal as i64)
+        .bind(round)
         .execute(pool)
         .await?;
     }
@@ -3644,6 +3902,30 @@ async fn spawn_node(
                 // out smaller than the fold proposed. Parking here would tell a reader the job is
                 // blocked while it is in fact working, and the park would be lifted by the next
                 // tick anyway.
+                NoRoom::ShrinkTheBatch => Step::Stopped,
+            }
+        }
+        // The same trade as a held slot — the work is untouched, so the job parks and the next pass
+        // asks again — under a reason of its own. On 2026-09-14 this arm did not exist: a disk below
+        // the floor came back as `Busy`, the job read `wait_reason slot` and fed "another run holds
+        // the project's worktree slot", and anybody reading it went looking for a run that was not
+        // there. Only the `worktree_provision_failed` line after it said the disk was full.
+        //
+        // The detail is the refusal itself, free space and floor, so the job's own line says what
+        // to go and clear. `park` says it once per reason rather than per sentence, so the MiB
+        // figure drifting between ticks does not flood the feed.
+        Err(crate::runs::CreateRunError::NoRoomOnDisk(refusal)) => {
+            release_item(pool, job, item).await;
+            match no_room {
+                NoRoom::Park => {
+                    park(
+                        state,
+                        job,
+                        WAIT_DISK,
+                        &format!("the disk is too full for another checkout: {refusal}"),
+                    )
+                    .await
+                }
                 NoRoom::ShrinkTheBatch => Step::Stopped,
             }
         }
@@ -4503,6 +4785,179 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
     }
 }
 
+/// What the reason column says while a job is waiting on a council.
+///
+/// One word, like `budget` and `slot` beside it, because `park` compares it against the reason the
+/// pass started with to decide whether the feed hears about this again. A detail sentence that
+/// changed between ticks would flood the feed with one line every thirty seconds for the whole
+/// deliberation; the id it names does not change, so it does not.
+const WAIT_COUNCIL: &str = "council";
+
+/// What the reason column says while a job's next checkout is refused for want of disk.
+///
+/// Apart from `slot` because the two ask different hands: a held slot clears when another run
+/// ends, and a full disk clears only when somebody deletes something. Like the rest, it is a note
+/// and not a latch — the next pass resumes the job and asks the disk again.
+const WAIT_DISK: &str = "disk";
+
+/// What the council has to say before a job's review node starts.
+#[derive(Debug, PartialEq, Eq)]
+enum BeforeReview {
+    /// Start the node. `council_file` is whether a synthesis is sitting beside the queue for it.
+    Go { council_file: bool },
+    /// A council is deliberating. The job parks and the next tick asks again.
+    Deliberating,
+}
+
+/// The question the council is asked on a job's behalf.
+///
+/// **Written for seats that cannot see the repository, and that is not a limitation being worked
+/// around — it is the honest shape of the thing.** A council seat is spawned with `cwd: None`, so
+/// it has no tree, no diff and no `plan.json`; asking it to review the change would get an answer
+/// invented out of the question's own words. What it CAN do from the task alone is say where a task
+/// of this shape usually goes wrong, and that is a genuinely useful thing to hand somebody who is
+/// about to read a diff — it is the difference between a reviewer scanning and a reviewer looking
+/// somewhere.
+fn council_review_question(task: &str) -> String {
+    format!(
+        "An autonomous coding job was asked to do the task below and has finished it. A reviewer is \
+         about to read the resulting diff. You cannot see that diff, the repository or the queue — \
+         answer from the task alone, and do not pretend otherwise.\n\n\
+         Say where a change satisfying this task is most likely to have gone wrong: the mistake that \
+         still passes a test suite, the requirement that gets read as done when it was only \
+         started, and the thing a diff of this shape usually leaves out. Be specific to this task, \
+         not to software in general.\n\n\
+         The task:\n\n{task}"
+    )
+}
+
+/// Puts the council in front of a job's review node, when the owner asked for one.
+///
+/// **The council ADVISES the reviewer; it does not replace it.** The `review` node still runs and
+/// still writes the opinion the proposal carries — §5.5 gives ship/no-ship to the deterministic
+/// gate and nothing here moves it. All that changes is that a synthesis may be sitting in the
+/// artifacts directory when the node starts, which is a directory `review_prompt` already sends it
+/// to. `ReviewState` gains no variant and `next_step` stays pure, which is the whole reason this
+/// lives here in the driver rather than in the state machine.
+///
+/// **Every failure walks the job on rather than holding it.** A council that could not start, one
+/// that ended `error` or `cancelled`, one whose row has been pruned, one whose chairman left no
+/// transcript, a file that would not write — each of them answers `Go { council_file: false }`, and
+/// the job reviews exactly as a job with no council configured does. The asymmetry is deliberate:
+/// the cost of proceeding unadvised is a slightly worse review, and the cost of waiting is a job
+/// that holds a worktree and its project's concurrency slot until the lifetime ceiling retires it.
+///
+/// The one thing that DOES hold the job is a council still deliberating, which is bounded by the
+/// council's own `timeout_seconds` and settled at daemon startup by `council::reconcile` — so a
+/// parked job always eventually sees a terminal status, even across a crash.
+async fn council_before_review(state: &AppState, job: &JobRow, artifacts: &str) -> BeforeReview {
+    let pool = &state.pool;
+    let unadvised = BeforeReview::Go {
+        council_file: false,
+    };
+
+    let existing: Option<String> = match sqlx::query_scalar::<_, Option<String>>(
+        "SELECT review_council_id FROM jobs WHERE id = ?",
+    )
+    .bind(job.id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(value) => value.flatten(),
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not read a job's review council");
+            return unadvised;
+        }
+    };
+
+    let Some(council_id) = existing else {
+        // Asked of the runtime and not of the row: no roster at all and a roster that did not ask
+        // for this answer the same way, which is the shipped state and must stay a silent no-op.
+        //
+        // **Read only on this branch, never above the column.** The flag decides whether to CONVENE
+        // a council, not whether to finish reading one. An owner who switches the consumer off — or
+        // restarts a daemon onto an edited roster — while a job is parked on a deliberation already
+        // paid for should get the synthesis it bought, not a job left waiting on a council nothing
+        // will ever look at again.
+        if !state.council.advises_job_review() {
+            return unadvised;
+        }
+        let question = council_review_question(job.prompt.as_deref().unwrap_or_default());
+        let council_id = match crate::council::start(state, &question, None).await {
+            Ok(id) => id,
+            // Unreachable while `advises_job_review` implies a roster, and answered silently anyway:
+            // "there is no council" is not an error a job has done anything about.
+            Err(crate::council::StartError::NotConfigured) => return unadvised,
+            Err(error) => {
+                tracing::warn!(job_id = job.id, %error, "a job's review council would not start");
+                return unadvised;
+            }
+        };
+        // Written before the job parks, and a failed write walks the job on. The council is running
+        // either way — that money is spent — but a job that parked without recording the id would
+        // convene a SECOND council on its next tick and park on that one too, which is the failure
+        // this order exists to make impossible.
+        if let Err(error) = sqlx::query("UPDATE jobs SET review_council_id = ? WHERE id = ?")
+            .bind(&council_id)
+            .bind(job.id)
+            .execute(pool)
+            .await
+        {
+            tracing::warn!(
+                job_id = job.id,
+                council_id,
+                %error,
+                "a job's review council started and could not be recorded; reviewing unadvised"
+            );
+            return unadvised;
+        }
+        return BeforeReview::Deliberating;
+    };
+
+    let row = match crate::council::get_council_row(pool, &council_id).await {
+        Ok(Some(row)) => row,
+        // The council is gone: pruned past its ninety days, or deleted. There is nothing to wait
+        // for and nothing to read, so this is the "council that failed" case by another door.
+        Ok(None) => {
+            tracing::warn!(
+                job_id = job.id,
+                council_id,
+                "a job's review council is no longer on record; reviewing unadvised"
+            );
+            return unadvised;
+        }
+        Err(error) => {
+            tracing::warn!(job_id = job.id, council_id, %error, "could not read a job's review council");
+            return unadvised;
+        }
+    };
+    if !row.is_settled() {
+        return BeforeReview::Deliberating;
+    }
+
+    // The column is deliberately NOT cleared here. See `0137_job_review_council.sql`: `advance`
+    // reaches this arm on every tick until the node actually starts, and a review that parks for a
+    // worktree slot would come back to a NULL column and convene a second council. Rewriting the
+    // same file on a retry is idempotent; paying for a second deliberation is not.
+    let Some(synthesis) = crate::council::synthesis_of(pool, &row).await else {
+        // Terminal with no synthesis: `error`, `cancelled`, or a chairman whose transcript was
+        // pruned. Nothing to say, and saying nothing must not stop the review.
+        return unadvised;
+    };
+
+    let path = std::path::Path::new(artifacts).join(COUNCIL_FILE);
+    if let Err(error) = tokio::fs::write(&path, synthesis.as_bytes()).await {
+        tracing::warn!(
+            job_id = job.id,
+            council_id,
+            %error,
+            "could not write a job's council synthesis; reviewing unadvised"
+        );
+        return unadvised;
+    }
+    BeforeReview::Go { council_file: true }
+}
+
 /// Performs one move for a job.
 async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
     let pool = &state.pool;
@@ -4517,6 +4972,23 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
     let next = next_step(&view);
     if matches!(next, Next::Wait) {
         return Step::Stopped;
+    }
+    // Said here, ahead of both roads a closing round can take — the ending just below and the
+    // replan past the brakes — because the skip is the reason for either, and a reader who finds a
+    // round with no review in the feed should find why beside it.
+    if the_skip_decided(&view) {
+        say_once(
+            pool,
+            job,
+            "job_review_skipped",
+            &format!(
+                "job {} round {}: no item of the round passed, so there was nothing on the branch \
+                 for a review to judge and none was run",
+                job.id,
+                view.rounds.round + 1
+            ),
+        )
+        .await;
     }
     if let Next::Finish(outcome) = &next {
         let outcome = *outcome;
@@ -4642,24 +5114,12 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
         }
         Next::SpawnPlan => {
             let task = job.prompt.clone().unwrap_or_default();
-            // Asked of the disk and not of the view, because the view knows a spec NODE ran and
-            // this sentence is about a spec FILE existing. A node that ended badly, or ended well
-            // and wrote nothing, leaves the two apart — and the planner must not be sent to a file
-            // that is not there.
-            let spec_written = tokio::fs::metadata(
-                worktree
-                    .0
-                    .join(crate::worktree::ARTIFACTS_DIR)
-                    .join(SPEC_FILE),
-            )
-            .await
-            .is_ok();
             let prompt = plan_prompt(
                 &task,
                 job.max_items.max(0) as usize,
                 &artifacts,
                 graph_rules(pool, job).await.as_ref(),
-                spec_written,
+                spec_is_written(&worktree.0).await,
             );
             spawn_node(state, job, "plan", prompt, None, worktree, NoRoom::Park).await
         }
@@ -4706,8 +5166,48 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             step
         }
         Next::SpawnReview => {
-            let prompt = review_prompt(job.head_sha.as_deref(), &artifacts);
-            spawn_node(state, job, "review", prompt, None, worktree, NoRoom::Park).await
+            // In front of the node rather than inside `next_step`, which stays pure: this reads
+            // the database, starts a council and writes a file, and none of those belong in a
+            // function whose whole value is that it can be tested with a struct literal.
+            match council_before_review(state, job, &artifacts).await {
+                BeforeReview::Go { council_file } => {
+                    // Here, where the node actually starts, and once: a review parked behind a
+                    // council comes back through this arm on every tick, and the row belongs to
+                    // the retry rather than to each tick spent waiting for it.
+                    if view.review == ReviewState::Retry {
+                        say_once(
+                            pool,
+                            job,
+                            "job_review_retried",
+                            &format!(
+                                "job {} round {}: its review ended on a transient API error before \
+                                 it could judge anything, so it is run once more",
+                                job.id,
+                                view.rounds.round + 1
+                            ),
+                        )
+                        .await;
+                    }
+                    let task = job.prompt.clone().unwrap_or_default();
+                    let prompt = review_prompt(
+                        &task,
+                        job.head_sha.as_deref(),
+                        &artifacts,
+                        spec_is_written(&worktree.0).await,
+                        council_file,
+                    );
+                    spawn_node(state, job, "review", prompt, None, worktree, NoRoom::Park).await
+                }
+                BeforeReview::Deliberating => {
+                    park(
+                        state,
+                        job,
+                        WAIT_COUNCIL,
+                        "a council is deliberating on this job before its review",
+                    )
+                    .await
+                }
+            }
         }
         Next::SpawnReplan => {
             // Archived BEFORE the node starts, because the node is about to overwrite `plan.json`
@@ -5533,6 +6033,8 @@ mod tests {
             )),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -6614,7 +7116,8 @@ mod tests {
                 | ItemState::Merging
                 | ItemState::Conflicted
                 | ItemState::Reverted
-                | ItemState::Orphaned => (),
+                | ItemState::Orphaned
+                | ItemState::Superseded => (),
             };
         }
     }
@@ -6646,7 +7149,8 @@ mod tests {
                 | ItemState::GateFailed
                 | ItemState::GateErrored
                 | ItemState::Skipped
-                | ItemState::Orphaned => false,
+                | ItemState::Orphaned
+                | ItemState::Superseded => false,
             }
         }
 
@@ -7015,7 +7519,7 @@ mod tests {
     #[test]
     fn the_nodes_that_only_look_are_told_what_to_look_with() {
         let replan = replan_prompt("t", 1, &[], "/wt/.nucleos", None, &[]);
-        let review = review_prompt(Some("abc123"), "/wt/.nucleos");
+        let review = review_prompt("t", Some("abc123"), "/wt/.nucleos", false, false);
 
         for prompt in [&replan, &review] {
             assert!(prompt.contains("Read, Grep and Glob"));
@@ -8868,7 +9372,9 @@ mod tests {
             classes_total: 0,
             withheld_classes_ready: 0,
             promotable: false,
+            open_review_items: 0,
             open_proposals: 0,
+            open_shadow_decisions: 0,
             wip_limit: None,
             queue_full: false,
             last_gate: None,
@@ -9169,20 +9675,47 @@ mod tests {
         );
     }
 
-    struct WorktreeRootEnv(Option<std::ffi::OsString>);
+    /// Points worktree provisioning at a root of the test's own, and switches the disk floor off.
+    ///
+    /// **The floor measures the machine, not the code.** `runs::no_room_on_disk` refuses an item's
+    /// checkout when the volume `NUCLEOS_WORKTREE_ROOT` lives on has less than 5 GiB free, and the
+    /// checkouts these fixtures open are a few kilobytes — so the floor has nothing to say about
+    /// what they exercise, and everything to say about whatever else is filling the disk. On
+    /// 2026-09-13 that was the suite itself, several multi-GB cargo target trees growing under
+    /// load: five team walks failed together with `last status waiting` (one of them again, alone,
+    /// in a gate on 2026-09-14), each an item run refused as `Busy`, a job parked as `slot`, and
+    /// forty parked passes spun through in milliseconds. Every one of them passed run by itself, and
+    /// every one failed on demand with `NUCLEOS_MIN_FREE_DISK_GB=100000`. The refusal is still
+    /// tested — in `runs.rs`, on purpose, with a floor no disk meets.
+    ///
+    /// Both variables come back as they were on drop. Callers hold `test_env_lock`, which is what
+    /// makes a process-wide variable safe to set at all.
+    struct WorktreeRootEnv {
+        root: Option<std::ffi::OsString>,
+        floor: Option<std::ffi::OsString>,
+    }
     impl WorktreeRootEnv {
         fn set(path: &std::path::Path) -> Self {
-            let previous = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
-            unsafe { std::env::set_var("NUCLEOS_WORKTREE_ROOT", path) };
-            Self(previous)
+            let root = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
+            let floor = std::env::var_os("NUCLEOS_MIN_FREE_DISK_GB");
+            unsafe {
+                std::env::set_var("NUCLEOS_WORKTREE_ROOT", path);
+                std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", "0");
+            }
+            Self { root, floor }
         }
     }
     impl Drop for WorktreeRootEnv {
         fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(value) => std::env::set_var("NUCLEOS_WORKTREE_ROOT", value),
-                    None => std::env::remove_var("NUCLEOS_WORKTREE_ROOT"),
+            for (name, previous) in [
+                ("NUCLEOS_WORKTREE_ROOT", &self.root),
+                ("NUCLEOS_MIN_FREE_DISK_GB", &self.floor),
+            ] {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
                 }
             }
         }
@@ -9193,21 +9726,45 @@ mod tests {
     /// Nodes run as spawned tasks, so without this every pass would find its own node still
     /// `running` and answer `Wait` forever — the walk would hang rather than fail, which is the
     /// least useful way for a test to be wrong.
+    ///
+    /// **On a deadline, and not a count.** It was 500 `yield_now()`s, which is a budget in scheduler
+    /// turns rather than time — and how much time a turn is worth is exactly what a loaded machine
+    /// changes. Two minutes of wall clock is purely a hang guard: the scripted nodes finish at once,
+    /// so the ordinary case returns in milliseconds, and when it does fire it names the runs it
+    /// gave up on.
+    ///
+    /// This is not what failed on 2026-09-13. Those walks ended `waiting`, a park, and a parked job
+    /// has no node in flight for this to wait on; `why_it_stands` is where a park shows.
     async fn settle(state: &AppState, job_id: i64) {
-        for _ in 0..500 {
-            let running: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM runs WHERE job_id = ? AND status = 'running'",
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let running: Vec<(i64, Option<String>, Option<i64>)> = sqlx::query_as(
+                "SELECT id, stage, item_id FROM runs
+                  WHERE job_id = ? AND status = 'running' ORDER BY id",
             )
             .bind(job_id)
-            .fetch_one(&state.pool)
+            .fetch_all(&state.pool)
             .await
             .unwrap();
-            if running == 0 {
+            if running.is_empty() {
                 return;
             }
-            tokio::task::yield_now().await;
+            if std::time::Instant::now() >= deadline {
+                let named = running
+                    .iter()
+                    .map(|(id, stage, item)| {
+                        let stage = stage.as_deref().unwrap_or("no stage");
+                        match item {
+                            Some(item) => format!("run {id} ({stage}, item {item})"),
+                            None => format!("run {id} ({stage})"),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                panic!("a node never finished: {named} still running after two minutes");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        panic!("a node never finished");
     }
 
     /// What one walk cost, in the two units that matter.
@@ -9236,6 +9793,10 @@ mod tests {
         /// again, which is the only durable trace an unhappy event leaves: the states it passed
         /// through are gone by the time the walk ends.
         attempts: Vec<i64>,
+        /// The passes that ended with the job `waiting`, each with the reason it gave then. A park
+        /// costs a pass and says nothing about the schedule, so a walk that is going to be compared
+        /// with another must have none — `walk_measured` refuses one that does.
+        parked: Vec<String>,
     }
 
     async fn walk_counting(state: &AppState, job_id: i64) -> Walk {
@@ -9249,6 +9810,7 @@ mod tests {
             .unwrap()
         };
         let mut writing = 0;
+        let mut parked = Vec::new();
         for pass in 1..=40 {
             let before = started(state.pool.clone()).await;
             job_tick(state, Utc::now()).await;
@@ -9257,6 +9819,12 @@ mod tests {
                 writing += 1;
             }
             let status = job_status(&state.pool, job_id).await;
+            if status == "waiting" {
+                parked.push(format!(
+                    "pass {pass}: {}",
+                    why_it_stands(&state.pool, job_id).await
+                ));
+            }
             if !LIVE_STATUSES.contains(&status.as_str()) {
                 let attempts = sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM runs
@@ -9272,13 +9840,57 @@ mod tests {
                     passes: pass,
                     writing,
                     attempts,
+                    parked,
                 };
             }
         }
         panic!(
-            "the job never reached an ending; last status {}",
-            job_status(&state.pool, job_id).await
+            "the job never reached an ending; last {} ({} of 40 passes ended parked)",
+            why_it_stands(&state.pool, job_id).await,
+            parked.len()
         );
+    }
+
+    /// Why a job is standing still, in words a failing assertion can print.
+    ///
+    /// A park leaves its reason in three places and the status is none of them: `wait_reason` on
+    /// the job's row, a `job_waiting` line from `park`, and — when it was a run's provisioning that
+    /// said no — a `worktree_provision_failed` line naming the wall. Until 2026-09-14 only the last
+    /// told the slot from the disk, because a refused item parked its job as `slot` either way; the
+    /// job now parks as `disk`, and the line is still the one with the numbers. The walks used to
+    /// print the status alone, and on 2026-09-13 five of them failed with `last status waiting` and
+    /// nothing else: the disk floor refusing every item, and not a word of it on screen.
+    ///
+    /// Newest first, and three lines at most. The pool is the test's own, so every line is this
+    /// job's.
+    async fn why_it_stands(pool: &sqlx::SqlitePool, job_id: i64) -> String {
+        let (status, reason): (String, Option<String>) =
+            sqlx::query_as("SELECT status, wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let lines: Vec<(String, String)> = sqlx::query_as(
+            "SELECT kind, summary FROM feed
+              WHERE kind IN ('job_waiting', 'worktree_provision_failed')
+              ORDER BY id DESC LIMIT 3",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let lines = if lines.is_empty() {
+            "none".to_owned()
+        } else {
+            lines
+                .iter()
+                .map(|(kind, summary)| format!("[{kind}] {summary}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        format!(
+            "status {status}, wait_reason {}, feed: {lines}",
+            reason.as_deref().unwrap_or("none")
+        )
     }
 
     /// A team of one, and a job it directs, over a real repository.
@@ -9405,6 +10017,157 @@ mod tests {
         );
     }
 
+    /// Ticks a job until it parks, and hands back the reason on its row and its last waiting line.
+    ///
+    /// Ten passes is far more than a plan node and a first item need; a job that has not parked by
+    /// then is not going to, and the panic says where it stood instead.
+    async fn tick_until_parked(state: &AppState, job_id: i64) -> (String, String) {
+        for _ in 0..10 {
+            job_tick(state, Utc::now()).await;
+            settle(state, job_id).await;
+            if job_status(&state.pool, job_id).await == "waiting" {
+                let reason: Option<String> =
+                    sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
+                        .bind(job_id)
+                        .fetch_one(&state.pool)
+                        .await
+                        .unwrap();
+                let line: String = sqlx::query_scalar(
+                    "SELECT summary FROM feed WHERE kind = 'job_waiting' ORDER BY id DESC LIMIT 1",
+                )
+                .fetch_one(&state.pool)
+                .await
+                .expect("a park says so in the feed");
+                return (reason.unwrap_or_default(), line);
+            }
+        }
+        panic!(
+            "the job never parked; last {}",
+            why_it_stands(&state.pool, job_id).await
+        );
+    }
+
+    /// **A job whose item is refused for disk waits for the disk, says how full, and comes back
+    /// when there is room.**
+    ///
+    /// On 2026-09-14, with the floor raised on purpose, a job read `status waiting, wait_reason
+    /// slot` and fed "another run holds the project's worktree slot" — and only the next line,
+    /// `worktree_provision_failed`, said the disk was the wall. Whoever reads the job goes looking
+    /// for a run holding a slot and finds none. The floor here is a million GiB, which no volume
+    /// meets, so the answer does not depend on the machine.
+    ///
+    /// The second half is the resume: `wait_reason` is a note and not a latch, and a disk park has
+    /// to lift exactly as a slot park does once the condition clears.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_refused_its_item_for_disk_waits_for_the_disk_and_resumes_when_there_is_room() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-disk-park-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        *runner.writes.lock().unwrap() = three_scripted_agents();
+
+        let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, 2, 0).await;
+        // After the guard, which switched the floor off and puts back what stood before it on drop,
+        // so this bare `set_var` is undone with it. The plan node works in the job's own checkout
+        // and is never asked; the first item is.
+        unsafe { std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", "1000000") };
+
+        let (reason, line) = tick_until_parked(&state, job_id).await;
+        assert_eq!(
+            reason, "disk",
+            "a disk refusal is not slot contention: {line}"
+        );
+        assert!(
+            line.contains("disk") && line.contains(" MiB free "),
+            "the job's own line has to name the disk and how much room there was: {line}"
+        );
+        assert!(
+            line.contains("at least 1024000000 MiB"),
+            "and the floor it fell below: {line}"
+        );
+        assert!(
+            !line.contains("slot"),
+            "a reader told about a slot goes looking for a run that is not there: {line}"
+        );
+
+        unsafe { std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", "0") };
+        // One pass first, and read before the walk: a job whose item starts again moves on either
+        // way, so the ending alone cannot tell a park that lifted from a note left standing. A row
+        // reading `implementing / disk` names a wall that is gone, which is `resume`'s to clear.
+        job_tick(&state, Utc::now()).await;
+        settle(&state, job_id).await;
+        let (status, reason): (String, Option<String>) =
+            sqlx::query_as("SELECT status, wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(
+            status, "waiting",
+            "the park did not lift once there was room"
+        );
+        assert_eq!(
+            reason, None,
+            "a job that is moving again is not waiting for the disk (status {status})"
+        );
+        let items_started: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs
+              WHERE job_id = ? AND stage = 'implement' AND item_id IS NOT NULL
+                AND status != 'failed'",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            items_started > 0,
+            "the refused item was never started again"
+        );
+
+        let walk = walk_counting(&state, job_id).await;
+        assert_eq!(
+            walk.ending, "completed",
+            "the park did not lift once there was room"
+        );
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["passed", "passed", "passed"]
+        );
+    }
+
+    /// **The control: an item refused for a slot still waits for a slot.**
+    ///
+    /// The disk got a reason of its own; this is what keeps that change from bleeding into the
+    /// contention it was split from. A ceiling of one, held by the job itself, is a project with no
+    /// room for its first item.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_refused_its_item_for_a_slot_still_waits_for_a_slot() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-slot-park-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        *runner.writes.lock().unwrap() = three_scripted_agents();
+
+        let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, 2, 0).await;
+        sqlx::query("UPDATE autopilot_global SET max_concurrent_slots = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (reason, line) = tick_until_parked(&state, job_id).await;
+        assert_eq!(reason, "slot", "{line}");
+        assert!(
+            line.contains("another run holds the project's worktree slot"),
+            "the slot's sentence is unchanged, and the shell reads it by these words: {line}"
+        );
+    }
+
     /// One walk of the three items at a given ceiling, and how many passes it took.
     ///
     /// A fresh repository and a fresh database each time. Sharing either would let the first walk's
@@ -9478,6 +10241,17 @@ mod tests {
             start_directed_job(&state, &runner, &repo, plan, max_parallel, gate_retries).await;
         let walk = walk_counting(&state, job_id).await;
 
+        // First, because every comparison these walks feed is a `<=` on passes. A park costs a
+        // pass for a reason that is this machine's and not the schedule's, so one on either side
+        // would flip the comparison — or, worse, satisfy it — and the assertion would still read
+        // as a verdict on the design. A park that never lifts already fails in `walk_counting`;
+        // this is the one that lifted and left only a larger number behind.
+        assert!(
+            walk.parked.is_empty(),
+            "the walk at {max_parallel} parked, which is the machine refusing and not the \
+             schedule: {:?}",
+            walk.parked
+        );
         assert_eq!(
             walk.ending, "completed",
             "the walk at {max_parallel} did not finish"
@@ -9844,8 +10618,8 @@ mod tests {
             }
         }
         panic!(
-            "the job never reached an ending; last status {}",
-            job_status(&state.pool, job_id).await
+            "the job never reached an ending; last {}",
+            why_it_stands(&state.pool, job_id).await
         );
     }
 
@@ -10034,10 +10808,13 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
+        // No review, and deliberately: both items went red and were reverted, so the round put
+        // nothing on the branch, and a review would read a diff of nothing — which is what job
+        // 27's round-0 review did on 2026-09-14. See `ReviewState::Skipped`.
         assert_eq!(
             stages,
-            vec!["spec", "plan", "implement", "implement", "review"],
-            "the whole queue runs, and the review still gets to see what came out of it"
+            vec!["spec", "plan", "implement", "implement"],
+            "the whole queue runs, and a round in which nothing passed is not reviewed"
         );
 
         let _ =
@@ -10327,6 +11104,286 @@ mod tests {
         );
     }
 
+    /// A job whose round has run out of items, allowed to go round again after a red gate: the
+    /// shape job 27 was in on 2026-09-14 when its round-0 review was spent on nothing.
+    async fn a_round_run_out(
+        pool: &sqlx::SqlitePool,
+        worktree: &std::path::Path,
+        items: &[&str],
+        review: bool,
+    ) -> i64 {
+        let job_id = seed_job(pool, "project-a", "gating").await.unwrap();
+        sqlx::query(
+            "UPDATE jobs SET project_root = ?, rule_name = NULL, budget_usd = 25.0, max_rounds = 5,
+                             review = ?
+             WHERE id = ?",
+        )
+        .bind(worktree.to_string_lossy().into_owned())
+        .bind(review)
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        seed_worktree(pool, job_id, worktree).await;
+        seed_items(pool, job_id, items).await;
+        spend_the_red_items_gates(pool, job_id).await;
+        job_id
+    }
+
+    /// The red items as `record_gate` leaves them: the attempt counted, so against a budget of no
+    /// retries each one reads `GateFailed` and not `GateRetriable` — an item over, not one to redo.
+    async fn spend_the_red_items_gates(pool: &sqlx::SqlitePool, job_id: i64) {
+        sqlx::query(
+            "UPDATE job_items SET gate_attempts = 1 WHERE job_id = ? AND status = 'gate_failed'",
+        )
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn skips_said(told: &[String]) -> usize {
+        told.iter()
+            .filter(|line| line.contains("nothing on the branch for a review to judge"))
+            .count()
+    }
+
+    /// A round in which nothing passed goes on to the replan without paying to review nothing.
+    ///
+    /// Job 27, 2026-09-14: round 0's only item ended `gate_failed`, its work was reverted, and the
+    /// review (run 900513, $0.12) found `HEAD` at the base and reported "no work was done". The
+    /// round now closes the way it would have after that review, and the feed says why it had none.
+    #[tokio::test]
+    async fn a_round_in_which_nothing_passed_goes_to_the_replan_without_a_review() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = a_round_run_out(&pool, worktree.path(), &["gate_failed"], true).await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(view.review, ReviewState::Skipped);
+        assert_eq!(next_step(&view), Next::SpawnReplan);
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(
+            stages_run(&pool, job_id).await,
+            vec!["replan"],
+            "the round was reviewed although nothing in it passed"
+        );
+        let told = feed_texts(&pool).await;
+        assert_eq!(
+            skips_said(&told),
+            1,
+            "the skip has to be said, once: {told:?}"
+        );
+        // Derived from the rows, so a second read — a restart — finds the same answer.
+        assert_eq!(
+            load_view(&pool, job_id).await.unwrap().review,
+            ReviewState::Skipped
+        );
+    }
+
+    /// The same for a job of one round: it ends where it would have ended after the review,
+    /// `gate_failed`, without the review.
+    #[tokio::test]
+    async fn a_one_round_job_in_which_nothing_passed_ends_without_a_review() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "gating").await.unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_items(&pool, job_id, &["gate_failed"]).await;
+        spend_the_red_items_gates(&pool, job_id).await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(view.review, ReviewState::Skipped);
+        assert_eq!(next_step(&view), Next::Finish(Outcome::GateFailed));
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert!(stages_run(&pool, job_id).await.is_empty());
+        assert_eq!(job_status(&pool, job_id).await, "gate_failed");
+        assert_eq!(
+            feed_kinds(&pool).await,
+            vec!["job_review_skipped", "job_finished"],
+            "the reason there was no review belongs beside the ending it led to"
+        );
+    }
+
+    /// One item that passed is a round with something to judge, and it is judged — whatever
+    /// happened to the rest of it.
+    #[tokio::test]
+    async fn a_round_with_one_passed_item_still_gets_its_review() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id =
+            a_round_run_out(&pool, worktree.path(), &["gate_failed", "passed"], true).await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(view.review, ReviewState::Pending);
+        assert_eq!(next_step(&view), Next::SpawnReview);
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(stages_run(&pool, job_id).await, vec!["review"]);
+        assert_eq!(skips_said(&feed_texts(&pool).await), 0);
+    }
+
+    /// A job that never wanted a review walks a round in which nothing passed exactly as it did: no
+    /// review, and no line saying one was skipped, because none was owed.
+    #[tokio::test]
+    async fn a_job_with_review_off_walks_a_round_with_nothing_passed_as_it_did() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = a_round_run_out(&pool, worktree.path(), &["gate_failed"], false).await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(view.review, ReviewState::NotWanted);
+        assert_eq!(next_step(&view), Next::SpawnReplan);
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(stages_run(&pool, job_id).await, vec!["replan"]);
+        assert_eq!(skips_said(&feed_texts(&pool).await), 0);
+    }
+
+    /// The skip is said only once it is what decided the step. While items are still to run the
+    /// view reads `Skipped` — nothing has passed yet — and has decided nothing.
+    #[test]
+    fn a_skipped_review_decides_only_once_the_round_has_nothing_left_to_run() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view(true, &[GateFailed], ReviewState::Skipped)),
+            Next::Finish(Outcome::GateFailed)
+        );
+        assert!(the_skip_decided(&view(
+            true,
+            &[GateFailed],
+            ReviewState::Skipped
+        )));
+        assert!(
+            !the_skip_decided(&view(true, &[GateFailed, Pending], ReviewState::Skipped)),
+            "an item still to run: the skip has decided nothing yet"
+        );
+        assert!(
+            !the_skip_decided(&view(true, &[Cancelled], ReviewState::Skipped)),
+            "a cancelled job ends at the short-circuit, review or no review"
+        );
+        assert!(!the_skip_decided(&view(
+            true,
+            &[GateFailed],
+            ReviewState::NotWanted
+        )));
+    }
+
+    /// A review node that has landed, with the stream it printed.
+    async fn seed_review(pool: &sqlx::SqlitePool, job_id: i64, status: &str, stdout: &str) {
+        let run_id = seed_node(pool, job_id, "review", status).await;
+        sqlx::query("UPDATE runs SET stdout = ? WHERE id = ?")
+            .bind(stdout)
+            .bind(run_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// A review that never reached the model has judged nothing, and is run once more.
+    ///
+    /// Measured on job 26, 2026-09-13: review run 900483 ended on "Can't reach the API server —
+    /// check your internet or DNS (ENOTFOUND)", read as `Done`, and twenty seconds later the replan
+    /// opened the next round with no verdict on this one.
+    #[tokio::test]
+    async fn a_review_that_failed_on_a_transient_api_error_is_run_again() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = job_ready_to_review(&pool, worktree.path()).await;
+        seed_review(
+            &pool,
+            job_id,
+            "failed",
+            crate::runner::REVIEW_THAT_NEVER_REACHED_THE_API,
+        )
+        .await;
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(view.review, ReviewState::Retry);
+        assert_eq!(next_step(&view), Next::SpawnReview);
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(stages_run(&pool, job_id).await, vec!["review", "review"]);
+        let told = feed_texts(&pool).await;
+        assert!(
+            told.iter().any(|line| line.contains("run once more")),
+            "a second review has to be said out loud, with why: {told:?}"
+        );
+    }
+
+    /// Once per round, counted from the rows: a network that stays down costs one extra node, and
+    /// then the round closes exactly as it did before.
+    #[tokio::test]
+    async fn a_second_review_that_fails_the_same_way_closes_the_round() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+        seed_items(&pool, job_id, &["passed", "passed"]).await;
+        for _ in 0..2 {
+            seed_review(
+                &pool,
+                job_id,
+                "failed",
+                crate::runner::REVIEW_THAT_NEVER_REACHED_THE_API,
+            )
+            .await;
+        }
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert_eq!(
+            view.review,
+            ReviewState::Done,
+            "the round already had its one retry"
+        );
+        assert_eq!(next_step(&view), Next::Finish(Outcome::Completed));
+    }
+
+    /// Every other way a review can end is a review that happened, as it always was: a failure the
+    /// network had nothing to do with, and a transient-looking stream on a review that did not end
+    /// `failed` — a `timed_out`, or a `cancelled` one a person or a hook stopped.
+    #[tokio::test]
+    async fn a_review_that_failed_for_any_other_reason_is_still_done() {
+        let refused = r#"{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":400,"result":"API Error: 400"}"#;
+        let max_turns = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"terminal_reason":"max_turns","result":""}"#;
+        let transient = crate::runner::REVIEW_THAT_NEVER_REACHED_THE_API;
+        for (status, stdout) in [
+            ("failed", refused),
+            ("failed", max_turns),
+            ("failed", ""),
+            ("timed_out", transient),
+            ("cancelled", transient),
+        ] {
+            let pool = test_pool().await;
+            let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+            seed_items(&pool, job_id, &["passed"]).await;
+            seed_review(&pool, job_id, status, stdout).await;
+
+            let view = load_view(&pool, job_id).await.unwrap();
+            assert_eq!(
+                view.review,
+                ReviewState::Done,
+                "a review that ended {status}: {stdout}"
+            );
+            assert_eq!(next_step(&view), Next::Finish(Outcome::Completed));
+        }
+    }
+
     /// Ending #1. `completed` and not `stopped`, because the node that just looked at the work is
     /// the one saying the work is over — the best evidence this system can get for that claim.
     #[tokio::test]
@@ -10433,6 +11490,164 @@ mod tests {
         assert_eq!(
             next_step(&load_view(&pool, job_id).await.unwrap()),
             Next::SpawnReplan
+        );
+    }
+
+    /// The replan names the unfinished items it takes over, one-based as it was shown them.
+    #[test]
+    fn a_replan_item_names_the_unfinished_items_it_takes_over() {
+        let planned = parse_plan(
+            Some(
+                br#"{"items": [{"description": "again", "replaces": [3, 1]}, {"description": "new"}]}"#,
+            ),
+            5,
+            None,
+        )
+        .unwrap();
+        assert_eq!(planned.items.len(), 2);
+        // One-based as the prompt lists them, zero-based as the rows store them.
+        assert_eq!(planned.replaces, vec![0, 2]);
+
+        let nothing = parse_plan(
+            Some(br#"{"items": [{"description": "x", "replaces": [0]}, {"description": "y"}]}"#),
+            5,
+            None,
+        )
+        .unwrap();
+        assert!(nothing.replaces.is_empty(), "a zero names no item");
+    }
+
+    /// Read back as what it is. The fallback in `item_state_from` is `Pending`, so a status it did
+    /// not know would come back as work to START - the one reading of a finished item that costs a
+    /// second run of it.
+    #[test]
+    fn a_superseded_item_is_read_back_as_superseded_and_not_as_work_to_do() {
+        assert_eq!(
+            item_state_from(STATUS_SUPERSEDED, 0, 0),
+            ItemState::Superseded
+        );
+        assert_eq!(ItemState::Superseded.claimable_as(), None);
+    }
+
+    /// Job 26, 2026-09-13: its round-0 item failed, round 1 redid it and passed the gate, and the job
+    /// was reported `failed`. With the failure taken over, the ending is read from what is left.
+    #[test]
+    fn a_failure_a_later_round_took_over_no_longer_decides_the_ending() {
+        let closing = |items: &[ItemState], replanned: Replan, max_rounds: i64| {
+            view_in_round(
+                items,
+                ReviewState::Done,
+                RoundState {
+                    round: 1,
+                    max_rounds,
+                    replanned,
+                    a_broken_item_may_go_round_again: true,
+                    ..RoundState::default()
+                },
+            )
+        };
+        let taken_over = [ItemState::Superseded, ItemState::Passed];
+        let not_taken_over = [ItemState::Failed, ItemState::Passed];
+
+        // The replan confirmed the task is met: completed, which the failure used to forbid.
+        assert_eq!(
+            next_step(&closing(&taken_over, Replan::Done, 3)),
+            Next::Finish(Outcome::Completed)
+        );
+        // Out of rounds with nobody confirming: stopped, the honest reading of green work that was
+        // never declared finished - and no longer `failed`, which is what job 26 was told.
+        assert_eq!(
+            next_step(&closing(&taken_over, Replan::NotYet, 2)),
+            Next::Finish(Outcome::Stopped)
+        );
+        // A failure nothing took over still decides, exactly as before.
+        assert_eq!(
+            next_step(&closing(&not_taken_over, Replan::NotYet, 2)),
+            Next::Finish(Outcome::Failed)
+        );
+    }
+
+    /// The next round marks what it takes over, and only what may be taken over: an unfinished item
+    /// of an earlier round. A number naming finished work is ignored rather than trusted.
+    #[tokio::test]
+    async fn opening_a_round_supersedes_only_the_unfinished_items_it_names() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_items(&pool, job_id, &["failed", "passed", "gate_failed"]).await;
+        sqlx::query("UPDATE jobs SET max_rounds = 5 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_node(&pool, job_id, "replan", "completed").await;
+        write_plan(
+            worktree.path(),
+            r#"{"items": [{"description": "item 1 again", "replaces": [1, 2]}, {"description": "new"}]}"#,
+        )
+        .await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            statuses,
+            [
+                STATUS_SUPERSEDED,
+                "passed",
+                "gate_failed",
+                "pending",
+                "pending"
+            ],
+            "item 1 taken over, item 2 was finished and stays, item 3 was not named and stays"
+        );
+    }
+
+    /// Told how to take a failure over when there is one, and not burdened with it when there is not.
+    #[test]
+    fn a_replan_is_told_how_to_take_over_what_broke_and_only_when_something_did() {
+        let broke = Unfinished {
+            ordinal: 0,
+            description: "the flaky test".to_owned(),
+            gate_output: None,
+        };
+        let with = replan_prompt("t", 0, &[], "/wt/.nucleos", None, &[broke]);
+        assert!(with.contains("\"replaces\": [N]"), "{with}");
+        assert!(with.contains("\"replaces\": []"), "{with}");
+        let without = replan_prompt("t", 0, &[], "/wt/.nucleos", None, &[]);
+        assert!(!without.contains("replaces"), "{without}");
+    }
+
+    /// Job 26, 2026-09-13: a retry sent back for formatting alone ran the whole test suite through
+    /// `| tail`, printed nothing for thirty minutes, and was killed as a hang with its fix unsaved.
+    #[test]
+    fn an_implement_node_is_told_the_gate_runs_the_suite_so_it_need_not() {
+        let first = implement_prompt("x", 0, 1, "/wt/.nucleos", &[], None, None);
+        assert!(
+            first.contains("do not run the whole suite yourself"),
+            "{first}"
+        );
+        assert!(first.contains("taken for a hang"), "{first}");
+        let retry = implement_prompt(
+            "x",
+            0,
+            1,
+            "/wt/.nucleos",
+            &[],
+            Some("gates FAILED:\n  core: fmt"),
+            None,
+        );
+        assert!(
+            retry.contains("re-run that step, not the whole gate"),
+            "{retry}"
         );
     }
 
@@ -11155,13 +12370,16 @@ mod tests {
         // cannot happen: `record_gate` marks the item anyway and answers `Stopped`, refusing to let
         // a queue advance onto a tree it could not put back. The MARK is what these assertions read.
         //
-        // And there the two part company, which is the point of the test. Silence stops the job
-        // where it stands. A verdict does not: the queue is spent, so the job goes on to have its
-        // work reviewed, and only then is it called `gate_failed` — pinned purely in
+        // And there the two part company, which is the point of the test: silence ends the job
+        // `gate_errored`, a verdict ends it `gate_failed`. Silence stops the job where it stands.
+        // A verdict lets the queue carry on, and here the queue is spent, so the job goes where a
+        // spent queue goes — without a review, because the round's only item did not pass and
+        // there is nothing on the branch for one to judge (see `ReviewState::Skipped`). The
+        // verdict with a review in front of it is pinned purely in
         // `one_red_gate_makes_the_whole_job_gate_failed_however_it_ends`.
         assert_eq!(
             next_step(&load_view(&pool, broken).await.unwrap()),
-            Next::SpawnReview
+            Next::Finish(Outcome::GateFailed)
         );
         assert_eq!(
             next_step(&load_view(&pool, unmeasured).await.unwrap()),
@@ -11379,10 +12597,16 @@ mod tests {
         let job = load_job(&pool, job_id).await.unwrap();
         advance(&state, &job, Utc::now()).await;
 
+        // Read before the assertion so it can print it. `["pending", "pending", "pending"]` alone
+        // is all 2026-09-13 left to go on, and it reads as the fold choosing nothing — when the
+        // fold chose right, the first run it asked for was refused, and only the job's row and
+        // the feed said why.
+        let why = why_it_stands(&pool, job_id).await;
         assert_eq!(
             item_statuses(&pool, job_id).await,
             vec!["running", "pending", "running"],
-            "one pass started items 0 and 2 together, and left 1 for the file it shares with 0"
+            "one pass started items 0 and 2 together, and left 1 for the file it shares with 0 \
+             (job: {why})"
         );
 
         // And they are two nodes, in two checkouts, not one node counted twice. `item_id` is what
@@ -11693,7 +12917,11 @@ mod tests {
              write the thing\n\n\
              The full queue is in /wt/.nucleos/plan.json for context. Do not start another item \
              and do not edit that file. Your work is verified after you finish, so leave the tree \
-             building. Leave it UNCOMMITTED: the job commits for you once the gate agrees, and \
+             building. That check is the project's gate, and it runs the whole test suite the \
+             moment you stop, so do not run the whole suite yourself: run the narrowest check \
+             that tells you your change works. A command that prints nothing for long is taken \
+             for a hang, and it ends this item. Leave it UNCOMMITTED: the job commits for you \
+             once the gate agrees, and \
              committing by hand stops this item to ask permission for something already arranged."
         );
         // Said twice on purpose: the equality above is the guarantee, and this says what it is a
@@ -11762,13 +12990,416 @@ mod tests {
     /// builder's session because no builder session is kept for it to resume.
     #[test]
     fn the_review_node_is_given_a_diff_and_no_reasoning() {
-        let with_base = review_prompt(Some("deadbeef"), "/wt/.nucleos");
+        let with_base = review_prompt("t", Some("deadbeef"), "/wt/.nucleos", false, false);
         assert!(with_base.contains("git diff deadbeef..HEAD"));
 
         // No recorded base: git would not answer when the job started. Asking for the branch's own
         // commits is worse than naming a sha and better than reviewing a guess.
-        let without = review_prompt(None, "/wt/.nucleos");
+        let without = review_prompt("t", None, "/wt/.nucleos", false, false);
         assert!(without.contains("git log --oneline"));
+    }
+
+    /// The review is given the task as it was asked, and the spec when there is one, and is told to
+    /// judge the diff against them and not only against the queue.
+    ///
+    /// Job 27, 2026-09-14: the task said a change that merely widens a test's timing margin until
+    /// it stops failing "loses that property and is not a fix", the spec restated it under
+    /// `Not this`, and the plan told the implementer to widen the bound anyway. The review was
+    /// handed the diff and the queue and nothing else, so it checked one against the other and
+    /// found them agreeing. A flaw that comes from the queue cannot be caught by a reader whose
+    /// only yardstick is the queue.
+    #[test]
+    fn the_review_judges_the_diff_against_the_task_and_not_only_the_queue() {
+        let task = "a change that merely widens the margin until the test stops failing loses that \
+                    property and is not a fix";
+        let with = review_prompt(task, Some("deadbeef"), "/wt/.nucleos", true, false);
+
+        assert!(
+            with.contains(task),
+            "the review has to see what was actually asked, word for word: {with}"
+        );
+        assert!(
+            with.contains("/wt/.nucleos/spec.md"),
+            "the review was not sent to the brief that exists: {with}"
+        );
+        for section in ["Done means", "Not this"] {
+            assert!(
+                with.contains(section),
+                "the review has to be pointed at `{section}`, the part a diff can break while \
+                 satisfying every item of the queue: {with}"
+            );
+        }
+        assert!(
+            with.contains("judged against the task"),
+            "the review has to judge against the task, not only against the queue: {with}"
+        );
+        assert!(
+            with.contains("the fault is the queue's"),
+            "a flaw that comes from the plan has to be reportable as the plan's: {with}"
+        );
+
+        let without = review_prompt(task, Some("deadbeef"), "/wt/.nucleos", false, false);
+        assert!(without.contains(task));
+        assert!(without.contains("judged against the task"));
+        assert!(
+            !without.contains("spec.md"),
+            "the review was sent to a brief that was never written: {without}"
+        );
+
+        // And the rules the node already had are all still there.
+        assert!(with.contains("git diff deadbeef..HEAD"));
+        assert!(with.contains("/wt/.nucleos/plan.json"));
+        assert!(with.contains("Change no files"));
+        assert!(with.contains("Read, Grep and Glob"));
+    }
+
+    /// The wiring the prompt test cannot see: the node that is started is handed the job's own
+    /// prompt, and is sent to the brief because the spec node left one on disk.
+    #[tokio::test]
+    async fn the_review_node_is_handed_the_jobs_task_and_the_brief_on_disk() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = job_ready_to_review(&pool, worktree.path()).await;
+        std::fs::write(
+            worktree
+                .path()
+                .join(crate::worktree::ARTIFACTS_DIR)
+                .join(SPEC_FILE),
+            "## Done means\n\n## Not this\n",
+        )
+        .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        let prompt: String =
+            sqlx::query_scalar("SELECT prompt FROM runs WHERE job_id = ? AND stage = 'review'")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            prompt.contains("pull from the todo list and advance what you can"),
+            "the review node was not handed the task it is to judge against: {prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("{}/{SPEC_FILE}", artifacts_for(worktree.path()))),
+            "the review node was not sent to the brief the spec node wrote: {prompt}"
+        );
+    }
+
+    // -- The council in front of the review node ---------------------------------------------
+
+    /// A roster that would advise, with the consumers the caller asks for.
+    ///
+    /// Cloud seats only: a local seat would be refused by `resolve_seat` against `NoAssistants`,
+    /// and these tests are about the job's side of the seam rather than about who may sit.
+    fn advising_roster(job_review: bool) -> crate::config::CouncilConfig {
+        crate::config::CouncilConfig {
+            timeout_seconds: 1,
+            rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+            consumers: crate::config::CouncilConsumers {
+                job_review,
+                proposal_advice: false,
+            },
+            chairman: crate::config::SeatSpec {
+                kind: Some(crate::config::SeatKind::Cloud),
+                model_ref: Some("the-chairman".to_string()),
+                agent: None,
+            },
+            members: vec![crate::config::SeatSpec {
+                kind: Some(crate::config::SeatKind::Cloud),
+                model_ref: Some("a-member".to_string()),
+                agent: None,
+            }],
+        }
+    }
+
+    /// The same state, with a council runtime swapped in. `token` is what decides whether
+    /// `council::start` can get past its second line -- see `a_council_that_will_not_start...`.
+    async fn state_with_council(
+        pool: sqlx::SqlitePool,
+        config: Option<crate::config::CouncilConfig>,
+        token: Option<&str>,
+    ) -> AppState {
+        let state = test_state(pool).await;
+        AppState {
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::new(
+                config,
+                token.map(str::to_string),
+            )),
+            ..state
+        }
+    }
+
+    /// A council row written by hand, so a job's side of the seam can be walked without spending a
+    /// deliberation. A synthesis is put where the real thing puts it: the transcript of the run in
+    /// `chairman_run_id`, which is not a column and must not be treated as one.
+    async fn seed_council(pool: &sqlx::SqlitePool, id: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO council_runs
+               (id, created_at, question, status, stage, anon_seed, chairman_kind, chairman_ref)
+             VALUES (?, ?, 'what should the reviewer look at', ?, 3, ?, 'cloud', 'the-chairman')",
+        )
+        .bind(id)
+        .bind(Utc::now().to_rfc3339())
+        .bind(status)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("insert a council");
+    }
+
+    /// Settles a seeded council with the text its chairman wrote.
+    async fn settle_council(pool: &sqlx::SqlitePool, id: &str, synthesis: &str) {
+        let run_id: i64 = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at, stdout)
+             VALUES ('project-a', 'synthesize', 'completed', 'assistant', ?, ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(synthesis)
+        .execute(pool)
+        .await
+        .expect("insert the chairman's run")
+        .last_insert_rowid();
+        sqlx::query("UPDATE council_runs SET status = ?, chairman_run_id = ? WHERE id = ?")
+            .bind(crate::council::STATUS_DONE)
+            .bind(run_id)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("settle the council");
+    }
+
+    /// A job with everything done but its review, and a directory to hand work through.
+    async fn job_ready_to_review(pool: &sqlx::SqlitePool, worktree: &std::path::Path) -> i64 {
+        let job_id = seed_job(pool, "project-a", "reviewing").await.unwrap();
+        sqlx::query("UPDATE jobs SET project_root = ? WHERE id = ?")
+            .bind(worktree.to_string_lossy().into_owned())
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        seed_worktree(pool, job_id, worktree).await;
+        seed_items(pool, job_id, &["passed", "passed"]).await;
+        job_id
+    }
+
+    async fn stages_run(pool: &sqlx::SqlitePool, job_id: i64) -> Vec<String> {
+        sqlx::query_scalar("SELECT stage FROM runs WHERE job_id = ? ORDER BY id")
+            .bind(job_id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn review_council_of(pool: &sqlx::SqlitePool, job_id: i64) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>("SELECT review_council_id FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn councils_held(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM council_runs")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn council_file_in(worktree: &std::path::Path) -> std::path::PathBuf {
+        worktree
+            .join(crate::worktree::ARTIFACTS_DIR)
+            .join(COUNCIL_FILE)
+    }
+
+    /// **The non-regression test, and the one that matters most in this file.** Both consumers ship
+    /// off, and off has to mean the pipeline that ran yesterday: the review node starts on the same
+    /// pass, with a prompt that names no council, and nothing is convened or written down.
+    #[tokio::test]
+    async fn a_job_with_council_review_off_walks_exactly_as_it_did() {
+        let pool = test_pool().await;
+        // The shipped state: no roster at all, which is what `CouncilRuntime::default()` is.
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = job_ready_to_review(&pool, worktree.path()).await;
+
+        assert_eq!(
+            next_step(&load_view(&pool, job_id).await.unwrap()),
+            Next::SpawnReview
+        );
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(stages_run(&pool, job_id).await, vec!["review"]);
+        assert_eq!(councils_held(&pool).await, 0);
+        assert_eq!(review_council_of(&pool, job_id).await, None);
+        assert_ne!(job_status(&pool, job_id).await, "waiting");
+
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !prompt.contains(COUNCIL_FILE),
+            "a review with no council must not be sent to a file that is not there: {prompt}"
+        );
+    }
+
+    /// A configured council that refuses to start is a council that never happened, and the job
+    /// walks on. Deterministic because the refusal is `Unavailable` -- a runtime holding a roster
+    /// and no daemon key, which `council::start` turns down before any row exists.
+    #[tokio::test]
+    async fn a_council_that_will_not_start_does_not_hold_the_job() {
+        let pool = test_pool().await;
+        let state = state_with_council(pool.clone(), Some(advising_roster(true)), None).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = job_ready_to_review(&pool, worktree.path()).await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(stages_run(&pool, job_id).await, vec!["review"]);
+        assert_eq!(councils_held(&pool).await, 0);
+        assert_eq!(review_council_of(&pool, job_id).await, None);
+        assert_ne!(
+            job_status(&pool, job_id).await,
+            "waiting",
+            "a council that could not convene must never be able to park a job"
+        );
+    }
+
+    /// The whole of the parked path: the job waits while the council deliberates, and the tick
+    /// after it settles writes the synthesis beside the queue and starts the node.
+    ///
+    /// `waiting` and not a status of its own, deliberately -- see `LIVE_STATUSES`, which is
+    /// duplicated in `LIVE_JOBS_SQL`, in a migration's index and in `concurrency.rs`. A status that
+    /// falls out of that list stops being ticked while still holding a concurrency slot.
+    #[tokio::test]
+    async fn a_council_review_parks_the_job_and_unparks_it_when_the_council_settles() {
+        let pool = test_pool().await;
+        let state =
+            state_with_council(pool.clone(), Some(advising_roster(true)), Some("key")).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = job_ready_to_review(&pool, worktree.path()).await;
+
+        // A council already convened for this job and still thinking. Seeded rather than spent:
+        // this test is about what the JOB does with a council, not about the council.
+        seed_council(&pool, "council-1", crate::council::STATUS_RUNNING).await;
+        sqlx::query("UPDATE jobs SET review_council_id = 'council-1' WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+        assert_eq!(job_status(&pool, job_id).await, "waiting");
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some(WAIT_COUNCIL));
+        assert!(
+            stages_run(&pool, job_id).await.is_empty(),
+            "the review must not start while the council it is going to read is still writing"
+        );
+
+        // The council settles. `drive` is what a tick actually calls, and it unparks before it
+        // re-reads anything -- so the whole pass is driven rather than `advance` alone.
+        settle_council(&pool, "council-1", "watch the cursor").await;
+        let job = load_job(&pool, job_id).await.unwrap();
+        drive(&state, job, Utc::now()).await;
+
+        let written = std::fs::read_to_string(council_file_in(worktree.path()))
+            .expect("the synthesis lands where `review_prompt` sends the node");
+        assert_eq!(written, "watch the cursor");
+        assert_eq!(stages_run(&pool, job_id).await, vec!["review"]);
+        let prompt: String =
+            sqlx::query_scalar("SELECT prompt FROM runs WHERE job_id = ? AND stage = 'review'")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(prompt.contains(COUNCIL_FILE));
+
+        // And the latch held: the column is not cleared when the council settles, precisely so a
+        // pass that comes back here cannot convene a second deliberation.
+        assert_eq!(
+            review_council_of(&pool, job_id).await.as_deref(),
+            Some("council-1")
+        );
+        assert_eq!(councils_held(&pool).await, 1);
+    }
+
+    /// Four ways a council ends with nothing to say -- errored, cancelled, gone from the record
+    /// entirely, and settled with no transcript to read -- and none of them may hold the job. The
+    /// review runs unadvised, which is exactly what a job with no council configured does.
+    #[tokio::test]
+    async fn a_council_that_failed_does_not_hold_the_job() {
+        for (label, status) in [
+            ("errored", Some(crate::council::STATUS_ERROR)),
+            ("cancelled", Some(crate::council::STATUS_CANCELLED)),
+            ("pruned", None),
+            ("done with no synthesis", Some(crate::council::STATUS_DONE)),
+        ] {
+            let pool = test_pool().await;
+            let state =
+                state_with_council(pool.clone(), Some(advising_roster(true)), Some("key")).await;
+            let worktree = tempfile::tempdir().unwrap();
+            let job_id = job_ready_to_review(&pool, worktree.path()).await;
+            if let Some(status) = status {
+                seed_council(&pool, "council-1", status).await;
+            }
+            sqlx::query("UPDATE jobs SET review_council_id = 'council-1' WHERE id = ?")
+                .bind(job_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let job = load_job(&pool, job_id).await.unwrap();
+            advance(&state, &job, Utc::now()).await;
+
+            assert_eq!(
+                stages_run(&pool, job_id).await,
+                vec!["review"],
+                "a council that {label} must not stop the review from happening"
+            );
+            assert_ne!(job_status(&pool, job_id).await, "waiting", "{label}");
+            assert!(
+                !council_file_in(worktree.path()).exists(),
+                "a council that {label} writes no advice, and the node must not be told there is any"
+            );
+        }
+    }
+
+    /// A prompt naming a file that is not there is an instruction that fails by omission: the node
+    /// reads nothing, gets an error nobody warned it about, and either hunts for the file or
+    /// decides the whole paragraph was wrong. The consumer is off by default, so absent is the
+    /// COMMON case here rather than the edge one.
+    #[test]
+    fn the_review_prompt_names_the_council_file_only_when_it_exists() {
+        let without = review_prompt("t", Some("deadbeef"), "/wt/.nucleos", false, false);
+        assert!(!without.contains(COUNCIL_FILE));
+
+        let with = review_prompt("t", Some("deadbeef"), "/wt/.nucleos", false, true);
+        assert!(with.contains(&format!("/wt/.nucleos/{COUNCIL_FILE}")));
+        // Named as advice, in the same paragraph. The gate holds ship/no-ship and the panel never
+        // saw this branch, so a node told to read a synthesis must not read it as a verdict.
+        assert!(with.contains("ADVICE"));
+        assert!(
+            with.contains("the diff is what is real"),
+            "the node is told which of the two to believe when they disagree: {with}"
+        );
+        // And nothing else about the prompt moved.
+        assert!(with.contains("git diff deadbeef..HEAD"));
+        assert!(with.contains("/wt/.nucleos/plan.json"));
+        assert!(with.contains("Read, Grep and Glob"));
     }
 
     /// The words an owner would leave on a job in flight, and the item they arrive beside.

@@ -40,6 +40,8 @@ export interface Subagent {
   description: string;
   /** The system prompt it runs under. */
   prompt: string;
+  /** Which tools it may call, or null/absent to inherit the conversation's whole surface. */
+  tools?: string[] | null;
   /** Which model answers as this helper, or null/absent to inherit the conversation's. */
   model?: string | null;
   /** How hard it is asked to think, or null/absent for its model's own default. */
@@ -179,17 +181,20 @@ export interface ChatProject {
 }
 
 /**
- * The five rungs a conversation can stand on, spelled as the daemon spells them.
+ * The six rungs a conversation can stand on, spelled as the daemon spells them.
  *
  * `manual` asks before anything changes; `accept_edits` adds the edits;
  * `plan` answers with a plan; `auto` runs what the rules allow and asks about
- * the rest; `bypass` asks about nothing but a delete inside the project.
+ * the rest; `dont_ask` runs exactly what `auto` runs and refuses that same rest
+ * instead of asking about it; `bypass` asks about nothing but a delete inside
+ * the project.
  */
 export type PermissionMode =
   | "manual"
   | "accept_edits"
   | "plan"
   | "auto"
+  | "dont_ask"
   | "bypass";
 
 /** A conversation already had in the IDE that this daemon could continue. */
@@ -543,10 +548,13 @@ export function useChats() {
  * an hour rather than `Infinity` so a daemon restart is eventually noticed
  * without the app being restarted too.
  */
-export function useAssistantModels() {
+export function useAssistantModels(chatId?: string) {
   return useQuery({
-    queryKey: keys.chats.models,
-    queryFn: () => apiFetch<AssistantModels>("/assistant/models"),
+    queryKey: chatId === undefined ? keys.chats.models : keys.chats.modelsFor(chatId),
+    queryFn: () =>
+      apiFetch<AssistantModels>(
+        `/assistant/models${chatId === undefined ? "" : `?chat=${encodeURIComponent(chatId)}`}`,
+      ),
     staleTime: 60 * 60 * 1000,
   });
 }

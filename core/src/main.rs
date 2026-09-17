@@ -43,6 +43,7 @@ mod join;
 mod land;
 mod local_agent;
 mod logging;
+mod machine_config;
 mod mailsend;
 mod map_anchor;
 mod map_intent;
@@ -58,6 +59,7 @@ mod mcp_tools;
 mod mentions;
 mod notes;
 mod notify;
+mod notify_policy;
 mod openrouter;
 mod ownership;
 mod pii_shadow;
@@ -70,6 +72,7 @@ mod project_exit;
 mod project_map;
 mod project_policy;
 mod project_readings;
+mod prompt_budget;
 mod proposals;
 mod recurrence;
 mod redact;
@@ -970,6 +973,8 @@ async fn main() {
             tracing::info!(model = %models_config.codex_model, "codex CLI selected as the run runner");
             Arc::new(runner::CodexCliRunner {
                 model: models_config.codex_model.clone(),
+                // A run keeps the user's Codex config; only chats pin a sandbox (`for_chat`).
+                sandbox_mode: None,
             })
         }
         Some(other) => {
@@ -1118,10 +1123,20 @@ async fn main() {
     // Read after the local model has been probed, because whether a `kind: local` seat is runnable
     // is not something a config file can assert — startup PROVES it, and a roster naming a local
     // seat this daemon cannot answer with is refused rather than quietly re-routed to the cloud.
-    let council_config = config::load_council_config(
-        std::path::Path::new(".ai/council.yaml"),
-        local_model.is_some(),
-    );
+    let council_config = match council::config_path() {
+        Some(path) => config::load_council_config(&path, local_model.is_some()),
+        // No home directory means there is nowhere a roster could be, so there is no council —
+        // and that is all it means. Warned rather than fatal, like every other missing-pillar
+        // path here: a daemon that will not boot costs the operator mail, autopilot and the API
+        // over a feature that ships off.
+        None => {
+            tracing::warn!(
+                "no home directory, so {} cannot be read; the council stays off",
+                council::CONFIG_DISPLAY_PATH
+            );
+            None
+        }
+    };
     // Minted only when there is a council to use it, and never the control token: a seat is an
     // agent CLI deciding what to call next, and `auth::COUNCIL_ROUTES` is what it can reach. A
     // failure to mint leaves `None`, and `council::start` refuses — a seat with a key that
@@ -1140,8 +1155,8 @@ async fn main() {
     // Assembles the assistant that answers a turn from what was just resolved above — one factory
     // in place of the two singletons `local_assistant`/`hosted_assistant` used to be. No production
     // caller until this packet; `AppState.assistants` below is the first one.
-    let assistants: Arc<dyn assistants::Assistants> =
-        Arc::new(assistants::ConfiguredAssistants::new(
+    let assistants: Arc<dyn assistants::Assistants> = Arc::new(
+        assistants::ConfiguredAssistants::new(
             local_model,
             hosted_model,
             hosted_key,
@@ -1149,7 +1164,9 @@ async fn main() {
             token_value.clone(),
             pool.clone(),
             runner::OLLAMA_BASE_URL.to_string(),
-        ));
+        )
+        .with_agent_clis(Arc::new(claude_runner()), models_config.codex_model.clone()),
+    );
 
     let state = AppState {
         token: Token(token_value),
@@ -1162,6 +1179,15 @@ async fn main() {
         // `None` when this machine has no home directory to hang a library off. Resolved here and
         // not per request, like `files_root` above: it is a fact about the machine.
         workflow_library: seeded_library(),
+        // Said out loud on failure rather than swallowed: every settings route refuses
+        // without it, and "the daemon cannot name its own working directory" is not a
+        // sentence anybody should have to infer from a 500.
+        secrets: std::sync::Arc::new(secrets::OsCredentialStore),
+        machine_config_root: std::env::current_dir()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "the daemon cannot name its own working directory; this machine's settings cannot be edited from the app")
+            })
+            .ok(),
         telegram_doctrine: telegram_config.doctrine,
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
@@ -1221,11 +1247,7 @@ async fn main() {
     // two browser or web sidecars fight over the same fixed ports. A second daemon is for
     // exercising this process's own HTTP and MCP surface, and it does that without any of them.
     let sidecars_wanted = is_primary;
-    let sidecar_path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("echo-sidecar.exe");
+    let sidecar_path = sidecar::binary("echo-sidecar.exe");
     if sidecars_wanted {
         tokio::spawn(sidecar::supervise(
             sidecar::ECHO.to_string(),
@@ -1249,11 +1271,7 @@ async fn main() {
             Err(error) => tracing::error!(%error, "could not retire open browsing sessions"),
         }
 
-        let path = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("browser-sidecar.exe");
+        let path = sidecar::binary("browser-sidecar.exe");
         let env = sidecar::browser_env(
             &daemon_client::daemon_url(),
             &browser_sidecar_token,
@@ -1284,11 +1302,7 @@ async fn main() {
                 String::new()
             }
         };
-        let path = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("web-sidecar.exe");
+        let path = sidecar::binary("web-sidecar.exe");
         let env = sidecar::web_env(
             &daemon_client::daemon_url(),
             &web_sidecar_token,
@@ -1325,11 +1339,7 @@ async fn main() {
     }
     match secrets::load_secret(TELEGRAM_TOKEN_KEY) {
         Ok(Some(bot_token)) => {
-            let telegram_path = std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("telegram-sidecar.exe");
+            let telegram_path = sidecar::binary("telegram-sidecar.exe");
             let telegram_env =
                 sidecar::telegram_env(&daemon_client::daemon_url(), &state.token.0, &bot_token);
             if sidecars_wanted {
@@ -1469,11 +1479,7 @@ async fn main() {
                     // everything is the arrangement being removed.
                     match state.email.sidecar_token.as_deref() {
                         Some(token) => {
-                            let path = std::env::current_exe()
-                                .unwrap()
-                                .parent()
-                                .unwrap()
-                                .join("email-sidecar.exe");
+                            let path = sidecar::binary("email-sidecar.exe");
                             let env = sidecar::email_env(
                                 &daemon_client::daemon_url(),
                                 token,

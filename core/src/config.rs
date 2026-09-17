@@ -150,6 +150,15 @@ pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// effort and the model can be set in separate requests and the model can change afterwards.
 pub fn is_effort_level(config: &ModelsConfig, value: &str) -> bool {
     config.effort_levels().iter().any(|level| level == value)
+        || config
+            .assistant_choices
+            .iter()
+            .any(|choice| choice.efforts.iter().any(|level| level == value))
+}
+
+/// Loads the current models configuration, falling back to defaults on failure.
+pub fn models_config_now() -> ModelsConfig {
+    load_models_config(Path::new(MODELS_CONFIG_PATH)).unwrap_or_default()
 }
 
 fn default_assistant_choices() -> Vec<AssistantChoice> {
@@ -176,6 +185,28 @@ fn default_assistant_choices() -> Vec<AssistantChoice> {
 }
 
 impl ModelsConfig {
+    /// Returns the CLI configured for a cloud model id.
+    pub fn runner_of(&self, id: &str) -> Option<&'static str> {
+        self.assistant_choices
+            .iter()
+            .find(|choice| choice.brain == "cloud" && choice.id == id)
+            .map(|choice| match choice.runner.as_deref() {
+                Some("codex") => "codex",
+                _ => "claude",
+            })
+    }
+
+    /// Returns the model catalogue available to a chat's rooted state.
+    pub fn catalogue_for_chat(&self, installed: &[String], rooted: bool) -> Vec<AssistantChoice> {
+        let mut choices = self.catalogue_scoped(installed, rooted);
+        if !rooted {
+            choices.retain(|choice| {
+                choice.brain != "cloud" || choice.runner.as_deref() != Some("codex")
+            });
+        }
+        choices
+    }
+
     /// The model a conversation runs on when it has pinned none — what the runner was built with.
     ///
     /// Reported beside the catalogue so the window can name the unpinned state instead of leaving
@@ -229,6 +260,11 @@ impl ModelsConfig {
     /// Ollama degrades to precisely today's behaviour rather than to some other empty state --
     /// trivially true here since `catalogue()` now calls this function with an empty slice.
     pub fn catalogue_with_installed(&self, installed: &[String]) -> Vec<AssistantChoice> {
+        self.catalogue_scoped(installed, false)
+    }
+
+    /// Builds a model catalogue limited to one runner or open to every runner.
+    fn catalogue_scoped(&self, installed: &[String], every_runner: bool) -> Vec<AssistantChoice> {
         // Only the models belonging to the CLI this daemon was actually started with. The file may
         // hold both lists — `scripts/refresh-models.py` writes both when it can reach both — and
         // offering `sonnet` to a daemon running Codex would produce a turn that dies at spawn.
@@ -241,7 +277,9 @@ impl ModelsConfig {
         // Cloud only. The local route is the same whichever CLI is configured, so filtering it by
         // the runner would hide a working model for a reason that has nothing to do with it.
         choices.retain(|choice| {
-            choice.brain != "cloud" || choice.runner.as_deref().unwrap_or("claude") == active
+            choice.brain != "cloud"
+                || every_runner
+                || choice.runner.as_deref().unwrap_or("claude") == active
         });
         // A file that says nothing about the running CLI would otherwise produce an empty menu.
         // The configured model always works — it is what the runner was built with.
@@ -458,12 +496,21 @@ where
 /// without a restart. The second reader is the reason it stopped being a literal in `main.rs`.
 pub const MODELS_CONFIG_PATH: &str = ".ai/nucleos-models.yaml";
 
+/// `.ai/nucleos-models.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Unlike its seven neighbours this file's loader could already refuse, so splitting the parser out
+/// buys no new strictness — it buys the write route a function with the shape every other claim's
+/// validator has, and it keeps the door and the loader reading one grammar rather than two.
+pub fn parse_models_config(contents: &str) -> Result<ModelsConfig, String> {
+    serde_yaml::from_str::<ModelsConfig>(contents).map_err(|error| error.to_string())
+}
+
 pub fn load_models_config(path: &Path) -> std::io::Result<ModelsConfig> {
     if !path.exists() {
         return Ok(ModelsConfig::default());
     }
     let contents = std::fs::read_to_string(path)?;
-    serde_yaml::from_str(&contents)
+    parse_models_config(&contents)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
@@ -549,14 +596,27 @@ impl EmailConfig {
     }
 }
 
+/// `.ai/email.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_email_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a typo in an optional pillar's config cannot stop the daemon from starting. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_email_config(contents: &str) -> Result<EmailConfig, String> {
+    serde_yaml::from_str::<EmailConfig>(contents)
+        .map(EmailConfig::validated)
+        .map_err(|error| error.to_string())
+}
+
 /// Reads `.ai/email.yaml`. Absent or unreadable → defaults, with a warning; never an error, so a
 /// typo in an optional pillar's config cannot stop the daemon from starting.
 pub fn load_email_config(path: &Path) -> EmailConfig {
     if !path.exists() {
         return EmailConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<EmailConfig>(&text)) {
-        Ok(Ok(config)) => config.validated(),
+    match std::fs::read_to_string(path).map(|text| parse_email_config(&text)) {
+        Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "email config: could not be parsed; the pillar stays off");
             EmailConfig::default()
@@ -632,6 +692,17 @@ pub struct VoiceConfig {
     /// Terms said often and heard badly. Applied twice on purpose — as decoding bias and as a
     /// deterministic pass — so a term is fixed even when the bias was not enough.
     pub hints: Vec<String>,
+    /// What ends a turn, now that silence does not. A list and not a literal because the spelling a
+    /// transcriber returns is a measurement, not a decision: `-l auto` picks a language per segment,
+    /// so the same spoken word comes back differently depending on what whisper thought it heard.
+    /// Phase 1 measures those spellings and they are added here.
+    pub closing_words: Vec<String>,
+    /// What throws the accumulated turn away. Two tokens, matched as two — `risca` alone is a verb
+    /// somebody says about code.
+    pub discard_phrase: String,
+    /// What confirms a discard. Throwing away three minutes of thinking on one misheard phrase is
+    /// the expensive mistake in this pair, so it takes two utterances and not one.
+    pub confirm_words: Vec<String>,
     pub cleanup_prompt: String,
 }
 
@@ -647,6 +718,9 @@ impl Default for VoiceConfig {
             conversation_hotkey: "Ctrl+Alt+C".to_string(),
             retain_dictations_days: 7,
             hints: Vec::new(),
+            closing_words: vec!["câmbio".into()],
+            discard_phrase: "risca isso".into(),
+            confirm_words: vec!["sim".into()],
             cleanup_prompt: DEFAULT_CLEANUP_PROMPT.to_string(),
         }
     }
@@ -692,6 +766,19 @@ impl VoiceConfig {
     }
 }
 
+/// `.ai/voice.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_voice_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a typo in a dictation aid cannot stop the daemon from starting. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_voice_config(contents: &str) -> Result<VoiceConfig, String> {
+    serde_yaml::from_str::<VoiceConfig>(contents)
+        .map(VoiceConfig::validated)
+        .map_err(|error| error.to_string())
+}
+
 /// Reads `.ai/voice.yaml`. Absent, unreadable or malformed → defaults, with a warning; never an error.
 ///
 /// This follows `load_email_config` rather than `load_schedule_rules`, and the choice matters in two
@@ -701,8 +788,8 @@ pub fn load_voice_config(path: &Path) -> VoiceConfig {
     if !path.exists() {
         return VoiceConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<VoiceConfig>(&text)) {
-        Ok(Ok(config)) => config.validated(),
+    match std::fs::read_to_string(path).map(|text| parse_voice_config(&text)) {
+        Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "voice config: could not be parsed; the pillar stays off");
             VoiceConfig::default()
@@ -750,11 +837,22 @@ impl Default for CalendarConfig {
     }
 }
 
+/// `.ai/calendar.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_calendar_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a typo in two policy strings cannot stop the daemon from starting. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_calendar_config(contents: &str) -> Result<CalendarConfig, String> {
+    serde_yaml::from_str::<CalendarConfig>(contents).map_err(|error| error.to_string())
+}
+
 pub fn load_calendar_config(path: &Path) -> CalendarConfig {
     if !path.exists() {
         return CalendarConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<CalendarConfig>(&text)) {
+    match std::fs::read_to_string(path).map(|text| parse_calendar_config(&text)) {
         Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "calendar config: could not be parsed; defaults apply");
@@ -815,6 +913,17 @@ impl Default for WebConfig {
     }
 }
 
+/// `.ai/web.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_web_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a broken file costs fidelity and never safety. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_web_config(contents: &str) -> Result<WebConfig, String> {
+    serde_yaml::from_str::<WebConfig>(contents).map_err(|error| error.to_string())
+}
+
 /// Reads `.ai/web.yaml`. Absent, unreadable or malformed → defaults, with a warning.
 ///
 /// The failure mode is deliberately asymmetric with the rest of this module: falling back to
@@ -826,7 +935,7 @@ pub fn load_web_config(path: &Path) -> WebConfig {
     if !path.exists() {
         return WebConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<WebConfig>(&text)) {
+    match std::fs::read_to_string(path).map(|text| parse_web_config(&text)) {
         Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "web config: could not be parsed; the pillar stays off and nothing is trusted");
@@ -879,6 +988,17 @@ impl Default for BrowserConfig {
     }
 }
 
+/// `.ai/browser.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_browser_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a broken file costs a capability and never grants one. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_browser_config(contents: &str) -> Result<BrowserConfig, String> {
+    serde_yaml::from_str::<BrowserConfig>(contents).map_err(|error| error.to_string())
+}
+
 /// Reads `.ai/browser.yaml`. Absent, unreadable or malformed → defaults, with a warning.
 ///
 /// Defaults mean the pillar is OFF, so a broken file costs a capability and never grants one — the
@@ -888,7 +1008,7 @@ pub fn load_browser_config(path: &Path) -> BrowserConfig {
     if !path.exists() {
         return BrowserConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<BrowserConfig>(&text)) {
+    match std::fs::read_to_string(path).map(|text| parse_browser_config(&text)) {
         Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "browser config: could not be parsed; the pillar stays off");
@@ -927,6 +1047,17 @@ where
     Ok(Option::<String>::deserialize(deserializer)?.filter(|text| !text.trim().is_empty()))
 }
 
+/// `.ai/telegram.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_telegram_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a typo never invents a doctrine nobody wrote. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_telegram_config(contents: &str) -> Result<TelegramConfig, String> {
+    serde_yaml::from_str::<TelegramConfig>(contents).map_err(|error| error.to_string())
+}
+
 /// Reads `.ai/telegram.yaml`. Absent, unreadable or malformed → default (`doctrine: None`), with a
 /// warning — the same asymmetry `load_web_config` and `load_browser_config` both take: a typo in a
 /// per-developer file must cost fidelity (no doctrine prepended) and never stop the daemon, and
@@ -935,7 +1066,7 @@ pub fn load_telegram_config(path: &Path) -> TelegramConfig {
     if !path.exists() {
         return TelegramConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<TelegramConfig>(&text)) {
+    match std::fs::read_to_string(path).map(|text| parse_telegram_config(&text)) {
         Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "telegram config: could not be parsed; every turn is launched exactly as before");
@@ -990,6 +1121,17 @@ impl Default for GithubConfig {
     }
 }
 
+/// `.ai/github.yaml`'s grammar, and the only place that decides what a valid one is.
+///
+/// Split out of [`load_github_config`] because a write route needs a parser that can REFUSE, and
+/// the loader by design cannot: it answers a malformed file with defaults precisely so that
+/// a typo in a convenience list cannot take the daemon down. Two questions, one grammar — the loader
+/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
+/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
+pub fn parse_github_config(contents: &str) -> Result<GithubConfig, String> {
+    serde_yaml::from_str::<GithubConfig>(contents).map_err(|error| error.to_string())
+}
+
 /// Reads `.ai/github.yaml`. Absent, unreadable or malformed -> defaults, with a warning.
 ///
 /// The same asymmetry `load_web_config` has and the same reason: falling back to defaults here means
@@ -1003,7 +1145,7 @@ pub fn load_github_config(path: &Path) -> GithubConfig {
     if !path.exists() {
         return GithubConfig::default();
     }
-    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<GithubConfig>(&text)) {
+    match std::fs::read_to_string(path).map(|text| parse_github_config(&text)) {
         Ok(Ok(config)) => config,
         Ok(Err(error)) => {
             tracing::warn!(%error, path = %path.display(), "github config: could not be parsed; the pillar stays capable and stops being autonomous");
@@ -1039,6 +1181,22 @@ pub const DEFAULT_COUNCIL_TIMEOUT_SECONDS: u64 = 600;
 /// nothing else in the daemon would ever end one. The clock is therefore the only thing that does,
 /// and an unbounded one is a council that stays `running` for as long as the daemon lives.
 pub const MAX_COUNCIL_TIMEOUT_SECONDS: u64 = 3_600;
+
+/// How many deliberation rounds a council runs when the file does not say.
+///
+/// One, which is what the pillar has always done: every seat answers, every seat ranks the others
+/// blind, a chairman synthesises. The second round is opt-in and the default is not a placeholder —
+/// a second round asks every seat the question again, so it roughly doubles what phase 1 cost, and
+/// a feature that expensive is one somebody chooses rather than one they inherit.
+pub const DEFAULT_COUNCIL_ROUNDS: u32 = 1;
+
+/// The most rounds this file accepts.
+///
+/// Two, and the ceiling is a decision rather than an arbitrary stop. A third round would ask every
+/// seat to revise a revision it has already seen ranked, and there is no third ranking to revise
+/// against — `.ai/specs/2026-08-11-council-design.md` §10 named exactly one further round, not a
+/// loop. When somebody wants the loop they can argue for it here.
+pub const MAX_COUNCIL_ROUNDS: u32 = 2;
 
 /// Where one seat's answer comes from.
 ///
@@ -1092,10 +1250,11 @@ pub fn seat_kind_for_engine(engine: &str) -> Option<SeatKind> {
 /// asking which half is set, and one of them would eventually guess.
 ///
 /// Both forms are valid forever. The tempting cleanup — migrate the file, drop `{ kind, ref }` — is
-/// refused for a concrete reason: `.ai/council.yaml` is under `.ai/`, which is gitignored, so it is
-/// per-developer configuration and not a fact of the repository. A form retired here does not
-/// produce an error on the machines still using it; `load_council_config` returns `None` on a roster
-/// with faults, so it produces a council that silently stops existing at the next daemon start.
+/// refused for a concrete reason: the roster lives at `~/.nucleos/council.yaml`, outside any
+/// checkout, so it is one person's configuration on one machine and nothing shipped here can
+/// rewrite it. A form retired here does not produce an error on the machines still using it;
+/// `load_council_config` returns `None` on a roster with faults, so it produces a council that
+/// silently stops existing at the next daemon start.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SeatSpec {
@@ -1219,7 +1378,7 @@ impl CouncilSeat {
     }
 }
 
-/// `.ai/council.yaml`. Absent means there is no council — this pillar has no useful default,
+/// `~/.nucleos/council.yaml`. Absent means there is no council — this pillar has no useful default,
 /// because a roster nobody chose is a list of models nobody agreed to pay for.
 ///
 /// `deny_unknown_fields`, and here it is load-bearing rather than tidy: `member:` for `members:`
@@ -1230,12 +1389,60 @@ impl CouncilSeat {
 pub struct CouncilConfig {
     #[serde(default = "default_council_timeout")]
     pub timeout_seconds: u64,
+    /// 1 or 2. Two adds a second deliberation round: after the blind ranking every seat is shown
+    /// the same anonymised peer answers it ranked, plus where the council placed them, and revises
+    /// its own answer — and the chairman then synthesises the revised ones.
+    ///
+    /// A FAULT rather than a clamp when it is anything else, which is the one place this field
+    /// parts company with `timeout_seconds` two lines up. A clock outside its bounds has an obvious
+    /// nearest legal value and costs nothing to guess at; `rounds: 3` does not, because both
+    /// candidates are defensible and they differ by the price of a whole extra round. So it joins
+    /// the fault list and the council stays off, which is the branch `load_council_config` took
+    /// over `load_models_config`'s on purpose: the operator is told, and nothing is spent guessing.
+    #[serde(default = "default_council_rounds")]
+    pub rounds: u32,
+    /// Which of the daemon's own decisions get the council's opinion before a person sees them.
+    ///
+    /// Absent means none of them, which is what every roster written before this field already
+    /// meant. `#[serde(default)]` on the struct AND on each flag, so `consumers: { job_review:
+    /// true }` is a legal half-answer: an operator turning one on should not have to write the
+    /// other down to leave it alone.
+    #[serde(default)]
+    pub consumers: CouncilConsumers,
     pub chairman: SeatSpec,
     pub members: Vec<SeatSpec>,
 }
 
+/// The internal callers a configured council is allowed to advise.
+///
+/// **Both false by default, and both are advice rather than authority.** A consumer costs minutes
+/// of paid deliberation in front of something that was going to happen anyway, so neither is
+/// inherited — and neither decides anything: the job's `review` node still runs and still writes
+/// its own opinion, and a proposal gets a NOTE on its event log while the human keeps the verdict.
+/// `.ai/decisions.md` fixed that second half — the arbiter of an ambiguity is the person, and the
+/// council gates nothing — so a flag here that approved anything would contradict a standing
+/// decision rather than extend a feature.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CouncilConsumers {
+    /// Before a job's `review` node starts, put the job's task to the council and leave the
+    /// synthesis in the job's artifacts directory for the node to read. The job waits while the
+    /// council deliberates.
+    #[serde(default)]
+    pub job_review: bool,
+    /// When a run is stopped for an approval, put the refused action to the council and write the
+    /// synthesis onto the proposal as a note. Best-effort and out of band: the proposal is created
+    /// and the run is parked exactly as they were, whatever the council does or fails to do.
+    #[serde(default)]
+    pub proposal_advice: bool,
+}
+
 fn default_council_timeout() -> u64 {
     DEFAULT_COUNCIL_TIMEOUT_SECONDS
+}
+
+fn default_council_rounds() -> u32 {
+    DEFAULT_COUNCIL_ROUNDS
 }
 
 impl CouncilConfig {
@@ -1253,6 +1460,15 @@ impl CouncilConfig {
             faults.push(format!(
                 "the roster has {} members, above the ceiling of {MAX_COUNCIL_SEATS}",
                 self.members.len()
+            ));
+        }
+        // Named in the list rather than clamped. See the field's own note: there is no obvious
+        // nearest legal value for a third round, and guessing one spends money the operator did not
+        // agree to spend.
+        if !(1..=MAX_COUNCIL_ROUNDS).contains(&self.rounds) {
+            faults.push(format!(
+                "rounds is {}; a council runs 1 round or {MAX_COUNCIL_ROUNDS}",
+                self.rounds
             ));
         }
         for (index, seat) in self.seats().enumerate() {
@@ -1285,7 +1501,8 @@ impl CouncilConfig {
     }
 }
 
-/// Reads `.ai/council.yaml`. Absent, unreadable, malformed or invalid → `None`, with a warning.
+/// Reads the roster at `path` — `council::config_path()` in production, a tempdir in the tests
+/// below. Absent, unreadable, malformed or invalid → `None`, with a warning.
 ///
 /// This follows `load_web_config` and NOT `load_models_config`, and the direction was chosen rather
 /// than inherited. Erroring would stop the daemon — mail, autopilot, voice and the API with it —
@@ -1300,29 +1517,40 @@ pub fn load_council_config(path: &Path, local_available: bool) -> Option<Council
     if !path.exists() {
         return None;
     }
-    let config = match std::fs::read_to_string(path).map(|text| serde_yaml::from_str(&text)) {
-        Ok(Ok(config)) => config,
+    match std::fs::read_to_string(path).map(|text| parse_council_config(&text, local_available)) {
+        Ok(Ok(config)) => Some(config),
         Ok(Err(error)) => {
-            tracing::warn!(%error, path = %path.display(), "council config: could not be parsed; there is no council");
-            return None;
+            tracing::warn!(%error, path = %path.display(), "council config: unusable; there is no council");
+            None
         }
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "council config: could not be read; there is no council");
-            return None;
+            None
         }
-    };
+    }
+}
 
+/// `.ai/council.yaml`'s grammar AND its roster rules, which for this file are the same question:
+/// a council whose seats do not add up is not a council, so `faults` belongs on this side of the
+/// door rather than after it.
+///
+/// `local_available` is a parameter for the reason [`load_council_config`] gives — whether this
+/// machine can answer locally is proved by probing at startup, not asserted by a file. The write
+/// route therefore passes `true`: the door refuses what is wrong about the ROSTER however the
+/// machine is configured, and leaves "no local model is up right now" to startup, which is where
+/// that fact is actually known. Refusing a local seat at the door because Ollama happens to be
+/// down would make the file uneditable on exactly the machine that needs it edited.
+pub fn parse_council_config(
+    contents: &str,
+    local_available: bool,
+) -> Result<CouncilConfig, String> {
+    let config: CouncilConfig =
+        serde_yaml::from_str(contents).map_err(|error| error.to_string())?;
     let faults = CouncilConfig::faults(&config, local_available);
     if !faults.is_empty() {
-        tracing::warn!(
-            path = %path.display(),
-            faults = %faults.join("; "),
-            "council config: the roster is not usable; there is no council"
-        );
-        return None;
+        return Err(faults.join("; "));
     }
-
-    Some(config.validated())
+    Ok(config.validated())
 }
 
 /// `deny_unknown_fields` on every rule type and on the file itself: without it a typo like
@@ -1535,6 +1763,18 @@ pub struct AutopilotRules {
     pub repo_triggers: Vec<RepoTrigger>,
     #[serde(default)]
     pub gate_command: Option<String>,
+    /// Whether a breached health readout should be written as a new intent record.
+    ///
+    /// **Absent and off by default**: a repository that says nothing behaves exactly as it did
+    /// before this key existed. `deny_unknown_fields` above means a misspelling is a startup error,
+    /// rather than a silently ignored line.
+    ///
+    /// Turning this on records the breach in `.ai/local/ledgers/intents.jsonl` for an operator to
+    /// review; it does not enqueue a job, start a run, or touch the approval queue. The
+    /// `schedules` and `repo_triggers` lists stay empty because the file's own doctrine is
+    /// "Creating this file must not start anything"; this key does not overrule that doctrine.
+    #[serde(default)]
+    pub health_breach_intent: bool,
     /// Whether the VCS queue measures a merge before it publishes it.
     ///
     /// **Off by default, and the default is the whole of the compatibility story**: a repository
@@ -1681,6 +1921,125 @@ fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn chat_choices() -> Vec<AssistantChoice> {
+        vec![
+            AssistantChoice {
+                id: "sonnet".to_string(),
+                label: "Sonnet".to_string(),
+                brain: "cloud".to_string(),
+                efforts: ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                runner: Some("claude".to_string()),
+                tools: None,
+                installed: None,
+            },
+            AssistantChoice {
+                id: "opus".to_string(),
+                label: "Opus".to_string(),
+                brain: "cloud".to_string(),
+                efforts: ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                runner: Some("claude".to_string()),
+                tools: None,
+                installed: None,
+            },
+            AssistantChoice {
+                id: "gpt-5.6-terra".to_string(),
+                label: "GPT-5.6 Terra".to_string(),
+                brain: "cloud".to_string(),
+                efforts: ["low", "medium", "high", "xhigh", "max", "ultra"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                runner: Some("codex".to_string()),
+                tools: None,
+                installed: None,
+            },
+            AssistantChoice {
+                id: "gpt-5.5".to_string(),
+                label: "GPT-5.5".to_string(),
+                brain: "cloud".to_string(),
+                efforts: ["low", "medium", "high", "xhigh"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                runner: Some("codex".to_string()),
+                tools: None,
+                installed: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn runner_of_names_the_cli_a_cloud_choice_belongs_to() {
+        let config = ModelsConfig {
+            assistant_choices: chat_choices(),
+            ..ModelsConfig::default()
+        };
+        assert_eq!(config.runner_of("gpt-5.5"), Some("codex"));
+        assert_eq!(config.runner_of("sonnet"), Some("claude"));
+
+        let mut mystery = config.clone();
+        mystery.assistant_choices[0].runner = Some("mystery".to_string());
+        assert_eq!(mystery.runner_of("sonnet"), Some("claude"));
+        mystery.assistant_choices[0].runner = None;
+        assert_eq!(mystery.runner_of("sonnet"), Some("claude"));
+        assert_eq!(config.runner_of("not-in-the-catalogue"), None);
+    }
+
+    #[test]
+    fn a_rooted_chat_is_offered_both_clis_in_one_menu() {
+        let config = ModelsConfig {
+            assistant_choices: chat_choices(),
+            ..ModelsConfig::default()
+        };
+        let chat_catalogue = config.catalogue_for_chat(&[], true);
+        let offered: Vec<&str> = chat_catalogue
+            .iter()
+            .map(|choice| choice.id.as_str())
+            .collect();
+        assert!(
+            ["sonnet", "opus", "gpt-5.6-terra", "gpt-5.5"]
+                .into_iter()
+                .all(|id| offered.contains(&id))
+        );
+        let catalogue = config.catalogue();
+        let unchanged: Vec<&str> = catalogue.iter().map(|choice| choice.id.as_str()).collect();
+        assert_eq!(unchanged, vec!["sonnet", "opus"]);
+    }
+
+    #[test]
+    fn an_unrooted_chat_is_never_offered_a_codex_model() {
+        for primary_runner in [None, Some("codex".to_string())] {
+            let config = ModelsConfig {
+                primary_runner,
+                assistant_choices: chat_choices(),
+                ..ModelsConfig::default()
+            };
+            assert!(
+                config
+                    .catalogue_for_chat(&[], false)
+                    .iter()
+                    .all(|choice| choice.runner.as_deref() != Some("codex"))
+            );
+        }
+    }
+
+    #[test]
+    fn the_effort_door_knows_every_clis_levels() {
+        let config = ModelsConfig {
+            assistant_choices: chat_choices(),
+            ..ModelsConfig::default()
+        };
+        assert!(is_effort_level(&config, "ultra"));
+        assert!(!is_effort_level(&config, "nonsense"));
+        assert!(!config.effort_levels().contains(&"ultra".to_string()));
+    }
+
     /// The picker must not offer a route the daemon cannot take.
     ///
     /// A conversation moved to `local` with no local model configured is refused at the first turn
@@ -2868,6 +3227,78 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         );
     }
 
+    /// A round count outside `1..=MAX_COUNCIL_ROUNDS` is a FAULT, not a clamp — the whole council is
+    /// refused and the operator is told, rather than quietly handed whichever neighbour the loader
+    /// guessed. The difference is money: rounding `rounds: 3` down to 2 still buys a second round
+    /// nobody asked for, and rounding it up is not a shape this file knows how to run at all.
+    ///
+    /// The clock in the test above IS clamped, and the asymmetry is the thing being held: a clock
+    /// has an obvious nearest legal value and a round count does not.
+    #[test]
+    fn a_third_round_is_not_a_shape_this_file_accepts() {
+        assert_eq!(
+            council_config_from(A_GOOD_ROSTER, true).unwrap().rounds,
+            DEFAULT_COUNCIL_ROUNDS,
+            "a file that says nothing about rounds runs the council it always ran"
+        );
+        assert_eq!(
+            council_config_from(&format!("rounds: 2\n{A_GOOD_ROSTER}"), true)
+                .unwrap()
+                .rounds,
+            2
+        );
+
+        for refused in ["rounds: 0", "rounds: 3", "rounds: 99"] {
+            assert!(
+                council_config_from(&format!("{refused}\n{A_GOOD_ROSTER}"), true).is_none(),
+                "`{refused}` must leave the council off rather than be clamped into one"
+            );
+        }
+        // Not a `u32` at all: serde refuses it before `faults` is ever reached, and the loader's
+        // parse branch reports it. Asserted because the OUTCOME has to be the same either way —
+        // there is no council, and the daemon still boots.
+        assert!(council_config_from(&format!("rounds: -1\n{A_GOOD_ROSTER}"), true).is_none());
+    }
+
+    /// The default is the one that matters here: every roster ever written predates this field, and
+    /// each consumer spends minutes of paid deliberation in front of something that was going to
+    /// happen anyway. Inheriting either by upgrading is the failure this test exists to catch.
+    #[test]
+    fn a_roster_that_says_nothing_about_consumers_advises_nobody() {
+        let silent = council_config_from(A_GOOD_ROSTER, true).unwrap();
+        assert!(!silent.consumers.job_review);
+        assert!(!silent.consumers.proposal_advice);
+
+        // And a half-answer leaves the other half alone rather than being refused for being
+        // incomplete: turning one consumer on must not require writing the other one down.
+        let half = council_config_from(
+            &format!("consumers: {{ job_review: true }}\n{A_GOOD_ROSTER}"),
+            true,
+        )
+        .expect("naming one consumer is a complete roster");
+        assert!(half.consumers.job_review);
+        assert!(!half.consumers.proposal_advice);
+
+        let both = council_config_from(
+            &format!("consumers: {{ job_review: true, proposal_advice: true }}\n{A_GOOD_ROSTER}"),
+            true,
+        )
+        .unwrap();
+        assert!(both.consumers.job_review && both.consumers.proposal_advice);
+
+        // `deny_unknown_fields` on the nested struct too. A misspelt consumer that parsed into a
+        // silent `false` would be the worst kind of failure here: the operator believes they have
+        // turned advice on, the daemon boots, and nothing ever says otherwise.
+        assert!(
+            council_config_from(
+                &format!("consumers: {{ job_reviews: true }}\n{A_GOOD_ROSTER}"),
+                true
+            )
+            .is_none(),
+            "a misspelt consumer is an arrest, not a consumer that quietly stays off"
+        );
+    }
+
     #[test]
     fn missing_file_returns_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -3097,6 +3528,20 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         let dir = tempfile::tempdir().unwrap();
         assert!(load_schedule_rules(dir.path()).unwrap().attention_brake());
         assert!(AutopilotRules::default().attention_brake());
+    }
+
+    #[test]
+    fn health_breach_intent_is_absent_and_off_by_default() {
+        let rules = AutopilotRules::default();
+        assert!(!rules.health_breach_intent);
+        assert!(!rules_from("schedules: []\n").unwrap().health_breach_intent);
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_rules_block_is_a_startup_error() {
+        let error = rules_from("health_breach_intnt: true\n")
+            .expect_err("a misspelled rules key must be rejected at startup");
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]

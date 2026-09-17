@@ -39,13 +39,17 @@ import {
 import {
   Button,
   ConfirmButton,
+  ConflictNote,
   Count,
   ErrorNote,
+  Inset,
   PageHeader,
   Panel,
   Quiet,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
   Section,
   StaleNote,
   StateBadge,
@@ -335,16 +339,6 @@ function dense(count: number): boolean {
   return count > 3;
 }
 
-function listClass(count: number): string {
-  return dense(count) ? "ui-rows waiting-dense" : "ui-rows";
-}
-
-/** A card: a shared row, plus this page's own air between the parts of one. */
-function cardClass(count: number): string {
-  return dense(count)
-    ? "ui-rows-row waiting-card ui-rows-row-dense"
-    : "ui-rows-row waiting-card";
-}
 
 /* ------------------------------------------------------------- shared parts -- */
 
@@ -704,9 +698,9 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
         />
       }
     >
-      <ul className={listClass(items.length)} aria-label="Wheel requests">
+      <Rows label="Wheel requests" className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((session) => (
-          <li className={cardClass(items.length)} key={session.id}>
+          <Row className="waiting-card" dense={dense(items.length)} key={session.id}>
             <div className="waiting-card-head">
               <span className="waiting-card-id">
                 wheel #{session.proposal_id}
@@ -762,9 +756,9 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
                 onConfirm={() => reject.mutate(session.proposal_id)}
               />
             </div>
-          </li>
+          </Row>
         ))}
-      </ul>
+      </Rows>
     </Queue>
   );
 }
@@ -927,9 +921,9 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
             )}
           </div>
         )}
-        <ul className={listClass(items.length)} aria-label="Action approvals">
+        <Rows label="Action approvals" className={dense(items.length) ? "waiting-dense" : undefined}>
           {items.map((proposal) => (
-            <li className={cardClass(items.length)} key={proposal.id}>
+            <Row className="waiting-card" dense={dense(items.length)} key={proposal.id}>
               <div className="waiting-card-head">
                 <input
                   className="waiting-select"
@@ -997,9 +991,9 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
               {failed.has(proposal.id) && (
                 <DecisionRefusal error={failed.get(proposal.id)} trustProse />
               )}
-            </li>
+            </Row>
           ))}
-        </ul>
+        </Rows>
       </>
     </Queue>
   );
@@ -1043,7 +1037,7 @@ function TeamActionSection({
         </>
       }
     >
-      <ul className={listClass(items.length)} aria-label="Team actions">
+      <Rows label="Team actions" className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((proposal) => (
           <TeamActionCard
             key={proposal.id}
@@ -1053,7 +1047,7 @@ function TeamActionSection({
             onArmedChange={onArmedChange}
           />
         ))}
-      </ul>
+      </Rows>
     </Queue>
   );
 }
@@ -1143,7 +1137,7 @@ function TeamActionCard({
   const action = executing?.find((row) => row.proposal_id === proposal.id);
 
   return (
-    <li className={cardClass(count)}>
+    <Row className="waiting-card" dense={dense(count)}>
       <div className="waiting-card-head">
         <span className="waiting-card-id">team action #{proposal.id}</span>
         <span className="waiting-card-title">
@@ -1203,7 +1197,7 @@ function TeamActionCard({
         approveError={approve.isError ? approve.error : null}
         refuseError={reject.isError ? reject.error : null}
       />
-    </li>
+    </Row>
   );
 }
 
@@ -1238,7 +1232,7 @@ function RecruitmentSection({ view }: { view: Reading<Proposal> }) {
         </>
       }
     >
-      <ul className={listClass(items.length)} aria-label="Recruitment">
+      <Rows label="Recruitment" className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((proposal) => (
           <RecruitmentCard
             key={proposal.id}
@@ -1247,7 +1241,7 @@ function RecruitmentSection({ view }: { view: Reading<Proposal> }) {
             onArmedChange={onArmedChange}
           />
         ))}
-      </ul>
+      </Rows>
     </Queue>
   );
 }
@@ -1298,7 +1292,7 @@ function RecruitmentCard({
   const idFor = (name: string) => `recruit-${proposal.id}-${name}`;
 
   return (
-    <li className={cardClass(count)}>
+    <Row className="waiting-card" dense={dense(count)}>
       <div className="waiting-card-head">
         <span className="waiting-card-id">recruit #{proposal.id}</span>
         <RelativeTime at={proposal.created_at} />
@@ -1315,7 +1309,7 @@ function RecruitmentCard({
       ) : (
         // The one card in this queue that is a form. The inset is what says the
         // fields are a thing standing on the row rather than more of the row.
-        <div className="ui-panel-inset waiting-recruit-form">
+        <Inset>
           <div className="waiting-recruit-field">
             <label className="waiting-recruit-label" htmlFor={idFor("name")}>
               name
@@ -1398,7 +1392,7 @@ function RecruitmentCard({
               onChange={(event) => field("tool_policy", event.target.value)}
             />
           </div>
-        </div>
+        </Inset>
       )}
       <div className="waiting-actions">
         <ConfirmButton
@@ -1429,31 +1423,41 @@ function RecruitmentCard({
       {reject.isError && (
         <DecisionRefusal error={reject.error} trustProse={false} />
       )}
-    </li>
+    </Row>
   );
 }
 
 /* ------------------------------------------------------- 5. contact merges -- */
 
+/**
+ * One side of a suggested merge, under the word for what happens to it.
+ *
+ * `kept` and `absorbed` are a heading and not a field label — the whole point of
+ * showing both sides is that the merge is not symmetrical, and which of the two
+ * survives is the first thing a reader has to know. `Section` is the heading
+ * rank; the label rank it used to be written in is what a `dt` gets, and at 11px
+ * the two are told apart by 0.06em of tracking and nothing else.
+ */
 function MergeSideView({ side, role }: { side: MergeSide; role: string }) {
   return (
-    <div className="waiting-side">
-      <p className="waiting-side-role">{role}</p>
-      <p className="waiting-side-name">
-        {side.display_name ?? "no name recorded"}
-      </p>
-      <ul className="waiting-addresses">
-        {side.addresses.map((address) => (
-          <li key={address}>{address}</li>
-        ))}
-      </ul>
-      <p className="waiting-meta">{side.messages_in} messages in</p>
-      <p className="waiting-verdict">
-        {side.verdict === null
-          ? "no standing decision"
-          : `standing decision: ${side.verdict}`}
-      </p>
-    </div>
+    <Section label={role} level={3}>
+      <div className="waiting-side">
+        <p className="waiting-side-name">
+          {side.display_name ?? "no name recorded"}
+        </p>
+        <ul className="waiting-addresses">
+          {side.addresses.map((address) => (
+            <li key={address}>{address}</li>
+          ))}
+        </ul>
+        <p className="waiting-meta">{side.messages_in} messages in</p>
+        <p className="waiting-verdict">
+          {side.verdict === null
+            ? "no standing decision"
+            : `standing decision: ${side.verdict}`}
+        </p>
+      </div>
+    </Section>
   );
 }
 
@@ -1498,9 +1502,9 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
         />
       }
     >
-      <ul className={listClass(items.length)} aria-label="Contact merges">
+      <Rows label="Contact merges" className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((suggestion) => (
-          <li className={cardClass(items.length)} key={suggestion.proposal_id}>
+          <Row className="waiting-card" dense={dense(items.length)} key={suggestion.proposal_id}>
             <div className="waiting-card-head">
               <span className="waiting-card-id">
                 merge #{suggestion.proposal_id}
@@ -1516,11 +1520,11 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
                 refuses a merge whose two people carry decisions that
                 contradict, and the remedy is to settle one of them first. */}
             {verdictsConflict(suggestion) && (
-              <p className="waiting-conflict">
+              <ConflictNote>
                 These two carry standing decisions that disagree, so the núcleo
                 will refuse the merge — settle one of them and decide this
                 again.
-              </p>
+              </ConflictNote>
             )}
             <div className="waiting-actions">
               <ConfirmButton
@@ -1552,9 +1556,9 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
                 }
               />
             </div>
-          </li>
+          </Row>
         ))}
-      </ul>
+      </Rows>
     </Queue>
   );
 }
@@ -1655,11 +1659,11 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
         />
       }
     >
-      <ul className={listClass(items.length)} aria-label="Exclusion requests">
+      <Rows label="Exclusion requests" className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((proposal) => {
           const pair = readExclusionPair(proposal.tool_input);
           return (
-            <li className={cardClass(items.length)} key={proposal.id}>
+            <Row className="waiting-card" dense={dense(items.length)} key={proposal.id}>
               <div className="waiting-card-head">
                 <span className="waiting-card-id">request #{proposal.id}</span>
                 <span className="waiting-card-title">
@@ -1704,10 +1708,10 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                   onConfirm={() => reject.mutate(proposal.id)}
                 />
               </div>
-            </li>
+            </Row>
           );
         })}
-      </ul>
+      </Rows>
     </Queue>
   );
 }
@@ -1746,9 +1750,9 @@ function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
         />
       }
     >
-      <ul className={listClass(items.length)} aria-label="Skipped items">
+      <Rows label="Skipped items" className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((proposal) => (
-          <li className={cardClass(items.length)} key={proposal.id}>
+          <Row className="waiting-card" dense={dense(items.length)} key={proposal.id}>
             <div className="waiting-card-head">
               <span className="waiting-card-id">item #{proposal.id}</span>
               <span className="waiting-card-title">
@@ -1778,9 +1782,9 @@ function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
                 onConfirm={() => dismiss.mutate(proposal.id)}
               />
             </div>
-          </li>
+          </Row>
         ))}
-      </ul>
+      </Rows>
     </Queue>
   );
 }
@@ -1819,9 +1823,9 @@ function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
         </>
       }
     >
-      <ul className={listClass(rows.length)} aria-label="Refused actions">
+      <Rows label="Refused actions" className={dense(rows.length) ? "waiting-dense" : undefined}>
         {rows.map((proposal) => (
-          <li className={cardClass(rows.length)} key={proposal.id}>
+          <Row className="waiting-card" dense={dense(rows.length)} key={proposal.id}>
             <div className="waiting-card-head">
               <span className="waiting-card-id">refusal #{proposal.id}</span>
               <span className="waiting-card-title">
@@ -1841,9 +1845,9 @@ function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
             </p>
             <ToolInput raw={proposal.tool_input} />
             <ReadFrom raw={proposal.read_from} />
-          </li>
+          </Row>
         ))}
-      </ul>
+      </Rows>
     </Queue>
   );
 }
@@ -1889,28 +1893,24 @@ function GitQueuePanel({ view }: { view: Reading<VcsRequestSummary> }) {
       }
     >
       {wanted.length === 0 ? (
-        <p className="waiting-empty">
-          nothing in the git queue is waiting on you.
-        </p>
+        <Quiet says="nothing in the git queue is waiting on you." />
       ) : (
-        <ul
-          className={listClass(wanted.length)}
-          aria-label="Git requests waiting on you"
-        >
+        <Rows label="Git requests waiting on you" className={dense(wanted.length) ? "waiting-dense" : undefined}>
           {wanted.map((row) => (
             <VcsRow key={row.id} row={row} count={wanted.length} />
           ))}
-        </ul>
+        </Rows>
       )}
       {recent.length > 0 && (
-        <>
-          <p className="waiting-subhead">recently through the queue</p>
-          <ul className="ui-rows" aria-label="Recent git requests">
-            {recent.map((row) => (
-              <VcsRow key={row.id} row={row} count={recent.length} />
-            ))}
-          </ul>
-        </>
+        <div className="waiting-recent">
+          <Section label="recently through the queue" level={3}>
+            <Rows label="Recent git requests">
+              {recent.map((row) => (
+                <VcsRow key={row.id} row={row} count={recent.length} />
+              ))}
+            </Rows>
+          </Section>
+        </div>
       )}
       {/* Nothing prunes `vcs_requests`, so this listing is the whole history and
           not a backlog. Arriving at the cap says the daemon has been running a
@@ -1928,9 +1928,7 @@ function GitQueuePanel({ view }: { view: Reading<VcsRequestSummary> }) {
 
 function VcsRow({ row, count }: { row: VcsRequestSummary; count: number }) {
   return (
-    <li
-      className={dense(count) ? "ui-rows-row ui-rows-row-dense" : "ui-rows-row"}
-    >
+    <Row dense={dense(count)}>
       <div className="waiting-card-head">
         <span className="waiting-card-id">
           {row.op} #{row.id}
@@ -1948,7 +1946,7 @@ function VcsRow({ row, count }: { row: VcsRequestSummary; count: number }) {
       {row.status === "blocked" ? (
         <p className="waiting-hint">submit it again</p>
       ) : null}
-    </li>
+    </Row>
   );
 }
 
@@ -1974,16 +1972,9 @@ function ParkedRunsPanel({ view }: { view: Reading<AwaitingRun> }) {
         </>
       }
     >
-      <ul className={listClass(rows.length)} aria-label="Parked runs">
+      <Rows label="Parked runs" className={dense(rows.length) ? "waiting-dense" : undefined}>
         {rows.map((run) => (
-          <li
-            className={
-              dense(rows.length)
-                ? "ui-rows-row ui-rows-row-dense"
-                : "ui-rows-row"
-            }
-            key={run.id}
-          >
+          <Row dense={dense(rows.length)} key={run.id}>
             <div className="waiting-card-head">
               <Link className="waiting-row-link" to={`/runs/${run.id}`}>
                 run {run.id}
@@ -1996,9 +1987,9 @@ function ParkedRunsPanel({ view }: { view: Reading<AwaitingRun> }) {
             </div>
             <p className="waiting-excerpt">{run.prompt}</p>
             {run.cwd !== null && <p className="waiting-meta">{run.cwd}</p>}
-          </li>
+          </Row>
         ))}
-      </ul>
+      </Rows>
     </Queue>
   );
 }

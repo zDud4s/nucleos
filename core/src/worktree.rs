@@ -1847,6 +1847,7 @@ mod tests {
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::ffi::{OsStr, OsString};
+    #[cfg(windows)]
     use std::fs::OpenOptions;
     use std::process::Command;
     use std::sync::MutexGuard;

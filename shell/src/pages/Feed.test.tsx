@@ -377,10 +377,10 @@ describe("Feed - routine folds", () => {
   });
 });
 
-/* ------------------------------- A15: one kind, four different situations -- */
+/* ------------------------------- A15: one kind, five different situations -- */
 
 describe("Feed - a waiting line says what it is waiting for", () => {
-  it("reads budget, slot and exclusion apart, from the same kind", async () => {
+  it("reads budget, slot, exclusion and disk apart, from the same kind", async () => {
     /*
       All three are `job_waiting`. The daemon puts the reason nowhere but the
       summary — `park` writes `job {id} is waiting: {detail}` — so this is the
@@ -391,21 +391,26 @@ describe("Feed - a waiting line says what it is waiting for", () => {
       "job 9 holds a slot and the two are excluded", so anything matching on the
       word "slot" reads it as slot contention and sends somebody looking for
       capacity that is already there.
+
+      The disk row is the other one. Its detail names "this project's
+      worktrees", and on 2026-09-14 the daemon still reported it as slot
+      contention — so it must read as the disk, and never as a slot.
     */
     useLines([
       entry({ id: 4, kind: "job_waiting", minutesAgo: 30, summary: "job 4 is waiting: job 9 holds a slot and the two are excluded" }),
       entry({ id: 3, kind: "job_waiting", minutesAgo: 31, summary: "job 3 is waiting: another run holds the project's worktree slot" }),
       entry({ id: 2, kind: "job_waiting", minutesAgo: 32, summary: "job 2 is waiting: hourly spend $4.90 + $0.25 reserve would exceed the $5.00 hourly limit" }),
+      entry({ id: 6, kind: "job_waiting", minutesAgo: 33, summary: "job 6 is waiting: the disk is too full for another checkout: only 37559 MiB free where this project's worktrees live, and a new checkout needs at least 102400 MiB" }),
     ]);
     await renderFeed();
 
-    // A parked job is routine — no park reason asks something of the reader — so the three fold.
+    // A parked job is routine — no park reason asks something of the reader — so the four fold.
     const list = await lines();
-    fireEvent.click(within(list).getByRole("button", { name: /3 routine/ }));
+    fireEvent.click(within(list).getByRole("button", { name: /4 routine/ }));
     const items = [...list.querySelectorAll("li.feed-line")] as HTMLElement[];
-    expect(items.length).toBe(3);
+    expect(items.length).toBe(4);
 
-    // Newest first: exclusion, slot, budget. Each row carries its own reading, and only its own.
+    // Newest first: exclusion, slot, budget, disk. Each row carries its own reading, and only its own.
     expect(within(items[0]).getByText("held by an exclusion")).toBeDefined();
     expect(within(items[0]).queryByText("waiting for a slot")).toBeNull();
 
@@ -417,6 +422,9 @@ describe("Feed - a waiting line says what it is waiting for", () => {
 
     expect(within(items[2]).getByText("held by budget")).toBeDefined();
     expect(within(items[2]).queryByText("waiting for a slot")).toBeNull();
+
+    expect(within(items[3]).getByText("held by a full disk")).toBeDefined();
+    expect(within(items[3]).queryByText("waiting for a slot")).toBeNull();
   });
 
   it("says nothing extra about a waiting line it cannot read", async () => {
@@ -431,6 +439,7 @@ describe("Feed - a waiting line says what it is waiting for", () => {
     expect(within(list).queryByText("held by budget")).toBeNull();
     expect(within(list).queryByText("waiting for a slot")).toBeNull();
     expect(within(list).queryByText("held by an exclusion")).toBeNull();
+    expect(within(list).queryByText("held by a full disk")).toBeNull();
   });
 });
 

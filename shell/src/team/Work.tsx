@@ -10,7 +10,20 @@ import {
   type TeamRun,
   type TeamView,
 } from "../data/teams";
-import { Button, ErrorNote, Meter, Panel, RefusalNote, RelativeTime, Section, StateBadge, usd } from "../ui";
+import {
+  Button,
+  ErrorNote,
+  Meter,
+  Panel,
+  Quiet,
+  RefusalNote,
+  RelativeTime,
+  Row,
+  Rows,
+  Section,
+  StateBadge,
+  usd,
+} from "../ui";
 import { daemonProse } from "./prose";
 
 /**
@@ -51,31 +64,31 @@ export function Work({ team, runs }: WorkProps) {
 
       {live.length > 0 && (
         <Section label="In flight">
-          <ul className="ui-rows" aria-label="In flight">
+          <Rows label="In flight">
             {live.map((run) => (
-              <li className="ui-rows-row" key={run.id}>
+              <Row key={run.id}>
                 <LiveTask run={run} ceiling={team.budget_usd} />
-              </li>
+              </Row>
             ))}
-          </ul>
+          </Rows>
         </Section>
       )}
 
       <Panel title="Tasks">
-        {runs.length === 0 && <p className="teams-empty">no task yet for this team.</p>}
+        {runs.length === 0 && <Quiet says="no task yet for this team." />}
         {done.length > 0 && (
-          <ul className="ui-rows" aria-label="Tasks">
+          <Rows label="Tasks">
             {done.map((run) => (
-              <li className="ui-rows-row" key={run.id}>
+              <Row key={run.id}>
                 <div className="teams-run-head">
                   <Link to={`/team-runs/${run.id}`}>{run.request}</Link>
                   <StateBadge domain="team_run" state={run.state} />
                   <RelativeTime at={run.created_at} />
                 </div>
                 {run.why !== null && <p className="teams-run-why">{run.why}</p>}
-              </li>
+              </Row>
             ))}
-          </ul>
+          </Rows>
         )}
         {/*
           The honest footer. `GET /team-runs` is a hard LIMIT 100 across EVERY
@@ -187,7 +200,7 @@ function LiveTask({ run, ceiling }: { run: TeamRun; ceiling: number | null }) {
       </p>
 
       {detail.data === undefined ? (
-        <p className="teams-loading">reading the rounds…</p>
+        <Quiet says="reading the rounds…" />
       ) : (
         <>
           <Rounds items={detail.data.items} round={detail.data.round} />
@@ -215,7 +228,7 @@ function LiveTask({ run, ceiling }: { run: TeamRun; ceiling: number | null }) {
  */
 function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
   if (items.length === 0) {
-    return <p className="teams-empty">nothing planned yet — the núcleo has not picked this up.</p>;
+    return <Quiet says="nothing planned yet — the núcleo has not picked this up." />;
   }
 
   const rounds = [...new Set(items.map((item) => item.round))].sort((a, b) => a - b);
@@ -240,7 +253,7 @@ function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
                   <span className="teams-round-mark" aria-hidden="true">
                     {MARK[item.state] ?? "·"}
                   </span>
-                  <span className="teams-said">{item.state}</span>
+                  <span className="sr-only">{item.state}</span>
                 </span>
               ))}
           </span>
@@ -249,7 +262,7 @@ function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
       <li className="teams-round-line">
         <span className="teams-round-no">round {Math.max(...rounds, round) + 1}</span>
         <span className="teams-round-who">
-          <span className="teams-empty">not planned yet</span>
+          <span className="teams-round-none">not planned yet</span>
         </span>
       </li>
       </ol>

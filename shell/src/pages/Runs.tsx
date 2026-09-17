@@ -31,6 +31,8 @@ import {
   RefusalNote,
   Section,
   RelativeTime,
+  Row,
+  Rows,
   money,
   readState,
   StaleNote,
@@ -371,8 +373,7 @@ function RunList({
   /** Opens the New run panel; absent while it is already open. */
   onCompose: (() => void) | undefined;
 }) {
-  if (rows === undefined)
-    return <p className="runs-loading">reading the index…</p>;
+  if (rows === undefined) return <Quiet says="reading the index…" />;
 
   if (rows.length === 0) {
     return (
@@ -406,9 +407,9 @@ function RunList({
 
   return (
     <>
-      <ul className="ui-rows" aria-label="Runs">
+      <Rows label="Runs">
         {rows.map((row) => (
-          <li key={row.id} className="ui-rows-row runs-row">
+          <Row key={row.id} className="runs-row">
             <span className="runs-row-state">
               <RunState status={row.status} />
             </span>
@@ -424,9 +425,9 @@ function RunList({
               <RelativeTime at={row.created_at} />
               <span className="runs-row-cost">{costOf(row)}</span>
             </p>
-          </li>
+          </Row>
         ))}
-      </ul>
+      </Rows>
       {rows.length >= RUN_LIST_LIMIT && (
         <p className="runs-ceiling">
           showing the newest {RUN_LIST_LIMIT} — there may be more behind these;
@@ -852,9 +853,7 @@ function PresetsList({ onStarted }: { onStarted: (id: number) => void }) {
 
   return (
     <Section label="Start from a preset">
-      {saved === undefined && (
-        <p className="runs-loading">reading the saved requests…</p>
-      )}
+      {saved === undefined && <Quiet says="reading the saved requests…" />}
       {saved !== undefined && saved.length === 0 && (
         <Quiet says="no saved requests">
           <p>
@@ -864,7 +863,7 @@ function PresetsList({ onStarted }: { onStarted: (id: number) => void }) {
         </Quiet>
       )}
       {saved !== undefined && saved.length > 0 && (
-        <ul className="ui-rows runs-presets" aria-label="Presets">
+        <Rows label="Presets" className="runs-presets">
           {saved.map((preset) => (
             <PresetRow
               key={preset.id}
@@ -878,7 +877,7 @@ function PresetsList({ onStarted }: { onStarted: (id: number) => void }) {
               onDelete={() => remove.mutate(preset.id)}
             />
           ))}
-        </ul>
+        </Rows>
       )}
       {run.isError && (
         <StartRefusal error={run.error} what="the preset was not started" />
@@ -915,7 +914,7 @@ function PresetRow({
   onDelete: () => void;
 }) {
   return (
-    <li className="ui-rows-row runs-preset">
+    <Row className="runs-preset">
       <div className="runs-preset-head">
         <span className="runs-preset-name">{preset.name}</span>
         <span className="runs-preset-fact">{preset.mode}</span>
@@ -953,7 +952,7 @@ function PresetRow({
           onConfirm={onDelete}
         />
       </div>
-    </li>
+    </Row>
   );
 }
 

@@ -19,14 +19,19 @@ import {
 import {
   Button,
   ConfirmButton,
+  Count,
   ErrorNote,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
   StaleNote,
   StateBadge,
   Teach,
+  Well,
 } from "../ui";
 import "./errands.css";
 
@@ -81,7 +86,7 @@ export function Errands() {
       {errandId !== null && selected !== undefined && <ErrandDetail key={errandId} errand={selected} />}
       {errandId !== null && selected === undefined && answered && (
         <Panel title="Errand">
-          <p className="errands-empty">there is no errand with that id.</p>
+          <Quiet says="there is no errand with that id." />
         </Panel>
       )}
       {errandId !== null && selected === undefined && !answered && !errands.isError && (
@@ -139,11 +144,11 @@ function ErrandList({
     <Panel title="Errands" aside={<Count n={answered ? rows.length : undefined} />}>
       {!answered && <p className="errands-loading">reading the errands…</p>}
       {rows.length > 0 && (
-        <ul className="ui-rows errands-list" aria-label="Errands">
+        <Rows label="Errands">
           {rows.map((row) => (
             <ErrandRow key={row.id} errand={row} active={String(row.id) === selected} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
@@ -168,7 +173,10 @@ function investigationText(errand: Errand): string {
 
 function ErrandRow({ errand, active }: { errand: Errand; active: boolean }) {
   return (
-    <li className={active ? "ui-rows-row errands-row errands-row-active" : "ui-rows-row errands-row"}>
+    // The row you are on is `current` — the shared 2px rule on the leading edge,
+    // in a neutral — and nothing else. `aria-current` on the link says the same
+    // thing to a screen reader, and both stay.
+    <Row current={active}>
       <Link
         className="errands-row-link"
         to={`/errands/${errand.id}`}
@@ -188,7 +196,7 @@ function ErrandRow({ errand, active }: { errand: Errand; active: boolean }) {
           {investigationText(errand)}
         </span>
       </Link>
-    </li>
+    </Row>
   );
 }
 
@@ -388,10 +396,15 @@ function NotebookPanel({ errandId }: { errandId: number }) {
         <p className="errands-loading">reading the notebook…</p>
       )}
       {notebook.data !== undefined && notebook.data === "" && (
-        <p className="errands-empty">nothing has been written to the notebook yet.</p>
+        <Quiet says="nothing has been written to the notebook yet." />
       )}
+      {/* A well and not a box: the notebook is a file the errand wrote, and the
+          rung below the panel is what the system calls a recess cut into a
+          surface. `as="pre"` keeps the literal text literal — `base.css` gives
+          a `pre` `white-space: pre-wrap`, so it wraps rather than scrolling
+          sideways, and it never becomes markup. */}
       {notebook.data !== undefined && notebook.data !== "" && (
-        <pre className="errands-notebook-body">{notebook.data}</pre>
+        <Well as="pre">{notebook.data}</Well>
       )}
     </Panel>
   );
@@ -425,12 +438,12 @@ function FilesPanel({ errandId }: { errandId: number }) {
         {files.isError && <FilesError error={files.error} />}
         {!files.isError && files.data === undefined && <p className="errands-loading">reading the folder…</p>}
         {files.data !== undefined && names.length === 0 && (
-          <p className="errands-empty">this errand&apos;s folder is empty.</p>
+          <Quiet says="this errand's folder is empty." />
         )}
         {names.length > 0 && (
           <ul className="errands-files" aria-label="Files">
             {names.map((name) => (
-              <li className="errands-file" key={name}>
+              <li key={name}>
                 <Button variant="link" onClick={() => setOpenPath(name)}>
                   {name}
                 </Button>
@@ -559,15 +572,13 @@ function RulesPanel({ errandId }: { errandId: number }) {
       </p>
       {rules.isError && <RulesError error={rules.error} />}
       {!rules.isError && rules.data === undefined && <p className="errands-loading">reading the rules…</p>}
-      {rules.data !== undefined && rows.length === 0 && (
-        <p className="errands-empty">no rule is armed on this errand.</p>
-      )}
+      {rules.data !== undefined && rows.length === 0 && <Quiet says="no rule is armed on this errand." />}
       {rows.length > 0 && (
-        <ul className="ui-rows errands-rules" aria-label="Rules">
+        <Rows label="Rules" className="errands-rules">
           {rows.map((rule) => (
             <RuleRow key={rule.id} errandId={errandId} rule={rule} />
           ))}
-        </ul>
+        </Rows>
       )}
 
       <CreateRuleForm errandId={errandId} />
@@ -586,7 +597,7 @@ function RuleRow({ errandId, rule }: { errandId: number; rule: ErrandRule }) {
   const del = useDeleteErrandRule();
 
   return (
-    <li className="ui-rows-row errands-rule">
+    <Row className="errands-rule">
       <div className="errands-rule-head">
         <span className="errands-rule-name">{rule.name}</span>
         <code className="errands-rule-cron">{rule.cron}</code>
@@ -614,7 +625,7 @@ function RuleRow({ errandId, rule }: { errandId: number; rule: ErrandRule }) {
         </div>
       </dl>
       {del.isError && <DeleteRuleRefusal error={del.error} />}
-    </li>
+    </Row>
   );
 }
 
@@ -705,11 +716,4 @@ function CreateRuleRefusal({ error }: { error: unknown }) {
       }}
     />
   );
-}
-
-/* ---------------------------------------------------------------- shared -- */
-
-function Count({ n }: { n: number | undefined }) {
-  if (n === undefined) return null;
-  return <span className="errands-count">{n}</span>;
 }

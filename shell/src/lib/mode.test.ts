@@ -30,7 +30,7 @@ describe("promotionConsequence", () => {
   */
   it("names the project and the slots already in use", () => {
     const said = promotionConsequence(
-      project({ project_id: "alpha", wip_limit: 4, open_proposals: 3 }),
+      project({ project_id: "alpha", wip_limit: 4, open_review_items: 3 }),
     );
     expect(said).toBe(
       "alpha acts on its own — 3 of its 4 proposal slots already in use, no approval",
@@ -46,7 +46,7 @@ describe("promotionConsequence", () => {
   */
   it("says no ceiling rather than a zero when there is none", () => {
     const said = promotionConsequence(
-      project({ project_id: "beta", wip_limit: null, open_proposals: 3 }),
+      project({ project_id: "beta", wip_limit: null, open_review_items: 3 }),
     );
     expect(said).toBe("beta acts on its own — no ceiling on proposals, no approval");
     expect(said).not.toContain("0");
@@ -57,7 +57,7 @@ describe("promotionConsequence", () => {
   /* The arithmetic is the roster row's. A full queue is reported, never corrected. */
   it("carries the daemon's numbers as they are, even at the ceiling", () => {
     const said = promotionConsequence(
-      project({ project_id: "gamma", wip_limit: 2, open_proposals: 2 }),
+      project({ project_id: "gamma", wip_limit: 2, open_review_items: 2 }),
     );
     expect(said).toBe(
       "gamma acts on its own — 2 of its 2 proposal slots already in use, no approval",
@@ -94,7 +94,7 @@ describe("promotionConfirmLabel", () => {
   */
   it("carries no arithmetic, whatever the row holds", () => {
     const said = promotionConfirmLabel(
-      project({ project_id: "bravo", wip_limit: 2, open_proposals: 2 }),
+      project({ project_id: "bravo", wip_limit: 2, open_review_items: 2 }),
     );
     expect(said).toBe("Let bravo act");
     expect(said).not.toMatch(/slot|proposal|approval/);

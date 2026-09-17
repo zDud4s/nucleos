@@ -1,11 +1,19 @@
 //! Deferred notification delivery: the one module that knows a feed row IS a notification.
 //!
-//! The Telegram sidecar forwards every new `feed` entry without inspecting its kind, which is why
-//! `triage.rs` has always filtered on the writing side rather than the reading side. That single
-//! fact decides this module's whole shape: suppressing a notification cannot mean intercepting a
-//! message somewhere downstream, because there is no downstream — it means **not writing the feed
-//! row yet**. So this is not a second notification channel sitting beside the feed. It is the
-//! feed's waiting room, and the sidecar needs no change at all.
+//! The Telegram sidecar forwards new `feed` entries, which is why `triage.rs` has always filtered
+//! on the writing side rather than the reading side. That single fact decides this module's whole
+//! shape: DEFERRING a notification cannot mean holding a message somewhere downstream, because
+//! there is no queue down there to hold it in — it means **not writing the feed row yet**. So this
+//! is not a second notification channel sitting beside the feed. It is the feed's waiting room.
+//!
+//! (Corrected: this used to say the sidecar forwards every entry "without inspecting its kind" and
+//! "needs no change at all". Since `notify_policy.rs` both are false — the sidecar reads the
+//! owner's selection each round and drops the kinds it silences. Nothing above changes, because
+//! the two are different questions: `notify_policy.rs` answers WHETHER a kind is wanted at all, in
+//! the sidecar, per channel; this module answers WHEN a wanted one is written, in the núcleo, for
+//! every channel at once. A row can be held here and dropped there without either knowing about
+//! the other. What the old sentence would mislead somebody into is looking for the selection in
+//! this module, where it deliberately is not.)
 //!
 //! `feed.rs` stays purely observational and knows nothing about any of this; `calendar.rs` is asked
 //! whether the person is busy and knows nothing about notifications. This module is the only place

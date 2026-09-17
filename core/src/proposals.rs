@@ -123,6 +123,15 @@ pub async fn create_action_approval(
 /// not a join because `runs` rows are pruned, and `None` means nothing was recorded — which is the
 /// normal state for the OTHER refusal this kind carries, where an errand was stopped for whose work
 /// it is rather than for anything it read.
+///
+/// **`project_id` is the run's, read inside the INSERT.** Until 2026-09-14 the row carried none,
+/// although every refusal names its run and a run knows its project: job 26 on 2026-09-13 left six
+/// of them, job 27 the next day one, and nothing could say which project any of them belonged to.
+/// A subquery rather than a ninth argument, because every caller holds the run id and nothing else,
+/// and an argument is one more thing a caller can get wrong. A run with no project — a chat, an
+/// errand, a department — leaves it NULL, which is the truth about it. Carrying a project is what
+/// put this kind in reach of the per-project WIP brake, which is why `wip::open_proposals_term` now
+/// names it among the kinds it does not count.
 // Eight, and the eighth is `read_from`. Bundling them into a struct to satisfy the lint would put a
 // type between the caller and a row it is spelling out field by field, which is what the sibling
 // constructors above all do; the shape stays consistent with them rather than with the count.
@@ -141,11 +150,12 @@ pub async fn create_refused_action(
     let mut transaction = pool.begin().await?;
     let result = sqlx::query(
         "INSERT INTO proposals
-         (kind, status, run_id, session_id, errand_id, tool_name, reasoning, tool_input, read_from, created_at, decided_at)
-         VALUES ('refused-action', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+         (kind, status, run_id, session_id, project_id, errand_id, tool_name, reasoning, tool_input, read_from, created_at, decided_at)
+         VALUES ('refused-action', 'pending', ?, ?, (SELECT project_id FROM runs WHERE id = ?), ?, ?, ?, ?, ?, ?, NULL)",
     )
     .bind(run_id)
     .bind(session_id)
+    .bind(run_id)
     .bind(errand_id)
     .bind(tool_name)
     .bind(reasoning)
@@ -349,7 +359,7 @@ pub async fn create_calendar_event(
 /// answering synchronously has no pass to be picked up on. Without that, the button would approve
 /// nothing.
 ///
-/// `project_id` is NULL like its three siblings, so `wip::OPEN_REVIEW_ITEMS_SQL` does not count
+/// `project_id` is NULL like its three siblings, so `wip::open_review_items` does not count
 /// these against a project's review ceiling. That is deliberate and it is a real gap: the ceiling
 /// that would govern them is the autonomy list itself, and an agent that files a hundred refused
 /// operations is an agent filling somebody's approvals queue. Nothing here throttles that yet, and
@@ -401,7 +411,7 @@ pub async fn create_github_action(
 /// this takes a transaction where its four siblings take a pool.
 ///
 /// `project_id` is NULL, like `calendar-event` and `contact-merge` before it, and the consequence is
-/// deliberate: `wip::OPEN_REVIEW_ITEMS_SQL` filters by project, so these never reach the per-project
+/// deliberate: `wip::open_review_items` filters by project, so these never reach the per-project
 /// ceiling. The ceiling that governs them is `teams.max_open_actions`, which is per team, because a
 /// department has no project to be counted against.
 pub(crate) async fn create_team_action_in_transaction(
@@ -1330,6 +1340,77 @@ mod tests {
         ));
         // Still in the queue, still pending, still holding whatever it was holding.
         assert_eq!(list_pending(&pool).await.unwrap().len(), 1);
+    }
+
+    /// A refusal names the project of the run that hit it, and no project when that run had none.
+    ///
+    /// Job 26 on 2026-09-13 left six refused actions and not one said which project it belonged to,
+    /// although each named its run and every run of that job named the project. The second half is
+    /// the case that must not be invented: a chat's run has no project, and neither does its
+    /// refusal.
+    #[tokio::test]
+    async fn a_refused_action_belongs_to_its_runs_project_and_to_none_without_one() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('nucleos', 'shadow')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let in_a_project = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('nucleos', 'a job node', 'running', 'worktree', '2026-09-13T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let in_no_project = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('a chat turn', 'running', 'real', '2026-09-13T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let attributed = create_refused_action(
+            &pool,
+            in_a_project,
+            None,
+            None,
+            "Bash",
+            "the classifier did not recognise this command",
+            Some(r#"{"command":"cargo fmt --all"}"#),
+            None,
+        )
+        .await
+        .unwrap();
+        let unattributed = create_refused_action(
+            &pool,
+            in_no_project,
+            None,
+            None,
+            "send_email",
+            "this turn has read third-party content and can no longer act",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            get(&pool, attributed)
+                .await
+                .unwrap()
+                .unwrap()
+                .project_id
+                .as_deref(),
+            Some("nucleos")
+        );
+        assert_eq!(
+            get(&pool, unattributed).await.unwrap().unwrap().project_id,
+            None,
+            "a run with no project must not lend its refusal one"
+        );
     }
 
     #[tokio::test]

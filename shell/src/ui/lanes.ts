@@ -57,6 +57,8 @@ const LANE_OF: Record<string, FeedLane> = {
   job_item_conflicted: "jobs",
   job_item_orphaned: "jobs",
   job_gate_failed: "jobs",
+  job_review_skipped: "jobs",
+  job_review_retried: "jobs",
   job_waiting: "jobs",
   job_finished: "jobs",
   job_failed: "jobs",
@@ -118,6 +120,8 @@ const LANE_OF: Record<string, FeedLane> = {
   promotion_ready: "machine",
   token_efficiency: "machine",
   resume_did_not_act: "machine",
+  secret_stored: "machine",
+  secret_forgotten: "machine",
 };
 
 /** The kinds this module places by name. For the completeness test. */
@@ -184,7 +188,7 @@ export function feedGravityTone(gravity: Exclude<FeedGravity, "routine">): Badge
  * of them read Stated Blue, and so do `job_finished` and `council_finished`, which close.
  *
  * - `job_waiting` is parked by a brake and will be picked up again; `run_retry` is an attempt
- *   that failed with another one coming.
+ *   that failed with another one coming, and `job_review_retried` is a review that will run again.
  * - The starts and middles — a job started, planned or replanned, a team run or a council
  *   started, a council stage, a conflict resolution started — are open only because nothing has
  *   been written after them yet; the next line from the same subject closes or continues them.
@@ -194,6 +198,7 @@ const OPEN_KINDS: ReadonlySet<string> = new Set([
   "job_planned",
   "job_replanned",
   "job_waiting",
+  "job_review_retried",
   "run_retry",
   "team_run_started",
   "council_started",

@@ -209,7 +209,14 @@ export function Workspace() {
         be an `<a href>` that can be copied, opened in a second window, and — the case
         `Workspace.test.tsx` pins — carry an old Portuguese segment's replacement in its
         `href` so the address canonicalises itself on the first press. A `role="tab"`
-        button has none of that. `pj-tabs` on the inspector is the same decision.
+        button has none of that — Radix's `Trigger` would swap the link role and
+        `aria-current` for `role="tab"` and `aria-selected`, and collapse five tab stops
+        into one roving one. `pj-tabs` on the inspector is the same decision.
+
+        What IS adopted is the rule underneath the appearance: **the active indicator is
+        `--text` and never `--accent`**, drawn by `.ui-tab[data-state="active"]`. `.ui-current`
+        does not fit here: it is an inset rule on the LEADING edge, and the mark a tab strip
+        needs is under the label.
       */}
       <nav aria-label="Project modes" className="ui-tab-list mb-6">
         {MODES.map((candidate) => {
@@ -229,7 +236,11 @@ export function Workspace() {
               {MODE_LABEL[candidate]}
               {/*
                 Said where the decision to press is taken rather than after the press. Absent until
-                the answer is in, so the strip never puts a nought on a tab it has not asked about.
+                the answer is in, so the strip never puts a nought on a tab it has not asked about —
+                which is `Count`'s own rule for an `undefined` reading, so the ternary this used to
+                spell out is now the component's. What the primitive adds over the hand-rolled span
+                is `tabular-nums` and `nowrap`: five of these sit on one line and a digit that
+                changes width under a poll would shift the labels beside it.
               */}
               <Count n={holds?.count} />
             </Link>

@@ -1258,8 +1258,10 @@ describe("Fleet — the headline", () => {
         fleetState({
           concurrency: { house: { limit: 5, held: 2 }, projects: [] },
           projects: [
-            project({ project_id: "alpha", open_proposals: 3 }),
-            project({ project_id: "beta", open_proposals: 2 }),
+            // The queue total is `open_review_items` since master c0d03b3 — proposals are
+            // one half of it and shadow decisions the other. The headline sums the total.
+            project({ project_id: "alpha", open_review_items: 3 }),
+            project({ project_id: "beta", open_review_items: 2 }),
           ],
         }),
       ),
@@ -1267,13 +1269,13 @@ describe("Fleet — the headline", () => {
 
     await renderWithRouter(<Fleet />);
 
-    const said = await screen.findByText(/proposals open across the roster/);
+    const said = await screen.findByText(/items to review across the roster/);
     expect(said.textContent).toBe(
-      "2 in flight of 5 across all projects; room for 3 more; 5 proposals open across the roster",
+      "2 in flight of 5 across all projects; room for 3 more; 5 items to review across the roster",
     );
 
     // The card is the same fact in the same words, so the two cannot drift apart.
-    const card = screen.getByRole("article", { name: "Proposals open" });
+    const card = screen.getByRole("article", { name: "To review" });
     expect(within(card).getByText("5")).toBeDefined();
     expect(within(card).getByText("across the roster")).toBeDefined();
   });

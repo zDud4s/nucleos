@@ -1,22 +1,13 @@
-# CI reruns the five `scripts/gates.sh` targets for each push and pull request.
+# CI reruns the `scripts/gates.sh` targets on Windows, Linux and macOS for each push and pull request.
 #
-# windows-latest is not a preference. The núcleo is Windows-only by construction: `keyring` builds
-# with the windows-native-keyring-store backend, autostart shells out to `schtasks`, and the run
-# supervisor to `taskkill /T /F`. There is no other runner this crate compiles on.
+# All three, because the núcleo, the sidecars and the shell are built for all three
+# (.ai/specs/2026-09-11-portabilidade-macos-e-linux-design.md). Windows is still where the owner
+# works, so its leg keeps the GNU host the owner's machine uses; see rust-toolchain.toml.
 #
-# Each job calls `scripts/gates.sh <stack>` rather than repeating its commands. The commands moved
-# into that script precisely because living in shell history is how a red suite and an AGENTS.md
-# claiming "green" managed to coexist; copying them here would recreate the same split, one file
-# further away.
-#
-# One job per target rather than one `gates.sh all`: `all` covers the hermetic targets, while the
-# separate security target is deliberately outside it. The script still runs every stack after one
-# fails — the useful property locally, where you want all three stack answers in one pass. In CI the
-# jobs give the same completeness in parallel, and name which target broke without reading a log.
-#
-# That per-target listing is also a trap, and it caught the `hooks` target on the day it was added:
-# a new target inside `all` does NOT start running here, because nothing here runs `all`. A target
-# added to the script has to be added to this file too, or it is covered locally and nowhere else.
+# Each job calls `scripts/gates.sh <target>` rather than repeating its commands: one definition of
+# green, run in two places. One job per target rather than one `gates.sh all`, so a red job names
+# the target that broke. The trap that comes with it: a target added to `gates.sh` does NOT start
+# running here until it is added to this file too.
 
 name: gates
 
@@ -37,36 +28,49 @@ defaults:
     shell: bash
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      os: ${{ steps.pick.outputs.os }}
+    steps:
+      - id: pick
+        env:
+          # THE switch. macOS minutes bill at a multiple on a private repository, so while this one is
+          # private macOS runs only where a merge decision is made: pull requests and master. The day
+          # the repository is public, set this to "true" and every push gets all three.
+          MACOS_ON_EVERY_PUSH: "false"
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$MACOS_ON_EVERY_PUSH" = true ] || [ "$EVENT" = pull_request ] || [ "$REF" = refs/heads/master ]; then
+            echo 'os=["windows-latest","ubuntu-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'os=["windows-latest","ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
   core:
-    runs-on: windows-latest
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.plan.outputs.os) }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      # The toolchain is READ out of rust-toolchain.toml and passed as an ARGUMENT, rather than
-      # left for rustup to take from the file itself. A bare `rustup toolchain install` is what this
-      # said until the second run answered it, and it fails here with:
-      #
-      #     error: target tuple in channel name '1.97.1-x86_64-pc-windows-gnu'
-      #
-      # rustup refuses to INSTALL from a toolchain file whose channel carries a target tuple, and
-      # this repo's channel carries one deliberately — the pin is to the GNU host, for the reason
-      # rust-toolchain.toml's own comment gives. The same name is accepted as an argument; only the
-      # file-reading path validates it. That asymmetry is why the failure cannot be seen on a
-      # developer's machine, where the toolchain is already installed and nothing ever installs it
-      # from the file. Not a version difference either: runner and workstation both run rustup
-      # 1.29.0, and the error reproduces on the workstation the moment the toolchain is absent.
-      #
-      # Read rather than retyped, so the version stays in one place — a second copy here is a pin
-      # that drifts in silence. The components ARE retyped, because the file's `components` apply
-      # only on the path this step no longer takes.
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      # Read from rust-toolchain.toml and passed as an argument, so the version lives in one place.
+      # Windows runners default to the MSVC host; this repository's Windows builds use GNU (see
+      # rust-toolchain.toml), so that leg sets the host first — the same line a Windows developer runs.
       - name: Install the pinned toolchain
         run: |
+          if [ "$RUNNER_OS" = Windows ]; then rustup set default-host x86_64-pc-windows-gnu; fi
           toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --component clippy --component rustfmt
 
-      # The workspace root is the repo root (`Cargo.toml` has `members = ["core"]`), which is this
-      # action's default — `shell/src-tauri` is deliberately excluded from it and keeps its own
-      # lockfile, and no gate builds it.
       - uses: Swatinem/rust-cache@v2
 
       - run: bash scripts/gates.sh core
@@ -75,7 +79,12 @@ jobs:
   # compiles INTO the daemon and which decides what a person's git commands may do. No Rust, no Go,
   # no Node, so this job installs none of them.
   hooks:
-    runs-on: windows-latest
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.plan.outputs.os) }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -91,7 +100,8 @@ jobs:
       - run: bash scripts/gates.sh hooks
 
   security:
-    runs-on: windows-latest
+    # Gitleaks reads content, not the OS, so one runner is enough.
+    runs-on: ubuntu-latest
     steps:
       # A depth-1 checkout only sees the tip; a secret committed then removed is exactly what this
       # job must find, so it needs the full history.
@@ -99,10 +109,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      # The pinned GNU toolchain, installed before cargo-audit is compiled — same command and same
-      # reason as the core job, whose comment carries the detail.
+      # Read from rust-toolchain.toml and passed as an argument, so the version lives in one place.
+      # Windows runners default to the MSVC host; this repository's Windows builds use GNU (see
+      # rust-toolchain.toml), so that leg sets the host first — the same line a Windows developer runs.
       - name: Install the pinned toolchain
         run: |
+          if [ "$RUNNER_OS" = Windows ]; then rustup set default-host x86_64-pc-windows-gnu; fi
           toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --component clippy --component rustfmt
 
@@ -113,15 +125,20 @@ jobs:
           cargo install cargo-audit --locked
           gitleaks_version=8.30.0
           curl --fail --location --silent --show-error \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${gitleaks_version}/gitleaks_${gitleaks_version}_windows_x64.zip" \
-            --output "$RUNNER_TEMP/gitleaks.zip"
-          unzip -q "$RUNNER_TEMP/gitleaks.zip" -d "$RUNNER_TEMP/gitleaks"
+            "https://github.com/gitleaks/gitleaks/releases/download/v${gitleaks_version}/gitleaks_${gitleaks_version}_linux_x64.tar.gz" \
+            --output "$RUNNER_TEMP/gitleaks.tar.gz"
+          mkdir -p "$RUNNER_TEMP/gitleaks" && tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks"
           echo "$RUNNER_TEMP/gitleaks" >> "$GITHUB_PATH"
 
       - run: bash scripts/gates.sh security
 
   sidecars:
-    runs-on: windows-latest
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.plan.outputs.os) }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -135,7 +152,12 @@ jobs:
       - run: bash scripts/gates.sh sidecars
 
   shell:
-    runs-on: windows-latest
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.plan.outputs.os) }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -158,10 +180,16 @@ jobs:
         working-directory: shell
         run: npm run build
 
-      # Those three legs are cargo commands, governed by the repo-root rust-toolchain.toml like
-      # every other one. Same install as the core job, for the reason its comment gives.
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libssl-dev pkg-config
+
+      # Read from rust-toolchain.toml and passed as an argument, so the version lives in one place.
+      # Windows runners default to the MSVC host; this repository's Windows builds use GNU (see
+      # rust-toolchain.toml), so that leg sets the host first — the same line a Windows developer runs.
       - name: Install the pinned toolchain
         run: |
+          if [ "$RUNNER_OS" = Windows ]; then rustup set default-host x86_64-pc-windows-gnu; fi
           toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --component clippy --component rustfmt
 

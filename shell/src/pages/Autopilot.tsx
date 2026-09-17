@@ -40,23 +40,27 @@ import {
 import {
   Badge,
   Button,
-  Count,
   ConfirmButton,
+  Count,
   ErrorNote,
+  Inset,
   Meter,
   ModeSwitch,
   PageHeader,
   Panel,
   Quiet,
   RefusalNote,
-  Section,
   RelativeTime,
+  Row,
+  Rows,
+  Section,
   StatCard,
   StaleNote,
   StateBadge,
   Teach,
   readState,
 } from "../ui";
+import { whereWaiting } from "../data/roster";
 import {
   EASE,
   caption,
@@ -286,7 +290,7 @@ function Statusline({
         detail="deciding without enforcing, to earn the promotion"
       />
       <StatCard
-        label="Proposals open"
+        label="To review"
         value={pending}
         detail={
           held === 0
@@ -907,23 +911,24 @@ function FanCard({
 /**
  * The reading, in a sunken well. In shadow and off it is the evidence: classes clearing the bar,
  * one segment per class in the mode's tone. Once a project acts the evidence is history, and what
- * matters is how full its queue of proposals is.
+ * matters is how full its review queue is — proposals and shadow decisions together, which is
+ * what `open_review_items` counts and what the ceiling holds.
  */
 function FanVisor({ project }: { project: ProjectSummary }) {
   if (project.mode === "active") {
     return (
       <div className="ap-fan-visor">
-        <span className="ap-fan-visor-label">proposals open</span>
+        <span className="ap-fan-visor-label">waiting for review</span>
         <div className="ap-fan-reading">
           <span className="ap-fan-figure">
-            {project.open_proposals}
+            {project.open_review_items}
             {project.wip_limit === null ? null : (
               <span className="ap-fan-figure-of">/{project.wip_limit}</span>
             )}
           </span>
           <Meter
-            label="proposals open"
-            value={project.open_proposals}
+            label="waiting for review"
+            value={project.open_review_items}
             ceiling={project.wip_limit}
             tone="pending"
             head={false}
@@ -965,6 +970,10 @@ function FanVisor({ project }: { project: ProjectSummary }) {
 
 /** The two facts under the well: what is waiting for a verdict, and how full the queue is. */
 function FanFacts({ project }: { project: ProjectSummary }) {
+  // Which queue, not just how many: a person reading the bare number went to the proposals list
+  // and found it empty, because on that project all of it was shadow decisions. `null` when the
+  // daemon sent no split, and then the line says only what the total is.
+  const waitingWhere = whereWaiting(project);
   if (project.mode === "active") {
     return (
       <dl className="ap-fan-facts">
@@ -991,10 +1000,10 @@ function FanFacts({ project }: { project: ProjectSummary }) {
         <dt>queue</dt>
         <dd>
           {project.wip_limit === null
-            ? project.open_proposals
-            : `${project.open_proposals} of ${project.wip_limit}`}
-          <span className="ap-fan-fact-sub">
-            {project.wip_limit === null ? "no ceiling" : "proposals open"}
+            ? project.open_review_items
+            : `${project.open_review_items} of ${project.wip_limit}`}
+          <span className="ap-fan-fact-sub" title={waitingWhere ?? undefined}>
+            {waitingWhere ?? (project.wip_limit === null ? "no ceiling" : "waiting for review")}
           </span>
         </dd>
       </div>
@@ -1100,7 +1109,7 @@ function FocusSetting({
         </div>
       )}
       {needsRoot && (
-        <div className="ui-panel-inset ap-project-root">
+        <Inset className="ap-project-root">
           <label className="ap-project-root-label" htmlFor={fieldId}>
             Folder for {project.project_id}
           </label>
@@ -1121,7 +1130,7 @@ function FocusSetting({
           >
             Try again with this folder
           </Button>
-        </div>
+        </Inset>
       )}
       {refused !== undefined && !needsRoot && (
         <RefusalNote
@@ -1176,9 +1185,7 @@ function ShadowReviewPanel({
         </>
       }
     >
-      {projectId === null && (
-        <p className="ap-empty">choose a project above.</p>
-      )}
+      {projectId === null && <Quiet says="choose a project above." />}
       {projectId !== null &&
         decisions.isError &&
         decisions.data === undefined && (
@@ -1192,7 +1199,7 @@ function ShadowReviewPanel({
       {rows.length > 0 && (
         <ul className="ap-list" aria-label="Shadow decisions">
           {rows.map((decision) => (
-            <li className="ap-card" key={decision.id}>
+            <Inset as="li" key={decision.id}>
               <div className="ap-card-head">
                 <span className="ap-card-id">decision #{decision.id}</span>
                 <span className="ap-card-title">{decision.tool_name}</span>
@@ -1217,11 +1224,11 @@ function ShadowReviewPanel({
                   <dd>{decision.classifier_version}</dd>
                 </div>
               </dl>
-              <p className="ap-reason">
-                {decision.reason === null || decision.reason.trim() === ""
-                  ? "the classifier recorded no reason"
-                  : decision.reason}
-              </p>
+              {decision.reason === null || decision.reason.trim() === "" ? (
+                <Quiet says="the classifier recorded no reason" />
+              ) : (
+                <p className="ap-reason">{decision.reason}</p>
+              )}
               <RawInput raw={decision.tool_input} />
               <div className="ap-actions">
                 <ConfirmButton
@@ -1249,7 +1256,7 @@ function ShadowReviewPanel({
                   }
                 />
               </div>
-            </li>
+            </Inset>
           ))}
         </ul>
       )}
@@ -1331,9 +1338,7 @@ function ScoreboardPanel({
         )
       }
     >
-      {projectId === null && (
-        <p className="ap-empty">choose a project above.</p>
-      )}
+      {projectId === null && <Quiet says="choose a project above." />}
       {projectId !== null &&
         scoreboard.isError &&
         scoreboard.data === undefined && (
@@ -1348,10 +1353,15 @@ function ScoreboardPanel({
         <TallyTable label="Shadow evidence" rows={evidence} />
       )}
       {history.length > 0 && (
-        <>
-          <p className="ap-subhead">enforced, and not evidence for promotion</p>
-          <TallyTable label="Enforced decisions" rows={history} />
-        </>
+        <div className="ap-group">
+          {/* `level={3}` because this heading sits inside a `Panel` that already
+              has an `h2`. Announced as a sibling of "Scoreboard" it would tell a
+              screen reader the enforced rows are a section of the page rather
+              than a group within this one. */}
+          <Section label="enforced, and not evidence for promotion" level={3}>
+            <TallyTable label="Enforced decisions" rows={history} />
+          </Section>
+        </div>
       )}
       {rows.length > 0 && (
         <p className="ap-note ap-note-foot">
@@ -1466,11 +1476,11 @@ function TriggerKills() {
       {!kills.isError && kills.data === undefined && (
         <p className="ap-loading">reading the trigger brakes…</p>
       )}
-      <ul className="ui-rows" aria-label="Trigger brakes">
+      <Rows label="Trigger brakes">
         {TRIGGER_SCOPES.map((scope) => {
           const engaged = scopeEngaged(kills.data, "trigger", scope.id);
           return (
-            <li className="ui-rows-row ap-trigger-row" key={scope.id}>
+            <Row className="ap-trigger-row" key={scope.id}>
               <span className="ap-trigger-name">{scope.label}</span>
               <StateBadge domain="brake" state={scope.reads ? (engaged ? "held" : "released") : "not_read"} />
               {scope.reads ? (
@@ -1498,10 +1508,10 @@ function TriggerKills() {
                   be held.
                 </p>
               )}
-            </li>
+            </Row>
           );
         })}
-      </ul>
+      </Rows>
       {setKill.isError && (
         <ErrorNote>
           that brake was not changed — the núcleo refused or did not answer
@@ -1526,17 +1536,15 @@ function JobsPanel({
   const live = jobs.data ?? [];
 
   const target = rows.find((row) => row.project_id === selected);
-  const blocked =
-    target === undefined || target.queue_full || target.mode === "off";
+  // Which queue is holding it, not just how many items: a person reading the bare number went to
+  // the proposals list and found it empty, because all of it was shadow decisions.
+  const targetWaitingWhere = target === undefined ? null : whereWaiting(target);
+  const blocked = target === undefined || target.queue_full || target.mode === "off";
 
   return (
     <Panel title="Jobs in flight" aside={<Count n={jobs.data?.length} />}>
-      {jobs.isError && jobs.data === undefined && (
-        <ListError error={jobs.error} what="the jobs" />
-      )}
-      {jobs.data !== undefined && live.length === 0 && (
-        <p className="ap-empty">nothing is running.</p>
-      )}
+      {jobs.isError && jobs.data === undefined && <ListError error={jobs.error} what="the jobs" />}
+      {jobs.data !== undefined && live.length === 0 && <Quiet says="nothing is running." />}
       {live.length > 0 && (
         <ul className="ap-list" aria-label="Jobs in flight">
           {live.map((job) => (
@@ -1591,9 +1599,9 @@ function JobsPanel({
       )}
       {target !== undefined && target.queue_full && (
         <p className="ap-hedge">
-          {target.project_id} is holding {target.open_proposals} open proposals
-          against its ceiling of {target.wip_limit ?? "none"} — review something
-          and the brake releases itself.
+          {target.project_id} is holding {target.open_review_items} items waiting for review
+          {targetWaitingWhere === null ? "" : ` (${targetWaitingWhere})`} against its ceiling of{" "}
+          {target.wip_limit ?? "none"} — review something and the brake releases itself.
         </p>
       )}
       {create.isError && <JobError error={create.error} />}
@@ -1603,7 +1611,7 @@ function JobsPanel({
 
 function JobRow({ job }: { job: Job }) {
   return (
-    <li className="ap-job">
+    <Inset as="li" className="ap-job">
       <div className="ap-card-head">
         <span className="ap-card-id">job {job.id}</span>
         <StateBadge domain="job" state={job.status} />
@@ -1622,7 +1630,7 @@ function JobRow({ job }: { job: Job }) {
         {job.team_id !== null &&
           ` — ${job.team_name ?? job.team_id}, up to ${job.team_max_parallel ?? 1} at once`}
       </p>
-    </li>
+    </Inset>
   );
 }
 

@@ -13,7 +13,22 @@ import {
   type QueuedEmail,
   type TriageOutcome,
 } from "../data/mail";
-import { Button, ErrorNote, Field, PageHeader, Panel, RefusalNote, RelativeTime, StaleNote, StateBadge, Teach } from "../ui";
+import {
+  Button,
+  Count,
+  ErrorNote,
+  Field,
+  PageHeader,
+  Panel,
+  Quiet,
+  RefusalNote,
+  RelativeTime,
+  Row,
+  Rows,
+  StaleNote,
+  StateBadge,
+  Teach,
+} from "../ui";
 import "./mail.css";
 
 /**
@@ -84,21 +99,31 @@ export function Mail() {
 /* -------------------------------------------------------------- the count -- */
 
 /**
- * How many rows have not been triaged yet, or nothing — never a zero drawn
- * before the queue has actually answered once.
+ * How many rows have not been triaged yet — never a zero drawn before the
+ * queue has actually answered once.
  *
  * `rows === undefined` covers both "still loading" and "the query has never
- * succeeded"; either way there is no count to have an opinion about yet, and
- * a badge that guessed zero would be a claim nobody measured.
+ * succeeded"; either way there is no count to have an opinion about yet, and a
+ * figure that guessed zero would be a claim nobody measured. {@link Count}
+ * renders nothing at all for `undefined` for exactly that reason, so the guard
+ * is now the argument's type rather than an early return.
+ *
+ * A *measured* zero is a different fact and does now show. "0 untriaged" is an
+ * answer; a heading that loses its count the moment the queue is caught up
+ * reads as a count that failed, which is the case `Count` was written around.
+ *
+ * This was `.mail-count`, a pill in the Awaiting You tone. The rail's
+ * `.nav-badge` is the system's only pill-shaped count, and it earns the shape
+ * because a shut sidebar has no room for the word the number belongs to — here
+ * the word is right there, so the pill was a quantity dressed as a badge.
  */
 function UntriagedCount({ rows }: { rows: QueuedEmail[] | undefined }) {
-  if (rows === undefined) return null;
-  const n = untriagedCount(rows);
-  if (n === 0) return null;
   return (
-    <span className="mail-count" aria-label={`${n} not triaged yet`}>
-      {n} untriaged
-    </span>
+    <Count
+      n={rows === undefined ? undefined : untriagedCount(rows)}
+      noun="untriaged"
+      plural="untriaged"
+    />
   );
 }
 
@@ -208,13 +233,16 @@ function QueueList({ rows, filtered }: { rows: QueuedEmail[] | undefined; filter
     );
   }
 
+  // Hairline-ruled and not a column of cards: this list is read by scanning
+  // down it, not by picking messages out of it — the argument `.ui-rows` now
+  // carries for all four lists that had grown it byte for byte.
   return (
     <>
-      <ul className="ui-rows" aria-label="Mail queue">
+      <Rows label="Mail queue">
         {rows.map((row) => (
           <MailRow key={row.id} row={row} />
         ))}
-      </ul>
+      </Rows>
       {rows.length >= MAIL_QUEUE_LIMIT && (
         <p className="mail-ceiling">
           showing the newest {MAIL_QUEUE_LIMIT} — narrow the search to reach further back
@@ -226,7 +254,7 @@ function QueueList({ rows, filtered }: { rows: QueuedEmail[] | undefined; filter
 
 function MailRow({ row }: { row: QueuedEmail }) {
   return (
-    <li className="ui-rows-row mail-row">
+    <Row>
       <div className="mail-row-head">
         {/* NULL and "noise" are two different facts and must read as two
             different badges — see this file's header. */}
@@ -245,7 +273,7 @@ function MailRow({ row }: { row: QueuedEmail }) {
         <RelativeTime at={row.received_at} />
         {row.triage_summary !== null && <p className="mail-row-summary">{row.triage_summary}</p>}
       </div>
-    </li>
+    </Row>
   );
 }
 
@@ -355,11 +383,18 @@ function CursorPanel({
 function SkippedAbsence() {
   return (
     <Panel title="Skipped messages" variant="dim">
-      <p className="mail-absence">
-        A message the fetcher could not parse does not appear above — it is written only as a line
-        on the feed, kind <code>email_fetch_skipped</code>, with the reason in its text. Open{" "}
-        <Link to="/feed">the feed</Link> and filter by that kind to read them.
-      </p>
+      {/* The absence in one line, with the paragraph that used to stand here
+          kept verbatim behind it. This panel says nothing but "there is nothing
+          to show and here is why", which is the whole of what `Quiet` is for:
+          the reasoning is worth keeping and is not worth the four lines it
+          costs every reader who already knows it. */}
+      <Quiet says="a message the fetcher could not parse is never a row in this queue.">
+        <p>
+          A message the fetcher could not parse does not appear above — it is written only as a line
+          on the feed, kind <code className="mail-kind">email_fetch_skipped</code>, with the reason
+          in its text. Open <Link to="/feed">the feed</Link> and filter by that kind to read them.
+        </p>
+      </Quiet>
     </Panel>
   );
 }

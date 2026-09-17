@@ -172,6 +172,11 @@ function indexSources() {
         is ever both a kind and a class is still read everywhere else it appears.
       */
       .replace(/\bkind:\s*"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"/g, " ")
+      /*
+        A secret's `key` is the same shape of name from the same place: `key: "web-search-api-key"`
+        in a System fixture is what the credential store is asked for, not a rule web.css owes.
+      */
+      .replace(/\bkey:\s*"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"/g, " ")
       .replace(/[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\$\{[^}]*\}/g, " ");
     for (const m of masked.matchAll(/[a-z][a-z0-9]*(?:-[a-z0-9]+)+/g)) {
       named.add(m[0]);

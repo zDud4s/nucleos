@@ -7,6 +7,18 @@ export interface QuietProps {
   children?: ReactNode;
   /** The one gesture that would fill the space, when there is one. It stays visible. */
   action?: ReactNode;
+  /**
+   * Announce the line when it appears, because it is the answer to something the
+   * reader just did.
+   *
+   * `role="status"` is polite: it waits for a pause rather than interrupting,
+   * which is right for "that provider is unavailable" arriving after a search.
+   * Off by default — a page that opens with seven quiet panels must not announce
+   * seven absences on load, and that is the common case this component was built
+   * for. `web.css` had to wrap this component in a `div role="status"` to get it,
+   * which is the wrapper a primitive exists to remove.
+   */
+  announce?: boolean;
 }
 
 /**
@@ -28,7 +40,7 @@ export interface QuietProps {
  * anybody is looking at an empty section, and hiding the only gesture behind a question about why
  * the section is empty is the drawer this app keeps refusing to build.
  */
-export function Quiet({ says, children, action }: QuietProps) {
+export function Quiet({ says, children, action, announce }: QuietProps) {
   const [why, setWhy] = useState(false);
   // Seven `why?` buttons on `03-waiting` whose accessible name was "why?" and nothing else.
   // The line beside it is the only description this component owns, and it is the right one:
@@ -37,7 +49,7 @@ export function Quiet({ says, children, action }: QuietProps) {
   const whyId = useId();
 
   return (
-    <div className="ui-quiet">
+    <div className="ui-quiet" role={announce === true ? "status" : undefined}>
       <p id={saidId}>{says}</p>
       {children === undefined ? null : (
         <button

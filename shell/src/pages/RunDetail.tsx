@@ -23,6 +23,7 @@ import {
   ErrorNote,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   StateBadge,
 } from "../ui";
@@ -87,7 +88,7 @@ function KnownRun({ id }: { id: number }) {
       <>
         <Crumb />
         <PageHeader title={`Run ${id}`} />
-        {run.isError ? <DetailError error={run.error} /> : <p className="runs-loading">reading run {id}…</p>}
+        {run.isError ? <DetailError error={run.error} /> : <Quiet says={`reading run ${id}…`} />}
       </>
     );
   }
@@ -218,6 +219,10 @@ function FactsPanel({ run }: { run: Run }) {
         <Fact label="Steerable">{run.steerable ? "yes — it accepts more turns" : "no"}</Fact>
       </dl>
 
+      {/* What went into the prompt stays here and not in the strip above: it is read once, as a
+          fact of how the run was built, not watched like the cost and the context fill. */}
+      <PromptBudget authored={run.authored_prompt_estimate} cliOwn={run.cli_own_estimate} />
+
       {/*
         The handoff link. The núcleo has recorded it since handoffs existed and
         the old shell never had the field, so a run that ran out of context and
@@ -231,6 +236,60 @@ function FactsPanel({ run }: { run: Run }) {
         </p>
       )}
     </Panel>
+  );
+}
+
+/**
+ * Where this run's prompt came from: the part we wrote, and everything else.
+ *
+ * **Two numbers, and there will never be a third.** The daemon knows exactly
+ * what it put on the command line — the tool schemas its MCP server announced,
+ * the standing instructions it appended, the helper definitions, the prompt —
+ * and it knows the total the CLI reported. It does not know, and cannot find
+ * out, how the remainder divides. The CLI's own system prompt, its built-in
+ * tool definitions and whatever it loaded from a CLAUDE.md are all inside the
+ * residual, and the daemon never sends the last of those, so no honest number
+ * for it exists on this side. A third line here naming one of them would be a
+ * guess wearing a measurement's clothes.
+ *
+ * Both are labelled *estimate* and neither is labelled *tokens*, because both
+ * are four characters to the token — right about the order of magnitude and
+ * wrong by tens of percent about anything finer.
+ *
+ * Absent is not zero, twice over. A run this daemon did not build a command
+ * line for recorded nothing, and says so; a run that recorded what it wrote but
+ * reported no usage has nothing to subtract from, so it shows what we wrote and
+ * says the rest is unknown rather than showing a residual of zero — which would
+ * read as *the CLI added nothing*, the exact opposite of the truth.
+ */
+function PromptBudget({ authored, cliOwn }: { authored: number | null; cliOwn: number | null }) {
+  // Grouped for readability, and grouped by a NAMED locale rather than the
+  // host's. A bare `toLocaleString()` follows whatever ICU locale the machine
+  // happens to have, which rendered this `10 500` — narrow no-break space —
+  // under the test runner's own. The shell is English throughout, so the
+  // separator is a fact about this page and not about the machine showing it.
+  const grouped = (value: number) => value.toLocaleString("en-US");
+  if (authored === null) {
+    return <p className="runs-successor">This run did not record what went into its prompt.</p>;
+  }
+  return (
+    <>
+      <p className="ui-cost">
+        {/* One template literal rather than an interpolation between two text
+            nodes: React would render three children, and a reading split across
+            three nodes is one no test — and no screen reader — can match as the
+            sentence it is. */}
+        <span className="ui-cost-money">{`≈ ${grouped(authored)} estimate — what we wrote`}</span>
+        <span className="ui-cost-tokens">
+          {cliOwn === null ? "the rest is unknown" : `≈ ${grouped(cliOwn)} estimate — the CLI's own`}
+        </span>
+      </p>
+      <p className="runs-successor">
+        {cliOwn === null
+          ? "This run reported no token usage, so there is nothing to subtract our share from."
+          : "Tool schemas, standing instructions, helpers and the prompt, against everything else the CLI sent — undivided, because nothing here can tell its parts apart."}
+      </p>
+    </>
   );
 }
 

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 11;
+pub const CLASSIFIER_VERSION: u32 = 13;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -23,7 +23,27 @@ pub const CLASSIFIER_VERSION: u32 = 11;
 ///
 /// `TodoWrite` writes the agent's task list, which lives in the session and not in the project.
 const READ_LOCAL_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Skill", "TodoWrite"];
-const WRITE_TOOLS: &[&str] = &["Edit", "Write"];
+/// Tools that put bytes in a file the project keeps.
+///
+/// **`NotebookEdit` joined this list on 2026-09-08, and it is a LOOSENING, deliberately.** Before
+/// that it was outside every list here, so it classified as `unrecognized-tool` and every call
+/// asked a person -- or, on an unattended run, was refused outright. That is conservative and it
+/// is also wrong in the way an unread rule is wrong: a notebook write was the one file write this
+/// file had no opinion about, so `.ai/autopilot.yaml` and the workspace boundary were enforced
+/// against `Edit` and `Write` and not against the third tool that does the same thing.
+///
+/// The order of the two halves of that change is the whole of its safety. `written_path` had to
+/// learn `notebook_path` FIRST, because the four guards below read the target out of the tool
+/// input and answer `false` when they cannot find one -- and `false` at those call sites means
+/// "this write is fine", not "I could not tell". Adding the name alone would have moved every
+/// notebook write from `pending_approval` straight to `allow`/`read-local`, boundary and
+/// self-governing guards passing vacuously on the way. That is strictly worse than the state it
+/// was meant to fix, and it is the shape of this mistake: the guards do not fail loudly.
+/// Public to the crate so `http` can refuse a declared rule by asking THIS list rather than
+/// repeating it. The handler used to carry its own `["Edit", "Write"]`, which is two lists for
+/// one fact and the ordinary way they come to disagree: the day this one grew, the door would
+/// have gone on refusing a rule the write chain had just learned to enforce.
+pub(crate) const WRITE_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
 /// Tools that start a subagent. Both spellings, because the CLI has used each.
 ///
@@ -262,7 +282,6 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "git reflog",
     "cargo test",
     "cargo check",
-    "cargo fmt --check",
     "cargo clippy",
     // **`cargo build` was missing, and its absence was an omission rather than a decision.** The
     // three above compile the crate and run `build.rs` exactly as this does — `cargo test` goes
@@ -322,7 +341,9 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     // already refused for every program by `writes_an_output_file`.
     //
     // Deliberately absent, and each for its own reason rather than for caution in general:
-    //   `sed`  — `-i` edits in place, and the `e` command executes.
+    //   `sed`  — `-i` edits in place, `w` writes and the `e` command executes. The one spelling
+    //            that does none of that, a print by line address under `-n`, is let in by
+    //            `prints_lines_by_address` rather than by a prefix here.
     //   `awk`  — `system()` runs a command and `print > file` writes one.
     //   `tee`  — writing is the whole program.
     //   `xargs`— it exists to run the command it is given.
@@ -377,6 +398,12 @@ const SAFE_EXACT_COMMANDS: &[&str] = &[
     "git remote",
     "git remote -v",
     "git remote --verbose",
+    // Exact, because `cargo` followed by anything is every cargo subcommand there is. Asked by an
+    // implement node of job 26 on 2026-09-13 before it went near the gate's formatting, and
+    // refused. `-v` is `-V` after `normalize_command` has lowercased it; typed as `-v` it is cargo's
+    // verbose flag with no subcommand, which prints the usage and does nothing else either.
+    "cargo --version",
+    "cargo -v",
 ];
 
 pub struct Classification {
@@ -506,6 +533,31 @@ pub fn classify(
         );
     }
 
+    // A project's own refusal about WHERE this tool may write, in the position that mirrors the
+    // shell path's `project-denied` exactly: below the compiled refusal, which keeps its own
+    // narrower `outside-workspace` class, and above every `pending_approval` beneath it. A refusal
+    // reachable from underneath a prompt is a refusal a person can approve, and approving it does
+    // the very thing the project wrote down as forbidden — the sentence the shell block already
+    // makes one screen down, about the same defect one layer over.
+    //
+    // The class is `project-denied`, reused rather than minted, because it is the same fact about
+    // the same table: this project said no. What differs is the reason string, so the scoreboard
+    // shows one class and the person reading a refusal is told whether it was a command or a write.
+    //
+    // **There is no `allow` counterpart here, and there must not be one.** The write chain ends at
+    // `("allow", "read-local")`, so everything a write `allow` could reach is either the compiled
+    // `outside-workspace` deny above or one of the three governance prompts below —
+    // `self-governing-file`, `executes-on-next-command`, `no-workspace`. A project that could
+    // `allow Edit .ai/` would be waiving the guard over its own autopilot files, using the very
+    // mechanism that guard exists to keep honest. The shell side's rule is the same and is stated
+    // on `classify` itself: an `allow` widens what this file would have ASKED about and lifts
+    // nothing that was refused.
+    if WRITE_TOOLS.contains(&tool_name)
+        && write_denied_by_project(tool_name, tool_input, cwd, rules)
+    {
+        return classification("deny", "project-denied", "this project denies this write");
+    }
+
     // Ahead of the no-workspace check below because it is the more specific answer and it does not
     // need a cwd: a governance file is recognised by its path suffix either way, and the scoreboard
     // reads these classes, so the narrower one is the one worth recording.
@@ -566,7 +618,13 @@ pub fn classify(
     // touching the first. Sharing the label made that impossible to express, and the two tests that
     // caught the attempt (`a_jobs_replan_node_gives_up_instead_of_parking_the_job` and its review
     // twin) are the ones to keep in mind: they park a job node on a `for` loop, which is a COMMAND.
-    if !reads_shell_rules(tool_name) {
+    // `reads_github_policy` and no longer `reads_shell_rules`, and the swap changes no verdict
+    // today: this line is asking "is this one of the two SHELL tools", the write tools return above
+    // it, and until `reads_shell_rules` grew `Edit` and `Write` the two predicates were the same
+    // list. They are not the same list any more, and leaving the old name here would have left a
+    // guard whose correctness depended on an earlier `return` rather than on what it says — the
+    // kind of thing that holds until somebody reorders the chain for an unrelated reason.
+    if !reads_github_policy(tool_name) {
         return classification(
             "pending_approval",
             "unrecognized-tool",
@@ -587,23 +645,46 @@ pub fn classify(
     )
 }
 
-/// PURE: whether a project's declared shell rules can change this tool's verdict at all.
+/// PURE: whether a project's declared rules can change this tool's verdict at all.
 ///
-/// `classify` consults `rules` in exactly one place — `classify_shell_command`, reached only for
-/// these two tool names — and every branch above returns first: `WRITE_TOOLS`, `READ_LOCAL_TOOLS`,
-/// `SUBAGENT_TOOLS` and the unrecognized-tool answer are all decided without the rules ever being
-/// looked at.
+/// `classify` consults `rules` in exactly two places now, and the second is what widened this list.
+/// `classify_shell_command` reads the command lists for the two shell tools; `write_denied_by_project`
+/// reads `deny_writes` for the two write tools. Everything else — `READ_LOCAL_TOOLS`,
+/// `SUBAGENT_TOOLS`, the unrecognized-tool answer — is still decided without the rules ever being
+/// looked at, and that is what this predicate is for.
 ///
 /// It exists so a caller can decide whether to LOAD them, which is a question `hooks.rs` has to ask
 /// for a reason its own comments give twice: a hook runs in front of every tool call. The read is
 /// cheap; the cost is its failure, which turns every `allow` into an approval prompt — so a
 /// `SQLITE_BUSY` on a table no `Read` could ever consult would park a run on its next file read.
+/// Widening the list widens that too, and deliberately: an `Edit` under an unreadable rules table
+/// now costs an approval, because an unreadable write refusal is a write refusal that was lost.
 ///
 /// The list is written ONCE and used by both the branch and the callers, for the reason
 /// `matches_command_prefix` and `only_reads` are shared: two spellings of the same list is how they
 /// come to disagree, and here they would disagree silently — the caller skipping a load the
 /// classifier then needed.
 pub fn reads_shell_rules(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "Bash" | "PowerShell" | "Edit" | "Write" | "NotebookEdit"
+    )
+}
+
+/// PURE: whether the GitHub policy can change this tool's verdict at all.
+///
+/// The other half of what `reads_shell_rules` used to answer, split off the day the first half
+/// stopped being the same list. `classify` consults `policy` in exactly one place —
+/// `classify_segment`, reached only through `classify_shell_command` — so this is still the two
+/// shell tools and nothing else.
+///
+/// `hooks.rs` gated both loads on one predicate while the two questions had one answer, and the
+/// note it wrote there is still true as far as it goes: a `Read` cannot be a `gh` line. But neither
+/// can an `Edit`, and an `Edit` now has to read the rules — so keeping them on one gate would have
+/// started building a per-project GitHub policy in front of every file edit, for a `policy`
+/// argument that branch can never reach. Two questions, two predicates, and the difference between
+/// them is a `Cow::Owned` and a table read per write.
+pub fn reads_github_policy(tool_name: &str) -> bool {
     matches!(tool_name, "Bash" | "PowerShell")
 }
 
@@ -749,7 +830,7 @@ fn classify_shell_command(
     let mut confined = false;
     let mut declared = false;
     for segment in segments {
-        match classify_segment(segment, cwd, policy, rules, unrecognized) {
+        match classify_segment(segment, cwd, policy, rules, shell, unrecognized) {
             Segment::Unrecognized => {
                 return classification(
                     "pending_approval",
@@ -896,6 +977,7 @@ fn classify_segment(
     cwd: Option<&Path>,
     policy: &crate::github::Policy,
     rules: &crate::project_policy::ShellRules,
+    shell: crate::command_reader::Shell,
     unrecognized: Unrecognized,
 ) -> Segment {
     // Redirection is a property of ONE command, which is why it is judged here rather than over the
@@ -914,7 +996,7 @@ fn classify_segment(
     // Raw, not normalized: `normalize_command` lowercases, and a `cd` target is a path. Folding it
     // here would widen the workspace behind the containment check's back, which is the same reason
     // `deletes_outside_cwd` reads raw tokens.
-    if lands_inside_the_workspace(segment, cwd) {
+    if lands_inside_the_workspace(segment, cwd, shell) {
         return Segment::ReadLocal;
     }
 
@@ -955,9 +1037,20 @@ fn classify_segment(
     // way around them: `shell_form_is_readable` is what refuses `--fix`, `--output`, an `-exec`, a
     // `tail -f` and a `sort -o`, and a line holding one of those is not made safe by its arguments
     // being local.
+    //
+    // **Nor may it widen a git operation the queue performs or refuses**, and that conjunction was
+    // missing until 2026-09-14. A branch in this repository is named `fix/<slug>`, and a token with
+    // a `/` in it is a path to `confined_to_workspace` — a relative one, which resolves inside. So
+    // `git branch -d fix/<slug>`, in every spelling, and `git -C . push --force origin master` came
+    // back `confined-to-workspace` for a job node: allowed on the strength of where they pointed,
+    // past the queue that exists to order exactly them. Found tracing that day's hand-deleted
+    // branch through the run path, which never consults the session gate's refusal and so had only
+    // this to stop it. Whether a segment is the queue's business is asked of the queue's own
+    // function, so the two cannot come to disagree about it.
     if unrecognized == Unrecognized::MayBeConfined
         && shell_form_is_readable(&normalized)
-        && confined_to_workspace(segment, cwd)
+        && crate::vcs::unqueueable_but_shared(segment).is_none()
+        && confined_to_workspace(segment, cwd, shell)
     {
         return Segment::Confined;
     }
@@ -982,9 +1075,9 @@ fn shell_for(tool_name: &str) -> crate::command_reader::Shell {
 
 /// Whether a piece is one of the commands judged by WHERE IT LANDS, and lands inside the workspace.
 ///
-/// Two so far, and they are here rather than in `SAFE_COMMAND_PREFIXES` for the same reason: a list
-/// answers "which program", and for these the program is not the question. `cd ..` and `cd core` are
-/// the same program and opposite answers.
+/// Three so far, and they are here rather than in `SAFE_COMMAND_PREFIXES` for the same reason: a
+/// list answers "which program", and for these the program is not the question. `cd ..` and
+/// `cd core` are the same program and opposite answers.
 ///
 /// - **`cd`** decides what every piece after it does, so a list entry would hand over the meaning of
 ///   the whole line.
@@ -992,6 +1085,13 @@ fn shell_for(tool_name: &str) -> crate::command_reader::Shell {
 ///   do — inside the workspace. `mkdir C:\Windows\evil` is not the same act with a different
 ///   argument, it is a different act. Measured: the job-6 dogfood stopped its plan node dead on
 ///   `mkdir -p "<worktree>/.nucleos"`, a directory the job itself needs.
+/// - **`cargo fmt`** rewrites files, and the only ones it reaches are the crate its directory
+///   names. That directory is where the line lands: the run's own, or one a `cd` before it took
+///   deeper — a `cd` that leaves is a piece refused on its own, and the line with it. Measured on
+///   job 27, 2026-09-14: an implement node in its own worktree was refused `cargo fmt --all` three
+///   times, from Bash and from PowerShell, and formatted the file by hand rather than stop. What
+///   could point it anywhere else is in its arguments, and `formats_only_where_it_stands` reads
+///   those.
 ///
 /// A `cd` this returns true for can only go deeper, never out, which is what makes judging the
 /// pieces AFTER it against the outer `cwd` safe rather than merely convenient: the real directory
@@ -1005,11 +1105,20 @@ fn shell_for(tool_name: &str) -> crate::command_reader::Shell {
 ///
 /// Without a `cwd` there is no boundary to be inside of, so the answer is no — the same reading
 /// `writes_outside_cwd` was corrected to.
-fn lands_inside_the_workspace(segment: &str, cwd: Option<&Path>) -> bool {
+fn lands_inside_the_workspace(
+    segment: &str,
+    cwd: Option<&Path>,
+    shell: crate::command_reader::Shell,
+) -> bool {
     let tokens = shell_words(segment);
     let Some(program) = tokens.first() else {
         return false;
     };
+    // `cargo fmt` names no destination: it formats where it stands, which is inside whenever the
+    // line got this far with a workspace to be inside of.
+    if program.eq_ignore_ascii_case("cargo") && tokens.get(1).is_some_and(|word| word == "fmt") {
+        return cwd.is_some() && formats_only_where_it_stands(&tokens[2..]);
+    }
     // `cd` takes one destination; `mkdir` takes as many as you like, and every one has to land
     // inside. Anything else is not judged this way at all.
     let one_target_only = if ["cd", "chdir", "set-location"]
@@ -1063,9 +1172,93 @@ fn lands_inside_the_workspace(segment: &str, cwd: Option<&Path>) -> bool {
         if target.starts_with('~') || target.contains('$') || target.contains('%') {
             return false;
         }
-        let target = fold_for_containment(&normalize_path(target, Some(cwd)));
+        let target = with_git_bash_drive(target, shell, &workspace);
+        let target = fold_for_containment(&normalize_path(&target, Some(cwd)));
         target == workspace || target.starts_with(&format!("{workspace}/"))
     })
+}
+
+/// PURE: whether `cargo fmt`'s arguments leave it formatting the crate it stands in, and nothing
+/// else.
+///
+/// A list of what may appear rather than of what may not, because the ways to point rustfmt
+/// somewhere else are open-ended and a missed one is a write outside the workspace:
+/// `--manifest-path` names another crate, `--emit` names a destination, `--print-config` writes the
+/// file it is given, and a bare path after `--` is handed to rustfmt as one more file to rewrite.
+/// Every value this admits names a package, an edition or a colour, never a path.
+///
+/// `--check` is listed so the gate's own spelling reads the same way here, but it was never this
+/// rule's to allow: `checks_formatting_without_writing` answers for it with or without a workspace.
+///
+/// **What this cannot see.** cargo finds its manifest by walking UP from the directory, so a
+/// workspace with no `Cargo.toml` of its own sends it into the nearest one above. This file never
+/// reads the disk and cannot rule that out. `cargo build` and `cargo test`, both on the list, walk
+/// the same way and then run the build scripts they find, which is more than a formatter can do
+/// with the same mistake.
+fn formats_only_where_it_stands(args: &[String]) -> bool {
+    const BARE: &[&str] = &["--", "--all", "--check", "-q", "--quiet", "-v", "--verbose"];
+    const VALUED: &[&str] = &[
+        "-p",
+        "--package",
+        "--edition",
+        "--color",
+        "--message-format",
+    ];
+    let names_nothing = |value: &str| {
+        !value.is_empty() && !value.starts_with('-') && !value.contains(['/', '\\', '~', '$', '%'])
+    };
+
+    let mut tokens = args.iter().map(String::as_str);
+    while let Some(token) = tokens.next() {
+        if BARE.contains(&token) {
+            continue;
+        }
+        if VALUED.contains(&token) {
+            if tokens.next().is_some_and(names_nothing) {
+                continue;
+            }
+            return false;
+        }
+        match token.split_once('=') {
+            Some((flag, value)) if VALUED.contains(&flag) && names_nothing(value) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// PURE: Git bash's spelling of a drive, `/c/Projects`, as the `C:/Projects` it names.
+///
+/// Git bash is the shell every `Bash` tool call runs under on Windows, and it mounts each drive at a
+/// single letter under `/`. The containment checks compared `/c/Projects/x` with a workspace of
+/// `C:/Projects/x`, found no common prefix, and refused a `cd` into the very directory the run was
+/// standing in. Measured on job 26, 2026-09-13: its replan node spelled its own worktree that way
+/// and was refused, with nobody there to approve it.
+///
+/// **Only for a POSIX shell, and only when the workspace itself sits on a drive.** PowerShell reads
+/// `/c/Projects` as `\c\Projects` on the current drive, a different directory, which must not be
+/// judged as the workspace. On a machine with no drive letters `/c/` is an ordinary directory
+/// name, and a workspace with no `X:` in it never takes the rewrite.
+///
+/// Used by the two checks that can ALLOW and by nothing that refuses. `deletes_outside_cwd` and the
+/// write guards still read `/c/…` as outside, which costs an approval and never lets anything
+/// through.
+fn with_git_bash_drive(path: &str, shell: crate::command_reader::Shell, workspace: &str) -> String {
+    let bytes = path.as_bytes();
+    let names_a_drive = shell == crate::command_reader::Shell::Posix
+        && workspace.as_bytes().get(1) == Some(&b':')
+        && bytes.first() == Some(&b'/')
+        && bytes.get(1).is_some_and(u8::is_ascii_alphabetic)
+        && matches!(bytes.get(2), None | Some(b'/'));
+    if names_a_drive {
+        format!(
+            "{}:{}",
+            char::from(bytes[1]).to_ascii_uppercase(),
+            &path[2..]
+        )
+    } else {
+        path.to_owned()
+    }
 }
 
 fn classification(decision: &str, action_class: &'static str, reason: &str) -> Classification {
@@ -1346,7 +1539,99 @@ fn has_shell_control(command: &str) -> bool {
 fn is_safe_command(command: &str) -> bool {
     shell_form_is_readable(command)
         && (SAFE_EXACT_COMMANDS.contains(&command)
-            || matches_command_prefix(command, SAFE_COMMAND_PREFIXES))
+            || matches_command_prefix(command, SAFE_COMMAND_PREFIXES)
+            || checks_formatting_without_writing(command)
+            || prints_lines_by_address(command))
+}
+
+/// `sed -n` whose script only prints lines by their address — `'1,40p'`, `'5p'`, `'$p'`,
+/// `'10,$p'` — which is `head` and `tail` in another spelling.
+///
+/// Measured on job 27, 2026-09-14: an implement node was refused
+/// `cd "<worktree>/core" && sed -n '1,40p' Cargo.toml`, a read of the first forty lines of a
+/// manifest. `sed` stays off the prefix list for the reasons written there — `-i` edits in place,
+/// `w` writes, `e` executes — and this admits the one spelling that can do none of them. It is a
+/// grammar rather than a blocklist: `-n`, one script of one or two addresses and a `p`, then files.
+/// No other flag in any position (GNU takes options after operands, so `sed -n 1p f -i` edits in
+/// place), so no `-e`, no `-f` and no `--in-place`; no second command; no regex address.
+///
+/// `$` is an address only inside single quotes. Anywhere else the shell expands `$p` before sed
+/// ever sees it, and the script becomes whatever that variable holds.
+///
+/// Read off the normalized command, as the lists are: lowercasing folds `P` into `p`, and `P`
+/// only prints as well.
+fn prints_lines_by_address(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    if tokens.next() != Some("sed") {
+        return false;
+    }
+    let mut quiet = false;
+    let mut script = None;
+    for token in tokens {
+        match token {
+            "-n" | "--quiet" | "--silent" => quiet = true,
+            _ if token.starts_with('-') => return false,
+            _ if script.is_none() => script = Some(token),
+            _ => {}
+        }
+    }
+    quiet && script.is_some_and(prints_by_address)
+}
+
+/// PURE: whether one `sed` script is a single `p` by one or two line addresses.
+fn prints_by_address(script: &str) -> bool {
+    let (body, dollar_is_literal) = match script
+        .strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+    {
+        Some(inner) => (inner, true),
+        None => (
+            script
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+                .unwrap_or(script),
+            false,
+        ),
+    };
+    let address = |value: &str| {
+        (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            || (value == "$" && dollar_is_literal)
+    };
+    let Some(range) = body.strip_suffix('p') else {
+        return false;
+    };
+    match range.split_once(',') {
+        Some((from, to)) => address(from) && address(to),
+        None => address(range),
+    }
+}
+
+/// `cargo fmt` with `--check` anywhere in it: rustfmt reports what it would change and writes
+/// nothing.
+///
+/// A rule rather than a list entry, because the list matches on a prefix and this flag moves. The
+/// gate runs `cargo fmt --all -- --check` (`scripts/gates.sh`) while the list held only
+/// `cargo fmt --check`, so the one spelling the gate judges a node by was the one a node could not
+/// run. Measured on job 26, 2026-09-13: refused four times across its implement, retry and review
+/// nodes, and its first round went red on `core: fmt` alone with every test passing.
+///
+/// `--emit` is refused beside it: it is how rustfmt is told where to write, and a check has no
+/// business naming a destination. Plain `cargo fmt` rewrites the tree, so it is not this rule's to
+/// answer: since 2026-09-14 it is judged by where it lands (`lands_inside_the_workspace`), and
+/// `mutating_siblings_remain_pending` pins it asking where there is no workspace to land in.
+///
+/// **It replaced the list's `cargo fmt --check` entry rather than joining it.** The lists are read
+/// as an OR, so the entry let `cargo fmt --check -- --emit files` through whatever the guard here
+/// said, and the test pinning that refusal went red the first time it ran. One place decides
+/// `cargo fmt` now.
+fn checks_formatting_without_writing(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    tokens.next().map(program_name) == Some("cargo")
+        && tokens.next() == Some("fmt")
+        && command.split_whitespace().any(|token| token == "--check")
+        && !command
+            .split_whitespace()
+            .any(|token| token.starts_with("--emit"))
 }
 
 /// The guards a command has to clear before ANY list may say yes to it, separated from the lists
@@ -1507,8 +1792,24 @@ pub(crate) fn matches_command_prefix<S: AsRef<str>>(command: &str, prefixes: &[S
     })
 }
 
+/// PURE: the file a write tool is aiming at, whichever key that tool uses to name it.
+///
+/// `Edit` and `Write` say `file_path`; `NotebookEdit` says `notebook_path`. Four guards used to
+/// read the first key inline, one copy each, and a copy that does not know a key returns `false`
+/// -- which every one of those call sites reads as a verdict rather than as an absence. One reader
+/// so the four cannot come to disagree, and so that admitting the next write tool is a line here
+/// instead of four edits somebody does three of.
+///
+/// First match wins and the order is not meaningful: no tool sends both keys, and one that did
+/// would be a tool this file has not reasoned about.
+fn written_path(tool_input: &Value) -> Option<&str> {
+    ["file_path", "notebook_path"]
+        .iter()
+        .find_map(|key| tool_input.get(key).and_then(Value::as_str))
+}
+
 fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>) -> bool {
-    let Some(file_path) = tool_input.get("file_path").and_then(Value::as_str) else {
+    let Some(file_path) = written_path(tool_input) else {
         return false;
     };
     let normalized = fold_for_match(&normalize_path(file_path, cwd));
@@ -1522,7 +1823,7 @@ fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>) -> bool {
 }
 
 fn targets_file_that_runs_on_next_command(tool_input: &Value, cwd: Option<&Path>) -> bool {
-    let Some(file_path) = tool_input.get("file_path").and_then(Value::as_str) else {
+    let Some(file_path) = written_path(tool_input) else {
         return false;
     };
     let normalized = fold_for_match(&normalize_path(file_path, cwd));
@@ -1539,7 +1840,7 @@ fn writes_outside_cwd(tool_input: &Value, cwd: Option<&Path>) -> bool {
     let Some(cwd) = cwd else {
         return false;
     };
-    let Some(file_path) = tool_input.get("file_path").and_then(Value::as_str) else {
+    let Some(file_path) = written_path(tool_input) else {
         return false;
     };
 
@@ -1550,6 +1851,57 @@ fn writes_outside_cwd(tool_input: &Value, cwd: Option<&Path>) -> bool {
 
 fn path_has_suffix(path: &str, suffix: &str) -> bool {
     path == suffix || path.ends_with(&format!("/{suffix}"))
+}
+
+/// PURE: whether `path` IS `prefix` or lies underneath it.
+///
+/// The mirror of `path_has_suffix`, and the separator inside the `starts_with` is the whole of it.
+/// A bare `starts_with` would let the prefix `core/mig` reach `core/migrations` — a directory
+/// nobody named, refused by a rule about a directory that need not even exist.
+fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// Whether this project wrote down a refusal that covers this write.
+///
+/// **`path_has_prefix` and deliberately not `matches_command_prefix`.** That one separates on a
+/// SPACE, because a command prefix is a run of whole words; a path has no spaces to separate on, so
+/// `migrations` would match the directory entry itself and nothing inside it. That is a restriction
+/// which silently is not one — the owner reads a refusal and the daemon enforces nothing — and it
+/// is exactly the shape `http.rs`'s `checked_denials` doc refuses to build.
+///
+/// **Both sides go through `normalize_path` against the same `cwd`, and that is what makes a
+/// RELATIVE prefix mean something.** A stored `migrations` is joined onto the workspace, so it
+/// names THIS project's `migrations/` and not any path anywhere that happens to end in it — which
+/// is what a suffix match would have given, and it would have refused a `vendor/x/migrations/y.sql`
+/// nobody was thinking about. An absolute prefix is left where it is, by `normalize_path` itself.
+///
+/// `fold_for_containment` on both sides and not `fold_for_match`: this is a containment question
+/// about a real filesystem, so the fold has to be the filesystem's own — the same one
+/// `writes_outside_cwd` asks a few lines up about the same `file_path`. It is also why
+/// `project_policy::fold_path_prefix` does not fold case at storage time: the case question is
+/// answered here, once, by the side that knows the answer.
+fn write_denied_by_project(
+    tool_name: &str,
+    tool_input: &Value,
+    cwd: Option<&Path>,
+    rules: &crate::project_policy::ShellRules,
+) -> bool {
+    // A project that declared no write refusals cannot enter this block at all — the same
+    // structural non-regression the shell side's empty-list guard buys, and for the same reason: no
+    // walk, no allocation, and no verdict this can possibly change.
+    if rules.deny_writes.is_empty() {
+        return false;
+    }
+    let Some(file_path) = written_path(tool_input) else {
+        return false;
+    };
+    let target = fold_for_containment(&normalize_path(file_path, cwd));
+
+    rules.deny_writes.iter().any(|(tool, prefix)| {
+        tool == tool_name
+            && path_has_prefix(&target, &fold_for_containment(&normalize_path(prefix, cwd)))
+    })
 }
 
 /// Whether the command deletes something outside the run's workspace.
@@ -1712,7 +2064,11 @@ fn is_absolute_path(path: &str) -> bool {
 ///
 /// A bare `README.md` — no separator, no leading `.` — is not read as a path either. It could as
 /// easily be a subcommand, and `./README.md` is available to anyone who means the file.
-fn confined_to_workspace(segment: &str, cwd: Option<&Path>) -> bool {
+fn confined_to_workspace(
+    segment: &str,
+    cwd: Option<&Path>,
+    shell: crate::command_reader::Shell,
+) -> bool {
     let Some(cwd) = cwd else {
         return false;
     };
@@ -1742,7 +2098,8 @@ fn confined_to_workspace(segment: &str, cwd: Option<&Path>) -> bool {
         if candidate.starts_with('~') || candidate.contains('$') || candidate.contains('%') {
             return false;
         }
-        let resolved = fold_for_containment(&normalize_path(candidate, Some(cwd)));
+        let resolved = with_git_bash_drive(candidate, shell, &workspace);
+        let resolved = fold_for_containment(&normalize_path(&resolved, Some(cwd)));
         if resolved != workspace && !resolved.starts_with(&format!("{workspace}/")) {
             return false;
         }
@@ -1822,7 +2179,39 @@ mod tests {
         crate::project_policy::ShellRules {
             allow: allow.iter().map(|entry| (*entry).to_owned()).collect(),
             deny: deny.iter().map(|entry| (*entry).to_owned()).collect(),
+            deny_writes: Vec::new(),
         }
+    }
+
+    /// The write half, built the same way and kept separate from `shell_rules` on purpose: every
+    /// test that reaches the shell lists through the helper above is also an assertion that a
+    /// project's command rules leave a write alone, and vice versa.
+    fn write_rules(deny_writes: &[(&str, &str)]) -> crate::project_policy::ShellRules {
+        crate::project_policy::ShellRules {
+            deny_writes: deny_writes
+                .iter()
+                .map(|(tool, prefix)| ((*tool).to_owned(), (*prefix).to_owned()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The shape for the tests that are about a project's write refusals: a real workspace, because
+    /// a relative prefix means nothing without one.
+    fn classify_writes(
+        rules: &crate::project_policy::ShellRules,
+        tool_name: &str,
+        file_path: &str,
+        cwd: Option<&Path>,
+    ) -> Classification {
+        super::classify(
+            tool_name,
+            &json!({ "file_path": file_path }),
+            cwd,
+            &crate::github::Policy::empty(),
+            rules,
+            Unrecognized::AsksAPerson,
+        )
     }
 
     /// The shape for the tests that are about a project's own two lists.
@@ -2076,12 +2465,23 @@ mod tests {
             "git remote -v",
             "cargo check",
             "cargo fmt --check",
+            // The gate's own spelling, and one with a package before the separator: `--check`
+            // is read wherever it stands, not only straight after `fmt`.
+            "cargo fmt --all -- --check",
+            "cargo fmt -p nucleos-core -- --check",
+            "cargo --version",
+            "cargo -V",
             "cargo clippy",
             // The two an autonomous run parked on overnight on 2026-08-27, both of them the first
             // thing anybody reaches for: a build baseline, and asking where you are.
             "cargo build",
             "cargo build --manifest-path core/Cargo.toml --tests",
             "pwd",
+            // Job 27, 2026-09-14: a print by line address is `head` and `tail` in another spelling.
+            "sed -n '1,40p' Cargo.toml",
+            "sed -n '5p' Cargo.toml",
+            "sed -n '$p' Cargo.toml",
+            "sed -n '10,$p' Cargo.toml",
         ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), None),
@@ -2410,6 +2810,259 @@ mod tests {
         }
     }
 
+    /// Every command the `core` gate runs is one a node may run first.
+    ///
+    /// Read from `scripts/gates.sh` itself rather than copied here, because a copy is what drifted:
+    /// the gate said `cargo fmt --all -- --check` and this file allowed `cargo fmt --check`, and
+    /// nothing noticed until job 26 went red on formatting it had been refused the means to check.
+    #[test]
+    fn the_core_gate_asks_nothing_a_node_is_refused() {
+        let gates = include_str!("../../scripts/gates.sh");
+        let commands: Vec<&str> = gates
+            .lines()
+            .filter(|line| line.trim_start().starts_with("run \"core: "))
+            .filter_map(|line| line.split_once(" . ").map(|(_, command)| command.trim()))
+            .collect();
+        assert!(
+            commands.len() >= 3,
+            "expected fmt, clippy and test among the core gate's steps, read {commands:?}"
+        );
+        for command in commands {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    /// Git bash names a drive `/c/`, and a path into the workspace spelled that way is a path into
+    /// the workspace. Job 26's replan node, 2026-09-13, was refused the first line below, unattended.
+    #[test]
+    fn a_git_bash_drive_path_is_the_drive_it_names() {
+        let on_a_drive = Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-26");
+        let judge = |tool: &str, command: &str, cwd: &Path, unrecognized: Unrecognized| {
+            super::classify(
+                tool,
+                &json!({ "command": command }),
+                Some(cwd),
+                &crate::github::Policy::empty(),
+                &shell_rules(&[], &[]),
+                unrecognized,
+            )
+        };
+
+        for command in [
+            r#"cd "/c/Projects/nucleos/.nucleos/worktrees/job-26" && git status && echo "---DIFF---" && git diff --stat"#,
+            "cd /c/Projects/nucleos/.nucleos/worktrees/job-26/core",
+            "mkdir -p /c/Projects/nucleos/.nucleos/worktrees/job-26/target/x",
+        ] {
+            assert_classification(
+                judge("Bash", command, on_a_drive, Unrecognized::AsksAPerson),
+                "allow",
+                "read-local",
+            );
+        }
+        // The confinement rule reads the same spelling the same way.
+        assert_eq!(
+            judge(
+                "Bash",
+                "frobnicate /c/Projects/nucleos/.nucleos/worktrees/job-26/core/src/vcs.rs",
+                on_a_drive,
+                Unrecognized::MayBeConfined,
+            )
+            .decision
+            .decision,
+            "allow"
+        );
+
+        // Still the drive it names, so the rest of the drive is still outside.
+        for command in [
+            "cd /c/Windows",
+            "cd /c",
+            "cd /d/Projects/nucleos/.nucleos/worktrees/job-26",
+        ] {
+            assert_classification(
+                judge("Bash", command, on_a_drive, Unrecognized::AsksAPerson),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+        assert_eq!(
+            judge(
+                "Bash",
+                "frobnicate /c/Windows/win.ini",
+                on_a_drive,
+                Unrecognized::MayBeConfined
+            )
+            .decision
+            .decision,
+            "pending_approval"
+        );
+
+        // PowerShell reads `/c/Projects` as `\c\Projects` on the current drive: not the workspace.
+        assert_classification(
+            judge(
+                "PowerShell",
+                "cd /c/Projects/nucleos/.nucleos/worktrees/job-26",
+                on_a_drive,
+                Unrecognized::AsksAPerson,
+            ),
+            "pending_approval",
+            "unrecognized",
+        );
+
+        // With no drive in the workspace, `/c/` is an ordinary directory and is left alone: a
+        // rewrite here would put the workspace's own subdirectory outside it.
+        assert_classification(
+            judge(
+                "Bash",
+                "cd /c/repo/sub",
+                Path::new("/c/repo"),
+                Unrecognized::AsksAPerson,
+            ),
+            "allow",
+            "read-local",
+        );
+    }
+
+    /// Job 27, 2026-09-14: an implement node in its own worktree was refused `cargo fmt --all`
+    /// three times — the first three lines below, verbatim, from Bash and from PowerShell — and
+    /// formatted the file by hand rather than stop. A formatter rewrites only the crate it stands
+    /// in, and where it stands is decided the way a `mkdir`'s target is: inside the workspace, or
+    /// asked about.
+    ///
+    /// The PowerShell line tracks its `cd` the way the Bash one does: its path is read with the
+    /// backslashes it was written with, and folded onto the workspace before it is compared.
+    #[test]
+    fn a_cargo_fmt_that_writes_is_allowed_only_where_it_lands() {
+        let worktree = Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-27");
+        let judge = |tool: &str, command: &str| {
+            super::classify(
+                tool,
+                &json!({ "command": command }),
+                Some(worktree),
+                &crate::github::Policy::empty(),
+                &shell_rules(&[], &[]),
+                Unrecognized::AsksAPerson,
+            )
+        };
+
+        for (tool, command) in [
+            (
+                "Bash",
+                r#"cd "C:/Projects/nucleos/.nucleos/worktrees/job-27" && cargo fmt --all && cargo fmt --all -- --check 2>&1 | head -50"#,
+            ),
+            (
+                "PowerShell",
+                r#"cd "C:\Projects\nucleos\.nucleos\worktrees\job-27"; cargo fmt --all"#,
+            ),
+            ("Bash", "cargo fmt --all"),
+            ("Bash", "cargo fmt"),
+            ("Bash", "cargo fmt -p nucleos-core"),
+            (
+                "Bash",
+                "cd /c/Projects/nucleos/.nucleos/worktrees/job-27/core && cargo fmt",
+            ),
+        ] {
+            assert_classification(judge(tool, command), "allow", "read-local");
+        }
+
+        for command in [
+            // Names another crate, and a manifest path can name one anywhere.
+            "cargo fmt --manifest-path ../other/Cargo.toml",
+            "cargo fmt --manifest-path=../other/Cargo.toml",
+            // Names a destination.
+            "cargo fmt -- --emit files",
+            // Lands outside, so it would format whatever crate it found there.
+            "cd /c/Windows && cargo fmt",
+            // A path after `--` is one more file for rustfmt, wherever it is; `--print-config`
+            // writes the file it names.
+            "cargo fmt -- C:/Windows/x.rs",
+            "cargo fmt -- --print-config default rustfmt.toml",
+        ] {
+            assert_classification(judge("Bash", command), "pending_approval", "unrecognized");
+        }
+    }
+
+    /// Job 27 again, the same day: `cd "<worktree>/core" && sed -n '1,40p' Cargo.toml` was refused,
+    /// and it is `head -40 Cargo.toml` in another spelling. A print by line address under `-n` is
+    /// judged exactly as `head` and `tail` are — asserted as pairs, so the two cannot drift apart
+    /// whatever the list decides about either — and every other `sed` stays where it was.
+    #[test]
+    fn a_sed_that_only_prints_by_line_address_is_judged_as_head_is() {
+        assert_classification(
+            classify(
+                "Bash",
+                &json!({
+                    "command": r#"cd "C:/Projects/nucleos/.nucleos/worktrees/job-27/core" && sed -n '1,40p' Cargo.toml"#
+                }),
+                Some(Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-27")),
+            ),
+            "allow",
+            "read-local",
+        );
+
+        for (sed, twin) in [
+            ("sed -n '1,40p' Cargo.toml", "head -40 Cargo.toml"),
+            ("sed -n '5p' Cargo.toml", "head -5 Cargo.toml"),
+            ("sed -n '$p' Cargo.toml", "tail -1 Cargo.toml"),
+            ("sed -n '10,$p' Cargo.toml", "tail -n +10 Cargo.toml"),
+            ("sed -n 1,40p Cargo.toml", "head -40 Cargo.toml"),
+            (
+                "sed -n '1,10p' ../../../etc/passwd",
+                "head -10 ../../../etc/passwd",
+            ),
+            ("sed -n '1,10p' ~/.ssh/id_rsa", "head -10 ~/.ssh/id_rsa"),
+        ] {
+            let judged = |command: &str| {
+                let got = classify("Bash", &json!({ "command": command }), None);
+                (got.decision.decision, got.action_class)
+            };
+            assert_eq!(
+                judged(sed),
+                judged(twin),
+                "{sed} is not judged as {twin} is"
+            );
+        }
+
+        for (command, decision, action_class) in [
+            ("sed -i 's/a/b/' f", "pending_approval", "unrecognized"),
+            ("sed -n '1,40w out' f", "pending_approval", "unrecognized"),
+            ("sed -n '1e rm -rf x' f", "deny", "destructive"),
+            ("sed -n -e '1,40p' f", "pending_approval", "unrecognized"),
+            ("sed -n -f script.sed f", "pending_approval", "unrecognized"),
+            (
+                "sed -n --in-place '1,40p' f",
+                "pending_approval",
+                "unrecognized",
+            ),
+            // GNU sed takes options after its operands.
+            ("sed -n '1,40p' f -i", "pending_approval", "unrecognized"),
+            ("sed -ni '1,40p' f", "pending_approval", "unrecognized"),
+            // Without `-n` every line prints as well; not the spelling that was asked about.
+            ("sed '1,40p' f", "pending_approval", "unrecognized"),
+            ("sed -n '1,40p;5q' f", "pending_approval", "unrecognized"),
+            ("sed -n '/fn main/p' f", "pending_approval", "unrecognized"),
+            // The shell expands `$p` here before sed sees the script.
+            (r#"sed -n "10,$p" f"#, "pending_approval", "unrecognized"),
+            ("sed -n 10,$p f", "pending_approval", "unrecognized"),
+        ] {
+            assert_classification(
+                classify("Bash", &json!({ "command": command }), None),
+                decision,
+                action_class,
+            );
+        }
+    }
+
+    /// The writing twins of commands allowed elsewhere in this file: the same program, a spelling
+    /// that changes something.
+    ///
+    /// Asked with no workspace, and that is what keeps a writing `cargo fmt` here. Since 2026-09-14
+    /// it is allowed where it lands inside one (`a_cargo_fmt_that_writes_is_allowed_only_where_it_lands`
+    /// pins that half with job 27's own lines); with no workspace there is no inside to land in, and
+    /// it asks exactly as before.
     #[test]
     fn mutating_siblings_remain_pending() {
         for (command, action_class) in [
@@ -2418,8 +3071,19 @@ mod tests {
             ("git checkout .", "unrecognized"),
             ("git remote add origin https://x", "unrecognized"),
             ("cargo fmt", "unrecognized"),
+            ("cargo fmt --all", "unrecognized"),
+            (
+                "cargo fmt --manifest-path ../other/Cargo.toml",
+                "unrecognized",
+            ),
+            ("cargo fmt -- --emit files", "unrecognized"),
+            // A check that names a destination is not a check.
+            ("cargo fmt --check -- --emit files", "unrecognized"),
+            ("cargo fmt -- --emit=files --check", "unrecognized"),
             ("cargo clippy --fix", "unrecognized"),
             ("cargo fix", "unrecognized"),
+            ("sed -i 's/a/b/' f", "unrecognized"),
+            ("sed -n '1,40w out' f", "unrecognized"),
         ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), None),
@@ -2649,13 +3313,87 @@ mod tests {
 
     /// The tool axis defaults to refusing, and has to keep doing so: a tool nobody has reasoned
     /// about is a capability nobody has bounded.
+    ///
+    /// `NotebookEdit` was the third name here until 2026-09-08 and is reasoned about now, which
+    /// is why it LEFT rather than being swapped for another. The two that remain are the point:
+    /// both bring text in from outside, neither has a rule of its own in this file, and both
+    /// still ask.
     #[test]
     fn a_tool_this_file_has_not_reasoned_about_still_asks() {
-        for tool_name in ["WebFetch", "WebSearch", "NotebookEdit"] {
+        for tool_name in ["WebFetch", "WebSearch"] {
             assert_classification(
                 classify(tool_name, &json!({}), None),
                 "pending_approval",
                 "unrecognized-tool",
+            );
+        }
+    }
+
+    /// The half of version 13 that makes the other half safe.
+    ///
+    /// Admitting `NotebookEdit` to `WRITE_TOOLS` is only defensible if the guards can SEE a
+    /// notebook write, and the day before this landed they could not: all four read `file_path`,
+    /// a `NotebookEdit` sends `notebook_path`, and a guard that finds no path answers `false` —
+    /// which its call site reads as "this write is fine". Every row below would have passed
+    /// vacuously, including the two that must not.
+    ///
+    /// Written as a MATRIX against `Write` rather than as five assertions about `NotebookEdit`
+    /// alone, because the claim being made is "the same treatment as a file write" and a test
+    /// naming one tool cannot make that claim. If a rule ever stops applying to one of the two,
+    /// this fails on the row where they part company and names it.
+    #[test]
+    fn a_notebook_write_is_contained_exactly_as_a_file_write_is() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+
+        for (key, tool) in [("file_path", "Write"), ("notebook_path", "NotebookEdit")] {
+            for (target, decision, class) in [
+                // Inside the workspace, governing nothing: the ordinary write.
+                (r"C:\work\repo\notes.ipynb", "allow", "read-local"),
+                // Outside it. Denied rather than asked about, which is the compiled refusal
+                // `outside-workspace` exists to be.
+                (r"C:\elsewhere\notes.ipynb", "deny", "outside-workspace"),
+                // The agent's own governance. A person decides, always.
+                (
+                    r"C:\work\repo\.ai\autopilot.yaml",
+                    "pending_approval",
+                    "self-governing-file",
+                ),
+                // A file whose contents run on somebody else's next command.
+                (
+                    r"C:\work\repo\build.rs",
+                    "pending_approval",
+                    "executes-on-next-command",
+                ),
+            ] {
+                assert_classification(classify(tool, &json!({key: target}), cwd), decision, class);
+            }
+
+            // No workspace at all: there is nothing for the write to be inside of, so the one
+            // guard that reads no path is the one that answers.
+            assert_classification(
+                classify(tool, &json!({key: "notes.ipynb"}), None),
+                "pending_approval",
+                "no-workspace",
+            );
+        }
+    }
+
+    /// A write tool that names no target is not a write this file can place, and it says so
+    /// rather than allowing it.
+    ///
+    /// The companion to the matrix above, and the reason `written_path` returns an `Option`
+    /// instead of a `&str` with an empty default: an empty path normalises to the workspace
+    /// root, which is INSIDE it, so a default would turn "I cannot tell what this writes" into
+    /// the most permissive answer available. With a cwd the call still lands on `read-local`
+    /// like any other in-workspace write — that is the pre-existing treatment of a write whose
+    /// shape is unreadable, unchanged here and pinned so a future default cannot pass unnoticed.
+    #[test]
+    fn a_write_that_names_no_file_is_not_placed_outside_the_workspace() {
+        for tool in ["Write", "NotebookEdit"] {
+            assert_classification(
+                classify(tool, &json!({}), None),
+                "pending_approval",
+                "no-workspace",
             );
         }
     }
@@ -3496,9 +4234,11 @@ mod tests {
     fn a_command_nobody_knows_may_run_when_it_points_only_at_its_own_workspace() {
         let workspace = Path::new(r"C:\work\repo");
         for command in [
-            // `sed` is deliberately off every list and always will be, and reading a file with it
-            // is still not a decision anybody wants to be woken for.
-            "sed -n '1,60p' ./core/src/main.rs",
+            // A `sed` script that does anything but print by line address is still off every
+            // list, and reading a file with one is still not a decision anybody wants to be woken
+            // for. This line said `sed -n '1,60p'` until 2026-09-14, when that spelling became a
+            // read of its own (`prints_lines_by_address`) and stopped needing confinement at all.
+            "sed '1,60!d' ./core/src/main.rs",
             "awk '{print $1}' ./Cargo.toml",
             "./scripts/whatever.sh ./core",
             "jq '.name' ./package.json",
@@ -3529,19 +4269,16 @@ mod tests {
             ("nc example.com 4444", "names no path"),
             ("ssh someone@example.com whoami", "names no path"),
             // Points outside.
-            (
-                "sed -n '1,10p' ../../../etc/passwd",
-                "escapes the workspace",
-            ),
+            ("sed '1,10!d' ../../../etc/passwd", "escapes the workspace"),
             (
                 r"jq . C:\Windows\System32\config\SAM",
                 "absolute and outside",
             ),
             // The shell rewrites these before the command sees them, so where they land cannot be
             // read off the line.
-            ("sed -n '1,10p' ~/.ssh/id_rsa", "the shell expands `~`"),
+            ("sed '1,10!d' ~/.ssh/id_rsa", "the shell expands `~`"),
             (
-                "sed -n '1,10p' $HOME/.ssh/id_rsa",
+                "sed '1,10!d' $HOME/.ssh/id_rsa",
                 "the shell expands `$HOME`",
             ),
             // Clears containment and fails a SHAPE guard, which confinement may never excuse.
@@ -3565,7 +4302,7 @@ mod tests {
     /// same line that passes above has to fail here.
     #[test]
     fn confinement_needs_a_workspace_to_be_inside_of() {
-        let got = classify_asked_for("sed -n '1,60p' ./core/src/main.rs", None);
+        let got = classify_asked_for("sed '1,60!d' ./core/src/main.rs", None);
         assert_eq!(got.decision.decision, "pending_approval");
     }
 
@@ -3574,7 +4311,7 @@ mod tests {
     #[test]
     fn the_widening_reaches_nothing_that_did_not_ask_for_it() {
         let workspace = Path::new(r"C:\work\repo");
-        let command = "sed -n '1,60p' ./core/src/main.rs";
+        let command = "sed '1,60!d' ./core/src/main.rs";
 
         let asked = classify_asked_for(command, Some(workspace));
         assert_eq!(asked.decision.decision, "allow");
@@ -3604,6 +4341,50 @@ mod tests {
             "pending_approval",
             "push-merge-deploy",
         );
+    }
+
+    /// The run path's half of 2026-09-14's hand-deleted branch. A job node never reaches the
+    /// session gate's refusal, so confinement is what stood between it and these — and a branch
+    /// named `fix/<slug>` reads as a path that resolves inside.
+    ///
+    /// Collected rather than asserted one at a time, so a regression names every spelling it lets
+    /// through instead of the first.
+    #[test]
+    fn confinement_never_widens_a_git_operation_the_queue_performs_or_refuses() {
+        let workspace = Path::new(r"C:\work\repo");
+        let widened: Vec<&str> = [
+            "git branch -d fix/espera-que-responde",
+            "git branch -d fix/espera-que-responde 2>&1",
+            "git branch -D fix/espera-que-responde",
+            "git -C ./core branch -d feature",
+            "git -C . push --force origin master",
+            "git -C . merge fix/x",
+            "git rebase fix/x",
+            "git fetch ./elsewhere",
+        ]
+        .into_iter()
+        .filter(|command| {
+            classify_asked_for(command, Some(workspace))
+                .decision
+                .decision
+                == "allow"
+        })
+        .collect();
+        assert!(
+            widened.is_empty(),
+            "confinement widened a git operation the queue owns: {widened:?}"
+        );
+
+        // What confinement is for is untouched: git spellings the queue has no opinion about.
+        for command in ["git branch --list fix/*", "git -C ./core log --oneline"] {
+            assert_eq!(
+                classify_asked_for(command, Some(workspace))
+                    .decision
+                    .decision,
+                "allow",
+                "{command}"
+            );
+        }
     }
 
     /// The two git reads that cost job 21 two of its four items, in the exact spelling the run
@@ -3870,7 +4651,16 @@ mod tests {
     /// file that a person's own file decides, 11 stopped the guards reading a quoted separator as
     /// a separator, took the text filters and three more read-only `git` subcommands into the safe
     /// list, and added `confined-to-workspace` — the first class whose verdict depends on WHO asked
-    /// for the work, since it is offered only to an unattended node of a job the owner commissioned.
+    /// for the work, since it is offered only to an unattended node of a job the owner commissioned,
+    /// and 12 gave a project's alçada a second dimension — a tool name — so that `deny` can now name
+    /// a PATH an `Edit` or a `Write` may not touch here, where before it could only name a
+    /// command, and 13 admitted `NotebookEdit` to `WRITE_TOOLS` — the first bump on this list
+    /// that ALLOWS more than the version before it at the same rung, since an in-workspace
+    /// notebook write used to ask and now does not. Narrated that way deliberately: read as a
+    /// tightening it would be read wrong. What made it safe to make was `written_path` landing
+    /// in the same commit, so the workspace boundary and the self-governing guards find a
+    /// `notebook_path` where they would otherwise have found no path at all and waved the
+    /// write through.
     /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
@@ -3885,7 +4675,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 11);
+        assert_eq!(CLASSIFIER_VERSION, 13);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
@@ -4425,6 +5215,243 @@ mod tests {
                 decision,
                 action_class,
             );
+        }
+    }
+
+    /* ------------------------------------------------- a project's writes -- */
+
+    /// The whole point of the second dimension: a project says "nothing here writes to
+    /// `core/migrations/`", and an `Edit` under that directory is refused where the compiled chain
+    /// would have called it an ordinary local write.
+    ///
+    /// The four spellings are four paths to the same block, and each one is a different helper
+    /// being exercised. The bare directory and the file under it are `path_has_prefix`'s two arms —
+    /// the second is the one `matches_command_prefix` would have missed, because it separates on a
+    /// space and a path has none. The absolute and backslash spellings are `normalize_path`, and
+    /// they matter because a CLI writes `file_path` however it likes: a refusal that binds
+    /// `core/migrations/x.sql` and not `C:\work\repo\core\migrations\x.sql` is a refusal you can
+    /// walk around by naming the same file differently.
+    ///
+    /// The negative in the same test is what stops it being a test of "denies everything": a write
+    /// beside the named directory is untouched, and comes back exactly as it did before this rule
+    /// existed.
+    #[test]
+    fn a_project_deny_reaches_a_write_under_the_directory_it_names() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        let rules = write_rules(&[("Edit", "core/migrations")]);
+
+        for file_path in [
+            "core/migrations",
+            "core/migrations/0131_project_alcada_por_ferramenta.sql",
+            r"C:\work\repo\core\migrations\0128_project_alcada.sql",
+            r"core\migrations\0130_shadow_outcome.sql",
+        ] {
+            assert_classification(
+                classify_writes(&rules, "Edit", file_path, cwd),
+                "deny",
+                "project-denied",
+            );
+        }
+
+        assert_classification(
+            classify_writes(&rules, "Edit", "core/src/classifier.rs", cwd),
+            "allow",
+            "read-local",
+        );
+    }
+
+    /// A stored prefix is joined onto the WORKSPACE, so `migrations` means this project's
+    /// `migrations/` and not every path anywhere that happens to end in that word. A suffix match —
+    /// which is what `path_has_suffix` next door does, and the obvious thing to reach for — would
+    /// have refused `vendor/lib/migrations/x.sql` too, on the strength of a rule the owner wrote
+    /// about their own directory.
+    ///
+    /// `migrations-old` is the separator half of `path_has_prefix`, and it is the one a bare
+    /// `starts_with` gets wrong: it would refuse a directory nobody named, because the name they
+    /// did use is a text prefix of it.
+    #[test]
+    fn a_project_deny_names_a_directory_and_not_every_path_that_ends_in_it() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        let rules = write_rules(&[("Write", "migrations")]);
+
+        assert_classification(
+            classify_writes(&rules, "Write", "migrations/0131_x.sql", cwd),
+            "deny",
+            "project-denied",
+        );
+
+        for file_path in [
+            "vendor/lib/migrations/0001_x.sql",
+            "migrations-old/0001_x.sql",
+            "core/migrations/0131_x.sql",
+        ] {
+            assert_classification(
+                classify_writes(&rules, "Write", file_path, cwd),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    /// **The ordering assertion, and the one that fails if the new guard is moved up a block.**
+    ///
+    /// A write that is both outside the workspace and covered by a project's own refusal keeps the
+    /// COMPILED class, `outside-workspace`, because that block answers first. Both are `deny`, so
+    /// nothing is lost by letting the compiled one speak — and the narrower class is the one worth
+    /// recording, which is the same sentence `a_compiled_refusal_keeps_its_own_class` makes about
+    /// the shell path one screen up. Measured by moving the guard above `writes_outside_cwd` and
+    /// watching this come back `project-denied`.
+    #[test]
+    fn a_write_outside_the_workspace_keeps_its_own_refusal() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        let rules = write_rules(&[("Write", "C:/other")]);
+
+        assert_classification(
+            classify_writes(&rules, "Write", r"C:\other\evil.rs", cwd),
+            "deny",
+            "outside-workspace",
+        );
+    }
+
+    /// A project's write list moves a verdict in exactly one direction, and the governance prompts
+    /// underneath it are the proof.
+    ///
+    /// The first half is what a rule that names something else does to them: nothing. The second is
+    /// the direction that IS available — a project may refuse `.ai/` outright, turning the prompt
+    /// into a refusal — and the direction that is not: there is no `allow` to declare, so no rule
+    /// in this table can turn `self-governing-file` or `executes-on-next-command` into an `allow`.
+    /// A project that could waive the guard over its own autopilot files would be using the
+    /// mechanism that guard exists to keep honest.
+    #[test]
+    fn a_project_rule_never_lifts_the_governance_prompt_it_sits_above() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        let elsewhere = write_rules(&[("Edit", "core/migrations")]);
+
+        assert_classification(
+            classify_writes(&elsewhere, "Edit", ".ai/autopilot.yaml", cwd),
+            "pending_approval",
+            "self-governing-file",
+        );
+        assert_classification(
+            classify_writes(&elsewhere, "Edit", "build.rs", cwd),
+            "pending_approval",
+            "executes-on-next-command",
+        );
+
+        // Downwards is the only way this table can move a prompt, and the class it lands on is the
+        // project's own — the scoreboard should say who refused.
+        let governing = write_rules(&[("Edit", ".ai")]);
+        assert_classification(
+            classify_writes(&governing, "Edit", ".ai/autopilot.yaml", cwd),
+            "deny",
+            "project-denied",
+        );
+    }
+
+    /// The tool name is part of the match and not decoration on it. A project that refuses `Edit`
+    /// under a directory has said nothing about `Write` there, and a matcher that ignored the
+    /// column would be enforcing a rule the owner did not write — in the direction that looks safe
+    /// and is still wrong, because it is a refusal nobody can account for.
+    #[test]
+    fn a_write_rule_for_one_tool_does_not_reach_the_other() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        let rules = write_rules(&[("Edit", "core/migrations")]);
+
+        assert_classification(
+            classify_writes(&rules, "Edit", "core/migrations/0131_x.sql", cwd),
+            "deny",
+            "project-denied",
+        );
+        assert_classification(
+            classify_writes(&rules, "Write", "core/migrations/0131_x.sql", cwd),
+            "allow",
+            "read-local",
+        );
+    }
+
+    /// `a_project_that_declared_nothing_changes_no_verdict`'s sentence, said again about the write
+    /// chain — and it needs saying again, because that test reaches `classify` through a shim that
+    /// only ever asks about `Bash`.
+    ///
+    /// The rules here are not empty: this project declared a COMMAND refusal, which is the case
+    /// most likely to be enforced against a file by accident once one struct carries both kinds of
+    /// list. Every answer the write chain can give is checked, in the order the chain gives them.
+    #[test]
+    fn a_project_that_declared_no_write_rules_changes_no_verdict() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        let commands_only = shell_rules(&["cargo run"], &["ls"]);
+
+        for (tool, file_path, workspace, decision, action_class) in [
+            ("Edit", "src/main.rs", cwd, "allow", "read-local"),
+            ("Write", "ls", cwd, "allow", "read-local"),
+            (
+                "Edit",
+                ".ai/autopilot.yaml",
+                cwd,
+                "pending_approval",
+                "self-governing-file",
+            ),
+            (
+                "Write",
+                "build.rs",
+                cwd,
+                "pending_approval",
+                "executes-on-next-command",
+            ),
+            (
+                "Edit",
+                r"C:\other\evil.rs",
+                cwd,
+                "deny",
+                "outside-workspace",
+            ),
+            ("Write", "x.rs", None, "pending_approval", "no-workspace"),
+        ] {
+            assert_classification(
+                classify_writes(&commands_only, tool, file_path, workspace),
+                decision,
+                action_class,
+            );
+        }
+    }
+
+    /// The two questions `reads_shell_rules` used to answer at once, now asked separately — and the
+    /// pair is the assertion, because either one alone is satisfied by leaving them fused.
+    ///
+    /// An `Edit` reads the rules, because `write_denied_by_project` is a second place `classify`
+    /// consults them and a caller that skipped the load would skip the refusal with it. An `Edit`
+    /// does NOT read the GitHub policy: `classify` reaches `policy` only through
+    /// `classify_shell_command`, so gating both on one predicate would have built a per-project
+    /// policy overlay in front of every file edit for an argument that branch cannot reach.
+    ///
+    /// `NotebookEdit` moved to the POSITIVE list on 2026-09-08, which is the day the comment
+    /// that stood here predicted. It is in `WRITE_TOOLS` now, so `write_denied_by_project` can
+    /// decide it, so the rules have to be loaded for it — a stored refusal nobody reads is a
+    /// refusal that was lost, and keeping that sentence true is the whole job of
+    /// `reads_shell_rules`. It stays in the GitHub negative list below and that is not an
+    /// oversight: a notebook write is no more a `gh` line than an `Edit` is.
+    #[test]
+    fn an_edit_now_reads_the_rules_and_still_never_reads_the_github_policy() {
+        for tool_name in ["Bash", "PowerShell", "Edit", "Write", "NotebookEdit"] {
+            assert!(reads_shell_rules(tool_name), "{tool_name}");
+        }
+        for tool_name in [
+            "Read",
+            "Grep",
+            "Glob",
+            "Skill",
+            "TodoWrite",
+            "Agent",
+            "Task",
+        ] {
+            assert!(!reads_shell_rules(tool_name), "{tool_name}");
+        }
+
+        for tool_name in ["Bash", "PowerShell"] {
+            assert!(reads_github_policy(tool_name), "{tool_name}");
+        }
+        for tool_name in ["Edit", "Write", "Read", "Agent", "NotebookEdit"] {
+            assert!(!reads_github_policy(tool_name), "{tool_name}");
         }
     }
 }

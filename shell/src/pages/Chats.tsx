@@ -7,6 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import {
   DropdownMenu,
@@ -136,6 +137,7 @@ import {
   CostLine,
   ErrorNote,
   PageHeader,
+  Quiet,
   RefusalNote,
   RelativeTime,
   relativeText,
@@ -1575,11 +1577,12 @@ function StartBox({
         <div className="chats-composer-actions">
           <label className="chats-attach" title="Attach a picture">
             <ImagePlus className="chats-tool-icon" aria-hidden="true" />
-            <span className="chats-offscreen">Attach a picture</span>
+            <span className="sr-only">Attach a picture</span>
             <input
               type="file"
               accept="image/*"
               multiple
+              className="sr-only"
               aria-label="Attach a picture"
               onChange={(event) => {
                 void attach(event.target.files);
@@ -1821,13 +1824,21 @@ function Project({ chatId }: { chatId: string }) {
 }
 
 /**
- * The five rungs, in the order the CLI's own picker shows them.
+ * The six rungs, ordered from least to most that happens unasked.
+ *
+ * It used to be "the order the CLI's own picker shows them", and that stopped being the ordering
+ * argument the moment a rung appeared that the CLI does not have. `dont_ask` sits BESIDE `auto`
+ * rather than above it, and the placement is the claim: it allows precisely what `auto` allows —
+ * same classifier, same rules — and refuses the remainder instead of asking about it. Nothing more
+ * runs on it than on `auto`, so putting it any higher would read as a wider permission than it is.
  *
  * `needsTools` is which of them a conversation with no tools cannot stand on. `plan` is a flag the
  * CLI is launched with, so it means something whatever the conversation can reach; `auto` is the
- * neutral state and is what every conversation already has. The other three are entirely about what
+ * neutral state and is what every conversation already has. The other four are entirely about what
  * the hook lets through, and a conversation whose turns get no `Bash`, `Read` or `Write` has nothing
- * for them to be about.
+ * for them to be about — `dont_ask` included, and it is the one whose flag is easiest to get wrong:
+ * it shares `auto`'s permissions but not `auto`'s reason for being reachable, because choosing it is
+ * choosing what the hook does with a refusal, and a conversation with no tools never gets there.
  */
 const PERMISSION_RUNGS: {
   mode: PermissionMode;
@@ -1858,6 +1869,12 @@ const PERMISSION_RUNGS: {
     label: "Auto",
     why: "runs what the rules recognise; a local judge may answer for the rest",
     needsTools: false,
+  },
+  {
+    mode: "dont_ask",
+    label: "Never ask",
+    why: "runs what auto runs, and refuses the rest instead of asking",
+    needsTools: true,
   },
   {
     mode: "bypass",
@@ -2443,13 +2460,15 @@ function ModelMenu({
   onPick,
   disabled = false,
   children,
+  chatId,
 }: {
   model: string | null;
   onPick: (model: string | null) => void;
   disabled?: boolean;
   children?: React.ReactNode;
+  chatId?: string;
 }) {
-  const catalogue = useAssistantModels();
+  const catalogue = useAssistantModels(chatId);
   const localModel = useLocalModel();
   const localUnavailable = localModel.data?.available === false;
   const pull = useLocalPull();
@@ -2635,13 +2654,15 @@ function EffortMenu({
   effort,
   onPick,
   disabled = false,
+  chatId,
 }: {
   model: string | null;
   effort: string | null;
   onPick: (effort: string | null) => void;
   disabled?: boolean;
+  chatId?: string;
 }) {
-  const catalogue = useAssistantModels();
+  const catalogue = useAssistantModels(chatId);
   const chosen = catalogue.data?.choices.find((choice) => choice.id === model);
   // The union stands in only while nothing is pinned — the front door, where the model question is
   // still open. Never empty merely because a fetch is slow: a control greyed out by latency reads
@@ -2717,6 +2738,7 @@ function ChatModelControls({
       <ModelMenu
         model={model}
         disabled={patch.isPending}
+        chatId={chatId}
         onPick={(picked) => patch.mutate({ chatId, model: picked })}
       >
         {patch.isError && <ModelRefusal error={patch.error} />}
@@ -2725,6 +2747,7 @@ function ChatModelControls({
         model={model}
         effort={effort}
         disabled={patch.isPending}
+        chatId={chatId}
         onPick={(picked) => patch.mutate({ chatId, effort: picked })}
       />
     </>
@@ -3114,11 +3137,23 @@ function ContextControls({ chatId }: { chatId: string }) {
 /* --------------------------------------------------------------- helpers -- */
 
 /** A helper as it is being written, before anybody has agreed it is one. */
-type HelperDraft = Subagent & { model: string | null; effort: string | null };
+type HelperDraft = Subagent & {
+  model: string | null;
+  effort: string | null;
+  tools: string[] | null;
+};
 
-/** What a fresh row starts as. Named so "add" and "reset" cannot drift apart. */
+/** What a fresh row starts as. Named so "add" and "reset" cannot drift apart. No restriction —
+ *  the helper inherits the parent's whole surface, exactly as it did before this field existed. */
 function blankHelper(): HelperDraft {
-  return { name: "", description: "", prompt: "", model: null, effort: null };
+  return {
+    name: "",
+    description: "",
+    prompt: "",
+    model: null,
+    effort: null,
+    tools: null,
+  };
 }
 
 /**
@@ -3132,10 +3167,15 @@ function blankHelper(): HelperDraft {
  * The rules themselves are not arbitrary: the CLI parses `--agents` inside a try/catch and answers
  * a throw with an empty agent list, so a helper it cannot build costs you every helper you wrote,
  * silently. That is what all of this is protecting against.
+ *
+ * `knownTools` is threaded in rather than read from `useDeniableTools` here — this function is not
+ * a component, and a hook called from one would break the rules of hooks the moment two helpers
+ * needed an answer in the same render.
  */
 function whyHelperIsRefused(
   helper: HelperDraft,
   others: HelperDraft[],
+  knownTools: string[],
 ): string | null {
   const name = helper.name.trim();
   if (name === "") return "needs a name — it is what the model calls it by";
@@ -3148,7 +3188,88 @@ function whyHelperIsRefused(
   if (helper.description.trim() === "")
     return "needs a description — it is what the model reads to decide whether to use it";
   if (helper.prompt.trim() === "") return "needs instructions to run under";
+  // Checked only once the served list has actually arrived — before that every name would read as
+  // unknown, and a helper opened with tools already set would flash a refusal it does not deserve.
+  // One membership check catches both a typo and a pattern like `Bash(git *)`: neither is ever a
+  // name the door serves, so neither is ever a name this list contains.
+  if (helper.tools !== null && knownTools.length > 0) {
+    const unknown = helper.tools.find((tool) => !knownTools.includes(tool));
+    if (unknown !== undefined)
+      return `"${unknown}" is not a tool the daemon can grant — a pattern is refused the same as a name it does not know`;
+  }
   return null;
+}
+
+/**
+ * Which tools this helper may call, or "no restriction — inherits" for what it does today.
+ *
+ * A separate control from `ChatDenials` rather than a shared one: that one takes something away
+ * from the whole conversation, this one GRANTS a subset to one helper, and null here means the
+ * opposite of empty there — absent is "everything", not "nothing". Checkboxes over the served list
+ * for the same reason `ChatDenials` uses them: a typed rule that matches no tool is a restriction
+ * somebody set and nobody applied, reported nowhere this app's user would read it.
+ *
+ * The top row is its own checkbox rather than a toggle beside the list, so the default state — no
+ * restriction — reads as a state you can SEE is selected, not as an absence of the others.
+ */
+function HelperToolsControl({
+  tools,
+  knownTools,
+  onChange,
+}: {
+  tools: string[] | null;
+  knownTools: string[];
+  onChange: (tools: string[] | null) => void;
+}) {
+  const toggle = (name: string, on: boolean) => {
+    const base = tools ?? [];
+    onChange(on ? [...base, name] : base.filter((tool) => tool !== name));
+  };
+
+  const label =
+    tools === null
+      ? "inherits everything"
+      : tools.length === 0
+        ? "nothing granted"
+        : `${tools.length} granted`;
+
+  return (
+    <div className="chats-helper-field">
+      <span>Tools</span>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          type="button"
+          disabled={knownTools.length === 0}
+          className="chats-helper-tools-trigger"
+        >
+          {label}
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="chats-meta-menu chats-denials">
+          <DropdownMenuLabel>Tools this helper may call</DropdownMenuLabel>
+          <DropdownMenuCheckboxItem
+            checked={tools === null}
+            onSelect={(event) => event.preventDefault()}
+            onCheckedChange={(on) => onChange(on === true ? null : [])}
+          >
+            no restriction — inherits the conversation
+          </DropdownMenuCheckboxItem>
+          <DropdownMenuSeparator />
+          {knownTools.map((name) => (
+            <DropdownMenuCheckboxItem
+              key={name}
+              checked={tools !== null && tools.includes(name)}
+              disabled={tools === null}
+              /* Several are usually granted together, so the menu is kept open. */
+              onSelect={(event) => event.preventDefault()}
+              onCheckedChange={(on) => toggle(name, on === true)}
+            >
+              {name}
+            </DropdownMenuCheckboxItem>
+          ))}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
 }
 
 /**
@@ -3178,6 +3299,8 @@ function ChatHelpers({
   const row = useChatRow(chatId);
   const patch = usePatchChat();
   const catalogue = useAssistantModels();
+  const deniable = useDeniableTools();
+  const knownTools = deniable.data?.tools ?? [];
   const [draft, setDraft] = useState<HelperDraft[]>([]);
 
   const saved = row?.agents;
@@ -3202,6 +3325,7 @@ function ChatHelpers({
         ...agent,
         model: agent.model ?? null,
         effort: agent.effort ?? null,
+        tools: agent.tools ?? null,
       })),
     );
   }, [open, saved]);
@@ -3209,7 +3333,9 @@ function ChatHelpers({
   const choices = (catalogue.data?.choices ?? []).filter(
     (choice) => choice.brain === "cloud",
   );
-  const refusals = draft.map((helper) => whyHelperIsRefused(helper, draft));
+  const refusals = draft.map((helper) =>
+    whyHelperIsRefused(helper, draft, knownTools),
+  );
   const ready = refusals.every((why) => why === null);
 
   const change = (at: number, patched: Partial<HelperDraft>) =>
@@ -3345,6 +3471,11 @@ function ChatHelpers({
                     ))}
                   </select>
                 </label>
+                <HelperToolsControl
+                  tools={helper.tools}
+                  knownTools={knownTools}
+                  onChange={(tools) => change(index, { tools })}
+                />
                 <Button
                   variant="danger"
                   onClick={() =>
@@ -3873,7 +4004,10 @@ function Transcript({
   // told them would be the window contradicting itself.
   if (turns.length === 0 && notices.length === 0 && precededBy) return null;
   if (turns.length === 0 && notices.length === 0)
-    return <p className="chats-empty">nothing has been said yet.</p>;
+    /* The app's one-line absence, said in the app's own component. `.chats-loading` beside it in
+       the stylesheet stayed hand-rolled on purpose: a "reading…" line is a wait, not an absence,
+       and `Quiet` is the muted rung because there the sentence is the content. */
+    return <Quiet says="nothing has been said yet." />;
   return (
     /* Around the turns and not around the whole door, because this is the only subtree that draws
        one: a turn in flight is the one thing here that grows the page on a poll of its own. */
@@ -4415,8 +4549,11 @@ function LiveAnswer({ turnId, since }: { turnId: number; since: string }) {
       <WhatItDid did={live.data?.did ?? []} turnId={turnId} settled={false} />
       <p className="chats-turn-live">
         {/* Turning, because the three words below can stand unchanged for two minutes while a
-            build runs and a page that never moves is a page that looks stopped. `base.css`
-            already clamps every animation for anybody who asked for less motion. */}
+            build runs and a page that never moves is a page that looks stopped. For anybody who
+            asked for less motion the icon is removed outright rather than left to the global
+            clamp in `base.css`, which would land it on its last frame and hold it there — a
+            broken ring standing still says "damaged". The elapsed clock carries the proof of
+            life instead; see `.chats-turn-spinner` in `chats.css`. */}
         <LoaderCircle className="chats-turn-spinner" aria-hidden="true" />
         <span>
           {doing !== null
@@ -4551,6 +4688,13 @@ function TurnPicture({ path }: { path: string }) {
  * by finding a small target is a thing that traps people. The same object URL the thumbnail is
  * already holding — fetching the bytes a second time to show the same picture larger would be
  * paying twice for one file.
+ *
+ * Rendered through a portal on `document.body`, and it has to be. `.chats-app` is a query container
+ * now — that is what moved the layout's fold off the window and onto the column it actually governs
+ * — and a query container is a containing block for `position: fixed` descendants. Left where it
+ * was, this would have covered the main column and stopped at the rail, which is the one thing a
+ * lightbox must not do. A React portal moves only the DOM node: events still bubble through the
+ * React tree, so every handler above it is untouched.
  */
 function PictureOverlay({
   url,
@@ -4569,7 +4713,7 @@ function PictureOverlay({
     return () => window.removeEventListener("keydown", escape);
   }, [onClose]);
 
-  return (
+  return createPortal(
     <div
       className="chats-picture-overlay"
       role="dialog"
@@ -4585,7 +4729,8 @@ function PictureOverlay({
       >
         close
       </button>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -5411,11 +5556,12 @@ function Composer({
               bare file input is the one control on this page nobody can style into the others. */}
           <label className="chats-attach" title="Attach a picture">
             <ImagePlus className="chats-tool-icon" aria-hidden="true" />
-            <span className="chats-offscreen">Attach a picture</span>
+            <span className="sr-only">Attach a picture</span>
             <input
               type="file"
               accept="image/*"
               multiple
+              className="sr-only"
               aria-label="Attach a picture"
               onChange={(event) => {
                 void attach(event.target.files);

@@ -334,12 +334,6 @@
   display: none;
 }
 
-.runs-loading {
-  margin: 0;
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
-
 /* =================================================================== list == */
 
 /* A row is a state, then the request, then the facts about it. The badge holds
@@ -582,6 +576,16 @@
   color: var(--text-faint);
 }
 
+/**
+ * "stdout" and "stderr", over the two wells that hold them.
+ *
+ * Not `Section`, which is the shared primitive for a labelled group and would
+ * otherwise be exactly right here. `Section` renders its label as an `h2`, and
+ * these sit inside a `Panel` whose own title is already an `h2` — adopting it
+ * would announce the stream name as a sibling of "Stored output" rather than as
+ * something under it. Recorded rather than worked around: the fix is a heading
+ * level on the shared component, and that is not this page's to add.
+ */
 .runs-stream-title {
   margin: var(--space-4) 0 0;
   font-family: var(--font-display);

@@ -53,15 +53,25 @@ impl Brain {
 
 /// How much a conversation is allowed to do without being asked.
 ///
-/// Five rungs of one ladder, and the ladder is the CLI's own — `manual` lets reads and
+/// Six rungs of one ladder, five of them the CLI's own — `manual` lets reads and
 /// non-mutating commands through and asks about every edit; `accept_edits` adds the edits;
 /// `plan` restrains the model itself; `auto` adds everything the classifier recognises; `bypass`
 /// stops asking about anything except the shape of a destructive command.
 ///
+/// `dont_ask` is the sixth and it is ours, not the CLI's. It allows precisely what `auto` allows
+/// — the same classifier, the same rules, the same project policy — and REFUSES everything `auto`
+/// would have stopped to ask about, instead of asking. It is a conversation that asks nobody, for
+/// a turn nobody is watching: the question `auto` would have raised waits 45 seconds for an answer
+/// that is not coming, and this rung spends nothing on it. A refusal here costs one tool call and
+/// nothing else — the turn goes on.
+///
+/// That is why the rung stands BESIDE `auto` in the ladder rather than above it. It is not a wider
+/// permission than `auto`; it is the same permission with the question removed.
+///
 /// This is the POLICY of the conversation, and it is not the same type as the `--permission-mode`
-/// the CLI is launched with: `Manual` and `Auto` differ only inside the hook, and both launch the
-/// CLI the same way. `runner::Permission` is that other question; keeping them apart is what stops
-/// somebody answering one with the other.
+/// the CLI is launched with: `Manual`, `Auto` and `DontAsk` differ only inside the hook, and all
+/// three launch the CLI the same way. `runner::Permission` is that other question; keeping them
+/// apart is what stops somebody answering one with the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
@@ -70,6 +80,7 @@ pub enum PermissionMode {
     Plan,
     Auto,
     Bypass,
+    DontAsk,
 }
 
 impl PermissionMode {
@@ -80,6 +91,7 @@ impl PermissionMode {
             Self::Plan => "plan",
             Self::Auto => "auto",
             Self::Bypass => "bypass",
+            Self::DontAsk => "dont_ask",
         }
     }
 
@@ -99,6 +111,12 @@ impl PermissionMode {
             "accept_edits" => Self::AcceptEdits,
             "plan" => Self::Plan,
             "bypass" => Self::Bypass,
+            // Before the fallback, and that placement is the whole point of this arm existing as
+            // its own line: `_ => Self::Auto` below would swallow `dont_ask` without a word and
+            // run the conversation as `auto`, which is WIDER than what was asked for — every call
+            // this rung exists to refuse would instead become a question, and nobody would see a
+            // symptom until the 45-second waits showed up in a log.
+            "dont_ask" => Self::DontAsk,
             _ => Self::Auto,
         }
     }
@@ -1634,7 +1652,7 @@ mod tests {
     /// `0123`'s header records as having already gone wrong here once. This is the assertion that
     /// says it went in.
     #[tokio::test]
-    async fn the_check_refuses_a_mode_outside_the_five() {
+    async fn the_check_refuses_a_mode_outside_the_six() {
         let pool = test_pool().await;
         let id = create(&pool, Brain::Cloud, None).await.unwrap();
 
@@ -1658,9 +1676,9 @@ mod tests {
 
     /// Every rung survives the round trip through the column, and nothing else does.
     ///
-    /// The five are asserted together rather than one per test because the property is the SET:
+    /// The six are asserted together rather than one per test because the property is the SET:
     /// a spelling that writes and reads back as something else is the failure, and it is only
-    /// visible when the five are compared against each other.
+    /// visible when the six are compared against each other.
     #[tokio::test]
     async fn each_rung_writes_and_reads_back_as_itself() {
         let pool = test_pool().await;
@@ -1672,6 +1690,7 @@ mod tests {
             PermissionMode::Plan,
             PermissionMode::Auto,
             PermissionMode::Bypass,
+            PermissionMode::DontAsk,
         ] {
             set_permission_mode(&pool, &id, mode).await.unwrap();
             assert_eq!(permission_mode_of(&pool, &id).await.unwrap(), mode);
@@ -1688,6 +1707,12 @@ mod tests {
     async fn an_unreadable_mode_and_a_missing_chat_both_read_as_auto() {
         let pool = test_pool().await;
 
+        // `dontAsk` next to a `DontAsk` variant reads as a contradiction and is not one. The
+        // CLI spells its own mode in camelCase; ours is `dont_ask`, snake_case, deliberately not
+        // the CLI's spelling — the two are different rungs on different ladders, and the CLI's is
+        // one we never select (see `runner::Permission`). No write this application has ever made
+        // put `dontAsk` in the column, so a row carrying it came from somewhere else entirely, and
+        // falling to `Auto` is the right answer for it and not an alias for `DontAsk`.
         assert_eq!(PermissionMode::from_wire("dontAsk"), PermissionMode::Auto);
         assert_eq!(PermissionMode::from_wire(""), PermissionMode::Auto);
         assert_eq!(PermissionMode::from_wire("Plan"), PermissionMode::Auto);

@@ -66,7 +66,9 @@ pub enum Scope {
     /// own environment. That is the property that makes it safe, not the mode's name.
     Control,
     /// One autonomous run's key. Minted when the run is created, dead the moment the run stops
-    /// running, and good for exactly one route: asking the safety gate about its own tool call.
+    /// running, and good for exactly three routes, all of them one conversation about its own tool
+    /// calls: asking the safety gate beforehand, waiting for a person's answer when the gate cannot
+    /// decide alone, and reporting back what actually happened.
     ///
     /// Nothing is lost by keeping it that narrow — only orchestrator turns are given an
     /// `--mcp-config`, so a `worktree`, `shadow` or triage run has no daemon tool to call in the
@@ -117,10 +119,11 @@ impl ApiTokenLevel {
     }
 }
 
-/// The only route a run token opens, and the reason a run token exists.
+/// The first route a run token opens, and the reason a run token exists.
 const HOOK_ROUTE: &str = "/hooks/pretooluse-decision";
 
-/// The second half of the same conversation, and the only other door a run has.
+/// The second door of the same conversation, and the only other one a run had until this route
+/// grew a third.
 ///
 /// The gate above answers in milliseconds because the hook can only wait five seconds. A tool call
 /// somebody has to say yes to cannot be answered in five seconds, so the gate says `asking` and the
@@ -130,6 +133,16 @@ const HOOK_ROUTE: &str = "/hooks/pretooluse-decision";
 /// A run reaches only its own question: `hooks::wait_for_run` finds the ask by the run id the key
 /// names, and a run has at most one tool call in flight because the hook that asks is synchronous.
 const ASK_WAIT_ROUTE: &str = "/hooks/ask-wait";
+
+/// The third door: the OUTCOME of the same tool call the first two routes decided about and waited
+/// on, reported after the fact.
+///
+/// It is not a narrower version of `HOOK_ROUTE` — the handler behind it never returns a `Decision`
+/// and can never block anything, because by the time it fires the tool has already run (or already
+/// failed). It sits in the same `Scope::Run` arm as the other two rather than in a table of its
+/// own for the same reason they do: this is still one run asking about one tool call of its own,
+/// now completing the loop instead of opening it.
+const POSTTOOLUSE_ROUTE: &str = "/hooks/posttooluse";
 
 /// The email sidecar's whole daemon surface: report what it fetched, and ask where it got to.
 ///
@@ -403,7 +416,10 @@ const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
 pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
     match scope {
         Scope::Control => true,
-        Scope::Run(_) => method == Method::POST && (path == HOOK_ROUTE || path == ASK_WAIT_ROUTE),
+        Scope::Run(_) => {
+            method == Method::POST
+                && (path == HOOK_ROUTE || path == ASK_WAIT_ROUTE || path == POSTTOOLUSE_ROUTE)
+        }
         Scope::Service(Service::Email) => route_is_listed(EMAIL_ROUTES, method, path),
         Scope::Service(Service::Council) => route_is_listed(COUNCIL_ROUTES, method, path),
         Scope::TeamRun(_) => route_is_listed(TEAM_ROUTES, method, path),
@@ -871,6 +887,8 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -913,6 +931,7 @@ mod tests {
             // path is what `permits` matches on.
             .route(HOOK_ROUTE, post(|| async { "decided" }))
             .route(ASK_WAIT_ROUTE, post(|| async { "waited" }))
+            .route(POSTTOOLUSE_ROUTE, post(|| async { "recorded" }))
             .route("/proposals/{id}/approve", post(|| async {}))
             .route("/worktrees/{run_id}/release", post(|| async {}))
             // All three, because the point of the test below is that they are graded differently:
@@ -1087,6 +1106,7 @@ mod tests {
         ("GET", "/email/cursor"),
         ("GET", "/files"),
         ("POST", HOOK_ROUTE),
+        ("POST", POSTTOOLUSE_ROUTE),
         ("GET", "/api-tokens"),
     ];
 
@@ -1097,6 +1117,25 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .uri("/secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The new door, checked the same way `rejects_missing_token` checks every other one: a hook
+    /// call reporting an outcome is exactly as unauthenticated without a bearer token as any other
+    /// request, and this route must not have grown an exception for it.
+    #[tokio::test]
+    async fn posttooluse_route_rejects_missing_token() {
+        let app = protected_router(test_state("expected-token").await);
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(POSTTOOLUSE_ROUTE)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1177,7 +1216,8 @@ mod tests {
 
     /// The whole point of the scope. A `worktree` or `shadow` run has a Bash tool and the classifier
     /// permits `echo $NUCLEOS_DAEMON_TOKEN`, so whatever is in its environment must be assumed
-    /// published. What it opens is one route.
+    /// published. What it opens is three routes, all of them the same conversation about its own
+    /// tool calls.
     #[tokio::test]
     async fn a_run_token_opens_the_gate_route_and_nothing_else() {
         let state = test_state("control-token").await;
@@ -1197,6 +1237,12 @@ mod tests {
             StatusCode::OK,
             "a run must be able to wait for the answer it was told to wait for"
         );
+        // The third leg: reporting back what the tool call it asked about actually did.
+        assert_eq!(
+            status_of(&app, "POST", POSTTOOLUSE_ROUTE, &run_token).await,
+            StatusCode::OK,
+            "a run must be able to report the outcome of its own tool call"
+        );
         // 403, not 401: it authenticated. It is simply not allowed to approve anything.
         assert_eq!(
             status_of(&app, "POST", "/proposals/7/approve", &run_token).await,
@@ -1215,11 +1261,12 @@ mod tests {
     /// unreviewed proposals, and the slot ceiling counts pieces of work in flight.
     ///
     /// **Honest note on what this test is worth.** It passes before `POST /jobs` was added to any
-    /// table as well as after, because `permits` gives `Scope::Run` exactly one route and everything
-    /// else is refused by construction. So it did not drive the change and it is not evidence the
-    /// change works — it is a pin, and its value is the day somebody widens `Scope::Run` to a second
-    /// route and has to decide, in front of this assertion, whether jobs are on the list. The test
-    /// that DID have to fail first is the one below it.
+    /// table as well as after, because `permits` gives `Scope::Run` a small, named list of routes
+    /// (`HOOK_ROUTE`, `ASK_WAIT_ROUTE`, `POSTTOOLUSE_ROUTE`) and everything else is refused by
+    /// construction. So it did not drive the change and it is not evidence the change works — it
+    /// is a pin, and its value is the day somebody widens `Scope::Run` further and has to decide,
+    /// in front of this assertion, whether jobs are on the list. The test that DID have to fail
+    /// first is the one below it.
     #[tokio::test]
     async fn a_run_token_cannot_ask_for_a_job() {
         let state = test_state("control-token").await;
@@ -2245,15 +2292,17 @@ mod tests {
         }
     }
 
-    /// The pin that says this scope did not widen the run token.
+    /// The pin that says this scope did not widen the run token beyond its three named routes.
     ///
-    /// `Scope::Run`'s doc claims it is "good for exactly one route", and three comments in this file
-    /// lean on that being true. A new scope is exactly the change that makes somebody widen the old
-    /// one by accident.
+    /// `Scope::Run`'s doc claims it is "good for exactly three routes", and other comments in this
+    /// file lean on that being true. A new scope is exactly the change that makes somebody widen
+    /// the old one by accident.
     #[test]
     fn a_run_token_still_reaches_exactly_the_hook_route() {
         let run = Scope::Run(1);
         assert!(permits(&run, &Method::POST, HOOK_ROUTE));
+        assert!(permits(&run, &Method::POST, ASK_WAIT_ROUTE));
+        assert!(permits(&run, &Method::POST, POSTTOOLUSE_ROUTE));
 
         for (method, pattern) in TEAM_ROUTES {
             assert!(
@@ -2362,9 +2411,10 @@ mod tests {
 
     /// The reach a project declares for itself is the owner's, and nobody else's.
     ///
-    /// These nine routes are the only way into the three tables `project_policy.rs` holds: what a
+    /// These twelve routes are the only way into the four tables `project_policy.rs` holds: what a
     /// project's worktrees may run unattended, what the GitHub manager may do on its remote, and
-    /// where a landing may be sent. **They are a live autonomy control, not a configuration edit.**
+    /// what the shared git queue may do on its repository, and where a landing may be sent. **They
+    /// are a live autonomy control, not a configuration edit.**
     /// The hook reads those tables per decision and caches nothing, so a single `allow` row written
     /// through `POST /projects/{id}/shell-rules` binds the very next tool call of every in-flight
     /// run of that project — no restart, no second confirmation, and no moment at which a person is
@@ -2374,12 +2424,12 @@ mod tests {
     /// Asserted as membership rather than through a request, like `POST /projects/{id}/write` and
     /// `POST /projects/{id}/commands` above and for the same reason: `permits` is default-deny, so
     /// these routes are safe TODAY by being in no table. What that does not survive is somebody
-    /// filing the three GETs beside the `/projects/{id}/…` reads that share their URL prefix, which
+    /// filing the four GETs beside the `/projects/{id}/…` reads that share their URL prefix, which
     /// would read as tidying up rather than as a decision. This is the test that says no.
     ///
     /// **The three scopes below are not decoration, and `Scope::Run` alone would prove nothing.**
     /// That arm consults no table at all — it is a fixed `match` over two routes — so it would go on
-    /// passing with all nine of these in every table. `ApiTokenLevel::ReadOnly` and
+    /// passing with all twelve of these in every table. `ApiTokenLevel::ReadOnly` and
     /// `ApiTokenLevel::RunCreating` are the two that actually read `READ_ONLY_ROUTES`, which is
     /// where a tidying hand would put them.
     #[test]
@@ -2394,6 +2444,9 @@ mod tests {
             (Method::GET, "/projects/{id}/land-targets"),
             (Method::POST, "/projects/{id}/land-targets"),
             (Method::DELETE, "/projects/{id}/land-targets"),
+            (Method::GET, "/projects/{id}/git-ops"),
+            (Method::POST, "/projects/{id}/git-ops"),
+            (Method::DELETE, "/projects/{id}/git-ops"),
         ];
 
         for (method, pattern) in DECLARED_REACH {
@@ -2436,7 +2489,7 @@ mod tests {
     ///
     /// `GET /projects/{id}/github-repo` turns a project id into `owner/name`. It is not a secret —
     /// it is written in the repository's own `.git/config` — but it does disclose WHICH repository a
-    /// registered project is, which is one sentence away from the class the nine routes above are
+    /// registered project is, which is one sentence away from the class the twelve routes above are
     /// excluded under.
     ///
     /// **The honest case for the other answer, first, because it is a strong one.** The
@@ -2465,7 +2518,7 @@ mod tests {
     /// in `READ_ONLY_ROUTES` — joining either would have made this grant by accident, as a side
     /// effect of saving a round trip. The placement decision and this one are the same decision.
     ///
-    /// Membership rather than a request, like the nine and the catalogue: `permits` is default-deny,
+    /// Membership rather than a request, like the twelve and the catalogue: `permits` is default-deny,
     /// so this is safe today by being nowhere, and what that does not survive is somebody filing it
     /// beside the `/projects/{id}/…` reads it shares a prefix with — on exactly the `cat` reasoning
     /// above, which is true and is not the point. That is the edit this test refuses.
@@ -2514,11 +2567,11 @@ mod tests {
     }
 
     /// The catalogue of DECLARABLE operations is in no scope table either, and the reason is not
-    /// the one its nine neighbours have.
+    /// the one its twelve neighbours have.
     ///
     /// `GET /github/declarable-ops` is a read of compiled constants. It takes no project id, it
     /// touches no database, and its answer is a function of the binary — two callers on the same
-    /// build get the same bytes. So the argument the nine are excluded under does NOT transfer:
+    /// build get the same bytes. So the argument the twelve are excluded under does NOT transfer:
     /// nothing here decides what a project's runs may do unattended, and nothing here discloses one
     /// project's configuration, one repository, or one secret. On confidentiality alone this could
     /// be filed beside `/fleet/exclusions`, which is listed as describing the shape of the fleet
@@ -2527,7 +2580,7 @@ mod tests {
     ///
     /// What settles it is that the grant would buy nobody anything. The caller this route was added
     /// for is the app, which holds `Scope::Control` and never consults these tables; no scoped key
-    /// has asked for it. And its only use is the nine routes above, every one of which a scoped key
+    /// has asked for it. And its only use is the twelve routes above, every one of which a scoped key
     /// is refused — a key that cannot read what a project HAS declared has no use for the list of
     /// what MAY be declared, while what the list does give a holder is the exact vocabulary to aim
     /// at those routes with. Between a grant with a use and a grant without one, this table's own
@@ -2536,41 +2589,46 @@ mod tests {
     /// same least-privilege reading, and `GET /assistant/tools` — compiled constants served for a
     /// picker, which is this route's twin in every respect — is in no table today.
     ///
-    /// Membership rather than a request, like the nine: `permits` is default-deny, so this is safe
+    /// Membership rather than a request, like the twelve: `permits` is default-deny, so this is safe
     /// today by being nowhere, and what that does not survive is somebody filing a GET of constants
     /// in `READ_ONLY_ROUTES` because it plainly discloses nothing. That is the edit this test
     /// refuses, and the paragraph above is the argument it refuses it with.
     #[test]
     fn the_declarable_ops_catalogue_is_in_no_scope_table() {
-        const CATALOGUE: &str = "/github/declarable-ops";
+        // `/vcs/declarable-ops` is `/github/declarable-ops`'s git twin, in no table for the same
+        // reason: compiled constants, no project id, no database, no use to a scoped key that
+        // cannot reach a single one of the routes this catalogue explains.
+        const CATALOGUES: &[&str] = &["/github/declarable-ops", "/vcs/declarable-ops"];
 
-        assert!(
-            !route_is_listed(READ_ONLY_ROUTES, &Method::GET, CATALOGUE)
-                && !route_is_listed(RUN_CREATING_ROUTES, &Method::GET, CATALOGUE)
-                && !route_is_listed(TEAM_ROUTES, &Method::GET, CATALOGUE)
-                && !route_is_listed(EMAIL_ROUTES, &Method::GET, CATALOGUE)
-                && !route_is_listed(COUNCIL_ROUTES, &Method::GET, CATALOGUE),
-            "the catalogue explains routes no scoped key may reach, so no scoped key needs it"
-        );
-
-        for scope in [
-            Scope::Run(7),
-            Scope::ApiToken(ApiTokenLevel::ReadOnly),
-            Scope::ApiToken(ApiTokenLevel::RunCreating),
-        ] {
+        for catalogue in CATALOGUES {
             assert!(
-                !permits(&scope, &Method::GET, CATALOGUE),
-                "{scope:?} must not reach GET {CATALOGUE}"
+                !route_is_listed(READ_ONLY_ROUTES, &Method::GET, catalogue)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &Method::GET, catalogue)
+                    && !route_is_listed(TEAM_ROUTES, &Method::GET, catalogue)
+                    && !route_is_listed(EMAIL_ROUTES, &Method::GET, catalogue)
+                    && !route_is_listed(COUNCIL_ROUTES, &Method::GET, catalogue),
+                "the catalogue explains routes no scoped key may reach, so no scoped key needs it"
             );
-        }
 
-        // And the two that act for the person do reach it, which is the half that makes the
-        // exclusion a boundary rather than a route nobody can open.
-        for scope in [Scope::ApiToken(ApiTokenLevel::Admin), Scope::Control] {
-            assert!(
-                permits(&scope, &Method::GET, CATALOGUE),
-                "{scope:?} opens the page these constants are for"
-            );
+            for scope in [
+                Scope::Run(7),
+                Scope::ApiToken(ApiTokenLevel::ReadOnly),
+                Scope::ApiToken(ApiTokenLevel::RunCreating),
+            ] {
+                assert!(
+                    !permits(&scope, &Method::GET, catalogue),
+                    "{scope:?} must not reach GET {catalogue}"
+                );
+            }
+
+            // And the two that act for the person do reach it, which is the half that makes the
+            // exclusion a boundary rather than a route nobody can open.
+            for scope in [Scope::ApiToken(ApiTokenLevel::Admin), Scope::Control] {
+                assert!(
+                    permits(&scope, &Method::GET, catalogue),
+                    "{scope:?} opens the page these constants are for"
+                );
+            }
         }
     }
 

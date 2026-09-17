@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useExtractSpec, useProjectSpecs, type Brain } from "../data/project-map";
+import { ErrorNote, Section } from "../ui";
 
 /**
  * Choosing what gets read, and by whom.
@@ -59,9 +60,9 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
 
   if (specs.isError) {
     return (
-      <p className="text-sm text-text-faint">
+      <ErrorNote>
         The núcleo could not say which specs this project keeps — its folder may have moved.
-      </p>
+      </ErrorNote>
     );
   }
   if (specs.data === undefined) {
@@ -92,10 +93,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
   }
 
   return (
-    <section aria-label="Read a spec" className="flex flex-col gap-3">
-      <h2 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
-        Read a spec
-      </h2>
+    <Section label="Read a spec">
       <p className="max-w-prose text-sm text-text-muted">
         One model reads one document and proposes the decisions it fixes. Nothing it proposes enters
         the map: the list lands below and waits for you to answer it, line by line.
@@ -132,9 +130,18 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
               Not a `max-h` to fight over: the height is the design, the rows
               are what must keep theirs and let the box scroll.
             */
+            /*
+              Chosen is `.ui-current` — a 2px rule on the leading edge — and nothing else.
+
+              It was an accent border over a raised fill, which is the Reserved Cyan Rule broken for
+              a selection and, worse, a mark that only worked in one theme: `--surface` and
+              `--surface-raised` are both `#ffffff` in light, so the fill said nothing there. The
+              border also made the chosen row a pixel wider than its siblings, which is a list that
+              twitches as you arrow down it.
+            */
             className={
               slug === chosen
-                ? "shrink-0 truncate rounded-sm border border-border-strong bg-surface-raised px-2 py-1 text-left font-mono text-xs text-text"
+                ? "ui-current shrink-0 truncate rounded-sm px-2 py-1 text-left font-mono text-xs text-text"
                 : "shrink-0 truncate rounded-sm px-2 py-1 text-left font-mono text-xs text-text-muted enabled:hover:text-text disabled:opacity-40"
             }
           >
@@ -153,7 +160,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
             onClick={() => setBrain(candidate)}
             className={
               candidate === brain
-                ? "rounded-md border border-border-strong bg-surface-raised px-3 py-1.5 text-sm text-text"
+                ? "ui-current rounded-md border border-border px-3 py-1.5 text-sm text-text"
                 : "rounded-md border border-border px-3 py-1.5 text-sm text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
             }
           >
@@ -209,7 +216,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
             : `Read. ${extract.data.length} ${extract.data.length === 1 ? "line is" : "lines are"} waiting below, this document's among them, and not one of them is in the map until you answer it.`}
         </p>
       ) : null}
-    </section>
+    </Section>
   );
 }
 
@@ -227,11 +234,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
  */
 function Failed({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return (
-      <p className="max-w-prose rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
-        The núcleo did not answer, so nothing was read and nothing was recorded.
-      </p>
-    );
+    return <ErrorNote>The núcleo did not answer, so nothing was read and nothing was recorded.</ErrorNote>;
   }
 
   const sentence =
@@ -245,9 +248,5 @@ function Failed({ error }: { error: unknown }) {
             ? "The núcleo could not read which brain was asked for."
             : error.detail;
 
-  return (
-    <p className="max-w-prose rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted">
-      {sentence}
-    </p>
-  );
+  return <ErrorNote>{sentence}</ErrorNote>;
 }

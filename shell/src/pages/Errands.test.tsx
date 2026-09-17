@@ -331,7 +331,10 @@ describe("Errands - the notebook", () => {
 
     const notebookPanel = await panelFor("Notebook");
     const body = await waitFor(() => {
-      const el = notebookPanel.querySelector(".errands-notebook-body");
+      // `.ui-well` since the notebook adopted the shared well — the assertion
+      // below still checks the element is a `pre`, which is what keeps the
+      // literal text literal.
+      const el = notebookPanel.querySelector(".ui-well");
       if (el === null) throw new Error("no notebook body found");
       return el;
     });

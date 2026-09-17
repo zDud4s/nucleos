@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
@@ -23,11 +23,16 @@ import {
   Badge,
   Button,
   ConfirmButton,
+  Count,
   ErrorNote,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
+  Section,
   StateBadge,
 } from "../ui";
 import "./browser.css";
@@ -103,9 +108,29 @@ function headline(rows: BrowserSession[] | undefined, subsystem: SubsystemReadou
   return asking === 0 ? `${rows.length} ${noun} open` : `${rows.length} ${noun} open — ${asking} asking for the wheel`;
 }
 
-function Count({ n }: { n: number | undefined }) {
-  if (n === undefined) return null;
-  return <span className="browser-count">{n}</span>;
+/**
+ * A panel's own prose — in front of a list that has something in it, one click
+ * behind the line when it has not.
+ *
+ * The sentences are the same either way and what changes is where a reader
+ * meets them. Above a populated list the note is what somebody needs *before*
+ * pressing a button: that a wheel request is answered on Waiting and not here.
+ * Above an empty one it is a paragraph explaining rows that are not there.
+ * Keeping it rather than cutting it is the point of the disclosure — "nothing
+ * is open right now" on its own reads as a list that failed to load, and the
+ * paragraph is what makes the emptiness a fact. `System.tsx` has the same
+ * helper, for the same reason.
+ *
+ * Not every note on this page belongs behind one, and the two that do not are
+ * both about placement rather than about prose. `SiteGrants` puts its project
+ * picker between the note and the list, so folding the note into the empty line
+ * would lift an answer above the control that changes it; `OpenAWindow`'s
+ * absence is the project registry's rather than that panel's own, so the "why?"
+ * would be answering a question nobody asked there.
+ */
+function PanelNote({ empty, says, children }: { empty: boolean; says: string; children: ReactNode }) {
+  if (empty) return <Quiet says={says}>{children}</Quiet>;
+  return <p className="browser-note">{children}</p>;
 }
 
 /** The daemon's own sentence, when it really sent one — `RunDetail.tsx`'s pattern. */
@@ -143,15 +168,14 @@ function LiveSessions({
 
   return (
     <Panel title="Live sessions" aside={<Count n={view.data?.length} />}>
-      <p className="browser-note">
+      <PanelNote empty={view.data !== undefined && rows.length === 0} says="nothing is open right now.">
         Every open browsing session, whatever is driving it — oldest first. A session asking for the
         wheel is decided on <Link to="/waiting">Waiting</Link>; this page only shows that it is asking.
-      </p>
+      </PanelNote>
       {view.isError && view.data === undefined && <MutationNote error={view.error} what="nothing is known about the open sessions" />}
       {view.data === undefined && !view.isError && <p className="browser-loading">reading the open sessions…</p>}
-      {view.data !== undefined && rows.length === 0 && <p className="browser-empty">nothing is open right now.</p>}
       {rows.length > 0 && (
-        <ul className="ui-rows" aria-label="Live sessions">
+        <Rows label="Live sessions">
           {rows.map((session) => (
             <SessionRow
               key={session.id}
@@ -166,7 +190,7 @@ function LiveSessions({
               returnPending={returnWheel.isPending}
             />
           ))}
-        </ul>
+        </Rows>
       )}
       {closeSession.isError && <MutationNote error={closeSession.error} what="that session could not be closed" />}
       {returnWheel.isError && <MutationNote error={returnWheel.error} what="the wheel could not be given back" />}
@@ -190,7 +214,7 @@ function SessionRow({
   const redirected = session.final_url !== session.requested_url && session.final_url !== "";
 
   return (
-    <li className="ui-rows-row browser-session">
+    <Row className="browser-session">
       <div className="browser-card-head">
         <span className="browser-card-mode">{MODE_COPY[session.mode]}</span>
         <span className="browser-meta">{session.project_id ?? "no project"}</span>
@@ -204,12 +228,12 @@ function SessionRow({
           <dt>asked for</dt>
           {/* Verbatim, punycode and all — an origin shown here is exactly the
               lookalike the wheel decision on Waiting exists to catch. */}
-          <dd className="browser-url">{session.requested_url}</dd>
+          <dd>{session.requested_url}</dd>
         </div>
         {redirected && (
           <div className="browser-fact">
             <dt>ended at</dt>
-            <dd className="browser-url">{session.final_url}</dd>
+            <dd>{session.final_url}</dd>
           </div>
         )}
         <div className="browser-fact">
@@ -243,7 +267,7 @@ function SessionRow({
           />
         )}
       </div>
-    </li>
+    </Row>
   );
 }
 
@@ -360,9 +384,7 @@ function OpenAWindow() {
         on the way out, which is the only way the list below ever grows.
       </p>
 
-      {projects.data !== undefined && options.length === 0 && (
-        <p className="browser-empty">no project is registered yet.</p>
-      )}
+      {projects.data !== undefined && options.length === 0 && <Quiet says="no project is registered yet." />}
 
       {options.length > 0 && (
         <form
@@ -441,9 +463,7 @@ function SiteGrants() {
         host is never prettified back to the glyphs it encodes.
       </p>
 
-      {projects.data !== undefined && options.length === 0 && (
-        <p className="browser-empty">no project is registered yet.</p>
-      )}
+      {projects.data !== undefined && options.length === 0 && <Quiet says="no project is registered yet." />}
       {options.length > 0 && (
         <label className="browser-field">
           <span>Project</span>
@@ -462,10 +482,10 @@ function SiteGrants() {
           {sites.isError && rows.length === 0 && <MutationNote error={sites.error} what="nothing is known about this project's sites" />}
           {sites.data === undefined && !sites.isError && <p className="browser-loading">reading the sites…</p>}
           {sites.data !== undefined && rows.length === 0 && (
-            <p className="browser-empty">{projectId} has not logged into anything yet.</p>
+            <Quiet says={`${projectId} has not logged into anything yet.`} />
           )}
           {rows.length > 0 && (
-            <ul className="ui-rows" aria-label="Site grants">
+            <Rows label="Site grants">
               {rows.map((site) => (
                 <SiteRow
                   key={site.origin}
@@ -475,7 +495,7 @@ function SiteGrants() {
                   pending={revoke.isPending || readonly.isPending}
                 />
               ))}
-            </ul>
+            </Rows>
           )}
           {revoke.isError && <MutationNote error={revoke.error} what="that site could not be revoked" />}
           {readonly.isError && (
@@ -526,7 +546,7 @@ function SiteRow({
   pending: boolean;
 }) {
   return (
-    <li className="ui-rows-row browser-row">
+    <Row className="browser-row">
       <div className="browser-row-head">
         <span className="browser-url">{site.origin}</span>
         <Badge tone={site.kind === "destination" ? "info" : "shadow"}>{site.kind}</Badge>
@@ -546,7 +566,7 @@ function SiteRow({
           />
         )}
       </div>
-    </li>
+    </Row>
   );
 }
 
@@ -568,21 +588,26 @@ function WriteRecord({ projectId }: { projectId: string }) {
   const rows = writes.data ?? [];
 
   return (
+    // The rule above the heading is this page's; the heading and the rhythm
+    // under it are `Section`'s. `level={3}` because the `Panel` around this has
+    // already spent the `h2` on "Site grants", and announcing these as siblings
+    // is the opposite of what the page means.
     <div className="browser-writes">
-      <h3 className="browser-subhead">Submitted</h3>
-      {writes.isError && rows.length === 0 && (
-        <MutationNote error={writes.error} what="the record of submissions could not be read" />
-      )}
-      {writes.data !== undefined && rows.length === 0 && (
-        <p className="browser-empty">nothing has been submitted from this profile.</p>
-      )}
-      {rows.length > 0 && (
-        <ul className="ui-rows" aria-label="Submitted forms">
-          {rows.map((wrote) => (
-            <WriteRow key={wrote.id} wrote={wrote} />
-          ))}
-        </ul>
-      )}
+      <Section label="Submitted" level={3}>
+        {writes.isError && rows.length === 0 && (
+          <MutationNote error={writes.error} what="the record of submissions could not be read" />
+        )}
+        {writes.data !== undefined && rows.length === 0 && (
+          <Quiet says="nothing has been submitted from this profile." />
+        )}
+        {rows.length > 0 && (
+          <Rows label="Submitted forms">
+            {rows.map((wrote) => (
+              <WriteRow key={wrote.id} wrote={wrote} />
+            ))}
+          </Rows>
+        )}
+      </Section>
     </div>
   );
 }
@@ -594,7 +619,7 @@ function WriteRow({ wrote }: { wrote: Written }) {
   const more = wrote.field_count - wrote.fields.length;
 
   return (
-    <li className="ui-rows-row browser-row">
+    <Row className="browser-row">
       <div className="browser-row-head">
         <span className="browser-url">{wrote.action}</span>
         <Badge tone="info">{wrote.method}</Badge>
@@ -620,7 +645,7 @@ function WriteRow({ wrote }: { wrote: Written }) {
           {wrote.element_ref !== "" && <> on {wrote.element_ref}</>}
         </p>
       )}
-    </li>
+    </Row>
   );
 }
 

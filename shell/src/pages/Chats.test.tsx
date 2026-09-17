@@ -236,7 +236,7 @@ function chatsFetch(
     if (path === "/assistant/tools") {
       return { tools: ["Bash", "Edit", "Read", "WebFetch"] };
     }
-    if (path === "/assistant/models") {
+    if (path.split("?")[0] === "/assistant/models") {
       return {
         choices: [
           { id: "opus", label: "Opus", brain: "cloud", efforts: CLAUDE_EFFORTS },
@@ -400,7 +400,7 @@ function chatsFetchWithHostedChoice(
     efforts: [],
   };
   return async (path, init) => {
-    if (path === "/assistant/models") {
+    if (path.split("?")[0] === "/assistant/models") {
       const models = (await base(path, init)) as AssistantModels;
       return { ...models, choices: [...models.choices, hosted] };
     }
@@ -430,7 +430,7 @@ function chatsFetchWithToollessChoice(
     tools: false,
   };
   return async (path, init) => {
-    if (path === "/assistant/models") {
+    if (path.split("?")[0] === "/assistant/models") {
       const models = (await base(path, init)) as AssistantModels;
       return { ...models, choices: [...models.choices, toolless] };
     }
@@ -477,7 +477,7 @@ function chatsFetchWithEveryRoute(
     installed: false,
   };
   return async (path, init) => {
-    if (path === "/assistant/models") {
+    if (path.split("?")[0] === "/assistant/models") {
       const models = (await base(path, init)) as AssistantModels;
       const choices = models.choices.map((choice) =>
         choice.brain === "local" ? { ...choice, installed: true } : choice,
@@ -1050,6 +1050,60 @@ describe("Chats - a conversation that grew too long for its window", () => {
 });
 
 describe("Chats - choosing a model", () => {
+  it("the conversation header asks for that conversation's own menu", async () => {
+    const requested: string[] = [];
+    const base = chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      requested.push(path);
+      return base(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+
+    await waitFor(() => {
+      expect(requested).toContain("/assistant/models?chat=c-1");
+    });
+  });
+
+  it("the front door still asks for the daemon-wide menu", async () => {
+    const requested: string[] = [];
+    const base = chatsFetch([], {});
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      requested.push(path);
+      return base(path, init);
+    });
+
+    await renderChats("/chats");
+
+    await waitFor(() => {
+      expect(requested).toContain("/assistant/models");
+      expect(requested.filter((path) => path.includes("?chat="))).toHaveLength(0);
+    });
+  });
+
+  it("a Codex model the daemon offers a rooted conversation is on its picker", async () => {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
+    const codex: ModelChoice = {
+      id: "gpt-5.5",
+      label: "GPT-5.5",
+      brain: "cloud",
+      efforts: ["low", "high"],
+      runner: "codex",
+    };
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      const models = (await base(path, init)) as AssistantModels;
+      if (path === "/assistant/models?chat=c-1") {
+        return { ...models, choices: [...models.choices, codex] };
+      }
+      return models;
+    });
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    expect(await screen.findByRole("menuitemradio", { name: /^GPT-5.5/ })).toBeDefined();
+  });
+
   it("offers the daemon's list rather than a list of its own", async () => {
     daemon.apiFetch.mockImplementation(chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }));
 
@@ -1685,20 +1739,28 @@ describe("Chats - the helpers a conversation may hand work to", () => {
 
     // One PATCH carrying the WHOLE set — which is how the daemon stores it, and what makes "two
     // windows saved at once" answerable with "the last one wins" instead of a merge rule.
+    //
+    // Parsed rather than matched against a `JSON.stringify`, for the reason the test below states
+    // about itself: what is asserted is WHICH FIELDS travel, and a string comparison also pins
+    // their order. `save()` spreads the draft, so the order on the wire is `blankHelper`'s
+    // insertion order and not the order written here — the same object, failing for a reason this
+    // test is not about.
     await waitFor(() => {
-      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
-        method: "PATCH",
-        body: JSON.stringify({
-          agents: [
-            {
-              name: "reviewer",
-              description: "Reviews a diff for correctness",
-              prompt: "You are a code reviewer.",
-              model: null,
-              effort: null,
-            },
-          ],
-        }),
+      const patch = daemon.apiFetch.mock.calls.find(
+        ([url, init]) => url === "/assistant/chats/c-1" && init?.method === "PATCH",
+      );
+      expect(patch).toBeDefined();
+      expect(JSON.parse(patch![1].body)).toEqual({
+        agents: [
+          {
+            name: "reviewer",
+            description: "Reviews a diff for correctness",
+            prompt: "You are a code reviewer.",
+            tools: null,
+            model: null,
+            effort: null,
+          },
+        ],
       });
     });
   });
@@ -1755,12 +1817,101 @@ describe("Chats - the helpers a conversation may hand work to", () => {
             description: "d, revised",
             prompt: "p",
             reasoning: "high",
+            tools: null,
             model: null,
             effort: null,
           },
         ],
       });
     });
+  });
+
+  it("keeps a helper's tools when an unrelated field is edited and saved", async () => {
+    // THE TRAP: `save()` used to build each helper object field by field with no spread, so a field
+    // not named there disappeared with no error. This is the test that would have caught it — it
+    // fails against a `save()` missing the `tools` line, and only that line fixes it.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({
+            chat_id: "c-1",
+            agents: [
+              {
+                name: "reviewer",
+                description: "d",
+                prompt: "p",
+                tools: ["Read", "Edit"],
+              },
+            ],
+          }),
+        ],
+        { "c-1": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+
+    fireEvent.change(await screen.findByLabelText("When to use it"), {
+      target: { value: "d, revised" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({
+          agents: [
+            {
+              name: "reviewer",
+              description: "d, revised",
+              prompt: "p",
+              tools: ["Read", "Edit"],
+              model: null,
+              effort: null,
+            },
+          ],
+        }),
+      });
+    });
+  });
+
+  it("refuses a stored helper naming a tool the daemon does not serve, or a CLI pattern rather than a name", async () => {
+    // Neither of these could be reached through the checkbox menu itself — that only ever offers
+    // the served list — but a helper saved before the list moved, or edited through the API
+    // directly, can still arrive with a name the door would now refuse. Same rule as
+    // `checked_denials` on the daemon: a pattern like `Bash(git *)` is never a name the served list
+    // contains, so one membership check catches both.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({
+            chat_id: "c-1",
+            agents: [
+              { name: "reviewer", description: "d", prompt: "p", tools: ["NoSuchTool"] },
+              { name: "runner", description: "d", prompt: "p", tools: ["Bash(git *)"] },
+            ],
+          }),
+        ],
+        { "c-1": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+
+    // Waits on the served list arriving — before that, every name would read as unknown, which
+    // would flash a refusal a helper opened with valid tools does not deserve.
+    const alerts = await screen.findAllByRole("alert");
+    expect(alerts).toHaveLength(2);
+    expect(alerts[0].textContent).toMatch(/is not a tool the daemon can grant/i);
+    expect(alerts[1].textContent).toMatch(/is not a tool the daemon can grant/i);
+    const save = screen.getByRole("button", { name: /^save$/i }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith(
+      "/assistant/chats/c-1",
+      expect.objectContaining({ method: "PATCH" }),
+    );
   });
 
   it("says why a helper would be refused, in place, before anything is sent", async () => {
@@ -2190,7 +2341,7 @@ describe("Chats - what it may do without asking", () => {
   // The owner's decision, and the reason the menu opens at all rather than being greyed whole: a
   // disabled control with no explanation is a dead end, and one of the two reasons — an unwired
   // hook — is a button away in the panel above.
-  it("offers Plan and Auto without tools, and says why the other three are out of reach", async () => {
+  it("offers Plan and Auto without tools, and says why the other four are out of reach", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(
         [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/fresh-worktree" })],
@@ -2224,6 +2375,11 @@ describe("Chats - what it may do without asking", () => {
     expect(reachable(/Auto/)).toBe(true);
     expect(reachable(/Manual/)).toBe(false);
     expect(reachable(/Edit automatically/)).toBe(false);
+    // `dont_ask` allows precisely what `auto` allows, and is out of reach here anyway: what a
+    // person chooses when they choose it is what the hook does with the calls it does NOT allow,
+    // and a conversation whose turns get no tools never has one. Grouping it with `auto` on this
+    // flag would be reading the permissions and not the choice.
+    expect(reachable(/Never ask/)).toBe(false);
     expect(reachable(/Bypass permissions/)).toBe(false);
     expect(
       screen.getAllByText(/the classifier hook is not wired in this project/).length,
