@@ -122,8 +122,9 @@ fi
 # The Python this repo ships. In `all`, unlike `security`, because it is offline and hermetic and
 # because being outside the everyday command is exactly how it went uncovered.
 #
-# `.claude/hooks/ask_daemon.py` is not a helper script: `core/src/triage.rs` does `include_str!` on
-# it, so it is compiled INTO the daemon, and its filter decides whether a git operation a person
+# `core/hooks/ask_daemon.py` is not a helper script: `core/src/autopilot.rs` and `core/src/triage.rs`
+# both `include_str!` it (`.claude/hooks/ask_daemon.py` is a byte copy the tests hold equal), so it
+# is compiled INTO the daemon, and its filter decides whether a git operation a person
 # types is refused and sent to the queue. It shipped with a hole that a `cd` walked through — the
 # filter read only the first two tokens of the command — and nothing here would have noticed,
 # because nothing here ran it. Found by accident, in use.

@@ -22,7 +22,7 @@ the contract, not a snapshot.
 |---|---|
 | `main.rs` | Startup orchestration ONLY: logging → autostart → storage → reconcile orphaned runs/stranded approvals/orphaned worktrees → secrets/token → model config → `AppState` → HTTP router → sidecar + scheduler + repo-poller + worktree-GC background tasks → serve. No business logic. |
 | `logging.rs` | `tracing` subscriber (rotating daily file + stdout), initialized first to catch a failed startup. |
-| `autostart.rs` | Self-registers OS autostart (Windows Scheduled Task, `LogonTrigger` + `RestartOnFailure`), independent of the shell. Non-fatal on failure. |
+| `autostart.rs` | Self-registers OS autostart at login, independent of the shell: a Windows Scheduled Task (`LogonTrigger` + `RestartOnFailure`), a macOS LaunchAgent, or on Linux a systemd user unit or an XDG autostart entry (one Linux backend at a time). Registering never starts a second daemon. Non-fatal on failure. |
 | `storage.rs` | SQLite pool + WAL + `sqlx::migrate!`. Knows the storage *mechanism* only — never a table's meaning. |
 | `backup.rs` | Backup files: takes a consistent snapshot, verifies one, and stages a restore for the next startup to apply. |
 | `auth.rs` | Local token generation + the bearer-token middleware on protected routes. |

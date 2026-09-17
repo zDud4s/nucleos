@@ -202,7 +202,7 @@ def control_token(cwd: str) -> str:
     """The daemon's own token, read the way the desktop app reads it.
 
     An editor session inherits no NucleOS environment, so the token has to be fetched
-    rather than found. It lives in Credential Manager under the person's own account,
+    rather than found. It lives in the system credential store under the person's own account,
     which is exactly who is sitting here — this grants nothing the session did not
     already have, it only stops the session having to be told how.
 
