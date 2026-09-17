@@ -1955,6 +1955,7 @@ pub async fn reconcile_interrupted(pool: &sqlx::SqlitePool) -> sqlx::Result<u64>
             "vcs_request_interrupted",
             &format!("vcs request {id} interrupted: daemon restarted mid-operation"),
             *run_id,
+            Some(&crate::feed::Subject::Vcs(*id)),
         )
         .await;
     }
@@ -2003,6 +2004,7 @@ pub async fn cancel_for_run(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Resul
             "vcs_request_cancelled",
             &format!("vcs request {id} cancelled with run {run_id}"),
             Some(run_id),
+            Some(&crate::feed::Subject::Vcs(*id)),
         )
         .await;
     }
@@ -2108,6 +2110,7 @@ pub async fn reap_requests_of_ended_runs(
             "vcs_request_cancelled",
             &format!("vcs request {id} cancelled: the run that asked for it had already ended"),
             *run_id,
+            Some(&crate::feed::Subject::Vcs(*id)),
         )
         .await;
     }
@@ -2480,6 +2483,7 @@ pub async fn drain_once(
                 "vcs_request_finished",
                 &summary,
                 None,
+                Some(&crate::feed::Subject::Vcs(id)),
             )
             .await;
         }
@@ -4896,19 +4900,20 @@ mod tests {
     #[tokio::test]
     async fn a_finished_request_is_reported_in_the_feed() {
         let pool = test_pool().await;
-        submit(&pool, &repo(), &merge_op(), Origin::Human)
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
             .await
             .unwrap();
 
         drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
 
-        let summaries: Vec<String> =
-            sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'vcs_request_finished'")
+        let lines: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT summary, subject FROM feed WHERE kind = 'vcs_request_finished'")
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(summaries.len(), 1);
-        assert!(summaries[0].contains("succeeded"), "got: {}", summaries[0]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].0.contains("succeeded"), "got: {}", lines[0].0);
+        assert_eq!(lines[0].1, Some(format!("vcs:{id}")));
     }
 
     /// An escalation is the one outcome whose reason has to reach the feed, and the one whose

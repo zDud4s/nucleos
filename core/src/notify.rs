@@ -51,7 +51,7 @@ pub async fn deliver_or_defer(
     // See calendar.rs — this is the one place in the tree where failing open is the correct
     // direction, because the failure being guarded against is silence.
     if !crate::calendar::busy_at(pool, Utc::now()).await {
-        crate::feed::append(pool, None, kind, summary, None).await?;
+        crate::feed::append(pool, None, kind, summary, None, None).await?;
         return Ok(true);
     }
 
@@ -92,7 +92,7 @@ pub async fn flush_due(pool: &sqlx::SqlitePool) -> sqlx::Result<usize> {
         // re-delivers rather than loses. Between an unwanted second ping and a message that never
         // arrives, this pillar has already chosen: the whole reason the queue is durable is that
         // notifications must not evaporate.
-        crate::feed::append(pool, None, &kind, &summary, None).await?;
+        crate::feed::append(pool, None, &kind, &summary, None, None).await?;
         sqlx::query("UPDATE pending_notifications SET delivered_at = ? WHERE id = ?")
             .bind(Utc::now().to_rfc3339())
             .bind(id)

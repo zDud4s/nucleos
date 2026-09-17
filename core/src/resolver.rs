@@ -259,6 +259,7 @@ async fn cancel_settled(state: &AppState) {
                 row.request_id, row.settled_id
             ),
             Some(row.run_id),
+            Some(&crate::feed::Subject::Vcs(row.request_id)),
         )
         .await;
     }
@@ -370,6 +371,7 @@ async fn launch_once(state: &AppState) -> Option<i64> {
                     candidate.id
                 ),
                 Some(run_id),
+                Some(&crate::feed::Subject::Vcs(candidate.id)),
             )
             .await;
             Some(run_id)
@@ -504,6 +506,7 @@ async fn record_discards(pool: &sqlx::SqlitePool) {
             published.id
         ),
         None,
+        Some(&crate::feed::Subject::Vcs(published.id)),
     )
     .await;
 }

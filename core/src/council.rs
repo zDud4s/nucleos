@@ -996,6 +996,7 @@ pub async fn start(
         "council_started",
         &format!("council convened with {} seats", members.len()),
         None,
+        Some(&crate::feed::Subject::Council(id.clone())),
     )
     .await;
 
@@ -1122,6 +1123,7 @@ impl Driver {
                 self.members.len()
             ),
             None,
+            Some(&crate::feed::Subject::Council(self.id.clone())),
         )
         .await;
 
@@ -1197,6 +1199,7 @@ impl Driver {
             "council_stage",
             &format!("council phase 2 done: {} seats ranked", leaderboard.len()),
             None,
+            Some(&crate::feed::Subject::Council(self.id.clone())),
         )
         .await;
 
@@ -1241,6 +1244,7 @@ impl Driver {
                     "council_finished",
                     &format!("council {status}"),
                     None,
+                    Some(&crate::feed::Subject::Council(self.id.clone())),
                 )
                 .await;
             }
@@ -1748,6 +1752,7 @@ pub async fn cancel(state: &crate::state::AppState, id: &str) -> sqlx::Result<bo
             "council_finished",
             "council cancelled",
             None,
+            Some(&crate::feed::Subject::Council(id.to_owned())),
         )
         .await;
     }
@@ -3877,6 +3882,23 @@ mod tests {
         let row = settled(&state, &id).await;
         assert_eq!(row.status, STATUS_CANCELLED);
         assert_eq!(row.error, None);
+
+        // Convened and cancelled are two lines of one council's story, keyed by the council's id.
+        let lines: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT kind, subject FROM feed WHERE kind IN ('council_started', 'council_finished')
+             ORDER BY id",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        let council = format!("council:{id}");
+        assert_eq!(
+            lines,
+            [
+                ("council_started".to_string(), Some(council.clone())),
+                ("council_finished".to_string(), Some(council)),
+            ]
+        );
 
         assert!(matches!(
             post_council_cancel(

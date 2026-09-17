@@ -728,6 +728,7 @@ pub async fn pretooluse_decision(
                             payload.tool_name, run_id
                         ),
                         Some(run_id),
+                        Some(&crate::feed::run_subject(&state.pool, run_id).await),
                     )
                     .await;
                     return Json(Decision {
@@ -2189,6 +2190,7 @@ async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name
             "run_stopped_probing",
             &format!("run {run_id} was stopped after {denials} denied actions (last: {tool_name})"),
             Some(run_id),
+            Some(&crate::feed::run_subject(&state.pool, run_id).await),
         )
         .await;
     })
@@ -2303,6 +2305,7 @@ async fn pause_for_approval(
             "proposal_record_failed",
             &format!("failed to record action-approval proposal: {error}"),
             Some(run_id),
+            Some(&crate::feed::run_subject(&state.pool, run_id).await),
         )
         .await;
 
@@ -2540,6 +2543,7 @@ async fn skip_the_item(state: AppState, item: SkippedItem) {
             "proposal_record_failed",
             &format!("failed to record skipped-item proposal: {error}"),
             Some(run_id),
+            Some(&crate::feed::run_subject(&state.pool, run_id).await),
         )
         .await;
         // Deliberately NOT rolled back, where the action-approval path above rolls its pause back.

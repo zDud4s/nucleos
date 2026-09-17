@@ -339,6 +339,12 @@ pub fn build_router(state: AppState) -> Router {
             post(post_project_workflow_adopt),
         )
         .route("/feed", get(get_feed))
+        // Beside `/feed` and not a parameter on it: `/feed` answers the Telegram sidecar's newest-50
+        // listing, and a window of a day oldest-first is a different question with a different
+        // shape. Folding it in would put that listing one query-string typo away from a 5000-row
+        // answer.
+        .route("/feed/timeline", get(get_feed_timeline))
+        .route("/feed/seen", get(get_feed_seen).post(post_feed_seen))
         .route("/runs", get(get_runs).post(create_run))
         .route(
             "/webhooks/push",
@@ -1097,6 +1103,20 @@ struct FeedQuery {
     since: Option<String>,
     until: Option<String>,
     limit: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FeedTimelineQuery {
+    /// Required, and an `Option` only so a missing one is this handler's 400 rather than the
+    /// extractor's — the same answer, reached through the one place that explains it.
+    since: Option<String>,
+    until: Option<String>,
+    after_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct FeedSeenRequest {
+    through: i64,
 }
 
 #[derive(Deserialize)]
@@ -5863,6 +5883,7 @@ async fn post_project_write(
         "config_written",
         &format!("{path} written from the app"),
         None,
+        None,
     )
     .await
     {
@@ -6125,7 +6146,7 @@ async fn post_project_command_run(
             {
                 tracing::error!(%error, command_id, "a project command finished and was not recorded");
             }
-            let _ = crate::feed::append(&pool, Some(&project_id), "command_finished", &said, None)
+            let _ = crate::feed::append(&pool, Some(&project_id), "command_finished", &said, None, None)
                 .await;
         });
         true
@@ -7496,6 +7517,7 @@ async fn workflow_feed(state: &AppState, project_id: &str, said: &str) {
         "workflow_changed",
         said,
         None,
+        None,
     )
     .await
     {
@@ -7734,6 +7756,47 @@ async fn get_feed(
     )
     .await;
     entries
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_feed_timeline(
+    State(state): State<AppState>,
+    Query(query): Query<FeedTimelineQuery>,
+) -> Result<Json<feed::Timeline>, StatusCode> {
+    let since = parse_time_bound(query.since)?.ok_or(StatusCode::BAD_REQUEST)?;
+    let until = parse_time_bound(query.until)?;
+    feed::timeline_window(since, until, chrono::Utc::now()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    feed::timeline(
+        &state.pool,
+        since,
+        until,
+        query.after_id,
+        feed::TIMELINE_MAX,
+    )
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_feed_seen(State(state): State<AppState>) -> Result<Json<feed::Seen>, StatusCode> {
+    feed::seen(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn post_feed_seen(
+    State(state): State<AppState>,
+    Json(body): Json<FeedSeenRequest>,
+) -> Result<Json<feed::Seen>, StatusCode> {
+    // Refused rather than clamped to zero: no line has a negative id, so a caller sending one has
+    // mixed something up, and storing the nearest legal value would hide that from it.
+    if body.through < 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    feed::mark_seen(&state.pool, body.through, chrono::Utc::now())
+        .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -13033,7 +13096,15 @@ async fn announce_promotable(pool: &sqlx::SqlitePool, project_id: &str, was_prom
         shadow::READINESS_MIN_REVIEWED,
         shadow::READINESS_MIN_AGREE_PERCENT,
     );
-    let _ = feed::append(pool, Some(project_id), "promotion_ready", &summary, None).await;
+    let _ = feed::append(
+        pool,
+        Some(project_id),
+        "promotion_ready",
+        &summary,
+        None,
+        None,
+    )
+    .await;
 }
 
 async fn get_scoreboard(
@@ -28437,7 +28508,7 @@ mod tests {
     async fn feed_scope_all_returns_global_and_project_rows() {
         let state = test_state().await;
         let pool = state.pool.clone();
-        crate::feed::append(&pool, None, "global", "global summary", None)
+        crate::feed::append(&pool, None, "global", "global summary", None, None)
             .await
             .unwrap();
         crate::feed::append(
@@ -28446,6 +28517,7 @@ mod tests {
             "project",
             "project a summary",
             None,
+            Some(&crate::feed::Subject::Job(57)),
         )
         .await
         .unwrap();
@@ -28470,14 +28542,16 @@ mod tests {
         let entries = parsed.as_array().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["summary"], "project a summary");
+        assert_eq!(entries[0]["subject"], "job:57");
         assert_eq!(entries[1]["summary"], "global summary");
+        assert!(entries[1]["subject"].is_null());
     }
 
     #[tokio::test]
     async fn feed_project_query_returns_only_that_project() {
         let state = test_state().await;
         let pool = state.pool.clone();
-        crate::feed::append(&pool, None, "global", "global summary", None)
+        crate::feed::append(&pool, None, "global", "global summary", None, None)
             .await
             .unwrap();
         crate::feed::append(
@@ -28485,6 +28559,7 @@ mod tests {
             Some("project-a"),
             "project",
             "project a summary",
+            None,
             None,
         )
         .await
@@ -28494,6 +28569,7 @@ mod tests {
             Some("project-b"),
             "project",
             "project b summary",
+            None,
             None,
         )
         .await
@@ -28526,7 +28602,7 @@ mod tests {
     async fn feed_without_query_returns_only_global_rows() {
         let state = test_state().await;
         let pool = state.pool.clone();
-        crate::feed::append(&pool, None, "global", "global summary", None)
+        crate::feed::append(&pool, None, "global", "global summary", None, None)
             .await
             .unwrap();
         crate::feed::append(
@@ -28534,6 +28610,7 @@ mod tests {
             Some("project-a"),
             "project",
             "project a summary",
+            None,
             None,
         )
         .await
@@ -28749,6 +28826,9 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 1);
         assert_eq!(parsed[0]["summary"], "Autopilot March work");
+        // Search hands out the same entry as the list, a row written before subjects included.
+        assert!(parsed[0].as_object().unwrap().contains_key("subject"));
+        assert!(parsed[0]["subject"].is_null());
     }
 
     #[tokio::test]
@@ -28803,6 +28883,212 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// One request against the full router, answered as status plus parsed body (`Null` when the
+    /// body is not JSON, which is what a refusal carries).
+    async fn feed_request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", "Bearer test-token");
+        if body.is_some() {
+            request = request.header("content-type", "application/json");
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .body(body.map_or_else(Body::empty, |body| Body::from(body.to_owned())))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// The route the redesigned feed page reads its day from: every owner's lines, oldest first,
+    /// wrapped in an object that can say it was cut. The entry is the shape `/feed` already hands
+    /// out, field for field, so the page has one entry type and not two.
+    #[tokio::test]
+    async fn the_timeline_answers_every_scope_oldest_first_in_the_feed_s_own_shape() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let machine = crate::feed::append(&pool, None, "kill_switch", "machine", None, None)
+            .await
+            .unwrap();
+        let project = crate::feed::append(
+            &pool,
+            Some("alpha"),
+            "run_completed",
+            "project",
+            Some(3),
+            Some(&crate::feed::Subject::Run(3)),
+        )
+        .await
+        .unwrap();
+        let errand = crate::feed::append_for_errand(&pool, 9, "errand_rule_fired", "errand", None)
+            .await
+            .unwrap();
+        let app = build_router(state);
+        let since = urlencoding(&since.to_rfc3339());
+
+        let (status, body) =
+            feed_request(&app, "GET", &format!("/feed/timeline?since={since}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["truncated"], false);
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            [machine, project, errand]
+        );
+        let mut keys = entries[1]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "created_at",
+                "errand_id",
+                "id",
+                "kind",
+                "project_id",
+                "run_id",
+                "subject",
+                "summary"
+            ]
+        );
+        assert_eq!(entries[1]["project_id"], "alpha");
+        assert_eq!(entries[1]["run_id"], 3);
+        assert_eq!(entries[1]["subject"], "run:3");
+        assert_eq!(entries[2]["errand_id"], 9);
+        assert_eq!(entries[2]["subject"], "errand:9");
+        // Present and null, not absent: the page tells "no subject" from "an older daemon" by it.
+        assert!(entries[0].as_object().unwrap().contains_key("subject"));
+        assert!(entries[0]["subject"].is_null());
+
+        let (status, body) = feed_request(
+            &app,
+            "GET",
+            &format!("/feed/timeline?since={since}&after_id={project}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["entries"][0]["id"], errand);
+    }
+
+    /// Every way to ask for a window that is not one. A 400 and not an empty list, because an empty
+    /// day and a malformed question look identical to a page that trusts the answer.
+    #[tokio::test]
+    async fn a_timeline_window_that_is_not_one_is_refused() {
+        let app = build_router(test_state().await);
+        let now = chrono::Utc::now();
+        let encode = |time: chrono::DateTime<chrono::Utc>| urlencoding(&time.to_rfc3339());
+        let week_ago = encode(now - chrono::Duration::days(7));
+
+        for uri in [
+            "/feed/timeline".to_owned(),
+            "/feed/timeline?since=yesterday".to_owned(),
+            format!("/feed/timeline?since={week_ago}&until=later"),
+            format!(
+                "/feed/timeline?since={week_ago}&until={}",
+                encode(now - chrono::Duration::days(8))
+            ),
+            format!(
+                "/feed/timeline?since={}",
+                encode(now - chrono::Duration::days(32))
+            ),
+            format!(
+                "/feed/timeline?since={}&until={}",
+                encode(now - chrono::Duration::days(60)),
+                encode(now - chrono::Duration::days(28))
+            ),
+            format!("/feed/timeline?since={week_ago}&after_id=many"),
+        ] {
+            let (status, _) = feed_request(&app, "GET", &uri, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "GET {uri}");
+        }
+    }
+
+    /// The read marker end to end: nothing on a fresh machine, forward only, never past the newest
+    /// line, and a negative id refused rather than stored.
+    #[tokio::test]
+    async fn the_read_marker_starts_empty_moves_forward_and_stops_at_the_newest_line() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let first = crate::feed::append(&pool, None, "event", "one", None, None)
+            .await
+            .unwrap();
+        let second = crate::feed::append(&pool, None, "event", "two", None, None)
+            .await
+            .unwrap();
+        let app = build_router(state);
+
+        let (status, body) = feed_request(&app, "GET", "/feed/seen", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({"through": null, "through_created_at": null, "seen_at": null})
+        );
+
+        let (status, body) = feed_request(
+            &app,
+            "POST",
+            "/feed/seen",
+            Some(&format!(r#"{{"through":{second}}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["through"], second);
+        assert!(body["through_created_at"].is_string());
+        assert!(body["seen_at"].is_string());
+
+        let (_, behind) = feed_request(
+            &app,
+            "POST",
+            "/feed/seen",
+            Some(&format!(r#"{{"through":{first}}}"#)),
+        )
+        .await;
+        assert_eq!(behind["through"], second, "a lower marker moved it back");
+
+        let (_, ahead) = feed_request(
+            &app,
+            "POST",
+            "/feed/seen",
+            Some(&format!(r#"{{"through":{}}}"#, second + 50)),
+        )
+        .await;
+        assert_eq!(ahead["through"], second);
+
+        let (status, read_back) = feed_request(&app, "GET", "/feed/seen", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read_back, ahead);
+
+        let (status, _) = feed_request(&app, "POST", "/feed/seen", Some(r#"{"through":-1}"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

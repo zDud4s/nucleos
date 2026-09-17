@@ -534,6 +534,7 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                         rule.name
                     ),
                     None,
+                    None,
                 )
                 .await;
             }

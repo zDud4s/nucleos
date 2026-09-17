@@ -372,6 +372,7 @@ pub async fn set_enabled(
             "team_trigger_armed",
             &format!("`{}` is armed for {}", trigger.name, trigger.team_id),
             None,
+            None,
         )
         .await;
     }
@@ -811,6 +812,7 @@ async fn fire(
                 "`{}` did not start {}: {why}",
                 trigger.name, trigger.team_id
             ),
+            None,
             None,
         )
         .await;
