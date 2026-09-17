@@ -637,15 +637,15 @@ async fn main() {
     let log_dir = data_dir.join("logs");
     let _log_guard = logging::init(&log_dir);
 
-    // Only the machine's daemon claims the logon task. `ensure_registered` writes it with
-    // `schtasks /F`, so a secondary doing this would point the machine's autostart at whatever
+    // Only the machine's daemon claims the logon entry. `ensure_registered` overwrites it (on
+    // Windows with `schtasks /F`), so a secondary doing this would point the autostart at whatever
     // build is under test — typically one inside a worktree that is about to be deleted, leaving a
     // task that runs nothing.
     if is_primary {
         match std::env::current_exe() {
             Ok(exe_path) => {
                 if let Err(e) = autostart::ensure_registered(&exe_path) {
-                    tracing::warn!("failed to self-register Windows autostart task: {e}");
+                    tracing::warn!("failed to register the daemon's autostart entry: {e}");
                 }
             }
             Err(e) => {
