@@ -48,6 +48,30 @@ fn show_main(app: &tauri::AppHandle) {
     }
 }
 
+/// Linux only: WebKitGTK ships with media streams off and answers no permission request, so
+/// `getUserMedia` failed before anyone was asked. Only the app's own bundle loads in this webview
+/// (the CSP fences the rest), and only an audio-only user-media request is granted; every other
+/// request falls through to WebKitGTK's default, which refuses it.
+#[cfg(target_os = "linux")]
+fn allow_the_microphone(webview: &webkit2gtk::WebView) {
+    use glib::prelude::*;
+    use webkit2gtk::{PermissionRequestExt, SettingsExt, UserMediaPermissionRequest, WebViewExt};
+
+    if let Some(settings) = webview.settings() {
+        settings.set_enable_media_stream(true);
+    }
+    webview.connect_permission_request(|_, request| {
+        // Both callers (lib/capture.ts, data/conversation.ts) ask for audio alone.
+        let audio_only = request.is::<UserMediaPermissionRequest>()
+            && request.property::<bool>("is-for-audio-device")
+            && !request.property::<bool>("is-for-video-device");
+        if audio_only {
+            request.allow();
+        }
+        audio_only
+    });
+}
+
 // Left at the crate root's default visibility on purpose: `#[tauri::command]` re-exports helper
 // macros with the function's visibility, and `pub(crate)` makes that re-export collide with its own
 // definition (E0255). `dictation` reaches it as `crate::get_daemon_token` because a private item in
@@ -124,6 +148,12 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // The microphone on Linux: see allow_the_microphone.
+            #[cfg(target_os = "linux")]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.with_webview(|webview| allow_the_microphone(&webview.inner()));
+            }
 
             Ok(())
         })
@@ -205,6 +235,21 @@ mod tests {
             CLOSE,
             CloseAction::Hide,
             "the tray brings the window back here"
+        );
+    }
+
+    /// Spec 1.10: without these, macOS refuses `getUserMedia` (capture.ts, conversation.ts).
+    #[test]
+    fn the_microphone_is_declared_to_macos() {
+        let info = include_str!("../Info.plist");
+        assert!(info.contains("<key>NSMicrophoneUsageDescription</key>"));
+        let entitlements = include_str!("../Entitlements.plist");
+        assert!(entitlements.contains("<key>com.apple.security.device.audio-input</key>"));
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri.conf.json parses");
+        assert_eq!(
+            conf["bundle"]["macOS"]["entitlements"],
+            "./Entitlements.plist"
         );
     }
 }
