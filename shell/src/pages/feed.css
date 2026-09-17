@@ -1,50 +1,191 @@
 /**
- * The Feed slice: the filter bar, the freeze notice and the line list.
- * `feed-` throughout, as `runs-` is for the run index and `fleet-` for the
- * fleet.
+ * The Feed slice: the verdict, the toolbar, the trace, the sequence opened from it and the
+ * day-grouped list under them.
+ * `feed-` throughout, as `runs-` is for the run index and `fleet-` for the fleet.
  *
  * The rule this file lives under: **no class appears in a component that is not
- * defined below.** `tsc` and vitest both pass happily on a class no stylesheet
- * has ever heard of, and the defect shows up only as something looking wrong on
- * a screen nobody is testing.
+ * defined below.** `tsc` and vitest both pass happily on a class no stylesheet has
+ * ever heard of, and the defect shows up only as something looking wrong on a
+ * screen nobody is testing.
  *
- * The `ui-` rules this page leans on — the relative time in every row's head —
- * are not repeated here. They live in `runs.css` under its own heading, on loan
- * from the design system until they move to `ui.css`, and both sheets are in
- * the bundle because both pages are statically imported by the router.
+ * No tone is chosen here for a line. The trace's exception marks take `ui-mark-*` from `ui.css`,
+ * chosen by `feedMarkTone`; the tones below colour a whole SEQUENCE by the gravity
+ * `lib/sequences.ts` read off the map — its bar and the words for how it ended — and everything
+ * else this sheet owns (lanes, ticks, silences, the playhead) is the neutral ladder.
  */
+
+/* --------------------------------------------------------------- verdict -- */
+
+/**
+ * The sentence under the title. Wraps as a sentence does: at 800px the counts fall to a second
+ * line rather than the window being cut.
+ */
+.feed-verdict {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: var(--space-2);
+  row-gap: var(--space-1);
+}
+
+.feed-verdict-window {
+  color: var(--text-muted);
+}
+
+.feed-verdict-dot {
+  color: var(--text-muted);
+}
+
+/**
+ * A count, and the way to its newest line.
+ *
+ * Primary text with the quiet control's hairline underline: it is the part of the sentence that
+ * matters and the part that does something, and neither of those is a hue. 24px tall at least,
+ * so the target is not the height of the glyphs.
+ */
+.feed-verdict-count {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 0.2em;
+  cursor: pointer;
+}
+
+.feed-verdict-count:hover {
+  text-decoration-color: currentColor;
+}
+
+/* The trace's own mark, as the key to it. Nudged onto the text's x-height rather than its baseline. */
+.feed-verdict-key {
+  flex: none;
+  align-self: center;
+}
+
+.feed-verdict-n {
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+/* --------------------------------------------------------------- toolbar -- */
+
+/**
+ * The window, the one mark-seen control, and the search — one row that wraps.
+ *
+ * The search goes to the far end with `margin-left: auto`, and the filter panel behind "More"
+ * takes a whole line of its own under the row. That is what `display: contents` on the form buys:
+ * the field and the panel are children of this flex row for layout, and one form for submission.
+ */
+.feed-tools {
+  /* One height for every control in the filter panel, declared once and read three times. */
+  --feed-control-h: calc(var(--text-sm) * var(--leading-normal) + 2 * var(--space-2) + 2px);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.feed-search {
+  display: contents;
+}
+
+.feed-search-bar {
+  display: flex;
+  align-items: stretch;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
+/* The same box as the window switch beside it, so the row reads as one line of controls. */
+.feed-search-input {
+  width: 16rem;
+  min-width: 0;
+  padding: 0.34rem var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-sm);
+}
+
+.feed-search-input::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+.feed-search-more {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0.34rem var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+}
+
+.feed-search-more:hover,
+.feed-search-more[aria-expanded="true"] {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.feed-search-chevron {
+  transition: transform var(--dur-quick) var(--ease);
+}
+
+.feed-search-more[aria-expanded="true"] .feed-search-chevron {
+  transform: rotate(180deg);
+}
 
 /* --------------------------------------------------------------- filters -- */
 
 /**
- * Seven filters on one line that wraps.
+ * Six filters behind "More", on one line that wraps.
  *
- * A grid would give every filter the same width, which is wrong here: the text
- * box wants the room and the two number boxes want almost none. Flex with
- * per-filter widths says that out loud.
+ * A grid would give every filter the same width, which is wrong here: the kind box wants the room
+ * and the two number boxes want almost none. Flex with per-filter widths says that out loud.
  */
 .feed-filters {
-  /* One height for every control in this row, declared once and read three times. */
-  --feed-control-h: calc(var(--text-sm) * var(--leading-normal) + 2 * var(--space-2) + 2px);
   display: flex;
+  flex-basis: 100%;
   flex-wrap: wrap;
   align-items: flex-end;
   gap: var(--space-3);
-  margin-bottom: var(--space-4);
   padding: var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--surface);
 }
 
+.feed-filters[hidden] {
+  display: none;
+}
+
+/* Muted and not faint: an 11px label at faint measured 3.8:1 on the working surface. */
 .feed-filter {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
   font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 
 .feed-filter input,
@@ -53,7 +194,7 @@
   min-width: 9rem;
   padding: var(--space-2);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background: var(--surface-sunken);
   color: var(--text);
   font-family: inherit;
@@ -62,8 +203,9 @@
   letter-spacing: normal;
 }
 
-.feed-filter-text input {
-  min-width: 16rem;
+.feed-filter input::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
 }
 
 /* An id and a count. Both are two or three digits and neither earns a column. */
@@ -110,142 +252,1118 @@
   line-height: var(--leading-snug);
 }
 
-/* ------------------------------------------------------------------ list -- */
+/* ---------------------------------------------------------------- states -- */
 
 .feed-loading {
   margin: 0;
-  color: var(--text-faint);
+  color: var(--text-muted);
   font-size: var(--text-sm);
   font-style: italic;
 }
 
-.feed-list {
+/* More lines than the route will send. Said in words, above the trace it limits. */
+.feed-truncated {
+  max-width: var(--measure-prose);
+  margin: 0 0 var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+.feed-teach-actions {
   display: flex;
-  flex-direction: column;
-  gap: 1px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+}
+
+/* ----------------------------------------------------------------- trace -- */
+
+/**
+ * The trace: a row per sequence under its lane, a ruler above, a transport below.
+ *
+ * Three columns share every row — the name, the track, how it ended — and the ruler, the grid, the
+ * playhead and the scrub surface are laid over the middle one, so all of them are positioned from
+ * the same two widths. Those widths are custom properties on the frame rather than on the section,
+ * because a container query cannot restyle the container it queries.
+ *
+ * A container, so the trace adapts to the room it is given rather than to the window: with the
+ * rail open at 800×600 it has ~500px, and the right column drops its words before the track
+ * shrinks to nothing.
+ */
+.feed-trace {
+  container: feed-trace / inline-size;
+  margin-bottom: var(--space-4);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
   overflow: hidden;
 }
 
-/**
- * One line. Hairline-separated rather than carded: the feed is read by
- * scanning down it, and fifty cards with their own borders turn a column into a
- * pile. The 1px gap over a `--border` ground is what draws the rules.
- */
-.feed-row {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-3) var(--space-4);
-  background: var(--surface);
+.feed-trace-frame {
+  --feed-trace-gutter: 13rem;
+  --feed-trace-meta: 11rem;
+  --feed-trace-pad: var(--space-3);
+  --feed-trace-ruler: 30px;
 }
 
-.feed-row-head {
+@container feed-trace (max-width: 47.5rem) {
+  .feed-trace-frame {
+    --feed-trace-gutter: 9.5rem;
+    --feed-trace-meta: 4rem;
+  }
+
+  .feed-trace-says,
+  .feed-trace-owner,
+  .feed-trace-span {
+    display: none;
+  }
+}
+
+.feed-trace-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--feed-trace-pad);
+  border-bottom: 1px solid var(--border);
+}
+
+/* At now, the one dot of Acting Green on the page: the trace is showing the machine as it is. */
+.feed-trace-live {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--border-strong);
+}
+
+.feed-trace-live[data-now] {
+  background: var(--tone-active-fg);
+}
+
+.feed-trace-title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.feed-trace-span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feed-trace-chip {
+  flex: none;
+  margin-left: auto;
+  padding: 1px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.feed-trace-body {
+  position: relative;
+}
+
+/* The middle column, wherever it is laid: the ruler's ticks, the grid, the playhead, the scrub. */
+.feed-trace-track {
+  position: absolute;
+  left: calc(var(--feed-trace-gutter) + var(--feed-trace-pad));
+  right: calc(var(--feed-trace-meta) + var(--feed-trace-pad));
+}
+
+.feed-trace-ruler {
+  position: relative;
+  height: var(--feed-trace-ruler);
+  border-bottom: 1px solid var(--border);
+}
+
+.feed-trace-ruler > .feed-trace-track {
+  top: 0;
+  bottom: 0;
+  cursor: ew-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.feed-trace-tick {
+  position: absolute;
+  top: 8px;
+  transform: translateX(-50%);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* A midnight is the one tick that is a boundary rather than a measure. */
+.feed-trace-tick-day {
+  color: var(--text);
+  font-family: var(--font-body);
+  font-weight: var(--weight-medium);
+}
+
+.feed-trace-grid,
+.feed-trace-playhead,
+.feed-trace-scrub {
+  top: var(--feed-trace-ruler);
+  bottom: 0;
+}
+
+.feed-trace-grid,
+.feed-trace-playhead {
+  pointer-events: none;
+}
+
+.feed-trace-rule {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+}
+
+.feed-trace-rule-day {
+  background: var(--border-strong);
+}
+
+/**
+ * A silence across every lane, named. Hatched in the ink of the text at a whisper — a surface rung
+ * would vanish in light, where Working and Raised are both white.
+ */
+.feed-trace-quiet {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-inline: 1px dashed var(--border-strong);
+}
+
+.feed-trace-quiet::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(135deg, transparent 0 6px, var(--text) 6px 12px);
+  opacity: 0.035;
+}
+
+.feed-trace-quiet-label {
+  position: absolute;
+  top: var(--space-1);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0 var(--space-2);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.feed-trace-rows {
+  position: relative;
+  margin: 0;
+  padding: var(--space-1) 0 var(--space-2);
+  list-style: none;
+}
+
+.feed-trace-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 34px;
+  padding: 0 var(--feed-trace-pad);
+  transition:
+    background-color var(--dur-quick) var(--ease),
+    opacity var(--dur-settle) var(--ease);
+}
+
+.feed-trace-lane {
+  height: 30px;
+  margin-top: var(--space-1);
+}
+
+.feed-trace-lane:first-child {
+  margin-top: 0;
+}
+
+/**
+ * The sequence open underneath. A rung up the ladder and a hairline round it — never a hue. The
+ * hairline is what carries it in light, where Working and Raised are both white.
+ */
+.feed-trace-row[data-selected] {
+  background: var(--surface-raised);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+/* A tally is pressed and this row has no line of its gravity. */
+.feed-trace-row[data-dim] {
+  opacity: 0.32;
+}
+
+/* The thread a lane's sequences hang from. */
+.feed-trace-seq::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--feed-trace-pad) + 11px);
+  width: 1px;
+  background: var(--border);
+}
+
+.feed-trace-lane-head {
+  flex: none;
+  width: var(--feed-trace-gutter);
+  margin: 0;
+}
+
+.feed-trace-label {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+  width: var(--feed-trace-gutter);
+  min-width: 0;
+  min-height: 26px;
+  padding: 2px var(--space-2) 2px var(--space-1);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.feed-trace-label:hover {
+  background: var(--surface-raised);
+}
+
+.feed-trace-lane .feed-trace-label {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.feed-trace-chevron {
+  flex: none;
+  transition: transform var(--dur-quick) var(--ease);
+}
+
+.feed-trace-label[aria-expanded="true"] .feed-trace-chevron {
+  transform: rotate(90deg);
+}
+
+.feed-trace-lane-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feed-trace-lane-n {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: normal;
+}
+
+.feed-trace-seq .feed-trace-label {
+  padding-left: 22px;
+}
+
+.feed-trace-fold .feed-trace-label {
+  padding-left: var(--space-4);
+  color: var(--text-muted);
+}
+
+.feed-trace-name {
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Not started yet at the playhead: named, but in the rung below. */
+.feed-trace-row[data-state="queued"] .feed-trace-name {
+  color: var(--text-muted);
+}
+
+.feed-trace-owner {
+  flex: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.feed-trace-retry {
+  flex: none;
+  padding: 0 var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 16px;
+}
+
+.feed-trace-bars {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  overflow: visible;
+}
+
+.feed-trace-ghost {
+  fill: var(--text);
+  fill-opacity: 0.08;
+}
+
+/* Still open: the rest of the way to now, dashed. */
+.feed-trace-ghost-open {
+  stroke: var(--text);
+  stroke-opacity: 0.14;
+  stroke-width: 8px;
+  stroke-dasharray: 4 3;
+}
+
+.feed-trace-fill {
+  fill: var(--text-muted);
+}
+
+.feed-trace-shade-wrong .feed-trace-fill {
+  fill: var(--tone-danger-fg);
+}
+
+.feed-trace-shade-held .feed-trace-fill {
+  fill: var(--tone-paused-fg);
+}
+
+.feed-trace-shade-asks .feed-trace-fill {
+  fill: var(--tone-pending-fg);
+}
+
+.feed-trace-shade-shadow .feed-trace-fill {
+  fill: var(--tone-shadow-fg);
+}
+
+/* A routine line: a hollow ring in the neutral ink, so only the exceptions carry a hue. */
+.feed-trace-ring {
+  fill: var(--surface);
+  stroke: var(--text-muted);
+  stroke-width: 1.5px;
+}
+
+/* Not written yet at the playhead. */
+.feed-trace-bars .feed-trace-later {
+  opacity: 0;
+}
+
+.feed-trace-meta {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  width: var(--feed-trace-meta);
+  min-width: 0;
+  padding-left: var(--space-3);
+  transition: opacity var(--dur-settle) var(--ease);
+}
+
+.feed-trace-row[data-state="queued"] .feed-trace-meta {
+  opacity: 0;
+}
+
+.feed-trace-says {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feed-trace-shade-wrong[data-state="settled"] .feed-trace-says {
+  color: var(--tone-danger-fg);
+}
+
+.feed-trace-shade-held[data-state="settled"] .feed-trace-says {
+  color: var(--tone-paused-fg);
+}
+
+.feed-trace-shade-asks[data-state="settled"] .feed-trace-says {
+  color: var(--tone-pending-fg);
+}
+
+.feed-trace-dur {
+  flex: none;
+  min-width: 3rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* The playhead: primary ink, a line and a diamond on the ruler's edge. Never the brand cyan. */
+.feed-trace-playhead-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1.5px;
+  margin-left: -0.75px;
+  background: var(--text);
+}
+
+.feed-trace-playhead-line::before {
+  content: "";
+  position: absolute;
+  top: -4px;
+  left: -3.25px;
+  width: 8px;
+  height: 8px;
+  background: var(--text);
+  transform: rotate(45deg);
+}
+
+.feed-trace-scrub {
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.feed-trace-transport {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--feed-trace-pad);
+  border-top: 1px solid var(--border);
+}
+
+/* Quiet on purpose: replaying is something to reach for, not the page's primary action. */
+.feed-trace-play {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.feed-trace-play:hover {
+  background: var(--surface-raised);
+}
+
+.feed-trace-slider {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 6rem;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.feed-trace-rail {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  left: 7px;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--surface-sunken);
+  box-shadow: inset 0 0 0 1px var(--border);
+  transform: translateY(-50%);
+}
+
+.feed-trace-rail-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: var(--text-muted);
+}
+
+.feed-trace-knob-track {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  left: 7px;
+  height: 0;
+}
+
+.feed-trace-knob {
+  position: absolute;
+  top: 0;
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--surface);
+  border-radius: 50%;
+  background: var(--text);
+  transform: translate(-50%, -50%);
+}
+
+.feed-trace-clock {
+  flex: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.feed-trace-now {
+  flex: none;
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 0.2em;
+  cursor: pointer;
+}
+
+.feed-trace-now:hover:not(:disabled) {
+  color: var(--text);
+  text-decoration-color: currentColor;
+}
+
+/* Already at now: nothing to go back to. */
+.feed-trace-now:disabled {
+  opacity: var(--opacity-disabled);
+  text-decoration: none;
+  cursor: default;
+}
+
+@container feed-trace (max-width: 30rem) {
+  .feed-trace-clock {
+    display: none;
+  }
+}
+
+/* ---------------------------------------------------------------- detail -- */
+
+/**
+ * The selected sequence, read line by line, with the facts a row cannot hold beside it.
+ *
+ * Hairline-ruled like the list below it and not carded: it is the same kind of reading, one
+ * sequence deep. At the app's breakpoint the facts fall under the lines.
+ */
+.feed-detail {
+  container: feed-detail / inline-size;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 17rem;
+  gap: var(--space-5);
+  margin-bottom: var(--space-6);
+}
+
+.feed-detail-main {
+  min-width: 0;
+}
+
+.feed-detail-title {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-2) var(--space-3);
+  margin: 0 0 var(--space-1);
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
 }
 
-/* Pushed to the end of the head, so a column of times lines up on the right
-   however many badges a row happens to carry. */
-.feed-row-head > .ui-reading-time,
-.feed-row-head > .ui-reading-raw {
-  margin-left: auto;
+.feed-detail-name {
+  overflow-wrap: anywhere;
 }
 
-.feed-row-run {
+.feed-detail-sub {
+  margin: 0 0 var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.feed-detail-lines {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--border);
+}
+
+.feed-detail-line {
+  display: grid;
+  grid-template-columns: 3.25rem 13rem minmax(0, 1fr);
+  column-gap: var(--space-4);
+  row-gap: var(--space-1);
+  align-items: baseline;
+  padding: var(--space-2) var(--space-2);
+  border-bottom: 1px solid var(--border);
+  transition: opacity var(--dur-settle) var(--ease);
+}
+
+/* Written after the playhead: still readable, visibly not yet. */
+.feed-detail-later {
+  opacity: 0.45;
+}
+
+.feed-detail-time {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.feed-detail-kind {
+  min-width: 0;
+}
+
+.feed-detail-kind-words {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.feed-detail-summary {
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  overflow-wrap: anywhere;
+}
+
+.feed-detail-side {
+  padding-left: var(--space-5);
+  border-left: 1px solid var(--border);
+  font-size: var(--text-sm);
+}
+
+.feed-detail-facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-2) var(--space-3);
+  margin: 0;
+}
+
+.feed-detail-facts dt {
+  padding-top: 2px;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+.feed-detail-facts dd {
+  margin: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.feed-detail-mono {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  letter-spacing: 0;
-  color: var(--accent);
-  text-decoration: none;
 }
 
-.feed-row-run:hover {
-  text-decoration: underline;
+@media (max-width: 60rem) {
+  .feed-detail {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-4);
+  }
+
+  .feed-detail-side {
+    padding-left: 0;
+    border-left: 0;
+  }
+}
+
+@container feed-detail (max-width: 40rem) {
+  .feed-detail-line {
+    grid-template-columns: 3rem minmax(0, 1fr);
+    column-gap: var(--space-3);
+  }
+
+  .feed-detail-kind,
+  .feed-detail-summary {
+    grid-column: 2;
+  }
+}
+
+/* The list's own heading: the record, after the trace and the sequence opened from it. */
+.feed-every {
+  margin: var(--space-6) 0 0;
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  color: var(--text);
+}
+
+/* -------------------------------------------------------------- narrowed -- */
+
+.feed-narrowed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-4);
+  margin: 0 0 var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.feed-narrowed-what {
+  color: var(--text);
+}
+
+.feed-narrowed-n {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------ list -- */
+
+/* A container too, so a line re-flows to two columns when the page is narrow. */
+.feed-days {
+  container: feed-days / inline-size;
+}
+
+.feed-day + .feed-day {
+  margin-top: var(--space-5);
+}
+
+/**
+ * A day's heading, held at the top while its lines scroll under it.
+ *
+ * On the page's own ground, so the lines pass under it rather than showing through. A weekday
+ * name and the full date beside it: "Yesterday" is the fast read, the date the checkable one.
+ */
+.feed-day-head {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin: 0;
+  padding: var(--space-3) var(--space-2) var(--space-2);
+  border-bottom: 1px solid var(--border-strong);
+  background: var(--bg);
+}
+
+.feed-day-title {
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: var(--weight-bold);
+  color: var(--text);
+}
+
+.feed-day-date {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+  color: var(--text-muted);
+}
+
+.feed-day-lines,
+.feed-routine-lines {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/**
+ * One line: its time, its kind, and what it says.
+ *
+ * Hairline-ruled and not carded: the list is read by scanning down it, and fifty boxes turn a
+ * column into a pile. Three columns so the times and the badges each line up down the page — the
+ * eye runs the time column to find an hour and the badge column to find a colour.
+ */
+.feed-line {
+  display: grid;
+  grid-template-columns: 3.25rem 13rem minmax(0, 1fr);
+  column-gap: var(--space-4);
+  row-gap: var(--space-1);
+  align-items: baseline;
+  padding: var(--space-3) var(--space-2);
+  border-bottom: 1px solid var(--border);
+  transition: background-color var(--dur-settle) var(--ease);
+}
+
+.feed-line-routine {
+  padding-block: var(--space-2);
+}
+
+.feed-line-time {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.feed-line-kind {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.feed-line-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.feed-line-summary {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  overflow-wrap: anywhere;
+}
+
+/* Routine reads a rung down, so the exceptions between the folds carry the page. */
+.feed-line-routine .feed-line-summary {
+  color: var(--text-muted);
+}
+
+.feed-line-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+  font-size: var(--text-xs);
 }
 
 /**
  * The owner, as a control rather than a link.
  *
- * It narrows this feed, which is the honest thing the row's ids can do — there
- * is no errand detail route and no job page to send anyone to. Styled as text
- * with a dotted underline so it does not read as a navigation.
+ * It narrows this feed, which is the honest thing the row's ids can do — there is no errand detail
+ * route and no job page to send anyone to. Styled as text with a dotted underline so it does not
+ * read as a navigation.
  */
-.feed-row-owner {
+.feed-line-owner {
   padding: 0;
   border: none;
   background: none;
   color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  letter-spacing: 0;
   text-decoration: underline dotted;
   text-underline-offset: 3px;
   cursor: pointer;
 }
 
-.feed-row-owner:hover {
+.feed-line-owner:hover {
   color: var(--text);
 }
 
 /* Nobody's line but the machine's. A fact, not an empty cell. */
-.feed-row-owner-none {
-  color: var(--text-faint);
+.feed-line-owner-none {
+  color: var(--text-muted);
   font-size: var(--text-xs);
   font-style: italic;
 }
 
-.feed-row-summary {
-  margin: 0;
-  color: var(--text);
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
+/* A door: a run, or the page where a line's question is answered. */
+.feed-link {
+  color: var(--accent);
+  font-size: var(--text-xs);
+  text-decoration: none;
+}
+
+.feed-link:hover {
+  text-decoration: underline;
+}
+
+.feed-link-run {
+  font-family: var(--font-mono);
 }
 
 /**
  * A deferred observation, and deliberately not an alarm.
  *
- * `token_efficiency` reaches the feed through the waiting room because it is
- * not governance — nothing is wrong, four runs in a row simply looked the same
- * way. So it gets the informational tone and a quiet left rule, never the red
- * one, and the cause is phrased as somewhere to look rather than something to
+ * `token_efficiency` reaches the feed through the waiting room because it is not governance —
+ * nothing is wrong, four runs in a row simply looked the same way. So the signal takes the
+ * informational tone's ink and the cause is phrased as somewhere to look rather than something to
  * stop.
  */
-.feed-row-observation {
+.feed-line-observation {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
   gap: var(--space-2);
   margin: var(--space-1) 0 0;
-  padding-left: var(--space-3);
-  border-left: 2px solid var(--tone-info-border);
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
 }
 
-.feed-row-signal {
+.feed-line-signal {
   flex: none;
   font-weight: var(--weight-semibold);
   color: var(--tone-info-fg);
 }
 
-.feed-row-cause {
+.feed-line-cause {
   flex: 1 1 18rem;
   color: var(--text-muted);
 }
 
-/* -------------------------------------------------------------- ceiling -- */
+@container feed-days (max-width: 40rem) {
+  .feed-line {
+    grid-template-columns: 3rem minmax(0, 1fr);
+    column-gap: var(--space-3);
+  }
 
-.feed-ceiling {
-  margin: var(--space-3) 0 0;
-  color: var(--text-faint);
+  .feed-line-kind,
+  .feed-line-body {
+    grid-column: 2;
+  }
+}
+
+/**
+ * Consecutive routine lines, as one row.
+ *
+ * The same time column as a line, so a fold sits in the column of times like any other row and
+ * its lines open under it on the full grid.
+ */
+.feed-routine {
+  display: grid;
+  grid-template-columns: 3.25rem minmax(0, 1fr);
+  column-gap: var(--space-4);
+  align-items: baseline;
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.feed-routine-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.feed-routine-toggle:hover {
+  color: var(--text);
+}
+
+.feed-routine-chevron {
+  flex: none;
+  transition: transform var(--dur-quick) var(--ease);
+}
+
+.feed-routine-toggle[aria-expanded="true"] .feed-routine-chevron {
+  transform: rotate(90deg);
+}
+
+.feed-routine-n {
+  flex: none;
+  color: var(--text);
+  font-weight: var(--weight-medium);
+}
+
+.feed-routine-kinds {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Open, the folded lines take the whole row and keep the list's own columns. */
+.feed-routine-lines {
+  grid-column: 1 / -1;
+  margin: var(--space-2) calc(-1 * var(--space-2)) calc(-1 * var(--space-2));
+  border-top: 1px solid var(--border);
+}
+
+.feed-routine-lines > .feed-line:last-child {
+  border-bottom: 0;
+}
+
+@container feed-days (max-width: 40rem) {
+  .feed-routine {
+    grid-template-columns: 3rem minmax(0, 1fr);
+    column-gap: var(--space-3);
+  }
+}
+
+/* A silence longer than two hours, between the two lines it separates. */
+.feed-gap {
+  padding: var(--space-3) var(--space-2) var(--space-3) calc(3.25rem + var(--space-4) + var(--space-2));
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
   font-size: var(--text-xs);
   font-style: italic;
+}
+
+/* Where you left off: a rule across the list with the moment written into it. */
+.feed-seen {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.feed-seen::before,
+.feed-seen::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--border-strong);
+}
+
+.feed-seen::before {
+  flex: 0 0 3.25rem;
+}
+
+.feed-seen-text {
+  flex: none;
+}
+
+/* The bottom of the window: said, so the list does not simply stop. */
+.feed-end {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+  margin: var(--space-4) 0 0;
+  padding: 0 var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.feed-end-oldest {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
 }

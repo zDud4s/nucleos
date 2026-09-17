@@ -135,7 +135,12 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     job_item_conflicted: { tone: "paused", label: "job item did not merge" },
     job_item_orphaned: { tone: "off", label: "job item never attempted" },
     job_gate_failed: { tone: "danger", label: "job gate failed" },
-    job_waiting: { tone: "pending", label: "job waiting" },
+    // Stated Blue, not Awaiting-You Amber. `job.rs::brakes` parks a job for exactly five reasons —
+    // `kill-switch`, `budget`, `excluded`, `attention` and `slot` (`park` writes the line) — and
+    // none of them is a question put to the reader: an approval is `awaiting_approval`, a status
+    // and not a park. Amber on every parked job taught the Feed to summon somebody for a slot that
+    // frees itself. The verdict, where there is one, is the `wait_reason` badge beside it.
+    job_waiting: { tone: "info", label: "job waiting" },
     job_finished: { tone: "info", label: "job finished" },
     job_failed: { tone: "danger", label: "job failed" },
     job_stopped: { tone: "off", label: "job stopped" },
@@ -364,10 +369,14 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * and the only thing that changes it is lifting the rule or letting the
    * partner finish. Reading it as slot contention would send somebody looking
    * for capacity that is already there.
+   *
+   * `slot` is Stated Blue and not amber: the slot frees itself when the run holding it ends, so the
+   * wait asks nothing of the reader — it is a fact about the queue. Budget and exclusion keep Held
+   * Ember, because each is a rule or a ceiling somebody could lift.
    */
   wait_reason: {
     budget: { tone: "paused", label: "held by budget" },
-    slot: { tone: "pending", label: "waiting for a slot" },
+    slot: { tone: "info", label: "waiting for a slot" },
     excluded: { tone: "paused", label: "held by an exclusion" },
   },
 

@@ -1,5 +1,5 @@
 // §spec mapa-do-projeto
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiFetch } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
@@ -42,6 +42,12 @@ export interface FeedEntry {
   run_id: number | null;
   /** The errand this line belongs to. Never set together with `project_id`. */
   errand_id: number | null;
+  /**
+   * What the line is about, when the núcleo knows: `job:<id>`, `run:<id>`, `council:<id>`,
+   * `team_run:<id>`, `vcs:<id>` or `errand:<id>`. Every line about one subject is one sequence on
+   * the Feed's trace — a job's start, its failed gate and its finish are one row, not three.
+   */
+  subject: string | null;
   created_at: string;
 }
 
@@ -240,6 +246,164 @@ export function useRecentFeed(options: { enabled?: boolean } = {}) {
     queryFn: () => apiFetch<FeedEntry[]>(`/feed${feedQueryString(filters)}`),
     enabled: options.enabled !== false,
     refetchInterval: POLL.queue,
+  });
+}
+
+/* ------------------------------------------------------------- timeline -- */
+
+/**
+ * `GET /feed/timeline` — every scope, inside a time window, oldest first.
+ *
+ * The listing above answers "the newest fifty", which is the wrong question for a time axis: a
+ * busy night fills fifty lines in an hour, and an axis drawn from them shows eleven hours of
+ * silence that never happened. This route answers "everything between these two instants",
+ * ordered `created_at` then `id`, capped at the newest {@link FEED_TIMELINE_CAP} with `truncated`
+ * saying so out loud.
+ */
+export interface FeedTimeline {
+  entries: FeedEntry[];
+  /** More lines fell inside the window than the cap; the OLDEST were left out. */
+  truncated: boolean;
+}
+
+/** The route's cap, in lines. A window holding more says `truncated`. */
+export const FEED_TIMELINE_CAP = 5000;
+
+/** The widest window the route accepts; anything wider is a 400. */
+export const FEED_WINDOW_MAX_DAYS = 31;
+
+/** A window of the axis. `until` absent is a live window, reaching up to now. */
+export interface FeedWindow {
+  /** RFC 3339. */
+  since: string;
+  until?: string;
+}
+
+/**
+ * The daemon's seen marker — `GET` and `POST /feed/seen`.
+ *
+ * `through` is the newest line id somebody has been shown; `through_created_at` is when that
+ * line was written, and `seen_at` is when it was marked. All three are `null` on a machine where
+ * nothing has ever been marked. The marker lives in the daemon rather than in `localStorage`
+ * because the Feed is not the only reader it will ever have, and because a second window would
+ * otherwise keep its own idea of what you have seen.
+ */
+export interface FeedSeen {
+  through: number | null;
+  through_created_at: string | null;
+  seen_at: string | null;
+}
+
+/** The query string for one window, with the incremental cursor when there is one. */
+export function timelineQueryString(range: FeedWindow, afterId: number | null = null): string {
+  const params = new URLSearchParams();
+  params.set("since", range.since);
+  if (range.until !== undefined) params.set("until", range.until);
+  if (afterId !== null) params.set("after_id", String(afterId));
+  return `?${params.toString()}`;
+}
+
+/** The newest id in a list, or `null` for an empty one. Ids only grow, so this is the cursor. */
+export function newestFeedId(entries: FeedEntry[]): number | null {
+  let newest: number | null = null;
+  for (const entry of entries) if (newest === null || entry.id > newest) newest = entry.id;
+  return newest;
+}
+
+/** The route's own order: `created_at`, then `id` for two lines written in the same instant. */
+export function compareFeedEntries(a: FeedEntry, b: FeedEntry): number {
+  const at = Date.parse(a.created_at) - Date.parse(b.created_at);
+  return at !== 0 ? at : a.id - b.id;
+}
+
+/**
+ * A poll's answer folded into what the page already holds.
+ *
+ * Deduplicated by id, because `after_id` is a cursor over ids while the route orders by time, and
+ * a line the núcleo stamped a moment late can arrive twice across two polls. Lines that have
+ * slid out of the window's start are NOT dropped here: a live window's `since` is fixed when the
+ * window is chosen, so nothing slides. The cap is re-applied, and trimming to it is itself a
+ * truncation — the flag is sticky, because once the oldest lines were left out they stay out.
+ */
+export function mergeFeedTimeline(previous: FeedTimeline | undefined, next: FeedTimeline): FeedTimeline {
+  if (previous === undefined) return next;
+  if (next.entries.length === 0) return previous;
+  const byId = new Map<number, FeedEntry>();
+  for (const entry of previous.entries) byId.set(entry.id, entry);
+  for (const entry of next.entries) byId.set(entry.id, entry);
+  const merged = [...byId.values()].sort(compareFeedEntries);
+  const overflow = merged.length > FEED_TIMELINE_CAP;
+  return {
+    entries: overflow ? merged.slice(merged.length - FEED_TIMELINE_CAP) : merged,
+    truncated: previous.truncated || next.truncated || overflow,
+  };
+}
+
+/**
+ * One window of the time axis, kept current.
+ *
+ * The first read is the whole window; every poll after it asks only for lines past the newest id
+ * already held (`after_id`) and merges them in, so a seven-day window of four thousand lines costs
+ * one large request per visit rather than one every three seconds. A different window is a
+ * different key and so a full read — which is the "full refetch when the window changes" the page
+ * wants, for free.
+ *
+ * `null` holds the query: the page does not know its window until the seen marker has answered,
+ * and asking for a guessed window first would draw one axis and then redraw another.
+ *
+ * A window with an `until` is a question about the past and does not poll — the same rule
+ * {@link useFeed} follows for a search.
+ */
+export function useFeedTimeline(range: FeedWindow | null) {
+  const client = useQueryClient();
+  const since = range?.since ?? "";
+  const until = range?.until ?? null;
+  const key = keys.feed.timeline(since, until);
+  return useQuery({
+    queryKey: key,
+    queryFn: async () => {
+      const held = client.getQueryData<FeedTimeline>(key);
+      const after = until === null && held !== undefined ? newestFeedId(held.entries) : null;
+      const answer = await apiFetch<FeedTimeline>(
+        `/feed/timeline${timelineQueryString({ since, until: until ?? undefined }, after)}`,
+      );
+      return after === null ? answer : mergeFeedTimeline(held, answer);
+    },
+    enabled: range !== null,
+    refetchInterval: until === null ? POLL.fast : false,
+    // A new window keeps the old one on screen until its own answer lands, so choosing a preset
+    // does not blank the chart. The caller clips what it draws to the window it asked for.
+    placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * The seen marker, read once per visit.
+ *
+ * No poll: the page snapshots it on arrival and shades from that snapshot for the whole visit,
+ * so a later value would be read by nobody. `staleTime: 0` and a fresh read on mount are what
+ * make "the marker as it was when you came in" true on every visit rather than on the first.
+ */
+export function useFeedSeen() {
+  return useQuery({
+    queryKey: keys.feed.seen,
+    queryFn: () => apiFetch<FeedSeen>("/feed/seen"),
+    refetchOnMount: "always",
+    refetchOnWindowFocus: false,
+  });
+}
+
+/**
+ * Move the marker forward to `through`.
+ *
+ * A plain function and not a mutation hook, because its commonest caller is an effect's cleanup —
+ * the page leaving — where a hook's state has already been torn down. The daemon clamps it
+ * monotonic and to the newest id it holds, so a late or repeated call can never move it back.
+ */
+export async function markFeedSeen(through: number): Promise<FeedSeen> {
+  return await apiFetch<FeedSeen>("/feed/seen", {
+    method: "POST",
+    body: JSON.stringify({ through }),
   });
 }
 

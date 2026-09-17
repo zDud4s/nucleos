@@ -1391,6 +1391,66 @@
   border: 0;
 }
 
+/* ------------------------------------------------------------------ marks -- */
+
+/**
+ * A state tone on an SVG mark — the Feed's time axis and the key beside its verdict.
+ *
+ * The pip's seven, restated for `fill` and `stroke`, because an SVG shape has no background to
+ * paint. A page picks the tone through `feedMarkTone` and never writes one, and the two weights
+ * below are the whole vocabulary: a line that went wrong, was held or asks for you is a solid
+ * mark cut out of its lane by a ring of the ground; a routine line is a hollow ring at the quiet
+ * opacity. Solid-versus-hollow carries the gravity without the hue, so it survives for anyone who
+ * cannot separate the tones.
+ */
+.ui-mark-active {
+  fill: var(--tone-active-fg);
+  stroke: var(--tone-active-fg);
+}
+
+.ui-mark-shadow {
+  fill: var(--tone-shadow-fg);
+  stroke: var(--tone-shadow-fg);
+}
+
+.ui-mark-off {
+  fill: var(--tone-off-fg);
+  stroke: var(--tone-off-fg);
+}
+
+.ui-mark-pending {
+  fill: var(--tone-pending-fg);
+  stroke: var(--tone-pending-fg);
+}
+
+.ui-mark-paused {
+  fill: var(--tone-paused-fg);
+  stroke: var(--tone-paused-fg);
+}
+
+.ui-mark-danger {
+  fill: var(--tone-danger-fg);
+  stroke: var(--tone-danger-fg);
+}
+
+.ui-mark-info {
+  fill: var(--tone-info-fg);
+  stroke: var(--tone-info-fg);
+}
+
+/* After the tones, so the ring of ground wins over the tone's own stroke. */
+.ui-mark-exception {
+  stroke: var(--surface);
+  stroke-width: 2px;
+}
+
+/* After the tones, so the hollow wins over the tone's own fill. */
+.ui-mark-routine {
+  fill: var(--surface);
+  stroke-width: 1.5px;
+  opacity: var(--opacity-quiet);
+}
+
 /* -------------------------------------------------------------- sparkline -- */
 
 .ui-spark {

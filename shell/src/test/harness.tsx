@@ -28,6 +28,7 @@ import type {
 } from "../data/project-policy";
 import { foldPrefix } from "../data/project-policy";
 import type { ListingRead, ProjectRepo, ReadOutcome } from "../data/project-github";
+import type { FeedEntry, FeedSeen, FeedTimeline } from "../data/feed";
 import type { Branches, Commit } from "../data/project-git";
 import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
 import type { GraphNode, WorkflowGraph } from "../data/workflow-graph";
@@ -300,6 +301,22 @@ export interface DaemonState {
   githubReadRefusal: { status: number; code: string; detail: string } | null;
   /** Every read the shell sent, in order, as the operation it named. */
   githubReads: { op: string; repo: string }[];
+  /**
+   * Every line the fake núcleo holds, for `GET /feed/timeline`, in any order.
+   *
+   * Answered the way the núcleo answers it — the window applied, `after_id` applied, ordered by
+   * time then id, the newest `feedTimelineCap` kept with `truncated` said — so a test that polls
+   * sees only what a poll would bring, and a test about the cap sets a small one rather than
+   * building five thousand rows.
+   */
+  feedLines: FeedEntry[];
+  feedTimelineCap: number;
+  /** What `GET /feed/timeline` refuses with, or `null` to answer. */
+  feedTimelineRefusal: { status: number; code: string; detail: string } | null;
+  /** The seen marker. Moved by `POST /feed/seen` exactly as the núcleo moves it: never back. */
+  feedSeen: FeedSeen;
+  /** Every `through` the shell posted, in order. */
+  feedSeenPosts: number[];
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -403,6 +420,11 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     },
     githubReadRefusal: null,
     githubReads: [],
+    feedLines: [],
+    feedTimelineCap: 5000,
+    feedTimelineRefusal: null,
+    feedSeen: { through: null, through_created_at: null, seen_at: null },
+    feedSeenPosts: [],
     ...overrides,
   };
 }
@@ -739,6 +761,37 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       return undefined;
     }
 
+    /*
+      The Feed's two routes, over its window and its marker. Ahead of the POST block below because
+      `POST /feed/seen` is a write this fake must APPLY rather than only record: the page reads the
+      marker back, and a fake that answered the old value would be testing a daemon that forgets.
+    */
+    if (path.startsWith("/feed/timeline")) {
+      if (state.feedTimelineRefusal !== null) {
+        const { status, code, detail } = state.feedTimelineRefusal;
+        throw new ApiRefusal(status, code, detail);
+      }
+      return answerFeedTimeline(state, path);
+    }
+    if (path === "/feed/seen") {
+      if (init?.method === "POST" && typeof init.body === "string") {
+        const { through } = JSON.parse(init.body) as { through: number };
+        state.feedSeenPosts.push(through);
+        // Monotonic and clamped to the newest line, which is the núcleo's contract for this route.
+        const newest = state.feedLines.reduce((top, line) => Math.max(top, line.id), -1);
+        const clamped = Math.min(through, newest);
+        if (clamped > (state.feedSeen.through ?? -1)) {
+          const line = state.feedLines.find((row) => row.id === clamped);
+          state.feedSeen = {
+            through: clamped,
+            through_created_at: line?.created_at ?? null,
+            seen_at: new Date().toISOString(),
+          };
+        }
+      }
+      return state.feedSeen;
+    }
+
     if (init?.method === "POST") {
       /*
         The one door both GitHub tools come through, first inside this block because it is the only
@@ -1019,6 +1072,22 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         return undefined;
     }
   };
+}
+
+/** `GET /feed/timeline`, as `core/src/feed.rs` answers it: windowed, cursored, ordered, capped. */
+function answerFeedTimeline(state: DaemonState, path: string): FeedTimeline {
+  const query = new URLSearchParams(path.split("?")[1] ?? "");
+  const since = Date.parse(query.get("since") ?? "");
+  const until = query.has("until") ? Date.parse(query.get("until") ?? "") : Infinity;
+  const after = query.has("after_id") ? Number(query.get("after_id")) : -Infinity;
+  const inside = state.feedLines
+    .filter((line) => {
+      const at = Date.parse(line.created_at);
+      return at >= since && at <= until && line.id > after;
+    })
+    .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id - b.id);
+  const truncated = inside.length > state.feedTimelineCap;
+  return { entries: truncated ? inside.slice(inside.length - state.feedTimelineCap) : inside, truncated };
 }
 
 export interface HarnessOptions {

@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED } from "../data/autopilot";
-import { FEED, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
+import { FEED, FEED_SEEN, FEED_TIMELINE, NOW, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
 import { readEfficiencySignal, readFeedKind, waitReasonFromSummary } from "../data/feed";
+import { LANE_FOLD_ABOVE, buildSequences, traceLanes } from "../lib/sequences";
+import { quietGaps } from "../lib/timeline";
+import { feedGravityOf, feedLaneOf } from "../ui";
 
 /**
  * The states the preview must be able to photograph, pinned as facts about the fixtures.
@@ -41,6 +44,57 @@ describe("the preview fixtures", () => {
     const efficiency = FEED.find((row) => row.kind === "token_efficiency");
     expect(readEfficiencySignal(efficiency!.summary)?.signal).toBe("cold cache");
   });
+  /*
+    The time axis has something to be read in, in every state its shots point at.
+
+    Each claim below is a picture that would otherwise be empty or a lie: the verdict needs all
+    three exceptional gravities after the marker, the trace needs a silence long enough to be named
+    and sequences still open at now, the seven-day shot needs a lane dense enough to fold its
+    routine sequences into one row, and the incremental poll needs ids that grow with time the way
+    the núcleo's row ids do.
+  */
+  it("the timeline holds a night worth a verdict, a named silence and a dense week", () => {
+    const lookedAt = Date.parse(FEED_SEEN.seen_at ?? "");
+    const since = FEED_TIMELINE.filter((row) => Date.parse(row.created_at) > lookedAt);
+    const gravities = since.map((row) => feedGravityOf(row.kind));
+    for (const gravity of ["wrong", "held", "asks"] as const) {
+      expect(gravities.filter((g) => g === gravity).length, gravity).toBe(2);
+    }
+
+    const night = FEED_TIMELINE.filter((row) => Date.parse(row.created_at) > NOW - 15 * 3_600_000);
+    expect(quietGaps(night.map((row) => Date.parse(row.created_at))).length).toBeGreaterThan(0);
+
+    // The night's sequences are whole: job 57 is one row of four lines, run 900598 one of three
+    // attempts, and two are still going at now — a parked job and a run between attempts.
+    const nightly = buildSequences(since);
+    expect(nightly.find((sequence) => sequence.key === "job:57")?.lines).toHaveLength(4);
+    expect(nightly.find((sequence) => sequence.key === "run:900598")?.attempts).toBe(3);
+    expect(nightly.filter((sequence) => sequence.open).map((sequence) => sequence.key).sort()).toEqual(["job:58", "run:900612"]);
+
+    const week = FEED_TIMELINE.filter((row) => Date.parse(row.created_at) > NOW - 7 * 86_400_000);
+    const dense = traceLanes(buildSequences(week)).filter((lane) => lane.sequences.length > LANE_FOLD_ABOVE);
+    expect(dense.map((lane) => lane.lane)).toContain("jobs");
+    // And the fold keeps something back as a row: the job that failed on Wednesday.
+    expect(dense.find((lane) => lane.lane === "jobs")?.shown.length).toBeGreaterThan(0);
+    expect(new Set(week.map((row) => feedLaneOf(row.kind))).size).toBe(6);
+    // A week-old line with no subject is a line of its own; the work itself always carries one.
+    for (const row of week) {
+      if (row.kind.startsWith("job_") || row.kind.startsWith("run_") || row.kind.startsWith("council_")) expect(row.subject, row.kind).not.toBeNull();
+    }
+
+    for (let i = 1; i < FEED_TIMELINE.length; i += 1) {
+      expect(FEED_TIMELINE[i].id).toBeGreaterThan(FEED_TIMELINE[i - 1].id);
+      expect(Date.parse(FEED_TIMELINE[i].created_at)).toBeGreaterThanOrEqual(Date.parse(FEED_TIMELINE[i - 1].created_at));
+    }
+    const through = FEED_TIMELINE.find((row) => row.id === FEED_SEEN.through);
+    expect(through).toBeDefined();
+    expect(Date.parse(through!.created_at)).toBeLessThanOrEqual(lookedAt);
+    for (const row of FEED_TIMELINE) {
+      const label = readFeedKind(row.kind)?.label ?? row.kind;
+      expect(row.summary.trim().toLowerCase(), row.kind).not.toBe(label.toLowerCase());
+    }
+  });
+
   /*
     Exactly one, and it is the one the shots point at.
 

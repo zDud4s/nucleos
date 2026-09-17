@@ -67,6 +67,21 @@ export { Teach, type TeachProps } from "./Teach";
 export { Who, type WhoProps } from "./Who";
 export { readState, type StateDomain, type StateReading } from "./state-map";
 /**
+ * The Feed's two readings of a kind — its lane on the time axis and its weight — kept beside the
+ * map because both are claims about núcleo kinds, and a page may not author a tone.
+ */
+export {
+  FEED_LANES,
+  feedGravityOf,
+  feedGravityTone,
+  feedKindLeavesOpen,
+  feedLaneOf,
+  feedMarkTone,
+  type FeedGravity,
+  type FeedLane,
+  type FeedLaneInfo,
+} from "./lanes";
+/**
  * Radix Tabs, re-exported from the front door like every other primitive.
  *
  * `ui/vendor/` is where a registry component is *kept*, not where a page reads
