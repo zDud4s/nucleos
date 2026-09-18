@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Production PreToolUse hook for NucleOS sessions — launched by the daemon or opened by hand.
+"""Production hook for NucleOS sessions — launched by the daemon or opened by hand.
 
-A run (NUCLEOS_RUN_ID present) gets the full safety gate: allows emit the recognized
-hookSpecificOutput approval contract, while denials and pending approvals emit the
+Registered under three events (`autopilot.rs`'s `wire_classifier_hook`), told apart by the
+payload's own `hook_event_name` rather than by anything the invocation says, because the same
+command is wired to all three:
+
+A run (NUCLEOS_RUN_ID present) gets the full safety gate on `PreToolUse`: allows emit the
+recognized hookSpecificOutput approval contract, while denials and pending approvals emit the
 empirically proven legacy block contract.
 
 An interactive session gets one narrow question instead: is this a git operation the
@@ -16,7 +20,14 @@ order git operations between sessions, and the sessions doing most of the work a
 ones a person opens in an editor. Measured: an editor session asked to `git merge master`
 merged, with no hook, no proposal and no row.
 
-All malformed-input, configuration, and daemon errors still fail closed.
+`PostToolUse`/`PostToolUseFailure` report the OUTCOME of a call this hook already judged, and
+never block anything: by the time either fires the tool has already run (or already failed), so
+a refusal here would be a barrier with nothing left to stop — an expensive warning, not a
+protection. `report_outcome` is therefore silent on every failure of its own: an unreachable
+daemon, a missing token, a payload it cannot use. Never `deny()`, never `approve()`.
+
+All malformed-input, configuration, and daemon errors still fail closed ON THE PreToolUse PATH —
+the one path where failing open would matter.
 """
 
 import json
@@ -162,11 +173,36 @@ def cargo_target_dirs(main_root, environ=None, configs=None):
     return roots
 
 
+def daemon_binary_candidates(roots, os_name=None):
+    """Every path the daemon binary might have, in the order `control_token` tries them.
+
+    cargo names the binary `nucleos-core.exe` on Windows and `nucleos-core` everywhere else.
+    Looking only for the `.exe` failed CLOSED off Windows: no candidate ever existed, so every
+    queue operation an agent asked for was refused for a token that could not be read.
+
+    The platform's own name comes first. On Windows that keeps the old list, in the old order, as
+    the exact head of this one, so a machine that found its binary before finds the same one now,
+    and the extension-less names are tried only after every `.exe` has missed. Off Windows the
+    `.exe` names come last; where no such file exists they cost one `os.path.exists` each.
+    """
+    os_name = os.name if os_name is None else os_name
+    if os_name == "nt":
+        names = ("nucleos-core.exe", "nucleos-core")
+    else:
+        names = ("nucleos-core", "nucleos-core.exe")
+    return [
+        os.path.join(root, build, name)
+        for name in names
+        for root in roots
+        for build in ("debug", "release")
+    ]
+
+
 def control_token(cwd: str) -> str:
     """The daemon's own token, read the way the desktop app reads it.
 
     An editor session inherits no NucleOS environment, so the token has to be fetched
-    rather than found. It lives in Credential Manager under the person's own account,
+    rather than found. It lives in the system credential store under the person's own account,
     which is exactly who is sitting here — this grants nothing the session did not
     already have, it only stops the session having to be told how.
 
@@ -193,15 +229,13 @@ def control_token(cwd: str) -> str:
         deny("could not locate the repository to find the daemon binary - failing closed")
     main_root = os.path.dirname(common.stdout.strip())
 
-    for root in cargo_target_dirs(main_root):
-        for build in ("debug", "release"):
-            binary = os.path.join(root, build, "nucleos-core.exe")
-            if os.path.exists(binary):
-                printed = subprocess.run(
-                    [binary, "--print-token"], capture_output=True, text=True, timeout=20
-                )
-                if printed.returncode == 0 and printed.stdout.strip():
-                    return printed.stdout.strip()
+    for binary in daemon_binary_candidates(cargo_target_dirs(main_root)):
+        if os.path.exists(binary):
+            printed = subprocess.run(
+                [binary, "--print-token"], capture_output=True, text=True, timeout=20
+            )
+            if printed.returncode == 0 and printed.stdout.strip():
+                return printed.stdout.strip()
     deny(
         "this is a git operation the queue performs, and the daemon token could not be "
         "read to queue it - failing closed. Run it from a terminal if you meant to act "
@@ -209,18 +243,78 @@ def control_token(cwd: str) -> str:
     )
 
 
-def read_payload(silent_on_error: bool) -> dict:
+def read_stdin_once():
+    """Reads and parses stdin exactly ONCE, returning `(payload, reason)`.
+
+    stdin can be read only once, and `main` now has three branches that each need it — the
+    outcome report, the interactive filter, and the governed-run gate — with three DIFFERENT
+    reactions to a parse failure: always silent, silent only for a person's session, and `deny()`
+    for a governed run. Reading here once and handing every branch the same pair lets each apply
+    its OWN reaction instead of the reader picking one for all three.
+
+    `reason` is `None` on success. On failure it is the exact message the pre-restructuring code
+    used to `deny()` with, preserved so the run branch's `deny(reason)` reads byte-identical to
+    what it printed before this function existed.
+    """
     try:
         payload = json.load(sys.stdin)
     except Exception as exc:
-        if silent_on_error:
-            no_opinion()
-        deny(f"failed to parse hook payload from stdin ({exc}) - failing closed")
+        return None, f"failed to parse hook payload from stdin ({exc}) - failing closed"
     if not isinstance(payload, dict):
-        if silent_on_error:
-            no_opinion()
-        deny("hook payload from stdin is not a JSON object - failing closed")
-    return payload
+        return None, "hook payload from stdin is not a JSON object - failing closed"
+    return payload, None
+
+
+def report_outcome(payload: dict) -> None:
+    """Reports what a tool call did, and never blocks anything.
+
+    By the time `PostToolUse`/`PostToolUseFailure` fires the call has already run (or already
+    failed) — there is nothing left here to approve or deny, only something to record. So this
+    function is silent on EVERY failure of its own: an unreachable daemon, a missing token, a
+    payload it cannot use. It never raises past its own boundary and never calls `deny()` or
+    `approve()` — `main` returns straight after calling this, which leaves the process to exit 0
+    with nothing printed, exactly like `no_opinion()` without the `sys.exit` neither of them needs
+    here.
+
+    `payload` is already a parsed dict — the caller determined the event from it, so by
+    construction it always has `hook_event_name`. NUCLEOS_RUN_ID/NUCLEOS_DAEMON_URL/
+    NUCLEOS_DAEMON_TOKEN are read fresh rather than trusted from the payload, exactly as the
+    `PreToolUse` gate below reads them: the CLI's own payload never carries a run id at all, only
+    the environment the daemon spawned this process with does.
+    """
+    try:
+        run_id = int(os.environ.get("NUCLEOS_RUN_ID", ""))
+        daemon_url = os.environ.get("NUCLEOS_DAEMON_URL")
+        token = os.environ.get("NUCLEOS_DAEMON_TOKEN")
+        if not daemon_url or not token:
+            return
+
+        body = json.dumps(
+            {
+                "run_id": run_id,
+                "tool_name": payload.get("tool_name", ""),
+                "tool_input": payload.get("tool_input", {}),
+                "tool_response": payload.get("tool_response", {}),
+                "event": payload.get("hook_event_name", ""),
+            }
+        ).encode()
+        request = urllib.request.Request(
+            f"{daemon_url}/hooks/posttooluse",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        # Three seconds, not `PreToolUse`'s five: a slow outcome report must not delay the NEXT
+        # turn, and unlike the gate above there is no verdict on the other end worth waiting for.
+        with urllib.request.urlopen(request, timeout=3):
+            pass
+    except Exception:
+        # Every failure is the same non-event: the ledger missed one entry. Nothing here is worth
+        # acting on from a hook that cannot block anyway.
+        pass
 
 
 def interactive_session(payload: dict) -> None:
@@ -271,22 +365,40 @@ def interactive_session(payload: dict) -> None:
 
 
 def main() -> None:
+    # Read exactly ONCE — stdin cannot be read twice — and keep the parse error rather than
+    # acting on it: which of the three branches below owns this call is decided next, and each
+    # reacts to a parse failure in its OWN way.
+    payload, parse_error = read_stdin_once()
+
+    # `hook_event_name` is the CLI's own field, not something either the interactive filter or
+    # the `PreToolUse` gate below has ever needed to read — until now. This branch runs whatever
+    # `NUCLEOS_RUN_ID` says, because a `PostToolUse` outcome fires for the SAME conversation a
+    # run's `PreToolUse` calls fire in, and it never blocks: never `deny()`, never `approve()`.
+    #
+    # An outer JSON parse failure (`payload is None`) leaves `event` unreadable, so a call that
+    # was genuinely `PostToolUse`/`PostToolUseFailure` but arrived unparseable falls through to
+    # the branches below instead of landing here — see `read_stdin_once`'s docstring. In practice
+    # this is unreachable: the CLI's own hook payloads are always well-formed JSON, and this
+    # ambiguity only exists for input that should never occur at all.
+    event = payload.get("hook_event_name") if payload is not None else None
+    if event in ("PostToolUse", "PostToolUseFailure"):
+        report_outcome(payload)
+        return
+
     run_id_raw = os.environ.get("NUCLEOS_RUN_ID")
     if run_id_raw is None:
-        # Parsed inside, and unparseable input is silence there rather than a refusal. The two
-        # branches fail closed in different directions on purpose: for a run, an unreadable
-        # payload means the gate cannot see what it is governing and must stop everything. For a
-        # person's session it means only that we cannot tell whether this was git — and refusing
-        # every tool call in someone's editor, over a payload the editor itself wrote, would take
-        # the session down to protect a guarantee that was never at risk.
-        interactive_session(read_payload(silent_on_error=True))
+        # Silent on a parse failure, exactly as `read_payload(silent_on_error=True)` used to be:
+        # for a person's session, an unreadable payload means only that we cannot tell whether
+        # this was git — and refusing every tool call in someone's editor, over a payload the
+        # editor itself wrote, would take the session down to protect a guarantee never at risk.
+        if payload is None:
+            no_opinion()
+        interactive_session(payload)
 
-    try:
-        payload = json.load(sys.stdin)
-    except Exception as exc:
-        deny(f"failed to parse hook payload from stdin ({exc}) - failing closed")
-    if not isinstance(payload, dict):
-        deny("hook payload from stdin is not a JSON object - failing closed")
+    # For a run, an unreadable payload means the gate cannot see what it is governing and must
+    # stop everything — `deny()`, exactly as the un-restructured code did.
+    if payload is None:
+        deny(parse_error)
 
     daemon_url = os.environ.get("NUCLEOS_DAEMON_URL")
     token = os.environ.get("NUCLEOS_DAEMON_TOKEN")

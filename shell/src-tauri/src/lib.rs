@@ -19,6 +19,59 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 /// state: after the first launch the answer belongs to the user, whatever it is.
 const AUTOSTART_MARKER: &str = "autostart-initialised";
 
+/// What closing the main window does on this platform.
+#[derive(Debug, PartialEq, Eq)]
+enum CloseAction {
+    /// Keep running in the tray; "Show NucleOS" or a left click on the tray brings the window back.
+    Hide,
+    /// Leave the app.
+    Exit,
+}
+
+/// Hide where a tray is guaranteed, exit where it is not (spec D9). GNOME without the AppIndicator
+/// extension draws no tray at all, and nothing reliable says whether one is there, so on Linux a
+/// hidden window could be unreachable. Exiting costs nothing: the daemon's life is independent of
+/// the shell's.
+const CLOSE: CloseAction = if cfg!(target_os = "linux") {
+    CloseAction::Exit
+} else {
+    CloseAction::Hide
+};
+
+/// Brings the main window back: unminimized, shown and focused. Errors are ignored because there is
+/// nothing useful to do with one here. The label is the default `main`: tauri.conf.json names none.
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// Linux only: WebKitGTK ships with media streams off and answers no permission request, so
+/// `getUserMedia` failed before anyone was asked. Only the app's own bundle loads in this webview
+/// (the CSP fences the rest), and only an audio-only user-media request is granted; every other
+/// request falls through to WebKitGTK's default, which refuses it.
+#[cfg(target_os = "linux")]
+fn allow_the_microphone(webview: &webkit2gtk::WebView) {
+    use glib::prelude::*;
+    use webkit2gtk::{PermissionRequestExt, SettingsExt, UserMediaPermissionRequest, WebViewExt};
+
+    if let Some(settings) = webview.settings() {
+        settings.set_enable_media_stream(true);
+    }
+    webview.connect_permission_request(|_, request| {
+        // Both callers (lib/capture.ts, data/conversation.ts) ask for audio alone.
+        let audio_only = request.is::<UserMediaPermissionRequest>()
+            && request.property::<bool>("is-for-audio-device")
+            && !request.property::<bool>("is-for-video-device");
+        if audio_only {
+            request.allow();
+        }
+        audio_only
+    });
+}
+
 // Left at the crate root's default visibility on purpose: `#[tauri::command]` re-exports helper
 // macros with the function's visibility, and `pub(crate)` makes that re-export collide with its own
 // definition (E0255). `dictation` reaches it as `crate::get_daemon_token` because a private item in
@@ -66,32 +119,57 @@ pub fn run() {
                 }
             }
 
-            // A tray icon is required once window-close hides instead of quits — otherwise there is no
-            // way to exit short of Task Manager. Minimal menu: just "Quit".
+            // A tray icon is required wherever closing the window hides it: it is the way back to the
+            // window and the way out of the app. On Linux closing exits instead (see CLOSE).
+            let show_item = MenuItem::with_id(app, "show", "Show NucleOS", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&quit_item])?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                .show_menu_on_left_click(true)
+                // A left click shows the window; the menu is on the right button. Linux ignores this
+                // setting and reports no tray clicks, so there the menu is the only way.
+                .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
-                    if event.id() == "quit" {
+                    if event.id() == "show" {
+                        show_main(app);
+                    } else if event.id() == "quit" {
                         app.exit(0);
                     }
                 })
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main(tray.app_handle());
+                    }
+                })
                 .build(app)?;
+
+            // The microphone on Linux: see allow_the_microphone.
+            #[cfg(target_os = "linux")]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.with_webview(|webview| allow_the_microphone(&webview.inner()));
+            }
 
             Ok(())
         })
         .on_window_event(|window, event| {
             match event {
-                WindowEvent::CloseRequested { api, .. } => {
-                    // Hide instead of quit — the app stays alive in the tray. "Quit" here is the
+                WindowEvent::CloseRequested { api, .. } => match CLOSE {
+                    // Hide instead of quit: the app stays alive in the tray. "Quit" there is the
                     // shell's own process exit; there is NO child daemon process to kill (the
-                    // daemon's lifecycle is entirely independent now — Part A).
-                    api.prevent_close();
-                    let _ = window.hide();
-                }
+                    // daemon's lifecycle is entirely independent now, Part A).
+                    CloseAction::Hide => {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                    // No guaranteed tray to come back from, so closing leaves the app.
+                    CloseAction::Exit => window.app_handle().exit(0),
+                },
                 // The OS drop is handled HERE rather than in the page, because the page never sees
                 // it: Tauri takes the drop so it can hand over real paths, which is also what makes
                 // this side the only honest place to decide which paths are readable afterwards.
@@ -122,6 +200,56 @@ pub fn run() {
             dictation::voice_register_hotkeys,
             drop::read_dropped,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(on_run_event);
+}
+
+/// The dock icon: macOS reports a click on it as Reopen, and before this a hidden window stayed hidden.
+#[cfg(target_os = "macos")]
+fn on_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
+    if let tauri::RunEvent::Reopen { .. } = event {
+        show_main(app);
+    }
+}
+
+/// No other platform has a Reopen event, so nothing is handled: exactly what `Builder::run` did.
+#[cfg(not(target_os = "macos"))]
+fn on_run_event(_app: &tauri::AppHandle, _event: tauri::RunEvent) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec D9: hide where a tray is guaranteed, exit where it is not.
+    #[test]
+    fn closing_the_window_hides_only_where_a_tray_is_guaranteed() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            CLOSE,
+            CloseAction::Exit,
+            "Linux has no guaranteed tray to come back from"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            CLOSE,
+            CloseAction::Hide,
+            "the tray brings the window back here"
+        );
+    }
+
+    /// Spec 1.10: without these, macOS refuses `getUserMedia` (capture.ts, conversation.ts).
+    #[test]
+    fn the_microphone_is_declared_to_macos() {
+        let info = include_str!("../Info.plist");
+        assert!(info.contains("<key>NSMicrophoneUsageDescription</key>"));
+        let entitlements = include_str!("../Entitlements.plist");
+        assert!(entitlements.contains("<key>com.apple.security.device.audio-input</key>"));
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri.conf.json parses");
+        assert_eq!(
+            conf["bundle"]["macOS"]["entitlements"],
+            "./Entitlements.plist"
+        );
+    }
 }

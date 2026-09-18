@@ -3382,6 +3382,7 @@ name = "shell"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "glib",
  "keyring",
  "serde",
  "serde_json",
@@ -3391,6 +3392,7 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "tauri-plugin-opener",
  "tempfile",
+ "webkit2gtk",
  "windows-sys 0.61.2",
 ]
 

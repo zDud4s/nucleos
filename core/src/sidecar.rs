@@ -278,16 +278,26 @@ where
 /// The variable that says where the sidecar binaries are, for a daemon that does not sit beside them.
 pub const SIDECAR_DIR_VAR: &str = "NUCLEOS_SIDECAR_DIR";
 
-/// Where the sidecar whose executable is called `file` is, for this daemon.
+/// The file name of the sidecar called `name`: `<name>-sidecar` plus this platform's executable
+/// suffix, so `.exe` on Windows and nothing on macOS or Linux.
+///
+/// The one place that name is spelled. `scripts/build-sidecars.sh` writes the same name with
+/// `go env GOEXE`, which is `.exe` on Windows and empty elsewhere; the two change together.
+pub fn binary_file_name(name: &str) -> String {
+    format!("{name}-sidecar{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Where the sidecar called `name` ([`ECHO`], [`BROWSER`], ...) is, for this daemon.
 ///
 /// Beside the daemon's own executable unless [`SIDECAR_DIR_VAR`] says otherwise. The default is the
 /// layout `scripts/build-sidecars.sh` produces and an installation ships; the variable is for a
 /// daemon built anywhere else. That is not rare on this machine: a build that must not overwrite the
 /// running daemon's binary goes to a target directory of its own, which has no sidecars in it, and
 /// on 2026-09-09 a daemon swapped in from one came up with all five down.
-pub fn binary(file: &str) -> PathBuf {
+pub fn binary(name: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("the daemon can name its own executable");
-    binary_in(std::env::var_os(SIDECAR_DIR_VAR).as_deref(), &exe, file)
+    let file = binary_file_name(name);
+    binary_in(std::env::var_os(SIDECAR_DIR_VAR).as_deref(), &exe, &file)
 }
 
 /// PURE: [`binary`], given what the environment and the executable's own path said. An empty
@@ -312,6 +322,26 @@ fn spawn_failure(binary_path: &Path, error: &io::Error) -> String {
     format!("could not start {}: {error}{remedy}", binary_path.display())
 }
 
+/// The variable that tells a sidecar its stdin is the daemon's lifeline (portability spec, D3).
+///
+/// Without it a sidecar reads nothing from stdin: one started by hand, or by a script with stdin at
+/// `/dev/null`, must not take that immediate EOF as its cue to leave.
+pub const LIFELINE_VAR: &str = "NUCLEOS_LIFELINE";
+
+/// Gives a sidecar its lifeline: stdin piped from THIS process, and [`LIFELINE_VAR`] set.
+///
+/// The write end lives here, and `supervise` holds it for as long as the child lives. However this
+/// process dies -- orderly, `SIGKILL`, `TerminateProcess`, a crash -- the kernel closes that end and
+/// the sidecar reads EOF, which each sidecar takes as its cue to shut down. That is what takes the
+/// sidecars down with a hard-killed daemon on macOS and Linux, where `LITTER` adopts nothing; on
+/// Windows the job object holds as well. Rust opens this process's end close-on-exec
+/// (non-inheritable on Windows), so no other child of the daemon can keep a sidecar alive by
+/// holding a copy of it.
+fn arm_lifeline(cmd: &mut Command) {
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.env(LIFELINE_VAR, "1");
+}
+
 pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, String)>) {
     let mut delay = RESTART_BASE;
     let mut attempts: u32 = 0;
@@ -331,6 +361,8 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
         // to make impossible.
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // The lifeline (spec D3); see `arm_lifeline`.
+        arm_lifeline(&mut cmd);
         match cmd.spawn() {
             Ok(mut child) => {
                 // Adopted before anything else is done with it, and while the `Child` is still held
@@ -346,6 +378,11 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
                 if let Some(stderr) = child.stderr.take() {
                     tokio::spawn(pump(name.clone(), "stderr", stderr));
                 }
+                // Held, not dropped: the lifeline must live exactly as long as the child. Taken out
+                // of `child` because tokio's `Child::wait` closes a stdin the `Child` still holds
+                // before waiting, which every sidecar would read as "the daemon is gone". A named
+                // binding, so it drops at the end of this arm, after `wait()` has returned.
+                let _lifeline = child.stdin.take();
                 let started_at = chrono::Utc::now().to_rfc3339();
                 let launched = std::time::Instant::now();
                 let restarts = attempts;
@@ -1000,6 +1037,23 @@ mod tests {
         );
     }
 
+    /// The daemon looks for exactly the name `scripts/build-sidecars.sh` writes, and Go adds `.exe`
+    /// only on Windows (`go env GOEXE` is empty elsewhere). A literal `.exe` was right on one
+    /// platform by coincidence.
+    #[test]
+    fn a_sidecar_binary_carries_this_platforms_executable_suffix() {
+        let expected = if cfg!(windows) {
+            "echo-sidecar.exe"
+        } else {
+            "echo-sidecar"
+        };
+        assert_eq!(binary_file_name(ECHO), expected);
+        assert_eq!(
+            binary_file_name(BROWSER),
+            format!("browser-sidecar{}", std::env::consts::EXE_SUFFIX)
+        );
+    }
+
     /// The failure a missing sidecar records names the file it looked for, and the two ways out.
     #[test]
     fn a_sidecar_that_cannot_start_says_where_it_looked() {
@@ -1014,5 +1068,51 @@ mod tests {
             &io::Error::from(io::ErrorKind::PermissionDenied),
         );
         assert!(!refused.contains(SIDECAR_DIR_VAR), "{refused}");
+    }
+
+    /// D3: a sidecar reads its lifeline to EOF and leaves, so dropping the write end -- what the
+    /// kernel does to a dead daemon's descriptors, however it died -- ends it. The stand-in honours
+    /// the contract the Go sidecars implement: without `NUCLEOS_LIFELINE=1` it exits 3 before saying
+    /// anything, so a pass cannot come from a bare `cat`.
+    #[tokio::test]
+    async fn a_sidecar_lives_exactly_as_long_as_its_lifeline() {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            r#"[ "$NUCLEOS_LIFELINE" = 1 ] || exit 3; echo up; cat >/dev/null; exit 0"#,
+        ]);
+        command.stdout(std::process::Stdio::piped());
+        command.kill_on_drop(true);
+        arm_lifeline(&mut command);
+        let mut child = command.spawn().expect("`sh` must be on PATH");
+        let lifeline = child.stdin.take().expect("the lifeline must be piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+
+        let mut first = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::BufReader::new(stdout).read_line(&mut first),
+        )
+        .await
+        .expect("the stand-in never started")
+        .expect("reading the stand-in's stdout");
+        assert_eq!(
+            first.trim(),
+            "up",
+            "the stand-in did not see {LIFELINE_VAR}=1"
+        );
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "left while the lifeline was still held"
+        );
+
+        drop(lifeline);
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("the sidecar outlived its lifeline")
+            .expect("wait");
+        assert!(status.success(), "{status}");
     }
 }

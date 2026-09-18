@@ -75,9 +75,10 @@ jobs:
 
       - run: bash scripts/gates.sh core
 
-  # The Python this repo ships — chiefly `.claude/hooks/ask_daemon.py`, which `core/src/triage.rs`
-  # compiles INTO the daemon and which decides what a person's git commands may do. No Rust, no Go,
-  # no Node, so this job installs none of them.
+  # The Python this repo ships — chiefly `core/hooks/ask_daemon.py`, which `core/src/autopilot.rs`
+  # and `core/src/triage.rs` compile INTO the daemon (`.claude/hooks/` holds a byte copy) and which
+  # decides what a person's git commands may do. No Rust, no Go, no Node, so this job installs none
+  # of them.
   hooks:
     needs: plan
     strategy:

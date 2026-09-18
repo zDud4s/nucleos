@@ -55,7 +55,7 @@ func Load() (Config, error) {
 
 	configPath := os.Getenv("NUCLEOS_TELEGRAM_CONFIG")
 	if configPath == "" {
-		configPath = filepath.Join(os.Getenv("LOCALAPPDATA"), "nucleos", "telegram-config.json")
+		configPath = filepath.Join(nucleosDir(), "telegram-config.json")
 	}
 
 	settings, err := LoadFromFile(configPath)
@@ -156,7 +156,22 @@ func OffsetPath() string {
 	if configured := os.Getenv("NUCLEOS_TELEGRAM_OFFSET"); configured != "" {
 		return configured
 	}
-	return filepath.Join(os.Getenv("LOCALAPPDATA"), "nucleos", "telegram-offset")
+	return filepath.Join(nucleosDir(), "telegram-offset")
+}
+
+// nucleosDir is where the Telegram config and its update offset live. LOCALAPPDATA comes first and
+// unchanged, so Windows resolves exactly where it always has. Elsewhere it is the user config
+// directory (XDG_CONFIG_HOME or ~/.config on Linux, ~/Library/Application Support on macOS): joined
+// with an unset LOCALAPPDATA the old path was relative to wherever the sidecar was started. The last
+// resort is that same relative "nucleos", reached only when the OS names no config directory at all.
+func nucleosDir() string {
+	if local := os.Getenv("LOCALAPPDATA"); local != "" {
+		return filepath.Join(local, "nucleos")
+	}
+	if dir, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(dir, "nucleos")
+	}
+	return "nucleos"
 }
 
 // LoadOffset reads the last confirmed update offset. Anything unreadable reads as 0: starting from

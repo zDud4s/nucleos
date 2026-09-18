@@ -34,13 +34,19 @@ const pinnedRevision = "1680269"
 const snapshotBase = "https://storage.googleapis.com/chromium-browser-snapshots"
 
 // DefaultPin is the pinned Chromium for the platform this binary was built for.
-//
-// Only windows/amd64 carries a digest today, because that is the platform the digest was measured on
-// and a digest cannot be guessed. The others come back with an empty Sha256 on purpose: `Download`
-// refuses that with [ErrNoDigest], which is a refusal that names what is missing — strictly better
-// than a pin that installs an unverified browser on a platform nobody has tested.
 func DefaultPin() Pin {
-	switch runtime.GOOS + "/" + runtime.GOARCH {
+	return pinFor(runtime.GOOS, runtime.GOARCH)
+}
+
+// pinFor is the pinned Chromium for a named platform, so one test build can read every platform's pin.
+//
+// Each digest was measured, never copied: the archive was downloaded from this exact URL and hashed.
+// windows/amd64 was measured first; linux/amd64 and darwin/arm64 on 2026-09-16. Any other platform
+// comes back with no URL and no Sha256 on purpose: `Download` refuses that with [ErrNoDigest], which
+// names what is missing and is strictly better than installing an unverified browser on a platform
+// nobody has tested.
+func pinFor(goos, goarch string) Pin {
+	switch goos + "/" + goarch {
 	case "windows/amd64":
 		return Pin{
 			Revision:            pinnedRevision,
@@ -52,12 +58,14 @@ func DefaultPin() Pin {
 		return Pin{
 			Revision:            pinnedRevision,
 			URL:                 snapshotBase + "/Linux_x64/" + pinnedRevision + "/chrome-linux.zip",
+			Sha256:              "f0a9a8aad04c6add4e80f9bc5d4e7eee380ad6fd0acb30e5ea7da6263d75a5cb",
 			ExecutableInArchive: "chrome-linux/chrome",
 		}
 	case "darwin/arm64":
 		return Pin{
 			Revision:            pinnedRevision,
 			URL:                 snapshotBase + "/Mac_Arm/" + pinnedRevision + "/chrome-mac.zip",
+			Sha256:              "39e875122a62b47ffbb74a9f7e8cda4f186385e3a3dac5745fdcaad85557c379",
 			ExecutableInArchive: "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
 		}
 	default:

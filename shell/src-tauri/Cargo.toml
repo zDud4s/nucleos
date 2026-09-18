@@ -57,6 +57,13 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Wi
 # an update channel that does not exist. Re-add it together with a real key, a real release
 # feed and the capability, as one change.
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The Linux webview, named so lib.rs can switch its media stream on and answer its microphone
+# permission request. Both already come in through tauri and wry at these versions (Cargo.lock:
+# webkit2gtk 2.0.2, glib 0.18.5), so this declares what is built rather than adding a crate.
+webkit2gtk = "2.0"
+glib = "0.18"
+
 [dev-dependencies]
 # For `drop.rs`'s walk tests, which need a real directory tree to walk.
 tempfile = "3.27.0"

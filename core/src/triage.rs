@@ -22,12 +22,22 @@ use std::path::{Path, PathBuf};
 /// from "the daemon was unreachable".
 pub const TRIAGE_DENY_REASON: &str = "email triage runs have no tools";
 
-/// The production hook, compiled in rather than read from disk at runtime.
+/// The production hook, compiled in rather than read from disk at runtime: the SAME source
+/// `autopilot.rs`'s `HOOK_SOURCE` embeds, `core/hooks/ask_daemon.py`, so the email sandbox and
+/// every project the daemon wires run one script. `.claude/hooks/ask_daemon.py` is a tracked copy
+/// of it, held equal by `scripts/test-hook-filter.py`, and is not compiled in.
 ///
 /// Copying `<cwd>/.claude/hooks/ask_daemon.py` at startup would reintroduce exactly the dependency
 /// on the repository root that the sandbox exists to remove, and it would find nothing at all in a
 /// packaged install.
-const HOOK_SCRIPT: &str = include_str!("../../.claude/hooks/ask_daemon.py");
+///
+/// One behaviour changed when this moved off the `.claude/` copy, accepted by the owner on
+/// 2026-09-14: a call whose payload says `hook_event_name` is `PostToolUse` or
+/// `PostToolUseFailure` goes to `report_outcome`, which never decides, so the sandbox gives it no
+/// decision instead of refusing it. The sandbox registers the hook only under `PreToolUse`, the
+/// field is written by the Claude CLI and not by the model, and barrier 1 (`ToolPolicy::None`)
+/// still refuses every tool.
+const HOOK_SCRIPT: &str = include_str!("../hooks/ask_daemon.py");
 
 /// Builds the directory a triage run works in, and returns it.
 ///
@@ -3173,6 +3183,25 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("hooks/ask_daemon.py")).unwrap(),
             HOOK_SCRIPT
+        );
+    }
+
+    /// One hook source for the daemon (owner decision, 2026-09-14): the script the email sandbox
+    /// runs is byte for byte the one `wire_classifier_hook` writes into every project. This file
+    /// used to embed the `.claude/` copy while `autopilot.rs` embedded `core/hooks/`, and the two
+    /// drifted apart with nothing to notice.
+    #[test]
+    fn the_sandbox_runs_the_same_hook_the_daemon_wires_into_projects() {
+        let sandbox = tempfile::tempdir().unwrap();
+        ensure_sandbox(sandbox.path()).unwrap();
+        let project = tempfile::tempdir().unwrap();
+        crate::autopilot::wire_classifier_hook(project.path()).unwrap();
+
+        let sandboxed = std::fs::read(sandbox.path().join("hooks/ask_daemon.py")).unwrap();
+        let wired = std::fs::read(project.path().join(".claude/hooks/ask_daemon.py")).unwrap();
+        assert!(
+            sandboxed == wired,
+            "the email sandbox and a wired project run different ask_daemon.py scripts"
         );
     }
 

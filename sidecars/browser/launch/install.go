@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -123,10 +124,25 @@ func (i Install) extract(archive []byte) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", dir, err)
 	}
+	// Off Windows the archive's symlinks and permission bits are kept: the macOS bundle reaches its
+	// frameworks through symlinks, and a binary without its execute bit does not run. On Windows
+	// every entry is still written as a plain file, as before.
+	keepLinks := runtime.GOOS != "windows"
 	for _, entry := range reader.File {
 		target, err := safeJoin(dir, entry.Name)
 		if err != nil {
 			return err
+		}
+		link := keepLinks && entry.Mode()&os.ModeSymlink != 0
+		if keepLinks {
+			// A symlink entry replaces whatever sits at its own path, so only its parents are checked.
+			checked := target
+			if link {
+				checked = filepath.Dir(target)
+			}
+			if err := refuseSymlinkOnTheWay(dir, checked, entry.Name); err != nil {
+				return err
+			}
 		}
 		if entry.FileInfo().IsDir() {
 			if err := os.MkdirAll(target, 0o755); err != nil {
@@ -136,6 +152,12 @@ func (i Install) extract(archive []byte) error {
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
+		}
+		if link {
+			if err := writeSymlink(entry, target); err != nil {
+				return err
+			}
+			continue
 		}
 		if err := writeEntry(entry, target); err != nil {
 			return err
@@ -166,6 +188,104 @@ func writeEntry(entry *zip.File, target string) error {
 	}
 	if written == maxEntry {
 		return fmt.Errorf("launch: archive entry %s is implausibly large", entry.Name)
+	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	// OpenFile's mode is narrowed by the umask and ignored for a file that already existed, so the
+	// archive's own bits are applied explicitly.
+	return os.Chmod(target, fileMode(&entry.FileHeader))
+}
+
+// Zip "version made by" hosts whose external attributes carry Unix permission bits (APPNOTE 4.4.2).
+const (
+	creatorUnix  = 3
+	creatorMacOS = 19
+)
+
+// fileMode is the permission a regular file is extracted with off Windows. An archive made on Unix
+// or macOS keeps its own bits, minus group and world write, plus owner read and write so a later
+// extraction can overwrite the file. Any other archive records no Unix bits and gets 0o755, the mode
+// every entry had before the bits were kept.
+func fileMode(header *zip.FileHeader) os.FileMode {
+	switch header.CreatorVersion >> 8 {
+	case creatorUnix, creatorMacOS:
+		return header.Mode().Perm()&^0o022 | 0o600
+	default:
+		return 0o755
+	}
+}
+
+// maxLink bounds a symlink's target text. The links in a Chromium archive are a few dozen bytes.
+const maxLink = 4 << 10
+
+// linkRefusal says why a symlink target read from the archive must not be written, or returns nil.
+//
+// A link may only point down: relative, with no ".." anywhere in it. safeJoin keeps the link itself
+// inside the install; this keeps where it points inside too. Checking where a ".." lands would not
+// be enough, because a link on the way may point somewhere shallower than its own path.
+func linkRefusal(link string) error {
+	switch {
+	case link == "":
+		return errors.New("empty symlink target")
+	case len(link) > maxLink:
+		return fmt.Errorf("symlink target longer than %d bytes", maxLink)
+	case strings.HasPrefix(link, "/") || filepath.IsAbs(filepath.FromSlash(link)):
+		return fmt.Errorf("absolute symlink target %q", link)
+	}
+	for _, part := range strings.Split(link, "/") {
+		if part == ".." {
+			return fmt.Errorf("symlink target %q climbs out with ..", link)
+		}
+	}
+	return nil
+}
+
+// writeSymlink writes a symlink entry once linkRefusal has accepted its target.
+func writeSymlink(entry *zip.File, target string) error {
+	source, err := entry.Open()
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	text, err := io.ReadAll(io.LimitReader(source, maxLink+1))
+	if err != nil {
+		return err
+	}
+	link := string(text)
+	if err := linkRefusal(link); err != nil {
+		return fmt.Errorf("launch: archive entry %q: %w", entry.Name, err)
+	}
+	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.Symlink(link, target)
+}
+
+// refuseSymlinkOnTheWay refuses to write at path when path, or any directory between root and it, is
+// already a symlink on disk. Writing through a link puts the bytes wherever the link points, which
+// is the one place safeJoin cannot see.
+func refuseSymlinkOnTheWay(root, path, name string) error {
+	relative, err := filepath.Rel(root, path)
+	if err != nil {
+		return err
+	}
+	current := root
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		if part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("launch: archive entry %q reaches through the symlink %s", name, current)
+		}
 	}
 	return nil
 }
