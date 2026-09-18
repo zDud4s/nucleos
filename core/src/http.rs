@@ -31259,6 +31259,13 @@ mod tests {
         let entries = parsed.as_array().unwrap();
         assert_eq!(entries.len(), 1, "the action approval must not appear here");
         assert_eq!(entries[0]["id"], skipped);
+        for key in ["job_id", "run_stage", "item_ordinal", "item_description"] {
+            assert!(entries[0].get(key).is_some(), "{key} must be present");
+            assert!(
+                entries[0][key].is_null(),
+                "{key} must be null without a run"
+            );
+        }
         // `tool_input` is the whole point of the record: it is what tells an item worth picking up
         // in the morning from one worth dropping.
         assert!(

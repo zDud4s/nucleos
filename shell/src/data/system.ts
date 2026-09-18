@@ -109,6 +109,14 @@ export interface Proposal {
   read_from: string | null;
   created_at: string;
   decided_at: string | null;
+  /**
+   * Joined in only by `GET /proposals/skipped-items`; absent or null elsewhere
+   * means the query did not ask, while null there means the run or item is gone.
+   */
+  job_id?: number | null;
+  run_stage?: string | null;
+  item_ordinal?: number | null;
+  item_description?: string | null;
 }
 
 /**
