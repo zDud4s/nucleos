@@ -1718,6 +1718,24 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
 
 /* ---------------------------------------------------------- 8. skipped items -- */
 
+function lostWorkOf(proposal: Proposal): { title: string; detail: string | null } {
+  if (proposal.job_id == null) {
+    return { title: "a job this record can no longer trace", detail: null };
+  }
+
+  const job = "job " + proposal.job_id + " \u00B7 ";
+  if (typeof proposal.item_ordinal === "number") {
+    // The column is 0-based; every surface renders item ordinals one-based.
+    return {
+      title: job + "item " + (proposal.item_ordinal + 1),
+      detail: proposal.item_description ?? null,
+    };
+  }
+  if (proposal.run_stage === "review") return { title: job + "the job's review", detail: null };
+  if (proposal.run_stage === "plan") return { title: job + "the job's plan", detail: null };
+  return { title: job + "an item it no longer names", detail: null };
+}
+
 function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
   const dismiss = useDismissProposal();
   const rows = view.rows ?? [];
@@ -1751,39 +1769,47 @@ function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
       }
     >
       <Rows label="Skipped items" className={dense(items.length) ? "waiting-dense" : undefined}>
-        {items.map((proposal) => (
-          <Row className="waiting-card" dense={dense(items.length)} key={proposal.id}>
-            <div className="waiting-card-head">
-              <span className="waiting-card-id">item #{proposal.id}</span>
-              <span className="waiting-card-title">
-                {proposal.tool_name ?? "an action that names no tool"}
-              </span>
-              <span className="waiting-meta">
-                {proposal.project_id ?? "no project"}
-              </span>
-              <RelativeTime at={proposal.created_at} />
-            </div>
-            <p className="waiting-reasoning">
-              {proposal.reasoning.trim() === ""
-                ? "nothing was recorded about why"
-                : proposal.reasoning}
-            </p>
-            <ToolInput raw={proposal.tool_input} />
-            <div className="waiting-actions">
-              {/* `/dismiss`, never `/reject`: rejecting guards on
-                  `action-approval` and would answer 409 for every one of these. */}
-              <ConfirmButton
-                label={`Put item #${proposal.id} away`}
-                confirmLabel="I have read it"
-                subject={`#${proposal.id}`}
-                variant="quiet"
-                disabled={dismiss.isPending}
-                onArmedChange={onArmedChange}
-                onConfirm={() => dismiss.mutate(proposal.id)}
-              />
-            </div>
-          </Row>
-        ))}
+        {items.map((proposal) => {
+          const work = lostWorkOf(proposal);
+          return (
+            <Row className="waiting-card" dense={dense(items.length)} key={proposal.id}>
+              <div className="waiting-card-head">
+                <span className="waiting-card-id">item #{proposal.id}</span>
+                <span className="waiting-card-title">{work.title}</span>
+                {proposal.run_id !== null && (
+                  <Link className="waiting-row-link" to={`/runs/${proposal.run_id}`}>
+                    run {proposal.run_id}
+                  </Link>
+                )}
+                <span className="waiting-meta">{proposal.project_id ?? "no project"}</span>
+                <RelativeTime at={proposal.created_at} />
+              </div>
+              {work.detail !== null && <p className="waiting-reasoning">{work.detail}</p>}
+              <p className="waiting-meta">
+                <span>{proposal.tool_name ?? "an action that names no tool"}</span>{" — "}
+                <span>
+                  {proposal.reasoning.trim() === ""
+                    ? "nothing was recorded about why"
+                    : proposal.reasoning}
+                </span>
+              </p>
+              <ToolInput raw={proposal.tool_input} />
+              <div className="waiting-actions">
+                {/* `/dismiss`, never `/reject`: rejecting guards on
+                    `action-approval` and would answer 409 for every one of these. */}
+                <ConfirmButton
+                  label={`Put item #${proposal.id} away`}
+                  confirmLabel="I have read it"
+                  subject={`#${proposal.id}`}
+                  variant="quiet"
+                  disabled={dismiss.isPending}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() => dismiss.mutate(proposal.id)}
+                />
+              </div>
+            </Row>
+          );
+        })}
       </Rows>
     </Queue>
   );

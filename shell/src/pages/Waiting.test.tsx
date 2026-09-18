@@ -980,6 +980,81 @@ describe("Waiting - a skipped item is put away, not refused", () => {
   });
 });
 
+describe("Waiting - a skipped item names the work it put down", () => {
+  it("heads the card with the job and item and links the run", async () => {
+    const world = waitingWorld({
+      skipped: [
+        proposal({
+          id: 41,
+          kind: "skipped-item",
+          run_id: 7,
+          tool_name: "Bash",
+          reasoning: "asked",
+          job_id: 27,
+          run_stage: "implement",
+          item_ordinal: 3,
+          item_description: "tidy the imports",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+    const list = await screen.findByRole("list", { name: "Skipped items" });
+
+    expect(within(list).getByText("job 27 \u00B7 item 4")).toBeDefined();
+    expect(within(list).getByText("tidy the imports")).toBeDefined();
+    expect(within(list).getByRole("link", { name: "run 7" }).getAttribute("href")).toContain(
+      "/runs/7",
+    );
+    expect(within(list).getByText("Bash")).toBeDefined();
+    expect(within(list).getByRole("button", { name: "Put item #41 away" })).toBeDefined();
+  });
+
+  it("names a review node as the job's review", async () => {
+    const world = waitingWorld({
+      skipped: [
+        proposal({
+          id: 41,
+          kind: "skipped-item",
+          run_id: 7,
+          tool_name: "Bash",
+          reasoning: "asked",
+          job_id: 27,
+          run_stage: "review",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+    const list = await screen.findByRole("list", { name: "Skipped items" });
+
+    expect(within(list).getByText("job 27 \u00B7 the job's review")).toBeDefined();
+  });
+
+  it("falls back without going blank when the run no longer resolves", async () => {
+    const world = waitingWorld({
+      skipped: [
+        proposal({
+          id: 41,
+          kind: "skipped-item",
+          run_id: 7,
+          tool_name: "Bash",
+          reasoning: "asked",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+    const list = await screen.findByRole("list", { name: "Skipped items" });
+
+    expect(within(list).getByText("a job this record can no longer trace")).toBeDefined();
+    expect(within(list).getByText("Bash")).toBeDefined();
+  });
+});
+
 /* --------------------------------------------------------------- the route -- */
 
 describe("Waiting - the route", () => {

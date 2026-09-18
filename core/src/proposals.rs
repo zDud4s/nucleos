@@ -43,6 +43,12 @@ pub struct Proposal {
     pub read_from: Option<String>,
     pub created_at: String,
     pub decided_at: Option<String>,
+    /// Joined in only by `list_skipped_items`; `None` elsewhere means that query did not ask.
+    /// There, `None` means the run or item can no longer be resolved because runs are pruned.
+    pub job_id: Option<i64>,
+    pub run_stage: Option<String>,
+    pub item_ordinal: Option<i64>,
+    pub item_description: Option<String>,
 }
 
 #[derive(Debug)]
@@ -192,7 +198,8 @@ pub async fn list_refused_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Proposa
         // that read its mail and then reached for a control) still appears, unnamed.
         "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.errand_id,
                 e.name AS errand_name, p.tool_name, p.reasoning,
-                p.tool_input, p.read_from, p.created_at, p.decided_at
+                p.tool_input, p.read_from, p.created_at, p.decided_at,
+                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
          FROM proposals p
          LEFT JOIN errands e ON e.id = p.errand_id
          WHERE p.status = 'pending' AND p.kind = 'refused-action'
@@ -625,7 +632,8 @@ pub async fn list_pending_recruits(
         // one is not a compile error; it is a row that fails to decode at runtime.
         "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
                 NULL AS errand_name, tool_name, reasoning,
-                tool_input, read_from, created_at, decided_at
+                tool_input, read_from, created_at, decided_at,
+                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
          FROM proposals
          WHERE status = 'pending' AND kind = 'agent-recruit'
          ORDER BY id ASC",
@@ -670,7 +678,8 @@ pub async fn list_pending_team_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Pr
         // one is not a compile error; it is a row that fails to decode at runtime.
         "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
                 NULL AS errand_name, tool_name, reasoning,
-                tool_input, read_from, created_at, decided_at
+                tool_input, read_from, created_at, decided_at,
+                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
          FROM proposals
          WHERE status = 'pending' AND kind = 'team-action'
          ORDER BY id ASC",
@@ -700,7 +709,8 @@ pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
     sqlx::query_as::<_, Proposal>(
         "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
                 NULL AS errand_name, tool_name, reasoning,
-                tool_input, read_from, created_at, decided_at
+                tool_input, read_from, created_at, decided_at,
+                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
          FROM proposals WHERE id = ?",
     )
     .bind(id)
@@ -712,7 +722,8 @@ pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
         "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
                 NULL AS errand_name, tool_name, reasoning,
-                tool_input, read_from, created_at, decided_at
+                tool_input, read_from, created_at, decided_at,
+                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
          FROM proposals
          WHERE status = 'pending' AND kind = 'action-approval'
          ORDER BY id ASC",
@@ -735,12 +746,18 @@ pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
 /// queue is worked front to back, and this is read the morning after.
 pub async fn list_skipped_items(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
-                NULL AS errand_name, tool_name, reasoning,
-                tool_input, read_from, created_at, decided_at
-         FROM proposals
-         WHERE status = 'pending' AND kind = 'skipped-item'
-         ORDER BY id DESC",
+        // LEFT so a pruned run still lists; the subquery keeps one run from duplicating a row.
+        "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.errand_id,
+                NULL AS errand_name, p.tool_name, p.reasoning, p.tool_input, p.read_from,
+                p.created_at, p.decided_at, COALESCE(i.job_id, r.job_id) AS job_id,
+                r.stage AS run_stage, i.ordinal AS item_ordinal, i.description AS item_description
+         FROM proposals p
+         LEFT JOIN runs r ON r.id = p.run_id
+         LEFT JOIN job_items i ON i.id = (
+             SELECT j.id FROM job_items j WHERE j.run_id = p.run_id ORDER BY j.id DESC LIMIT 1
+         )
+         WHERE p.status = 'pending' AND p.kind = 'skipped-item'
+         ORDER BY p.id DESC",
     )
     .fetch_all(pool)
     .await
@@ -1411,6 +1428,121 @@ mod tests {
             None,
             "a run with no project must not lend its refusal one"
         );
+    }
+
+    #[tokio::test]
+    async fn a_skipped_item_from_an_implement_node_names_its_job_and_item() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('nucleos', 'shadow')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job_id = sqlx::query(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
+             VALUES ('nucleos', 'C:/somewhere', 'implementing', 5, '2026-09-17T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at, job_id, stage)
+             VALUES ('nucleos', 'a node', 'completed', 'worktree', '2026-09-17T00:00:00Z', ?, 'implement')",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status, run_id)
+             VALUES (?, 3, 'tidy the imports', 'skipped', ?)",
+        )
+        .bind(job_id)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        create_skipped_item(&pool, run_id, None, Some("nucleos"), "Bash", "asked", None)
+            .await
+            .unwrap();
+
+        let skipped = list_skipped_items(&pool).await.unwrap();
+
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].job_id, Some(job_id));
+        assert_eq!(skipped[0].run_stage.as_deref(), Some("implement"));
+        assert_eq!(skipped[0].item_ordinal, Some(3));
+        assert_eq!(
+            skipped[0].item_description.as_deref(),
+            Some("tidy the imports")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skipped_item_from_a_review_node_names_its_job_and_no_item() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('nucleos', 'shadow')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job_id = sqlx::query(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
+             VALUES ('nucleos', 'C:/somewhere', 'implementing', 5, '2026-09-17T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at, job_id, stage)
+             VALUES ('nucleos', 'a node', 'completed', 'worktree', '2026-09-17T00:00:00Z', ?, 'review')",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        create_skipped_item(&pool, run_id, None, Some("nucleos"), "Bash", "asked", None)
+            .await
+            .unwrap();
+
+        let skipped = list_skipped_items(&pool).await.unwrap();
+
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].job_id, Some(job_id));
+        assert_eq!(skipped[0].run_stage.as_deref(), Some("review"));
+        assert_eq!(skipped[0].item_ordinal, None);
+        assert_eq!(skipped[0].item_description, None);
+    }
+
+    #[tokio::test]
+    async fn a_skipped_item_whose_run_is_gone_still_lists_with_nothing_joined() {
+        let pool = test_pool().await;
+        let older =
+            create_skipped_item(&pool, 999998, None, Some("nucleos"), "Bash", "asked", None)
+                .await
+                .unwrap();
+        let newer =
+            create_skipped_item(&pool, 999999, None, Some("nucleos"), "Bash", "asked", None)
+                .await
+                .unwrap();
+
+        let skipped = list_skipped_items(&pool).await.unwrap();
+
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|proposal| proposal.id)
+                .collect::<Vec<_>>(),
+            [newer, older]
+        );
+        for proposal in skipped {
+            assert_eq!(proposal.job_id, None);
+            assert_eq!(proposal.run_stage, None);
+            assert_eq!(proposal.item_ordinal, None);
+            assert_eq!(proposal.item_description, None);
+        }
     }
 
     #[tokio::test]
