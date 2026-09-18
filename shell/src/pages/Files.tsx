@@ -30,6 +30,7 @@ import {
   ConfirmButton,
   Count,
   ErrorNote,
+  Field,
   Inset,
   PageHeader,
   Panel,
@@ -311,15 +312,14 @@ export function Files() {
             <Breadcrumbs path={path} onGo={setPath} />
 
             <div className="fi-toolbar">
-              <label className="fi-search">
-                <span>Search under this folder</span>
+              <Field label="Search under this folder">
                 <input
                   value={qInput}
                   aria-label="Search files by name"
                   placeholder="find by name…"
                   onChange={(event) => setQInput(event.target.value)}
                 />
-              </label>
+              </Field>
               <NewFolderForm path={path} create={create} />
             </div>
 
@@ -600,12 +600,14 @@ function Breadcrumbs({ path, onGo }: { path: string; onGo: (path: string) => voi
 /* -------------------------------------------------------------- upload -- */
 
 function UploadButton({ path, upload }: { path: string; upload: ReturnType<typeof useUpload> }) {
+  const [chosen, setChosen] = useState<string[]>([]);
   const [oversized, setOversized] = useState<string[]>([]);
   const [savedAs, setSavedAs] = useState<string[]>([]);
 
   async function handleFiles(fileList: FileList | null) {
     if (fileList === null) return;
     const files = Array.from(fileList);
+    setChosen(files.map((file) => file.name));
     const tooBig = files.filter((file) => file.size > MAX_UPLOAD_BYTES).map((file) => file.name);
     setOversized(tooBig);
     setSavedAs([]);
@@ -625,11 +627,12 @@ function UploadButton({ path, upload }: { path: string; upload: ReturnType<typeo
         <span>Upload</span>
         <input
           type="file"
+          className="sr-only"
           multiple
-          aria-label="Upload files"
           onChange={(event) => void handleFiles(event.target.files)}
         />
       </label>
+      {chosen.length > 0 && <p className="fi-upload-chosen">{chosen.join(", ")}</p>}
       {oversized.length > 0 && (
         <p className="fi-upload-note" role="alert">
           not sent — larger than the {String(MAX_UPLOAD_BYTES / (1024 * 1024))} MB the daemon will accept in one
@@ -659,10 +662,9 @@ function NewFolderForm({ path, create }: { path: string; create: ReturnType<type
         create.mutate(joinPath(path, trimmed), { onSuccess: () => setName("") });
       }}
     >
-      <label className="fi-field">
-        <span>New folder</span>
+      <Field label="New folder">
         <input value={name} aria-label="New folder name" onChange={(event) => setName(event.target.value)} />
-      </label>
+      </Field>
       <Button type="submit" disabled={name.trim() === "" || create.isPending}>
         Create folder
       </Button>
@@ -1056,10 +1058,9 @@ function MoveForm({
       }}
     >
       <Inset className="fi-move">
-        <label className="fi-field">
-          <span>Move {entry.name} to</span>
+        <Field label={`Move ${entry.name} to`}>
           <input value={to} aria-label="Destination path" onChange={(event) => setTo(event.target.value)} />
-        </label>
+        </Field>
         <Button type="submit" disabled={move.isPending}>
           Move
         </Button>
@@ -1097,6 +1098,7 @@ function NotEmptyNote({
         <ConfirmButton
           label="Delete with everything inside"
           confirmLabel="Really delete everything inside"
+          variant="danger"
           disabled={busy}
           onConfirm={onConfirm}
         />

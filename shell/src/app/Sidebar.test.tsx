@@ -53,12 +53,13 @@ describe("Sidebar", () => {
     expect(screen.getByRole("link", { name: "All projects" })).toBeTruthy();
   });
 
-  it("says a project's pending count out loud, since the badge is only drawn", async () => {
+  it("says a project's open-proposal count out loud, since the badge is only drawn", async () => {
     await renderWithRouter(<Sidebar projects={[{ id: "sidecar", mode: "shadow", pending: 2 }]} />, {
       initialPath: "/projects",
     });
 
-    expect(screen.getByRole("link", { name: "sidecar, 2 waiting" })).toBeTruthy();
+    // A roster badge is open proposals, not the Waiting queue's arithmetic.
+    expect(screen.getByRole("link", { name: "sidecar, 2 items to review" })).toBeTruthy();
   });
 
   /**
@@ -121,6 +122,41 @@ describe("Sidebar", () => {
     expect(screen.getByRole("link", { name: "Home" }).getAttribute("aria-current")).toBeNull();
   });
 
+  /**
+   * Two rows said it, on every project screen there is.
+   *
+   * `isActive` prefix-matches so that `/runs/412` keeps Runs lit, and the row that owns the
+   * roster is the one place that is wrong: inside `/projects/alpha/state` both `All projects`
+   * and `alpha` matched, and both got the fill, the `--text` label, the glyph, the bar and
+   * `aria-current="page"`. "You are here" twice is "you are here" nowhere.
+   */
+  it("says you are here once, even where a row owns the rows under it", async () => {
+    await renderWithRouter(<Sidebar projects={[{ id: "alpha", mode: "active", pending: 0 }]} />, {
+      initialPath: "/projects/alpha/state",
+    });
+
+    const here = screen
+      .getAllByRole("link")
+      .filter((link) => link.getAttribute("aria-current") === "page");
+    expect(here).toHaveLength(1);
+    expect(here[0].getAttribute("aria-label") ?? here[0].textContent).toContain("alpha");
+  });
+
+  /** And the group's own row is not given up — it is lit on the page it actually is. */
+  it("and on the list itself it is All projects", async () => {
+    await renderWithRouter(<Sidebar projects={[{ id: "alpha", mode: "active", pending: 0 }]} />, {
+      initialPath: "/projects",
+    });
+
+    expect(
+      screen.getByRole("link", { name: "All projects" }).getAttribute("aria-current"),
+    ).toBe("page");
+    const here = screen
+      .getAllByRole("link")
+      .filter((link) => link.getAttribute("aria-current") === "page");
+    expect(here).toHaveLength(1);
+  });
+
   it("navigates on Enter from the keyboard", async () => {
     const { router } = await renderWithRouter(<Sidebar />);
 
@@ -160,6 +196,13 @@ describe("Sidebar", () => {
     // And when there is a count it is part of the name, not decoration a screen
     // reader steps over — a summons only some people get is not a summons.
     expect(screen.getByRole("link", { name: "Waiting, 7 waiting" })).toBeDefined();
+  });
+
+  it("names chat and mail badges by their own arithmetic", async () => {
+    await renderWithRouter(<Sidebar badges={{ chats: 2, mail: 3 }} />);
+
+    expect(screen.getByRole("link", { name: "Chats, 2 unread" })).toBeDefined();
+    expect(screen.getByRole("link", { name: "Mail, 3 untriaged" })).toBeDefined();
   });
 
   it("renders no badge at all for a count the shell has no source for", async () => {

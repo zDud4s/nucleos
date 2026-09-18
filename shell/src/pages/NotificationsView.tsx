@@ -218,8 +218,8 @@ function KindItem({
   /** `false` for a kind no family prefix claims — it has nothing to inherit from. */
   inFamily?: boolean;
 }) {
-  // The only thing FEED_KINDS is used for on this screen, and the one place its
-  // gaps are harmless: `readFeedKind` already falls back to the literal.
+  // The only thing the state map's `feed` domain is used for on this screen, and
+  // the one place its gaps are harmless: `readFeedKind` falls back to the literal.
   const label = readFeedKind(row.kind)?.label ?? row.kind;
 
   return (

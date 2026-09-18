@@ -48,6 +48,13 @@ describe("suggestedId", () => {
 });
 
 describe("adding a project", () => {
+  it("a step says which of how many", async () => {
+    await openWizard();
+
+    expect(await screen.findByRole("heading", { name: "1 of 3. The folder" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "The folder" })).toBeTruthy();
+  });
+
   /**
    * **§9's second step, and the reason it exists.** This repository's way of working is a folder,
    * and the app has to recognise it rather than ask for it to be described again.

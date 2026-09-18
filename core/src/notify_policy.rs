@@ -407,7 +407,7 @@ mod tests {
     async fn observed_kinds_are_distinct_and_ordered() {
         let pool = test_pool().await;
         for kind in ["worktree_gc", "job_failed", "job_failed", "email_digest"] {
-            crate::feed::append(&pool, None, kind, "a summary", None)
+            crate::feed::append(&pool, None, kind, "a summary", None, None)
                 .await
                 .expect("the feed row to insert");
         }

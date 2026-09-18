@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -150,6 +150,25 @@ describe("Voice — not armed", () => {
     expect(await screen.findByText("Voice is not armed")).toBeDefined();
     expect(screen.queryByRole("button", { name: "Start dictation" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Start memo" })).toBeNull();
+  });
+});
+
+describe("Voice — hotkey registration", () => {
+  it("says the hotkeys failed when they did", async () => {
+    daemon.apiFetch.mockImplementation(daemonBaseline(voiceConfig()));
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "voice_phase") return "idle";
+      if (cmd === "voice_register_hotkeys") throw new Error("host unavailable");
+      return undefined;
+    });
+
+    renderWithQuery(<Voice />);
+
+    expect(await screen.findByText("armed, but the hotkeys did not register — use the buttons below")).toBeDefined();
+    const capture = screen.getByRole("heading", { level: 2, name: "Capture" }).closest("section");
+    expect(capture).not.toBeNull();
+    expect(within(capture as HTMLElement).getByText("hotkeys failed")).toBeDefined();
+    expect(within(capture as HTMLElement).queryByText("idle")).toBeNull();
   });
 });
 

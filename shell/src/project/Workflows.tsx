@@ -18,7 +18,7 @@ import {
   type Installed,
 } from "../data/workflows";
 import { openInVscode } from "../lib/vscode";
-import { Quiet, RefusalNote, Row, Rows, Section, Teach, Well } from "../ui";
+import { Button, Quiet, RefusalNote, Row, Rows, Section, Teach, Well } from "../ui";
 import { WorkflowChain, WorkflowGraph } from "./WorkflowGraph";
 
 /**
@@ -268,13 +268,11 @@ function InstalledRow({
           />
         )}
 
-        <button
-          type="button"
-          onClick={() => forget.mutate({ projectId, name: row.name })}
-          className="ml-auto text-xs text-text-faint underline-offset-2 hover:underline"
-        >
-          stop using it
-        </button>
+        <span className="ml-auto">
+          <Button variant="quiet" onClick={() => forget.mutate({ projectId, name: row.name })}>
+            stop using it
+          </Button>
+        </span>
       </div>
 
       {/*
@@ -399,13 +397,11 @@ function EjectGuard({
         >
           edit in the library
         </button>
-        <button
-          type="button"
-          onClick={onCancel}
-          className="px-2 py-1.5 text-xs text-text-faint underline-offset-2 hover:underline"
-        >
-          cancel
-        </button>
+        <span className="inline-flex px-2 py-1.5">
+          <Button variant="quiet" onClick={onCancel}>
+            cancel
+          </Button>
+        </span>
       </div>
     </div>
   );
@@ -563,7 +559,7 @@ function LibraryRow({
         <span className="text-xs text-text-muted">{bundle.description}</span>
       ) : null}
       {isPinned ? (
-        <span className="ml-auto text-xs text-tone-active-fg">used here</span>
+        <span className="ml-auto text-xs text-text-muted">used here</span>
       ) : (
         <button
           type="button"

@@ -17,6 +17,7 @@ import {
   type DaemonState,
 } from "../test/harness";
 import type { ProjectSummary } from "../data/system";
+import { statesOf } from "../ui/state-map";
 
 async function openRoster(projects: ProjectSummary[], overrides: Partial<DaemonState> = {}) {
   const state = daemonState({ projects, ...overrides });
@@ -69,6 +70,36 @@ describe("the roster", () => {
 
     await screen.findByRole("table");
     expect(order()).toEqual(["gamma", "beta", "zeta", "ANSup"]);
+  });
+
+  /**
+   * The card names proposals.
+   *
+   * `Waiting on you` over `open proposals across the roster` made the label a promise the
+   * detail then took back. The bare phrase counts the six decision lists at `/waiting`; this
+   * number is `open_review_items` summed over the rows, so the label says that and the detail is
+   * left to say only where they are.
+   */
+  it("the card names proposals", async () => {
+    await openRoster([
+      fine("alpha", { open_review_items: 3 }),
+      fine("beta", { open_review_items: 2 }),
+    ]);
+    await screen.findByRole("table");
+
+    const card = screen.getByRole("article", { name: "To review" });
+    expect(within(card).getByText("5")).toBeDefined();
+    expect(within(card).getByText("across the roster")).toBeDefined();
+    expect(screen.queryByRole("article", { name: "Waiting on you" })).toBeNull();
+  });
+
+  /** Zero keeps the sentence it already had: nothing has stopped to ask, not `across` nothing. */
+  it("says nothing has stopped to ask when no proposal is open", async () => {
+    await openRoster([fine("alpha"), fine("beta")]);
+    await screen.findByRole("table");
+
+    const card = screen.getByRole("article", { name: "To review" });
+    expect(within(card).getByText("nothing has stopped to ask")).toBeDefined();
   });
 
   /**
@@ -168,6 +199,17 @@ describe("the roster", () => {
     expect(row("moved").getByText("gone").className).toContain("ui-badge-danger");
   });
 
+  it("keeps no folder reading nobody reads", async () => {
+    expect(statesOf("folder").sort()).toEqual(["missing", "unset"]);
+
+    await openRoster([fine("here")]);
+    await screen.findByRole("table");
+    const row = within(screen.getByRole("rowheader", { name: "here" }).closest("tr") as HTMLElement);
+    const cell = row.getByText("ok");
+    expect(cell.className).not.toContain("ui-badge");
+    expect(cell.getAttribute("title")).toBe("C:/Projects/here");
+  });
+
   /**
    * Into the workspace and not back into a file tree: a roster row is a project, and the question
    * somebody arrives at a project with is what Estado answers. This is the whole reason the
@@ -187,7 +229,7 @@ describe("the roster", () => {
     expect(rendered.router.state.location.pathname).toBe("/projects");
   });
 
-  /** A gate that could not RUN says nothing about the code, so it is not drawn as a failure. */
+  /** The map already reads `job.gate_errored` as info; Roster was the last surface saying otherwise. */
   it("keeps a gate that could not run apart from one that said no", async () => {
     await openRoster([fine("broken", { last_gate: "failed" }), fine("unrun", { last_gate: "errored" })]);
 
@@ -196,7 +238,15 @@ describe("the roster", () => {
     const unrunRow = screen.getByRole("rowheader", { name: "unrun" }).closest("tr") as HTMLElement;
 
     expect(within(brokenRow).getByText("failed").className).toContain("ui-badge-danger");
-    expect(within(unrunRow).getByText("errored").className).toContain("ui-badge-paused");
+    expect(within(unrunRow).getByText("errored").className).toContain("ui-badge-info");
+  });
+
+  it("a gate that could not run is a fact, not a ceiling", async () => {
+    await openRoster([fine("unrun", { last_gate: "errored" })]);
+    await screen.findByRole("table");
+    const cell = screen.getByText("errored");
+    expect(cell.className).toContain("ui-badge-info");
+    expect(cell.textContent).toBe("errored");
   });
 
   it("says so plainly when the núcleo knows of no project", async () => {
@@ -339,5 +389,15 @@ describe("a project leaving the roster", () => {
     await openRemove("two");
     expect(screen.queryByRole("group", { name: "Remove one from NucleOS" })).toBeNull();
     expect(screen.getByRole("group", { name: "Remove two from NucleOS" })).toBeTruthy();
+  });
+});
+
+describe("Roster - map-authored readings", () => {
+  it("the mode mark on the name comes from the map", async () => {
+    await openRoster([fine("alpha", { mode: "active" })]);
+    const row = await screen.findByRole("rowheader", { name: /alpha/ });
+    const badge = within(row).getByText("active");
+    expect(badge.textContent).toBe("active");
+    expect(badge.className).toContain("ui-badge-active");
   });
 });

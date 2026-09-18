@@ -225,10 +225,39 @@ describe("Bench - the shell", () => {
     expect(screen.queryByText(/Not written yet/)).toBeNull();
   });
 
-  it("names the department the núcleo says it has never heard of", async () => {
+  /**
+   * One count treatment across the app. This tab drew its backlog as a filled
+   * `Badge`, which is the shape `ui.css` reserves for a STATE — so the bench had a
+   * pending pill beside "at work"/"idle" pills, three ranks of meaning in one row of
+   * identical capsules. The project tab strip already said how many with a `Count`.
+   */
+  it("the Decisions tab wears a count and not a pill", async () => {
+    const run = teamRun({ id: "run-1", team_id: "financas" });
+    const action: TeamAction = {
+      id: 1,
+      team_run_id: "run-1",
+      ordinal: null,
+      kind: "send_email",
+      payload: "{}",
+      why: "the supplier asked twice",
+      proposal_id: 9,
+      state: "pending",
+      error: null,
+      created_at: "2026-08-24T09:10:00Z",
+      executed_at: null,
+    };
+    await renderBench({ team: teamView(), runs: [run], actions: [action] });
+
+    const decisions = await screen.findByRole("tab", { name: /Decisions/ });
+    const count = decisions.querySelector(".ui-count");
+    expect(count?.textContent).toBe("1");
+    expect(decisions.querySelector(".ui-badge")).toBeNull();
+  });
+
+  it("names the team the núcleo says it has never heard of", async () => {
     await renderBench({ team: null }, "nao-existe");
 
-    expect(await screen.findByText("there is no department with that id")).toBeDefined();
+    expect(await screen.findByText("there is no team with that id")).toBeDefined();
   });
 });
 
@@ -263,7 +292,7 @@ describe("Bench - Routines", () => {
     expect((within(panel).getByLabelText("Request") as HTMLTextAreaElement).value).toBe("reconcile last month");
   });
 
-  it("asks before arming a rule for a department with no ceiling, and never before disarming", async () => {
+  it("asks before arming a rule for a team with no ceiling, and never before disarming", async () => {
     await renderBench({
       team: teamView({ budget_usd: null }),
       triggers: [
@@ -342,19 +371,42 @@ describe("Bench - Work", () => {
 
     // The honest footer: this department's tasks out of the newest hundred
     // runs across every department, with no paging past it.
-    expect(within(panel).getByText(/newest 100 runs across all departments/)).toBeDefined();
+    expect(within(panel).getByText(/newest 100 runs across all teams/)).toBeDefined();
+  });
+
+  it("the rounds strip says what its marks mean", async () => {
+    const live = teamRun({ id: "run-1", state: "working" });
+    await renderBench({
+      team: teamView(),
+      runs: [live],
+      runViews: {
+        "run-1": {
+          ...live,
+          cost_usd: 0,
+          items: [{ ordinal: 1, round: 1, agent_id: "auditor", description: "pull the ledger", state: "done", run_id: 11, output_path: null }],
+        },
+      },
+    });
+
+    const panel = await openTab("Work");
+    const key = panel.querySelector(".teams-rounds-key");
+    expect(key?.textContent).toContain("✓ done");
+    expect(key?.textContent).toContain("⋯ running");
+    expect(key?.textContent).toContain("· not started");
+    expect(key?.textContent).toContain("✗ failed");
+    expect(within(panel).getByRole("list", { name: "Rounds" })).toBeDefined();
   });
 
   it("keeps the composer to one line until it is being used", async () => {
     await renderBench({ team: teamView() });
 
     const panel = await screen.findByRole("tabpanel");
-    const box = within(panel).getByLabelText("Ask this department for something") as HTMLTextAreaElement;
+    const box = within(panel).getByLabelText("Ask this team for something") as HTMLTextAreaElement;
 
     // It replaced a three-row textarea that stood permanently open.
     expect(box.rows).toBe(1);
     fireEvent.focus(box);
-    expect((within(panel).getByLabelText("Ask this department for something") as HTMLTextAreaElement).rows).toBe(3);
+    expect((within(panel).getByLabelText("Ask this team for something") as HTMLTextAreaElement).rows).toBe(3);
   });
 
   it("names the specialist the núcleo says is missing when a task will not start", async () => {
@@ -368,7 +420,7 @@ describe("Bench - Work", () => {
       return benchFetch({ team: teamView() })(path, init);
     });
 
-    fireEvent.change(within(panel).getByLabelText("Ask this department for something"), {
+    fireEvent.change(within(panel).getByLabelText("Ask this team for something"), {
       target: { value: "find leads" },
     });
     fireEvent.click(within(panel).getByRole("button", { name: "Start" }));
@@ -376,5 +428,25 @@ describe("Bench - Work", () => {
     // The daemon's own sentence, verbatim — no toast and no modal anywhere.
     expect(await within(panel).findByText(/pesquisa.*not in the catalogue/)).toBeDefined();
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});
+
+describe("Bench - map-authored readings", () => {
+  it("an armed routine is a setting, not work in flight", async () => {
+    await renderBench({ team: teamView(), triggers: [teamTrigger({ enabled: 1 })] });
+    const badge = within(await openTab("Routines")).getByText("armed");
+    expect(badge.className).toContain("ui-badge-info");
+    expect(badge.className).not.toContain("ui-badge-active");
+  });
+
+  it("the bench head says waiting, the one word Teams says", async () => {
+    const run = teamRun({ state: "done" });
+    const action: TeamAction = { id: 1, team_run_id: run.id, ordinal: null, kind: "send_email", payload: "{}", why: "needs a reply", proposal_id: 1, state: "pending", error: null, created_at: "2026-08-24T09:10:00Z", executed_at: null };
+    await renderBench({ team: teamView(), runs: [run], actions: [action] });
+    const head = (await screen.findByRole("heading", { level: 1 })).closest("header");
+    if (head === null) throw new Error("no bench head");
+    const badge = within(head).getByText("waiting");
+    expect(badge.textContent).toBe("waiting");
+    expect(within(head).queryByText("waiting on you")).toBeNull();
   });
 });

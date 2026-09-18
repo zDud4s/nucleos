@@ -33,19 +33,9 @@
   color: var(--text-muted);
 }
 
-.learned-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
+.learned-row {
+  gap: var(--space-2);
 }
-
-/* The row itself is `Inset` from `../ui` — the box inside a panel body, which
-   this page had drawn for itself on the lower rung of the ladder. Its own
-   `--space-2` gap is what now separates the head, the text and the controls, so
-   nothing below sets a vertical margin to do the same job twice. */
 
 /* Kind, scope and age on one line: the three facts that decide whether the text
    below is worth reading now. */

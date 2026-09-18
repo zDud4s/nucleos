@@ -2,7 +2,7 @@ import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import { useConcurrency } from "../data/fleet";
 import { useProjects } from "../data/system";
 import { useProjectWorkflows } from "../data/workflows";
-import { Count, StateBadge } from "../ui";
+import { Count, PageHeader, StateBadge } from "../ui";
 import { ModeState } from "./ModeState";
 import { ModeMap } from "./ModeMap";
 import { ModeCode } from "./ModeCode";
@@ -177,46 +177,48 @@ export function Workspace() {
   const holding = useHolding(projectId);
 
   return (
-    <div className="flex flex-col gap-6">
-      <header className="flex items-baseline gap-3">
-        <h1 className="font-display text-2xl font-semibold tracking-[-0.02em] text-text">
-          {projectId}
-        </h1>
-        {/*
+    <>
+      <PageHeader
+        title={projectId}
+        /*
           The mode through the one non-collapsing map, never a literal: off,
           shadow and active are three different promises about what happens here
           without being asked, and picking a tone locally is how that distinction
-          starts to drift page by page.
-        */}
-        <StateBadge domain="autopilot" state={project?.mode} />
-        {project?.project_root === null ? (
-          <span className="text-sm text-text-faint">no folder named</span>
-        ) : (
-          <span className="truncate font-mono text-xs text-text-faint">
-            {project?.project_root}
+          starts to drift page by page. The folder is the other half of the
+          sentence — what this project IS on this disk — and both belong on the
+          header's one derived line rather than beside the name as a second title.
+        */
+        headline={
+          <span className="inline-flex min-w-0 max-w-full items-baseline gap-2">
+            <StateBadge domain="autopilot" state={project?.mode} />
+            {project?.project_root === null ? (
+              <span>no folder named</span>
+            ) : (
+              <span className="truncate font-mono text-xs">{project?.project_root}</span>
+            )}
           </span>
-        )}
-      </header>
+        }
+      />
 
       {/*
-        Links, and deliberately not the `Tabs` primitive — the same conclusion System and Projects
-        each reached about their own strips, and the three now agree to the declaration. Every item
-        here is a real `<a href>` to `/projects/<id>/<mode>`, and the current one is marked with
-        `aria-current="page"`. Radix's `Trigger` puts `role="tab"` on whatever it renders, `asChild`
-        and a `Link` included, so adopting it would replace the link role, swap `aria-current` for
-        `aria-selected`, collapse five tab stops into one roving one, and point `aria-controls` at
-        panels that exist only for the mode you are already on. A tab widget switches panels inside
-        a page; this switches pages.
+        The five modes, dressed as the vendored `Tabs` and still links.
 
-        What IS adopted is the rule underneath the appearance: **the active indicator is `--text`
-        and never `--accent`.** The brand colour marks the wordmark, links and the focus ring and
-        nothing else — a selection wearing it reads as a status, and a status wearing it reads as
-        something you can click. `.ui-current` is the class that normally carries this and it does
-        not fit: it is an inset rule on the LEADING edge, and the mark a tab strip needs is under
-        the label, on the same line as the rule this nav already draws. The ink is what carries,
-        which is what `.ui-tab[data-state="active"]` marks its own with too.
+        `ui-tab-list` and `ui-tab` are the shared classes Radix's Tabs wears, so this
+        strip is the same object on screen as the tabs in the Bench. What it is NOT is
+        Radix's `Tabs`, and that is deliberate: each mode is a URL, so a tab here has to
+        be an `<a href>` that can be copied, opened in a second window, and — the case
+        `Workspace.test.tsx` pins — carry an old Portuguese segment's replacement in its
+        `href` so the address canonicalises itself on the first press. A `role="tab"`
+        button has none of that — Radix's `Trigger` would swap the link role and
+        `aria-current` for `role="tab"` and `aria-selected`, and collapse five tab stops
+        into one roving one. `pj-tabs` on the inspector is the same decision.
+
+        What IS adopted is the rule underneath the appearance: **the active indicator is
+        `--text` and never `--accent`**, drawn by `.ui-tab[data-state="active"]`. `.ui-current`
+        does not fit here: it is an inset rule on the LEADING edge, and the mark a tab strip
+        needs is under the label.
       */}
-      <nav aria-label="Project modes" className="flex gap-1 border-b border-border">
+      <nav aria-label="Project modes" className="ui-tab-list mb-6">
         {MODES.map((candidate) => {
           const holds = holding[candidate];
           const quiet = holds !== undefined && holds.count === 0;
@@ -225,14 +227,11 @@ export function Workspace() {
               key={candidate}
               to={`/projects/${projectId}/${candidate}`}
               aria-current={candidate === mode ? "page" : undefined}
+              /* What the vendored trigger says about itself, said the same way, so one
+                 rule in `ui.css` draws the selected tab wherever it is. */
+              data-state={candidate === mode ? "active" : "inactive"}
               title={holds?.means}
-              className={
-                candidate === mode
-                  ? "-mb-px flex items-baseline gap-2 border-b-2 border-text px-3 py-2 text-sm font-medium text-text"
-                  : quiet
-                    ? "-mb-px flex items-baseline gap-2 border-b-2 border-transparent px-3 py-2 text-sm text-text-faint hover:text-text"
-                    : "-mb-px flex items-baseline gap-2 border-b-2 border-transparent px-3 py-2 text-sm text-text-muted hover:text-text"
-              }
+              className={quiet ? "ui-tab opacity-[var(--opacity-quiet)]" : "ui-tab"}
             >
               {MODE_LABEL[candidate]}
               {/*
@@ -269,6 +268,6 @@ export function Workspace() {
       ) : null}
       {mode === "workflows" ? <ModeWorkflows projectId={projectId} /> : null}
       {mode === "github" ? <ModeGithub projectId={projectId} /> : null}
-    </div>
+    </>
   );
 }

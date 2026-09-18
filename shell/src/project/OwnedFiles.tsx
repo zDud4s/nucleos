@@ -163,7 +163,7 @@ function OwnedFile({ projectId, claim }: { projectId: string; claim: Claim }) {
               </button>
               {dirty ? <span className="text-xs text-text-faint">unsaved changes</span> : null}
               {write.isSuccess && !dirty ? (
-                <span className="text-xs text-tone-active-fg">saved</span>
+                <span className="text-xs text-text-muted">saved</span>
               ) : null}
             </div>
 

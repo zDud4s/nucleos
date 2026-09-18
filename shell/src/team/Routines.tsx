@@ -11,7 +11,6 @@ import {
   type TriggerRequest,
 } from "../data/teams";
 import {
-  Badge,
   Button,
   ConfirmButton,
   ErrorNote,
@@ -20,6 +19,7 @@ import {
   Quiet,
   RefusalNote,
   RelativeTime,
+  StateBadge,
 } from "../ui";
 import { daemonProse } from "./prose";
 
@@ -87,7 +87,7 @@ export function Routines({ team, rules }: RoutinesProps) {
           A rule cannot be edited — the núcleo has no route for it. Duplicate one to write a
           variant, then delete the original.
         </p>
-        {rules.length === 0 && <Quiet says="no rule is written for this department." />}
+        {rules.length === 0 && <Quiet says="no rule is written for this team." />}
         {rules.length > 0 && (
           <ul className="teams-rules" aria-label="Rules">
             {rules.map((rule) => (
@@ -127,7 +127,7 @@ function RuleRow({
     <Inset as="li">
       <div className="teams-rule-head">
         <span className="teams-rule-name">{rule.name}</span>
-        <Badge tone={armed ? "active" : "off"}>{armed ? "armed" : "disarmed"}</Badge>
+        <StateBadge domain="setting" state={armed ? "armed" : "disarmed"} />
         <span className="teams-rule-source">{rule.source}</span>
         {rule.cron !== null && <code className="teams-rule-cron">{rule.cron}</code>}
         {rule.timezone !== null && <span className="teams-rule-zone">{rule.timezone}</span>}
@@ -151,6 +151,7 @@ function RuleRow({
           <ConfirmButton
             label="Arm with no ceiling"
             confirmLabel="Arm it anyway"
+            variant="approve"
             intent="go"
             disabled={setEnabled.isPending}
             onConfirm={() => setEnabled.mutate({ id: rule.id, enabled: true })}
@@ -169,6 +170,7 @@ function RuleRow({
         <ConfirmButton
           label="Delete"
           confirmLabel="Delete this rule"
+          variant="danger"
           intent="stop"
           disabled={del.isPending}
           onConfirm={() => del.mutate(rule.id)}

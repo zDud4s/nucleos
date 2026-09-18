@@ -59,49 +59,19 @@
 }
 
 /**
- * The label rank — 11px uppercase at `--tracking-wide` — under two names: a
- * field's own label and a fact's column head.
- *
- * Grouped rather than shared with a primitive, because there is nothing to
- * share with: DESIGN.md records the missing input primitive as the largest
- * remaining hole in the component layer, and until `ui.css` has one, collecting
- * the selector is as far as a page can take it. Not the section-title rank,
- * which is the display face at `--tracking-wider` and belongs to
- * `.ui-section-title` — the heading over a group is a different rank from the
- * name of a field inside one, and at 11px that difference is all there is.
+ * The label rank — 11px uppercase at `--tracking-wide` — as a fact's column
+ * head. A field's own label is `Field` now, which carries the same rank from
+ * the shared layer; this is the one writing of it the page still owns. Not the
+ * section-title rank, which is the display face at `--tracking-wider` and
+ * belongs to `.ui-section-title` — the heading over a group is a different rank
+ * from the name of a field inside one, and at 11px that difference is all there
+ * is.
  */
-.web-field,
 .web-fact dt {
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
   color: var(--text-faint);
-}
-
-/* A field label over its own input — every form on this page shares it. */
-.web-field {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  min-width: 0;
-}
-
-.web-field input {
-  min-width: 16rem;
-  padding: var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--text-sm);
-  text-transform: none;
-  letter-spacing: normal;
-}
-
-.web-field input:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
 }
 
 /**
@@ -134,7 +104,7 @@
   overflow-wrap: anywhere;
 }
 
-/* The sentence under either. No margin of its own: both sit inside an `Inset`,
+/* The sentence under either. No margin of its own: both sit inside a `Row`,
    which spaces its own children — a margin here would be counted twice. */
 .web-row-snippet,
 .web-search-snippet {
@@ -142,22 +112,6 @@
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
   color: var(--text-muted);
-}
-
-/**
- * The two columns this page has: the archive, and a search's hits. Each item
- * is an `Inset`, which paints its own box — this only spaces them and takes
- * the list markers off, the same division `browser-list` and
- * `contacts-questions` already draw.
- */
-.web-list,
-.web-search-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
 }
 
 /* ---------------------------------------------------------------- forms == */
@@ -211,15 +165,16 @@
 
 /* =================================================================== list == */
 
-/* The archive stands off the filter form above it; the search's own lists take
-   their spacing from the `Section` around them and want none of their own. */
+/* Both columns are `Rows`. The archive stands off the filter form above it; the
+   search's own lists take their spacing from the `Section` around them and want
+   none of their own, so they carry no page class at all. */
 .web-list {
   margin-top: var(--space-3);
 }
 
 .web-row-link {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(8rem, auto) auto;
   align-items: baseline;
   gap: var(--space-2);
   color: inherit;
@@ -266,18 +221,17 @@
  * the boundary in the light theme.
  */
 .web-content {
-  max-height: 32rem;
-  overflow: auto;
-  overscroll-behavior: none;
+  max-width: var(--measure-prose);
+  max-height: none;
   margin: 0;
   padding: var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
   color: var(--text);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: var(--leading-relaxed);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }

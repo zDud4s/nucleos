@@ -90,6 +90,19 @@
 }
 
 /**
+ * A teach block is already inside the panel's padding; it must not add its own.
+ *
+ * `.ui-teach` carries `padding: var(--space-6) var(--space-5)` because it is
+ * usually the whole of an empty page, standing on nothing. Dropped into a panel
+ * body it inherits that body's `--space-5` too, and the result is a paragraph
+ * indented 40px from a heading 20px in — a double indent nobody chose, on every
+ * empty panel in the app.
+ */
+.ui-panel-body > .ui-teach {
+  padding-inline: 0;
+}
+
+/**
  * The box *inside* a panel body. One rung up, one rank down.
  *
  * Ten page stylesheets had independently written the same seven declarations —
@@ -240,7 +253,7 @@
  * `div` inside every row — a box put back exactly where the primitive exists to
  * remove one.
  *
- * It is a modifier on the row and not a `className` the caller passes, because
+ * It is a modifier on the row and not something a page's own class restates, because
  * the row's `background` is not decoration: the rules of this list are a 1px gap
  * over a `--border` ground, so a row that loses its fill is a gap you can see
  * through. Handing out `className` here means handing out the ability to delete
@@ -255,6 +268,69 @@
   flex-wrap: wrap;
   align-items: baseline;
   gap: var(--space-3);
+}
+
+/**
+ * Above a handful, the list is being *worked* rather than read.
+ *
+ * The padding comes in, and nothing else changes: the tenth row staying on the
+ * same screen as the first is what stops a queue being abandoned halfway.
+ */
+.ui-rows-row-dense {
+  padding: var(--space-2) var(--space-4);
+}
+
+/**
+ * Inside a panel, the list drops its own frame and its own margins.
+ *
+ * The panel is already the box. A second border 24px inside the first draws a
+ * frame around a frame — and with a `.ui-panel-inset` on a row, three of them
+ * around one thing. What a list contributes here is the *rules* between its
+ * rows, and those are the gaps over the `--border` ground, not the border.
+ *
+ * The inline padding goes with it so a row's first word sits under the panel's
+ * own heading rather than 16px to the right of it, which is the misalignment
+ * that makes a nested list read as a quotation.
+ */
+.ui-panel-body > .ui-rows {
+  border: none;
+  border-radius: 0;
+}
+
+.ui-panel-body > .ui-rows > .ui-rows-row {
+  padding-inline: 0;
+}
+
+/* ----------------------------------------------------------------- crumb -- */
+
+/**
+ * Where this page sits, above its title.
+ *
+ * `--text-xs` and `--text-faint` because a crumb is orientation and never content:
+ * it is read once, on arrival, by somebody deciding whether they are in the right
+ * place. `color: inherit` on the link so the whole line is one faint sentence — the
+ * underline on hover is what says it is a door, and `base.css` already draws it.
+ *
+ * Three pages had three of these, with three glyphs and three sizes. One rule now,
+ * and the pages carry no crumb CSS of their own.
+ */
+.ui-crumb {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.ui-crumb a {
+  color: inherit;
+}
+
+.ui-crumb-mark {
+  margin-right: var(--space-1);
+}
+
+.ui-crumb-here {
+  margin-left: var(--space-2);
+  color: var(--text-faint);
 }
 
 /* ----------------------------------------------------------------- badge -- */
@@ -438,8 +514,27 @@
   color: var(--text);
 }
 
+/* A clause that reports something wrong, and the door standing inside it.
+
+   A class and not `text-tone-danger-fg`, because a Tailwind utility cannot win
+   here: `base.css` styles `a` unlayered (`color: var(--accent)`), and unlayered
+   CSS beats every utility whatever the specificity. A `<Link>` carrying
+   `text-tone-danger-fg` would render Signal Cyan and look like a bug in the
+   token. `.ui-wrong-door` takes the colour of the clause around it and keeps
+   the underline, so the door is still visibly a door — and it is still a real
+   link, so it is still reachable by keyboard. */
+.ui-wrong {
+  color: var(--tone-danger-fg);
+}
+
+.ui-wrong-door {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
 /* A control that has to be on every row of a table and must not compete with
-   the readings in those rows. Borderless and faint at rest, underlined on
+   the readings in those rows. Borderless and muted at rest, underlined on
    hover: findable by anybody looking for it, invisible to anybody scanning the
    column beside it.
 
@@ -448,20 +543,30 @@
    same colour as the wordmark and the focus ring, which the design gives to
    nothing that is a state or an action. The roster's `remove` is an action, and
    four of them in accent down the right edge were the loudest thing on a page
-   whose whole job is to say which project needs somebody. */
+   whose whole job is to say which project needs somebody.
+
+   A control needs an affordance at rest. Hue is not available: cyan is reserved
+   for links, and a tone would make an action look like a state. The affordance is
+   a hairline underline — and the underline is what lets the text stop at Muted
+   rather than Faint. Faint on Working Surface measures 3.8:1, under the 4.5:1
+   floor, which is a reading and not a taste on something that is now explicitly
+   a control label; Muted is 6.9:1 and still recedes, because the underline is
+   doing the finding. */
 .ui-button-quiet {
   padding: 0;
   background: none;
   border-color: transparent;
-  color: var(--text-faint);
+  color: var(--text-muted);
   font-weight: var(--weight-regular);
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 0.2em;
 }
 
 .ui-button-quiet:hover:not(:disabled) {
   border-color: transparent;
   color: var(--text);
-  text-decoration: underline;
-  text-underline-offset: 0.2em;
+  text-decoration-color: currentColor;
 }
 
 /* Direction, as a glyph rather than as a colour — it reads the same to someone
@@ -478,21 +583,180 @@
   line-height: 1;
 }
 
+/* ------------------------------------------------------------ iconbutton -- */
+
+/* A control that is only a glyph, at `.ui-button-quiet`'s weight: no box at rest and muted, the
+   text colour on a raised ground under the pointer. 1.5rem square because 24px is the smallest
+   target WCAG 2.2 accepts (2.5.8). The focus ring is `base.css`'s, and here it has a box to go
+   round rather than the bare glyph. */
+.ui-icon-button {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.ui-icon-button:hover:not(:disabled) {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.ui-icon-button:disabled {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+.ui-icon-button-glyph {
+  width: 1rem;
+  height: 1rem;
+}
+
 /* --------------------------------------------------------- confirmbutton -- */
 
+/* `position: relative` is for the live region inside, not for the button. That `.sr-only` span
+   is `position: absolute`, and with no positioned ancestor its containing block was the initial
+   one — so a 1px box placed at wherever the button sat in the flow escaped every scroller it was
+   inside, and the Fleet page at 800px measured a document 974px wide with nothing visible past
+   the edge. Anchored here, it stays inside whatever box the control is in. It sets no z-index,
+   so it opens no stacking context, and the armed ring (a `box-shadow` on the button) is drawn
+   exactly as before. */
 .ui-confirm {
   display: inline-flex;
+  position: relative;
+}
+
+/**
+ * The width an armed control will need, reserved before it needs it.
+ *
+ * One cell, two labels, both in it: the box is the wider of the two from the first paint and
+ * arming is a swap rather than a growth. The alternative was clipping the armed label to the
+ * rest width, which hides the `subject` — the one thing the armed label adds on a page of
+ * five byte-identical cards.
+ *
+ * `justify-items: center` and not `text-align`, because a label can be a fragment with a glyph
+ * in it (`app/KillSwitchControl.tsx`): centre the item, and let the item lay itself out. The
+ * button's own `justify-content: center` then centres this box inside the padding.
+ *
+ * The hidden one is hidden by the attribute that hides it from a screen reader, so there is one
+ * fact and not two: an element that is `aria-hidden` here is also `visibility: hidden`, and a
+ * future edit cannot silently take the label out of one channel and leave it in the other.
+ */
+.ui-confirm-stack {
+  display: inline-grid;
+  grid-template-areas: "label";
+  align-items: center;
+  justify-items: center;
+}
+
+/**
+ * Both labels in the one cell — and each of them still a ROW inside it.
+ *
+ * A grid item is blockified, so a label that is a fragment with a glyph in it
+ * (`app/KillSwitchControl.tsx`'s `<Play/>` beside its words) lost `.ui-button`'s own flex row
+ * the moment it moved in here: `base.css` makes every `svg` a block, and the icon stacked
+ * ABOVE the text with no gap. The button's `justify-content` centres this box; what lays the
+ * box's own contents out is this rule.
+ */
+.ui-confirm-stack > * {
+  grid-area: label;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+.ui-confirm-stack > [aria-hidden="true"] {
+  visibility: hidden;
 }
 
 /**
  * Armed: the control is live and will act on the next click.
  *
- * A ring rather than a colour change alone — the button has already changed
- * what it says, and the ring is the peripheral signal that something on this
- * page is waiting for a second click.
+ * A ring rather than a lift — the button has already changed what it says, and the ring is
+ * the peripheral signal that something on this page is waiting for a second click.
+ *
+ * ONE colour, at every site, and the colour is the text colour. The ring answers "is this
+ * control live?"; the variant underneath it already answers "what kind of thing is it?", and
+ * a ring that tried to answer both said the second one at a contrast nobody could read. The
+ * neutral hairline this used to draw measured 1.7:1 against Working Surface and the danger
+ * tint 1.2:1, both under the 3:1 floor for a non-text indicator — so at 51 of 53 sites the
+ * only signal that the next click fires was the label. `--text` is 14.3:1 on the same
+ * surface, and it is not the focus ring: that is a 2px cyan `outline` at `--focus-ring`.
+ *
+ * The variants keep their own answer where it belongs. A `danger` button still swaps to
+ * `danger-solid` while armed (`ConfirmButton.tsx`), so the FILL changes and the ring does
+ * not have to say it twice.
  */
 .ui-confirm-armed > .ui-button {
-  box-shadow: 0 0 0 3px var(--tone-danger-bg);
+  box-shadow: 0 0 0 3px var(--text);
+}
+
+/**
+ * Armed, on a control with no box.
+ *
+ * `.ui-button-quiet` is `padding: 0`, `background: none`, `border-color: transparent` — an
+ * underlined run of `--text-muted` text, on purpose, because it has to sit on every row of a
+ * table without competing with the readings in those rows. So the one ring above had nothing
+ * to sit on: at the ten quiet interlocks it was a 3px opaque band hugging the content box of
+ * 13px text with nothing between them, a slab around a word at the weight of the word's own
+ * stems. No shot had ever photographed one.
+ *
+ * The ring is kept and the box is given, rather than the other way round. A quieter armed
+ * state — the text to Primary and the underline doubled — is what `:hover` already draws, and
+ * an armed control is under the pointer, so the one signal it could add would be a 1px change
+ * in underline thickness: the same "nobody can see it" that took the 1.7:1 and 1.2:1 rings out
+ * at 51 sites last round.
+ *
+ * The vertical is the primitive's own, so an armed quiet button is exactly as tall as a real
+ * one. The horizontal is `--space-1` and NOT the primitive's `--space-3`, and that is measured
+ * rather than chosen: every container that holds a quiet interlock gives it `gap:
+ * var(--space-2)` — `.waiting-actions`, `.ui-panel-aside`, `.chats-archive`,
+ * `.contacts-unmerge` — so 4px of padding plus a 3px ring leaves 1px of surface before the
+ * neighbour, where 12px would paint 7px over it.
+ *
+ * The negative margin is the whole reason this is safe: it cancels the padding in the outer
+ * box, so the ring grows outward from the word and the word does not move. Nothing here
+ * transitions — `.ui-button` animates background, border and colour only — so the box appears
+ * in the frame the click lands in.
+ */
+.ui-confirm-armed > .ui-button-quiet {
+  padding: 0.34rem var(--space-1);
+  margin: -0.34rem calc(-1 * var(--space-1));
+}
+
+/**
+ * Two rings, and they do not share a band.
+ *
+ * `base.css` draws focus as `outline: 2px solid var(--focus-ring)` at `outline-offset: 2px`,
+ * so the outline occupies 2-4px outside the border box and the armed ring occupies 0-3px: two
+ * of the outline's two pixels land ON the ring. Composited over `--text` the cyan measures
+ * 1.3:1 against the ring it sits on, so a keyboard user who armed a control very nearly lost
+ * the mark that says the keyboard is here — at the one moment the app is asking for a
+ * deliberate second press.
+ *
+ * At 4px the outline is 4-6px out, clear of the ring with 1px of surface between the two
+ * marks, and it composites over `--surface` instead: 3.9:1, above the 3:1 floor for a non-text
+ * indicator. Two devices, two bands, one job each.
+ *
+ * Here and not in `base.css`, because the offset is a fact about the armed state and not about
+ * focus: every other control in the app keeps the global 2px. Two classes and a pseudo-class
+ * is 0,3,0 against the global rule's 0,1,0, and both sheets are unlayered — and if the
+ * `:focus-visible` rule moves into `@layer base`, an unlayered rule wins outright. It holds
+ * either way.
+ *
+ * Inside `.ui-switch` this changes nothing: there the ring is inset and the track's `overflow:
+ * hidden` clips outlines whatever their offset.
+ */
+.ui-confirm-armed > .ui-button:focus-visible {
+  outline-offset: 4px;
 }
 
 /* ----------------------------------------------------------------- teach -- */
@@ -634,14 +898,24 @@
   color: var(--text-muted);
 }
 
+/*
+  The same control at the smaller rank.
+
+  `why?` is a button that opens a paragraph, and it underlined only on hover while its
+  twin one section over underlined at rest — on `10-project-state` all three treatments
+  were on one screen. One treatment, one floor: `--text-muted` and the hairline.
+*/
 .ui-quiet-ask {
   font-size: var(--text-xs);
-  color: var(--text-faint);
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
   text-underline-offset: 2px;
 }
 
 .ui-quiet-ask:hover {
-  text-decoration: underline;
+  color: var(--text);
+  text-decoration-color: currentColor;
 }
 
 /**
@@ -885,7 +1159,8 @@ ol.ui-well {
 .ui-note-stale {
   padding-left: 0;
   padding-right: 0;
-  color: var(--text-faint);
+  /* 11px on --text-faint is 3.8:1 in light, under the 4.5:1 floor. */
+  color: var(--text-muted);
   background: none;
   border-color: transparent;
   font-size: var(--text-xs);
@@ -1031,8 +1306,17 @@ ol.ui-well {
 .ui-stat-detail {
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
-  color: var(--text-faint);
+  /* 11px on --text-faint is 3.8:1 in light, under the 4.5:1 floor. */
+  color: var(--text-muted);
 }
+/* No card-level tone, since round 11. This app has ONE device for a wrong fact — `.ui-wrong`
+   on the clause that is wrong, as `canvas/Boundary.tsx`, `pages/Home.tsx` and `pages/System.tsx`
+   all use it — and `.ui-stat-danger .ui-stat-value` was a second one painting the numeral. The
+   two together drew a red figure, a grey label and a red clause: three colours in a three-line
+   card for one piece of news. Round 9 retired exactly that on the map's boundary readout, where
+   the numeral-only red was two devices for one sentence. `6/10` is the reading and keeps the
+   reading colour, like the other four cards; what is red is "1 down, 1 degraded". A caller
+   wraps its own detail in `.ui-wrong`. */
 
 /* ----------------------------------------------------------- page header -- */
 
@@ -1046,7 +1330,10 @@ ol.ui-well {
   justify-content: space-between;
   gap: var(--space-5);
   padding-bottom: var(--space-3);
-  margin-bottom: var(--space-3);
+  /* More below the rule than above it. The rule belongs to the title, and a gap
+     equal on both sides makes it float between the heading and the page instead
+     of closing the one and opening the other. */
+  margin-bottom: var(--space-5);
   border-bottom: 1px solid var(--border);
 }
 
@@ -1079,6 +1366,105 @@ ol.ui-well {
   gap: var(--space-2);
 }
 
+/* ---------------------------------------- readings and the context meter -- */
+
+/**
+ * `readings.tsx` — a relative time, a cost, and the context meter a run fills.
+ *
+ * These rules were housed in `pages/runs.css` while the sheet they belong to was
+ * outside somebody's packet, under a heading that said "on loan". This is the
+ * repayment: a design system primitive whose rules live in a feature sheet is
+ * one page away from a second page rendering it unstyled, and nothing in the
+ * type system or the tests would say so.
+ */
+
+/* A relative time. Tabular figures so a column of them does not jitter as the
+   seconds tick over. */
+.ui-reading-time,
+.ui-reading-raw {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A timestamp we could not parse is shown as itself, and marked as unusual. */
+.ui-reading-raw {
+  color: var(--tone-info-fg);
+}
+
+.ui-cost {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.ui-cost-money {
+  color: var(--text);
+}
+
+.ui-cost-tokens {
+  color: var(--text-faint);
+}
+
+.ui-meter {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-2) 0 0;
+}
+
+/**
+ * The bar.
+ *
+ * `position: relative` because the handoff mark is placed against it — the mark
+ * is at a fixed fraction of the track and not at a fraction of the fill, which
+ * is the whole reason it says anything.
+ */
+.ui-meter-track {
+  position: relative;
+  display: block;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.ui-meter-fill {
+  display: block;
+  height: 100%;
+  background: var(--tone-info-fg);
+}
+
+/* Past four fifths the run is about to be handed off, which is a fact about
+   what happens next rather than a fault — the warm tone, not the red one. */
+.ui-meter-past .ui-meter-fill {
+  background: var(--tone-paused-fg);
+}
+
+.ui-meter-mark {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--text);
+  opacity: var(--opacity-quiet);
+}
+
+.ui-meter-text,
+.ui-meter-absent {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
 /* ----------------------------------------------------------------- gauge -- */
 
 /**
@@ -1086,9 +1472,9 @@ ol.ui-well {
  * each task from zero.
  *
  * `ui-gauge-` rather than `ui-meter-`: `ContextMeter` in `readings.tsx` owns
- * that prefix already, and — a wart worth naming — its rules live in
- * `pages/runs.css` rather than here. Sharing the name would have this component
- * silently inherit a feature sheet.
+ * that prefix already, and it is directly above. Two components sharing one
+ * prefix means every rule written for either silently reaches both, so the
+ * second one takes a name of its own — the separate prefix is the boundary.
  */
 
 .ui-gauge {
@@ -1144,6 +1530,11 @@ ol.ui-well {
   background: var(--tone-danger-fg);
 }
 
+/* A quantity is a past fact, not a state. */
+.ui-gauge-quantity .ui-gauge-fill {
+  background: var(--text-muted);
+}
+
 /* Full is worth seeing without reading: the ceiling itself takes the tone. */
 .ui-gauge-full .ui-gauge-track {
   box-shadow: inset 0 0 0 1px var(--tone-paused-border);
@@ -1164,6 +1555,93 @@ ol.ui-well {
 .ui-gauge-note {
   font-size: var(--text-xs);
   color: var(--text-faint);
+}
+
+/* ------------------------------------------------------------------ pips -- */
+
+/**
+ * `SlotPips` — a project's slots as a row of lamps.
+ *
+ * A status dot, so a circle. Ten pixels rather than the rail's 0.4rem dot, because a pip is read
+ * in a row of up to eight and has to be told from its neighbour; the grid's smallest step between
+ * them.
+ *
+ * A held pip is its tone's foreground inside a one-pixel rim of that tone's edge: the triple, less
+ * the fill, which at this size could not be told from the rim. A free pip is hollow, and its
+ * outline is Faint Text rather than a hairline. Strong Hairline measured 1.85:1 against the ground,
+ * under the 3:1 a meaningful mark needs — and here the outline is the whole difference between
+ * "free" and "nothing drawn". Faint Text is 4.09:1 on the dark ground and 3.60:1 on the light one.
+ */
+.ui-pips {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.ui-pips-row {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.ui-pip {
+  flex: none;
+  width: 0.625rem;
+  height: 0.625rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background-clip: padding-box;
+}
+
+.ui-pip-free {
+  border-color: var(--text-faint);
+}
+
+.ui-pip-active {
+  background-color: var(--tone-active-fg);
+  border-color: var(--tone-active-border);
+}
+
+.ui-pip-shadow {
+  background-color: var(--tone-shadow-fg);
+  border-color: var(--tone-shadow-border);
+}
+
+.ui-pip-off {
+  background-color: var(--tone-off-fg);
+  border-color: var(--tone-off-border);
+}
+
+.ui-pip-pending {
+  background-color: var(--tone-pending-fg);
+  border-color: var(--tone-pending-border);
+}
+
+.ui-pip-paused {
+  background-color: var(--tone-paused-fg);
+  border-color: var(--tone-paused-border);
+}
+
+.ui-pip-danger {
+  background-color: var(--tone-danger-fg);
+  border-color: var(--tone-danger-border);
+}
+
+.ui-pip-info {
+  background-color: var(--tone-info-fg);
+  border-color: var(--tone-info-border);
+}
+
+/* Past eight slots only the held pips are drawn, and this says out of how many — the daemon's
+   numbers, so its face, and tabular so `3/12` and `11/12` hold one width. */
+.ui-pips-count {
+  margin-left: var(--space-1);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 
 /*
@@ -1264,6 +1742,66 @@ ol.ui-well {
   border: 0;
 }
 
+/* ------------------------------------------------------------------ marks -- */
+
+/**
+ * A state tone on an SVG mark — the Feed's time axis and the key beside its verdict.
+ *
+ * The pip's seven, restated for `fill` and `stroke`, because an SVG shape has no background to
+ * paint. A page picks the tone through `feedMarkTone` and never writes one, and the two weights
+ * below are the whole vocabulary: a line that went wrong, was held or asks for you is a solid
+ * mark cut out of its lane by a ring of the ground; a routine line is a hollow ring at the quiet
+ * opacity. Solid-versus-hollow carries the gravity without the hue, so it survives for anyone who
+ * cannot separate the tones.
+ */
+.ui-mark-active {
+  fill: var(--tone-active-fg);
+  stroke: var(--tone-active-fg);
+}
+
+.ui-mark-shadow {
+  fill: var(--tone-shadow-fg);
+  stroke: var(--tone-shadow-fg);
+}
+
+.ui-mark-off {
+  fill: var(--tone-off-fg);
+  stroke: var(--tone-off-fg);
+}
+
+.ui-mark-pending {
+  fill: var(--tone-pending-fg);
+  stroke: var(--tone-pending-fg);
+}
+
+.ui-mark-paused {
+  fill: var(--tone-paused-fg);
+  stroke: var(--tone-paused-fg);
+}
+
+.ui-mark-danger {
+  fill: var(--tone-danger-fg);
+  stroke: var(--tone-danger-fg);
+}
+
+.ui-mark-info {
+  fill: var(--tone-info-fg);
+  stroke: var(--tone-info-fg);
+}
+
+/* After the tones, so the ring of ground wins over the tone's own stroke. */
+.ui-mark-exception {
+  stroke: var(--surface);
+  stroke-width: 2px;
+}
+
+/* After the tones, so the hollow wins over the tone's own fill. */
+.ui-mark-routine {
+  fill: var(--surface);
+  stroke-width: 1.5px;
+  opacity: var(--opacity-quiet);
+}
+
 /* -------------------------------------------------------------- sparkline -- */
 
 .ui-spark {
@@ -1301,6 +1839,8 @@ ol.ui-well {
   fill: var(--border-strong);
 }
 
+/* The newest bar, in Primary Text at the weight the ladder gives emphasis. "Which one is
+   now" is emphasis, not state, and emphasis moves a rung — it does not reach for a hue. */
 .ui-spark-now {
   fill: var(--text);
 }
@@ -1391,7 +1931,6 @@ ol.ui-well {
   color: var(--text);
 }
 
-/* The accent as identity — which tab you are on — and not as a state. */
 /* The current tab, marked by contrast rather than by hue. This was the brand
    cyan, which is reserved for the wordmark, links and the focus ring — a
    selection wearing it reads as a status, and a status wearing it reads as
@@ -1411,99 +1950,498 @@ ol.ui-well {
   outline: none;
 }
 
-/* --------------------------------------------------------------- readings -- */
+/* ---------------------------------------------------------- mode switch -- */
 
-/**
- * The three formatters from `src/ui/readings.tsx`: a relative time, a cost, and
- * a meter. They lived in `src/pages/runs.css` on loan, which meant twenty pages
- * imported the components while their appearance depended on whether the Runs
- * route had been visited — a defect that shows up only as something looking
- * wrong on a screen nobody is testing.
- */
-
-/* A relative time. Tabular figures so a column of them does not jitter as the
-   seconds tick over. */
-.ui-reading-time,
-.ui-reading-raw {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-
-/* A timestamp we could not parse is shown as itself, and marked as unusual. */
-.ui-reading-raw {
-  color: var(--tone-info-fg);
-}
-
-.ui-cost {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-3);
-  margin: 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-variant-numeric: tabular-nums;
-}
-
-.ui-cost-money {
-  color: var(--text);
-}
-
-.ui-cost-tokens {
-  color: var(--text-faint);
-}
-
-.ui-meter {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  margin: var(--space-2) 0 0;
-}
-
-/**
- * The bar.
- *
- * `position: relative` because the handoff mark is placed against it — the mark
- * is at a fixed fraction of the track and not at a fraction of the fill, which
- * is the whole reason it says anything.
- */
-.ui-meter-track {
-  position: relative;
-  display: block;
-  height: 6px;
-  border-radius: var(--radius-pill);
-  background: var(--surface-sunken);
+/*
+  One decision, one control. Segments sit in a single bordered track so the three read as
+  three positions of one thing rather than three separate buttons — which is what they were,
+  in two different vocabularies, on two different pages.
+*/
+.ui-switch {
+  display: inline-flex;
+  align-items: stretch;
+  /* Its own width, wherever it is put. Both callers hand it to a flex parent, and a stretched
+     track would make one decision two different shapes on the two pages that offer it. */
+  align-self: flex-start;
+  gap: 0;
   border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   overflow: hidden;
 }
 
-.ui-meter-fill {
-  display: block;
-  height: 100%;
-  background: var(--tone-info-fg);
+.ui-switch > * + * {
+  border-left: 1px solid var(--border);
 }
 
-/* Past four fifths the run is about to be handed off, which is a fact about
-   what happens next rather than a fault — the warm tone, not the red one. */
-.ui-meter-past .ui-meter-fill {
-  background: var(--tone-paused-fg);
+.ui-switch-seg {
+  padding: 0.34rem 0.75rem;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+  cursor: pointer;
 }
 
-.ui-meter-mark {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  background: var(--text);
-  opacity: 0.7;
+.ui-switch-seg:hover:not(:disabled):not([aria-disabled="true"]) {
+  color: var(--text);
 }
 
-.ui-meter-text,
-.ui-meter-absent {
-  margin: 0;
-  font-size: var(--text-xs);
+/* The setting now. A rung on the ladder, never a hue — Contrast-Not-Hue. */
+.ui-switch-seg[aria-pressed="true"] {
+  background: var(--surface-raised);
+  color: var(--text);
+  cursor: default;
+}
+
+.ui-switch-seg[aria-disabled="true"]:not([aria-pressed="true"]),
+.ui-switch-seg:disabled:not([aria-pressed="true"]) {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+/*
+  The third segment is a ConfirmButton, which takes no class of its own, so it travels inside
+  this wrapper — the wrapper is the segment as far as the track is concerned, and it is what
+  the divider rule above lands on. Inside the track the button drops its own corners and outer
+  border, because a bordered button inside a bordered track reads as two boxes.
+*/
+.ui-switch-seg-wrap {
+  display: inline-flex;
+}
+
+/*
+  And it stays one line whatever it is given.
+
+  `white-space: nowrap` is the property the two sibling `.ui-switch-seg` already carry, and it was
+  the one difference between them and the third segment. Without it a long armed label wrapped
+  inside `.ap-project-row`'s last track and grew the row from 90.6 to 125.0 pixels — the button
+  moving out from under a pointer that has four seconds left to press it again. The label is short
+  now, and this is the guarantee that a longer one cannot bring the row back.
+*/
+.ui-switch-seg-wrap > .ui-confirm > .ui-button {
+  border: 0;
+  border-radius: 0;
+  white-space: nowrap;
+}
+
+/*
+  Armed, inside a track that clips.
+
+  `.ui-confirm-armed > .ui-button` draws its ring OUTSIDE the button, and `.ui-switch`
+  carries `overflow: hidden` so the three segments read as one box — so on the roster the
+  armed segment was the same green segment it had been before the click, and the only
+  signals left were two words of label and a sentence at the other end of the row. Three
+  classes here against two there, so this REPLACES the outer ring rather than adding to it.
+
+  `--text` and not a hue: the segment is `.ui-button-approve`, so the fill is already the
+  tone, and a second colour on top of it would be saying the same thing twice in a
+  different word. 2px and not 3: an inset ring eats the button's own padding.
+*/
+.ui-switch-seg-wrap > .ui-confirm-armed > .ui-button {
+  box-shadow: inset 0 0 0 2px var(--text);
+}
+
+/*
+  Locked, and still focusable. `ModeSwitch`'s `focusableWhenInert` hands the interlock
+  `aria-disabled` instead of `disabled`, and `.ui-button:disabled` never reaches a button that is
+  not `:disabled` — so the half-visible paint is restated here, for the segment only.
+*/
+.ui-switch-seg-wrap > .ui-confirm > .ui-button[aria-disabled="true"] {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+/*
+  A control that cannot be pressed does not advertise the consequence of pressing it.
+  Acting Green at 45% opacity still reads as "this will act" — three of the four "Let it act"
+  buttons on the roster are disabled, and all four were green.
+  The same holds for a locked segment that keeps its focus, which is `aria-disabled` and not
+  `:disabled` — that selector comes first so `:disabled` stays directly before the brace.
+*/
+.ui-button-approve[aria-disabled="true"],
+.ui-button-approve:disabled {
+  background: none;
+  border-color: var(--border);
   color: var(--text-faint);
+}
+
+/* ---------------------------------------------------------------- field -- */
+
+/*
+  One label rank for the whole app. Files labelled in sentence case while five pages labelled
+  uppercase-tracked, and neither was wrong on its own — what was wrong was that there was no
+  primitive, so every page decided again.
+*/
+.ui-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+/* Muted at 500, not faint: faint failed AA at this 11px rank (3.8:1 on the working surface). */
+.ui-field-label {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* Present for a screen reader, absent from the page — see `labelHidden`. */
+.ui-field-said {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.ui-field input,
+.ui-field textarea,
+.ui-field select {
+  min-width: 14rem;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  /* Controls are 6px — the four-step radius ladder, not the 3px inline step. */
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+/* `base.css` sets `color: inherit`, which reaches `::placeholder` — a hint that reads as
+   text somebody already typed. Said once, here — and muted, because faint failed AA (3.8:1). */
+.ui-field ::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+.ui-field input:focus-visible,
+.ui-field textarea:focus-visible,
+.ui-field select:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.ui-field-helper {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* --------------------------------------------------------------- palette -- */
+
+/**
+ * The one palette, dressed here rather than in `ui/vendor/command.tsx`.
+ *
+ * The same rule the tabs above follow: a vendored component is *kept* in
+ * `ui/vendor/` and dressed in real classes on real tokens. `ui.css` is
+ * unlayered, so every rule below beats the registry's Tailwind — including the
+ * selected row's `data-[selected=true]:bg-border` — which is how the palette is
+ * redressed without the vendor file being edited at all.
+ *
+ * No hue anywhere in it. The palette is chrome: a surface, a border, and a
+ * ladder of neutrals. Reserved Cyan reaches it only through the focus ring
+ * every control in the app inherits.
+ */
+
+.ui-palette {
+  /* The input is the top edge of this box. The vendor's `p-6` would inset it and
+     leave a frame of surface above the caret, which reads as a dialog with a
+     search field in it rather than as a thing you type into. */
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.ui-palette-input {
+  font-family: inherit;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+/* `base.css` sets `color: inherit`, and it reaches `::placeholder` — a hint that
+   reads as text somebody has already typed. Said here for the same reason
+   `.ui-field` says it, and `opacity: 1` is the UA's own fade being undone
+   rather than a transparency this sheet is choosing. */
+.ui-palette-input::placeholder {
+  color: var(--text-faint);
+  opacity: 1;
+}
+
+.ui-palette-list {
+  /* About ten rows. A list longer than the window is a list nobody scrolls to
+     the end of, and the answer to one that long is to type. */
+  max-height: 22rem;
+  overflow-y: auto;
+  padding: var(--space-1);
+}
+
+/* The heading cmdk draws above a group's rows. Quiet, because it is a label for
+   rows somebody is reading past — the row is the thing. */
+.ui-palette-group [cmdk-group-heading] {
+  padding: var(--space-2) var(--space-2) var(--space-1);
+  font-family: var(--font-display);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--text-faint);
+}
+
+.ui-palette-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  cursor: default;
+}
+
+/* The highlighted row, and it is a rung of the neutral ladder rather than a
+   colour — Contrast-Not-Hue, and the Reserved Cyan rule's own text sends you
+   here instead of to the accent. */
+.ui-palette-item[data-selected="true"] {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+/* Listed, and said to be unavailable. `nav.ts` already rules that hiding a
+   destination would be the shell pretending the feature was never designed, and
+   the palette does not get to overturn the rail on its own list; the reason
+   travels beside the row as the hint. */
+.ui-palette-item[data-disabled="true"] {
+  opacity: var(--opacity-disabled);
+}
+
+/* Right-aligned, and never the thing you read first: a hint is why a row is
+   disabled, or where it goes — not what it is. */
+.ui-palette-hint {
+  margin-left: auto;
+  padding-left: var(--space-3);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.ui-palette-empty {
+  padding: var(--space-4);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+
+/* ------------------------------------------------------------- run pipe -- */
+
+/**
+ * A run's four stages, drawn on a line. See `ui/RunPipeline.tsx` for what the
+ * stages are and why the component authors no tone of its own.
+ *
+ * Every tone arrives here as a class the component was handed by `state-map.ts`
+ * and is turned into three custom properties — ink, fill and line — so the box,
+ * its small-caps kind line and the marks travelling into it all take one
+ * decision. A rule that hard-coded `--tone-active-fg` on a box would be this
+ * sheet re-deciding what the map already decided.
+ */
+
+/**
+ * Drawn at its natural size, never stretched to the page.
+ *
+ * An SVG given `width: 100%` scales its TEXT with the window: at 1440px the
+ * viewBox's 14px reading came out at 30 on screen, larger than the `h1` above
+ * it, and the stage labels became the loudest thing on a page whose subject is
+ * the output below them. Capped at the viewBox's own width, the type is the
+ * size it was chosen to be, and a narrow window shrinks the whole row
+ * proportionally rather than reflowing four boxes into a column.
+ */
+.ui-runpipe {
+  display: block;
+  width: 100%;
+  max-width: 720px;
+  height: auto;
+  margin-bottom: var(--space-4);
+}
+
+/* The grey that makes no claim. It is the base for every stage, so a tone class
+   that fails to load leaves a legible box rather than an invisible one. */
+.ui-runpipe-stage,
+.ui-runpipe-neutral {
+  --runpipe-ink: var(--text-faint);
+  --runpipe-fill: var(--surface-raised);
+  --runpipe-line: var(--border);
+}
+
+.ui-runpipe-active {
+  --runpipe-ink: var(--tone-active-fg);
+  --runpipe-fill: var(--tone-active-bg);
+  --runpipe-line: var(--tone-active-border);
+}
+
+.ui-runpipe-shadow {
+  --runpipe-ink: var(--tone-shadow-fg);
+  --runpipe-fill: var(--tone-shadow-bg);
+  --runpipe-line: var(--tone-shadow-border);
+}
+
+.ui-runpipe-off {
+  --runpipe-ink: var(--tone-off-fg);
+  --runpipe-fill: var(--tone-off-bg);
+  --runpipe-line: var(--tone-off-border);
+}
+
+.ui-runpipe-pending {
+  --runpipe-ink: var(--tone-pending-fg);
+  --runpipe-fill: var(--tone-pending-bg);
+  --runpipe-line: var(--tone-pending-border);
+}
+
+.ui-runpipe-paused {
+  --runpipe-ink: var(--tone-paused-fg);
+  --runpipe-fill: var(--tone-paused-bg);
+  --runpipe-line: var(--tone-paused-border);
+}
+
+.ui-runpipe-danger {
+  --runpipe-ink: var(--tone-danger-fg);
+  --runpipe-fill: var(--tone-danger-bg);
+  --runpipe-line: var(--tone-danger-border);
+}
+
+.ui-runpipe-info {
+  --runpipe-ink: var(--tone-info-fg);
+  --runpipe-fill: var(--tone-info-bg);
+  --runpipe-line: var(--tone-info-border);
+}
+
+.ui-runpipe-box {
+  fill: var(--runpipe-fill);
+  stroke: var(--runpipe-line);
+  stroke-width: 1;
+}
+
+.ui-runpipe-kind {
+  fill: var(--runpipe-ink);
+  font-size: 9.5px;
+  letter-spacing: var(--tracking-wide);
+}
+
+/* The reading itself is the app's text colour whatever the tone: colour
+   reinforces the state on the kind line and the border, and text that changes
+   hue with the status is the thing `Badge` refuses to do for the same reason —
+   roughly one reader in twelve cannot separate the red from the green. */
+.ui-runpipe-title {
+  fill: var(--text);
+  font-size: 14px;
+  font-weight: var(--weight-medium);
+}
+
+.ui-runpipe-sub {
+  fill: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.ui-runpipe-edge {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* A stage the run never reached, and the arrow into it: an outline and a dash,
+   which says *not yet* without borrowing a state's colour to say it. */
+.ui-runpipe-unreached {
+  opacity: 0.6;
+}
+
+.ui-runpipe-unreached .ui-runpipe-box,
+.ui-runpipe-edge.ui-runpipe-unreached {
+  fill: none;
+  stroke-dasharray: 4 4;
+}
+
+/**
+ * The marks travelling into the working stage, and the three dots inside it.
+ *
+ * Both start at zero opacity and are brought up by their own keyframes, which
+ * is what makes them disappear rather than freeze when the global
+ * `prefers-reduced-motion` rule in `base.css` clamps every animation to one
+ * 0.01ms iteration. A mark parked mid-gap would read as a stalled run.
+ *
+ * `translateX(40px)` is the gap between two boxes, in viewBox units, and the
+ * boxes in `RunPipeline.tsx` are laid out with that one gap everywhere so this
+ * distance is written once.
+ */
+.ui-runpipe-flow {
+  fill: var(--runpipe-ink, var(--text-muted));
+  opacity: 0;
+  animation: ui-runpipe-travel 1.2s linear infinite;
+}
+
+.ui-runpipe-flow:nth-child(2) {
+  animation-delay: 0.4s;
+}
+
+.ui-runpipe-flow:nth-child(3) {
+  animation-delay: 0.8s;
+}
+
+@keyframes ui-runpipe-travel {
+  0% {
+    transform: translateX(0);
+    opacity: 0;
+  }
+
+  15% {
+    opacity: 1;
+  }
+
+  85% {
+    opacity: 0.7;
+  }
+
+  100% {
+    transform: translateX(40px);
+    opacity: 0;
+  }
+}
+
+.ui-runpipe-workdot {
+  fill: var(--runpipe-ink);
+  opacity: 0;
+  animation: ui-runpipe-work 1.2s ease-in-out infinite;
+}
+
+.ui-runpipe-workdot:nth-child(2) {
+  animation-delay: 0.4s;
+}
+
+.ui-runpipe-workdot:nth-child(3) {
+  animation-delay: 0.8s;
+}
+
+@keyframes ui-runpipe-work {
+  0%,
+  100% {
+    opacity: 0.15;
+  }
+
+  50% {
+    opacity: 1;
+  }
 }

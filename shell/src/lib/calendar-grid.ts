@@ -10,6 +10,9 @@
  * to run under a particular `TZ` to exercise a 23-hour day.
  */
 
+import { UI_LOCALE } from "./locale";
+import type { CalendarConfigView } from "../data/calendar";
+
 const HOUR_MS = 3_600_000;
 
 /** Where a block sits inside its day, as fractions of that day's own height. */
@@ -211,7 +214,7 @@ export function weekOf(anchor: Date): Date[] {
  * form is what fits the column, and the long form is what a screen reader
  * should say instead of "Wed".
  */
-export function weekdayLabels(locale?: string): { short: string; long: string }[] {
+export function weekdayLabels(locale: string = UI_LOCALE): { short: string; long: string }[] {
   const MONDAY = new Date(2024, 0, 1);
   return Array.from({ length: 7 }, (_, index) => {
     const day = new Date(MONDAY.getFullYear(), MONDAY.getMonth(), MONDAY.getDate() + index);
@@ -289,6 +292,28 @@ export function nowFraction(now: Date, day: Date): number | null {
   if (!sameDay(now, day)) return null;
   const [start, end] = dayBounds(day);
   return (now.getTime() - start.getTime()) / (end.getTime() - start.getTime());
+}
+
+/**
+ * How far down a day's column the working hours begin, as a fraction of the drawn day.
+ *
+ * Pure, and here rather than in the component, for the reason `nowFraction` is here: the
+ * arithmetic is a table test and the component is a scroll offset. `null` when there is no
+ * config yet or the stamp will not parse — absent is not midnight, and a caller that got a 0
+ * for "we do not know" would scroll to exactly the place this exists to avoid.
+ */
+export function workingStartFraction(day: Date, config: CalendarConfigView | undefined): number | null {
+  const stamp = config?.working_hours_start;
+  const match = /^(\d{2}):(\d{2})$/.exec(stamp ?? "");
+  if (match === null) return null;
+
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) return null;
+
+  const [start, end] = dayBounds(day);
+  const workingStart = new Date(day.getFullYear(), day.getMonth(), day.getDate(), hour, minute);
+  return (workingStart.getTime() - start.getTime()) / (hoursInSpan(start, end) * HOUR_MS);
 }
 
 /**

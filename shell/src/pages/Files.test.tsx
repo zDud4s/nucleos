@@ -266,7 +266,7 @@ describe("Files — uploading", () => {
     renderWithQuery(<Files />);
     await screen.findByText("This folder is empty");
 
-    const input = screen.getByLabelText("Upload files");
+    const input = screen.getByLabelText("Upload");
     const file = new File([new Uint8Array([1, 2, 3])], "report.docx", { type: "application/octet-stream" });
     fireEvent.change(input, { target: { files: [file] } });
 
@@ -274,6 +274,24 @@ describe("Files — uploading", () => {
     expect(uploaded[0]?.body).not.toBeInstanceOf(FormData);
     expect(uploaded[0]?.body).toBeInstanceOf(ArrayBuffer);
     expect(await screen.findByText(/saved as: report \(2\)\.docx/)).toBeDefined();
+  });
+
+  it("keeps the upload control as one labelled, styled control and shows chosen names", async () => {
+    daemon.apiFetch.mockImplementation(makeFilesDaemon({ list: () => [] }));
+
+    renderWithQuery(<Files />);
+    await screen.findByText("This folder is empty");
+
+    const input = screen.getByLabelText("Upload");
+    expect(input.classList.contains("sr-only")).toBe(true);
+    expect(input.getAttribute("aria-label")).toBeNull();
+    expect(input.closest("label")?.textContent).toBe("Upload");
+
+    const first = new File([new Uint8Array([1])], "first.txt", { type: "text/plain" });
+    const second = new File([new Uint8Array([2])], "second.txt", { type: "text/plain" });
+    fireEvent.change(input, { target: { files: [first, second] } });
+
+    expect(await screen.findByText("first.txt, second.txt")).toBeDefined();
   });
 });
 

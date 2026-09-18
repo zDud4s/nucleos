@@ -44,6 +44,7 @@ vi.mock("../data/dictation", () => ({
 
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
+import { PaletteProvider } from "../ui";
 import { ApiRefusal } from "../data/client";
 import type {
   Ask,
@@ -513,7 +514,9 @@ async function renderChats(initialPath: string) {
   await router.load();
   const result = render(
     <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
+      <PaletteProvider>
+        <RouterProvider router={router} />
+      </PaletteProvider>
     </QueryClientProvider>,
   );
   return { ...result, router, queryClient };
@@ -898,9 +901,9 @@ describe("Chats - what a department said", () => {
 
     await renderChats("/chats/c-1");
 
-    expect(await screen.findByRole("link", { name: /1 from a department/ })).toBeDefined();
+    expect(await screen.findByRole("link", { name: /1 from a team/ })).toBeDefined();
     // The count of turns is untouched by it: two unread answers are still two, not three.
-    expect(screen.getByRole("link", { name: /aqui, cloud, .+, 2 unread, 1 from a department$/ })).toBeDefined();
+    expect(screen.getByRole("link", { name: /aqui, cloud, .+, 2 unread, 1 from a team$/ })).toBeDefined();
     expect(screen.getByRole("link", { name: /ali, cloud, .+, 2 unread$/ })).toBeDefined();
   });
 });
@@ -2611,6 +2614,12 @@ describe("Chats - giving a conversation a project", () => {
     );
     await renderChats("/chats/c-1");
 
+    // Behind the `⋯` now. It is a fact about the conversation that never changes and is
+    // wanted about twice in its life, and it was a line of mono text above every reading
+    // of every chat that has a folder.
+    expect(screen.queryByText(/claude --resume sess-42/)).toBeNull();
+    await openConversationSettings();
+
     const carry = await screen.findByText(/claude --resume sess-42/);
     expect(carry.textContent).toContain("C:/Projects/nucleos");
   });
@@ -2857,9 +2866,8 @@ describe("Chats - the route and the sidebar badge", () => {
     expect(router.state.location.pathname).toBe("/chats");
     expect(screen.queryByText("Chats is not built yet")).toBeNull();
 
-    // The badge sums `waiting` across every conversation, not a row count —
-    // two chats waiting on 2 and 3 answers read as 5, not as 2.
-    expect(await screen.findByRole("link", { name: "Chats, 5 waiting" })).toBeDefined();
+    // The badge names what it counts: unread chats, not the Waiting queue.
+    expect(await screen.findByRole("link", { name: "Chats, 5 unread" })).toBeDefined();
 
     // The detail route is reached by clicking into the real page, proving it
     // too is in the real tree rather than only in a test's own two-route
@@ -2872,7 +2880,55 @@ describe("Chats - the route and the sidebar badge", () => {
       await screen.findByRole("link", { name: /^hello there, cloud, .+, 2 unread$/ }),
     );
     await waitFor(() => expect(router.state.location.pathname).toBe("/chats/c-1"));
-    expect(await screen.findByRole("heading", { level: 1, name: "Chats" })).toBeDefined();
+    // And once a conversation is open, the heading is the conversation — see "the open
+    // conversation is the page's heading" below. These fixtures carry no title, and an
+    // unnamed conversation says so rather than borrowing the page's old one.
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "New conversation" }),
+    ).toBeDefined();
+  });
+});
+
+/* ---------------------------------------------------- the page's own subject -- */
+
+describe("Chats - what the page is about", () => {
+  /**
+   * The heading rank belongs to the page's SUBJECT.
+   *
+   * Every conversation in this app answered to the heading "Chats", which is the one
+   * thing the person who has just clicked a conversation already knows. What tells this
+   * conversation from the twenty above it is its name, and that was a `--text-lg` line
+   * two ranks down, under a heading that never changed.
+   *
+   * The name stays a control, which is the reason this header is composed out of the
+   * shared `ui-page-*` classes rather than through `PageHeader`: that component takes a
+   * `string`, and clicking the title to rename it is the affordance this page was built
+   * with.
+   */
+  it("the open conversation is the page's heading", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", title: "arranja o parser de datas" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const heading = await screen.findByRole("heading", {
+      level: 1,
+      name: "arranja o parser de datas",
+    });
+    expect(heading.className).toContain("chats-head-title");
+    // The band is the shared one, so this page's top is the same object as every other
+    // page's — the composition is local, the rules are not.
+    expect(heading.closest(".ui-page-header")).not.toBeNull();
+    // And the words the heading used to spend itself on are the crumb back to the list.
+    const crumb = document.querySelector(".chats-crumb");
+    expect(within(crumb as HTMLElement).getByRole("link", { name: "Chats" })).toBeDefined();
+
+    // Still a rename control, and the rename's own label has not become the heading's.
+    expect(
+      within(heading).getByRole("button", { name: /^Rename this conversation/ }),
+    ).toBeDefined();
   });
 });
 
@@ -4198,11 +4254,11 @@ describe("Chats - finding a conversation by typing", () => {
     await renderChats("/chats/c-1");
     await screen.findByRole("list", { name: "Conversations" });
 
-    expect(screen.queryByRole("dialog", { name: /find a conversation/i })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Go to anything" })).toBeNull();
 
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
 
-    const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
     expect(within(palette).getByText("rewrite the gate")).toBeDefined();
     expect(within(palette).getByText("bump dependencies")).toBeDefined();
   });
@@ -4371,6 +4427,22 @@ describe("Chats - the list, cut into days", () => {
 });
 
 describe("Chats - a turn while it is running", () => {
+  it("gives a reduced-motion reader a mark, not a frozen spinner", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 7, status: "running", answer: null })],
+      }, { live: { 7: { text: "", doing: null } } }),
+    );
+
+    await renderChats("/chats/c-1");
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    const live = (await within(transcript).findByText("thinking…")).closest(".chats-turn-live");
+    const spinner = live?.querySelector(".chats-turn-spinner");
+
+    expect(spinner?.getAttribute("aria-hidden")).toBe("true");
+    expect(live?.textContent).toContain("thinking…");
+  });
+
   it("names the tool it is in and keeps a clock on it", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(
@@ -4602,7 +4674,7 @@ describe("Chats - finding something that was said", () => {
     await screen.findByRole("list", { name: "Conversations" });
 
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
-    const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
     fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "leap" } });
 
     // No conversation is CALLED "leap" — this hit exists only because the word was said in one.
@@ -4626,7 +4698,7 @@ describe("Chats - finding something that was said", () => {
     await screen.findByRole("list", { name: "Transcript" });
 
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
-    const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
     fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "three parts" } });
 
     fireEvent.click(await within(palette).findByText(/the year rule has three parts/));
@@ -4636,6 +4708,51 @@ describe("Chats - finding something that was said", () => {
       const found = document.getElementById("turn-1");
       expect(found?.className).toContain("chats-turn-lit");
     });
+  });
+
+  // The invariant `openingAChat` is there for (`Chats.tsx`): the editor preview is state and
+  // outranks the route, so a turn chosen here has to put the picked-up session down. Without the
+  // call the URL changes, the row lights up, and the editor session keeps the right-hand column —
+  // the conversation you just pressed does not open, and nothing says so.
+  it("puts a picked-up editor session down when a found turn is chosen", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", first_message: "o que ficou por fazer" })],
+        {
+          "c-1": [
+            turnRow({ id: 1, asked: "e o parser?", answer: "the year rule has three parts" }),
+          ],
+        },
+        {
+          ideSessions: [ideSession()],
+          said: {
+            "aaaa-1111": {
+              cut: false,
+              said: [{ by_owner: true, text: "arranja o parser de datas", aside: false }],
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    // Picked up: from here it is the editor session on screen and not the route's conversation.
+    fireEvent.click(
+      await screen.findByRole("button", { name: /arranja o parser de datas/i }),
+    );
+    expect(await screen.findByPlaceholderText("Carry on where you left off…")).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
+    fireEvent.change(within(palette).getByRole("combobox"), {
+      target: { value: "three parts" },
+    });
+    fireEvent.click(await within(palette).findByText(/the year rule has three parts/));
+
+    await waitFor(() => {
+      expect(screen.queryByPlaceholderText("Carry on where you left off…")).toBeNull();
+    });
+    expect(await screen.findByRole("list", { name: "Transcript" })).toBeTruthy();
   });
 });
 
@@ -5108,7 +5225,9 @@ describe("Chats - how large the conversation is drawn", () => {
     for (const sel of [".chats-detail-head", ".chats-composer-box", ".ui-page-header"]) {
       const other = container.querySelector(sel);
       if (other === null) continue;
-      expect(other.className).not.toContain("chats-zoom");
+      // The class the record just took, by name. A bare prefix was a class no sheet defines, which
+      // `scripts/css-contract.mjs` cannot tell from a typo.
+      expect(other.className).not.toContain("chats-zoom-90");
     }
   });
 });

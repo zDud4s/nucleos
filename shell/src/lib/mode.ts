@@ -3,29 +3,21 @@ import type { AutopilotMode, ProjectSummary } from "../data/system";
 /**
  * The rules about a project's three settings, shared by every surface that shows them.
  *
- * Two pages now offer the same choice — the Autopilot page, which governs the whole roster, and a
- * project's own workspace, where the setting is the biggest lever on the page. **What is shared is
- * the rules, not the pixels.** The two are drawn in different design languages (one predates the
- * Tailwind migration and is not being migrated for this), and a component configurable enough to
- * be both would be worse than two renderings of one rule.
+ * Two pages offer the same choice — the Autopilot page, which governs the whole roster, and a
+ * project's own workspace, where the setting is the biggest lever on the page. This header used to
+ * argue that what was shared were the rules and not the pixels, and that a component configurable
+ * enough to be both would be worse than two renderings of one rule. **That has been reversed: the
+ * pixels are shared too, through `ui/ModeSwitch`.** Two renderings had become two vocabularies —
+ * `off / shadow / active` on one page against `Turn off / Watch in shadow / Let it act` on the
+ * other — and a reader had to learn that they were the same decision.
  *
- * What must never diverge is what the words mean and when the third setting is offered — because a
- * control that unlocked on different arithmetic from the one the núcleo enforces would offer a
- * button that always refuses, and two copies of a sentence about restraint would eventually say
- * two different things about it.
+ * What this module still owns is what the words MEAN and when the third setting is offered, and
+ * that is why it is still a module rather than three constants inside the control: something that
+ * unlocked on different arithmetic from the one the núcleo enforces would offer a button that
+ * always refuses, and two copies of a sentence about restraint would eventually say two different
+ * things about it.
+ * The third vocabulary is gone too: the map says `active`, the daemon literal, and that word wins.
  */
-
-export const MODE_TONE: Record<AutopilotMode, "active" | "shadow" | "off"> = {
-  active: "active",
-  shadow: "shadow",
-  off: "off",
-};
-
-export const MODE_LABEL: Record<AutopilotMode, string> = {
-  active: "acting",
-  shadow: "shadow",
-  off: "off",
-};
 
 /**
  * What each setting means, in one line, for a surface with room to say it.
@@ -61,15 +53,141 @@ export function promotionBlocker(project: ProjectSummary, withheld: number): str
 }
 
 /**
+ * What letting a project act on its own actually means, said before it is done.
+ *
+ * The armed half of the interlock used to say "It may act on its own", which is the same sentence
+ * as the button it replaces and names neither the project nor the ceiling that will govern it. A
+ * confirmation whose two states say the same thing is a second click, not a second thought.
+ *
+ * The arithmetic is the roster row's and is never recomputed here — `open_review_items` and
+ * `wip_limit` come from the daemon. A null `wip_limit` is the ABSENCE of a ceiling and is never
+ * written as a zero: "0 proposal slots" would read as a project that may do nothing, which is the
+ * opposite of what no ceiling means. Same rule the spend line already follows on Home.
+ *
+ * The count is spelled "already in use" because of where the sentence is read. In a sentence about
+ * what is ABOUT to happen, "3 of 4 proposal slots" reads as an allowance being granted — as though
+ * pressing this were what hands the project three of its four slots. It is the opposite: three are
+ * spent before the decision is taken, and one is what is left. The clause has to say which of the
+ * two it is, because the tense around it cannot.
+ *
+ * Where this sentence GOES is the caller's problem and deliberately so: it is 52 characters, and
+ * inside a switch segment it wraps and grows the row under a pointer that has four seconds left to
+ * press the same button. `promotionConfirmLabel` is what the segment says; this is what the caller
+ * prints under the control.
+ */
+export function promotionConsequence(project: ProjectSummary): string {
+  const ceiling =
+    project.wip_limit === null
+      ? "no ceiling on proposals"
+      : `${String(project.open_review_items)} of its ${String(project.wip_limit)} proposal slots already in use`;
+  return `${project.project_id} acts on its own — ${ceiling}, no approval`;
+}
+
+/**
+ * What the armed segment says: short, one line, and it names the project.
+ *
+ * The armed half of an interlock has two jobs and they pull against each other — it must not
+ * repeat the offer it replaced ("It may act on its own" was the same sentence as the button that
+ * had just been pressed), and it must fit where it is drawn. `promotionConsequence` does the first
+ * and fails the second: rendered as the label it wrapped inside `.ap-project-row`'s last track and
+ * grew the row from 90.6 to 125.0 pixels, moving the button out from under the finger about to
+ * confirm it.
+ *
+ * So the label names the project and nothing else, and the consequence is printed under the
+ * control where it has a full-width line to live on. "Let alpha act" is still not the words of the
+ * button it replaced — "Let it act" — and the difference is the one word that matters when four
+ * rows offer the same button.
+ */
+export function promotionConfirmLabel(project: ProjectSummary): string {
+  return `Let ${project.project_id} act`;
+}
+
+/**
+ * One prerequisite of a mode change: words before a path, the path, words after it.
+ *
+ * The path is its own field so a surface with room can draw it as a path (`<code>`) — three of
+ * the five prerequisites are files a person has to go and look at, and inside a sentence they could
+ * only be read. Any of the three parts may be absent; `prerequisiteText` joins them back into words.
+ */
+export interface Prerequisite {
+  text?: string;
+  path?: string;
+  after?: string;
+}
+
+/**
+ * The 422's prerequisites as data: a lead sentence, the four things every mode needs, and the one
+ * more thing that only acting needs.
+ */
+export interface PrerequisiteList {
+  lead: string;
+  items: readonly Prerequisite[];
+  plus: Prerequisite;
+}
+
+/**
  * What the mode door says when it says no.
  *
  * The 422 is the one worth writing copy for, and the copy is deliberately a *list* rather than a
  * diagnosis: the route answers a bare status with an empty body for four different prerequisites,
- * so the honest sentence names all four and admits which one is unknown.
+ * so the honest answer names all four and admits which one is unknown.
+ *
+ * **The list is data, and each surface renders it the way it can** — as a list where there is room,
+ * each path drawn as a path, or as the prose sentence `MODE_REFUSAL_PROSE` joins from it, inside a
+ * `<p>`. The words stay one copy either way; only the drawing differs.
  */
-export const MODE_SENTENCES: Record<string, string> = {
-  unprocessable:
-    "the núcleo would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these: a folder, .ai/workflow/workflow.md inside it, .claude/hooks/ask_daemon.py on disk, and a PreToolUse hook in .claude/settings.json naming that file — plus, to act, a folder that is a git repository.",
+export const MODE_SENTENCES: {
+  unprocessable: PrerequisiteList;
+  bad_request: string;
+  internal: string;
+} = {
+  unprocessable: {
+    lead: "the núcleo would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these:",
+    items: [
+      { text: "a folder" },
+      { path: ".ai/workflow/workflow.md", after: " inside it" },
+      { path: ".claude/hooks/ask_daemon.py", after: " on disk" },
+      { text: "a PreToolUse hook in ", path: ".claude/settings.json", after: " naming that file" },
+    ],
+    plus: { text: "to act, a folder that is a git repository" },
+  },
   bad_request: "that is not one of the three settings",
   internal: "the núcleo hit an error of its own while changing this",
 };
+
+/** One prerequisite as plain words: its text, its path and what follows the path, joined. */
+export function prerequisiteText(item: Prerequisite): string {
+  return `${item.text ?? ""}${item.path ?? ""}${item.after ?? ""}`;
+}
+
+/** The prerequisite list as the one sentence a surface with no room for a list prints. */
+function prerequisiteProse(list: PrerequisiteList): string {
+  const leading = list.items.slice(0, -1).map(prerequisiteText).join(", ");
+  const last = list.items[list.items.length - 1];
+  const final = last === undefined ? "" : prerequisiteText(last);
+  return `${list.lead} ${leading}, and ${final} — plus, ${prerequisiteText(list.plus)}.`;
+}
+
+/**
+ * The mode door's refusals as sentences, keyed by the refusal code, for a surface that prints one.
+ *
+ * `unprocessable` is joined from the list above, never retyped: byte for byte the sentence the
+ * list replaced, so a page that still prints prose says what it always said.
+ */
+export const MODE_REFUSAL_PROSE: Record<string, string> = {
+  unprocessable: prerequisiteProse(MODE_SENTENCES.unprocessable),
+  bad_request: MODE_SENTENCES.bad_request,
+  internal: MODE_SENTENCES.internal,
+};
+
+/**
+ * The gate, once a project in shadow has earned the third setting.
+ *
+ * Shared because two surfaces state the gate — a project's own settings and the Autopilot fan's
+ * cards — and two copies of a sentence about restraint would eventually say two different things.
+ */
+export const PROMOTION_EARNED =
+  "every class it has exercised clears the bar, and at least one is a class the classifier withheld — it has earned this";
+
+/** What stands where the gate was, once a project acts: how to stop it, not the gate it passed. */
+export const PROMOTION_ACTING = "acting on its own — “Turn off” stops it at once";

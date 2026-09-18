@@ -12,7 +12,10 @@ export { CopyButton, type CopyButtonProps } from "./CopyButton";
 export { ConflictNote, type ConflictNoteProps } from "./ConflictNote";
 export { CopyOnce, type CopyOnceProps } from "./CopyOnce";
 export { Count, type CountProps } from "./Count";
+export { Crumb, type CrumbProps } from "./Crumb";
 export { ErrorNote, type ErrorNoteProps } from "./ErrorNote";
+export { Field, type FieldProps } from "./Field";
+export { IconButton, type IconButtonProps } from "./IconButton";
 export { Inset, type InsetAs, type InsetProps } from "./Inset";
 /**
  * Two primitives in one module — the second recorded exception to one
@@ -21,7 +24,24 @@ export { Inset, type InsetAs, type InsetProps } from "./Inset";
  * and splitting them is how the next ceiling gets drawn as the wrong one.
  */
 export { LimitChip, Meter, usd, type LimitChipProps, type MeterProps, type MeterTone } from "./Meter";
+export { ModeSwitch, type ModeSwitchProps, type SwitchMode } from "./ModeSwitch";
 export { PageHeader, type PageHeaderProps } from "./PageHeader";
+/**
+ * The one palette, and the one place the `Ctrl K` chord is bound.
+ *
+ * A page does not open a palette of its own: it contributes a group through
+ * `usePaletteGroup` and the shell's provider draws it. `SHORTCUT_HINT` is here
+ * so a page can print the chord beside a button without deciding what it is.
+ */
+export {
+  PaletteProvider,
+  SHORTCUT_HINT,
+  usePaletteGroup,
+  usePaletteOpen,
+  usePaletteQuery,
+  type PaletteGroup,
+  type PaletteItem,
+} from "./Palette";
 export { Panel, type PanelProps, type PanelVariant } from "./Panel";
 export { Quiet, type QuietProps } from "./Quiet";
 /**
@@ -39,6 +59,14 @@ export {
   type RelativeTimeProps,
 } from "./readings";
 export { RefusalNote, type RefusalNoteProps } from "./RefusalNote";
+export {
+  RunPipeline,
+  runStages,
+  type RunPipelineProps,
+  type RunShape,
+  type Stage,
+  type StageKey,
+} from "./RunPipeline";
 /**
  * A container and its item in one module — the third recorded exception to one
  * primitive per file. See the header of `Rows.tsx`: a row exists only inside
@@ -48,6 +76,7 @@ export { RefusalNote, type RefusalNoteProps } from "./RefusalNote";
 export { Row, Rows, type RowProps, type RowsProps } from "./Rows";
 export { Section, type SectionProps } from "./Section";
 export { SectionTitle, type SectionTitleProps } from "./SectionTitle";
+export { SlotPips, type SlotPipsProps } from "./SlotPips";
 export { Sparkline, type SparklineProps } from "./Sparkline";
 export { StaleNote, type StaleNoteProps } from "./StaleNote";
 export { StatCard, type StatCardProps } from "./StatCard";
@@ -56,6 +85,21 @@ export { Teach, type TeachProps } from "./Teach";
 export { Well, type WellProps } from "./Well";
 export { Who, type WhoProps } from "./Who";
 export { readState, type StateDomain, type StateReading } from "./state-map";
+/**
+ * The Feed's two readings of a kind — its lane on the time axis and its weight — kept beside the
+ * map because both are claims about núcleo kinds, and a page may not author a tone.
+ */
+export {
+  FEED_LANES,
+  feedGravityOf,
+  feedGravityTone,
+  feedKindLeavesOpen,
+  feedLaneOf,
+  feedMarkTone,
+  type FeedGravity,
+  type FeedLane,
+  type FeedLaneInfo,
+} from "./lanes";
 /**
  * Radix Tabs, re-exported from the front door like every other primitive.
  *

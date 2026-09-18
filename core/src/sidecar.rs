@@ -3,9 +3,10 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::sync::Notify;
 
 /// The supervisor's key for each sidecar, named once.
 ///
@@ -401,7 +402,7 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
             }
         }
         attempts = attempts.saturating_add(1);
-        tokio::time::sleep(delay).await;
+        delay = wait_out(&name, delay).await;
     }
 }
 
@@ -586,6 +587,87 @@ pub fn email_env(
     env.extend(sent_mailbox_env(config));
     env.extend(smtp_env(config));
     env
+}
+
+/// A "try now" bell for one sidecar: rung by the restart route, heard by [`supervise`].
+///
+/// A [`Notify`] and not a channel, for one property. `notify_one` STORES a permit when nobody is
+/// waiting, so a bell rung in the gap between the supervisor recording `DOWN` and reaching its sleep
+/// is heard AT the sleep rather than lost. A `watch` or a `broadcast` needs its receiver to exist
+/// first, and the moment this is rung in is exactly the moment it might not.
+///
+/// The same property has a cost worth naming: a bell rung just after the supervisor spawned is kept
+/// and spent on the NEXT backoff, which skips one wait. That is an early retry after a real death,
+/// not a wrong state, and the route refuses a running child anyway — so the window is a race between
+/// a person's press and a process coming up, not an ordinary path. Closing it would mean holding a
+/// lock across the spawn, which is worse than the thing it fixes.
+///
+/// Process-wide beside [`SIDECARS`], and for its reason: one set of sidecars per daemon, supervised
+/// by free tasks that outlive every request.
+static BELLS: LazyLock<Mutex<BTreeMap<String, Arc<Notify>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn bell_for(name: &str) -> Arc<Notify> {
+    BELLS
+        .lock()
+        .unwrap()
+        .entry(name.to_owned())
+        .or_insert_with(|| Arc::new(Notify::new()))
+        .clone()
+}
+
+/// What asking a sidecar to restart can answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartOutcome {
+    /// The supervisor was told to stop waiting and spawn now.
+    Asked,
+    /// A child is up, so there was nothing to hurry.
+    AlreadyRunning,
+    /// Nobody ever supervised this name, so there is no task to ask.
+    NotSupervised,
+}
+
+/// Ask the supervisor of `name` to stop waiting out its backoff and spawn now.
+///
+/// **A running child is REFUSED rather than killed, and that is the decision this function exists to
+/// hold.** Killing one would need a second registry holding the live [`tokio::process::Child`] —
+/// `supervise` owns it on its own stack — and for the browser sidecar it costs every open session
+/// (spec §9.1). That is a different feature: *stop this sidecar* rather than *stop waiting*, and a
+/// destructive one. The control this serves is drawn only beside a row that reads `down`, so this
+/// refusal is the backstop for a sidecar that came up between the render and the press.
+///
+/// `None` is refused for the sharper reason. `health.rs` reports both a supervisor backing off and a
+/// name nothing ever supervised as `not-running`, and only the first has a task listening: ringing
+/// the second's bell would answer "asked" and do nothing at all, which is the one answer a restart
+/// button must never give.
+///
+/// [`Liveness::FailedToSpawn`] is allowed, and is the case worth having — a binary that was never
+/// built is backing off at the 60 s ceiling, and the person pressing this has usually just built it.
+pub fn ask_to_restart(name: &str) -> RestartOutcome {
+    match liveness_of(name) {
+        None => RestartOutcome::NotSupervised,
+        Some(Liveness::Running) => RestartOutcome::AlreadyRunning,
+        Some(Liveness::Restarting | Liveness::FailedToSpawn(_)) => {
+            bell_for(name).notify_one();
+            RestartOutcome::Asked
+        }
+    }
+}
+
+/// Wait out `delay` unless somebody rings the bell first, and answer the delay the next attempt earned.
+///
+/// A bell heard starts the ladder over at [`RESTART_BASE`] rather than keeping a ceiling earned by a
+/// binary that did not exist yet. It is the same judgement [`next_delay`] makes about a process that
+/// ran before dying — this is a fresh incident, and the last one's backoff is not evidence about it.
+async fn wait_out(name: &str, delay: Duration) -> Duration {
+    let bell = bell_for(name);
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => delay,
+        _ = bell.notified() => {
+            tracing::info!(sidecar = %name, "a restart was asked for — trying now");
+            RESTART_BASE
+        }
+    }
 }
 
 #[cfg(test)]
@@ -832,6 +914,69 @@ mod tests {
         let kept = keepable_line(&"ç".repeat(MAX_LINE_BYTES)).expect("a long line is a line");
         assert!(kept.ends_with('…'));
         assert!(kept.len() <= MAX_LINE_BYTES + '…'.len_utf8());
+    }
+
+    /// The property that makes [`Notify`] the right primitive: a permit rung before anybody waits is
+    /// kept, so a press landing in the gap between an exit and the sleep is not silently dropped.
+    #[tokio::test]
+    async fn a_bell_rung_before_anybody_waits_still_ends_the_backoff_and_starts_the_delay_over() {
+        bell_for("test-bell").notify_one();
+        let next = tokio::time::timeout(
+            Duration::from_millis(200),
+            wait_out("test-bell", RESTART_MAX),
+        )
+        .await
+        .expect("a bell already rung must not leave the supervisor waiting out a minute");
+        assert_eq!(
+            next, RESTART_BASE,
+            "a restart somebody asked for is a fresh incident, not an inherited ceiling"
+        );
+    }
+
+    /// And the other half, without which the `select!` could be a no-op nobody would notice.
+    #[tokio::test]
+    async fn without_a_bell_the_supervisor_waits_out_its_backoff() {
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                wait_out("test-silent", RESTART_MAX),
+            )
+            .await
+            .is_err(),
+            "an unrung bell must not shorten the wait"
+        );
+    }
+
+    /// The three answers, and the two that are refusals.
+    ///
+    /// `not-running` is two situations wearing one word — a supervisor backing off, and a name no
+    /// supervisor task exists for — and only one of them has anybody listening for the bell.
+    #[test]
+    fn a_restart_is_refused_for_a_running_child_and_asked_for_while_it_backs_off() {
+        assert_eq!(
+            ask_to_restart("test-never-supervised"),
+            RestartOutcome::NotSupervised,
+        );
+
+        record("test-running", |entry| entry.state = RUNNING);
+        assert_eq!(
+            ask_to_restart("test-running"),
+            RestartOutcome::AlreadyRunning
+        );
+
+        record("test-backing-off", |entry| {
+            entry.state = DOWN;
+            entry.spawn_error = None;
+        });
+        assert_eq!(ask_to_restart("test-backing-off"), RestartOutcome::Asked);
+
+        // A binary that was never built is the case this is most useful for: it is sitting at the
+        // 60 s ceiling, and whoever is pressing the button has just built it.
+        record("test-never-built", |entry| {
+            entry.state = DOWN;
+            entry.spawn_error = Some(io::ErrorKind::NotFound);
+        });
+        assert_eq!(ask_to_restart("test-never-built"), RestartOutcome::Asked);
     }
 
     /// Beside the daemon by default, and wherever the variable says when it says anything.

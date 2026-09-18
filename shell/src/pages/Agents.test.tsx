@@ -168,6 +168,26 @@ describe("Agents - the shape of the page", () => {
     expect(screen.getAllByRole("table")).toHaveLength(1);
   });
 
+  it("the catalogue says what its marks mean", async () => {
+    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
+    renderWithQuery(<Agents />);
+
+    const key = await screen.findByText(/directs a team/);
+    expect(key.textContent).toContain("on a team’s roster");
+    expect(key.textContent).toContain("no tools");
+    expect(key.textContent).toContain("renamed since");
+  });
+
+  it("the key spends one glyph per meaning", async () => {
+    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
+    renderWithQuery(<Agents />);
+
+    const key = await screen.findByText(/directs a team/);
+    expect(key.textContent).toContain("■ has tools");
+    expect(key.textContent).toContain("□ no tools");
+    expect(key.textContent).not.toContain("● has tools");
+  });
+
   it("keeps one editor, below the table, and swaps it rather than stacking a second", async () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "one", name: "one" }), agent({ id: "two", name: "two", speciality: "second" })]),
@@ -224,7 +244,7 @@ describe("Agents - the name and the id", () => {
 
     await screen.findByText("head-of-content");
     expect(document.querySelector(".agents-id-diverged")).toBeNull();
-    expect(screen.queryByText(/renamed since/i)).toBeNull();
+    expect(screen.getByText(/renamed since/i).className).toContain("agents-key");
   });
 });
 
@@ -339,17 +359,17 @@ describe("Agents - how much of an agent is spoken for", () => {
     expect(screen.getByText(/on the roster of Informática/)).toBeDefined();
   });
 
-  it("marks an agent no department names, and says so in the headline", async () => {
+  it("marks an agent no team names, and says so in the headline", async () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "spare", name: "spare", model: "sonnet" })], { teams: departments }),
     );
     renderWithQuery(<Agents />);
 
-    expect(await screen.findByText("no department names this one")).toBeDefined();
+    expect(await screen.findByText("no team names this one")).toBeDefined();
     expect(screen.getByText(/1 nobody uses/)).toBeDefined();
   });
 
-  it("never says nobody uses an agent while the department list has not answered", async () => {
+  it("never says nobody uses an agent while the team list has not answered", async () => {
     daemon.apiFetch.mockImplementation(async (path: string) => {
       if (path === "/teams") return await new Promise(() => {});
       if (path === "/agents") return [agent({ id: "spare", name: "spare", model: "sonnet" })];
@@ -357,8 +377,8 @@ describe("Agents - how much of an agent is spoken for", () => {
     });
     renderWithQuery(<Agents />);
 
-    expect(await screen.findByText(/the department list has not answered/)).toBeDefined();
-    expect(screen.queryByText("no department names this one")).toBeNull();
+    expect(await screen.findByText(/the team list has not answered/)).toBeDefined();
+    expect(screen.queryByText("no team names this one")).toBeNull();
     expect(screen.queryByText(/nobody uses/)).toBeNull();
   });
 });
@@ -474,7 +494,7 @@ describe("Agents - what stands on an agent", () => {
     renderWithQuery(<Agents />);
 
     const editor = await openEditor("copywriter");
-    expect(within(editor).getByText(/No department names copywriter/)).toBeDefined();
+    expect(within(editor).getByText(/No team names copywriter/)).toBeDefined();
     expect(within(editor).getByText(/is not something this page can see/)).toBeDefined();
   });
 });

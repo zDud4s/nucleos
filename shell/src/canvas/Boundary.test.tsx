@@ -130,6 +130,21 @@ describe("the boundary between the two sides", () => {
     expect(screen.queryByText(/Nothing asks for a route that does not exist/)).toBeNull();
   });
 
+  it("a crossing import and an unserved route are drawn as the faults they are", () => {
+    const { container } = draw(
+      [mod("core/src/a.rs"), mod("shell/src/x.ts")],
+      [link("core/src/a.rs", "shell/src/x.ts")],
+      { seam: { served: ["/things"], calls: 1, matched: 0, unmatched: [{ path: "/thingz", file: "shell/src/data/things.ts", line: 12 }] } },
+    );
+
+    const wrong = container.querySelector(".ui-wrong") as HTMLElement | null;
+    expect(wrong?.className).toContain("ui-wrong");
+    expect(wrong?.textContent).toContain("cross between sides");
+    expect((container.querySelector(".bg-tone-danger-bg") as HTMLElement | null)?.className).toContain(
+      "bg-tone-danger-bg",
+    );
+  });
+
   it("prints the size of its blind spot beside the list that blind spot corrupts", () => {
     // A route reached only by a call whose path was built elsewhere is reported as one nothing
     // calls. Without the number beside it, that list reads as a list of dead code.

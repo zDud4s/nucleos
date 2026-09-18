@@ -15,12 +15,14 @@ import {
 import {
   Button,
   ErrorNote,
-  Inset,
+  Field,
   PageHeader,
   Panel,
   Quiet,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
   Section,
   StateBadge,
   Teach,
@@ -114,15 +116,14 @@ function ReadForm() {
           read.mutate(url.trim(), { onSuccess: () => setUrl("") });
         }}
       >
-        <label className="web-field">
-          <span>URL</span>
+        <Field label="URL">
           <input
             value={url}
             aria-label="URL to read"
             placeholder="https://…"
             onChange={(event) => setUrl(event.target.value)}
           />
-        </label>
+        </Field>
         <Button type="submit" intent="go" disabled={url.trim() === "" || read.isPending}>
           Read
         </Button>
@@ -193,14 +194,14 @@ function WebSearchPanel() {
           search.mutate({ query: query.trim() });
         }}
       >
-        <label className="web-field">
-          <span>Search</span>
+        <Field label="Search" labelHidden>
           <input
             value={query}
             aria-label="Search query"
+            placeholder="search the web…"
             onChange={(event) => setQuery(event.target.value)}
           />
-        </label>
+        </Field>
         <Button type="submit" disabled={query.trim() === "" || search.isPending}>
           Search
         </Button>
@@ -229,14 +230,14 @@ function SearchOutcome({ view }: { view: SearchView }) {
           reader the opposite of what the page means. */}
       {view.cached.length > 0 && (
         <Section label="already in the archive" level={3}>
-          <ul className="web-search-list" aria-label="Already read">
+          <Rows label="Already read">
             {view.cached.map((hit) => (
-              <Inset as="li" key={hit.id}>
+              <Row key={hit.id}>
                 <Link to={`/web/pages/${hit.id}`}>{hit.title ?? hit.final_url}</Link>
                 <span className="web-search-snippet">{hit.snippet}</span>
-              </Inset>
+              </Row>
             ))}
-          </ul>
+          </Rows>
         </Section>
       )}
 
@@ -245,15 +246,15 @@ function SearchOutcome({ view }: { view: SearchView }) {
           {view.results.length === 0 ? (
             <Quiet says="nothing came back" />
           ) : (
-            <ul className="web-search-list" aria-label="Search results">
+            <Rows label="Search results">
               {view.results.map((result) => (
-                <Inset as="li" key={result.url}>
+                <Row key={result.url}>
                   <span className="web-search-title">{result.title}</span>
                   <span className="web-search-url">{result.url}</span>
                   <span className="web-search-snippet">{result.snippet}</span>
-                </Inset>
+                </Row>
               ))}
-            </ul>
+            </Rows>
           )}
         </Section>
       )}
@@ -294,10 +295,9 @@ function ArchiveList({
           onSearch(text === "" ? undefined : text);
         }}
       >
-        <label className="web-field">
-          <span>Filter</span>
+        <Field label="Filter">
           <input name="q" defaultValue={q ?? ""} key={q ?? ""} aria-label="Filter the archive" />
-        </label>
+        </Field>
         <Button type="submit">Filter</Button>
         {q !== undefined && <Button onClick={() => onSearch(undefined)}>Clear</Button>}
       </form>
@@ -313,21 +313,19 @@ function ArchiveList({
         </Teach>
       )}
       {rows !== undefined && rows.length > 0 && (
-        <ul className="web-list" aria-label="Archive">
+        <Rows label="Archive" className="web-list">
           {rows.map((row) => (
             <ArchiveRow key={row.id} row={row} active={row.id === selected} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
 }
 
 /**
- * One archived page, as a box you reach into rather than a line you scan past
- * — which is the question that picks `Inset` over `Rows`: this column is a
- * master list, and the whole point of a row is that it opens the reader beside
- * it.
+ * One archived page, as a `Row` of the archive's `Rows`: the column is scanned
+ * down for the page to open, and the reader opens beside it.
  *
  * `current` and not a border colour of its own. The row used to say "this one"
  * with `border-color: var(--accent)`, and the accent is the one colour in this
@@ -338,7 +336,7 @@ function ArchiveList({
  */
 function ArchiveRow({ row, active }: { row: Hit; active: boolean }) {
   return (
-    <Inset as="li" current={active}>
+    <Row current={active}>
       <Link className="web-row-link" to={`/web/pages/${row.id}`} aria-current={active ? "page" : undefined}>
         <span className="web-row-title">{row.title ?? row.final_url}</span>
         <StateBadge domain="web_trust" state={row.trust_at_fetch} />
@@ -346,7 +344,7 @@ function ArchiveRow({ row, active }: { row: Hit; active: boolean }) {
         <RelativeTime at={row.fetched_at} />
       </Link>
       <p className="web-row-snippet">{row.snippet}</p>
-    </Inset>
+    </Row>
   );
 }
 

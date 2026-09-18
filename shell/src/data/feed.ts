@@ -1,9 +1,9 @@
 // §spec mapa-do-projeto
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiFetch } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
-import type { BadgeTone } from "../ui";
+import { readState, statesOf, type StateReading } from "../ui/state-map";
 
 /**
  * The feed, and the notifications the calendar is holding back.
@@ -42,6 +42,12 @@ export interface FeedEntry {
   run_id: number | null;
   /** The errand this line belongs to. Never set together with `project_id`. */
   errand_id: number | null;
+  /**
+   * What the line is about, when the núcleo knows: `job:<id>`, `run:<id>`, `council:<id>`,
+   * `team_run:<id>`, `vcs:<id>` or `errand:<id>`. Every line about one subject is one sequence on
+   * the Feed's trace — a job's start, its failed gate and its finish are one row, not three.
+   */
+  subject: string | null;
   created_at: string;
 }
 
@@ -243,6 +249,164 @@ export function useRecentFeed(options: { enabled?: boolean } = {}) {
   });
 }
 
+/* ------------------------------------------------------------- timeline -- */
+
+/**
+ * `GET /feed/timeline` — every scope, inside a time window, oldest first.
+ *
+ * The listing above answers "the newest fifty", which is the wrong question for a time axis: a
+ * busy night fills fifty lines in an hour, and an axis drawn from them shows eleven hours of
+ * silence that never happened. This route answers "everything between these two instants",
+ * ordered `created_at` then `id`, capped at the newest {@link FEED_TIMELINE_CAP} with `truncated`
+ * saying so out loud.
+ */
+export interface FeedTimeline {
+  entries: FeedEntry[];
+  /** More lines fell inside the window than the cap; the OLDEST were left out. */
+  truncated: boolean;
+}
+
+/** The route's cap, in lines. A window holding more says `truncated`. */
+export const FEED_TIMELINE_CAP = 5000;
+
+/** The widest window the route accepts; anything wider is a 400. */
+export const FEED_WINDOW_MAX_DAYS = 31;
+
+/** A window of the axis. `until` absent is a live window, reaching up to now. */
+export interface FeedWindow {
+  /** RFC 3339. */
+  since: string;
+  until?: string;
+}
+
+/**
+ * The daemon's seen marker — `GET` and `POST /feed/seen`.
+ *
+ * `through` is the newest line id somebody has been shown; `through_created_at` is when that
+ * line was written, and `seen_at` is when it was marked. All three are `null` on a machine where
+ * nothing has ever been marked. The marker lives in the daemon rather than in `localStorage`
+ * because the Feed is not the only reader it will ever have, and because a second window would
+ * otherwise keep its own idea of what you have seen.
+ */
+export interface FeedSeen {
+  through: number | null;
+  through_created_at: string | null;
+  seen_at: string | null;
+}
+
+/** The query string for one window, with the incremental cursor when there is one. */
+export function timelineQueryString(range: FeedWindow, afterId: number | null = null): string {
+  const params = new URLSearchParams();
+  params.set("since", range.since);
+  if (range.until !== undefined) params.set("until", range.until);
+  if (afterId !== null) params.set("after_id", String(afterId));
+  return `?${params.toString()}`;
+}
+
+/** The newest id in a list, or `null` for an empty one. Ids only grow, so this is the cursor. */
+export function newestFeedId(entries: FeedEntry[]): number | null {
+  let newest: number | null = null;
+  for (const entry of entries) if (newest === null || entry.id > newest) newest = entry.id;
+  return newest;
+}
+
+/** The route's own order: `created_at`, then `id` for two lines written in the same instant. */
+export function compareFeedEntries(a: FeedEntry, b: FeedEntry): number {
+  const at = Date.parse(a.created_at) - Date.parse(b.created_at);
+  return at !== 0 ? at : a.id - b.id;
+}
+
+/**
+ * A poll's answer folded into what the page already holds.
+ *
+ * Deduplicated by id, because `after_id` is a cursor over ids while the route orders by time, and
+ * a line the núcleo stamped a moment late can arrive twice across two polls. Lines that have
+ * slid out of the window's start are NOT dropped here: a live window's `since` is fixed when the
+ * window is chosen, so nothing slides. The cap is re-applied, and trimming to it is itself a
+ * truncation — the flag is sticky, because once the oldest lines were left out they stay out.
+ */
+export function mergeFeedTimeline(previous: FeedTimeline | undefined, next: FeedTimeline): FeedTimeline {
+  if (previous === undefined) return next;
+  if (next.entries.length === 0) return previous;
+  const byId = new Map<number, FeedEntry>();
+  for (const entry of previous.entries) byId.set(entry.id, entry);
+  for (const entry of next.entries) byId.set(entry.id, entry);
+  const merged = [...byId.values()].sort(compareFeedEntries);
+  const overflow = merged.length > FEED_TIMELINE_CAP;
+  return {
+    entries: overflow ? merged.slice(merged.length - FEED_TIMELINE_CAP) : merged,
+    truncated: previous.truncated || next.truncated || overflow,
+  };
+}
+
+/**
+ * One window of the time axis, kept current.
+ *
+ * The first read is the whole window; every poll after it asks only for lines past the newest id
+ * already held (`after_id`) and merges them in, so a seven-day window of four thousand lines costs
+ * one large request per visit rather than one every three seconds. A different window is a
+ * different key and so a full read — which is the "full refetch when the window changes" the page
+ * wants, for free.
+ *
+ * `null` holds the query: the page does not know its window until the seen marker has answered,
+ * and asking for a guessed window first would draw one axis and then redraw another.
+ *
+ * A window with an `until` is a question about the past and does not poll — the same rule
+ * {@link useFeed} follows for a search.
+ */
+export function useFeedTimeline(range: FeedWindow | null) {
+  const client = useQueryClient();
+  const since = range?.since ?? "";
+  const until = range?.until ?? null;
+  const key = keys.feed.timeline(since, until);
+  return useQuery({
+    queryKey: key,
+    queryFn: async () => {
+      const held = client.getQueryData<FeedTimeline>(key);
+      const after = until === null && held !== undefined ? newestFeedId(held.entries) : null;
+      const answer = await apiFetch<FeedTimeline>(
+        `/feed/timeline${timelineQueryString({ since, until: until ?? undefined }, after)}`,
+      );
+      return after === null ? answer : mergeFeedTimeline(held, answer);
+    },
+    enabled: range !== null,
+    refetchInterval: until === null ? POLL.fast : false,
+    // A new window keeps the old one on screen until its own answer lands, so choosing a preset
+    // does not blank the chart. The caller clips what it draws to the window it asked for.
+    placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * The seen marker, read once per visit.
+ *
+ * No poll: the page snapshots it on arrival and shades from that snapshot for the whole visit,
+ * so a later value would be read by nobody. `staleTime: 0` and a fresh read on mount are what
+ * make "the marker as it was when you came in" true on every visit rather than on the first.
+ */
+export function useFeedSeen() {
+  return useQuery({
+    queryKey: keys.feed.seen,
+    queryFn: () => apiFetch<FeedSeen>("/feed/seen"),
+    refetchOnMount: "always",
+    refetchOnWindowFocus: false,
+  });
+}
+
+/**
+ * Move the marker forward to `through`.
+ *
+ * A plain function and not a mutation hook, because its commonest caller is an effect's cleanup —
+ * the page leaving — where a hook's state has already been torn down. The daemon clamps it
+ * monotonic and to the newest id it holds, so a late or repeated call can never move it back.
+ */
+export async function markFeedSeen(through: number): Promise<FeedSeen> {
+  return await apiFetch<FeedSeen>("/feed/seen", {
+    method: "POST",
+    body: JSON.stringify({ through }),
+  });
+}
+
 /**
  * What the calendar is holding, and what it held and later let through.
  *
@@ -265,132 +429,24 @@ export function isHeld(notification: PendingNotification): boolean {
 
 /* ------------------------------------------------------------- readings -- */
 
-export interface FeedReading {
-  tone: BadgeTone;
-  /** What this kind of line means, in a phrase. */
-  label: string;
-}
-
 /**
- * Every `kind` the núcleo actually writes, mapped to a reading.
+ * A feed kind's reading, which is the map's reading — the same shape it always was.
  *
- * **Built by enumeration, not by guessing**: every key below was taken from a
- * `feed::append` / `append_on` / `append_for_errand` call site in `core/src/`,
- * plus the two indirect writers — `job::say` (thirteen `job_*` kinds) and
- * `notify::deliver_or_defer`, which is how `token_efficiency` and the e-mail
- * classes reach the feed. Nothing here is a name that looked plausible.
- *
- * **An unmapped kind renders its own literal**, exactly as `ui/state-map.ts`
- * does for an unmapped state. The núcleo grows kinds faster than this table
- * will, and a guessed label is a claim the shell cannot support — showing the
- * raw literal admits ignorance, which is the only honest fallback.
- *
- * Two kinds are deliberately absent and cannot be added:
- *
- * - `email_<class>` is built at run time from `notify_classes`
- *   (`triage.rs`: `format!("email_{}", verdict.class)`), which is configuration.
- *   Only the shipped default — `urgent` — is mapped; anybody else's class reads
- *   as its literal, which is right, because only they know what it means.
- * - The tones are the seven of `tokens.css` and nothing else. Where the núcleo's
- *   own line covers several outcomes at once — `vcs_request_finished` carries
- *   *succeeded*, *failed*, *blocked* and *escalated*; `council_finished` carries
- *   whatever status settled it — the reading is `info` and the verdict is left
- *   in the summary, rather than the shell picking one of four and being wrong
- *   three times.
+ * The table this alias replaces lived here, in a `.ts` file, with 46 `tone:` literals in it,
+ * and `ui/badge-authorship.test.ts` walked only `.tsx` and only `<Badge` tags. So the app's
+ * largest tone table was invisible to the one test that exists to find exactly that, and it
+ * stayed invisible long enough for five rows to drift into Acting Green. It is in
+ * `ui/state-map.ts` now, and the ratchet walks `.ts` too.
  */
-export const FEED_KINDS: Record<string, FeedReading> = {
-  /* -- jobs: `job::say`, fifteen kinds ------------------------------------ */
-  job_started: { tone: "active", label: "job started" },
-  job_planned: { tone: "info", label: "job planned" },
-  job_replanned: { tone: "info", label: "job replanned" },
-  job_plan_failed: { tone: "danger", label: "job could not be planned" },
-  job_item_failed: { tone: "danger", label: "job item failed" },
-  job_gate_failed: { tone: "danger", label: "job gate failed" },
-  job_waiting: { tone: "pending", label: "job waiting" },
-  /**
-   * A round in which no item passed has nothing for a review to judge, so none
-   * runs (job 27, 2026-09-14: a review read a reverted tree and reported "no work
-   * was done"). Information, not a failure: the red items already said so.
-   */
-  job_review_skipped: { tone: "info", label: "job review skipped" },
-  /**
-   * A review that never reached the API is run once more (job 26, 2026-09-13:
-   * a DNS outage ended it and the next round opened without a verdict). Pending,
-   * because the verdict it stands for is still to come.
-   */
-  job_review_retried: { tone: "pending", label: "job review retried" },
-  job_finished: { tone: "active", label: "job finished" },
-  job_failed: { tone: "danger", label: "job failed" },
-  /**
-   * The three ways a job stops that are **not** failures, and never share a
-   * reading with `job_failed` — §7's sharpest row. `stopped` is a person or a
-   * brake halting the chain, `cancelled` is the request being withdrawn, and
-   * `expired` is the four-hour window closing on it.
-   */
-  job_stopped: { tone: "off", label: "job stopped" },
-  job_cancelled: { tone: "off", label: "job cancelled" },
-  job_expired: { tone: "paused", label: "job expired" },
-  /** The daemon died under it. A defect in us, not in the work. */
-  job_interrupted: { tone: "paused", label: "job interrupted" },
-
-  /* -- runs --------------------------------------------------------------- */
-  run_retry: { tone: "info", label: "run retried" },
-  run_failed_final: { tone: "danger", label: "run failed for good" },
-  run_interrupted: { tone: "paused", label: "run interrupted" },
-  run_stopped_probing: { tone: "danger", label: "run stopped after repeated refusals" },
-  /** Not an alarm. See {@link readEfficiencySignal}. */
-  token_efficiency: { tone: "info", label: "efficiency observation" },
-
-  /* -- worktrees ---------------------------------------------------------- */
-  worktree_gate_failed: { tone: "danger", label: "worktree gate failed" },
-  worktree_provision_failed: { tone: "danger", label: "worktree could not be made" },
-  worktree_released: { tone: "off", label: "worktree released" },
-  worktree_branch_kept: { tone: "info", label: "unmerged branch kept" },
-  worktree_removed: { tone: "off", label: "worktree removed" },
-  worktree_gc_failed: { tone: "danger", label: "worktree cleanup failed" },
-
-  /* -- the git queue ------------------------------------------------------ */
-  vcs_request_finished: { tone: "info", label: "git request settled" },
-  vcs_request_cancelled: { tone: "off", label: "git request cancelled" },
-  vcs_request_interrupted: { tone: "paused", label: "git request interrupted" },
-
-  /* -- council ------------------------------------------------------------ */
-  council_started: { tone: "active", label: "council started" },
-  council_stage: { tone: "info", label: "council stage" },
-  council_finished: { tone: "info", label: "council settled" },
-
-  /* -- errands and the scheduler ------------------------------------------ */
-  schedule_rule_invalid: { tone: "danger", label: "schedule rule invalid" },
-  errand_rule_fired: { tone: "active", label: "errand rule fired" },
-  errand_rule_failed: { tone: "danger", label: "errand rule failed" },
-  errand_investigation_done: { tone: "active", label: "errand investigation done" },
-  errand_investigation_failed: { tone: "danger", label: "errand investigation failed" },
-
-  /* -- e-mail ------------------------------------------------------------- */
-  email_digest: { tone: "info", label: "e-mail digest" },
-  email_urgent: { tone: "pending", label: "urgent e-mail" },
-  email_triage_failed: { tone: "danger", label: "e-mail triage failed" },
-  email_triage_paused: { tone: "paused", label: "e-mail triage paused" },
-  email_triage_stalled: { tone: "paused", label: "e-mail triage stalled" },
-  email_fetch_skipped: { tone: "info", label: "e-mail skipped" },
-  /** A misconfigured `sent_mailbox`: mail arrives and correspondents are lost. */
-  email_sent_mailbox_foreign: { tone: "danger", label: "sent mail filed elsewhere" },
-
-  /* -- governance and the rest -------------------------------------------- */
-  action_authorized: { tone: "info", label: "action authorised by a grant" },
-  proposal_record_failed: { tone: "danger", label: "proposal not recorded" },
-  promotion_ready: { tone: "pending", label: "promotion ready" },
-  /** The one kind the núcleo spells with a dot (`web.rs`). */
-  "web.read": { tone: "info", label: "web page read" },
-};
+export type FeedReading = StateReading;
 
 /** The reading for a kind, or `null` when this shell has none. */
 export function readFeedKind(kind: string): FeedReading | null {
-  return FEED_KINDS[kind.trim()] ?? null;
+  return readState("feed", kind);
 }
 
 /** Every mapped kind, sorted, for the filter's `datalist`. */
-export const FEED_KIND_NAMES: string[] = Object.keys(FEED_KINDS).sort();
+export const FEED_KIND_NAMES: string[] = statesOf("feed").sort();
 
 /**
  * Why a `job_waiting` line is waiting, read out of its summary.
@@ -531,8 +587,8 @@ export interface FamilyRow {
  * family, and nothing else.
  *
  * It contains NO kinds. Which kind belongs to which family is computed by
- * prefix match, so this list cannot fall behind the núcleo the way `FEED_KINDS`
- * has — the worst it can do is leave a new family without a pretty name.
+ * prefix match, so this list cannot fall behind the núcleo the way a table of
+ * kinds can — the worst it can do is leave a new family without a pretty name.
  *
  * One family is exactly one prefix. Two prefixes under one label would make a
  * single switch write two rules, make a state where the two disagree reachable,
@@ -566,11 +622,12 @@ export const NOTIFY_FAMILIES: { selector: string; label: string }[] = [
  * resolution of the same rules, written somewhere else and free to disagree
  * with this one.
  *
- * Nothing here derives from `FEED_KINDS`. That table is missing every `team_`
- * kind and half the `vcs_` ones; building the screen on it would hide from the
- * owner exactly the kinds nobody remembered to add. `FEED_KINDS` is used for
- * one thing only, in the component: making a kind's label prettier, where
- * `readFeedKind` already falls back to the literal.
+ * Nothing here derives from the state map's `feed` domain. That table is held to
+ * the núcleo by `state-map-completeness.test.ts`, but only for kinds this
+ * checkout's source writes; the observed kinds come from the database, which
+ * also holds kinds an older or newer daemon wrote. The map is used for one thing
+ * only, in the component: making a kind's label prettier, where `readFeedKind`
+ * already falls back to the literal.
  */
 export function groupKinds(
   observed: string[],

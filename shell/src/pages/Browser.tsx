@@ -15,6 +15,7 @@ import {
   useReturnWheel,
   type BrowserSession,
   type Site,
+  type SubsystemReadout,
   type Written,
 } from "../data/browser";
 import { useProjects } from "../data/system";
@@ -24,12 +25,13 @@ import {
   ConfirmButton,
   Count,
   ErrorNote,
-  Inset,
   PageHeader,
   Panel,
   Quiet,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
   Section,
   StateBadge,
 } from "../ui";
@@ -59,11 +61,16 @@ import "./browser.css";
  */
 export function Browser() {
   const sessions = useBrowserSessions();
+  const health = useBrowserHealth();
   const [chainDialogue, setChainDialogue] = useState<{ sessionId: number; chain: string[] } | null>(null);
 
   return (
     <>
-      <PageHeader title="Browser" headline={headline(sessions.data)} />
+      <PageHeader
+        title="Browser"
+        headline={headline(sessions.data, health.data?.subsystem ?? null)}
+        actions={health.data?.subsystem == null ? undefined : <StateBadge domain="pillar" state={health.data.subsystem.status} />}
+      />
 
       <LiveSessions
         view={sessions}
@@ -82,12 +89,18 @@ export function Browser() {
 
       <SiteGrants />
 
-      <BrowserHealth />
+      <BrowserHealth health={health} />
     </>
   );
 }
 
-function headline(rows: BrowserSession[] | undefined): string | undefined {
+function headline(rows: BrowserSession[] | undefined, subsystem: SubsystemReadout | null): string | undefined {
+  // The pillar being down outranks how many sessions are open: none of them can be doing
+  // anything. The reason travels with it — it was in a panel at the bottom of the page.
+  if (subsystem !== null && subsystem.status !== "ok" && subsystem.status !== "disabled") {
+    const why = subsystem.reason === undefined ? "" : ` — ${subsystem.reason}`;
+    return `the browser sidecar is ${subsystem.status}${why}`;
+  }
   if (rows === undefined) return undefined;
   if (rows.length === 0) return "nothing is open right now";
   const asking = rows.filter((row) => row.mode === "wheel-requested").length;
@@ -162,7 +175,7 @@ function LiveSessions({
       {view.isError && view.data === undefined && <MutationNote error={view.error} what="nothing is known about the open sessions" />}
       {view.data === undefined && !view.isError && <p className="browser-loading">reading the open sessions…</p>}
       {rows.length > 0 && (
-        <ul className="browser-list" aria-label="Live sessions">
+        <Rows label="Live sessions">
           {rows.map((session) => (
             <SessionRow
               key={session.id}
@@ -177,7 +190,7 @@ function LiveSessions({
               returnPending={returnWheel.isPending}
             />
           ))}
-        </ul>
+        </Rows>
       )}
       {closeSession.isError && <MutationNote error={closeSession.error} what="that session could not be closed" />}
       {returnWheel.isError && <MutationNote error={returnWheel.error} what="the wheel could not be given back" />}
@@ -201,7 +214,7 @@ function SessionRow({
   const redirected = session.final_url !== session.requested_url && session.final_url !== "";
 
   return (
-    <Inset as="li">
+    <Row className="browser-session">
       <div className="browser-card-head">
         <span className="browser-card-mode">{MODE_COPY[session.mode]}</span>
         <span className="browser-meta">{session.project_id ?? "no project"}</span>
@@ -248,12 +261,13 @@ function SessionRow({
           <ConfirmButton
             label="Close session"
             confirmLabel="Close it now"
+            variant="quiet"
             disabled={closePending}
             onConfirm={onClose}
           />
         )}
       </div>
-    </Inset>
+    </Row>
   );
 }
 
@@ -321,6 +335,7 @@ function ChainDialogue({
         <ConfirmButton
           label="Keep none"
           confirmLabel="Discard the chain"
+          variant="ghost"
           disabled={keepChain.isPending}
           onConfirm={() =>
             keepChain.mutate({ sessionId, keep: false, writable: false }, { onSuccess: onSettled })
@@ -470,7 +485,7 @@ function SiteGrants() {
             <Quiet says={`${projectId} has not logged into anything yet.`} />
           )}
           {rows.length > 0 && (
-            <ul className="browser-list" aria-label="Site grants">
+            <Rows label="Site grants">
               {rows.map((site) => (
                 <SiteRow
                   key={site.origin}
@@ -480,7 +495,7 @@ function SiteGrants() {
                   pending={revoke.isPending || readonly.isPending}
                 />
               ))}
-            </ul>
+            </Rows>
           )}
           {revoke.isError && <MutationNote error={revoke.error} what="that site could not be revoked" />}
           {readonly.isError && (
@@ -493,6 +508,7 @@ function SiteGrants() {
             <ConfirmButton
               label="Forget this profile"
               confirmLabel="Forget everything — every site, every session"
+              variant="danger"
               disabled={forget.isPending}
               onConfirm={() => forget.mutate(projectId)}
             />
@@ -530,7 +546,7 @@ function SiteRow({
   pending: boolean;
 }) {
   return (
-    <Inset as="li">
+    <Row className="browser-row">
       <div className="browser-row-head">
         <span className="browser-url">{site.origin}</span>
         <Badge tone={site.kind === "destination" ? "info" : "shadow"}>{site.kind}</Badge>
@@ -539,17 +555,18 @@ function SiteRow({
       </div>
       {site.granted_for !== null && <p className="browser-meta">brought in by {site.granted_for}</p>}
       <div className="browser-actions">
-        <ConfirmButton label="Revoke" confirmLabel="Revoke this origin" disabled={pending} onConfirm={onRevoke} />
+        <ConfirmButton label="Revoke" confirmLabel="Revoke this origin" variant="danger" disabled={pending} onConfirm={onRevoke} />
         {site.writable && (
           <ConfirmButton
             label="Read-only"
             confirmLabel="Stop agents submitting forms here"
+            variant="ghost"
             disabled={pending}
             onConfirm={onReadonly}
           />
         )}
       </div>
-    </Inset>
+    </Row>
   );
 }
 
@@ -584,11 +601,11 @@ function WriteRecord({ projectId }: { projectId: string }) {
           <Quiet says="nothing has been submitted from this profile." />
         )}
         {rows.length > 0 && (
-          <ul className="browser-list" aria-label="Submitted forms">
+          <Rows label="Submitted forms">
             {rows.map((wrote) => (
               <WriteRow key={wrote.id} wrote={wrote} />
             ))}
-          </ul>
+          </Rows>
         )}
       </Section>
     </div>
@@ -602,7 +619,7 @@ function WriteRow({ wrote }: { wrote: Written }) {
   const more = wrote.field_count - wrote.fields.length;
 
   return (
-    <Inset as="li">
+    <Row className="browser-row">
       <div className="browser-row-head">
         <span className="browser-url">{wrote.action}</span>
         <Badge tone="info">{wrote.method}</Badge>
@@ -628,14 +645,13 @@ function WriteRow({ wrote }: { wrote: Written }) {
           {wrote.element_ref !== "" && <> on {wrote.element_ref}</>}
         </p>
       )}
-    </Inset>
+    </Row>
   );
 }
 
 /* ------------------------------------------------------------- 5. health -- */
 
-function BrowserHealth() {
-  const health = useBrowserHealth();
+function BrowserHealth({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
   const subsystem = health.data?.subsystem ?? null;
   const sidecar = health.data?.sidecar ?? null;
 

@@ -313,6 +313,10 @@ function Catalogue({
           ))}
         </tbody>
       </table>
+      <p className="agents-key">
+        ◉ directs a team · ● on a team&rsquo;s roster · ■ has tools · □ no tools · ? this shell has no
+        reading for that policy · ≠ renamed since the núcleo learned its id
+      </p>
     </div>
   );
 }
@@ -457,7 +461,7 @@ function toolsOf(agent: Agent): ToolsReading {
   return agent.tool_policy === "none" ? "none" : "unmapped";
 }
 
-const TOOLS_MARK: Record<ToolsReading, string> = { tools: "●", none: "○", unmapped: "?" };
+const TOOLS_MARK: Record<ToolsReading, string> = { tools: "■", none: "□", unmapped: "?" };
 
 const TOOLS_SAID: Record<ToolsReading, string> = {
   tools: "has tools",
@@ -510,18 +514,18 @@ function Tools({ agent }: { agent: Agent }) {
 function Employed({ employment, known }: { employment: Employment; known: boolean }) {
   if (!known) {
     return (
-      <span className="agents-figure agents-figure-unknown" title="the department list has not answered yet">
+      <span className="agents-figure agents-figure-unknown" title="the team list has not answered yet">
         <span aria-hidden="true">·</span>
-        <span className="sr-only">the department list has not answered — this is not zero</span>
+        <span className="sr-only">the team list has not answered — this is not zero</span>
       </span>
     );
   }
 
   if (unemployed(employment)) {
     return (
-      <span className="agents-figure agents-figure-none" title="no department names this one">
+      <span className="agents-figure agents-figure-none" title="no team names this one">
         <span aria-hidden="true">—</span>
-        <span className="sr-only">no department names this one</span>
+        <span className="sr-only">no team names this one</span>
       </span>
     );
   }
@@ -816,6 +820,7 @@ function AgentEditor({
         <ConfirmButton
           label="Delete"
           confirmLabel={`Delete ${agent.name}`}
+          variant="danger"
           intent="stop"
           disabled={del.isPending}
           onConfirm={() => del.mutate(agent.id, { onSuccess: onClose })}
@@ -839,11 +844,11 @@ function holdSentence(agent: Agent, employment: Employment, known: boolean): str
     "an item of a team run, or of a job, is not something this page can see, and it is the other half of what the núcleo checks";
 
   if (!known) {
-    return `The department list has not answered, so what stands on ${agent.name} is not known here. The núcleo refuses a delete on four grounds: it directs a team, it is on a roster, or it holds an item of a team run or of a job.`;
+    return `The team list has not answered, so what stands on ${agent.name} is not known here. The núcleo refuses a delete on four grounds: it directs a team, it is on a roster, or it holds an item of a team run or of a job.`;
   }
 
   if (unemployed(employment)) {
-    return `No department names ${agent.name}. Work it is already holding — ${work}.`;
+    return `No team names ${agent.name}. Work it is already holding — ${work}.`;
   }
 
   const standings = [

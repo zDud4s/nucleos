@@ -1848,6 +1848,7 @@ fn spawn_run(
                                     "worktree_gate_failed",
                                     &format!("worktree gate failed with exit code {exit_code}"),
                                     Some(id),
+                                    Some(&crate::feed::run_subject(&pool, id).await),
                                 )
                                 .await;
                             }
@@ -1858,6 +1859,7 @@ fn spawn_run(
                                     "worktree_gate_failed",
                                     &format!("worktree gate errored: {reason}"),
                                     Some(id),
+                                    Some(&crate::feed::run_subject(&pool, id).await),
                                 )
                                 .await;
                             }
@@ -1869,6 +1871,7 @@ fn spawn_run(
                                         kind,
                                         summary,
                                         Some(id),
+                                        Some(&crate::feed::run_subject(&pool, id).await),
                                     )
                                     .await;
                                 }
@@ -1892,6 +1895,7 @@ fn spawn_run(
                                      #{proposal_id}, and finished without attempting it"
                                 ),
                                 Some(id),
+                                Some(&crate::feed::run_subject(&pool, id).await),
                             )
                             .await;
                         }
@@ -1949,6 +1953,7 @@ fn spawn_run(
                             "run_retry",
                             &format!("run {id} attempt {attempt} failed to launch, retrying: {e}"),
                             Some(id),
+                            Some(&crate::feed::run_subject(&pool, id).await),
                         )
                         .await;
                         attempt += 1;
@@ -1980,6 +1985,7 @@ fn spawn_run(
                             "run_failed_final",
                             &format!("run {id} failed after {attempt} attempts"),
                             Some(id),
+                            Some(&crate::feed::run_subject(&pool, id).await),
                         )
                         .await;
                     }
@@ -2090,6 +2096,7 @@ async fn fail_provisioning(state: &AppState, id: i64, project_id: Option<&str>, 
         "worktree_provision_failed",
         summary,
         Some(id),
+        Some(&crate::feed::run_subject(&state.pool, id).await),
     )
     .await;
 }
@@ -3958,6 +3965,7 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
             "run_interrupted",
             "run interrupted during startup recovery",
             Some(*id),
+            Some(&crate::feed::run_subject(pool, *id).await),
         )
         .await;
     }
@@ -4001,6 +4009,7 @@ pub async fn reconcile_stranded_approvals(pool: &sqlx::SqlitePool) -> Result<u64
             "run_interrupted",
             "run interrupted during startup recovery: its approval request no longer exists",
             Some(*id),
+            Some(&crate::feed::run_subject(pool, *id).await),
         )
         .await;
     }
@@ -8562,6 +8571,14 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(feed_kind.as_deref(), Some("worktree_gate_failed"));
+        // A plain run is its own subject: nothing owns it, so the replay row is the run.
+        let subject: Option<String> =
+            sqlx::query_scalar("SELECT subject FROM feed WHERE run_id = ? ORDER BY id DESC LIMIT 1")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(subject, Some(format!("run:{id}")));
 
         // The feed row was all this asserted, which left the `failed` verdict itself unpinned:
         // `gate_status` is checked as 'passed', 'errored' and NULL elsewhere but never as 'failed',
@@ -10139,6 +10156,51 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, "run_interrupted");
         assert_eq!(entries[0].run_id, Some(1));
+        assert_eq!(entries[0].subject.as_deref(), Some("run:1"));
+        db.close().await;
+    }
+
+    /// A job's node that a restart interrupted is a line in the JOB's story: the run id still rides
+    /// in `run_id`, but the subject the replay groups on is the job the node belonged to.
+    #[tokio::test]
+    async fn an_interrupted_job_node_is_announced_about_its_job() {
+        let db = crate::storage::TempDb::new().await;
+        let pool = db.pool.clone();
+        let job_id = crate::job::insert_job(
+            &pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: ".",
+                rule_name: None,
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at, job_id, stage)
+             VALUES ('proj', 'a node', 'running', 'worktree', '2026-07-17T00:00:00Z', ?, 'plan')",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        reconcile_orphaned_runs(&pool).await.unwrap();
+
+        let entries = crate::feed::list_feed(&pool, Some("proj"), 50).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].run_id, Some(run_id));
+        assert_eq!(entries[0].subject, Some(format!("job:{job_id}")));
         db.close().await;
     }
 

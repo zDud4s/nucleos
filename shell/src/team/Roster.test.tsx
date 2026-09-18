@@ -181,7 +181,7 @@ describe("Roster", () => {
    * an idle department drew three boxes and "nothing in flight", and said nothing about how it is
    * put together or what it runs under.
    */
-  it("draws the department itself, with the limits it runs under", async () => {
+  it("draws the team itself, with the limits it runs under", async () => {
     await renderRoster(team(), [listRow()]);
 
     expect(await screen.findByLabelText("Finanças — 2 on the roster")).toBeTruthy();
@@ -201,7 +201,7 @@ describe("Roster", () => {
   it("says nobody is in charge rather than drawing a nameless box", async () => {
     await renderRoster(team({ director_agent_id: "", members: ["auditor"] }), []);
 
-    expect(await screen.findByText(/nobody is in charge of this department yet/)).toBeTruthy();
+    expect(await screen.findByText(/nobody is in charge of this team yet/)).toBeTruthy();
     expect(screen.getByLabelText("Auditor Sénior — checks the books")).toBeTruthy();
   });
 

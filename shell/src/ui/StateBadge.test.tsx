@@ -53,11 +53,41 @@ describe("StateBadge — run", () => {
     expect(cancelled?.className).not.toContain("ui-badge-danger");
     expect(cancelled?.text).not.toMatch(/fail/i);
   });
+
+  it("keeps all eight run states apart and calls none of them unknown", () => {
+    const states = ["running", "awaiting_approval", "completed", "failed", "cancelled", "interrupted", "timed_out", "superseded"];
+    assertAllDistinct("run", states);
+    for (const state of states) {
+      expect(badge("run", state)?.className).not.toContain("ui-state-unmapped");
+    }
+  });
+
+  it("does not dress a run that hit a ceiling as one that failed", () => {
+    const timedOut = badge("run", "timed_out");
+    const failed = badge("run", "failed");
+    expect(timedOut?.className).not.toContain("ui-badge-danger");
+    expect(timedOut?.text).not.toMatch(/fail/i);
+    expect(timedOut?.className).not.toBe(failed?.className);
+    expect(timedOut?.text).not.toBe(failed?.text);
+  });
+
+  it("a superseded run is neither a failure nor a summons", () => {
+    const superseded = badge("run", "superseded");
+    const cancelled = badge("run", "cancelled");
+    expect(superseded?.className).not.toContain("ui-badge-danger");
+    expect(superseded?.className).not.toContain("ui-badge-pending");
+    expect(superseded?.text).not.toBe(cancelled?.text);
+  });
 });
 
 describe("StateBadge — job", () => {
   it("keeps completed, stopped and expired apart", () => {
-    assertAllDistinct("job", ["completed", "stopped", "expired"]);
+    assertAllDistinct("job", ["implementing", "completed", "stopped", "expired"]);
+  });
+
+  it("a job that is running is not an unknown word", () => {
+    expect(badge("job", "implementing")?.className).not.toContain("ui-state-unmapped");
+    assertAllDistinct("job", ["implementing", "completed", "stopped", "expired", "gate_errored", "gate_failed"]);
   });
 
   it("never reads a cancelled job as a failure", () => {
@@ -155,13 +185,12 @@ describe("StateBadge — slot", () => {
 
 describe("StateBadge — vcs", () => {
   it("does not dress a blocked request as a failure", () => {
-    // Terminal, but the answer is to fix the tree and submit again — which is
-    // not what a person does about a failure.
+    // Since round 9, the instruction lives on the Waiting row, not in this badge.
     assertAllDistinct("vcs", ["succeeded", "failed", "blocked", "escalated"]);
     const blocked = badge("vcs", "blocked");
     expect(blocked?.className).not.toContain("ui-badge-danger");
     expect(blocked?.text).not.toMatch(/fail/i);
-    expect(blocked?.text).toMatch(/again/i);
+    expect(blocked?.text).toBe("blocked");
   });
 
   it("presents an escalated request as a normal outcome, not a fault", () => {
@@ -351,6 +380,10 @@ describe("StateBadge — team_item", () => {
   it("keeps pending, running, done and failed apart", () => {
     assertAllDistinct("team_item", ["pending", "running", "done", "failed"]);
   });
+
+  it("an item nobody has started asks nothing of the reader", () => {
+    expect(badge("team_item", "pending")?.className).not.toContain("ui-badge-pending");
+  });
 });
 
 describe("StateBadge — team_action", () => {
@@ -394,10 +427,13 @@ describe("StateBadge — autopilot mode", () => {
 });
 
 describe("StateBadge — states with no reading", () => {
-  it("shows an unmapped state as itself rather than guessing a tone", () => {
+  it("a state with no reading admits ignorance in Switched Off Grey, not in Stated Blue", () => {
     const unknown = badge("run", "hibernating");
     expect(unknown?.text).toBe("hibernating");
     expect(unknown?.className).toContain("ui-state-unmapped");
+    // Ignorance must not borrow the tone that says a completed fact.
+    expect(unknown?.className).toContain("ui-badge-off");
+    expect(unknown?.className).not.toContain("ui-badge-info");
   });
 
   it("renders nothing when there is no state and the domain gives absence no meaning", () => {

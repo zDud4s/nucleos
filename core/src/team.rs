@@ -1128,6 +1128,7 @@ pub async fn start_with(
         "team_run_started",
         &format!("{} was asked to {request}", team.team.name),
         None,
+        Some(&crate::feed::Subject::TeamRun(id.clone())),
     )
     .await;
 
@@ -2326,6 +2327,7 @@ pub async fn execute_due_actions(state: &AppState) {
                 Err(why) => format!("a department's `{}` failed: {why}", action.kind),
             },
             None,
+            Some(&crate::feed::Subject::TeamRun(action.team_run_id.clone())),
         )
         .await;
     }
@@ -3344,7 +3346,15 @@ async fn ingest_director(state: &AppState, run: TeamRun) -> Result<(), sqlx::Err
     let team_roster = roster(&state.pool, &run.team_id).await.unwrap_or_default();
     let plan = parse_team_plan(&answer, &team_roster, MAX_ITEMS_PER_ROUND);
     for dropped in plan.iter().flat_map(|plan| plan.dropped.iter()) {
-        let _ = crate::feed::append(&state.pool, None, "team_item_dropped", dropped, None).await;
+        let _ = crate::feed::append(
+            &state.pool,
+            None,
+            "team_item_dropped",
+            dropped,
+            None,
+            Some(&crate::feed::Subject::TeamRun(run.id.clone())),
+        )
+        .await;
     }
 
     let max_rounds: i64 = sqlx::query_scalar("SELECT max_rounds FROM teams WHERE id = ?")
@@ -3495,6 +3505,7 @@ async fn finish(
         "team_run_finished",
         &format!("a team run {ending}: {why}"),
         None,
+        Some(&crate::feed::Subject::TeamRun(run.id.clone())),
     )
     .await;
     Ok(())
@@ -7402,6 +7413,23 @@ mod tests {
             Err(TeamError::NotFound)
         ));
         assert_eq!(fetch_run(&state, &id).await.state, "done");
+
+        // Started and finished are one department run's story, keyed by that run's id.
+        let lines: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT kind, subject FROM feed
+             WHERE kind IN ('team_run_started', 'team_run_finished') ORDER BY id",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        let team_run = format!("team_run:{id}");
+        assert_eq!(
+            lines,
+            [
+                ("team_run_started".to_string(), Some(team_run.clone())),
+                ("team_run_finished".to_string(), Some(team_run)),
+            ]
+        );
     }
 
     /// The column migration 0084 adds, doing the job it was added for: the director's own nodes are

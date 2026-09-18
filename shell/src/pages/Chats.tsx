@@ -5,6 +5,7 @@ import {
   useEffect,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
@@ -31,14 +32,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "../ui/vendor/dialog";
-import {
-  CommandDialog,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "../ui/vendor/command";
 import {
   ArrowUp,
   ChevronDown,
@@ -108,6 +101,7 @@ import {
 } from "../data/chats";
 import { type RelaySent } from "../lib/turns";
 import { type ChatNotice } from "../data/chats";
+import { SHORTCUT_HINT, usePaletteGroup, usePaletteOpen, usePaletteQuery } from "../ui";
 import {
   anyTurnLive,
   marksBetween,
@@ -192,7 +186,6 @@ export function Chats() {
    * gets the whole width, which is what a page made of prose wants.
    */
   const [railOpen, setRailOpen] = useState(true);
-  const [paletteOpen, setPaletteOpen] = useState(false);
   /**
    * The editor conversation being considered, if any.
    *
@@ -241,32 +234,72 @@ export function Chats() {
   } | null>(null);
   const navigate = useNavigate();
   const unseen = rows.reduce((total, row) => total + row.waiting, 0);
+  const query = usePaletteQuery();
+  const openPalette = usePaletteOpen();
+  const said = useSaid(query);
+  const needle = query.trim().toLowerCase();
 
-  /**
-   * Ctrl+K, and Cmd+K for the same fingers on a Mac keyboard.
-   *
-   * On `window` rather than on a container because the point of it is to work while
-   * the caret is in the composer, which is where it will be nearly every time.
-   * `preventDefault` because Ctrl+K is a browser shortcut and the webview would
-   * otherwise act on it as well.
-   */
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key.toLowerCase() !== "k" || !(event.ctrlKey || event.metaKey))
-        return;
-      event.preventDefault();
-      setPaletteOpen((open) => !open);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  // Matched here rather than by cmdk, and `shouldFilter={false}` below is the other half of that.
+  // The hits underneath were matched by the daemon against the whole text of a conversation, which
+  // is text this list does not have — left to cmdk they would be filtered out again for not
+  // containing the query in their own visible row.
+  const named = rows.filter((row) => {
+    if (needle === "") return true;
+    const name = row.title ?? row.first_message ?? "New conversation";
+    return `${name} ${row.cwd ?? ""}`.toLowerCase().includes(needle);
+  });
+  const hits = said.data ?? [];
+
+  usePaletteGroup({
+    id: ["chats", "named"].join("-"),
+    heading: "Conversations",
+    items: named.map((row) => {
+      const name = row.title ?? row.first_message ?? "New conversation";
+      return {
+        id: `chat-${row.chat_id}`,
+        label: <>
+          <span className="chats-palette-title">{name}</span>
+          {row.cwd !== null && <span className="chats-palette-where">{row.cwd}</span>}
+          {row.waiting > 0 && <span className="chats-palette-waiting">{row.waiting}</span>}
+        </>,
+        match: `${name} ${row.cwd ?? ""}`,
+        run: () => {
+          openingAChat();
+          void navigate({ to: `/chats/${row.chat_id}` });
+        },
+      };
+    }),
+  });
+  usePaletteGroup(
+    hits.length === 0
+      ? null
+      : {
+          id: "chats-said",
+          heading: "Said in a conversation",
+          prematched: true,
+          items: hits.map((hit) => ({
+            id: `said-${hit.turn_id}`,
+            label: <SaidRow hit={hit} />,
+            match: hit.excerpt,
+            run: () => {
+              openingAChat();
+              void navigate({ to: `/chats/${hit.chat_id}` });
+              setFound({ chatId: hit.chat_id, turnId: hit.turn_id, at: Date.now() });
+            },
+          })),
+        },
+  );
 
   return (
     /* The class that turns this route from a document into an application: see `.chats-app`, which
        stops the shell scrolling the whole page and hands the height to the two columns below. */
     <div className="chats-app">
-      <PageHeader
-        title="Chats"
+      <ChatsHeader
+        /* The subject of this page is the conversation on it, when there is one. Every
+           chat answered to the heading "Chats", which is the one thing the person who
+           just clicked a conversation already knew. */
+        open={pickingUp === null && chatId !== null ? (summary ?? null) : null}
+        openId={chatId}
         headline={headlineFor(rows, chats.data !== undefined)}
         actions={
           <>
@@ -303,9 +336,9 @@ export function Chats() {
                 <span className="chats-unseen">{unseen}</span>
               )}
             </Button>
-            <Button variant="ghost" onClick={() => setPaletteOpen(true)}>
+            <Button variant="ghost" onClick={openPalette}>
               Find a conversation
-              <kbd className="chats-kbd">Ctrl K</kbd>
+              <kbd className="chats-kbd">{SHORTCUT_HINT}</kbd>
             </Button>
           </>
         }
@@ -315,16 +348,6 @@ export function Chats() {
       {chats.isError && chats.data === undefined && (
         <ListError error={chats.error} />
       )}
-
-      <ConversationPalette
-        rows={rows}
-        open={paletteOpen}
-        onOpenChange={setPaletteOpen}
-        onFound={(chatId, turnId) =>
-          setFound({ chatId, turnId, at: Date.now() })
-        }
-        onOpenChat={openingAChat}
-      />
 
       <div
         className={
@@ -382,6 +405,79 @@ export function Chats() {
   );
 }
 
+/**
+ * The top of the page, which says a different thing depending on whether a conversation
+ * is open.
+ *
+ * **Nothing open** — `PageHeader`, exactly as every other page has it: the word "Chats"
+ * and one line about the list.
+ *
+ * **A conversation open** — the same band, composed here rather than through
+ * `PageHeader`, because its `title` is a `string` and this heading has to stay the
+ * editable name it has always been. Clicking the title to rename it is the affordance
+ * this page was built with; turning it into a plain string and putting "Rename" behind a
+ * menu would have been a capability traded for a component. So the shared classes are
+ * used directly — `ui-page-header`, `ui-page-header-text`, `ui-page-actions` — which is
+ * the same header, drawn by the same rules, holding a control.
+ *
+ * The `⋯` comes up here with it. It is the conversation's settings, and a conversation's
+ * settings belong beside the conversation's name.
+ */
+function ChatsHeader({
+  open,
+  openId,
+  headline,
+  actions,
+}: {
+  /** The conversation on screen, or `null` for the front door. */
+  open: ChatSummary | null;
+  /** Its id — separate, because the summary can be late while the route is not. */
+  openId: string | null;
+  headline: string | undefined;
+  actions: ReactNode;
+}) {
+  if (open === null || openId === null) {
+    return <PageHeader title="Chats" headline={headline} actions={actions} />;
+  }
+
+  return (
+    <header className="ui-page-header">
+      <div className="ui-page-header-text">
+        {/* The way back to the list of all of them, and the word the heading used to
+            spend itself on. Muted and unlined: a crumb is read once, on arrival. */}
+        <p className="chats-crumb">
+          <Link to="/chats">Chats</Link>
+        </p>
+        <TitleEditor chatId={openId} title={open.title} />
+        <ChatWhere chatId={openId} />
+      </div>
+      <div className="ui-page-actions">
+        {actions}
+        <ChatMenu chatId={openId} />
+      </div>
+    </header>
+  );
+}
+
+/**
+ * Where this conversation runs, as the header's one derived line.
+ *
+ * The directory is named here only when it is settled. While it is unknown, or while it
+ * is a state that needs teaching, `Project` in the transcript says so in full — a
+ * headline is the wrong place to explain something.
+ *
+ * A second reader of `useChatProject` and never a second source: react-query answers both
+ * this and the menu below out of one cache entry, so the line and the settings cannot
+ * disagree about which folder a conversation is in.
+ */
+function ChatWhere({ chatId }: { chatId: string }) {
+  const project = useChatProject(chatId);
+  const cwd = project.data?.cwd ?? null;
+  const tools = project.data?.tools ?? false;
+  if (cwd === null || !tools) return null;
+  return <p className="ui-page-headline chats-where">{cwd}</p>;
+}
+
 /** One derived sentence about the whole list. */
 function headlineFor(
   rows: ChatSummary[],
@@ -403,124 +499,6 @@ function ListError({ error }: { error: unknown }) {
     <ErrorNote>
       the núcleo did not answer — nothing is known about your conversations
     </ErrorNote>
-  );
-}
-
-/* --------------------------------------------------------------- the list -- */
-
-/**
- * Find a conversation by typing its name, rather than by reading down a list.
- *
- * The list panel answers "what have I got"; this answers "where is the one I mean",
- * and past a couple of dozen conversations those stop being the same question. It is
- * also what makes closing the list a real option rather than a way to lose things.
- *
- * The searchable text is the title AND the directory, because half of these are
- * remembered as "the one about the shell" rather than by whatever the daemon titled
- * them.
- */
-function ConversationPalette({
-  rows,
-  open,
-  onOpenChange,
-  onFound,
-  onOpenChat,
-}: {
-  rows: ChatSummary[];
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  /** A turn somebody picked out of a search, to be scrolled to once its conversation opens. */
-  onFound: (chatId: string, turnId: number) => void;
-  /** See `openingAChat`. Both of this palette's exits open a conversation. */
-  onOpenChat: () => void;
-}) {
-  const navigate = useNavigate();
-  const [query, setQuery] = useState("");
-  const said = useSaid(query);
-  const needle = query.trim().toLowerCase();
-
-  // Matched here rather than by cmdk, and `shouldFilter={false}` below is the other half of that.
-  // The hits underneath were matched by the daemon against the whole text of a conversation, which
-  // is text this list does not have — left to cmdk they would be filtered out again for not
-  // containing the query in their own visible row.
-  const named = rows.filter((row) => {
-    if (needle === "") return true;
-    const name = row.title ?? row.first_message ?? "New conversation";
-    return `${name} ${row.cwd ?? ""}`.toLowerCase().includes(needle);
-  });
-  const hits = said.data ?? [];
-
-  return (
-    <CommandDialog
-      open={open}
-      onOpenChange={(next) => {
-        onOpenChange(next);
-        // Cleared on the way out, so opening it again is a fresh question rather than the last
-        // one's answers under an empty box.
-        if (!next) setQuery("");
-      }}
-      title="Find a conversation"
-      description="Type to narrow the list. Enter opens the one highlighted."
-      /* Escape closes it, and a palette is a thing you dismiss rather than
-         close — the corner X is clutter that also has to be styled. */
-      showCloseButton={false}
-      shouldFilter={false}
-    >
-      <CommandInput
-        placeholder="Find a conversation, or something said in one…"
-        value={query}
-        onValueChange={setQuery}
-      />
-      <CommandList>
-        <CommandEmpty>Nothing matches that.</CommandEmpty>
-        <CommandGroup heading="Conversations">
-          {named.map((row) => {
-            const name = row.title ?? row.first_message ?? "New conversation";
-            return (
-              <CommandItem
-                key={row.chat_id}
-                value={`chat-${row.chat_id}`}
-                onSelect={() => {
-                  onOpenChange(false);
-                  onOpenChat();
-                  void navigate({ to: `/chats/${row.chat_id}` });
-                }}
-              >
-                <span className="chats-palette-title">{name}</span>
-                {row.cwd !== null && (
-                  <span className="chats-palette-where">{row.cwd}</span>
-                )}
-                {row.waiting > 0 && (
-                  <span className="chats-palette-waiting">{row.waiting}</span>
-                )}
-              </CommandItem>
-            );
-          })}
-        </CommandGroup>
-        {/* The second question, and the one a title cannot answer: a title is a summary a model
-            wrote, and what people come back for is a sentence they remember. Its own group so the
-            two never merge — retracing your own words and hunting an answer you were given are
-            different errands, and a merged list makes the second one wade through the first. */}
-        {hits.length > 0 && (
-          <CommandGroup heading="Said in a conversation">
-            {hits.map((hit) => (
-              <CommandItem
-                key={`said-${hit.turn_id}`}
-                value={`said-${hit.turn_id}`}
-                onSelect={() => {
-                  onOpenChange(false);
-                  onOpenChat();
-                  void navigate({ to: `/chats/${hit.chat_id}` });
-                  onFound(hit.chat_id, hit.turn_id);
-                }}
-              >
-                <SaidRow hit={hit} />
-              </CommandItem>
-            ))}
-          </CommandGroup>
-        )}
-      </CommandList>
-    </CommandDialog>
   );
 }
 
@@ -759,7 +737,7 @@ function chatRowLabel(row: ChatSummary, live: boolean): string {
   // Said as its own clause and not added to the number above it, because it IS its own axis: a
   // department speaking is not the conversation answering, and nothing ran for it.
   const said = row.notices_waiting ?? 0;
-  if (said > 0) parts.push(`${said} from a department`);
+  if (said > 0) parts.push(`${said} from a team`);
   return parts.join(", ");
 }
 
@@ -820,7 +798,7 @@ function ChatRow({
           <span
             className="chats-row-said"
             aria-hidden="true"
-            title={`${row.notices_waiting} said by a department you set going`}
+            title={`${row.notices_waiting} said by a team you set going`}
           >
             {row.notices_waiting}
           </span>
@@ -990,7 +968,6 @@ function EditorDetail({
       <StartBox
         pending={start.isPending}
         placeholder="Carry on where you left off…"
-        standing="thread"
         /* The `@` note, corrected for this one case: there IS a folder — it is the one the session
            was had in — and what is missing is a conversation here to ask about it. */
         noFolderNote={`this conversation is not open here yet — say something to carry it on, and an @ will name the files in ${chosen.cwd}`}
@@ -1269,16 +1246,13 @@ function ChatDetail({
        name two lines below — a panel captioned "Conversation" around a conversation was a third
        label for a thing nobody was confused about, plus a border down both sides of the reading. */
     <section className="chats-detail-inner">
-      {summary !== undefined && (
-        <div className="chats-detail-head">
-          <TitleEditor chatId={chatId} title={summary.title} />
-          <ChatMeta chatId={chatId} />
-        </div>
-      )}
+      {/* The head that was here — the name and the `⋯` — is the page's own header now: the
+          conversation is what this page is about, so its name is the `h1` and not a line
+          under one. `ChatsHeader` draws both. */}
 
-      {/* Everything that is a RECORD of the conversation scrolls; the head above and the box below
-          do not. One scrollbar used to move all three, so reading the middle of a long transcript
-          took the title, the model and the place you type off the screen together. */}
+      {/* Everything that is a RECORD of the conversation scrolls; the header above and the box
+          below do not. One scrollbar used to move all three, so reading the middle of a long
+          transcript took the title, the model and the place you type off the screen together. */}
       <div
         className={`chats-scroll ${zoom}`}
         ref={box}
@@ -1405,7 +1379,6 @@ function StartBox({
   pending,
   onSay,
   placeholder = "Say something…",
-  standing = "front",
   noFolderNote = "this conversation has no folder yet — open it, point it at a project, and an @ will name its files",
   tools = false,
 }: {
@@ -1420,14 +1393,10 @@ function StartBox({
   /** What the empty box invites. The front door says one thing; a conversation being carried on
       from the editor says another, and both are the same gesture. */
   placeholder?: string;
-  /**
-   * Where the box is standing.
-   *
-   * `front` is the middle of an empty page — raised, because it is the only object on it.
-   * `thread` is the foot of a conversation, wearing the same frame the composer wears there, so
-   * an editor session and a chat have the same thing at the bottom of the column.
-   */
-  standing?: "front" | "thread";
+  /* `standing` was here — `front` for the middle of an empty page and `thread` for the
+     foot of a conversation — and the only thing it decided was whether the box got a
+     `--shadow-md`. Nothing else on the front door floats, so the shadow went and the
+     prop with it: one box, one frame, wherever it stands. */
   /** What to say when an `@` cannot be answered here. See the call in `EditorDetail`. */
   noFolderNote?: string;
   /**
@@ -1528,11 +1497,10 @@ function StartBox({
         />
       )}
       <form
-        className={
-          standing === "front"
-            ? "chats-composer-box chats-front-box"
-            : "chats-composer-box"
-        }
+        /* One class in both places now. `.chats-front-box` existed only to add a
+           `--shadow-md` on the front door, and nothing else on that page floats — the box
+           IS the page there, not a dialog standing on it. */
+        className="chats-composer-box"
         onSubmit={(event) => {
           event.preventDefault();
           say();
@@ -1746,10 +1714,9 @@ function DictateToggle({ dictation }: { dictation: DictationView }) {
  * turning a deliberate two-step into a one-click irreversible action. Rendered as plain
  * content, the menu stays open and both clicks land.
  */
-function ChatMeta({ chatId }: { chatId: string }) {
+function ChatMenu({ chatId }: { chatId: string }) {
   const project = useChatProject(chatId);
   const cwd = project.data?.cwd ?? null;
-  const tools = project.data?.tools ?? false;
   // Held HERE and not inside `ChatHelpers`, because a dialog rendered inside `DropdownMenuContent`
   // unmounts the moment the menu closes — which the menu does on the very click that opens it. The
   // item lives in the menu; the dialog is its sibling.
@@ -1760,18 +1727,11 @@ function ChatMeta({ chatId }: { chatId: string }) {
   const instructed = (row?.system_prompt ?? "") !== "";
 
   return (
-    <div className="chats-meta">
-      <p className="chats-meta-line">
-        {/* The directory is named here only when it is settled. While it is unknown, or
-            while it is a state that needs teaching, `Project` below says so in full — a
-            summary line is the wrong place to explain something.
-            The model and plan-only were here too; both moved into the box, where the words
-            they govern are being written. What is left is where this runs. */}
-        {cwd !== null && tools && (
-          <span className="chats-meta-where">{cwd}</span>
-        )}
-      </p>
-
+    /* No line of its own any more. What this component used to carry beside the `⋯` — the
+       directory — is the page header's headline now (`ChatWhere`), which is where "one
+       derived sentence about the subject" belongs on every other page in the app. What is
+       left here is the menu and the two dialogs it opens. */
+    <>
       <DropdownMenu>
         <DropdownMenuTrigger
           className="chats-meta-more"
@@ -1808,6 +1768,15 @@ function ChatMeta({ chatId }: { chatId: string }) {
             </span>
           </DropdownMenuItem>
           <ChatDenials chatId={chatId} />
+          {/* The way back to a terminal, moved in here from the top of the transcript. It is
+              a fact about this conversation that never changes and is wanted about twice in
+              its life, and it was a line of mono text above every reading of every chat that
+              has a folder — which is nearly all of them. Content and not an item: there is
+              nothing to select, and a menu item would close the menu on the click that
+              selects the command to copy it. */}
+          {cwd !== null && project.data?.session != null && (
+            <CarryOn cwd={cwd} session={project.data.session} />
+          )}
           <DropdownMenuSeparator />
           {/* Content and not items, like `ArchiveControl` below: the stronger of the two is a
               `ConfirmButton`, whose two-click interlock a menu item would collapse into one. */}
@@ -1825,7 +1794,7 @@ function ChatMeta({ chatId }: { chatId: string }) {
         open={instructions}
         onOpenChange={setInstructions}
       />
-    </div>
+    </>
   );
 }
 
@@ -1835,7 +1804,7 @@ function Project({ chatId }: { chatId: string }) {
   // Nothing at all until it is known. A conversation is not "without a project" because the answer
   // has not arrived yet, and a note that appears and then retracts itself is worse than a late one.
   if (project.data === undefined) return null;
-  const { cwd, tools, session } = project.data;
+  const { cwd, tools } = project.data;
 
   return (
     <>
@@ -1847,9 +1816,9 @@ function Project({ chatId }: { chatId: string }) {
       {cwd !== null && !tools && (
         <ProjectWithoutTools chatId={chatId} cwd={cwd} />
       )}
-      {cwd !== null && session !== null && (
-        <CarryOn cwd={cwd} session={session} />
-      )}
+      {/* `CarryOn` was here, above every transcript. It is behind the `⋯` now — see
+          `ChatMeta`. What is left in this block is the two states that need SAYING, which
+          is what it was always for. */}
     </>
   );
 }
@@ -2213,7 +2182,15 @@ function TitleEditor({
 
   if (!editing) {
     return (
-      <div className="chats-title">
+      /*
+        The page's heading, and still the rename control.
+
+        `aria-label` on the `h1` and not only on the button, because a heading takes its
+        name from its descendants — and the button's own label, which has to say what
+        pressing it does, would have become the heading's. Named here, the outline says
+        the conversation's name and the control inside it says it is a rename.
+      */
+      <h1 className="chats-head-title" aria-label={title ?? "New conversation"}>
         <button
           type="button"
           className="chats-title-name"
@@ -2227,12 +2204,12 @@ function TitleEditor({
         >
           {title ?? "New conversation"}
         </button>
-      </div>
+      </h1>
     );
   }
 
   return (
-    <div className="chats-title">
+    <div className="chats-head-title">
       <input
         className="chats-title-input"
         aria-label="Conversation title"
@@ -3147,6 +3124,7 @@ function ContextControls({ chatId }: { chatId: string }) {
       <ConfirmButton
         label="Clear"
         confirmLabel="Clear — the turns stay, the model stops seeing them"
+        variant="ghost"
         onConfirm={() => clear.mutate(chatId)}
       />
       <p className="chats-context-why">and this one tells it nothing at all</p>
@@ -3561,6 +3539,7 @@ function ArchiveControl({ chatId }: { chatId: string }) {
       <ConfirmButton
         label="Archive"
         confirmLabel="Archive — every turn stays readable"
+        variant="quiet"
         onConfirm={() =>
           archive.mutate(chatId, {
             onSuccess: () => void navigate({ to: "/chats" }),

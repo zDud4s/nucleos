@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
-  clockOfInstant, clockOfStamp, hourMarks, hourSlots, hoursInSpan, inputFromStamp, localDateOfStamp,
-  localStamp, monthMatrix, nowFraction, occurrenceMinutes, overlapLanes, placeInDay, sameDay,
-  stampFromInput, weekOf, weekdayLabels,
+  clockOfInstant, clockOfStamp, dayBounds, hourMarks, hourSlots, hoursInSpan, inputFromStamp,
+  localDateOfStamp, localStamp, monthMatrix, nowFraction, occurrenceMinutes, overlapLanes, placeInDay,
+  sameDay, stampFromInput, weekOf, weekdayLabels, workingStartFraction,
 } from "./calendar-grid";
+import type { CalendarConfigView } from "../data/calendar";
 
 const HOUR = 3_600_000;
 
@@ -176,6 +177,28 @@ describe("the now line", () => {
 
   it("sits halfway down at midday", () => {
     expect(nowFraction(new Date(2026, 7, 3, 12), new Date(2026, 7, 3))).toBeCloseTo(0.5, 2);
+  });
+});
+
+describe("the working-day start", () => {
+  const config: CalendarConfigView = {
+    default_tz: "Europe/Lisbon",
+    working_hours_start: "09:00",
+    working_hours_end: "18:00",
+    working_weekdays: ["mon", "tue", "wed", "thu", "fri"],
+  };
+
+  it("starts a known fraction down the column", () => {
+    expect(workingStartFraction(new Date(2026, 7, 3), config)).toBeCloseTo(0.375);
+    expect(workingStartFraction(new Date(2026, 7, 3), undefined)).toBeNull();
+    expect(workingStartFraction(new Date(2026, 7, 3), { ...config, working_hours_start: "9am" })).toBeNull();
+
+    const dstDay = new Date(2026, 2, 29);
+    const [start, end] = dayBounds(dstDay);
+    const nineLocal = new Date(2026, 2, 29, 9);
+    expect(workingStartFraction(dstDay, config)).toBeCloseTo(
+      (nineLocal.getTime() - start.getTime()) / (end.getTime() - start.getTime()),
+    );
   });
 });
 

@@ -284,6 +284,12 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/map/silenced"),
     (Method::GET, "/projects/{id}/map/orphan"),
     (Method::GET, "/feed"),
+    // The same lines `/feed?scope=all` already hands this key, read as a window instead of the newest
+    // fifty — so refusing it would protect nothing. Where the owner stopped reading is a number
+    // about those lines. Moving it is `POST /feed/seen`, in no table: what the owner has seen is
+    // theirs to say, and a key that could mark everything read could hide what the page surfaces.
+    (Method::GET, "/feed/timeline"),
+    (Method::GET, "/feed/seen"),
     (Method::GET, "/runs"),
     (Method::GET, "/presets"),
     (Method::GET, "/presets/{id}"),
@@ -1703,6 +1709,24 @@ mod tests {
         let scope = Scope::ApiToken(ApiTokenLevel::ReadOnly);
         assert!(permits(&scope, &Method::GET, "/concurrency"));
         assert!(!permits(&scope, &Method::GET, "/autopilot/budget"));
+    }
+
+    /// Reading the day and reading where the owner stopped are reads; moving the marker is not.
+    ///
+    /// The POST changes nothing but a number, and it is still outside the table: what the owner has
+    /// seen is the owner's to say, and a script holding a read-only key that could mark everything
+    /// read would hide exactly the lines the page exists to surface.
+    #[test]
+    fn the_feed_timeline_and_its_marker_are_reads_and_moving_the_marker_is_not() {
+        let scope = Scope::ApiToken(ApiTokenLevel::ReadOnly);
+        assert!(permits(&scope, &Method::GET, "/feed/timeline"));
+        assert!(permits(&scope, &Method::GET, "/feed/seen"));
+        assert!(!permits(&scope, &Method::POST, "/feed/seen"));
+        assert!(!route_is_listed(
+            RUN_CREATING_ROUTES,
+            &Method::POST,
+            "/feed/seen"
+        ));
     }
 
     #[tokio::test]

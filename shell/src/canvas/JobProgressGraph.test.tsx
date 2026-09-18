@@ -79,7 +79,7 @@ describe("JobProgressGraph", () => {
         items={[
           item({ ordinal: 0, status: "passed" }),
           item({ ordinal: 1, status: "running" }),
-          item({ ordinal: 2, status: "conflicted" }),
+          item({ ordinal: 2, status: "skipped" }),
           item({ ordinal: 3, status: "cancelled" }),
           item({ ordinal: 4, status: "failed" }),
         ]}

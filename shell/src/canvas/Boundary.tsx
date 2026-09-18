@@ -76,8 +76,11 @@ export function Boundary({ modules, imports, unread, foreign, seam }: BoundaryPr
             className="flex min-w-[150px] flex-col gap-0.5 rounded-lg border border-border bg-surface px-3 py-2"
           >
             <span className="font-display text-sm text-text">{side.folder}</span>
-            <span className="text-[10px] uppercase tracking-wide text-text-faint">{side.reader}</span>
-            <span className="mt-1 text-xs text-text-muted">
+            <span className="text-xs uppercase tracking-wide text-text-faint">{side.reader}</span>
+            {/* No margin of its own: the card is a column with `gap-0.5`, and a top
+                margin here made one of its four gaps three times the other three.
+                Invisible until round 11 layered the reset that was cancelling it. */}
+            <span className="text-xs text-text-muted">
               <span className="font-display text-sm text-text">{side.files}</span> file
               {side.files === 1 ? "" : "s"} · {side.imports} import{side.imports === 1 ? "" : "s"}{" "}
               inside
@@ -106,23 +109,19 @@ export function Boundary({ modules, imports, unread, foreign, seam }: BoundaryPr
           </>
         ) : (
           <>
-            {/*
-              The tone's own foreground, and it was `text-danger` — a colour name this app has never
-              declared. `tailwind.css` maps `--color-tone-danger-fg`, `-bg` and `-border` and no bare
-              `danger`, so the utility compiled to nothing and the figure this sentence exists to
-              point at inherited the muted grey of the prose around it. The failure is the Dead
-              Fallback Rule's cousin: it looks deliberate in the source and is absent on screen.
-            */}
-            <span className="text-tone-danger-fg">{sides.crossing}</span> import
-            {sides.crossing === 1 ? "" : "s"} cross between sides. Nothing here should be able to do
-            that, so the walk and this drawing disagree about what a side is.
+            <span className="ui-wrong">
+              {sides.crossing} import{sides.crossing === 1 ? "" : "s"} cross between sides.
+            </span>{" "}
+            Nothing here should be able to do that, so the walk and this drawing disagree about
+            what a side is.
           </>
         )}
         {sides.loose > 0 ? (
           <>
             {" "}
-            <span className="text-tone-danger-fg">{sides.loose}</span> import
-            {sides.loose === 1 ? " ends" : "s end"} on no file this map lists.
+            <span className="ui-wrong">
+              {sides.loose} import{sides.loose === 1 ? " ends" : "s end"} on no file this map lists.
+            </span>
           </>
         ) : null}
       </p>
@@ -197,7 +196,8 @@ function Routes({ seam }: { seam: Seam }) {
       </p>
       {/*
         The finding, in the danger tone as its full triple — foreground, fill and edge — and it was
-        in none of them. `border-danger/40 bg-danger/10` names a colour this app does not have, so
+        in none of them. The old border and fill utilities named a bare `danger` colour this app
+        does not have, so
         the box shipped with the ground it stands on and a border falling back to the ordinary
         hairline: the one thing on this panel worth looking at, drawn as though it were the rest.
         Hand-diluting an opacity was the second half of the same mistake — the tone already carries
@@ -208,7 +208,7 @@ function Routes({ seam }: { seam: Seam }) {
       */}
       {seam.unmatched.length > 0 ? (
         <div className="rounded-lg border border-tone-danger-border bg-tone-danger-bg px-3 py-2">
-          <p className="text-sm text-tone-danger-fg">
+          <p className="ui-wrong text-sm">
             {seam.unmatched.length} call{seam.unmatched.length === 1 ? "" : "s"} ask for a route this
             daemon does not serve.
           </p>

@@ -59,38 +59,6 @@
   text-transform: uppercase;
 }
 
-/**
- * A labelled field. Two of them — the queue's search box and the three boxes of
- * the reply form — written out twice with six declarations in common, which is
- * the duplication this pass is treating one file at a time.
- *
- * It is a page recipe and not a primitive because there is no `.ui-input` or
- * `.ui-field` to adopt: `ui.css` ships neither, DESIGN.md records that as the
- * largest remaining hole in the component layer, and four distinct label/field
- * recipes are in circulation across the app waiting on it. Saying it once here
- * is the smallest correct step, not the answer.
- */
-.mail-search-field,
-.mail-detail-reply-field {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-
-.mail-search-field input,
-.mail-detail-reply-field input,
-.mail-detail-reply-field textarea {
-  padding: var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--text-sm);
-}
-
 /* ---------------------------------------------------------------- triage -- */
 
 /**
@@ -117,8 +85,18 @@
   margin-bottom: var(--space-4);
 }
 
-.mail-search-field input {
-  min-width: 18rem;
+/* The visible Field label adds a row above the input, so the buttons beside it need the
+   input's own height to centre on. Written as the relationship rather than the number it
+   evaluates to: the input is `.ui-field input` — `font-size: var(--text-sm)`,
+   `padding: var(--space-2)` on four sides, a 1px border — and its line height is the body
+   leading it inherits (`base.css` sets `line-height: var(--leading-normal)` and gives controls
+   `font: inherit`). The number this evaluates to used to be typed out by hand, which meant a
+   change to any one of those four tokens moved the input and left the buttons where they were. */
+.mail-search-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: calc(var(--text-sm) * var(--leading-normal) + 2 * var(--space-2) + 2px);
 }
 
 /* ------------------------------------------------------------------ list -- */
@@ -128,20 +106,44 @@
    of cards now lives on the component, where all four lists that had grown it
    can read it. */
 .mail-row-head {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: 6rem minmax(8rem, 11rem) minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--space-2);
 }
 
-.mail-row-head > .ui-reading-time {
-  margin-left: auto;
+.mail-row-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
 }
 
 .mail-row-from {
   color: var(--text);
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
+}
+
+.mail-verdict {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+/* A pin is a standing decision to keep seeing this sender in full; a mute is
+   the opposite. Warm and quiet, in the same vocabulary as the state tones,
+   without claiming either one is a `StateBadge` domain of its own. */
+.mail-verdict-pin {
+  background: var(--tone-active-bg);
+  color: var(--tone-active-fg);
+}
+
+.mail-verdict-mute {
+  background: var(--tone-off-bg);
+  color: var(--tone-off-fg);
 }
 
 .mail-attachment {
@@ -155,10 +157,10 @@
 }
 
 /* A link to `/mail/$emailId` — block and undecorated so it reads as the row's
-   subject line first and a link second, the same posture `.runs-row-link`
-   takes for a run id. */
+   subject line first and a link second, the same posture `.runs-row-name`
+   takes for a run's excerpt. */
 .mail-row-subject {
-  display: block;
+  grid-column: 3;
   margin: 0;
   color: var(--text);
   font-size: var(--text-sm);
@@ -171,6 +173,7 @@
 }
 
 .mail-row-summary {
+  grid-column: 3;
   margin: 0;
   padding-left: var(--space-3);
   border-left: 2px solid var(--border-strong);
@@ -250,41 +253,39 @@
  * A message body is text a sender wrote, not markup — this page renders it in
  * a `pre` and nowhere does it reach `dangerouslySetInnerHTML`.
  *
- * The wrapping is not restated here. `base.css` already gives every `pre` the
- * mono face, `pre-wrap` and `overflow-wrap: anywhere`, and says in its own
- * comment that e-mail bodies are what it was written for — a long line wraps
- * rather than forcing the panel to scroll sideways, and this rule repeating it
- * was three declarations free to disagree with the floor they sat on.
+ * The wrapping is not restated here. `base.css` already gives every `pre`
+ * `pre-wrap` and `overflow-wrap: anywhere`, and says in its own comment that
+ * e-mail bodies are what it was written for — a long line wraps rather than
+ * forcing the panel to scroll sideways, and this rule repeating it was
+ * declarations free to disagree with the floor they sat on. The face is the one
+ * thing overridden: a message is prose somebody reads, so it takes the body face
+ * at reading size and leading, held to the prose measure, rather than the mono
+ * face `pre` gives stdout.
  */
 .mail-detail-body {
-  max-height: 28rem;
-  overflow: auto;
-  overscroll-behavior: none;
+  max-width: var(--measure-prose);
+  max-height: none;
   margin: 0;
   padding: var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
   color: var(--text);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: var(--leading-relaxed);
 }
 
 /* --------------------------------------------------------- attachments -- */
 
 .mail-detail-attachments {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
+  margin-top: var(--space-3);
 }
 
-.mail-detail-attachment-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
+.mail-detail-attachment {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: center;
   gap: var(--space-2);
 }
 
@@ -301,10 +302,9 @@
   font-size: var(--text-xs);
 }
 
-.mail-detail-attachment-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
+.mail-detail-attachment > .mail-outcome,
+.mail-detail-attachment > .ui-error-note {
+  grid-column: 1 / -1;
 }
 
 /* -------------------------------------------------------------- sender -- */
@@ -324,16 +324,29 @@
   gap: var(--space-3);
 }
 
-/* The reply labels are the label rank rather than the search bar's plain one —
-   three stacked fields need the column of uppercase words to scan down. */
+/* The search bar is a `Field` from `../ui`; the reply form still labels its own
+   three boxes, at the label rank — three stacked fields need the column of
+   uppercase words to scan down. */
 .mail-detail-reply-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
+  color: var(--text-faint);
 }
 
 .mail-detail-reply-field input,
 .mail-detail-reply-field textarea {
   width: 100%;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-sm);
   text-transform: none;
   letter-spacing: normal;
 }

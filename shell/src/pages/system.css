@@ -19,19 +19,16 @@
 /* =============================================================== shared == */
 
 /**
- * The page's stacked panels, capped at the column measure.
+ * The page's stacked panels, at the full width of the page column.
  *
- * `--width-column` rather than the raw `64rem` that stood here: three
- * stylesheets had independently agreed on that number without ever writing it
- * down, which is exactly how a fourth page gets to disagree by accident. It is
- * a different measurement from the `78rem` outer cap on `.app-page`, which is
- * the window and not the column, and both stay.
+ * No cap of its own: the header, the tabs and every panel share one right edge
+ * so the page reads as one surface. A column of controls is narrower than any
+ * panel, and `.sy-budget-form` and `.sy-mint-form` cap themselves below.
  */
 .sy-sections {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  max-width: var(--width-column);
 }
 
 /**
@@ -115,7 +112,7 @@
 /* The names: a subsystem, a project, a snapshot, a token. Every one of them is
    an identifier the daemon chose, so every one of them is mono. */
 .sy-subsystem-name,
-.sy-kill-name,
+.sy-project-brake-name,
 .sy-backup-name,
 .sy-token-name {
   font-family: var(--font-mono);
@@ -269,35 +266,36 @@
 
 /* ------------------------------------------------------------------ health == */
 
-/**
- * The subsystem readout: ten rows, scanned for the one that is down.
- *
- * Still this page's own box rather than `Inset`. Ten rows is the densest thing
- * on the page and an inset would loosen the padding and raise the rung; and
- * `Rows`, which is what "read by scanning down" actually chooses, cannot carry
- * a line whose parts sit beside each other — `.ui-rows-row` is a column and
- * takes no `className`, so every subsystem would need a wrapper `div` that the
- * primitive exists to remove. Recorded so the next reader knows it was looked
- * at.
- */
-.sy-subsystems {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
+/* The subsystem readout: ten rows, scanned for the one that is down, on four
+   tracks so the names, badges and reasons line up down the column. */
+.sy-subsystem-row {
+  display: grid;
+  grid-template-columns: minmax(0, 12rem) 8rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
 }
 
-.sy-subsystem {
+/* The padding is room for a RING that is drawn outside its button.
+   `.ui-confirm-armed`'s 3px `box-shadow` plus the quiet variant's negative inline margin
+   (`--space-1`) put 7 CSS px of the armed control past its own border box, and this row ends
+   exactly where `.ui-rows` clips: the list carries `overflow: hidden` and a row in a panel body
+   has `padding-inline: 0`. Armed, the Restart control lost its right-hand bar and its corner
+   curve — measured on `31-system-armed.png`, the ring stopping dead at x=2726 while the panel's
+   own border was still 48 device px further out. The room was there; nothing had claimed it.
+   Here and not in `ui.css`: the clip is shared by every panel in the app, and this is the page
+   that puts a confirm control at the end of one of its rows. */
+.sy-subsystem-action {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-end;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
+  justify-self: end;
+  padding-inline-end: calc(var(--space-1) + 3px);
+}
+
+.sy-restart-asked {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
 /* --------------------------------------------------------------- sidecars == */
@@ -325,36 +323,11 @@
 
 /* ---------------------------------------------------------- project brakes == */
 
-.sy-kills {
+.sy-project-brake-row {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-/**
- * A brake is an `Inset`; this is the one thing it says on top of the recipe.
- *
- * The box the old rule drew was `.ui-panel-inset` to the property, and the only
- * real difference was the flow: a brake is a name, a badge and a button on one
- * line, where a sidecar or a snapshot stacks a head over its facts. That is a
- * fact about this box's contents rather than about the box, so it is drift and
- * not intent — the fill, the radius, the padding and the border were the four
- * things the thirty copies each answered differently, and re-answering one of
- * them here is how the problem gets rebuilt a page at a time. None of the four
- * is restated below. The gap is not either: `--space-2` is already the inset's.
- */
-.sy-kill {
-  flex-flow: row wrap;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
-}
-
-/* The name takes the slack, so the badge and the button sit together at the
-   end of the row rather than drifting apart with it. */
-.sy-kill-name {
-  flex: 1 1 auto;
+  gap: var(--space-3);
 }
 
 /* ------------------------------------------------------------------ budget == */
@@ -509,7 +482,7 @@
 }
 
 .sy-setting-editor:focus-visible {
-  outline: 2px solid var(--focus, var(--accent));
+  outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 

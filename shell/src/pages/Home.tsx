@@ -1,13 +1,19 @@
 import { Link } from "@tanstack/react-router";
+import type { ReactNode } from "react";
+import { FeedEmbed } from "../app/FeedEmbed";
 import {
+  isAggregateTimeout,
   useBudget,
   useProjects,
-  useProposals,
+  useSystemHealth,
   type BudgetView,
+  type HealthReadout,
   type ProjectSummary,
-  type Proposal,
+  type SubsystemReadout,
 } from "../data/system";
-import { PageHeader, Panel, StatCard } from "../ui";
+import { useWaitingCount } from "../data/waiting";
+import { Meter, PageHeader, Section, StatCard, usd } from "../ui";
+import { headlineFor as systemHeadline } from "./System";
 
 /**
  * The first screen: four numbers and two doors.
@@ -24,12 +30,14 @@ import { PageHeader, Panel, StatCard } from "../ui";
  */
 export function Home() {
   const projects = useProjects();
-  const proposals = useProposals();
+  const waiting = useWaitingCount();
   const budget = useBudget();
+  const health = useSystemHealth();
 
   const roster = projects.data;
-  const queue = proposals.data;
   const spend = budget.data;
+  const subsystems = health.data?.subsystems;
+  const healthy = subsystems?.filter((row) => row.status === "ok").length;
 
   const active = roster?.filter((project) => project.mode === "active").length;
   const shadow = roster?.filter((project) => project.mode === "shadow").length;
@@ -40,8 +48,19 @@ export function Home() {
 
   return (
     <>
-      <PageHeader title="Home" headline={headline(roster, queue, spend)} />
+      <PageHeader title="Home" headline={headline(roster, waiting, spend, health.data)} />
 
+      {/*
+        Five cards, always five. They do not recede when everything is well, and that is a
+        decision rather than an omission: the four autopilot readings are standing readings, not
+        exceptions, and a card that appeared only when something was wrong would teach the reader
+        that an absent card is an absent fact — the opposite of the honesty this page is being
+        fixed for. What was lying here was the headline; the cards were already right.
+
+        A conditional card would also change the page's shape under the eyes of somebody halfway
+        down it, which is the invariant `project/ModeState.tsx:31-34` already defends for a
+        project page.
+      */}
       <div className="app-home-stats">
         <StatCard
           label="Projects"
@@ -56,34 +75,84 @@ export function Home() {
           detail="what the autopilot would have done, waiting to be read"
         />
         <StatCard
-          label="Approval queue"
-          value={queue?.length}
-          detail={queue === undefined ? undefined : queue.length === 0 ? "nothing waiting on you" : "waiting on you"}
+          label="Waiting on you"
+          value={waiting}
+          // What the number IS, not a table of contents for another page. Four lists are outside it
+          // and for three different reasons: skipped and refused are records, calendar events have no
+          // listing route, and a parked run is the run side of an approval already counted.
+          detail={waiting === undefined ? undefined : waiting === 0 ? "nothing waiting on you" : "decisions held for you — not records, and not the calendar"}
         />
         <StatCard
           label="Window spend"
-          value={spend === undefined ? undefined : `$ ${spend.window_spend_usd.toFixed(2)}`}
+          value={spend === undefined ? undefined : `$${spend.window_spend_usd.toFixed(2)}`}
           detail={ceiling(spend)}
+          bar={
+            spend === undefined || spend.limit_usd === null ? undefined : (
+              <Meter
+                label="window spend"
+                value={spend.window_spend_usd}
+                ceiling={spend.limit_usd}
+                tone="quantity"
+                format={usd}
+                head={false}
+              />
+            )
+          }
+        />
+        {/*
+          The fifth, and the one that is not about the autopilot: whether the machine
+          under it is well. `headlineFor` is System's own sentence, imported rather than
+          rewritten — the first screen is where somebody finds out a subsystem is down,
+          and two screens describing one readout in two ways is how a person learns to
+          check both.
+        */}
+        <StatCard
+          label="Subsystems healthy"
+          value={
+            subsystems === undefined || healthy === undefined
+              ? undefined
+              : `${healthy}/${subsystems.length}`
+          }
+          /* One device for one piece of news: the clause that is wrong wears the tone and the
+             figure stays the figure. See the note under `.ui-stat-detail` in `ui.css`. */
+          detail={
+            wrongClause(health.data) === null ? (
+              systemHeadline(health.data)
+            ) : (
+              <span className="ui-wrong">{systemHeadline(health.data)}</span>
+            )
+          }
         />
       </div>
 
-      <Panel title="Where to look next">
-        <div className="app-quicklinks">
-          <Link to="/autopilot" className="app-quicklink">
-            <span className="app-quicklink-title">Autopilot</span>
-            <span className="app-quicklink-text">
-              The mode of every project, the bar a project has to clear to leave shadow, and the ceilings
-              that hold work back.
-            </span>
-          </Link>
-          <Link to="/waiting" className="app-quicklink">
-            <span className="app-quicklink-title">Waiting</span>
-            <span className="app-quicklink-text">
-              Everything that stopped to ask you something, of every kind, in one queue.
-            </span>
-          </Link>
+      {/*
+        Two doors, and no cards around them. They were bordered blocks with a title and a
+        paragraph each — the same weight as the four readings above, for two links that
+        say where a link goes. A `Section` puts them under a heading with no frame, which
+        is what a list of two places is.
+      */}
+      <Section label="Where to look next">
+        <div className="flex flex-col gap-2">
+          <p className="text-sm text-text-muted">
+            <Link to="/autopilot" className="ui-button ui-button-link">
+              Autopilot
+            </Link>{" "}
+            — the mode of every project, the bar one has to clear to leave shadow, and the
+            ceilings that hold work back.
+          </p>
+          <p className="text-sm text-text-muted">
+            <Link to="/waiting" className="ui-button ui-button-link">
+              Waiting
+            </Link>{" "}
+            — every decision that stopped to ask you something, in one queue.
+          </p>
         </div>
-      </Panel>
+      </Section>
+
+      {/* What has actually happened, which is the question the four figures above raise
+          and none of them answers. Five lines, not the cockpit's ten: this is the last
+          block of the first screen, not a feed reader. */}
+      <FeedEmbed lines={5} />
     </>
   );
 }
@@ -99,21 +168,67 @@ export function Home() {
 function ceiling(spend: BudgetView | undefined): string | undefined {
   if (spend === undefined) return undefined;
   if (spend.limit_usd === null) return `no ceiling · ${spend.period}`;
-  return `of $ ${spend.limit_usd.toFixed(2)} · ${spend.period}`;
+  return `of $${spend.limit_usd.toFixed(2)} · ${spend.period}`;
 }
 
 /**
- * One derived sentence about the state of the autopilot.
+ * One derived sentence about the state of the machine — the worst thing first.
  *
- * Not a description of the page — the title already says what this is. This is
- * the line that changes, and it is the reason the shell can be glanced at
- * rather than read.
+ * Not a description of the page: the title already says what this is. This is the
+ * line that changes, and it is the reason the shell can be glanced at rather than
+ * read. Which is why the order it picks in is a ladder and not a preference:
+ *
+ *   1. the worst live fact about the machine — a subsystem down, or degraded;
+ *   2. a ceiling holding autonomous work;
+ *   3. the modes the projects are in.
+ *
+ * A subsystem being down outranks a ceiling holding work because one says the
+ * machine is broken and the other says it is being restrained, and both outrank a
+ * count of who is acting, which is only news while nothing is wrong.
+ *
+ * The wrong-fact clause is a **link**, and that is the substance of it rather than
+ * decoration. `/system` is where the answer to *which one, and why* is kept, so a
+ * sentence that names a problem and then goes nowhere leaves the reader to carry
+ * the fact across the window by hand — and a reader who has had to do that twice
+ * stops reading the sentence. Naming a problem with no door to it is the exact
+ * failure this page is being repaired for.
+ *
+ * `ReactNode` and not `string` because of that link; this is the only headline in
+ * the app that is not a string.
  */
 function headline(
   roster: ProjectSummary[] | undefined,
-  queue: Proposal[] | undefined,
+  waiting: number | undefined,
   spend: BudgetView | undefined,
-): string | undefined {
+  health: HealthReadout | undefined,
+): ReactNode {
+  const tail =
+    waiting === undefined
+      ? ""
+      : waiting === 0
+        ? "; nothing waiting on you"
+        : `; ${String(waiting)} waiting on you`;
+
+  // The worst live fact leads, and it is a door. A subsystem being down outranks a ceiling
+  // holding work: one says the machine is broken, the other says it is being restrained.
+  const wrong = wrongClause(health);
+  if (wrong !== null) {
+    return (
+      <>
+        {/* The clause is red and the tail is not: "; 2 waiting on you" is the queue doing its
+            job, not a fault, and colouring it with the fault would make the page report two
+            problems where there is one. The door keeps the clause's colour rather than the
+            accent — see `.ui-wrong-door` in `ui.css` for why that cannot be a utility. */}
+        <span className="ui-wrong">
+          <Link to="/system" className="ui-wrong-door">
+            {wrong}
+          </Link>
+        </span>
+        {tail}
+      </>
+    );
+  }
+
   if (spend?.paused === true) {
     return `autonomous work is held — ${spend.reason ?? "a ceiling is holding it"}`;
   }
@@ -121,7 +236,6 @@ function headline(
 
   const active = roster.filter((project) => project.mode === "active").length;
   const shadow = roster.filter((project) => project.mode === "shadow").length;
-  const waiting = queue?.length;
 
   const modes =
     active === 0 && shadow === 0
@@ -129,5 +243,31 @@ function headline(
       : `${active} acting, ${shadow} in shadow`;
 
   if (waiting === undefined) return modes;
-  return waiting === 0 ? `${modes}; nothing waiting on you` : `${modes}; ${waiting} waiting on you`;
+  return `${modes}${tail}`;
+}
+
+/**
+ * The worst live fact about the machine, or nothing when there is none.
+ *
+ * `down` before `degraded`, both named, and the down ones named BY NAME: "1 subsystem down"
+ * sends somebody to /system to find out which, and the answer is three words long. `disabled`
+ * is deliberately absent — a subsystem nobody configured is not a fault, which is the same
+ * rule `wantsAttention` already follows for the rail's dot.
+ */
+function wrongClause(readout: HealthReadout | undefined): string | null {
+  if (readout === undefined) return null;
+  if (isAggregateTimeout(readout))
+    return "the health readout timed out before it measured anything";
+  const down: SubsystemReadout[] = readout.subsystems.filter((row) => row.status === "down");
+  const degraded: SubsystemReadout[] = readout.subsystems.filter(
+    (row) => row.status === "degraded",
+  );
+  if (down.length === 0 && degraded.length === 0) return null;
+  const parts: string[] = [];
+  if (down.length > 0) {
+    const named = down.map((row) => row.name).join(", ");
+    parts.push(`${String(down.length)} subsystem${down.length === 1 ? "" : "s"} down (${named})`);
+  }
+  if (degraded.length > 0) parts.push(`${String(degraded.length)} degraded`);
+  return parts.join(", ");
 }

@@ -102,4 +102,19 @@ describe("Rows", () => {
 
     expect(screen.getByRole("list", { name: "Items" }).tagName).toBe("OL");
   });
+
+  it("tightens a worked list, and takes a page's layout class after its own", () => {
+    render(
+      <Rows label="Recent git requests" className="probe-list">
+        <Row dense className="probe-row">
+          <span>#101</span>
+        </Row>
+      </Rows>,
+    );
+
+    expect(screen.getByRole("list", { name: "Recent git requests" }).className).toBe("ui-rows probe-list");
+    // The shared classes come first and stay: the page's class places the row's
+    // parts, it never replaces the fill that draws the rules.
+    expect(screen.getByRole("listitem").className).toBe("ui-rows-row ui-rows-row-dense probe-row");
+  });
 });

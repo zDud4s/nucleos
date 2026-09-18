@@ -44,8 +44,8 @@ describe("the notifications view", () => {
     serve({ families: [], kinds: [] }, OBSERVED);
     renderWithQuery(<NotificationsView />);
 
-    // `team_` is the case a screen built on FEED_KINDS could not show at all —
-    // that table has no `team_` kind — and `council` is the empty family that is
+    // `team_` is the family a screen built on a table of kinds would fall behind
+    // on, and `council` is the empty family that is
     // shown rather than hidden.
     expect(await screen.findByText("jobs")).toBeDefined();
     expect(screen.getByText("team")).toBeDefined();

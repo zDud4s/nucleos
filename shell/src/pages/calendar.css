@@ -188,9 +188,9 @@
 }
 
 .calendar-weekday {
-  font-family: var(--font-mono);
+  font-family: var(--font-display);
   font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
+  letter-spacing: var(--tracking-wider);
   text-transform: uppercase;
   color: var(--text-faint);
 }
@@ -290,17 +290,14 @@
 /* What is in the hand. Faded where it came from, so the eye follows the
    cursor rather than arguing with the copy left behind.
 
-   Raw, and neither `--opacity-disabled` (0.5) nor `--opacity-quiet` (0.7) is
-   the right name for it. This chip is not disabled — it is the live subject of
-   the gesture — and it is not a decorative mark standing beside content, which
-   is what quiet is for. It is the ghost at the origin of a drag, and it has to
-   fall further than either: at 0.7 the copy left behind still competes with the
-   cursor, which is the exact failure the fade exists to prevent. The system has
-   two opacities on purpose and a third would need to be argued for in
-   `tokens.css`, which is not this page's to write. */
+   `--opacity-ghost`, and neither `--opacity-disabled` (0.5) nor
+   `--opacity-quiet` (0.7): this chip is not disabled — it is the live subject
+   of the gesture — and it is not a decorative mark standing beside content. It
+   is the ghost at the origin of a drag, and it has to fall further than either;
+   `tokens.css` argues the third opacity. */
 .calendar-chip-held,
 .calendar-block-held {
-  opacity: 0.4;
+  opacity: var(--opacity-ghost);
 }
 
 .calendar-chip[draggable="true"] {
@@ -463,7 +460,18 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--border);
-  overflow: hidden;
+}
+
+/*
+  The day is drawn whole (48rem, two rem an hour) and looked at through a window. It used to
+  be looked at from the top, so the week opened at 01:00 with eight empty rows above the hours
+  anybody works — the panel was showing the part of the day the config says is not the day.
+*/
+.calendar-week-scroll {
+  max-height: 32rem;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
 
 .calendar-gutter {
@@ -567,7 +575,7 @@
      exactly, and this inset is the gutter between two lanes. */
   padding: 1px var(--space-1);
   border: 1px solid var(--border-strong);
-  border-left: 3px solid var(--border-strong);
+  /* The card is the box, not a card plus a side tab. */
   border-radius: var(--radius-sm);
   background: var(--surface-raised);
   color: var(--text);
@@ -656,30 +664,26 @@
 
 /* ========================================================== occurrences == */
 
-/*
-  Two plain columns of boxes, and the same six declarations for both: the day's
-  occurrences and the held notifications are lists whose items carry their own
-  frame, so the list itself only has to stop being a bulleted one and set the
-  air between them. Not `.ui-rows`, which is the other way to present a
-  collection — a hairline-ruled column read by scanning down it. These are
-  picked out of rather than scanned, and each item is a box.
-
-  The occurrence's own box is `Inset` now (`.ui-panel-inset`), which is the same
-  seven declarations this file used to write under the name
-  `.calendar-occurrence-actions`.
-*/
-.calendar-occurrence-list,
-.calendar-notifications {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
+`/*
+`  Both of this sheet's lists — the day's occurrences and the held notifications —
+`  are \`Rows\`: a hairline-ruled column read by scanning down it, each item a row
+`  laid out on one grid line. The list keeps only its margin reset here; the frame,
+`  the rules and the fill are the shared layer's.
+`*/
+`.calendar-occurrence-list,
+`.calendar-notifications {
   margin: 0;
-  padding: 0;
-  list-style: none;
+}
+
+.calendar-occurrence-actions {
+  display: grid;
+  grid-template-columns: 5rem minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: var(--space-2);
 }
 
 .calendar-occurrence-title {
-  display: flex;
+  display: contents;
   flex-wrap: wrap;
   align-items: baseline;
   gap: var(--space-2);
@@ -690,6 +694,7 @@
 }
 
 .calendar-occurrence-clock {
+  grid-column: 1;
   font-family: var(--font-mono);
   font-weight: var(--weight-regular);
   color: var(--text-muted);
@@ -706,10 +711,55 @@
 }
 
 .calendar-occurrence-controls {
+  display: contents;
+}
+
+.calendar-occurrence-name {
+  grid-column: 2;
   display: flex;
   flex-wrap: wrap;
-  align-items: flex-end;
+  align-items: baseline;
   gap: var(--space-2);
+}
+
+/* "Move to" sits on the row's one line, label beside its input rather than above
+   it. Only the label's layout differs from the draft's field; the input itself
+   takes the shared reset in the draft-form block below. */
+.calendar-move-field {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.calendar-move {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.calendar-occurrence-more {
+  position: relative;
+}
+
+.calendar-occurrence-more summary {
+  cursor: pointer;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.calendar-occurrence-more summary:hover {
+  text-decoration: underline;
+}
+
+.calendar-occurrence-more > .ui-button {
+  position: absolute;
+  top: calc(100% + var(--space-1));
+  right: 0;
+  z-index: var(--z-overlay);
 }
 
 /* ============================================================ draft form == */
@@ -724,7 +774,7 @@
 
 .calendar-draft-lead {
   margin: 0;
-  font-family: var(--font-mono);
+  font-family: var(--font-display);
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
@@ -749,9 +799,10 @@
   There is no shared input primitive in `ui.css` to adopt here; DESIGN.md
   records that as the largest open hole in the component layer, and this is the
   page-local half of the answer rather than a private version of the missing one.
+  The label's layout is the one place the two differ — the move field sits on its
+  row's line — so only the input selector is shared.
 */
-.calendar-draft-field,
-.calendar-move-field {
+.calendar-draft-field {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
@@ -786,13 +837,10 @@
 /* ==================================================== held notifications == */
 
 .calendar-notification {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--space-2);
 }
 
 .calendar-notification-kind {

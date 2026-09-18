@@ -14,6 +14,8 @@ export interface StatCardProps {
   value: ReactNode | undefined;
   /** The line under the figure: a split, a ceiling, a trend. */
   detail?: ReactNode;
+  /** A bar under the reading, for a figure that runs against a ceiling. */
+  bar?: ReactNode;
 }
 
 /**
@@ -22,13 +24,20 @@ export interface StatCardProps {
  * The Home page is four of these and nothing else, which is the point: the
  * first screen is a *reading*, not a console. Nothing on a stat card is
  * clickable and nothing behind one mutates.
+ *
+ * No tone of its own. A card whose figure is bad news says so by wrapping its `detail` in
+ * `.ui-wrong` at the call site, which is what every other wrong clause in the app does. The
+ * `tone="danger"` prop that used to paint the figure is gone: one piece of news wearing two
+ * treatments is the thing round 9 fixed on the boundary readout, and `6/10` is a reading
+ * that is true either way.
  */
-export function StatCard({ label, value, detail }: StatCardProps) {
+export function StatCard({ label, value, detail, bar }: StatCardProps) {
   return (
     <article className="ui-stat" aria-label={label}>
       <p className="ui-stat-value">{value === undefined ? "—" : value}</p>
       <p className="ui-stat-label">{label}</p>
       {detail === undefined ? null : <p className="ui-stat-detail">{detail}</p>}
+      {bar === undefined ? null : bar}
     </article>
   );
 }

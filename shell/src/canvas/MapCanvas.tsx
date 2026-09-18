@@ -182,7 +182,7 @@ export function MapCanvas({
                 </button>
                 {claimed.has(path) ? null : (
                   <span
-                    className="ml-2 text-[10px] text-text-faint"
+                    className="ml-2 text-xs text-text-faint"
                     title="No approved decision names this file. Derived from the junction, and not a verdict about the code."
                   >
                     nothing asked for it
@@ -369,7 +369,7 @@ function Rail({
       */}
       {open === null ? null : (
         <>
-          <h3 className="px-2 pb-1 font-display text-[10px] font-medium uppercase tracking-wider text-text-faint">
+          <h3 className="px-2 pb-1 font-display text-xs font-medium uppercase tracking-wider text-text-faint">
             {open}
           </h3>
           <ul className="flex list-none flex-col">
@@ -395,7 +395,7 @@ function Rail({
       )}
       <h3
         className={
-          "px-2 pb-1 font-display text-[10px] font-medium uppercase tracking-wider text-text-faint" +
+          "px-2 pb-1 font-display text-xs font-medium uppercase tracking-wider text-text-faint" +
           (open === null ? "" : " pt-3")
         }
       >
@@ -456,7 +456,7 @@ function Traffic({
     "rounded-pill border border-border px-2 py-0.5 font-mono text-[11px] text-text-muted hover:border-border-strong hover:text-text";
   const row = (label: string, traffic: ReturnType<typeof trafficFor>["uses"]) => (
     <div className="flex flex-wrap items-baseline gap-1">
-      <span className="w-16 text-[10px] uppercase tracking-wide text-text-faint">{label}</span>
+      <span className="w-16 text-xs uppercase tracking-wide text-text-faint">{label}</span>
       {traffic.length === 0 ? (
         <span className="text-xs text-text-faint">nothing</span>
       ) : (
@@ -762,9 +762,9 @@ function FileDrawing({
           onFull={onFull}
           /*
             Three rungs of the neutral ladder, and two of the three were broken. Reachable from
-            outside wore `stroke-accent` — the brand colour marking an identifier, which the
-            Reserved Cyan Rule names outright — and what nothing reaches wore `stroke-border-subtle`,
-            a colour this app has never had: `tailwind.css` declares `--color-border` and
+            outside wore the brand colour — marking an identifier, which the Reserved Cyan Rule
+            names outright — and what nothing reaches wore a `border-subtle` stroke, a colour this
+            app has never had: `tailwind.css` declares `--color-border` and
             `--color-border-strong` and no third, so the utility compiled to nothing, SVG's default
             `stroke` is `none`, and those boxes shipped with no outline at all.
 
@@ -837,7 +837,7 @@ function Matrix({
         each. No arrangement of boxes and arrows survives that, so this is a matrix: each row uses
         the columns marked in it. The files were grouped into {matrix.order.length} communities found
         from the imports themselves. <span className="text-text">A mark above the diagonal is a
-        dependency that goes down. One below points backwards</span> — and no reordering removes it.
+        dependency that goes down. A heavier mark below it points backwards</span> — and no reordering removes it.
       </p>
       <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-text-muted">
         <span>
@@ -862,7 +862,7 @@ function Matrix({
           matrix.order.reduce((longest, title) => Math.max(longest, title.length), 0),
         )}
       >
-        <table className="m-3 border-collapse font-mono text-[10px]">
+        <table className="m-3 border-collapse font-mono text-xs">
           <thead>
             <tr>
               <th />
@@ -895,19 +895,12 @@ function Matrix({
                 {matrix.order.map((column, j) => {
                   const weight = matrix.cells.get(cellKey(row, column));
                   /*
-                    The two marks this whole matrix exists to be counted by, and neither was
-                    drawable. Forwards wore `bg-accent/30` — the brand colour, hand-diluted — and
-                    backwards wore `bg-danger/30`, a name this app has never declared: there is
-                    `--color-tone-danger-bg` and no `--color-danger`, so the utility compiled to
-                    nothing and every dependency pointing backwards, the one number the paragraph
-                    above tells a reader to act on, shipped as an empty cell.
-
-                    Forwards is the ordinary case and takes no colour at all — a flight deck is grey
-                    until something is wrong — so it moves a rung to `--border`, which is a real
-                    fill in both themes where `--surface-raised` is white-on-white in light.
-                    Backwards is the finding and takes the danger tone as its own fill; the cell
-                    already carries the tone's edge weight through the border below it, and the
-                    figure inside stays `--text` because the number is the content.
+                    The two marks this whole matrix exists to be counted by, and neither used to be
+                    drawable: forwards wore the brand colour hand-diluted, and backwards a bare
+                    `danger` name this app has never declared, so the utility compiled to nothing
+                    and every dependency pointing backwards shipped as an empty cell. Both are now
+                    real fills of `--text` at two weights — never a state tone, because red means
+                    destroyed and a back edge is coupling, not damage.
                   */
                   const tone =
                     i === j
@@ -915,8 +908,9 @@ function Matrix({
                       : weight === undefined
                         ? ""
                         : j > i
-                          ? "bg-border"
-                          : "bg-tone-danger-bg";
+                          ? "bg-text/15"
+                          // Both triangles are the same hue at two weights: a back edge is a structural fact, not a fault. At the default 50% zoom the lighter mark was close to invisible, even though the 358 forward marks are the primary signal.
+                          : "bg-text/35";
                   return (
                     <td
                       key={column}
@@ -1078,7 +1072,7 @@ function Graph({
 }: {
   drawn: Layout;
   /** What this drawing is of — carried into the frame, which keeps it in full screen. */
-  title: ReactNode;
+  title: string;
   full: boolean;
   onFull: (full: boolean) => void;
   onOpen?: (id: string) => void;
@@ -1091,6 +1085,9 @@ function Graph({
   return (
     <Stage title={title} natural={drawn.width + PAD * 2} full={full} onFull={onFull}>
       <svg
+        // This is a picture; “Every community” is its text alternative, and its name lets a reader decide to skip it.
+        role="img"
+        aria-label={title}
         width={drawn.width + PAD * 2}
         height={drawn.height + PAD * 2}
         viewBox={`${-PAD} ${-PAD + NODE_H / 2} ${drawn.width + PAD * 2} ${drawn.height + PAD * 2}`}
@@ -1108,12 +1105,7 @@ function Graph({
                 key={`${segment.from}>${segment.to}`}
                 d={`M${a.x} ${y1} C${a.x} ${mid} ${b.x} ${mid} ${b.x} ${y2}`}
                 fill="none"
-                /* `stroke-tone-danger-border` and not `stroke-danger`: the second is a colour
-                   this app never declared, so a reversed segment — the one edge in a layered
-                   drawing worth pointing at — was drawn with SVG's default stroke, which is
-                   `none`. The dash below was carrying the distinction alone, on a line nobody
-                   could see. The tone's edge member is the right half of the triple for a stroke. */
-                className={segment.reversed ? "stroke-tone-danger-border" : "stroke-border"}
+                className={segment.reversed ? "stroke-border-strong" : "stroke-border"}
                 strokeWidth={1.2}
                 strokeDasharray={segment.reversed ? "4 3" : undefined}
               />

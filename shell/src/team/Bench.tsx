@@ -1,4 +1,4 @@
-import { Link, useNavigate, useParams } from "@tanstack/react-router";
+import { useNavigate, useParams } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
   teamRunIsAlive,
@@ -12,8 +12,9 @@ import {
   type TeamView,
 } from "../data/teams";
 import {
-  Badge,
   ConfirmButton,
+  Count,
+  Crumb,
   ErrorNote,
   Panel,
   Quiet,
@@ -22,6 +23,7 @@ import {
   TabsContent,
   TabsList,
   TabsTrigger,
+  StateBadge,
 } from "../ui";
 import { Charter } from "./Charter";
 import { Decisions } from "./Decisions";
@@ -71,12 +73,12 @@ export function Bench() {
   if (detail === undefined) {
     return (
       <>
-        <BenchCrumb />
-        <Panel title="Department">
+        <Crumb to="/teams">Teams</Crumb>
+        <Panel title="Team">
           {team.isError ? (
             <BenchError error={team.error} />
           ) : (
-            <Quiet says="reading the department…" />
+            <Quiet says="reading the team…" />
           )}
         </Panel>
       </>
@@ -87,7 +89,7 @@ export function Bench() {
 
   return (
     <>
-      <BenchCrumb />
+      <Crumb to="/teams">Teams</Crumb>
       <BenchHead team={detail} live={live.length} waiting={waiting} />
 
       <Tabs defaultValue="work" className="teams-bench-tabs">
@@ -96,8 +98,11 @@ export function Bench() {
           <TabsTrigger value="decisions">
             Decisions
             {/* The count is on the label because this is the tab that is
-                waiting for a person — the only one that can be behind. */}
-            {waiting > 0 && <Badge tone="pending">{waiting}</Badge>}
+                waiting for a person — the only one that can be behind. A `Count`
+                and not a `Badge`: how many decisions are held is a reading, and the
+                project tab strip already says that kind of thing this way. The
+                filled capsule stays reserved for a state. */}
+            {waiting > 0 && <Count n={waiting} />}
           </TabsTrigger>
           <TabsTrigger value="roster">Roster</TabsTrigger>
           <TabsTrigger value="routines">Routines</TabsTrigger>
@@ -128,19 +133,11 @@ export function Bench() {
   );
 }
 
-function BenchCrumb() {
-  return (
-    <p className="teams-crumb">
-      <Link to="/teams">← Teams</Link>
-    </p>
-  );
-}
-
 /**
- * The department's identity and its standing, above the tabs.
+ * The team's identity and its standing, above the tabs.
  *
  * Deleting lives here rather than in the Charter: the Charter is about what
- * this department IS, and removing it is not an edit of that — it is the end of
+ * this team IS, and removing it is not an edit of that — it is the end of
  * it. `ConfirmButton` because it is a destructive write, which is the standing
  * rule for the interlock.
  */
@@ -152,19 +149,15 @@ function BenchHead({ team, live, waiting }: { team: TeamView; live: number; wait
     <header className="teams-bench-head">
       <div className="teams-bench-title">
         <h1 className="teams-bench-name">{team.name}</h1>
-        {live > 0 ? (
-          <Badge tone="active">at work</Badge>
-        ) : waiting > 0 ? (
-          <Badge tone="pending">waiting on you</Badge>
-        ) : (
-          <Badge tone="off">idle</Badge>
-        )}
+        {/* "waiting on you" belongs to Waiting's decision count; this is open team action. */}
+        <StateBadge domain="department" state={live > 0 ? "working" : waiting > 0 ? "waiting" : "idle"} />
       </div>
       <p className="teams-bench-remit">{team.mission}</p>
       <div className="teams-bench-aside">
         <ConfirmButton
-          label="Delete department"
+          label="Delete team"
           confirmLabel="Delete it now"
+          variant="danger"
           intent="stop"
           disabled={del.isPending}
           onConfirm={() => del.mutate(team.id, { onSuccess: () => void navigate({ to: "/teams" }) })}
@@ -180,16 +173,16 @@ function BenchError({ error }: { error: unknown }) {
     return (
       <RefusalNote
         refusal={error}
-        sentences={{ not_found: "there is no department with that id", ...daemonProse(error) }}
+        sentences={{ not_found: "there is no team with that id", ...daemonProse(error) }}
       />
     );
   }
-  return <ErrorNote>the núcleo did not answer — nothing is known about this department</ErrorNote>;
+  return <ErrorNote>the núcleo did not answer — nothing is known about this team</ErrorNote>;
 }
 
 function DeleteRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — this department was not deleted</ErrorNote>;
+  return <ErrorNote>the núcleo did not answer — this team was not deleted</ErrorNote>;
 }
 
 /**

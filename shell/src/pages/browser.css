@@ -28,6 +28,7 @@
  */
 .browser-note {
   margin: 0 0 var(--space-3);
+  max-width: var(--measure);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
   color: var(--text-muted);
@@ -170,19 +171,14 @@
 
 /* =================================================================== list == */
 
-/* The three columns this page has: sessions, site grants, submissions. Each
-   item is an `Inset`, which paints its own box — this only spaces them and
-   takes the list markers off. */
-.browser-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
 /* -------------------------------------------------------------- sessions == */
+
+/* Sessions, grants and submissions are each a `Row` of their list's `Rows`; the
+   parts of one sit a step further apart than a row's default. */
+.browser-session,
+.browser-row {
+  gap: var(--space-2);
+}
 
 .browser-card-mode {
   font-family: var(--font-display);
@@ -271,6 +267,14 @@
 }
 
 /* ------------------------------------------------------------- site grants == */
+
+/* A grant's origin reads across a line and its two buttons stand in columns of
+   their own, so the revokes line up from one grant to the next. The one head of
+   the four above that is a grid rather than a wrapping line. */
+.browser-row-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
 
 /**
  * The two things hung below the grants: what has been submitted under them,

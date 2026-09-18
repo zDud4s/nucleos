@@ -9,7 +9,7 @@ import {
   type MachineSecret,
   type MachineSetting,
 } from "../data/machine-config";
-import { Badge, Button, ConfirmButton, ErrorNote, Panel, RefusalNote } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, StateBadge } from "../ui";
 
 /**
  * This machine's settings — the files whose author is the daemon rather than
@@ -107,13 +107,7 @@ function SettingPanel({
   return (
     <Panel
       title={setting.area}
-      aside={
-        setting.exists ? (
-          <Badge tone="info">configured</Badge>
-        ) : (
-          <Badge tone="off">never configured</Badge>
-        )
-      }
+      aside={<StateBadge domain="machine_file" state={setting.exists ? "configured" : "unconfigured"} />}
     >
       <p className="sy-note">{setting.what}</p>
 
@@ -202,11 +196,12 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
     <div className="sy-secret">
       <div className="sy-secret-head">
         <span className="sy-secret-key">{secret.key}</span>
-        {secret.present === true && <Badge tone="info">set</Badge>}
-        {secret.present === false && <Badge tone="off">not set</Badge>}
-        {/* Not the same as "not set", and acting on the two differs: one wants a
+        {/* "unknown" is not the same as "not set", and acting on the two differs: one wants a
             credential pasted, the other wants somebody to look at the store. */}
-        {secret.present === null && <Badge tone="pending">could not be asked</Badge>}
+        <StateBadge
+          domain="credential"
+          state={secret.present === true ? "set" : secret.present === false ? "unset" : "unknown"}
+        />
       </div>
       <p className="sy-note">{secret.what}</p>
       <div className="sy-setting-controls">
@@ -237,9 +232,12 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
         </Button>
         {secret.present === true && (
           <ConfirmButton
+            // Danger: forgetting a credential destroys the only copy the núcleo holds.
+            variant="danger"
             intent="stop"
             label="Forget"
             confirmLabel="Forget it"
+            subject={secret.key}
             onConfirm={() => {
               forget.mutate(secret.key);
             }}

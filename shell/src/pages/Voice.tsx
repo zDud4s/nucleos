@@ -33,6 +33,7 @@ import {
   StaleNote,
   StateBadge,
   Teach,
+  Section,
 } from "../ui";
 import "./voice.css";
 
@@ -69,9 +70,15 @@ function headline(
   config: VoiceConfigView | undefined,
   memos: Capture[] | undefined,
   dictations: Capture[] | undefined,
+  conflicts: string[] | null,
+  registerFailed: boolean,
 ): string | undefined {
   if (config === undefined) return undefined;
   if (!config.armed) return "not armed — no transcriber is configured";
+  if (registerFailed) return "armed, but the hotkeys did not register — use the buttons below";
+  if (conflicts !== null && conflicts.length > 0) {
+    return `armed — ${conflicts.length} hotkey${conflicts.length === 1 ? "" : "s"} is taken by another app`;
+  }
   if (memos === undefined || dictations === undefined) return "armed";
   const memoNoun = memos.length === 1 ? "memo" : "memos";
   const dictationNoun = dictations.length === 1 ? "dictation" : "dictations";
@@ -286,9 +293,9 @@ export function Voice() {
 
   return (
     <>
-      <PageHeader title="Voice" headline={headline(config.data, memos.data, dictations.data)} />
+      <PageHeader title="Voice" headline={headline(config.data, memos.data, dictations.data, hotkeyConflicts, hotkeyRegisterFailed)} />
 
-      <Panel title="Capture" aside={<PhaseBadge phase={phase} />}>
+      <Panel title="Capture" aside={<PhaseBadge phase={phase} registerFailed={hotkeyRegisterFailed} />}>
         <HotkeyConflictNote failed={hotkeyConflicts} registerFailed={hotkeyRegisterFailed} />
         <CaptureButtons
           phase={phase}
@@ -319,7 +326,10 @@ export function Voice() {
  * enums, and this one is a fact this page's reducer invents, not one the
  * daemon sends over the wire.
  */
-function PhaseBadge({ phase }: { phase: VoicePhase }) {
+function PhaseBadge({ phase, registerFailed }: { phase: VoicePhase; registerFailed: boolean }) {
+  // `idle` above an error is two readings of one moment. When the hotkeys did not register,
+  // the head says the thing the note underneath is about.
+  if (phase === "idle" && registerFailed) return <Badge tone="danger">hotkeys failed</Badge>;
   if (phase === "idle") return <Badge tone="off">idle</Badge>;
   if (phase === "recording") return <Badge tone="pending">recording</Badge>;
   return <Badge tone="info">transcribing</Badge>;
@@ -534,15 +544,18 @@ function MemoList({
   const stale = memos.isError && rows !== undefined;
 
   return (
+    <>
+      {rows !== undefined && rows.length === 0 ? (
+        <Section label="Memos">
+          <Quiet says="no memos yet">
+            <p>A memo is a capture that stays a note — start one above, or press the memo hotkey from anywhere.</p>
+          </Quiet>
+        </Section>
+      ) : (
     <Panel title="Memos" aside={<Count n={rows?.length} />}>
       {stale && <StaleNote dataUpdatedAt={memos.dataUpdatedAt} />}
       {memos.isError && rows === undefined && <MemosError error={memos.error} />}
       {rows === undefined && !memos.isError && <p className="voice-loading">reading the memos…</p>}
-      {rows !== undefined && rows.length === 0 && (
-        <Teach title="No memos yet">
-          <p>A memo is a capture that stays a note — start one above, or press the memo hotkey from anywhere.</p>
-        </Teach>
-      )}
       {rows !== undefined && rows.length > 0 && (
         <Rows label="Memos">
           {rows.map((row) => (
@@ -557,6 +570,8 @@ function MemoList({
       )}
       {deleteMemo.isError && <DeleteMemoError error={deleteMemo.error} />}
     </Panel>
+      )}
+    </>
   );
 }
 
@@ -575,22 +590,18 @@ function DictationList({ dictations }: { dictations: ReturnType<typeof useDictat
   const stale = dictations.isError && rows !== undefined;
 
   return (
+    <>
+      {rows !== undefined && rows.length === 0 ? (
+        <Section label="Dictations">
+          <Quiet says="no dictations yet">
+            <p className="voice-note">A dictation is a capture that gets pasted where you were typing — start one above, or press the dictation hotkey from anywhere.</p>
+          </Quiet>
+        </Section>
+      ) : (
     <Panel title="Dictations" variant="dim" aside={<Count n={rows?.length} />}>
-      <p className="voice-note">
-        Read by hand for prompt tuning, not by the shell — there is no delete here; dictations expire
-        on their own by retention.
-      </p>
       {stale && <StaleNote dataUpdatedAt={dictations.dataUpdatedAt} />}
       {dictations.isError && rows === undefined && <DictationsError error={dictations.error} />}
       {rows === undefined && !dictations.isError && <p className="voice-loading">reading the dictations…</p>}
-      {rows !== undefined && rows.length === 0 && (
-        <Teach title="No dictations yet">
-          <p>
-            A dictation is a capture that gets pasted where you were typing — start one above, or press
-            the dictation hotkey from anywhere.
-          </p>
-        </Teach>
-      )}
       {rows !== undefined && rows.length > 0 && (
         <Rows label="Dictations">
           {rows.map((row) => (
@@ -599,6 +610,8 @@ function DictationList({ dictations }: { dictations: ReturnType<typeof useDictat
         </Rows>
       )}
     </Panel>
+      )}
+    </>
   );
 }
 

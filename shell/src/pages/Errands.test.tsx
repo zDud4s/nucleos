@@ -223,15 +223,15 @@ function afterDwell(): Promise<void> {
 /* ------------------------------------------------------- A15: no create -- */
 
 describe("Errands - the empty state and the missing create control", () => {
-  it("offers no create control and its Teach names Telegram as where an errand is opened (A15)", async () => {
+  it("an empty catalogue is the teach block alone", async () => {
     daemon.apiFetch.mockImplementation(errandsFetch(errandsState()));
 
     await renderErrands("/errands");
 
-    expect(await screen.findByText(/no errand has been opened yet/i)).toBeDefined();
     const teachHeading = screen.getByRole("heading", { level: 3, name: /errands are opened from telegram/i });
     const teach = teachHeading.closest(".ui-teach");
     if (teach === null) throw new Error("no Teach block found");
+    expect(screen.queryByRole("region", { name: "Errands" })).toBeNull();
     expect(within(teach as HTMLElement).getByText(/chat_key/i)).toBeDefined();
 
     // No door in, anywhere on the page.
@@ -470,5 +470,15 @@ describe("Errands - the route and the list", () => {
     fireEvent.click(await screen.findByRole("link", { name: /watch the release pr/i }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/errands/1"));
     expect(await screen.findByRole("heading", { level: 1, name: "Errands" })).toBeDefined();
+  });
+});
+
+describe("Errands - map-authored readings", () => {
+  it("the brain is an identifier, not a state", async () => {
+    daemon.apiFetch.mockImplementation(errandsFetch(errandsState({ errands: [errand({ brain: "local" })] })));
+    await renderErrands("/errands");
+    const brain = await screen.findByText("local");
+    expect(brain.className).toContain("errands-row-brain");
+    expect(brain.className).not.toContain("ui-badge");
   });
 });

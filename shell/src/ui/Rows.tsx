@@ -16,6 +16,15 @@ export interface RowsProps {
    * a chain of steps. `ul` otherwise, which is nearly always.
    */
   as?: "ul" | "ol";
+  /**
+   * A page's own modifier on the list — a grid, a width, a margin on the column.
+   *
+   * Added when twenty-eight pages were recomposed onto this list and nearly every
+   * one of them carried a layout class beside `.ui-rows`. It is for placing the
+   * column, never for restating its ground, border or radius: those three are
+   * the hairline mechanism, and a page that re-answers one of them deletes rules.
+   */
+  className?: string;
   /** {@link Row} elements. Anything else and the ground shows through. */
   children: ReactNode;
 }
@@ -42,6 +51,24 @@ export interface RowProps {
    * showing through; see its comment in `ui.css`.
    */
   current?: boolean;
+  /**
+   * Above a handful, the list is being *worked* rather than read, and the row's
+   * padding comes in (`.ui-rows-row-dense`). Nothing else changes: the tenth row
+   * staying on the same screen as the first is what stops a queue being abandoned
+   * halfway.
+   */
+  dense?: boolean;
+  /**
+   * A page's own modifier for what is INSIDE the row — its grid tracks, its
+   * alignment, a hook a test reaches for.
+   *
+   * Under the same protest as {@link Inset}'s: never `background`, `padding` or
+   * `border`. The fill is what keeps the hairline gap from showing through, so a
+   * page that overrides it knocks a rule out of the column rather than restyling
+   * a row. A row marked out from its siblings says so with `current`, never with
+   * a class of its own.
+   */
+  className?: string;
   children: ReactNode;
 }
 
@@ -74,10 +101,10 @@ export interface RowProps {
  * is a row you can see through. That is the one thing a caller must not have to
  * remember, and now cannot.
  */
-export function Rows({ label, as = "ul", children }: RowsProps) {
+export function Rows({ label, as = "ul", className, children }: RowsProps) {
   const Element = as;
   return (
-    <Element className="ui-rows" aria-label={label}>
+    <Element className={className === undefined ? "ui-rows" : `ui-rows ${className}`} aria-label={label}>
       {children}
     </Element>
   );
@@ -90,20 +117,22 @@ export function Rows({ label, as = "ul", children }: RowsProps) {
  * copies used, because a row that wants more air can add it and a row that wants
  * less cannot take it back without knowing what it is undoing.
  *
- * It carries no `className` on purpose, and `layout` is the reason that stayed
- * true rather than becoming an inconvenience. None of these lists marks a row
- * out from its neighbours — no selected row, no unread weight — and the fill it
- * paints is not decoration but the thing that keeps the ground from showing
- * through, so a page overriding `background` here would knock a rule out of the
- * column rather than restyle a row. A named axis gives the two callers that
- * needed one what they actually wanted, without handing out the one property
- * that must not be overridden.
+ * It was first written with no `className`, and `layout` was the reason that
+ * stayed true for the four lists it was extracted from: the fill it paints is
+ * not decoration but the thing that keeps the ground from showing through, so a
+ * page overriding `background` here would knock a rule out of the column rather
+ * than restyle a row. The recomposition that moved twenty-eight pages onto this
+ * list brought row layouts no named axis could carry, so `className` exists now
+ * with the narrow brief its doc gives; `layout`, `current` and `dense` remain the
+ * way to say the things the shared layer owns.
  */
-export function Row({ layout = "stack", current, children }: RowProps) {
+export function Row({ layout = "stack", current, dense, className, children }: RowProps) {
   const classes = [
     "ui-rows-row",
     layout === "line" ? "ui-rows-row-line" : undefined,
+    dense === true ? "ui-rows-row-dense" : undefined,
     current === true ? "ui-current" : undefined,
+    className,
   ]
     .filter((c) => c !== undefined)
     .join(" ");

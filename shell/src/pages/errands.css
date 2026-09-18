@@ -92,11 +92,9 @@
 }
 
 /**
- * The page's own controls, and there is no primitive to adopt: `ui.css` defines
- * no `.ui-input` and no `.ui-field`, which DESIGN.md records as the largest
- * remaining hole in the component layer. Until it is filled these stay here —
- * written once for the three shapes rather than twice, which is what the file
- * editor below was doing under its own name.
+ * The page's own controls, not yet moved onto `Field` from `../ui`. Until they
+ * are, these stay here — written once for the three shapes rather than twice,
+ * which is what the file editor below was doing under its own name.
  */
 .errands-field input,
 .errands-field textarea,
@@ -191,9 +189,9 @@
 }
 
 /**
- * The name of the thing at the head of its row. The `flex` basis is what
- * pushes the badges and the folder to the far end and lets them drop under the
- * name when the column narrows.
+ * The name of the thing at the head of its row. An errand name is one line
+ * that ellipsises inside the first track of the row grid; a rule name takes the
+ * slack in its head and pushes the cron and the controls to the far end.
  */
 .errands-row-name,
 .errands-rule-name {
@@ -202,7 +200,6 @@
 }
 
 .errands-row-name {
-  flex: 1 1 10rem;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -213,24 +210,15 @@
   flex: 1 1 8rem;
 }
 
-/**
- * The three columns this page stacks: errands, files, rules. One recipe, where
- * there were three differing only in the gap.
- */
-.errands-list,
-.errands-files,
-.errands-rules {
+/* The files column. The errands and the rules are `Rows`; this is a plain list,
+   one line per file, where the link on it is the whole row. */
+.errands-files {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  gap: var(--space-1);
   margin: 0;
   padding: 0;
   list-style: none;
-}
-
-/* Tighter, because a file is one line and the link on it is the whole row. */
-.errands-files {
-  gap: var(--space-1);
 }
 
 /* The armed rules stand off from the form that arms another. */
@@ -241,12 +229,13 @@
 /* =================================================================== list == */
 
 /**
- * One errand, as a link that is the whole box.
+ * One errand, as a link across the whole row: name, state, brain, folder and
+ * investigation on one baseline, in tracks that line up down the column.
  *
- * The row you are on is marked by `.ui-current` — a 2px inset rule on the
- * leading edge, in `--text` — and by nothing else. It used to be
- * `border-color: var(--accent)` over `background: var(--accent-quiet)`, which
- * is the mark six pages had independently reached for and is wrong twice: the
+ * The row you are on is marked by `Row current` — `.ui-current`, a 2px inset
+ * rule on the leading edge, in `--text` — and by nothing else. It used to be
+ * the brand accent as a border over its quiet form as a fill, which is the mark
+ * six pages had independently reached for and is wrong twice: the
  * brand colour means identity and never selection, and a fill-based mark works
  * in dark and disappears in light, where `--surface` and `--surface-raised` are
  * both `#ffffff`. Decided by the owner on 2026-09-06 from a rendering of four
@@ -254,20 +243,24 @@
  * on `.ui-current` in `ui.css`. Do not reopen it with a fill.
  */
 .errands-row-link {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
+  display: grid;
+  grid-template-columns: minmax(0, 14rem) auto auto minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+  padding: 0;
   color: var(--text);
   text-decoration: none;
 }
 
+/* Which brain answers, as the identifier it is. A state tone here dressed a
+   configuration value as something the núcleo was doing. */
+.errands-row-brain {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
 .errands-row-investigation {
-  flex: 1 1 100%;
   font-size: var(--text-xs);
   color: var(--text-muted);
   overflow-wrap: anywhere;
@@ -323,6 +316,12 @@
 }
 
 /* ----------------------------------------------------------------- rules -- */
+
+/* A rule's row stacks its head, its prompt and its facts a step further apart
+   than the row's own default. */
+.errands-rule {
+  gap: var(--space-2);
+}
 
 .errands-rule-prompt {
   margin: 0;

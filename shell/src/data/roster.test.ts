@@ -194,8 +194,29 @@ describe("headline", () => {
       }),
     ];
     expect(headline(busy)).toBe(
-      "2 projects · 1 acting · 1 failing the gate · 171 waiting on you",
+      "2 projects · 1 acting · 1 failing the gate · 171 items to review",
     );
+  });
+
+  /**
+   * The headline names what the open ones are.
+   *
+   * "171 waiting on you" was the roster claiming the bare phrase, which belongs to the one
+   * queue at `/waiting`. What this page counts is `open_review_items` — proposals and shadow
+   * decisions together — so it says items, and says it in the singular when there is one,
+   * because a sentence that reads "1 items to review" is a sentence nobody wrote on purpose.
+   */
+  it("the headline names what the open ones are", () => {
+    const one = [
+      project({
+        project_id: "a",
+        mode: "shadow",
+        project_root: "C:/a",
+        root_exists: true,
+        open_review_items: 1,
+      }),
+    ];
+    expect(headline(one)).toBe("1 project · 1 item to review");
   });
 
   it("says so when there is nothing at all", () => {

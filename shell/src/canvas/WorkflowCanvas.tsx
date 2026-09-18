@@ -170,7 +170,7 @@ function WorkflowNode({ data, selected }: NodeProps<WorkflowFlowNode>) {
           ) : null}
         </div>
         <div className="flex items-center gap-1.5">
-          <span className="text-[10px] uppercase tracking-wide" style={{ color: `var(--tone-${tone}-fg)` }}>
+          <span className="text-xs uppercase tracking-wide" style={{ color: `var(--tone-${tone}-fg)` }}>
             {node.role === "gate" ? "gate" : node.type}
           </span>
           {/*
@@ -178,11 +178,11 @@ function WorkflowNode({ data, selected }: NodeProps<WorkflowFlowNode>) {
             the question "what has this project changed" is asked of the whole picture at once.
           */}
           {node.overridden ? (
-            <span className="rounded-pill border border-border px-1.5 text-[10px] text-text-muted">
+            <span className="rounded-pill border border-border px-1.5 text-xs text-text-muted">
               project
             </span>
           ) : null}
-          {node.disabled ? <span className="text-[10px] text-text-faint">off here</span> : null}
+          {node.disabled ? <span className="text-xs text-text-faint">off here</span> : null}
         </div>
       </motion.div>
       <Handle type="source" position={Position.Right} isConnectable={false} />
@@ -242,7 +242,7 @@ function WorkflowEdgeLine({
         <EdgeLabelRenderer>
           <span
             style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
-            className="pointer-events-none absolute rounded-pill border border-border bg-surface px-1.5 py-0.5 text-[10px] text-text-muted"
+            className="pointer-events-none absolute rounded-pill border border-border bg-surface px-1.5 py-0.5 text-xs text-text-muted"
           >
             {label}
           </span>

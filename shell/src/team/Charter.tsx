@@ -217,7 +217,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
     }
   }, [existing, form]);
 
-  if (form === null) return <Quiet says="reading the department…" />;
+  if (form === null) return <Quiet says="reading the team…" />;
 
   const mutation = existing === null ? create : update;
   const valid = form.name.trim() !== "" && form.mission.trim() !== "" && form.directorAgentId.trim() !== "";
@@ -302,7 +302,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
     >
       <Section
         title="Identity"
-        note="The id is slugged from the first name this department ever had, and renaming never changes it."
+        note="The id is slugged from the first name this team ever had, and renaming never changes it."
       >
         <Field label="Name">
           <input
@@ -343,7 +343,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
 
       <Section
         title="Staff"
-        note="Sent whole on every save. A specialist can serve several departments — where else they serve is shown beside each one."
+        note="Sent whole on every save. A specialist can serve several teams — where else they serve is shown beside each one."
       >
         <Field label="Members">
           <select
@@ -407,10 +407,12 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
               onChange={(event) => edit("maxLiveRuns", { maxLiveRuns: event.target.value })}
             />
           </Field>
+          {/* Live runs occupy this ceiling right now: the reading Acting Green is for. */}
           <Meter
             label="at work"
             value={runs.filter((run) => run.team_id === existing?.id && LIVE.has(run.state)).length}
             ceiling={parseCeiling(form.maxLiveRuns)}
+            tone="active"
           />
           <Field label="Max open actions (0-20)">
             <input
@@ -490,7 +492,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
 
       {unreadable && (
         <ErrorNote>
-          the núcleo did not answer when this form asked what the department looks like now — nothing
+          the núcleo did not answer when this form asked what the team looks like now — nothing
           was sent, because saving is a full replace and there was nothing to compare against
         </ErrorNote>
       )}
@@ -505,7 +507,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
               : `${touched.size} ${touched.size === 1 ? "section" : "sections"} changed — the roster and the powers are sent whole, so what is here replaces what is there.`}
           </p>
           <Button type="submit" intent="go" disabled={!valid || mutation.isPending || checking}>
-            {checking ? "Checking…" : existing === null ? "Create department" : "Save"}
+            {checking ? "Checking…" : existing === null ? "Create team" : "Save"}
           </Button>
         </div>
       )}
@@ -540,7 +542,7 @@ function DriftGuard({
   return (
     <div className="teams-drift" role="alert" aria-label="Changed while you were editing">
       <p className="teams-drift-said">
-        This department changed while you had the form open, in{" "}
+        This team changed while you had the form open, in{" "}
         {guard.drifted.length === 1 ? "a field" : "fields"} you were not editing. Saving as-is would
         replace {guard.drifted.length === 1 ? "it" : "them"} — the roster and the powers go whole.
       </p>
@@ -630,5 +632,5 @@ function Grants({ grants, onChange }: { grants: TeamGrant[]; onChange: (grants: 
 
 function SaveRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — this department was not saved</ErrorNote>;
+  return <ErrorNote>the núcleo did not answer — this team was not saved</ErrorNote>;
 }

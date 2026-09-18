@@ -188,6 +188,17 @@ describe("Browser - live sessions", () => {
 /* ---------------------------------------------------------------- health -- */
 
 describe("Browser - health", () => {
+  it("puts a non-running sidecar reason in the headline", async () => {
+    const world = browserWorld({
+      readout: { status: "degraded", subsystems: [{ name: "browser_sidecar", status: "down", reason: "not-running" }] },
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    expect(await screen.findByText("the browser sidecar is down — not-running")).toBeDefined();
+  });
+
   it("reports the one browser subsystem the daemon has", async () => {
     const world = browserWorld({
       readout: {

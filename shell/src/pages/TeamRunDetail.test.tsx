@@ -152,7 +152,7 @@ async function renderTeamRunDetail(initialPath: string) {
 /* ------------------------------------------------------------------ rounds -- */
 
 describe("TeamRunDetail - rounds and actions", () => {
-  it("draws each round with its items and the actions the department asked for", async () => {
+  it("draws each round with its items and the actions the team asked for", async () => {
     const run = teamRunView({
       id: "run-1",
       items: [
@@ -251,9 +251,97 @@ describe("TeamRunDetail - cost", () => {
 
     await renderTeamRunDetail("/team-runs/run-2");
 
-    const costFigures = await screen.findAllByText((_, element) => element?.className === "teams-cost");
+    // `money()` and not a raw `toFixed(4)`: `$1.2400` was this page's own convention for
+    // a spend, and every other figure in the app is written by the one formatter — two
+    // conventions for money is how a reader learns to distrust both.
+    const costFigures = await screen.findAllByText(
+      (_, element) => element?.className === "ui-stat-value" && /1\.25/.test(element.textContent ?? ""),
+    );
     expect(costFigures).toHaveLength(1);
-    expect(costFigures[0].textContent).toContain("1.2500");
+    expect(costFigures[0].textContent).toBe("$1.25");
+  });
+
+  it("keeps stat cards non-clickable", async () => {
+    const run = teamRunView({ id: "run-2", parent_id: "run-1", root_id: "run-1", cost_usd: 1.25 });
+    daemon.apiFetch.mockImplementation(teamRunFetch({ "run-2": run }));
+
+    await renderTeamRunDetail("/team-runs/run-2");
+
+    const costCard = await screen.findByRole("article", { name: "Cost" });
+    expect(within(costCard).queryByRole("link")).toBeNull();
+    expect(screen.getAllByRole("link", { name: "see the root" })).toHaveLength(1);
+  });
+});
+
+/* --------------------------------------------------------------- headline -- */
+
+describe("TeamRunDetail - what the page is about", () => {
+  /**
+   * A8's sibling, and the reason the whole packet exists: the heading rank belongs to
+   * the page's SUBJECT. Every team run answered to the heading "Team run", which is the
+   * one thing a reader already knew — they clicked a run to get here. What tells this run
+   * from the last one is the sentence somebody typed, and it was two ranks down in the
+   * muted headline.
+   */
+  it('the request is the heading and "Team run" is the crumb', async () => {
+    const run = teamRunView({ id: "run-1", request: "clear the backlog" });
+    daemon.apiFetch.mockImplementation(teamRunFetch({ "run-1": run }));
+
+    await renderTeamRunDetail("/team-runs/run-1");
+
+    const heading = await screen.findByRole("heading", { level: 1 });
+    expect(heading.textContent).toBe("clear the backlog");
+    expect(screen.queryByRole("heading", { level: 1, name: "Team run" })).toBeNull();
+
+    // The page's kind, and the way back out of it, above the title rather than under the
+    // last panel — which is where "Back to the teams" was, reachable only by somebody who
+    // had already read everything they came for.
+    const crumb = document.querySelector(".ui-crumb");
+    expect(crumb?.textContent).toContain("Team run");
+  });
+
+  /**
+   * One noun, and one glyph. The rail calls this place Teams; the crumb called it
+   * Departments, and the arrow it drew was a `·` that a screen reader read out.
+   */
+  it("the crumb says Teams and links to the console", async () => {
+    const run = teamRunView({ id: "run-1", request: "clear the backlog" });
+    daemon.apiFetch.mockImplementation(teamRunFetch({ "run-1": run }));
+
+    await renderTeamRunDetail("/team-runs/run-1");
+    await screen.findByRole("heading", { level: 1, name: "clear the backlog" });
+
+    const crumb = document.querySelector(".ui-crumb") as HTMLElement;
+    // The accessible name is the word alone: the arrow is `aria-hidden`, so this fails
+    // the moment somebody folds a glyph back into the link's text.
+    const back = within(crumb).getByRole("link", { name: "Teams" });
+    expect(back.getAttribute("href")).toBe("/teams");
+    expect(crumb.textContent).not.toContain("Departments");
+  });
+
+  /**
+   * Cancel ends the work; Delete ends the record of it, and its folder with it. They
+   * were the same red, the same size and one corner apart, which made the difference
+   * between them a matter of aim. They are now a page apart.
+   */
+  it("cancel and delete do not sit side by side", async () => {
+    const run = teamRunView({ id: "run-1", state: "working" });
+    daemon.apiFetch.mockImplementation(teamRunFetch({ "run-1": run }));
+
+    await renderTeamRunDetail("/team-runs/run-1");
+
+    const cancel = await screen.findByRole("button", { name: "Cancel" });
+    const remove = await screen.findByRole("button", { name: "Delete run" });
+
+    // The live control is in the header, where a page's own actions live.
+    expect(cancel.closest("header.ui-page-header")).not.toBeNull();
+
+    // The destructive one is not — it is in a region of its own, at the foot of the
+    // page, under a heading that says what it is for.
+    expect(remove.closest("header.ui-page-header")).toBeNull();
+    const ending = remove.closest("section");
+    expect(ending?.getAttribute("aria-label")).toBe("Ending this run");
+    expect(ending?.contains(cancel)).toBe(false);
   });
 });
 
@@ -265,7 +353,7 @@ describe("TeamRunDetail - the run's cadence", () => {
     daemon.apiFetch.mockImplementation(teamRunFetch({ "run-1": liveRun }));
 
     const { queryClient } = await renderTeamRunDetail("/team-runs/run-1");
-    await screen.findByRole("heading", { level: 1, name: "Team run" });
+    await screen.findByRole("heading", { level: 1, name: "clear the backlog" });
 
     function computedInterval(): number | false {
       const query = queryClient.getQueryCache().find({ queryKey: keys.teams.run("run-1"), exact: true });

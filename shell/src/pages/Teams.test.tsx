@@ -80,6 +80,24 @@ function teamRun(overrides: Partial<TeamRun> = {}): TeamRun {
   };
 }
 
+/** One open action of `run-1`. Its team comes back through the run list, never off the action. */
+function teamAction(overrides: Partial<TeamAction> = {}): TeamAction {
+  return {
+    id: 1,
+    team_run_id: "run-1",
+    ordinal: 0,
+    kind: "send_email",
+    payload: "{}",
+    why: "the customer asked for the invoice",
+    proposal_id: 9,
+    state: "pending",
+    error: null,
+    created_at: "2026-08-24T09:00:00Z",
+    executed_at: null,
+    ...overrides,
+  };
+}
+
 function teamTrigger(overrides: Partial<TeamTrigger> = {}): TeamTrigger {
   return {
     id: 1,
@@ -228,13 +246,13 @@ describe("Teams - who works where", () => {
 
 /* -------------------------------------------------------------- the table -- */
 
-/** The departments table, by its caption — the matrix is the other one. */
+/** The teams table, by its caption — the matrix is the other one. */
 function departments() {
-  return screen.findByRole("table", { name: /Every department/ });
+  return screen.findByRole("table", { name: /Every team/ });
 }
 
 describe("Teams - the table", () => {
-  it("gives every department the same row, whatever it happens to be doing", async () => {
+  it("gives every team the same row, whatever it happens to be doing", async () => {
     // The defect this shape exists to make impossible. As cards, a department
     // with a task running carried a block the others did not, so everything
     // below it sat at a different height in every card and six cards became six
@@ -314,7 +332,37 @@ describe("Teams - the table", () => {
     expect(within(table).getByText(/at the ceiling/)).toBeDefined();
   });
 
-  it("marks a department with nobody on it, because it cannot start a task", async () => {
+  /**
+   * A pulse with no key is a shape whose unit a reader has to guess, and the guess is
+   * free to be wrong: these are days, and a run stacked on a day, and nothing on the
+   * page said either. The header now carries the unit and each bar carries its own day —
+   * there is no axis to read it off, because there is no fixed span to draw one for.
+   */
+  it("says what the pulse counts, in the header and on every bar", async () => {
+    const team = teamView({ id: "financas", name: "Finanças" });
+    daemon.apiFetch.mockImplementation(
+      teamsFetch({
+        teams: [team],
+        runs: [
+          teamRun({ id: "run-1", state: "done", created_at: "2026-09-05T08:00:00Z" }),
+          teamRun({ id: "run-2", state: "done", created_at: "2026-09-05T17:00:00Z" }),
+          teamRun({ id: "run-3", state: "done", created_at: "2026-09-06T09:00:00Z" }),
+        ],
+      }),
+    );
+
+    await renderTeams();
+
+    const table = await departments();
+    const pulse = within(table).getByRole("columnheader", { name: /Pulse/ });
+    expect(pulse.querySelector(".teams-col-key")?.textContent).toBe("per day");
+
+    // Oldest first, plural where the count earns it, and the day spelled out.
+    const said = [...table.querySelectorAll("svg title")].map((node) => node.textContent);
+    expect(said).toEqual(["2 runs on 2026-09-05", "1 run on 2026-09-06"]);
+  });
+
+  it("nobody yet is a mark, not a fault", async () => {
     const empty = teamView({
       id: "operacoes",
       name: "Operações",
@@ -326,11 +374,11 @@ describe("Teams - the table", () => {
     await renderTeams();
 
     const table = await departments();
-    expect(table.querySelector(".teams-figure-none")).not.toBeNull();
+    expect(table.querySelector(".teams-figure-none")?.textContent).toContain("0");
     expect(within(table).getByText(/nobody yet, so no task can start/)).toBeDefined();
   });
 
-  it("says what a department does on its own in words, not by colour alone", async () => {
+  it("says what a team does on its own in words, not by colour alone", async () => {
     const team = teamView({
       id: "financas",
       name: "Finanças",
@@ -348,6 +396,18 @@ describe("Teams - the table", () => {
     expect(within(table).getByText("file_document: asks first")).toBeDefined();
     // No grant row at all IS the denial — there is no `deny` mode in the núcleo.
     expect(within(table).getByText("calendar_event: asks you")).toBeDefined();
+  });
+
+  it("the glyph column says what its glyphs mean", async () => {
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [teamView()] }));
+
+    await renderTeams();
+
+    const header = within(await departments()).getByRole("columnheader", { name: /On its own/ });
+    expect(header.textContent).toContain("does it");
+    expect(header.textContent).toContain("asks first");
+    expect(header.textContent).toContain("asks you");
+    expect(header.textContent).toContain("routines armed");
   });
 
   it("reads a grant mode this shell does not know as its own gap, not as a decision", async () => {
@@ -456,19 +516,56 @@ describe("Teams - in flight", () => {
 /* ------------------------------------------------------------ the header -- */
 
 describe("Teams - the headline", () => {
-  it("counts departments and specialists, and never a spend the daemon does not report", async () => {
+  it("counts teams and specialists, and never a spend the daemon does not report", async () => {
     const financas = teamView({ id: "financas", name: "Finanças", director_agent_id: "controller", members: ["controller", "auditor"] });
     const marketing = teamView({ id: "marketing", name: "Marketing", director_agent_id: "writer", members: ["writer"] });
     daemon.apiFetch.mockImplementation(teamsFetch({ teams: [financas, marketing] }));
 
     await renderTeams();
 
-    const headline = await screen.findByText(/2 departments · 3 specialists · none at work/);
+    const headline = await screen.findByText(/2 teams · 3 specialists · none at work/);
     // There is no per-department spend anywhere in the núcleo, so the console
     // aggregates none — the only money on this page is a per-task ceiling on a
     // card, and even that is a rule rather than a total. See the module header.
     expect(headline.textContent).not.toMatch(/\$/);
     expect(screen.queryByText(/spent/i)).toBeNull();
+  });
+
+  /**
+   * The headline and the badge name team actions.
+   *
+   * Both said `waiting on you`, which is the one queue's phrase for the six decision lists at
+   * `/waiting`. What this page has is open team actions, so the sentence says so and the badge
+   * — already inside a column headed `Waiting`, on a row that names the team — says only the
+   * one word it still needs to add.
+   */
+  it("the headline and the badge name team actions", async () => {
+    const financas = teamView({
+      id: "financas",
+      name: "Finan\u00e7as",
+      director_agent_id: "controller",
+      members: ["controller", "auditor"],
+    });
+    // Finished, so the row is not `at work`: working beats waiting, and this is about waiting.
+    const finished = teamRun({ id: "run-1", team_id: "financas", state: "done" });
+    daemon.apiFetch.mockImplementation(
+      teamsFetch({
+        teams: [financas],
+        runs: [finished],
+        actions: [teamAction({ id: 1 }), teamAction({ id: 2 })],
+      }),
+    );
+
+    await renderTeams();
+
+    const headline = await screen.findByText(/team actions? waiting/);
+    expect(headline.textContent).toContain("2 team actions waiting");
+    expect(headline.textContent).not.toContain("waiting on you");
+
+    const table = await departments();
+    const row = within(table).getAllByRole("row")[1];
+    expect(within(row).getByText("waiting").textContent).toBe("waiting");
+    expect(within(row).queryByText("waiting on you")).toBeNull();
   });
 
   it("keeps the create form closed until it is asked for", async () => {
@@ -477,8 +574,8 @@ describe("Teams - the headline", () => {
     await renderTeams();
 
     // The old page opened an eleven-field editor above a list nobody had read.
-    expect(await screen.findByRole("button", { name: "New department" })).toBeDefined();
-    expect(screen.queryByRole("heading", { level: 2, name: "New department" })).toBeNull();
+    expect(await screen.findByRole("button", { name: "New team" })).toBeDefined();
+    expect(screen.queryByRole("heading", { level: 2, name: "New team" })).toBeNull();
   });
 });
 
@@ -508,5 +605,30 @@ describe("Teams - the real route", () => {
 
     expect(await screen.findByRole("heading", { level: 1, name: "Teams" })).toBeDefined();
     expect(screen.queryByText(/not yet wired/i)).toBeNull();
+  });
+});
+
+describe("Teams - map-authored readings", () => {
+  it("a department's state is one word from the map", async () => {
+    const team = teamView({ id: "financas", name: "FinanÃ§as" });
+    const done = teamRun({ id: "run-1", team_id: "financas", state: "done" });
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [team], runs: [done], actions: [teamAction()] }));
+    await renderTeams();
+    const row = within(await departments()).getAllByRole("row")[1];
+    const badge = within(row).getByText("waiting");
+    expect(badge.textContent).toBe("waiting");
+    expect(badge.className).toContain("ui-badge-pending");
+    expect(within(row).queryByText("waiting on you")).toBeNull();
+  });
+
+  it("the spend meter draws a quantity, not work in flight", async () => {
+    const team = teamView({ budget_usd: 5, max_live_runs: 1 });
+    const live = teamRun({ id: "run-1", state: "working" });
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [team], runs: [live], runViews: { "run-1": { ...live, items: [], cost_usd: 1.2 } } }));
+    await renderTeams();
+    const meter = await screen.findByRole("img", { name: "spent on this task: $1.20 of $5.00" });
+    const gauge = meter.closest(".ui-gauge");
+    expect(gauge?.className).toContain("ui-gauge-quantity");
+    expect(gauge?.className).not.toContain("ui-gauge-active");
   });
 });

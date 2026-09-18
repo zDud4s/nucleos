@@ -1,14 +1,19 @@
-import { Outlet } from "@tanstack/react-router";
+import { useMemo } from "react";
+import { Outlet, useNavigate } from "@tanstack/react-router";
 import { useChats } from "../data/chats";
 import { untriagedCount, useMailQueue } from "../data/mail";
 import { POLL } from "../data/poll";
-import { useProjects, useProposals, useSystemHealth, wantsAttention } from "../data/system";
+import { useProjects, useSystemHealth, wantsAttention } from "../data/system";
+import { useWaitingCount } from "../data/waiting";
 import { unreadTotal } from "../lib/turns";
+import { PaletteProvider, usePaletteGroup, type PaletteGroup } from "../ui";
 import { AttentionHeartbeat } from "./AttentionHeartbeat";
 import { ConnectionGate } from "./ConnectionGate";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { NotificationsDrawer } from "./NotificationsDrawer";
+import { PaletteTrigger } from "./PaletteTrigger";
 import { Sidebar } from "./Sidebar";
+import { NAV_ITEMS } from "./nav";
 
 /**
  * Everything that is true on every page.
@@ -54,15 +59,11 @@ function Frame() {
    * it, off the same cache entry.
    */
   const health = useSystemHealth(POLL.slow);
-  /**
-   * `GET /proposals` is `list_pending` in the núcleo — the route serves the
-   * queue, not the archive — so its length *is* the badge. Filtering by status
-   * here would be the shell second-guessing a decision the route already made.
-   */
-  const proposals = useProposals();
+  /** The six decision lists share one count, so the rail cannot drift from Waiting. */
+  const waiting = useWaitingCount();
   /**
    * Unread turns, summed across every conversation. `undefined` until the
-   * list has answered once — the same honest-absence rule as `proposals`
+   * list has answered once — the same honest-absence rule as `waiting`
    * above, read through `unreadTotal` rather than a bare `.length` because a
    * chat's badge is `waiting`, not a row count.
    */
@@ -90,64 +91,113 @@ function Frame() {
   const projects = useProjects();
 
   return (
-    <div className="app-shell">
-      <AttentionHeartbeat />
-      <Sidebar
-        badges={{
-          proposals: proposals.data?.length,
-          chats: chats.data === undefined ? undefined : unreadTotal(chats.data),
-          mail: mail.data === undefined ? undefined : untriagedCount(mail.data),
-        }}
-        projects={projects.data?.map((project) => ({
-          id: project.project_id,
-          mode: project.mode,
-          pending: project.open_review_items,
-        }))}
-        systemAlert={wantsAttention(health.data)}
-      >
-        {/*
-          The connection line used to be here, and it was removed on 2026-09-05
-          because it could only ever say one thing.
+    <PaletteProvider>
+      <div className="app-shell">
+        <AttentionHeartbeat />
+        <Destinations />
+        <Sidebar
+          badges={{
+            proposals: waiting,
+            chats: chats.data === undefined ? undefined : unreadTotal(chats.data),
+            mail: mail.data === undefined ? undefined : untriagedCount(mail.data),
+          }}
+          projects={projects.data?.map((project) => ({
+            id: project.project_id,
+            mode: project.mode,
+            pending: project.open_review_items,
+          }))}
+          systemAlert={wantsAttention(health.data)}
+        >
+          {/*
+            The connection line used to be here, and it was removed on 2026-09-05
+            because it could only ever say one thing.
 
-          `ConnectionGate` wraps this whole component and `read()` returns
-          "through" only when `health.data === true`; every other reading —
-          connecting, unreachable, unauthorised — replaces the entire window with
-          a takeover. So by the time the rail is on screen the daemon is
-          answering by construction, and a status line inside it was a green dot
-          that had no second state to show. The two states worth seeing are shown
-          where they take over the screen, which is where somebody can act on
-          them.
-        */}
-        {/*
-          Two destinations, then the stop, and nothing else.
+            `ConnectionGate` wraps this whole component and `read()` returns
+            "through" only when `health.data === true`; every other reading —
+            connecting, unreachable, unauthorised — replaces the entire window with
+            a takeover. So by the time the rail is on screen the daemon is
+            answering by construction, and a status line inside it was a green dot
+            that had no second state to show. The two states worth seeing are shown
+            where they take over the screen, which is where somebody can act on
+            them.
+          */}
+          {/*
+            Two destinations, then the stop, and nothing else.
 
-          The budget line was the third thing here and came out on 2026-09-05 on
-          the owner's call. Unlike the connection line above it, it was not dead —
-          it said something true — it was just not worth a permanent row: the
-          figure is already on Home, Fleet, Autopilot, System and a project's
-          Estado mode, all of which are places somebody goes to think about
-          spending. A rail is for getting somewhere and for stopping the machine.
+            The budget line was the third thing here and came out on 2026-09-05 on
+            the owner's call. Unlike the connection line above it, it was not dead —
+            it said something true — it was just not worth a permanent row: the
+            figure is already on Home, Fleet, Autopilot, System and a project's
+            Estado mode, all of which are places somebody goes to think about
+            spending. A rail is for getting somewhere and for stopping the machine.
 
-          The drawer is above the kill switch and never below it. The switch is
-          the one control that must be reachable without aiming, from every page,
-          and inserting anything under it would move it off the bottom edge
-          people already know — the drawer is somewhere you choose to go, which
-          is a lower claim on the footer than the emergency stop has.
-        */}
-        <NotificationsDrawer />
-        {/*
-          The break this footer actually has. Everything above it is somewhere to
-          go or something to read; below it is the one control that stops the
-          machine, and it gets the width and the distance that says so.
-        */}
-        <hr className="nav-rule" />
-        <KillSwitchControl />
-      </Sidebar>
-      <main className="app-main">
-        <div className="app-page">
-          <Outlet />
-        </div>
-      </main>
-    </div>
+            The drawer is above the kill switch and never below it. The switch is
+            the one control that must be reachable without aiming, from every page,
+            and inserting anything under it would move it off the bottom edge
+            people already know — the drawer is somewhere you choose to go, which
+            is a lower claim on the footer than the emergency stop has.
+          */}
+          {/*
+            First into the slot, and put here rather than in `Sidebar.tsx`: the
+            slot's own comment says that only whoever fills it knows where the
+            break falls, and the rail does not otherwise know a palette exists.
+            `Sidebar.tsx` stays untouched, and so does its twenty-five-case test.
+          */}
+          <PaletteTrigger />
+          <NotificationsDrawer />
+          {/*
+            The break this footer actually has. Everything above it is somewhere to
+            go or something to read; below it is the one control that stops the
+            machine, and it gets the width and the distance that says so.
+          */}
+          <hr className="nav-rule" />
+          <KillSwitchControl />
+        </Sidebar>
+        <main className="app-main">
+          <div className="app-page">
+            <Outlet />
+          </div>
+        </main>
+      </div>
+    </PaletteProvider>
   );
+}
+
+/**
+ * The nineteen places the rail goes, contributed to the palette exactly the way
+ * a page contributes its own rows.
+ *
+ * It renders nothing — the shape `AttentionHeartbeat` already uses — and it
+ * lives here rather than inside `ui/Palette.tsx` because the primitive imports
+ * nothing from `app/`. There is one registration mechanism and the app is
+ * merely its first caller; a palette that knew about the nav table would be a
+ * second one, and the two would drift.
+ */
+function Destinations() {
+  const navigate = useNavigate();
+  const group = useMemo<PaletteGroup>(
+    () => ({
+      id: "go",
+      heading: "Go to",
+      items: NAV_ITEMS.map((item) => ({
+        id: item.id,
+        label: item.label,
+        /* The label, and nothing else the rail holds: a path is not a word
+           anybody types, and `nav.ts` carries the only human-readable name this
+           shell has for a route — `router.tsx` has no titles. */
+        match: item.label,
+        /* Listed, disabled, with the reason as the hint. `nav.ts` already rules
+           that hiding such an item "would be the shell pretending the feature
+           was never designed", and the palette does not get to overturn the
+           rail on the rail's own list. */
+        hint: item.disabled,
+        disabled: item.disabled !== undefined,
+        run: () => void navigate({ to: item.path }),
+      })),
+    }),
+    [navigate],
+  );
+
+  usePaletteGroup(group);
+  return null;
 }

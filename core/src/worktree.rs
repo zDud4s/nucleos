@@ -1332,6 +1332,7 @@ pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutc
             "worktree_released",
             &summary,
             Some(run_id),
+            Some(&crate::feed::run_subject(pool, run_id).await),
         )
         .await;
         feed_branch_outcome(pool, &worktree, branch_deleted).await;
@@ -1359,6 +1360,29 @@ async fn delete_branch_if_merged(project_root: &str, branch: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+/// What a feed line about this owner's worktree is about.
+///
+/// Not [`Owner::feed_run_id`], which answers a narrower question — which single run to blame — and
+/// has to say `None` for a job's tree. A subject has an answer for all three: a job's tree and an
+/// item's tree are both the job's story, and a run's tree is whatever [`feed::run_subject`] says the
+/// run belongs to. An item whose row cannot be read is the one owner with no exact key, and gets
+/// none rather than a guess.
+async fn feed_subject(pool: &SqlitePool, owner: Owner) -> Option<feed::Subject> {
+    match owner {
+        Owner::Run(run_id) => Some(feed::run_subject(pool, run_id).await),
+        Owner::Job(job_id) => Some(feed::Subject::Job(job_id)),
+        Owner::Item(item_id) => {
+            sqlx::query_scalar::<_, i64>("SELECT job_id FROM job_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten()
+                .map(feed::Subject::Job)
+        }
+    }
+}
+
 /// Records what became of a branch after its worktree was collected. Kept branches are announced
 /// too — an unmerged branch left behind is a thing the human may want to look at, not a silent leak.
 async fn feed_branch_outcome(pool: &SqlitePool, worktree: &WorktreeRow, deleted: bool) {
@@ -1366,12 +1390,17 @@ async fn feed_branch_outcome(pool: &SqlitePool, worktree: &WorktreeRow, deleted:
         return;
     }
     let summary = format!("kept unmerged branch {}", worktree.branch);
+    let subject = match worktree.owner() {
+        Some(owner) => feed_subject(pool, owner).await,
+        None => None,
+    };
     let _ = feed::append(
         pool,
         Some(&worktree.project_id),
         "worktree_branch_kept",
         &summary,
         worktree.owner().and_then(Owner::feed_run_id),
+        subject.as_ref(),
     )
     .await;
 }
@@ -1478,6 +1507,7 @@ pub(crate) async fn gc_pass(
             continue;
         };
         let feed_run_id = owner.feed_run_id();
+        let subject = feed_subject(pool, owner).await;
 
         match remove(
             Path::new(&worktree.project_root),
@@ -1508,6 +1538,7 @@ pub(crate) async fn gc_pass(
                     "worktree_removed",
                     &summary,
                     feed_run_id,
+                    subject.as_ref(),
                 )
                 .await;
                 feed_branch_outcome(pool, &worktree, branch_deleted).await;
@@ -1560,6 +1591,7 @@ pub(crate) async fn gc_pass(
                     "worktree_gc_failed",
                     &summary,
                     feed_run_id,
+                    subject.as_ref(),
                 )
                 .await;
             }
@@ -3634,6 +3666,14 @@ mod tests {
                 .iter()
                 .any(|entry| entry.kind == "worktree_removed" && entry.run_id == Some(run_id))
         );
+        let expected = format!("run:{run_id}");
+        assert!(
+            entries
+                .iter()
+                .filter(|entry| entry.kind == "worktree_removed")
+                .all(|entry| entry.subject.as_deref() == Some(expected.as_str())),
+            "a collected run's worktree is a line about that run: {entries:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3937,6 +3977,13 @@ mod tests {
             entries
                 .iter()
                 .any(|entry| { entry.kind == "worktree_released" && entry.run_id == Some(run_id) })
+        );
+        let expected = format!("run:{run_id}");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.subject.as_deref() == Some(expected.as_str())),
+            "every line a release writes is about the released run: {entries:?}"
         );
     }
 

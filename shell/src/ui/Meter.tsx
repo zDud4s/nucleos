@@ -19,13 +19,20 @@
  * ceiling finds one of them and draws a bar for a rule.
  *
  * The classes are `ui-gauge-*` and not `ui-meter-*`: `ContextMeter` in
- * `readings.tsx` already owns that prefix, and its rules live in
- * `pages/runs.css` rather than in `ui.css`. Reusing the name would have this
- * component inherit a stylesheet it has never seen.
+ * `readings.tsx` already owns that prefix, and its rules live in `ui.css` too,
+ * directly above the gauge's own. Reusing the name would have every rule
+ * written for either one silently reach both.
  */
 
-/** How full a ceiling is drawn. Absent is the seventh tone's job, not a colour. */
-export type MeterTone = "active" | "pending" | "danger";
+/**
+ * How full a ceiling is drawn, and what the fill MEANS. Absent is the seventh tone's job.
+ *
+ * `quantity` is the neutral rung. Money taken is a fact, not work in flight or a summons; it is
+ * drawn in `var(--text-muted)` and adds no token. Required, not optional: a caller drawing a bar
+ * says what the bar means. `active` is a ceiling something occupies right now, `pending` asks
+ * the reader for something, and `danger` is bad news.
+ */
+export type MeterTone = "active" | "pending" | "danger" | "quantity";
 
 export interface MeterProps {
   /** What is being occupied — "at work", "waiting on you". Also the accessible name. */
@@ -42,8 +49,8 @@ export interface MeterProps {
    * or a full one.
    */
   ceiling: number | null;
-  /** The tone of the fill. `active` unless the caller knows the reading is bad news. */
-  tone?: MeterTone;
+  /** What the fill means. Required — see {@link MeterTone}. */
+  tone: MeterTone;
   /**
    * How to write the two numbers, for a reading that is not a plain count.
    *
@@ -52,6 +59,8 @@ export interface MeterProps {
    * what it is.
    */
   format?: (value: number) => string;
+  /** Whether to draw the label and figures above the bar. `true` unless already written nearby. */
+  head?: boolean;
 }
 
 /**
@@ -61,16 +70,18 @@ export interface MeterProps {
  * anything that does not render — and because the exact figure is what somebody
  * acts on. `aria-label` carries the same sentence the eye gets.
  */
-export function Meter({ label, value, ceiling, tone = "active", format }: MeterProps) {
+export function Meter({ label, value, ceiling, tone, format, head = true }: MeterProps) {
   const write = format ?? String;
 
   if (ceiling === null) {
     return (
       <p className="ui-gauge ui-gauge-open">
-        <span className="ui-gauge-head">
-          <span className="ui-gauge-label">{label}</span>
-          <span className="ui-gauge-value">{write(value)}</span>
-        </span>
+        {head && (
+          <span className="ui-gauge-head">
+            <span className="ui-gauge-label">{label}</span>
+            <span className="ui-gauge-value">{write(value)}</span>
+          </span>
+        )}
         <span className="ui-gauge-track" role="img" aria-label={`${label}: ${write(value)}, no ceiling`} />
         <span className="ui-gauge-note">no ceiling</span>
       </p>
@@ -90,12 +101,14 @@ export function Meter({ label, value, ceiling, tone = "active", format }: MeterP
 
   return (
     <p className={classes.join(" ")}>
-      <span className="ui-gauge-head">
-        <span className="ui-gauge-label">{label}</span>
-        <span className="ui-gauge-value">
-          {write(value)} / {write(ceiling)}
+      {head && (
+        <span className="ui-gauge-head">
+          <span className="ui-gauge-label">{label}</span>
+          <span className="ui-gauge-value">
+            {write(value)} / {write(ceiling)}
+          </span>
         </span>
-      </span>
+      )}
       <span className="ui-gauge-track" role="img" aria-label={`${label}: ${write(value)} of ${write(ceiling)}`}>
         <span className="ui-gauge-fill" style={{ width: `${percent}%` }} />
       </span>

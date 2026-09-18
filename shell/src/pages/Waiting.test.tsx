@@ -10,6 +10,7 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 import { Waiting } from "./Waiting";
+import { ApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
 import type { AgentRequest } from "../data/agents";
 import type { Proposal } from "../data/system";
@@ -250,6 +251,18 @@ function orderIn(listName: string, pattern: RegExp): string[] {
 /* ------------------------------------------------------- A13: the sources -- */
 
 describe("Waiting - each section reads the route that serves it", () => {
+  it("the headline is the number the rail shows", async () => {
+    const world = waitingWorld({
+      approvals: [proposal({ id: 1 })],
+      teamActions: [proposal({ id: 2, kind: "team-action" })],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    expect(await screen.findByText("2 waiting on a decision")).toBeDefined();
+  });
+
   it("asks eight routes and shows a card from each", async () => {
     const world = waitingWorld({
       sessions: [
@@ -321,17 +334,316 @@ describe("Waiting - each section reads the route that serves it", () => {
 
     await renderWaiting();
 
+    // The absence wears the page's own empty shape, so the paragraph is one
+    // click away like every other one — the section itself is on screen from the
+    // first paint, because it answers no route and waits for nothing.
+    const section = await screen.findByRole("region", { name: "Calendar events" });
+    fireEvent.click(await within(section).findByRole("button", { name: "why?" }));
+
     const said = await screen.findByText(/mounts no route that lists the pending ones/);
     expect(said.textContent).toMatch(/what is missing is the door, not the record/);
     // Nothing was asked for on its behalf.
     const asked = daemon.apiFetch.mock.calls.map(([path]) => String(path));
     expect(asked.some((path) => path.includes("calendar"))).toBe(false);
   });
+
+  it("an excluded list says why it is not counted", async () => {
+    daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld()));
+
+    await renderWaiting();
+
+    const section = await screen.findByRole("region", { name: "Parked runs" });
+    fireEvent.click(await within(section).findByRole("button", { name: "why?" }));
+    const explanation = within(section).getByText(/A parked run is not in the count above either/);
+    expect(explanation.textContent).toContain("approval that frees it");
+  });
+});
+
+describe("Waiting - git requests", () => {
+  it("a blocked git request wears one word and the row says what to do", async () => {
+    daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld({ vcs: [vcsRow({ status: "blocked" })] })));
+
+    await renderWaiting();
+
+    const list = await screen.findByRole("list", { name: "Git requests waiting on you" });
+    const row = within(list).getByText("push #61").closest("li");
+    if (row === null) throw new Error("no blocked git row");
+    expect(within(row).getByText("blocked").textContent).toBe("blocked");
+
+    // The instruction is its own line now. It rode at the end of the faint mono path line —
+    // `--text-faint` at 11px, third clause in an em-dash chain — which is the quietest rank on
+    // the card, for the one sentence on it that is asking somebody to do something.
+    expect(within(row).getByText(/alpha:main/).textContent).not.toContain("submit it again");
+    expect(within(row).getByText("submit it again").className).toBe("waiting-hint");
+  });
+});
+
+/* ------------------------------------------------------- the empty morning -- */
+
+describe("Waiting - a section with nothing in it", () => {
+  /**
+   * The shape of an empty queue, which is this page's *normal* state.
+   *
+   * Eleven panels each explaining an absence made the page longest on the
+   * morning nothing was wrong — 1900px of scrolling to learn that there was
+   * nothing to decide. An empty section is now one line under its own heading,
+   * and the paragraph that used to sit above the list is behind "why?": kept,
+   * because "nothing has asked for the wheel" alone reads as a list that failed
+   * to load, and costing nothing to whoever does not ask.
+   */
+  it("an empty section is one line under its heading, not a panel", async () => {
+    daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld()));
+
+    await renderWaiting();
+
+    // Waited for by the sentence and not by the landmark, deliberately: a section
+    // still *reading* is also one quiet line inside a region, so asserting the
+    // shape first would pass on a page that had not answered yet.
+    const line = await screen.findByText("nothing has asked for the wheel");
+    const section = screen.getByRole("region", { name: "Wheel requests" });
+    expect(line.closest("section")).toBe(section);
+    expect(section.className).toContain("ui-section");
+
+    // One quiet line, and no panel anywhere around it.
+    expect(section.querySelectorAll(".ui-quiet")).toHaveLength(1);
+    expect(section.querySelector(".ui-panel")).toBeNull();
+    expect(section.closest(".ui-panel")).toBeNull();
+
+    // The heading is still an `h2` carrying the section's own name, so the
+    // page's outline does not depend on whether a queue happens to be busy.
+    expect(within(section).getByRole("heading", { level: 2 }).textContent).toBe("Wheel requests");
+
+    // The reasoning is kept rather than cut — one click away, no pixels until then.
+    expect(within(section).queryByText(/asking for the window/)).toBeNull();
+    fireEvent.click(within(section).getByRole("button", { name: "why?" }));
+    expect(within(section).getByText(/asking for the window/)).toBeDefined();
+  });
+
+  /**
+   * The control on the case above. A section is a panel again the moment it has
+   * something in it, which is what makes the one line a statement about the data
+   * rather than about the page.
+   */
+  it("is a panel again as soon as one row arrives", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(waitingWorld({ approvals: [proposal({ id: 11 })] })),
+    );
+
+    await renderWaiting();
+
+    const list = await screen.findByRole("list", { name: "Action approvals" });
+    expect(list.closest(".ui-panel")).not.toBeNull();
+    expect(screen.queryByRole("region", { name: "Action approvals" })).toBeNull();
+  });
+});
+
+/* ----------------------------------------------------- A13: batch approvals -- */
+
+describe("Waiting - batch action approvals", () => {
+  it("each approval card carries a checkbox named for its row", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] })),
+    );
+
+    await renderWaiting();
+
+    expect(await screen.findByRole("checkbox", { name: "Select approval #1" })).toBeDefined();
+    expect(screen.getByRole("checkbox", { name: "Select approval #2" })).toBeDefined();
+  });
+
+  it("select all takes every row and clear selection empties it", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] })),
+    );
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("button", { name: "Select all 2" }));
+    expect((screen.getByRole("checkbox", { name: "Select approval #1" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("checkbox", { name: "Select approval #2" }) as HTMLInputElement).checked).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear selection" }));
+    expect((screen.getByRole("checkbox", { name: "Select approval #1" }) as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByRole("checkbox", { name: "Select approval #2" }) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("offers no batch decision until something is selected", async () => {
+    daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 })] })));
+
+    await renderWaiting();
+    await screen.findByRole("button", { name: "Select all 1" });
+    expect(screen.queryByRole("button", { name: "Approve 1" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject 1" })).toBeNull();
+  });
+
+  it("the bar says how many are selected and which", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] })),
+    );
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Select approval #2" }));
+
+    const said = screen.getByText("1 selected — #2");
+    expect(said.getAttribute("role")).toBe("status");
+  });
+
+  it("approves the selected rows one at a time, in the order they are on screen", async () => {
+    const world = waitingWorld({ approvals: [proposal({ id: 2 }), proposal({ id: 1 })] });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Select approval #2" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select approval #1" }));
+    const approveAll = screen.getByRole("button", { name: "Approve 2" });
+    fireEvent.click(approveAll);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
+    fireEvent.click(approveAll);
+
+    await waitFor(() => {
+      const approveCalls = daemon.apiFetch.mock.calls
+        .filter(([path, init]) => init?.method === "POST" && String(path).endsWith("/approve"))
+        .map(([path]) => String(path));
+      expect(approveCalls).toEqual(["/proposals/2/approve", "/proposals/1/approve"]);
+    });
+  });
+
+  it("a refusal on one row does not stop the others and is shown on that row", async () => {
+    const world = waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] });
+    const base = waitingFetch(world);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method === "POST" && path === "/proposals/1/approve") {
+        throw new ApiRefusal(409, "conflict", "");
+      }
+      return await base(path, init);
+    });
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("button", { name: "Select all 2" }));
+    const approveAll = screen.getByRole("button", { name: "Approve 2" });
+    fireEvent.click(approveAll);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
+    fireEvent.click(approveAll);
+
+    const failedRow = screen.getByText("approval #1").closest("li");
+    expect(failedRow).not.toBeNull();
+    expect(
+      await within(failedRow as HTMLElement).findByText(
+        "this one was already answered — the list clears it on the next read, and nothing further is needed",
+      ),
+    ).toBeDefined();
+    const approveCalls = daemon.apiFetch.mock.calls
+      .filter(([path, init]) => init?.method === "POST" && String(path).endsWith("/approve"))
+      .map(([path]) => String(path));
+    expect(approveCalls).toEqual(["/proposals/1/approve", "/proposals/2/approve"]);
+  });
+
+  it("keeps the rows that failed selected and drops the ones that went through", async () => {
+    const world = waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] });
+    const base = waitingFetch(world);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method === "POST" && path === "/proposals/1/approve") {
+        throw new ApiRefusal(409, "conflict", "");
+      }
+      return await base(path, init);
+    });
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("button", { name: "Select all 2" }));
+    const approveAll = screen.getByRole("button", { name: "Approve 2" });
+    fireEvent.click(approveAll);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
+    fireEvent.click(approveAll);
+
+    await screen.findByText(
+      "this one was already answered — the list clears it on the next read, and nothing further is needed",
+    );
+    expect((screen.getByRole("checkbox", { name: "Select approval #1" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("checkbox", { name: "Select approval #2" }) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("the armed batch names the rows it will approve", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] })),
+    );
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("button", { name: "Select all 2" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve 2" }));
+
+    expect(screen.getByRole("button", { name: "Let these happen · #1, #2" })).toBeDefined();
+  });
+
+  it("names the first three and counts the rest above five", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(
+        waitingWorld({ approvals: [1, 2, 3, 4, 5, 6].map((id) => proposal({ id })) }),
+      ),
+    );
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("button", { name: "Select all 6" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve 6" }));
+
+    expect(screen.getByRole("button", { name: "Let these happen · #1, #2, #3 and 3 more" })).toBeDefined();
+  });
+
+  it("holds the order still while the batch control is armed", async () => {
+    const world = waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    const { queryClient } = await renderWaiting();
+    fireEvent.click(await screen.findByRole("button", { name: "Select all 2" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve 2" }));
+
+    world.approvals = [proposal({ id: 2 }), proposal({ id: 1 }), proposal({ id: 3 })];
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: keys.proposals.all });
+    });
+    expect(await screen.findByText("approval #3")).toBeDefined();
+    expect(orderIn("Action approvals", /^approval #\d+$/)).toEqual([
+      "approval #1",
+      "approval #2",
+      "approval #3",
+    ]);
+  });
 });
 
 /* -------------------------------------------------------- A13: the freeze -- */
 
 describe("Waiting - the ordering freeze", () => {
+  it("the armed approval names the row it will approve", async () => {
+    const world = waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+    await screen.findByText("approval #1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve #1" }));
+
+    // Two cards, one consequence sentence between them. Before this the armed button said
+    // only what would happen, on a page whose whole difficulty is which row it happens to.
+    expect(screen.getByRole("button", { name: "Let this action happen · #1" })).toBeDefined();
+    const said = screen.getByText("armed: #1 — Let this action happen — press again to confirm");
+    expect(said.getAttribute("role")).toBe("status");
+
+    // The rest label is still here, holding the width it had a click ago — hidden from the eye
+    // by `visibility` and from the ear by `aria-hidden`, which is why the button's accessible
+    // name is still only the label that is showing and every other case on this page is
+    // untouched.
+    const armedButton = screen.getByRole("button", { name: "Let this action happen · #1" });
+    const labels = armedButton.querySelectorAll(".ui-confirm-stack > *");
+    expect(labels).toHaveLength(2);
+    expect(labels[0].textContent).toBe("Approve #1");
+    expect(labels[0].getAttribute("aria-hidden")).toBe("true");
+    expect(labels[1].getAttribute("aria-hidden")).toBeNull();
+  });
+
   it("holds a section's order still while one of its cards is armed", async () => {
     const world = waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] });
     daemon.apiFetch.mockImplementation(waitingFetch(world));
@@ -342,7 +654,7 @@ describe("Waiting - the ordering freeze", () => {
 
     // One click arms; it does not decide.
     fireEvent.click(screen.getByRole("button", { name: "Approve #1" }));
-    expect(screen.getByRole("button", { name: "Let this action happen" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Let this action happen · #1" })).toBeDefined();
 
     // Now the daemon answers in a different order, with one more row.
     world.approvals = [proposal({ id: 2 }), proposal({ id: 1 }), proposal({ id: 3 })];
@@ -390,6 +702,22 @@ describe("Waiting - the ordering freeze", () => {
 /* ------------------------------------------- A14: what is deliberately absent -- */
 
 describe("Waiting - the sections that are not there", () => {
+  it("the queue calls a team a team", async () => {
+    daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld()));
+
+    await renderWaiting();
+
+    await screen.findByText("no team is waiting on an action");
+    const actions = screen.getByRole("region", { name: "Team actions" });
+    const recruitment = screen.getByRole("region", { name: "Recruitment" });
+    fireEvent.click(within(actions).getByRole("button", { name: "why?" }));
+    fireEvent.click(within(recruitment).getByRole("button", { name: "why?" }));
+
+    expect(screen.getByText("no team is waiting on an action")).toBeDefined();
+    expect(screen.getByText("no team has asked for a specialist")).toBeDefined();
+    expect(screen.queryByText(/no department/)).toBeNull();
+  });
+
   it("renders a team action's payload as readable fields, never as JSON", async () => {
     const world = waitingWorld({
       teamActions: [
@@ -436,7 +764,7 @@ describe("Waiting - the sections that are not there", () => {
     // The confirm click is its own step — a `waitFor` must not both click the
     // confirm and assert the mutation, since disarming makes a retry throw.
     await new Promise((resolve) => setTimeout(resolve, 350));
-    fireEvent.click(within(list).getByRole("button", { name: "Let this action happen" }));
+    fireEvent.click(within(list).getByRole("button", { name: "Let this action happen · #202" }));
 
     await waitFor(() => {
       expect(
@@ -496,7 +824,7 @@ describe("Waiting - the sections that are not there", () => {
     fireEvent.click(within(list).getByRole("button", { name: "Hire #301" }));
     await new Promise((resolve) => setTimeout(resolve, 350));
     fireEvent.click(
-      within(list).getByRole("button", { name: "Write the agent and add them to the roster" }),
+      within(list).getByRole("button", { name: "Write the agent and add them to the roster · #301" }),
     );
 
     await waitFor(() => {
@@ -637,9 +965,9 @@ describe("Waiting - a skipped item is put away, not refused", () => {
     // timers into a suite that waits on react-query. The confirm is a *separate*
     // wait, because `mutate` reaches the client a tick after the click.
     await waitFor(() => {
-      const armed = screen.queryByRole("button", { name: "I have read it" });
+      const armed = screen.queryByRole("button", { name: "I have read it · #41" });
       if (armed !== null) fireEvent.click(armed);
-      expect(screen.queryByRole("button", { name: "I have read it" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "I have read it · #41" })).toBeNull();
     });
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/proposals/41/dismiss", { method: "POST" });
@@ -665,5 +993,45 @@ describe("Waiting - the route", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Waiting" })).toBeDefined();
     expect(router.state.location.pathname).toBe("/waiting");
     expect(screen.queryByText("Waiting is not built yet")).toBeNull();
+  });
+});
+
+/* ------------------------------------------------ a project in the location -- */
+
+/**
+ * The queue, narrowed by the location and saying so.
+ *
+ * A project page's loudest sentence links here with its own name in the search, so this page
+ * has to be able to show one project's share of the queue. Two things are under test and the
+ * second is the one that is easy to forget: rows belonging to another project are gone, AND
+ * the page admits that it is withholding them. A silently filtered queue reads as an empty
+ * one, which is the wrong claim to make to somebody deciding whether they are done.
+ */
+describe("Waiting - a project in the location", () => {
+  it("a project in the location narrows the queue and says so", async () => {
+    const world = waitingWorld({
+      approvals: [
+        proposal({ id: 11, project_id: "nucleos", tool_name: "Bash" }),
+        proposal({ id: 12, project_id: "other", tool_name: "Bash" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWithRouter(<Waiting />, { initialPath: "/waiting?project=nucleos" });
+
+    expect(await screen.findByText("approval #11")).toBeDefined();
+    expect(screen.queryByText("approval #12")).toBeNull();
+
+    // The admission, and the way back out of it.
+    //
+    // Found by what it says rather than by being the page's only live region: every
+    // `ConfirmButton` now renders its own polite `role="status"` — empty at rest — so that
+    // arming and expiring are announced, and this page holds several of them.
+    const note = screen.getByText(/^Only nucleos\./);
+    expect(note.getAttribute("role")).toBe("status");
+    expect(note.textContent).toBe("Only nucleos. Show everything");
+    expect(within(note).getByRole("link", { name: "Show everything" }).getAttribute("href")).toBe(
+      "/waiting",
+    );
   });
 });

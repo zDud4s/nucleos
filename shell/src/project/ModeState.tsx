@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { Link } from "@tanstack/react-router";
 import {
   compactTokens,
   efficiencyTrend,
@@ -167,7 +168,7 @@ function Leading({
   const tone = toneFor(concern.kind);
 
   return (
-    <section aria-label="Leading" className="min-h-16">
+    <section aria-label="Leading" aria-live="polite" className="min-h-16">
       {concern.kind === "unknown" ? (
         <p className="font-display text-lg text-text-faint">Reading {project}…</p>
       ) : concern.kind === "calm" ? (
@@ -182,14 +183,29 @@ function Leading({
         </p>
       ) : (
         <div
+          role="status"
           className="rounded-lg border bg-surface-raised p-5"
           style={{ borderColor: `var(--tone-${tone}-border)` }}
         >
-          <p className="font-display text-xl font-medium leading-snug text-text">
-            {concern.count === null
-              ? CONCERN_TEXT[concern.kind]
-              : `${concern.count} ${concern.count === 1 ? "decision" : "decisions"} waiting on you.`}
-          </p>
+          {/*
+            A count is the one concern with somewhere to go: those proposals are rows in the
+            Waiting queue, and the sentence naming them should be the way there, narrowed to
+            this project. A kill switch or a budget hold has no queue behind it, so it stays a
+            paragraph — a link that led nowhere would be a promise the page cannot keep.
+          */}
+          {concern.count === null ? (
+            <p className="font-display text-xl font-medium leading-snug text-text">
+              {CONCERN_TEXT[concern.kind]}
+            </p>
+          ) : (
+            <Link
+              to="/waiting"
+              search={{ project }}
+              className="font-display text-xl font-medium leading-snug"
+            >
+              {concern.count} {concern.count === 1 ? "decision" : "decisions"} waiting on you.
+            </Link>
+          )}
           {concern.kind === "budget-paused" && budgetReason !== null ? (
             <p className="mt-2 text-sm text-text-muted">{budgetReason}</p>
           ) : null}
@@ -290,10 +306,10 @@ function EfficiencyReading({ data }: { data: ProjectReadings | undefined }) {
   const trend = efficiencyTrend(efficiency);
   return (
     <Card label="Token efficiency" span>
-      <p className="mt-1 font-display text-3xl text-text">
+      <p className="mt-1 font-display text-3xl font-bold tabular-nums text-text">
         {compactTokens(efficiency.median_total_tokens)}
-        <span className="ml-2 text-sm text-text-faint">median per session</span>
       </p>
+      <p className="text-xs text-text-faint">median per session</p>
       <p className="mt-1 text-xs text-text-muted">
         {efficiency.measured_runs} measured
         {/*
@@ -324,7 +340,7 @@ function CostReading({ data }: { data: ProjectReadings | undefined }) {
   }
   return (
     <Card label="Cost">
-      <p className="mt-1 font-display text-xl text-text">$ {data.cost.usd.toFixed(2)}</p>
+      <p className="mt-1 font-display text-xl font-bold tabular-nums text-text">${data.cost.usd.toFixed(2)}</p>
       <p className="mt-1 text-xs text-text-muted">
         over {data.cost.runs} {data.cost.runs === 1 ? "run" : "runs"}, {data.window_days} days
       </p>
@@ -366,10 +382,10 @@ function GateReading({ data }: { data: ProjectReadings | undefined }) {
 
   return (
     <Card label="Gate">
-      <p className="mt-1 font-display text-xl text-text">
+      <p className="mt-1 font-display text-xl font-bold tabular-nums text-text">
         {Math.round(share.passed * 100)}%
-        <span className="ml-2 text-sm text-text-faint">of {share.judged} judged</span>
       </p>
+      <p className="text-xs text-text-faint">of {share.judged} judged</p>
       <div className="mt-2 flex h-1.5 overflow-hidden rounded-pill bg-surface-sunken">
         <span style={{ width: `${share.passed * 100}%` }} className="bg-tone-active-fg" />
         <span style={{ width: `${share.failed * 100}%` }} className="bg-tone-danger-fg" />
@@ -405,10 +421,10 @@ function DeliveredReading({ data }: { data: ProjectReadings | undefined }) {
   }
   return (
     <Card label="Delivered">
-      <p className="mt-1 font-display text-xl text-text">
+      <p className="mt-1 font-display text-xl font-bold tabular-nums text-text">
         {data.delivered.landed}
-        <span className="ml-2 text-sm text-text-faint">landed</span>
       </p>
+      <p className="text-xs text-text-faint">landed</p>
       <p className="mt-1 text-xs text-text-muted">
         {data.delivered.median_minutes === null
           ? "none of them had a run to time from"

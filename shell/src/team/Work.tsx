@@ -13,12 +13,14 @@ import {
 import {
   Button,
   ErrorNote,
-  Inset,
   Meter,
   Panel,
   Quiet,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
+  Section,
   StateBadge,
   usd,
 } from "../ui";
@@ -61,28 +63,32 @@ export function Work({ team, runs }: WorkProps) {
       <Composer teamId={team.id} />
 
       {live.length > 0 && (
-        <Panel title="In flight">
-          {live.map((run) => (
-            <LiveTask key={run.id} run={run} ceiling={team.budget_usd} />
-          ))}
-        </Panel>
+        <Section label="In flight">
+          <Rows label="In flight">
+            {live.map((run) => (
+              <Row key={run.id}>
+                <LiveTask run={run} ceiling={team.budget_usd} />
+              </Row>
+            ))}
+          </Rows>
+        </Section>
       )}
 
       <Panel title="Tasks">
-        {runs.length === 0 && <Quiet says="no task yet for this department." />}
+        {runs.length === 0 && <Quiet says="no task yet for this team." />}
         {done.length > 0 && (
-          <ul className="teams-runs" aria-label="Tasks">
+          <Rows label="Tasks">
             {done.map((run) => (
-              <Inset as="li" key={run.id}>
+              <Row key={run.id}>
                 <div className="teams-run-head">
                   <Link to={`/team-runs/${run.id}`}>{run.request}</Link>
                   <StateBadge domain="team_run" state={run.state} />
                   <RelativeTime at={run.created_at} />
                 </div>
                 {run.why !== null && <p className="teams-run-why">{run.why}</p>}
-              </Inset>
+              </Row>
             ))}
-          </ul>
+          </Rows>
         )}
         {/*
           The honest footer. `GET /team-runs` is a hard LIMIT 100 across EVERY
@@ -91,8 +97,8 @@ export function Work({ team, runs }: WorkProps) {
           hundred.
         */}
         <p className="teams-cap">
-          showing this department&apos;s tasks from the newest {TEAM_RUN_LIST_LIMIT} runs across all
-          departments — there is no paging past that cap.
+          showing this team&apos;s tasks from the newest {TEAM_RUN_LIST_LIMIT} runs across all teams
+          — there is no paging past that cap.
         </p>
       </Panel>
     </div>
@@ -123,7 +129,7 @@ function Composer({ teamId }: { teamId: string }) {
       }}
     >
       <label className="teams-composer-field">
-        <span className="teams-label">Ask this department for something</span>
+        <span className="teams-label">Ask this team for something</span>
         <textarea
           className={grown ? "teams-textarea teams-composer-grown" : "teams-textarea"}
           rows={grown ? 3 : 1}
@@ -198,12 +204,13 @@ function LiveTask({ run, ceiling }: { run: TeamRun; ceiling: number | null }) {
       ) : (
         <>
           <Rounds items={detail.data.items} round={detail.data.round} />
+          {/* A spend does not ask the reader for anything; Teams reads the same meter this way. */}
           <Meter
             label="spent on this task"
             value={detail.data.cost_usd}
             ceiling={ceiling}
             format={usd}
-            tone="pending"
+            tone="quantity"
           />
         </>
       )}
@@ -227,7 +234,9 @@ function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
   const rounds = [...new Set(items.map((item) => item.round))].sort((a, b) => a - b);
 
   return (
-    <ol className="teams-rounds" aria-label="Rounds">
+    <>
+      <p className="teams-rounds-key"><span>✓ done</span><span>⋯ running</span><span>· not started</span><span>✗ failed</span></p>
+      <ol className="teams-rounds" aria-label="Rounds">
       {rounds.map((number) => (
         <li className="teams-round-line" key={number}>
           <span className="teams-round-no">round {number}</span>
@@ -256,15 +265,15 @@ function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
           <span className="teams-round-none">not planned yet</span>
         </span>
       </li>
-    </ol>
+      </ol>
+    </>
   );
 }
 
 /** A glyph per item state. The word travels beside it for anything that does not render. */
 const MARK: Record<string, string> = {
   done: "✓",
-  working: "⋯",
-  planned: "·",
+  running: "⋯",
+  pending: "·",
   failed: "✗",
-  skipped: "–",
 };

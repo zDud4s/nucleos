@@ -14,10 +14,10 @@ import {
   type TriageOutcome,
 } from "../data/mail";
 import {
-  Badge,
   Button,
   Count,
   ErrorNote,
+  Field,
   PageHeader,
   Panel,
   Quiet,
@@ -28,7 +28,6 @@ import {
   StaleNote,
   StateBadge,
   Teach,
-  type BadgeTone,
 } from "../ui";
 import "./mail.css";
 
@@ -78,10 +77,7 @@ export function Mail() {
     <>
       <PageHeader title="Mail" headline={headline(rows)} />
 
-      <ConfigPanel config={config} />
-
-      <TriagePanel />
-
+      {/* Mail opens on what arrived; configuration is filled in once, not read first. */}
       <Panel title="Queue" aside={<UntriagedCount rows={rows} />}>
         <MailSearchBar q={q} onSearch={setQ} />
         {stale && <StaleNote dataUpdatedAt={queue.dataUpdatedAt} />}
@@ -89,9 +85,13 @@ export function Mail() {
         <QueueList rows={rows} filtered={q !== undefined} />
       </Panel>
 
+      <TriagePanel />
+
       <CursorPanel mailbox={mailbox} cursor={cursor.data} loading={cursor.data === undefined && !cursor.isError} />
 
       <SkippedAbsence />
+
+      <ConfigPanel config={config} />
     </>
   );
 }
@@ -193,8 +193,7 @@ function MailSearchBar({ q, onSearch }: { q: string | undefined; onSearch: (q: s
         onSearch(text === "" ? undefined : text);
       }}
     >
-      <label className="mail-search-field">
-        <span>Search</span>
+      <Field label="Search">
         <input
           name="q"
           defaultValue={q ?? ""}
@@ -202,9 +201,11 @@ function MailSearchBar({ q, onSearch }: { q: string | undefined; onSearch: (q: s
           aria-label="Search sender, subject or summary"
           placeholder="sender, subject or summary"
         />
-      </label>
-      <Button type="submit">Search</Button>
-      {q !== undefined && <Button onClick={() => onSearch(undefined)}>Clear</Button>}
+      </Field>
+      <div className="mail-search-actions">
+        <Button type="submit">Search</Button>
+        {q !== undefined && <Button onClick={() => onSearch(undefined)}>Clear</Button>}
+      </div>
     </form>
   );
 }
@@ -257,41 +258,23 @@ function MailRow({ row }: { row: QueuedEmail }) {
       <div className="mail-row-head">
         {/* NULL and "noise" are two different facts and must read as two
             different badges — see this file's header. */}
-        <StateBadge domain="email_class" state={row.triage_class} />
+        <span className="mail-row-badges">
+          <StateBadge domain="email_class" state={row.triage_class} />
+          {/* `has_attachments` is an i64 0/1 over the wire, not a boolean. */}
+          {row.has_attachments === 1 && <span className="mail-attachment">attachment</span>}
+          {row.sender_verdict !== null && (
+            <span className={`mail-verdict mail-verdict-${row.sender_verdict}`}>{row.sender_verdict}</span>
+          )}
+        </span>
         <span className="mail-row-from">{row.from_name ?? row.from_addr}</span>
-        {/* `has_attachments` is an i64 0/1 over the wire, not a boolean. */}
-        {row.has_attachments === 1 && <span className="mail-attachment">attachment</span>}
-        {row.sender_verdict !== null && <Badge tone={verdictTone(row.sender_verdict)}>{row.sender_verdict}</Badge>}
+        <Link to={`/mail/${row.id}`} className="mail-row-subject">
+          {row.subject ?? "(no subject)"}
+        </Link>
         <RelativeTime at={row.received_at} />
+        {row.triage_summary !== null && <p className="mail-row-summary">{row.triage_summary}</p>}
       </div>
-      <Link to={`/mail/${row.id}`} className="mail-row-subject">
-        {row.subject ?? "(no subject)"}
-      </Link>
-      {row.triage_summary !== null && <p className="mail-row-summary">{row.triage_summary}</p>}
     </Row>
   );
-}
-
-/**
- * The tone for a standing decision about a sender.
- *
- * A pin is a decision to keep seeing this sender in full; a mute is the
- * opposite. Two of the seven tones, which is what the hand-rolled
- * `.mail-verdict-pin` / `.mail-verdict-mute` chips already were — they named
- * `--tone-active-*` and `--tone-off-*` and simply drew them at the wrong
- * radius, without the edge the triple asks for. Neither is a `StateBadge`
- * domain, because neither is a state machine the núcleo runs.
- *
- * `sender_verdict` is `string | null` over the wire, so the third case is real
- * and is not a grey chip: Switched Off Grey means "off on purpose", and a word
- * this shell has never heard of would be claiming the sender was muted. Stated
- * Blue is the tone for a fact with no verdict attached, which is exactly what
- * an unrecognised verdict is.
- */
-function verdictTone(verdict: string): BadgeTone {
-  if (verdict === "pin") return "active";
-  if (verdict === "mute") return "off";
-  return "info";
 }
 
 /* -------------------------------------------------------------- configuration -- */
@@ -307,23 +290,21 @@ function ConfigPanel({ config }: { config: { data: EmailConfigView | undefined; 
           <div className="mail-config-fact">
             <dt>account</dt>
             <dd>
-              {data.username}@{data.host}
+              {configAccount(data)}
             </dd>
           </div>
           <div className="mail-config-fact">
             <dt>mailbox</dt>
-            <dd>{data.mailbox}</dd>
+            <dd>{configMailbox(data)}</dd>
           </div>
           <div className="mail-config-fact">
             <dt>state</dt>
             <dd>{configState(data)}</dd>
           </div>
-          {data.local_triage_disabled !== null && (
-            <div className="mail-config-fact">
-              <dt>local triage</dt>
-              <dd>{data.local_triage_disabled}</dd>
-            </div>
-          )}
+          <div className="mail-config-fact">
+            <dt>local triage</dt>
+            <dd>{configLocalTriage(data)}</dd>
+          </div>
         </dl>
       )}
     </Panel>
@@ -339,6 +320,23 @@ function configState(data: EmailConfigView): string {
   if (!data.enabled) return "not enabled — nothing is fetched";
   if (!data.armed) return "enabled but not armed — mail arrives, triage does not run";
   return "enabled and armed";
+}
+
+function configAccount(data: EmailConfigView): string {
+  if (!data.username && !data.host) return "no account configured";
+  return [data.username, data.host].filter(Boolean).join("@");
+}
+
+function configMailbox(data: EmailConfigView): string {
+  if (!data.mailbox) return "no mailbox named";
+  return data.mailbox;
+}
+
+function configLocalTriage(data: EmailConfigView): string {
+  const disabled = (data as { local_triage_disabled?: unknown }).local_triage_disabled;
+  if (disabled === null) return "nothing is wrong";
+  if (typeof disabled === "string") return `disabled: ${disabled}`;
+  return "unknown";
 }
 
 function ConfigError({ error }: { error: unknown }) {

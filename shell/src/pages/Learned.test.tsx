@@ -61,6 +61,25 @@ async function panelFor(headingText: string | RegExp): Promise<HTMLElement> {
 }
 
 describe("Learned", () => {
+  it("four kinds of refinement wear one tone, because a kind is not a state", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        refinement({ id: 1, kind: "prompt" }),
+        refinement({ id: 2, kind: "memory" }),
+        refinement({ id: 3, kind: "skill" }),
+        refinement({ id: 4, kind: "subagent" }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+
+    for (const [kind, word] of [["prompt", "instruction"], ["memory", "fact"], ["skill", "how-to"], ["subagent", "delegation"]] as const) {
+      const badge = await screen.findByText(word);
+      expect(badge.className, kind).toContain("ui-badge-info");
+    }
+    expect(screen.queryByText("instruction")?.className).not.toContain("ui-badge-shadow");
+  });
+
   it("keeps what is waiting apart from what is in force", async () => {
     daemon.apiFetch.mockImplementation(
       daemonWith([
@@ -158,5 +177,40 @@ describe("Learned", () => {
     // met it with three blank panels would read as broken rather than as new.
     expect(await screen.findByText(/nothing has been learned yet/i)).toBeDefined();
     expect(screen.queryByRole("heading", { level: 2, name: "In force" })).toBeNull();
+  });
+
+  it("the headline names refinements", async () => {
+    // "waiting on you" is the one queue's phrase, and this page counts one kind
+    // of thing: a refinement somebody proposed. Naming it is what lets a reader
+    // hold Home's number and this one at the same time without adding them up.
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        refinement({ id: 1, status: "active", title: "in force" }),
+        refinement({ id: 2, status: "proposed", title: "one", proposal_id: 9 }),
+        refinement({ id: 3, status: "proposed", title: "two", proposal_id: 10 }),
+        refinement({ id: 4, status: "proposed", title: "three", proposal_id: 11 }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+
+    expect(
+      (await screen.findByText(/refinements proposed/)).textContent,
+    ).toBe("one note is in force; 3 refinements proposed");
+  });
+
+  it("says nothing proposed when every refinement is settled", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        refinement({ id: 1, status: "active", title: "in force" }),
+        refinement({ id: 2, status: "reverted", title: "taken back" }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+
+    expect((await screen.findByText(/nothing proposed/)).textContent).toBe(
+      "one note is in force; nothing proposed",
+    );
   });
 });

@@ -195,3 +195,19 @@ describe("MailDetail — sending a reply", () => {
     expect(screen.queryByText(/this shell has no reading/)).toBeNull();
   });
 });
+
+describe("MailDetail — an absent subject", () => {
+  it("replies to a message whose subject the daemon never sent", async () => {
+    const detail = emailDetail();
+    delete (detail as { subject?: unknown }).subject;
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/email/42") return detail;
+      return undefined;
+    });
+
+    await renderMailDetail("/mail/42");
+
+    expect(await screen.findByText("Reply")).toBeDefined();
+    expect((screen.getByLabelText("Reply subject") as HTMLInputElement).value).toBe("Re:");
+  });
+});

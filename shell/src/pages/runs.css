@@ -1,46 +1,449 @@
 /**
- * The Runs slice: the index, the new-run form, the presets rail and the run
- * detail. `runs-` throughout, as `fleet-` is for the fleet.
+ * The Runs slice: the index and its filter strip, the New run panel (the form
+ * and the presets beside it) and the run detail. `runs-` throughout, as
+ * `fleet-` is for the fleet.
  *
  * The rule this file lives under: **no class appears in a component that is not
  * defined below.** `tsc` and vitest both pass happily on a class no stylesheet
  * has ever heard of, and the defect shows up only as something looking wrong on
  * a screen nobody is testing.
- *
- * There is no exception any more. `src/ui/readings.tsx` is a design system
- * primitive, and the three formatters' rules it needs were housed here on loan
- * for want of a packet that could touch `src/ui.css`. They now live there, with
- * the rest of the `ui-` prefix, where twenty pages can rely on them without
- * first having visited Runs.
- *
- * The boxes themselves are no longer this file's either. A run row and a preset
- * are both `Inset`, and the three "reading…" lines are `Quiet`; what is left
- * here is the layout around them and the type inside them. Nothing below draws
- * a card.
  */
 
-/* ================================================================= shared == */
+/* ================================================================ new run == */
 
-/**
- * What the index and the presets rail have in common.
- *
- * Both are a column of `Inset` boxes with a head line, mono annotations beside
- * it and a paragraph of the prompt under it. The two were written out
- * separately, which is how they came to disagree about `white-space` on the
- * same three words.
- */
+/* Between the header and the filters, so opening it pushes the list down and
+   never sideways. No `display` here: the `hidden` attribute is what closes it. */
+.runs-compose {
+  margin-bottom: var(--space-5);
+}
 
-/**
- * The filter bar's fields and the new-run form's fields are one recipe.
- *
- * Two names rather than one because the controls under them differ — a filter
- * is tighter than a form field — but the label above is the same label, and
- * writing it twice is how the two drift apart the first time one is touched.
- * There is nothing shared to reach for instead: DESIGN.md records the missing
- * input primitive as the largest remaining hole in the component layer, and
- * until `ui.css` has one, grouping the selector is as far as a page can take it.
- */
-.runs-filter,
+/* The panel body is the container, so the two halves decide by the width they
+   actually have — the same viewport is a different width with the rail open. */
+.runs-compose-frame {
+  container-type: inline-size;
+}
+
+.runs-compose-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-6);
+  align-items: start;
+}
+
+@container (min-width: 48rem) {
+  .runs-compose-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(16rem, 22rem);
+  }
+}
+
+.runs-compose-form {
+  min-width: 0;
+}
+
+.runs-new,
+.runs-steer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.runs-new {
+  gap: var(--space-4);
+}
+
+.runs-prompt {
+  min-height: 5rem;
+  resize: vertical;
+  line-height: var(--leading-snug);
+}
+
+/* Where it runs: two short fields, side by side while there is room. */
+.runs-new-where {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: var(--space-3);
+}
+
+/* ------------------------------------------------------------------ mode -- */
+
+.runs-modes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+/* The field label's rank, so the fieldset reads as one more field. */
+.runs-modes-legend {
+  margin-bottom: var(--space-2);
+  padding: 0;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.runs-mode {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+}
+
+.runs-mode input {
+  margin: 0;
+  accent-color: var(--text);
+}
+
+.runs-mode-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+/* The mode is the literal the daemon records on the row, so it wears the face
+   the list below shows it in. */
+.runs-mode-name {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.runs-mode-says {
+  grid-column: 2;
+  max-width: var(--measure-prose);
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+}
+
+/* ----------------------------------------------------------- before start -- */
+
+/* A refusal the núcleo is about to make, said before the press: Held Ember's
+   whole triple, and never a stripe. */
+.runs-hold {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--tone-paused-border);
+  border-radius: var(--radius-md);
+  background: var(--tone-paused-bg);
+  color: var(--tone-paused-fg);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+.runs-check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.runs-check input {
+  accent-color: var(--text);
+}
+
+.runs-new-actions,
+.runs-steer-actions,
+.runs-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* The save-a-preset half is a second gesture on the same draft, not a second
+   form about something else — the rule is what says so. One row, its own
+   width: the quiet button must never grow into something that outweighs Start
+   run. */
+.runs-save {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2) var(--space-3);
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px dashed var(--border);
+}
+
+.runs-save > .ui-field {
+  flex: 0 1 18rem;
+}
+
+.runs-save .ui-field input {
+  min-width: 0;
+}
+
+/* A quiet button has no padding, so it sits on the input's text line rather
+   than on its bottom border. */
+.runs-save > .ui-button {
+  margin-bottom: var(--space-2);
+}
+
+.runs-save > .ui-note {
+  flex-basis: 100%;
+}
+
+/* ================================================================ presets == */
+
+/* Inside the panel the list is rules between rows, not a box inside a box. */
+.runs-presets.ui-rows {
+  border: none;
+  border-radius: 0;
+}
+
+.runs-presets > .runs-preset {
+  gap: var(--space-2);
+  padding-inline: 0;
+}
+
+.runs-preset-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.runs-preset-name {
+  font-family: var(--font-display);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.runs-preset-fact,
+.runs-preset-cwd {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.runs-preset-cwd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* Two lines of the prompt, then an ellipsis: this list is for choosing between
+   presets, not for reading one. */
+.runs-preset-prompt {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.runs-preset-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+}
+
+/* Delete is a quiet interlock: an underlined word in a box reserved for "Delete
+   memory-upkeep for good". Centred in that box it stood off from Run beside it,
+   and on a wrapped line off the row's left edge. Start-aligned, as Fleet's Lift
+   is and for the same reason; the width stays reserved, so arming moves
+   nothing. Scoped to this row, because System's quiet Restart is aligned to a
+   right edge and centring is the closer of the two answers there. */
+.runs-preset-actions .ui-confirm-stack {
+  justify-items: start;
+}
+
+.runs-preset-actions .ui-confirm-stack > * {
+  justify-content: flex-start;
+}
+
+/* ================================================================ filters == */
+
+/* A strip on the page, not a card on it: the list below is the one box. */
+.runs-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+/* `.ui-switch` puts itself at the top of a flex row; here it lines up with the
+   bottoms of the fields beside it. */
+.runs-filters > .runs-scope {
+  align-self: flex-end;
+}
+
+/* One height along the strip: the segments and the Search button take the
+   field's own block padding, so they stand level with the inputs beside them. */
+.runs-scope .ui-switch-seg,
+.runs-search > .ui-button {
+  padding-block: var(--space-2);
+}
+
+/* The one field that grows: a prompt search is a phrase, the rest are words
+   chosen from a list. Its submit sits against it, so it cannot read as the
+   button that applies every filter. */
+.runs-search {
+  display: flex;
+  flex: 1 1 18rem;
+  align-items: flex-end;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.runs-search > .ui-field {
+  flex: 1 1 auto;
+}
+
+/* The field primitive's 14rem floor is for a form; in a strip that wraps it is
+   what would push the row past a narrow window. */
+.runs-filters .ui-field input,
+.runs-filters .ui-field select {
+  min-width: 0;
+}
+
+.runs-filters-aside {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding-bottom: var(--space-2);
+}
+
+.runs-more {
+  display: flex;
+  flex-wrap: wrap;
+  flex-basis: 100%;
+  gap: var(--space-3) var(--space-4);
+}
+
+.runs-more[hidden] {
+  display: none;
+}
+
+/* =================================================================== list == */
+
+/* A row is a state, then the request, then the facts about it. The badge holds
+   its own column so the excerpts of twelve rows start on one left edge; the
+   name and the metadata share the second, one above the other.
+
+   8rem and not 6rem for the badge: `.ui-badge` is `white-space: nowrap`, so the
+   longest run state — "awaiting approval" — does not wrap. At 6rem it overran
+   its track and painted itself over the first word of the excerpt. */
+.runs-row {
+  display: grid;
+  grid-template-columns: 8rem minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+}
+
+.runs-row-state {
+  justify-self: start;
+}
+
+/* The normal state, receded: the map's word, no pill. */
+.runs-row-settled {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* The excerpt is what the run IS, so it is the link — an id is a handle, not a
+   name. Two lines, because a prompt can be a paragraph and a list of twelve
+   runs must stay a list. */
+.runs-row-name {
+  grid-column: 2;
+  max-width: var(--measure-prose);
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  text-decoration: none;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+.runs-row-name:hover {
+  text-decoration: underline;
+}
+
+/* One metadata line under the name, on fixed columns so id, mode, project, time
+   and cost line up down the list instead of moving with every excerpt. */
+.runs-row-meta {
+  grid-column: 2;
+  display: grid;
+  grid-template-columns: 4.5rem 5.5rem 7rem 7rem minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--space-3);
+  margin: 0;
+}
+
+/* Muted, not faint: faint on the row's surface measured 3.45:1, under the
+   4.5:1 floor, and the cost at the end of this line is the one figure worth
+   reading down the column. */
+.runs-row-id,
+.runs-row-mode,
+.runs-row-project,
+.runs-row-cost,
+.runs-row-meta .ui-reading-time {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* The money is the one figure worth reading down the column, so it ends the
+   metadata line rather than sitting in the middle of the words. */
+.runs-row-cost {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* Each row is its own container, so the metadata line decides by the width the
+   row actually has. The fixed columns need about 44rem of row; under that they
+   ran past the excerpt's column and `.ui-rows` clipped the time and the cost off
+   the edge at 800px. Narrower, the facts wrap as a line of words instead. */
+.runs-row {
+  container-type: inline-size;
+}
+
+@container (max-width: 44rem) {
+  .runs-row-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 var(--space-3);
+  }
+
+  .runs-row-cost {
+    text-align: left;
+  }
+}
+
+/* A list that arrived at the ceiling may have been cut, and says so rather than
+   letting the reader believe they have seen everything. */
+.runs-ceiling {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* ================================================================= detail == */
+
 .runs-field {
   display: flex;
   flex-direction: column;
@@ -52,12 +455,18 @@
   color: var(--text-faint);
 }
 
-.runs-filter select,
-.runs-filter input,
+.runs-field label {
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
 .runs-field input,
 .runs-field select,
 .runs-field textarea {
   width: 100%;
+  padding: var(--space-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
@@ -68,250 +477,17 @@
   letter-spacing: normal;
 }
 
-/* The one property the two kinds of field genuinely disagree about: the bar is
-   a strip of four controls that has to stay one strip, and the form is a
-   column with room to breathe. */
-.runs-filter select,
-.runs-filter input {
-  padding: var(--space-1) var(--space-2);
-}
-
-.runs-field input,
-.runs-field select,
 .runs-field textarea {
-  padding: var(--space-2);
+  resize: vertical;
+  line-height: var(--leading-snug);
 }
 
-/* The global ring at a 1px offset, which is the offset the system allows a
-   tight control. Colour and width are untouched. */
-.runs-filter select:focus-visible,
-.runs-filter input:focus-visible,
 .runs-field input:focus-visible,
 .runs-field select:focus-visible,
 .runs-field textarea:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
-
-/* Neither column is hairline-ruled, so neither is `Rows`: both are read by
-   picking an item out rather than by scanning down, and that is the question
-   which chooses `Inset`. */
-.runs-list,
-.runs-presets {
-  display: flex;
-  flex-direction: column;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.runs-list {
-  gap: var(--space-2);
-}
-
-/* Looser than the index: a preset box is taller, and at the index's gap the
-   rail reads as one block rather than as a stack of things to choose between. */
-.runs-presets {
-  gap: var(--space-3);
-}
-
-.runs-row-head,
-.runs-preset-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-2);
-}
-
-/* What the daemon recorded, said in the margin of the line that names the
-   thing: the mode, the project, the cost, the exit code. Mono because the
-   daemon wrote it, faint because it qualifies the title beside it, and
-   `nowrap` because these are two-word facts — "no project" broken across two
-   lines in a head is not a shorter head. */
-.runs-row-mode,
-.runs-row-project,
-.runs-row-cost,
-.runs-preset-mode,
-.runs-preset-project,
-.runs-gate-exit {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-  white-space: nowrap;
-}
-
-/* The prompt as prose, in whichever of the two columns it is being read in.
-   `anywhere` because a prompt may be one unbroken path or URL, and a column
-   that scrolls sideways to show one is a column nobody reads. */
-.runs-row-excerpt,
-.runs-preset-prompt {
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
-}
-
-.runs-new-actions,
-.runs-steer-actions,
-.runs-detail-actions,
-.runs-preset-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-}
-
-/* ================================================================ filters == */
-
-.runs-filters {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: end;
-  gap: var(--space-3);
-  margin-bottom: var(--space-4);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-}
-
-/* The one field that grows: a prompt search is a phrase, the rest are words
-   chosen from a list. */
-.runs-filter-text {
-  flex: 1 1 14rem;
-}
-
-/* =================================================================== body == */
-
-/**
- * The index and the two things that create runs, side by side.
- *
- * The list is the page and the forms are the margin — `minmax(0, 1fr)` on the
- * first column so a long prompt excerpt wraps instead of pushing the rail off
- * the screen.
- *
- * It collapses on its **own** width and not on the window's, which is why the
- * `68rem` media query that used to sit here was never the app's `60rem` and
- * never could be. That number was compensating for the sidebar: at a 60rem
- * window an open rail leaves this grid 41rem and a shut one leaves 53rem, and a
- * viewport query cannot tell those apart, so whichever number is picked is
- * wrong for one of the two states. A container query asks the question that
- * actually decides — is there room here for a 22rem rail beside the list — and
- * gets the same answer whatever the sidebar is doing. 48rem is where the old
- * 68rem fell with the rail open, so nothing moves for anyone who kept it open.
- *
- * A container cannot restyle itself, so the collapse is written as the two
- * children spanning both tracks rather than as a one-column template. Same
- * result — the fixed track stays in the definition and nothing is left beside
- * it to sit in.
- */
-.runs-body {
-  container: runs-body / inline-size;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 22rem;
-  gap: var(--space-5);
-  align-items: start;
-}
-
-@container runs-body (max-width: 48rem) {
-  .runs-main,
-  .runs-side {
-    grid-column: 1 / -1;
-  }
-}
-
-.runs-main {
-  min-width: 0;
-}
-
-.runs-side {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  min-width: 0;
-}
-
-/* =================================================================== list == */
-
-/* The colour is not restated here: `base.css` gives every `a` the accent, and
-   the only thing left to say about a run id is that the daemon numbered it. */
-.runs-row-link {
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-}
-
-/* The money is the one figure worth reading down the column, so it sits at the
-   end of the row rather than in the middle of the words. */
-.runs-row-cost {
-  margin-left: auto;
-  font-variant-numeric: tabular-nums;
-}
-
-/* A list that arrived at the ceiling may have been cut, and says so rather than
-   letting the reader believe they have seen everything. */
-.runs-ceiling {
-  margin: var(--space-3) 0 0;
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-
-/* ================================================================ new run == */
-
-.runs-new,
-.runs-save,
-.runs-steer {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-}
-
-/* The save-a-preset half is a second gesture on the same draft, not a second
-   form about something else — the rule is what says so. */
-.runs-save {
-  margin-top: var(--space-4);
-  padding-top: var(--space-4);
-  border-top: 1px dashed var(--border);
-}
-
-.runs-field textarea {
-  resize: vertical;
-  line-height: var(--leading-snug);
-}
-
-.runs-prompt {
-  min-height: 5rem;
-}
-
-.runs-check {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
-
-/* ================================================================ presets == */
-
-.runs-preset-name {
-  font-family: var(--font-display);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-semibold);
-  color: var(--text);
-  overflow-wrap: anywhere;
-}
-
-/* Two lines of the prompt, then an ellipsis: the rail is for choosing between
-   presets, not for reading one. */
-.runs-preset-prompt {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  overflow: hidden;
-}
-
-/* ================================================================= detail == */
 
 .runs-facts {
   display: grid;
@@ -349,6 +525,12 @@
   margin: 0;
 }
 
+.runs-gate-exit {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
 /* "No gate configured" is not a warning and is not drawn as one. */
 .runs-gate-note {
   margin: var(--space-2) 0 0;
@@ -376,8 +558,8 @@
   background: var(--surface-sunken);
   color: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  line-height: var(--leading-snug);
+  font-size: var(--text-sm);
+  line-height: 1.45;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -406,9 +588,9 @@
  */
 .runs-stream-title {
   margin: var(--space-4) 0 0;
-  font-family: var(--font-mono);
+  font-family: var(--font-display);
   font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
+  letter-spacing: var(--tracking-wider);
   text-transform: uppercase;
   color: var(--text-faint);
 }

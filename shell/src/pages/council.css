@@ -177,44 +177,23 @@
 
 /* =================================================================== list == */
 
-/* The column of councils. Each row paints its own box, so this only spaces them
-   and takes the list markers off. */
-.council-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
 /**
- * One council, as a whole-row link.
+ * One council, as a link across its whole `Row`: the question, then state,
+ * phase and age in tracks that line up down the column. The row draws the
+ * hairline and the padding, so the link adds neither.
  *
- * A box picked out of a set rather than a line scanned past, which is the
- * question that separates this app's two ways of presenting a collection — so
- * this stays the inset's idiom and not `Rows`'. It cannot *be* an `Inset`: the
- * whole row is the hit area, so the box has to be the `<a>`, and `Inset` draws
- * a `div` or an `li`. What it can do is agree with one, and `--surface-raised`
- * is the half of the recipe it did not have: on a `--surface` panel the lower
- * rung leaves the box with no fill of its own and only a frame, which is the
- * flat-outline card the anti-references name.
- *
- * The current row is marked by `.ui-current`, added in `Council.tsx` — a 2px
- * rule on the leading edge and nothing else. It was `--accent` plus
+ * The current row is marked by `Row current` in `Council.tsx` — `.ui-current`, a
+ * 2px rule on the leading edge and nothing else. It was `--accent` plus
  * `--accent-quiet` here: the brand colour doing a job it is not allowed to do,
  * over a fill that disappears in the light theme, where `--surface` and
  * `--surface-raised` are both white. See the comment on `.ui-current`.
  */
 .council-row-link {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+  padding: 0;
   color: var(--text);
   text-decoration: none;
 }
@@ -255,15 +234,10 @@
 
 /* =================================================================== seats == */
 
-/* The grid of seats. Each seat is an `Inset`, which paints its own box — this
-   only lays them out and takes the list markers off. */
-.council-seats {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
+/* A seat's row stacks its head, answers and phases a step further apart than the
+   row's own default. */
+.council-seat {
+  gap: var(--space-2);
 }
 
 .council-seat-head {
@@ -374,6 +348,16 @@
   white-space: pre-wrap;
 }
 
+/* Three lines until somebody asks for the rest — the button beside it is what
+   unclamps this same paragraph, so the full text is never on the page twice. */
+.council-seat-answer-clamped {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+
 .council-seat-abstained {
   margin: 0;
   font-size: var(--text-xs);
@@ -413,7 +397,8 @@
 
 .council-synthesis {
   margin: 0;
-  font-size: var(--text-sm);
+  max-width: var(--measure-prose);
+  font-size: var(--text-base);
   line-height: var(--leading-normal);
   color: var(--text);
   overflow-wrap: anywhere;

@@ -76,7 +76,7 @@ export function Decisions({ team, runs }: DecisionsProps) {
     <div className="teams-decisions">
       <Teach title="What this tab is a ceiling on">
         <p>
-          The ceiling here is <strong>your attention</strong>, not the department&apos;s capacity:
+          The ceiling here is <strong>your attention</strong>, not the team&apos;s capacity:
           only the actions it has been granted as <em>asks first</em> ever queue. Anything granted
           as <em>does it</em> happens on the next tick and never appears — change that on the
           Charter tab, under Powers.
@@ -88,7 +88,7 @@ export function Decisions({ team, runs }: DecisionsProps) {
           <ErrorNote>the núcleo did not answer — nothing is known about what is waiting</ErrorNote>
         )}
         {actions.data !== undefined && theirs.length === 0 && (
-          <Quiet says="nothing is waiting on you for this department." />
+          <Quiet says="nothing is waiting on you for this team." />
         )}
         {theirs.length > 0 && (
           <ul className="teams-acts" aria-label="Actions">
@@ -102,10 +102,10 @@ export function Decisions({ team, runs }: DecisionsProps) {
       <Panel title="Specialists it asked for" aside={<Count n={recruits.data === undefined ? undefined : asked.length} />}>
         <p className="teams-note">
           A director found a gap in its roster. The request is editable here before it is granted;
-          saying not now leaves nothing behind — the department may ask again.
+          saying not now leaves nothing behind — the team may ask again.
         </p>
         {recruits.data !== undefined && asked.length === 0 && (
-          <Quiet says="this department has not asked for anybody." />
+          <Quiet says="this team has not asked for anybody." />
         )}
         {asked.length > 0 && (
           <ul className="teams-acts" aria-label="Recruitment">
@@ -402,7 +402,7 @@ function RecruitCard({ proposal }: { proposal: Proposal }) {
 
       {hire.isSuccess && hire.data !== undefined && (
         <p className="teams-act-outcome" role="status">
-          {hire.data.agent_id} is hired and on this department&apos;s roster
+          {hire.data.agent_id} is hired and on this team&apos;s roster
         </p>
       )}
       {hire.isError && <DecisionRefusal error={hire.error} what="nobody was hired" />}

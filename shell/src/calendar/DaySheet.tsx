@@ -14,7 +14,8 @@ import {
   type EventOccurrence,
 } from "../data/calendar";
 import { inputFromStamp, occurrenceMinutes, stampFromInput } from "../lib/calendar-grid";
-import { Badge, Button, ConfirmButton, ErrorNote, Inset, Quiet, RefusalNote } from "../ui";
+import { UI_LOCALE } from "../lib/locale";
+import { Badge, Button, ConfirmButton, ErrorNote, Quiet, RefusalNote, Row, Rows } from "../ui";
 import { placementOf, slotStamp, type Slot } from "./slot";
 
 /**
@@ -55,7 +56,7 @@ export function DaySheet({ slot, occurrences, now, config }: DaySheetProps) {
     <div className="calendar-sheet">
       <div className="calendar-sheet-head">
         <h3 className="calendar-sheet-title">
-          {slot.day.toLocaleDateString(undefined, {
+          {slot.day.toLocaleDateString(UI_LOCALE, {
             weekday: "long",
             day: "numeric",
             month: "long",
@@ -73,18 +74,16 @@ export function DaySheet({ slot, occurrences, now, config }: DaySheetProps) {
       {occurrences.length === 0 ? (
         <Quiet says="nothing on this day." />
       ) : (
-        <ul className="calendar-occurrence-list">
+        <Rows label="Occurrences on this day" className="calendar-occurrence-list">
           {occurrences.map((occurrence) => (
-            /* The `li` is the box, and the box is the `li`. `OccurrenceActions`
-               renders an `Inset` as the list item itself rather than a bare
-               wrapper around one — a `li` whose only child is a bordered div is
-               a nesting nobody chose. */
+            /* No wrapper `li`: `OccurrenceActions` renders the `Row` itself, so the
+               item is the row rather than a row holding a nested box. */
             <OccurrenceActions
               key={occurrenceKey(occurrence.event_id, occurrence.occurrence_local)}
               occurrence={occurrence}
             />
           ))}
-        </ul>
+        </Rows>
       )}
 
       <DraftEventForm slot={slot} config={config} />
@@ -263,57 +262,62 @@ export function OccurrenceActions({ occurrence }: { occurrence: EventOccurrence 
 
   return (
     /*
-      `Inset` — the box inside a panel body, one rung up and one rank down.
-      This page wrote those seven declarations out under the name
-      `calendar-occurrence-actions`, on `--surface` rather than
-      `--surface-raised`; the two are the same white in the light theme, so the
-      change is visible in dark only, and it is the shared rung the sheet should
-      have been on.
+      A `Row` of the day's `Rows`, not a box of its own: the occurrences are
+      scanned down one hairline-ruled column, clock first. `calendar-occurrence-actions`
+      only lays the parts out on one grid line; the fill and the rules are the row's.
     */
-    <Inset as="li">
+    <Row className="calendar-occurrence-actions">
       <p className="calendar-occurrence-title">
         <span className="calendar-occurrence-clock">{placement.clock}</span>
-        {occurrence.title}
-        {occurrence.source === "proposal" && <Badge tone="shadow">proposed</Badge>}
-        {placement.moved && (
-          <span className="calendar-occurrence-moved">
-            moved from {occurrence.occurrence_local.replace("T", " ").slice(0, 16)}
-          </span>
-        )}
+        <span className="calendar-occurrence-name">
+          {occurrence.title}
+          {occurrence.source === "proposal" && <Badge tone="shadow">proposed</Badge>}
+          {placement.moved && (
+            <span className="calendar-occurrence-moved">
+              moved from {occurrence.occurrence_local.replace("T", " ").slice(0, 16)}
+            </span>
+          )}
+        </span>
       </p>
       <div className="calendar-occurrence-controls">
         <ConfirmButton
           label="Skip this occurrence"
           confirmLabel="Skip it"
+          variant="quiet"
           disabled={cancel.isPending}
           onConfirm={() =>
             cancel.mutate({ eventId: occurrence.event_id, occurrenceLocal: occurrence.occurrence_local })
           }
         />
-        <label className="calendar-move-field">
-          <span>Move to</span>
-          <input
-            type="datetime-local"
-            value={moveTo}
-            onChange={(event) => setMoveTo(event.target.value)}
-            aria-label={`Move ${occurrence.title} to`}
+        <div className="calendar-move">
+          <label className="calendar-move-field">
+            <span>Move to</span>
+            <input
+              type="datetime-local"
+              value={moveTo}
+              onChange={(event) => setMoveTo(event.target.value)}
+              aria-label={`Move ${occurrence.title} to`}
+            />
+          </label>
+          <Button disabled={move.isPending} onClick={submitMove}>
+            Move
+          </Button>
+        </div>
+        <details className="calendar-occurrence-more">
+          <summary>Delete series</summary>
+          <ConfirmButton
+            label="Delete whole series"
+            confirmLabel="Delete every occurrence"
+            variant="danger"
+            disabled={deleteSeries.isPending}
+            onConfirm={() => deleteSeries.mutate(occurrence.event_id)}
           />
-        </label>
-        <Button disabled={move.isPending} onClick={submitMove}>
-          Move
-        </Button>
-        <ConfirmButton
-          label="Delete whole series"
-          confirmLabel="Delete every occurrence"
-          variant="danger"
-          disabled={deleteSeries.isPending}
-          onConfirm={() => deleteSeries.mutate(occurrence.event_id)}
-        />
+        </details>
       </div>
       {cancel.isError && <OccurrenceError error={cancel.error} what="not skipped" />}
       {move.isError && <OccurrenceError error={move.error} what="not moved" />}
       {deleteSeries.isError && <OccurrenceError error={deleteSeries.error} what="the series was not deleted" />}
-    </Inset>
+    </Row>
   );
 }
 

@@ -150,7 +150,6 @@ export const RUN_MODE_FILTERS = [...RUN_MODES, "assistant"] as const;
 
 /** Every status a run row can carry, as `runs.rs` writes them. */
 export const RUN_STATUSES = [
-  "pending",
   "running",
   "awaiting_approval",
   "completed",
@@ -158,6 +157,7 @@ export const RUN_STATUSES = [
   "cancelled",
   "interrupted",
   "timed_out",
+  "superseded",
 ] as const;
 
 /**
@@ -218,9 +218,9 @@ function runsQuery(filters: RunFilters): string {
   return `?${params.toString()}`;
 }
 
-/** Whether a run can still change on its own. */
+/** Whether a run can still change on its own; waiting on a person does not. */
 export function runIsAlive(status: string): boolean {
-  return status === "pending" || status === "running";
+  return status === "running";
 }
 
 /**

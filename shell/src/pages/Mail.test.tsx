@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 
@@ -100,9 +103,22 @@ function mailFetch(world: MailWorld): (path: string, init?: RequestInit) => Prom
  * so it needs router context, and `renderApp` would mount the gate and the
  * rail's own live queries around every assertion for no benefit here.
  */
-function renderMail() {
-  return renderWithRouter(<Mail />, { initialPath: "/mail" });
+function renderMail(initialPath = "/mail") {
+  return renderWithRouter(<Mail />, { initialPath });
 }
+
+describe("Mail — panel order", () => {
+  it("puts the queue first and configuration last", async () => {
+    daemon.apiFetch.mockImplementation(mailFetch(mailWorld()));
+
+    await renderMail();
+
+    await screen.findByRole("heading", { level: 2, name: "Queue" });
+    const headings = [...document.querySelectorAll("h2")].map((heading) => heading.textContent);
+    expect(headings[0]).toBe("Queue");
+    expect(headings[headings.length - 1]).toBe("Configuration");
+  });
+});
 
 /* -------------------------------------------------- an untriaged message -- */
 
@@ -181,6 +197,42 @@ describe("Mail — the untriaged count", () => {
   });
 });
 
+describe("Mail — an unconfigured account", () => {
+  it("says so instead of rendering empty configuration facts", async () => {
+    const absentConfig: Partial<EmailConfigView> = emailConfig();
+    delete absentConfig.username;
+    delete absentConfig.host;
+    delete absentConfig.mailbox;
+    const world = mailWorld({ config: absentConfig as EmailConfigView });
+    daemon.apiFetch.mockImplementation(mailFetch(world));
+
+    await renderMail();
+
+    expect(await screen.findByText("no account configured")).toBeDefined();
+    expect(screen.getByText("no mailbox named")).toBeDefined();
+    expect(screen.getByText("nothing is wrong")).toBeDefined();
+    const facts = document.querySelectorAll(".mail-config dd");
+    expect([...facts].some((fact) => fact.textContent?.includes("undefined"))).toBe(false);
+  });
+
+  it("renders the local triage disable reason and calls an absent value unknown", async () => {
+    const reasonConfig = emailConfig({ local_triage_disabled: "the local model is unavailable" });
+    daemon.apiFetch.mockImplementation(mailFetch(mailWorld({ config: reasonConfig })));
+
+    await renderMail();
+
+    expect(await screen.findByText("disabled: the local model is unavailable")).toBeDefined();
+
+    const absentConfig: Partial<EmailConfigView> = emailConfig();
+    delete absentConfig.local_triage_disabled;
+    daemon.apiFetch.mockImplementation(mailFetch(mailWorld({ config: absentConfig as EmailConfigView })));
+
+    await renderMail();
+
+    expect(await screen.findByText("unknown")).toBeDefined();
+  });
+});
+
 /* ---------------------------------------------- the pillar key migration -- */
 
 /**
@@ -213,5 +265,48 @@ describe("Mail — the pillar key migration", () => {
         queryClient.getQueryCache().find({ queryKey: keys.contacts.merges, exact: true }),
       ).toBeDefined();
     });
+  });
+});
+
+describe("Mail search field", () => {
+  it("the search label is the field primitive", async () => {
+    daemon.apiFetch.mockImplementation(mailFetch(mailWorld()));
+
+    await renderMail();
+
+    expect(await screen.findByRole("search", { name: "Search the mail queue" })).toBeDefined();
+    const input = screen.getByLabelText("Search sender, subject or summary");
+    // The field is a column around a `<label for>` and the control: the label holds its own text
+    // and nothing else, so a helper can never become part of the control's name.
+    const field = input.closest(".ui-field");
+    expect(field).not.toBeNull();
+    const label = field?.querySelector("label");
+    expect(label?.className).toContain("ui-field-label");
+    expect(label?.textContent).toBe("Search");
+    expect(label?.htmlFor).toBe(input.id);
+    fireEvent.change(input, { target: { value: "invoice" } });
+    fireEvent.submit(screen.getByRole("search", { name: "Search the mail queue" }));
+    const actions = screen.getByRole("button", { name: "Search" }).closest(".mail-search-actions");
+    expect(actions?.className).toContain("mail-search-actions");
+    expect(actions?.querySelectorAll("button")).toHaveLength(2);
+  });
+
+  /**
+   * The buttons centre on the input by arithmetic, and the arithmetic is in tokens.
+   *
+   * jsdom lays nothing out, so the sheet is where this is checkable. The number that used to be
+   * typed out here was right — the input's font size times the inherited leading, plus its
+   * padding twice, plus two borders — but any one of those tokens changing moved the input and
+   * left the buttons where they were.
+   */
+  it("the search buttons take their height from the input's tokens", () => {
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "mail.css"), "utf8");
+    const rule = /\.mail-search-actions\s*\{([^}]*)\}/.exec(css);
+    expect(rule).not.toBeNull();
+    expect(rule?.[1]).toMatch(/min-height:\s*calc\(/);
+    expect(rule?.[1]).toContain("var(--text-sm)");
+    expect(rule?.[1]).toContain("var(--leading-normal)");
+    expect(rule?.[1]).toContain("var(--space-2)");
+    expect(css).not.toContain("2.384375");
   });
 });

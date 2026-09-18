@@ -182,6 +182,13 @@ describe("moving an occurrence", () => {
 /* ------------------------------------------------------- the other writes -- */
 
 describe("skipping and deleting", () => {
+  it("makes the extra actions a word rather than a glyph", () => {
+    renderWithQuery(<OccurrenceActions occurrence={occurrence()} />);
+
+    expect(screen.getByText("Delete series", { selector: "summary" }).tagName).toBe("SUMMARY");
+    expect(screen.queryByText("…")).toBeNull();
+  });
+
   it("addresses a skip by occurrence_local — there is no occurrence id to send", async () => {
     const seen = recorder();
     renderWithQuery(<OccurrenceActions occurrence={occurrence()} />);

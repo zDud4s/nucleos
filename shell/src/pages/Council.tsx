@@ -20,7 +20,6 @@ import {
   ConfirmButton,
   Count,
   ErrorNote,
-  Inset,
   PageHeader,
   Panel,
   Quiet,
@@ -73,11 +72,9 @@ export function Council() {
       {councilId === null && (
         <Teach title="Choose a council">
           <p>
-            Pick a question from the list, or convene a new one above. Every seat answers on its
-            own, ranks the others blind, and a chairman writes a synthesis. A council configured
-            for a second round adds a revision between the ranking and the synthesis; each row
-            says how many phases it has, and this page shows all of them whichever one a council
-            has reached.
+            Pick a question from the list, or convene a new one above. Each row says how many
+            phases its council has — four where a second round adds a revision before the
+            synthesis — and this page shows all of them whichever one a council has reached.
           </p>
         </Teach>
       )}
@@ -454,6 +451,8 @@ function CouncilList({
   answered: boolean;
   selected: string | null;
 }) {
+  if (answered && rows.length === 0) return null;
+
   return (
     <Panel title="Councils" aside={<Count n={answered ? rows.length : undefined} />}>
       {/* A wait and an absence, and they must not read the same. The loading
@@ -461,13 +460,12 @@ function CouncilList({
           answer that there is no list, which is the panel's content and is set
           at the rung content is set at. */}
       {!answered && <p className="council-loading">reading the councils…</p>}
-      {answered && rows.length === 0 && <Quiet says="no council has been convened yet." />}
       {rows.length > 0 && (
-        <ul className="council-list" aria-label="Councils">
+        <Rows label="Councils">
           {rows.map((row) => (
             <CouncilRow key={row.id} row={row} active={row.id === selected} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
@@ -476,26 +474,21 @@ function CouncilList({
 /**
  * One council in the list, as a whole-row link.
  *
- * The row you are on is marked by `.ui-current` and by nothing else — a 2px
- * rule on the leading edge, in a neutral. The class rather than a `current`
- * prop because the box here has to be the `<a>` that carries the hit area, and
- * neither `Inset` nor `Row` draws an anchor. `aria-current` is the same fact
- * said to a screen reader and stays beside it.
+ * The row you are on is marked by `Row current` — `.ui-current`, a 2px rule on
+ * the leading edge, in a neutral — and by nothing else. The link fills the row
+ * and carries the hit area; `aria-current` on it is the same fact said to a
+ * screen reader and stays beside it.
  */
 function CouncilRow({ row, active }: { row: CouncilSummary; active: boolean }) {
   return (
-    <li>
-      <Link
-        className={active ? "council-row-link ui-current" : "council-row-link"}
-        to={`/council/${row.id}`}
-        aria-current={active ? "page" : undefined}
-      >
+    <Row current={active}>
+      <Link className="council-row-link" to={`/council/${row.id}`} aria-current={active ? "page" : undefined}>
         <span className="council-row-question">{row.question}</span>
         <StateBadge domain="council" state={row.status} />
         <span className="council-phase">phase {row.stage} of {row.stages_total}</span>
         <RelativeTime at={row.created_at} />
       </Link>
-    </li>
+    </Row>
   );
 }
 
@@ -527,6 +520,7 @@ function CouncilDetail({ id }: { id: string }) {
             <ConfirmButton
               label="Cancel"
               confirmLabel="Cancel this council"
+              variant="ghost"
               intent="stop"
               disabled={cancel.isPending}
               onConfirm={() => cancel.mutate(id)}
@@ -609,11 +603,11 @@ function SeatGrid({ seats, stagesTotal }: { seats: SeatView[]; stagesTotal: numb
       {seats.length === 0 ? (
         <Quiet says="no seat has been recorded for this council yet." />
       ) : (
-        <ul className="council-seats" aria-label="Seats">
+        <Rows label="Seats">
           {seats.map((seat) => (
             <SeatCard key={seat.seat_idx} seat={seat} stagesTotal={stagesTotal} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
@@ -670,6 +664,7 @@ function revisedText(seat: SeatView): string {
 }
 
 function SeatCard({ seat, stagesTotal }: { seat: SeatView; stagesTotal: number }) {
+  const [full, setFull] = useState(false);
   const abstained = seat.stage2_status === "ok" && seat.rankings.length === 0;
   // Four phases means a revision round was configured for this council, so the
   // seat has a third block to draw even while it is still `pending`. Three
@@ -681,7 +676,7 @@ function SeatCard({ seat, stagesTotal }: { seat: SeatView; stagesTotal: number }
   const agentIsGone = seat.agent_id !== null && seat.agent_name === null;
 
   return (
-    <Inset as="li">
+    <Row className="council-seat">
       <div className="council-seat-head">
         <span
           className={
@@ -706,7 +701,19 @@ function SeatCard({ seat, stagesTotal }: { seat: SeatView; stagesTotal: number }
           {seat.stage1_error}
         </p>
       )}
-      <p className="council-seat-answer">{answerText(seat)}</p>
+      <p className={full ? "council-seat-answer" : "council-seat-answer council-seat-answer-clamped"}>
+        {answerText(seat)}
+      </p>
+      {/* The clamp is three lines, and a seat's answer is routinely longer. The
+          control unclamps the paragraph rather than printing a second copy of
+          it underneath: two elements holding the same text read as the seat
+          having answered twice, which on a council that revises is a real
+          thing and must not be said by accident. */}
+      {seat.answer !== null && (
+        <Button variant="quiet" aria-expanded={full} onClick={() => setFull(!full)}>
+          {full ? "less" : "more"}
+        </Button>
+      )}
 
       <div className="council-seat-stage">
         <span className="council-seat-stage-label">stage 2</span>
@@ -735,7 +742,7 @@ function SeatCard({ seat, stagesTotal }: { seat: SeatView; stagesTotal: number }
           <p className="council-seat-answer">{revisedText(seat)}</p>
         </>
       )}
-    </Inset>
+    </Row>
   );
 }
 

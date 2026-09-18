@@ -84,14 +84,14 @@ export interface CostLineProps {
 /**
  * A spend, at the precision it actually has.
  *
- * The rule that produced `$ 0.0310` was *always four decimals*, and it was right about
- * the thing it was defending: a single run costs cents, and a two-decimal `$ 0.00` for
+ * The rule that produced `$0.0310` was *always four decimals*, and it was right about
+ * the thing it was defending: a single run costs cents, and a two-decimal `$0.00` for
  * a run that really spent $0.004 reads as free. What it got wrong is that four decimals
  * is a FLOOR, not a fixed width — so every ordinary turn ended in a zero that carried no
  * information, in the footing under every turn in a long transcript.
  *
  * So: never fewer than two, never more than four, and no trailing zero inside that. The
- * defended case is untouched — $0.004 is still `$ 0.004` and never `$ 0.00`.
+ * defended case is untouched — $0.004 is still `$0.004` and never `$0.00`.
  *
  * The one reading it refuses to give is a rounded zero: a run that spent something is
  * never written as having spent nothing, even when what it spent is below the last
@@ -99,9 +99,9 @@ export interface CostLineProps {
  */
 export function money(costUsd: number): string {
   const trimmed = costUsd.toFixed(4).replace(/0+$/, "");
-  if (costUsd > 0 && Number(trimmed) === 0) return "< $ 0.0001";
-  // Two decimals is the floor: `$ 1.7` is not how money is written.
-  return `$ ${/\.\d\d/.test(trimmed) ? trimmed : costUsd.toFixed(2)}`;
+  if (costUsd > 0 && Number(trimmed) === 0) return "< $0.0001";
+  // Two decimals is the floor: `$1.7` is not how money is written.
+  return `$${/\.\d\d/.test(trimmed) ? trimmed : costUsd.toFixed(2)}`;
 }
 
 /**
@@ -111,6 +111,7 @@ export function money(costUsd: number): string {
  * are the cheap part, and a run whose input is mostly cache is a different fact
  * about cost than one that paid full price for the same window.
  */
+// The type promises a present nullable field; a lying source should not take down the reading.
 export function CostLine({
   costUsd,
   inputTokens = null,
@@ -121,7 +122,7 @@ export function CostLine({
   return (
     <p className="ui-cost">
       <span className="ui-cost-money">
-        {costUsd === null ? "cost not recorded" : money(costUsd)}
+      {typeof costUsd !== "number" ? "cost not recorded" : money(costUsd)}
       </span>
       {counted && (
         <>
@@ -136,7 +137,7 @@ export function CostLine({
 
 /** A token count, short. An em dash for absent, which is not the same as `0`. */
 export function tokenCount(count: number | null): string {
-  if (count === null) return "—";
+  if (typeof count !== "number") return "—";
   return count < 1000 ? String(count) : `${(count / 1000).toFixed(1)}k`;
 }
 
@@ -167,7 +168,7 @@ export interface ContextMeterProps {
  * render.
  */
 export function ContextMeter({ fill }: ContextMeterProps) {
-  if (fill === null) return <p className="ui-meter-absent">context fill not reported</p>;
+  if (typeof fill !== "number") return <p className="ui-meter-absent">context fill not reported</p>;
   const share = Math.min(fill / CONTEXT_WINDOW_TOKENS, 1);
   const percent = Math.round(share * 100);
   const past = share >= HANDOFF_SHARE;

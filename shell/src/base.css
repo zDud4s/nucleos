@@ -12,6 +12,7 @@
  * Import order matters and is fixed in `main.tsx`: fonts, tokens, base, ui.
  */
 
+@layer base {
 *,
 *::before,
 *::after {
@@ -134,9 +135,36 @@ pre {
 
 a {
   color: var(--accent);
+  text-decoration: none;
   text-underline-offset: 0.2em;
 }
 
+a:hover,
+a:focus-visible {
+  text-decoration: underline;
+}
+
+}
+
+/* Unlayered on purpose, and the only four places in this file that are.
+
+   `.sr-only` is an assertion and not a default: it says "this must not be seen". Inside
+   `@layer base` a `block` or a `w-full` utility would beat it and put hidden text on the
+   page, which is the one failure a screen-reader helper must not have. DESIGN.md:704
+   already records it as unlayered. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+@layer base {
 button,
 input,
 select,
@@ -161,19 +189,26 @@ textarea {
    same hole and it cannot be closed the same way -- a field with no border and
    no fill is not legible-but-flat, it is gone -- so those are still each their
    own to paint. */
-/* Inside `@layer base`, and that word is the whole difference between fixing
-   this and breaking every bordered button in the app.
+/* This block is inside `@layer base`, and so is the rest of this file above it.
 
-   `tailwind.css` declares `@layer theme, base, components, utilities` and puts
-   the utilities in the last of them. Unlayered CSS — which is what the rest of
-   this file is — beats every layer there is, so the first version of this rule
-   sat above `.border` and `.bg-surface` and won against both: `cloud` and
-   `local` on the map lost their outlines the moment it shipped, seen in a
-   screenshot and not in a test. Layered, it is what it was meant to be: the
-   default a button gets when its class list asks for nothing. */
-@layer base {
-  button {
-    background: transparent;
+   `tailwind.css` declares `@layer theme, base, components, utilities` and puts the
+   utilities in the last of them. Unlayered normal declarations beat every layer there
+   is, whatever their specificity — so for as long as this file was unlayered, the first
+   version of this rule sat above `.border` and `.bg-surface` and won against both
+   (`cloud` and `local` on the map lost their outlines the moment it shipped, seen in a
+   screenshot and not in a test), and, one floor down, `* { margin: 0 }` at the top of
+   this file beat all 55 `mt-*`/`ml-*`/`mx-*` utilities in the shell. That second half
+   went unnoticed for ten rounds because it never looks broken: the page is a few pixels
+   tighter than it was drawn, and nobody can tell a gap that was declared and refused
+   from a gap nobody asked for.
+
+   So the fix written for this one rule in round 4 is now the file's default, and what is
+   left outside a layer is a short list with a reason each — `.sr-only`, the focus ring,
+   the reduced-motion clamp and the scroll-lock block. `ui/base-layer.test.ts` fails on
+   anything else. Layered, every rule here is what it was meant to be: the default an
+   element gets when its class list asks for nothing. */
+button {
+  background: transparent;
   /* And the same hole one property along: the user agent draws every button a
      `2px outset` border, so a button that asks for none gets one anyway. It is
      what put a raised grey slab around each row of the map's spec picker, where
@@ -185,73 +220,9 @@ textarea {
      the app would quietly lose its outline. Width zero, style solid, colour
      inherited: a button with no border class shows nothing, and one with
      `border border-border` is unchanged. */
-    border-width: 0;
-    border-style: solid;
-    border-color: currentColor;
-  }
-}
-
-/* The ring is the one place `--accent` is allowed near a control: it says
-   "keyboard is here", which is not a state of anything in the app. */
-:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-  border-radius: var(--radius-sm);
-}
-
-/* Pointer users get no ring; keyboard users must never lose it. */
-:focus:not(:focus-visible) {
-  outline: none;
-}
-
-/* ---------------------------------------------------- visually hidden -- */
-
-/**
- * Said to a screen reader, absent to the eye.
- *
- * A utility and not a component, which is why it is here rather than in
- * `ui.css`: it has no look, it belongs to no `src/ui/` component, and the thing
- * it does — decouple the accessible name from the visible one — is a fact about
- * the document. Nine copies of it existed when this was written, seven of them
- * in page stylesheets under seven different names (`agents-said`, `pj-said`,
- * `teams-said`, `chats-offscreen`, `calendar-visually-hidden`, …), which is nine
- * chances to get an accessibility primitive subtly wrong and no way to fix them
- * all at once. The `chats-` and `teams-` copies are gone; the rest are being
- * retired page by page, so treat that list as the census it was and not as an
- * inventory of what is still out there.
- *
- * `clip-path: inset(50%)` and not `clip: rect(0 0 0 0)`. `clip` is deprecated,
- * takes a *physical* rectangle — so it is the wrong shape the moment a document
- * is laid out right-to-left — and in some engines it drops the text out of the
- * accessibility tree along with the pixels, which is the exact opposite of the
- * point. `clip-path` is direction-agnostic and purely visual. The one copy that
- * still used `clip` was the file input at `chats.css:2758`, which has since
- * adopted this rule — the deprecated recipe is out of the tree entirely.
- *
- * The rest of the recipe is not decoration: `position: absolute` takes it out of
- * flow, the 1px box plus `margin: -1px` keeps a non-zero rendered size (a 0×0
- * element is skipped by several screen readers), `overflow: hidden` does the
- * hiding `clip-path` cannot do for descendants, and `white-space: nowrap` stops
- * a sentence squeezed into 1px from becoming a column of single letters that
- * some readers announce one at a time.
- *
- * Deliberately unlayered, and that word is load-bearing in the other direction
- * from the `@layer base` note above. Tailwind ships its own `.sr-only` in the
- * `utilities` layer — still on `clip: rect()` — and `dialog.tsx`, `command.tsx`
- * and `Roster.tsx` already spell the class that way. Unlayered CSS beats every
- * layer, so writing it here replaces that older recipe for the three components
- * that already use it rather than fighting it.
- */
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-  border: 0;
+  border-width: 0;
+  border-style: solid;
+  border-color: currentColor;
 }
 
 img,
@@ -266,7 +237,31 @@ svg {
   scrollbar-color: var(--border-strong) transparent;
   scrollbar-width: thin;
 }
+}
 
+/* Unlayered on purpose: the keyboard ring is an accessibility invariant, not a default.
+   Layered, `outline-none` or a `rounded-*` utility would take it away from the person who
+   cannot see the pointer, and "pointer users get no ring" would become negotiable. */
+/* The ring is the one place `--accent` is allowed near a control: it says
+   "keyboard is here", which is not a state of anything in the app. */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Unlayered on purpose: the other half of the keyboard-ring invariant keeps the pointer ring
+   off, so it must not be beaten by a utility either. */
+/* Pointer users get no ring; keyboard users must never lose it. */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Unlayered on purpose, and for a reason that is about `!important` rather than about
+   motion. In the important origin the cascade REVERSES layer order — an earlier layer
+   wins, and unlayered important wins over all of them — so moving these declarations into
+   `@layer base` changes what they beat. Nobody has reasoned that through, and this is the
+   one block in the file that exists to protect somebody. It stays where it was. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -302,6 +297,9 @@ svg {
  * inline padding — a measured value, which is also why adding a CSP hash for the
  * injected style was never an option: the hash would change with the scrollbar.
  */
+/* Unlayered on purpose, same reason as the reduced-motion clamp above: these are
+   `!important` rules standing in for a `<style>` element this app's CSP refuses, and their
+   whole job is to beat whatever the page already says. */
 body[data-scroll-locked] {
   overflow: hidden !important;
   overscroll-behavior: contain;

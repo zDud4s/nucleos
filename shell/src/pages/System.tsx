@@ -1,9 +1,14 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
-import { scopeEngaged, useScopedKills, useSetScopedKill } from "../data/autopilot";
+import {
+  scopeEngaged,
+  useScopedKills,
+  useSetScopedKill,
+} from "../data/autopilot";
 import {
   isAggregateTimeout,
+  sidecarKeyOf,
   useApiTokens,
   useBackups,
   useBudget,
@@ -13,6 +18,7 @@ import {
   usePiiTally,
   useProjects,
   useRevokeToken,
+  useRestartSidecar,
   useSetBudget,
   useSidecars,
   useStageRestore,
@@ -45,6 +51,9 @@ import {
   Quiet,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
+  Section,
   StateBadge,
 } from "../ui";
 import { MachineSettings } from "./MachineSettings";
@@ -100,7 +109,9 @@ const VIEW_LABEL: Record<SystemView, string> = {
  */
 export function normaliseView(raw: string | undefined): SystemView {
   const candidate = (raw ?? "").trim().toLowerCase();
-  return (VIEWS as readonly string[]).includes(candidate) ? (candidate as SystemView) : "health";
+  return (VIEWS as readonly string[]).includes(candidate)
+    ? (candidate as SystemView)
+    : "health";
 }
 
 export function System() {
@@ -111,10 +122,12 @@ export function System() {
 
   return (
     <>
-      <PageHeader title="System" headline={headlineFor(health.data)} />
+      <PageHeader title="System" headline={headlineNodeFor(health.data)} />
       <ViewTabs view={view} />
       <div className="sy-sections">
-        {view === "health" && <HealthView health={health} sidecars={sidecars} />}
+        {view === "health" && (
+          <HealthView health={health} sidecars={sidecars} />
+        )}
         {view === "backups" && <BackupsView />}
         {view === "tokens" && <TokensView />}
         {view === "notifications" && <NotificationsView />}
@@ -124,16 +137,44 @@ export function System() {
   );
 }
 
-function headlineFor(readout: HealthReadout | undefined): string | undefined {
+/**
+ * How the daemon is, in one sentence.
+ *
+ * Exported because Home reads it too, on its fifth stat card: the first screen is where
+ * somebody finds out that a subsystem is down, and a reading that lives only on the page
+ * you go to when you already suspect something is the wrong way round. One function, so
+ * the two screens cannot describe the same readout differently.
+ */
+export function headlineFor(readout: HealthReadout | undefined): string | undefined {
   if (readout === undefined) return undefined;
-  if (isAggregateTimeout(readout)) return "the health readout timed out before it measured anything";
+  if (isAggregateTimeout(readout))
+    return "the health readout timed out before it measured anything";
   const down = readout.subsystems.filter((row) => row.status === "down").length;
-  const degraded = readout.subsystems.filter((row) => row.status === "degraded").length;
-  if (down === 0 && degraded === 0) return "every configured subsystem is healthy";
+  const degraded = readout.subsystems.filter(
+    (row) => row.status === "degraded",
+  ).length;
+  if (down === 0 && degraded === 0)
+    return "every configured subsystem is healthy";
   const parts: string[] = [];
   if (down > 0) parts.push(`${String(down)} down`);
   if (degraded > 0) parts.push(`${String(degraded)} degraded`);
   return parts.join(", ");
+}
+
+export function headlineNodeFor(readout: HealthReadout | undefined): ReactNode {
+  if (readout === undefined) return undefined;
+  if (isAggregateTimeout(readout))
+    return "the health readout timed out before it measured anything";
+  const down = readout.subsystems.filter((row) => row.status === "down").length;
+  const degraded = readout.subsystems.filter(
+    (row) => row.status === "degraded",
+  ).length;
+  if (down === 0 && degraded === 0)
+    return "every configured subsystem is healthy";
+  const parts: string[] = [];
+  if (down > 0) parts.push(`${String(down)} down`);
+  if (degraded > 0) parts.push(`${String(degraded)} degraded`);
+  return <span className="ui-wrong">{parts.join(", ")}</span>;
 }
 
 /**
@@ -194,52 +235,117 @@ function HealthView({
   );
 }
 
-function HealthReadoutPanel({ health }: { health: ReturnType<typeof useSystemHealth> }) {
+function HealthReadoutPanel({
+  health,
+}: {
+  health: ReturnType<typeof useSystemHealth>;
+}) {
   return (
     <Panel title="Subsystems">
-      {health.data === undefined && !health.isError && <p className="sy-loading">reading…</p>}
-      {health.isError && health.data === undefined && <HealthError error={health.error} />}
+      {health.data === undefined && !health.isError && (
+        <p className="sy-loading">reading…</p>
+      )}
+      {health.isError && health.data === undefined && (
+        <HealthError error={health.error} />
+      )}
       {health.data !== undefined && isAggregateTimeout(health.data) && (
         <p className="sy-timeout" role="status">
-          The readout timed out before it could measure anything below the aggregate — the ten
-          subsystems below were never reached, which is not the same as nine of them being down.
+          The readout timed out before it could measure anything below the
+          aggregate — the ten subsystems below were never reached, which is not
+          the same as nine of them being down.
         </p>
       )}
       {health.data !== undefined && !isAggregateTimeout(health.data) && (
-        <ul className="sy-subsystems" aria-label="Subsystems">
-          {health.data.subsystems.map((row) => (
+        <Rows label="Subsystems">
+          {[...health.data.subsystems].sort(bySubsystemHealth).map((row) => (
             <SubsystemRow key={row.name} row={row} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
 }
 
 function SubsystemRow({ row }: { row: SubsystemReadout }) {
+  const key = sidecarKeyOf(row.name);
   return (
-    <li className="sy-subsystem">
+    <Row className="sy-subsystem-row">
       <span className="sy-subsystem-name">{row.name}</span>
       <StateBadge domain="pillar" state={row.status} />
-      {row.reason !== undefined && <span className="sy-meta">reason: {row.reason}</span>}
-    </li>
+      <span className="sy-meta">{row.reason !== undefined && <>reason: {row.reason}</>}</span>
+      <div className="sy-subsystem-action">
+        {key !== null && row.status === "down" && <RestartSidecar name={key} subject={row.name} />}
+      </div>
+    </Row>
+  );
+}
+
+function RestartSidecar({ name, subject }: { name: string; subject: string }) {
+  const restart = useRestartSidecar();
+  return (
+    <>
+      <ConfirmButton
+        label="Restart"
+        confirmLabel="Start it again"
+        subject={subject}
+        variant="quiet"
+        disabled={restart.isPending}
+        onConfirm={() => {
+          restart.mutate(name);
+        }}
+      />
+      {restart.isSuccess && (
+        <span className="sy-restart-asked" role="status">
+          asked — the supervisor is trying now
+        </span>
+      )}
+      {restart.isError &&
+        (isApiRefusal(restart.error) ? (
+          <RefusalNote
+            refusal={restart.error}
+            sentences={{
+              running: "it is running now — there was nothing to start",
+              not_supervised:
+                "nothing is supervising it — the daemon starts a sidecar only when its pillar is switched on, and only at startup",
+              kill_switch:
+                "the emergency stop is engaged — release it first; the supervisor keeps retrying on its own meanwhile",
+            }}
+          />
+        ) : (
+          <ErrorNote>the núcleo did not answer — nothing was asked of it</ErrorNote>
+        ))}
+    </>
   );
 }
 
 function HealthError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the machine&apos;s health</ErrorNote>;
+  return (
+    <ErrorNote>
+      the núcleo did not answer — nothing is known about the machine&apos;s
+      health
+    </ErrorNote>
+  );
 }
 
-function SidecarCardsPanel({ sidecars }: { sidecars: ReturnType<typeof useSidecars> }) {
+function SidecarCardsPanel({
+  sidecars,
+}: {
+  sidecars: ReturnType<typeof useSidecars>;
+}) {
+  if (sidecars.data !== undefined && sidecars.data.length === 0) {
+    return <Section label="Sidecars"><Quiet says="no sidecar is registered." /></Section>;
+  }
+
   return (
     <Panel title="Sidecars">
-      {sidecars.data === undefined && !sidecars.isError && <p className="sy-loading">reading…</p>}
-      {sidecars.isError && sidecars.data === undefined && (
-        <ErrorNote>the núcleo did not answer — nothing is known about the sidecars</ErrorNote>
+      {sidecars.data === undefined && !sidecars.isError && (
+        <p className="sy-loading">reading…</p>
       )}
-      {sidecars.data !== undefined && sidecars.data.length === 0 && (
-        <Quiet says="no sidecar is registered." />
+      {sidecars.isError && sidecars.data === undefined && (
+        <ErrorNote>
+          the núcleo did not answer — nothing is known about the sidecars
+        </ErrorNote>
       )}
       {sidecars.data !== undefined && sidecars.data.length > 0 && (
         <ul className="sy-sidecars" aria-label="Sidecars">
@@ -330,33 +436,54 @@ function ScopedKillsPanel() {
       )}
       {!projects.isError && projects.data === undefined && <p className="sy-loading">reading the projects…</p>}
       {projects.data !== undefined && projects.data.length > 0 && (
-        <ul className="sy-kills" aria-label="Project brakes">
+        <Rows label="Project brakes">
           {projects.data.map((project) => {
-            const engaged = scopeEngaged(kills.data, "project", project.project_id);
+            const engaged = scopeEngaged(
+              kills.data,
+              "project",
+              project.project_id,
+            );
             return (
-              <Inset as="li" className="sy-kill" key={project.project_id}>
-                <span className="sy-kill-name">{project.project_id}</span>
-                <Badge tone={engaged ? "paused" : "active"}>{engaged ? "held" : "running"}</Badge>
+              <Row className="sy-project-brake-row" key={project.project_id}>
+                <span className="sy-project-brake-name">{project.project_id}</span>
+                <StateBadge domain="brake" state={engaged ? "held" : "released"} />
                 <Button
                   variant="ghost"
                   intent={engaged ? "go" : "stop"}
                   disabled={kills.data === undefined || setKill.isPending}
                   onClick={() =>
-                    setKill.mutate({ scope_type: "project", scope_id: project.project_id, engaged: !engaged })
+                    setKill.mutate({
+                      scope_type: "project",
+                      scope_id: project.project_id,
+                      engaged: !engaged,
+                    })
                   }
                 >
-                  {engaged ? `Release ${project.project_id}` : `Hold ${project.project_id}`}
+                  {engaged
+                    ? `Release ${project.project_id}`
+                    : `Hold ${project.project_id}`}
                 </Button>
-              </Inset>
+              </Row>
             );
           })}
-        </ul>
+        </Rows>
       )}
       {setKill.isError && (
-        <ErrorNote>that brake was not changed — the núcleo refused or did not answer</ErrorNote>
+        <ErrorNote>
+          that brake was not changed — the núcleo refused or did not answer
+        </ErrorNote>
       )}
     </Panel>
   );
+}
+
+function bySubsystemHealth(
+  left: SubsystemReadout,
+  right: SubsystemReadout,
+): number {
+  const rank = (status: SubsystemReadout["status"]): number =>
+    status === "down" ? 0 : status === "degraded" ? 1 : 2;
+  return rank(left.status) - rank(right.status);
 }
 
 /* ------------------------------------------------------------------ budget -- */
@@ -375,7 +502,8 @@ function formFromBudget(budget: BudgetView): BudgetFormState {
   return {
     windowLimit: budget.limit_usd === null ? "" : String(budget.limit_usd),
     period: budget.period,
-    hourlyLimit: budget.hourly_limit_usd === null ? "" : String(budget.hourly_limit_usd),
+    hourlyLimit:
+      budget.hourly_limit_usd === null ? "" : String(budget.hourly_limit_usd),
     perRunReserve: String(budget.per_run_reserve_usd),
     timeCost: String(budget.time_cost_per_hour_usd),
   };
@@ -425,8 +553,12 @@ function BudgetPanel() {
 
   return (
     <Panel title="Budget">
-      {budget.isError && budget.data === undefined && <SystemListError error={budget.error} what="the budget" />}
-      {!budget.isError && budget.data === undefined && <p className="sy-loading">reading the budget…</p>}
+      {budget.isError && budget.data === undefined && (
+        <SystemListError error={budget.error} what="the budget" />
+      )}
+      {!budget.isError && budget.data === undefined && (
+        <p className="sy-loading">reading the budget…</p>
+      )}
       {budget.data !== undefined && budget.data.paused && (
         <p className="sy-budget-paused" role="status">
           Autonomous work is currently held: {budget.data.reason}
@@ -447,7 +579,9 @@ function BudgetPanel() {
       {form !== null && (
         <div className="sy-budget-form">
           <div className="sy-field">
-            <label htmlFor="sy-budget-window-limit">Window limit (USD, blank = no ceiling)</label>
+            <label htmlFor="sy-budget-window-limit">
+              Window limit (USD, blank = no ceiling)
+            </label>
             <input
               id="sy-budget-window-limit"
               className="sy-field-input"
@@ -461,7 +595,10 @@ function BudgetPanel() {
               }}
             />
             <p className="sy-field-hint">
-              currently: {form.windowLimit.trim() === "" ? "no ceiling" : `$${form.windowLimit}`}
+              currently:{" "}
+              {form.windowLimit.trim() === ""
+                ? "no ceiling"
+                : `$${form.windowLimit}`}
             </p>
           </div>
           <div className="sy-field">
@@ -470,7 +607,12 @@ function BudgetPanel() {
               id="sy-budget-period"
               className="sy-field-input"
               value={form.period}
-              onChange={(event) => setForm({ ...form, period: event.target.value as BudgetView["period"] })}
+              onChange={(event) =>
+                setForm({
+                  ...form,
+                  period: event.target.value as BudgetView["period"],
+                })
+              }
             >
               {BUDGET_PERIODS.map((period) => (
                 <option key={period} value={period}>
@@ -480,7 +622,9 @@ function BudgetPanel() {
             </select>
           </div>
           <div className="sy-field">
-            <label htmlFor="sy-budget-hourly-limit">Hourly limit (USD, blank = no ceiling)</label>
+            <label htmlFor="sy-budget-hourly-limit">
+              Hourly limit (USD, blank = no ceiling)
+            </label>
             <input
               id="sy-budget-hourly-limit"
               className="sy-field-input"
@@ -494,29 +638,40 @@ function BudgetPanel() {
               }}
             />
             <p className="sy-field-hint">
-              currently: {form.hourlyLimit.trim() === "" ? "no ceiling" : `$${form.hourlyLimit}`}
+              currently:{" "}
+              {form.hourlyLimit.trim() === ""
+                ? "no ceiling"
+                : `$${form.hourlyLimit}`}
             </p>
           </div>
           <div className="sy-field">
-            <label htmlFor="sy-budget-per-run-reserve">Per-run reserve (USD)</label>
+            <label htmlFor="sy-budget-per-run-reserve">
+              Per-run reserve (USD)
+            </label>
             <input
               id="sy-budget-per-run-reserve"
               className="sy-field-input"
               type="text"
               inputMode="decimal"
               value={form.perRunReserve}
-              onChange={(event) => setForm({ ...form, perRunReserve: event.target.value })}
+              onChange={(event) =>
+                setForm({ ...form, perRunReserve: event.target.value })
+              }
             />
           </div>
           <div className="sy-field">
-            <label htmlFor="sy-budget-time-cost">Time cost per hour (USD)</label>
+            <label htmlFor="sy-budget-time-cost">
+              Time cost per hour (USD)
+            </label>
             <input
               id="sy-budget-time-cost"
               className="sy-field-input"
               type="text"
               inputMode="decimal"
               value={form.timeCost}
-              onChange={(event) => setForm({ ...form, timeCost: event.target.value })}
+              onChange={(event) =>
+                setForm({ ...form, timeCost: event.target.value })
+              }
             />
           </div>
           <ConfirmButton
@@ -546,11 +701,14 @@ function BudgetPanel() {
           />
           {badCeilings.length > 0 && (
             <ErrorNote>
-              the budget was not sent — {badCeilings.join(" and ")} must be a number, or blank for no ceiling
+              the budget was not sent — {badCeilings.join(" and ")} must be a
+              number, or blank for no ceiling
             </ErrorNote>
           )}
           {setBudget.isError && (
-            <ErrorNote>the budget was not changed — the núcleo refused or did not answer</ErrorNote>
+            <ErrorNote>
+              the budget was not changed — the núcleo refused or did not answer
+            </ErrorNote>
           )}
         </div>
       )}
@@ -587,15 +745,25 @@ function BackupsPanel() {
         Staging a restore changes nothing yet — the swap happens the next time the núcleo starts.
       </PanelNote>
       <div className="sy-backups-actions">
-        <Button variant="ghost" disabled={takeBackup.isPending} onClick={() => takeBackup.mutate()}>
+        <Button
+          variant="ghost"
+          disabled={takeBackup.isPending}
+          onClick={() => takeBackup.mutate()}
+        >
           Take a backup now
         </Button>
       </div>
       {takeBackup.isError && (
-        <ErrorNote>the backup was not taken — the núcleo refused or did not answer</ErrorNote>
+        <ErrorNote>
+          the backup was not taken — the núcleo refused or did not answer
+        </ErrorNote>
       )}
-      {backups.isError && backups.data === undefined && <SystemListError error={backups.error} what="the backups" />}
-      {!backups.isError && backups.data === undefined && <p className="sy-loading">reading the backups…</p>}
+      {backups.isError && backups.data === undefined && (
+        <SystemListError error={backups.error} what="the backups" />
+      )}
+      {!backups.isError && backups.data === undefined && (
+        <p className="sy-loading">reading the backups…</p>
+      )}
       {backups.data !== undefined && backups.data.length > 0 && (
         <ul className="sy-backups" aria-label="Backups">
           {backups.data.map((backup) => (
@@ -616,12 +784,15 @@ function BackupRow({ backup }: { backup: BackupInfo }) {
         <span className="sy-backup-name">{backup.name}</span>
         <span className="sy-backup-meta">
           {formatBytes(backup.size_bytes)} · migration{" "}
-          {backup.migration_version === null ? "unknown" : backup.migration_version}
+          {backup.migration_version === null
+            ? "unknown"
+            : backup.migration_version}
         </span>
       </div>
       <ConfirmButton
         label="Stage a restore"
         confirmLabel={`Restore ${backup.name} on next start`}
+        variant="ghost"
         disabled={stageRestore.isPending}
         onConfirm={() => stageRestore.mutate(backup.name)}
       />
@@ -641,7 +812,8 @@ function RestoreError({ error }: { error: unknown }) {
       <RefusalNote
         refusal={error}
         sentences={{
-          conflict: "a restore is already staged, or that snapshot name is taken — only one can be pending",
+          conflict:
+            "a restore is already staged, or that snapshot name is taken — only one can be pending",
           not_found: "that snapshot is no longer there",
           unprocessable: "the núcleo could not verify that snapshot",
           bad_request: "that snapshot name is not one the núcleo will accept",
@@ -649,7 +821,11 @@ function RestoreError({ error }: { error: unknown }) {
       />
     );
   }
-  return <ErrorNote>the restore could not be staged — the núcleo did not answer</ErrorNote>;
+  return (
+    <ErrorNote>
+      the restore could not be staged — the núcleo did not answer
+    </ErrorNote>
+  );
 }
 
 /** Bytes, for a person — the same three-step scale `MailDetail.tsx` and `data/files.ts` use. */
@@ -752,8 +928,9 @@ function TokensPanel() {
   return (
     <Panel title="API tokens">
       <p className="sy-note">
-        A read-only token cannot read the budget or the kill switch — both sit outside its read
-        allowlist. A run-creating token may start work. An admin token is everything.
+        A read-only token cannot read the budget or the kill switch — both sit
+        outside its read allowlist. A run-creating token may start work. An
+        admin token is everything.
       </p>
 
       {minted !== null && (
@@ -790,7 +967,11 @@ function TokensPanel() {
             </label>
           ))}
         </fieldset>
-        <Button variant="ghost" disabled={mintToken.isPending || name.trim() === ""} onClick={handleMint}>
+        <Button
+          variant="ghost"
+          disabled={mintToken.isPending || name.trim() === ""}
+          onClick={handleMint}
+        >
           Mint token
         </Button>
       </div>
@@ -799,7 +980,9 @@ function TokensPanel() {
       {tokens.isError && tokens.data === undefined && (
         <SystemListError error={tokens.error} what="the API tokens" />
       )}
-      {!tokens.isError && tokens.data === undefined && <p className="sy-loading">reading the tokens…</p>}
+      {!tokens.isError && tokens.data === undefined && (
+        <p className="sy-loading">reading the tokens…</p>
+      )}
       {tokens.data !== undefined && tokens.data.length === 0 && (
         <Quiet says="no token has been minted." />
       )}
@@ -820,13 +1003,16 @@ function MintError({ error }: { error: unknown }) {
       <RefusalNote
         refusal={error}
         sentences={{
-          bad_request: "a token name is 1–64 characters, letters, digits, hyphen or underscore",
+          bad_request:
+            "a token name is 1–64 characters, letters, digits, hyphen or underscore",
           conflict: "there is already a token with that name",
         }}
       />
     );
   }
-  return <ErrorNote>the token was not minted — the núcleo did not answer</ErrorNote>;
+  return (
+    <ErrorNote>the token was not minted — the núcleo did not answer</ErrorNote>
+  );
 }
 
 /** One row, with its own `useRevokeToken` instance — each row's pending/error state is its own. */
@@ -856,9 +1042,18 @@ function TokenRow({ token }: { token: ApiTokenSummary }) {
 
 function RevokeError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
-    return <RefusalNote refusal={error} sentences={{ not_found: "that token is already gone" }} />;
+    return (
+      <RefusalNote
+        refusal={error}
+        sentences={{ not_found: "that token is already gone" }}
+      />
+    );
   }
-  return <ErrorNote>that token was not revoked — the núcleo did not answer</ErrorNote>;
+  return (
+    <ErrorNote>
+      that token was not revoked — the núcleo did not answer
+    </ErrorNote>
+  );
 }
 
 /* ------------------------------------------------------------------- config -- */
@@ -904,7 +1099,9 @@ function EmailConfigPanel() {
       {email.isError && email.data === undefined && (
         <SystemListError error={email.error} what="the e-mail configuration" />
       )}
-      {!email.isError && email.data === undefined && <p className="sy-loading">reading…</p>}
+      {!email.isError && email.data === undefined && (
+        <p className="sy-loading">reading…</p>
+      )}
       {email.data !== undefined && <EmailConfigFacts config={email.data} />}
     </Panel>
   );
@@ -922,18 +1119,33 @@ function EmailConfigFacts({ config }: { config: EmailConfig }) {
   return (
     <>
       <div className="sy-config-flags">
-        <Badge tone={config.enabled ? "active" : "off"}>{config.enabled ? "enabled" : "disabled"}</Badge>
-        <Badge tone={config.armed ? "active" : "paused"}>{config.armed ? "armed" : "unarmed"}</Badge>
+        <StateBadge domain="setting" state={config.enabled ? "enabled" : "disabled"} />
+        <StateBadge domain="setting" state={config.armed ? "armed" : "unarmed"} />
       </div>
       <dl className="sy-config-facts">
         <ConfigFact term="host" value={config.host} />
         <ConfigFact term="username" value={config.username} />
         <ConfigFact term="mailbox" value={config.mailbox} />
-        <ConfigFact term="sent mailbox" value={config.sent_mailbox ?? "not set"} />
-        <ConfigFact term="poll interval" value={`${String(config.poll_interval_secs)}s`} />
-        <ConfigFact term="notify classes" value={config.notify_classes.join(", ") || "none"} />
-        <ConfigFact term="digest hour (UTC)" value={String(config.digest_hour_utc)} />
-        <ConfigFact term="retain bodies (days)" value={String(config.retain_bodies_days)} />
+        <ConfigFact
+          term="sent mailbox"
+          value={config.sent_mailbox ?? "not set"}
+        />
+        <ConfigFact
+          term="poll interval"
+          value={`${String(config.poll_interval_secs)}s`}
+        />
+        <ConfigFact
+          term="notify classes"
+          value={config.notify_classes.join(", ") || "none"}
+        />
+        <ConfigFact
+          term="digest hour (UTC)"
+          value={String(config.digest_hour_utc)}
+        />
+        <ConfigFact
+          term="retain bodies (days)"
+          value={String(config.retain_bodies_days)}
+        />
       </dl>
       <p className="sy-note">
         {config.local_triage_disabled === null
@@ -951,7 +1163,9 @@ function VoiceConfigPanel() {
       {voice.isError && voice.data === undefined && (
         <SystemListError error={voice.error} what="the voice configuration" />
       )}
-      {!voice.isError && voice.data === undefined && <p className="sy-loading">reading…</p>}
+      {!voice.isError && voice.data === undefined && (
+        <p className="sy-loading">reading…</p>
+      )}
       {voice.data !== undefined && <VoiceConfigFacts config={voice.data} />}
     </Panel>
   );
@@ -961,15 +1175,27 @@ function VoiceConfigFacts({ config }: { config: VoiceConfig }) {
   return (
     <>
       <div className="sy-config-flags">
-        <Badge tone={config.armed ? "active" : "paused"}>{config.armed ? "armed" : "unarmed"}</Badge>
+        <StateBadge domain="setting" state={config.armed ? "armed" : "unarmed"} />
       </div>
       <dl className="sy-config-facts">
         <ConfigFact term="hotkey" value={config.hotkey} />
         <ConfigFact term="memo hotkey" value={config.memo_hotkey} />
-        <ConfigFact term="cleanup model" value={config.cleanup_model ?? "none configured"} />
-        <ConfigFact term="retain dictations (days)" value={String(config.retain_dictations_days)} />
-        <ConfigFact term="max capture (s)" value={String(config.max_capture_seconds)} />
-        <ConfigFact term="max body (bytes)" value={String(config.max_body_bytes)} />
+        <ConfigFact
+          term="cleanup model"
+          value={config.cleanup_model ?? "none configured"}
+        />
+        <ConfigFact
+          term="retain dictations (days)"
+          value={String(config.retain_dictations_days)}
+        />
+        <ConfigFact
+          term="max capture (s)"
+          value={String(config.max_capture_seconds)}
+        />
+        <ConfigFact
+          term="max body (bytes)"
+          value={String(config.max_body_bytes)}
+        />
         <ConfigFact term="hints" value={config.hints.join(", ") || "none"} />
       </dl>
     </>
@@ -981,10 +1207,17 @@ function CalendarConfigPanel() {
   return (
     <Panel title="Calendar configuration">
       {calendar.isError && calendar.data === undefined && (
-        <SystemListError error={calendar.error} what="the calendar configuration" />
+        <SystemListError
+          error={calendar.error}
+          what="the calendar configuration"
+        />
       )}
-      {!calendar.isError && calendar.data === undefined && <p className="sy-loading">reading…</p>}
-      {calendar.data !== undefined && <CalendarConfigFacts config={calendar.data} />}
+      {!calendar.isError && calendar.data === undefined && (
+        <p className="sy-loading">reading…</p>
+      )}
+      {calendar.data !== undefined && (
+        <CalendarConfigFacts config={calendar.data} />
+      )}
     </Panel>
   );
 }
@@ -997,7 +1230,10 @@ function CalendarConfigFacts({ config }: { config: CalendarConfig }) {
         term="working hours"
         value={`${config.working_hours_start}–${config.working_hours_end}`}
       />
-      <ConfigFact term="working weekdays" value={config.working_weekdays.join(", ")} />
+      <ConfigFact
+        term="working weekdays"
+        value={config.working_weekdays.join(", ")}
+      />
     </dl>
   );
 }
@@ -1029,5 +1265,9 @@ function PanelNote({ empty, says, children }: { empty: boolean; says: string; ch
 
 function SystemListError({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about {what}</ErrorNote>;
+  return (
+    <ErrorNote>
+      the núcleo did not answer — nothing is known about {what}
+    </ErrorNote>
+  );
 }

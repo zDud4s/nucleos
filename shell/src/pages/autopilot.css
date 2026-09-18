@@ -17,21 +17,10 @@
 
 /* =============================================================== the page == */
 
-/**
- * The page's own column, named rather than measured.
- *
- * `--width-column` is the 64rem the three blocks below each wrote out
- * literally, and six sites across this page, `projects.css` and `system.css`
- * had agreed on that number without ever saying so — which is exactly how a
- * seventh gets to disagree by accident. It is a different measurement from the
- * `78rem` outer cap on `.app-page`: that one is the window, this one is the
- * column, and both stay.
- */
 .ap-sections {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  max-width: var(--width-column);
 }
 
 /* The stat row under the header — the same shape the Fleet page uses. */
@@ -40,7 +29,12 @@
   grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
   gap: var(--space-3);
   margin-bottom: var(--space-4);
-  max-width: var(--width-column);
+}
+
+/* Every card's detail is two lines tall, so a detail that gains a line — a queue filling, a
+   project promoted — never pushes the page down, and the row of cards stays one height. */
+.ap-stats .ui-stat-detail {
+  min-height: 2lh;
 }
 
 /* =============================================================== banners == */
@@ -49,9 +43,10 @@
  * A page-wide statement about what is currently suspended.
  *
  * Deliberately not a `ui-note`: the notes are said next to the control that
- * produced them, and these two are said about the whole page. They carry a
- * heavy left rule rather than a fill, so a screen with both of them on it is
- * still readable — two saturated blocks stacked would be a wall.
+ * produced them, and these two are said about the whole page. A plain hairline
+ * in the tone's own border colour carries that, and nothing more: a coloured
+ * left stripe on a card is a named anti-reference, and the tone triple already
+ * says which of the two this is.
  */
 .ap-banner {
   display: flex;
@@ -59,10 +54,8 @@
   gap: var(--space-1);
   margin: 0 0 var(--space-4);
   padding: var(--space-3) var(--space-4);
-  max-width: var(--width-column);
   border-radius: var(--radius-md);
   border: 1px solid var(--border);
-  border-left-width: 3px;
   background: var(--surface);
 }
 
@@ -82,26 +75,24 @@
 /* The emergency stop: the only thing on this page that suspends everything. */
 .ap-banner-kill {
   border-color: var(--tone-danger-border);
-  border-left-color: var(--tone-danger-fg);
   background: var(--tone-danger-bg);
 }
 
 /* A ceiling holding work is not a fault — warm, and never red. */
 .ap-banner-budget {
   border-color: var(--tone-paused-border);
-  border-left-color: var(--tone-paused-fg);
   background: var(--tone-paused-bg);
 }
 
 /* ============================================================ shared text == */
 
 /**
- * What a panel is for, said once above its list.
+ * What a panel is for, said once.
  *
- * Only above a list that has something in it. A panel with nothing in it says
- * the same thing through `Quiet`, which keeps the prose one click behind the
- * line rather than in front of it — a cockpit of seven panels that each explain
- * themselves in a paragraph gets longer the quieter it is, which is backwards.
+ * A panel with nothing in it says the same thing through `Quiet`, which keeps
+ * the prose one click behind the line rather than in front of it — a cockpit of
+ * seven panels that each explain themselves in a paragraph gets longer the
+ * quieter it is, which is backwards.
  */
 .ap-note {
   margin: 0 0 var(--space-3);
@@ -110,9 +101,27 @@
   color: var(--text-muted);
 }
 
+.ap-note-foot {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  max-width: var(--measure-prose);
+}
+
 /**
- * A wait, not an absence — which is why this survived while the six absences
- * beside it became `Quiet`.
+ * The page's one sentence. Two lines tall whatever it says, and before it says anything, so the
+ * page never moves down when the roster answers or when a promotion adds a clause. Prose, so it
+ * takes prose's measure.
+ */
+.ap-headline {
+  display: block;
+  min-height: 2lh;
+  max-width: var(--measure-prose);
+}
+
+/**
+ * A wait, not an absence — which is why this survived while the absences beside
+ * it became `Quiet`.
  *
  * The system settled the empty-state rung at `--text-muted`: in an empty region
  * the sentence *is* the content, and content set fainter than the labels around
@@ -126,24 +135,29 @@
   color: var(--text-faint);
 }
 
-/**
- * The count in a panel's heading corner. Tabular, so a column of them is a
- * column rather than a wobble.
- *
- * One site left: the scoreboard's `1/2 classes ready`. That is a ratio with a
- * trailing adjective rather than a quantity, and the shared `Count` takes a
- * number and an optional noun — routing this through it would mean inventing a
- * second shape for one call site. Every other count on this page is `Count`.
- */
-.ap-count {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-variant-numeric: tabular-nums;
-  color: var(--text-faint);
+/* The one absence still drawn by hand: `FeedEmbed` (Home and this cockpit) says
+   an empty feed with it. Every absence on this page itself is `Quiet`. */
+.ap-empty {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
+/**
+ * A second group inside a panel, under its own heading.
+ *
+ * The heading is a `Section` rather than the hand-rolled `.ap-subhead` that
+ * used to sit here. A section title brings no margin of its own, because the
+ * container owns the rhythm. This is that container, and the air above it is the
+ * one thing `.ap-subhead` had that the shared heading deliberately does not.
+ */
+.ap-group {
+  margin-top: var(--space-4);
+}
+
+/* The count in a panel's heading corner. Tabular, so a column of them is a
+   column rather than a wobble. */
 .ap-meta {
-  margin: 0;
   font-size: var(--text-xs);
   color: var(--text-faint);
 }
@@ -159,16 +173,6 @@
   text-decoration: underline;
 }
 
-/* The small print under a control: what a brake covers, and what one cannot
-   promise. Same rung, and the hedge adds only what makes it a hedge. */
-.ap-switch-note,
-.ap-hedge {
-  margin: 0;
-  font-size: var(--text-xs);
-  line-height: var(--leading-normal);
-  color: var(--text-faint);
-}
-
 /**
  * A hedge: something the page can draw but must not promise.
  *
@@ -177,168 +181,55 @@
  * a control simply does not do what its neighbours do.
  */
 .ap-hedge {
-  margin-top: var(--space-2);
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--text-faint);
   font-style: italic;
 }
 
-/**
- * A second group inside a panel, under its own heading.
- *
- * The heading is a `Section` now rather than the hand-rolled `.ap-subhead` that
- * used to sit here, which set a section title in the mono face — and the face is
- * a claim about origin, so "ask for one" in mono said the daemon wrote it. A
- * section title also brings no margin of its own, because the container owns the
- * rhythm. This is that container, and the air above it is the one thing
- * `.ap-subhead` had that the shared heading deliberately does not.
- */
-.ap-group {
-  margin-top: var(--space-4);
-}
-
-/* Same argument, one level down: inside a group the gap is the rhythm, so the
-   note must not also bring its own. */
-.ap-group .ap-note {
-  margin-bottom: 0;
-}
-
-/* ================================================================ fields == */
-
-/**
- * The label rank: field names and the name over a control.
- *
- * Three copies of the same three declarations, said once. This is **not** a
- * section title and must not be folded into `Section`: a heading is set in the
- * display face at `--tracking-wider`, this is set in the body face at
- * `--tracking-wide`, and at 11px that 0.06em is the whole of what stops a field
- * name and a heading being told apart.
- */
-.ap-fact dt,
-.ap-root-label,
-.ap-field-label {
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-/**
- * The two fields this page owns.
- *
- * `ui.css` ships no input primitive — that is the largest remaining hole in the
- * component layer, and closing it is not a page's job. What is a page's job is
- * saying the shared half once: the two differ only in the face, in how they
- * take their width, and in whether they resize.
- */
-.ap-root-input,
-.ap-field-input {
-  padding: var(--space-2);
-  font-size: var(--text-sm);
-  color: var(--text);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-}
-
-/* One of the app's four focus overrides, and like the other three it keeps the
-   colour and the 2px and changes only the offset — tight controls, little room
-   around them. */
-.ap-root-input:focus-visible,
-.ap-field-input:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
-}
-
-/* A path came from the machine, so it is set in the machine's face, and it
-   takes whatever room the label and the button leave. */
-.ap-root-input {
-  flex: 1 1 20rem;
-  min-width: 0;
-  font-family: var(--font-mono);
-}
-
-/* A prompt is a person's sentence, and grows downwards as one. */
-.ap-field-input {
-  width: 100%;
-  font-family: var(--font-body);
-  line-height: var(--leading-normal);
-  resize: vertical;
-}
-
-.ap-form {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  align-items: flex-start;
-}
-
 /* ================================================================= lists == */
-
-/* Three lists, one reset. What each one does with the space is below it. */
-.ap-list,
-.ap-switches,
-.ap-feed {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
 
 .ap-list {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
 }
 
-/**
- * The head line of a box: a name, some badges, a time.
- *
- * Three copies of the same four declarations — the project row's, the decision
- * card's and the brake's. `Inset` takes no head slot, deliberately: the
- * nineteen page copies of that box each had a `-head` div and they have nothing
- * in common but `display: flex`. This page's three do have something in common,
- * so they say it once here instead of three times.
- */
-.ap-row-head,
-.ap-card-head,
-.ap-switch-head {
+/* ------------------------------------------------------ the project's name -- */
+
+/* The project a panel is about, beside the panel's title (the shadow review, the scoreboard). */
+.ap-project-name {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
 }
 
-/* ---------------------------------------------------------- project rows -- */
-
-/**
- * The project the shadow panels below are about.
- *
- * A rung of the border ladder, and not the accent it used to be. Signal Cyan
- * marks the wordmark, links and the focus ring and nothing else; a selection
- * wearing it reads as a link that does not navigate, and it makes an
- * interaction look like a status. The row is already at the top of the neutral
- * fill ladder — `Inset` is `--surface-raised` — so what is left to move is the
- * frame: the hairline goes to its strong weight and grows a 3px left rule,
- * which is a border drawn as an inset shadow rather than elevation, and the
- * same gesture the rail uses to mark the row you are on.
- */
-.ap-row-selected {
-  border-color: var(--border-strong);
-  box-shadow: inset 3px 0 0 var(--border-strong);
-}
-
-.ap-facts {
+.ap-decision-facts {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-4);
   margin: 0;
 }
 
-.ap-fact {
+.ap-decision-fact {
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
-.ap-fact dd {
+.ap-decision-fact dt {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.ap-decision-fact dd {
   margin: 0;
   font-family: var(--font-mono);
   font-size: var(--text-sm);
@@ -346,41 +237,10 @@
   color: var(--text);
 }
 
-.ap-modes,
 .ap-actions {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2);
-}
-
-/**
- * The promotion gate, stated whether or not it is open.
- *
- * Two states and no third: open is informational, locked is held. Neither is
- * red — a project that has not earned promotion is a project doing exactly what
- * shadow mode is for.
- *
- * Each state is its tone's full triple. It carried the foreground and the fill
- * and skipped the edge, which is half a tone: on the raised fill of the row
- * around it a 12% wash with no edge has no boundary of its own, and a tone that
- * is not the whole triple is the first step towards a new colour being invented
- * for the next condition.
- */
-.ap-gate {
-  margin: 0;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--tone-active-border);
-  border-radius: var(--radius-sm);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--tone-active-fg);
-  background: var(--tone-active-bg);
-}
-
-.ap-gate-locked {
-  border-color: var(--tone-shadow-border);
-  color: var(--tone-shadow-fg);
-  background: var(--tone-shadow-bg);
 }
 
 /* --------------------------------------------------- the project-root input -- */
@@ -393,26 +253,572 @@
  * shell can do something about. Laid out as a row that wraps, so a long Windows
  * path does not push the button off the panel.
  *
- * A well, and not a third card. This sits inside a project row, which sits
- * inside a panel, and the graduation stops at one step — panel, inset, then
- * nothing. It used to carry a dashed frame saying "provisional", and at the
- * third level in that frame was simply a third frame: what it produced was
- * boxes-in-boxes, not provisionality. The sunken rung says "well" on its own in
- * both themes (`#08090c` under the raised row in dark, `#eceef3` under white in
- * light), and what says this is provisional is that it is only on the screen
- * while a refusal is standing.
+ * An `Inset`, which draws the box and stacks its children; this says only that
+ * these three sit on one line and wrap. None of the box's own properties is
+ * restated here.
  */
-.ap-root {
+.ap-project-root {
+  grid-column: 1 / -1;
+  flex-flow: row wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ap-project-root-label {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.ap-project-root-input {
+  flex: 1 1 20rem;
+  min-width: 0;
+  padding: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.ap-project-root-input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* ============================================================ the carousel == */
+
+/**
+ * The roster as a fan: an index above it, one card per project, and the setting for the project
+ * in focus below it. Ported from the approved prototype, its `apc-` classes renamed `ap-fan-`.
+ *
+ * Everything that moves is written by the component through `element.style` (CSSOM), which the
+ * production CSP allows; nothing here is animated by a stylesheet except the index's tick height.
+ */
+
+/* The note about the three settings is prose, and takes prose's measure. */
+.ap-fan-note {
+  max-width: var(--measure-prose);
+}
+
+.ap-fan-note strong {
+  color: var(--text);
+  font-weight: var(--weight-semibold);
+}
+
+/* --------------------------------------------------------- the index rail -- */
+
+/**
+ * Every project, at once, most urgent first — the answer to "is everything fine?" that the fan
+ * alone cannot give, because the fan shows one project at a time.
+ *
+ * A tablist: one tab stop, arrows walk it, and selection follows focus. One tick per project in its
+ * mode's tone; a project with an exception is taller and held ember, so the exceptions are the first
+ * thing on the row. Groups of equal urgency are separated by air, not by a rule.
+ */
+.ap-fan-index {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2) var(--space-4);
+}
+
+.ap-fan-rail {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.ap-fan-tick {
+  position: relative;
+  flex: 0 1 2.5rem;
+  min-width: 0.875rem;
+  height: 1.75rem;
+  display: flex;
+  align-items: flex-end;
+  padding: 0 0 7px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  cursor: pointer;
+}
+
+.ap-fan-tick-gap {
+  margin-left: var(--space-3);
+}
+
+.ap-fan-tick-bar {
+  display: block;
+  width: 100%;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--tone-off-fg);
+  transition: height var(--dur-quick) var(--ease);
+}
+
+.ap-fan-tick-active .ap-fan-tick-bar {
+  background: var(--tone-active-fg);
+}
+
+.ap-fan-tick-shadow .ap-fan-tick-bar {
+  background: var(--tone-shadow-fg);
+}
+
+.ap-fan-tick-exception .ap-fan-tick-bar {
+  height: 12px;
+  background: var(--tone-paused-fg);
+}
+
+/* The selection is contrast, never hue: a 2px underline in the text colour. Hover is one rung
+   below it. */
+.ap-fan-tick::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  border-radius: var(--radius-pill);
+  background: transparent;
+}
+
+.ap-fan-tick:hover::after {
+  background: var(--border-strong);
+}
+
+.ap-fan-tick[aria-selected="true"]::after {
+  background: var(--text);
+}
+
+.ap-fan-index-meta {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding-bottom: 5px;
+}
+
+.ap-fan-position {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.ap-fan-hint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.ap-fan-hint kbd {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  padding: 0 0.3em;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+
+/* The project the pointer is over, or the selected one. One line always, so hovering the index
+   never moves the fan under it. */
+.ap-fan-readout {
+  margin: var(--space-1) 0 0;
+  min-height: 1.6em;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.ap-fan-readout strong {
+  color: var(--text);
+  font-weight: var(--weight-semibold);
+}
+
+/* ------------------------------------------------------------- the stage -- */
+
+/**
+ * Pointer only — the index above is the keyboard's way in, so the stage takes no focus and its edge
+ * fade can never swallow a focus ring. The fade is the horizontal twin of `--scroll-fade`: a card
+ * cut hard at the edge reads as broken. The card size is the component's (`--ap-fan-card-w/h`, from
+ * `fanConfig` and the stage's own width); the values here are only what it starts from.
+ */
+.ap-fan-stage {
+  --ap-fan-card-w: 232px;
+  --ap-fan-card-h: 316px;
+  position: relative;
+  height: calc(var(--ap-fan-card-h) + 5rem);
+  overflow: hidden;
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grab;
+  -webkit-mask-image: linear-gradient(to right, transparent 0, black var(--space-7), black calc(100% - var(--space-7)), transparent 100%);
+  mask-image: linear-gradient(to right, transparent 0, black var(--space-7), black calc(100% - var(--space-7)), transparent 100%);
+}
+
+.ap-fan-stage-dragging {
+  cursor: grabbing;
+}
+
+/* One project is not a fan: no room kept for neighbours that will never drop into it. */
+.ap-fan-stage-single {
+  cursor: default;
+  height: calc(var(--ap-fan-card-h) + var(--space-5));
+}
+
+.ap-fan-stage-single .ap-fan-card {
+  --ap-fan-lift: 0px;
+}
+
+/**
+ * One project, at the first rank: the Projects panel is flat, so these are not boxes inside a box.
+ * The one in focus moves one rung, to the strong hairline. Identity first, then the exception if
+ * there is one, then the reading.
+ */
+.ap-fan-card {
+  --ap-fan-lift: 1.5rem;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: var(--ap-fan-card-w);
+  height: var(--ap-fan-card-h);
+  margin-left: calc(var(--ap-fan-card-w) / -2);
+  margin-top: calc(var(--ap-fan-card-h) / -2 - var(--ap-fan-lift));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.ap-fan-card:not(.ap-fan-card-focus) {
+  cursor: pointer;
+}
+
+.ap-fan-card-focus {
+  border-color: var(--border-strong);
+}
+
+.ap-fan-card-focus .ap-fan-selectable {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+/* Distance recedes toward the ground, in both themes — not toward black. */
+.ap-fan-dim {
+  position: absolute;
+  inset: 0;
+  background: var(--bg);
+  opacity: 0;
+  pointer-events: none;
+  z-index: var(--z-cover);
+}
+
+.ap-fan-id {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ap-fan-id-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.ap-fan-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  line-height: var(--leading-tight);
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ap-fan-name + .ui-badge {
+  flex: none;
+}
+
+.ap-fan-root {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.ap-fan-root-none {
+  font-family: var(--font-body);
+  font-style: italic;
+}
+
+/* The exception takes the tone surface — the only tinted box a card carries. */
+.ap-fan-exception {
+  margin: 0;
+  padding: 2px var(--space-2);
+  border: 1px solid var(--tone-paused-border);
+  border-radius: var(--radius-md);
+  background: var(--tone-paused-bg);
+  color: var(--tone-paused-fg);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/**
+ * The reading — a sunken well, not a tinted card. The label reads at the top of the well and the
+ * reading sits at the bottom: the room between is the instrument's face, not a gap. The tone is on
+ * the badge and the segments only.
+ */
+.ap-fan-visor {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+
+.ap-fan-reading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.ap-fan-visor-label {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.ap-fan-figure {
+  font-family: var(--font-display);
+  font-size: var(--text-3xl);
+  font-weight: var(--weight-bold);
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.ap-fan-figure-of {
+  font-size: var(--text-xl);
+  color: var(--text-muted);
+  font-weight: var(--weight-semibold);
+}
+
+.ap-fan-figure-word {
+  font-size: var(--text-xl);
+}
+
+.ap-fan-track {
+  display: flex;
+  gap: 3px;
+  height: 6px;
+}
+
+.ap-fan-tone-active {
+  color: var(--tone-active-fg);
+}
+
+.ap-fan-tone-shadow {
+  color: var(--tone-shadow-fg);
+}
+
+.ap-fan-tone-off {
+  color: var(--tone-off-fg);
+}
+
+.ap-fan-seg {
+  flex: 1;
+  border-radius: var(--radius-pill);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+.ap-fan-seg-on {
+  background: currentColor;
+  box-shadow: none;
+}
+
+.ap-fan-track-empty {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-pill);
+}
+
+.ap-fan-caption {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+}
+
+.ap-fan-facts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-2);
+  margin: 0;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border);
+}
+
+.ap-fan-fact {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ap-fan-fact dt {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ap-fan-fact dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ap-fan-fact-sub {
+  display: block;
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ap-fan-stage-compact .ap-fan-facts {
+  display: none;
+}
+
+/* ------------------------------------------ the project in focus, below -- */
+
+/**
+ * The setting for whichever project is at rest in the centre, on the page's own left axis. The
+ * evidence comes before the control: the gate sentence sits above the switch, so the reason
+ * arrives before the decision.
+ */
+.ap-fan-focus {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+  width: 100%;
+  max-width: 44rem;
+  margin-top: var(--space-2);
+}
+
+.ap-fan-focus-title {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.ap-fan-focus-title strong {
+  margin-left: var(--space-1);
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+/**
+ * The gate is always there, the full width of the column and at least two lines tall.
+ *
+ * It used to appear only for a project that was not acting, at the width of its own sentence — so
+ * walking the fan moved everything below it by a box, and the page read as if the panels underneath
+ * were the thing changing. Every project has something to say here; an acting one says how to stop
+ * it. Its tone's full triple, and a note's 6px rather than an inline mark's 3px.
+ */
+.ap-fan-gate {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  min-height: calc(2lh + var(--space-4) + 2px);
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--tone-active-border);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--tone-active-fg);
+  background: var(--tone-active-bg);
+}
+
+/* Locked: the way to the third setting is not open yet, said in shadow's triple. */
+.ap-fan-gate-locked {
+  border-color: var(--tone-shadow-border);
+  color: var(--tone-shadow-fg);
+  background: var(--tone-shadow-bg);
+}
+
+/* The bare 422, and the folder field that follows it, take the column's full width. `.ui-note`
+   lays its children in a row; the list of prerequisites needs them stacked. */
+.ap-fan-refusal {
+  align-self: stretch;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.ap-fan-focus > .ap-project-root {
+  align-self: stretch;
+}
+
+.ap-fan-prereqs {
+  margin: var(--space-1) 0 0;
+  padding-left: var(--space-5);
+}
+
+.ap-fan-prereqs li {
+  margin: 1px 0;
+}
+
+/* ============================================================ decision cards == */
+
+/* A decision is an `Inset`: the box is the primitive's, and what is left here is
+   the type inside it. */
+
+.ap-card-head {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-3);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
 }
-
-/* ============================================================ decision cards == */
 
 .ap-card-id {
   font-family: var(--font-mono);
@@ -426,8 +832,6 @@
   color: var(--text);
 }
 
-/* Why the classifier decided what it did. When it recorded nothing, that is an
-   absence and `Quiet` says so — same rung, one shared recipe. */
 .ap-reason {
   margin: 0;
   font-size: var(--text-sm);
@@ -443,9 +847,11 @@
  * happen, here it is whether the classifier read *this exact text* correctly.
  * Scrolls in its own box rather than stretching the card.
  *
- * A well, like the root field above and for the same reason: it is the third
- * level in, the ladder has no third card rank, and the hairline it used to
- * carry was the frame that made the nesting visible in the first place.
+ * A well, and not a box with a hairline: it is the third level in, the ladder
+ * has no third card rank, and the frame it used to carry was what made the
+ * nesting visible in the first place. Still this page's own rather than `Well`,
+ * because a payload has to wrap inside the well and `Well as="pre"` keeps the
+ * text on its own lines at whatever width they arrive.
  */
 .ap-raw {
   margin: 0;
@@ -474,7 +880,7 @@
 .ap-score-caption {
   padding-bottom: var(--space-2);
   text-align: left;
-  font-family: var(--font-mono);
+  font-family: var(--font-display);
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
@@ -511,17 +917,76 @@
 
 /* ============================================================ trigger brakes == */
 
-.ap-switches {
+.ap-trigger-row {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
   gap: var(--space-3);
 }
 
-.ap-switch-name {
+.ap-trigger-name {
   font-family: var(--font-display);
   font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
   color: var(--text);
+}
+
+.ap-trigger-note {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--text-faint);
+}
+
+/* ================================================================== jobs == */
+
+/* A job is an `Inset`. Its two lines belong together more tightly than the
+   inset's default gap says, and that is the only thing said about it here. */
+.ap-job {
+  gap: var(--space-1);
+}
+
+.ap-job .ap-meta {
+  margin: 0;
+}
+
+/* A rule above the ask form, because round 10 took its heading away and left it touching the
+   jobs list. A hairline says "a different act, on the same subject" without saying it twice. */
+.ap-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: flex-start;
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+.ap-field-label {
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.ap-field-input {
+  width: 100%;
+  padding: var(--space-2);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  resize: vertical;
+}
+
+.ap-field-input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
 }
 
 /* ================================================================== feed == */
@@ -530,24 +995,11 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
 }
 
-/**
- * A ruled line, and not `Rows`.
- *
- * `Rows`/`Row` is the shared column read by scanning down it, and this embed is
- * exactly that kind of column — but a `Row` stacks its children in a column and
- * takes no `className`, while a feed line is a badge, a summary and a time on
- * one baseline. Wrapping the line in a div inside a `Row` would put a box back
- * where the primitive exists to take one out, so the hand-rolled version stays
- * until `Row` can carry a horizontal line.
- *
- * That leaves the `border-bottom` plus `:last-child` pair below, which is the
- * two-rule arrangement `.ui-rows` replaces with one — the exception is the half
- * everybody forgets, and forgetting it is how a list ends with a rule hanging
- * under nothing. It is written out here because it is not forgotten, not
- * because it is the better shape.
- */
 .ap-feed-line {
   display: flex;
   flex-wrap: wrap;

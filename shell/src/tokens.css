@@ -12,7 +12,9 @@
  * Everything else here — type, spacing, radii, motion, stacking, opacity and
  * measure — is a fact about the layout rather than about the light in the room,
  * and duplicating any of it into the light block is how the two themes start to
- * drift apart.
+ * drift apart. `tokens.test.ts` holds that line: every motion, stacking, opacity
+ * and measure name is declared once, in the base `:root`, and never again under
+ * the media query.
  *
  * The seven state tones are the app's whole colour vocabulary for *state*.
  * Interaction does not get a hue of its own — a primary button is expressed by
@@ -246,10 +248,17 @@
     --text-muted: #545d6c;
     --text-faint: #79828f;
 
-    --accent: #0b8493;
-    --accent-quiet: rgba(11, 132, 147, 0.12);
+    /* Link text on every light ground: 5.26:1 on --surface, 4.87:1 on --bg and 4.53:1 on
+       --surface-sunken. #0b8493 before it measured 4.43, 4.10 and 3.82, so a link in the page
+       headline — which sits on the page ground — and a card's link were both under the AA
+       floor. The hue is held (186.8° against 186.6°); only the lightness moved, and only as far
+       as the sunken ground, the tightest of the three, needed. */
+    --accent: #0a7785;
+    --accent-quiet: rgba(10, 119, 133, 0.12);
     --accent-ink: #ffffff;
-    --focus-ring: rgba(11, 132, 147, 0.5);
+    /* A non-text indicator, opaque so it clears 3:1 on every light ground. The accent's own
+       value, so the one brand colour stays one colour. */
+    --focus-ring: #0a7785;
 
     /* The contrast flips with the ground: near-black fill, light ink. */
     --solid: #12151b;
@@ -257,7 +266,8 @@
 
     /* Foregrounds darken for the light ground; the fills stay the same idea
        at a slightly higher alpha, because a 12% tint disappears on white. */
-    --tone-active-fg: #0d7d5c;
+    /* Text on its own 10% fill, also read over the sunken ground: 4.5:1 there too. */
+    --tone-active-fg: #0a6b4f;
     --tone-active-bg: rgba(13, 125, 92, 0.1);
     --tone-active-border: rgba(13, 125, 92, 0.28);
 
@@ -273,7 +283,11 @@
     --tone-pending-bg: rgba(138, 92, 0, 0.1);
     --tone-pending-border: rgba(138, 92, 0, 0.28);
 
-    --tone-paused-fg: #a94e22;
+    /* On its own 10% fill: 5.22:1 over --surface, 4.85:1 over --bg, 4.53:1 over
+       --surface-sunken. #a94e22 measured 4.80, 4.46 and 4.17, so a Held Ember badge off the card
+       was under the floor. Only the foreground moved — hue 19.7° against 19.6° — and the fill and
+       edge keep the tone's original rgb, as --tone-active's do. */
+    --tone-paused-fg: #a04a20;
     --tone-paused-bg: rgba(169, 78, 34, 0.1);
     --tone-paused-border: rgba(169, 78, 34, 0.28);
 

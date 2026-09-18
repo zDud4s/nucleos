@@ -16,6 +16,21 @@ describe("Quiet", () => {
     expect(screen.queryByText(/A command is a name/)).toBeNull();
   });
 
+  it("the question names its section and its answer", () => {
+    render(<Quiet says="none declared">Declaration rather than detection.</Quiet>);
+
+    const ask = screen.getByRole("button", { name: "why?" });
+    const said = ask.getAttribute("aria-describedby");
+    const why = ask.getAttribute("aria-controls");
+    expect(said).toBeTruthy();
+    expect(screen.getByText("none declared").getAttribute("id")).toBe(said);
+    expect(why).toBeTruthy();
+    const answer = document.getElementById(why ?? "");
+    expect(answer?.className).toContain("ui-quiet-why");
+    expect(answer?.getAttribute("hidden")).not.toBeNull();
+    expect(answer?.textContent).toBe("");
+  });
+
   it("gives the paragraph back, whole, on one click", () => {
     render(
       <Quiet says="none installed">

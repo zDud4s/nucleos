@@ -116,6 +116,13 @@ export const keys = {
   feed: {
     all: ["feed"] as const,
     search: (filters: Record<string, string | undefined>) => ["feed", "search", filters] as const,
+    /**
+     * One window of the time axis. `until` is `null` for a live window, which is every window the
+     * page offers today — and the key a poll merges into rather than replaces.
+     */
+    timeline: (since: string, until: string | null) => ["feed", "timeline", since, until] as const,
+    /** The daemon's seen marker. One per machine, so no parameters. */
+    seen: ["feed", "seen"] as const,
   },
 
   notifications: {

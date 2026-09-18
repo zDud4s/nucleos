@@ -1,25 +1,31 @@
 /* §spec canvas-da-frota */
 /**
- * The fleet page: the meter, the columns, the slot card and the canvas.
+ * The fleet page: the meter, the New job panel, the slot rack, the columns, the slot card and the
+ * canvas.
  *
  * `fleet-` throughout, and nothing in here styles a design-system primitive —
- * those rules live in `ui.css` behind the `ui-` prefix. The one thing this file
- * does to a primitive is give it room inside a fleet slot.
+ * those rules live in `ui.css` behind the `ui-` prefix. Where this file has to
+ * give a primitive room inside a fleet box, the selector starts with the fleet
+ * class, so no line here begins with `.ui-`.
  *
  * The rule that keeps this honest: **no class appears in a component that is
  * not defined below.** TypeScript and vitest both pass happily on a class no
  * stylesheet has ever heard of, and the defect shows up only as something
- * looking wrong on screen.
+ * looking wrong on screen. `scripts/css-contract.mjs` checks it both ways.
  *
- * Two of the boxes below are no longer this file's to draw: the column's
- * "nothing in flight" and the page's "no project is registered" are both
- * `Quiet`, the one-line absence. What is left is the layout around the
- * primitives and the type inside them.
+ * **One level of boxes.** A slot card is a box; nothing else on the page is. The
+ * column used to be a box around the cards, the exclusion note a well inside
+ * the card and the item list a second well — four frames deep at the item
+ * note — and a frame inside a frame reads as a pile, not as a list. Columns are
+ * now a heading and a rule, and what sat in wells is an inset line under its own
+ * hairline.
  *
  * Imported from `Fleet.tsx` rather than from `main.tsx`, so the sheet arrives
  * with the page and cannot outlive it in the bundle. It still lands after the
  * design system in the cascade, because the page module is reached through
- * `./router`, which `main.tsx` imports after `./ui.css`.
+ * `./router`, which `main.tsx` imports after `./ui.css`. It also lands after
+ * xyflow's own sheet, which `canvas/FleetCanvas.tsx` imports and `Fleet.tsx`
+ * reaches first.
  */
 
 /* ----------------------------------------------------------------- meter -- */
@@ -31,69 +37,154 @@
   margin-bottom: var(--space-5);
 }
 
-/**
- * The two arrangements, as one control.
- *
- * Sits in the page header's action slot, so it is the first thing after the
- * headline — the reader chooses how to look before reading what is there.
- */
-.fleet-views {
-  display: inline-flex;
+/* ----------------------------------------------------------------- notes -- */
+
+/* The route and the time under a refusal, for the one reader who is also the
+   person who fixes it. */
+.fleet-error {
+  display: flex;
+  flex-direction: column;
   gap: var(--space-1);
-  padding: var(--space-1);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-pill);
-  background: var(--surface-sunken);
+  margin-bottom: var(--space-4);
 }
 
-/* The pressed half is filled rather than merely tinted: which view is open is a
-   fact about the page, not a hover state. */
-.fleet-views .ui-button[aria-pressed="true"] {
-  background: var(--surface-raised);
-  border-color: var(--border-strong);
-  color: var(--text);
+.fleet-error-where {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* The time inside an error note takes the note's colour: the reading's own
+   faint grey is under 4.5:1 on the red fill. */
+.fleet-error-time .ui-reading-time {
+  color: inherit;
+}
+
+/* --------------------------------------------------------------- new job -- */
+
+/* Between the header and the meter, so opening it pushes the page down and
+   never sideways. No `display` here: the `hidden` attribute is what closes it. */
+.fleet-compose {
+  margin-bottom: var(--space-5);
+}
+
+.fleet-new-job {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 48rem;
+}
+
+.fleet-new-job-prompt {
+  min-height: 4.5rem;
+  resize: vertical;
+  line-height: var(--leading-snug);
+}
+
+/**
+ * Where it runs: the project and the team, side by side while there is room.
+ *
+ * Both selects carry sentences — "charlie — full (2 of 2)", "Infra — up to 3 at
+ * once" — so they share a row of their own rather than the numbers' row, where
+ * they would either truncate or stretch it.
+ */
+.fleet-new-job-where {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: var(--space-3);
+}
+
+.fleet-new-job-where .ui-field select {
+  width: 100%;
+  min-width: 0;
+}
+
+/* Two short numbers: their own width, not the field primitive's 14rem floor. */
+.fleet-new-job-limits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.fleet-new-job-limits .ui-field input {
+  width: 8rem;
+  min-width: 0;
+  font-family: var(--font-mono);
+}
+
+.fleet-new-job-why {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+}
+
+/* A refusal the núcleo is certain to make, said before the press: Held Ember's
+   whole triple, and never a stripe. The same note Runs draws for the same switch. */
+.fleet-hold {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--tone-paused-border);
+  border-radius: var(--radius-md);
+  background: var(--tone-paused-bg);
+  color: var(--tone-paused-fg);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+/* The button and the daemon's answer to it, on one line while there is room. */
+.fleet-new-job-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.fleet-new-job-actions > .ui-note {
+  flex: 1 1 20rem;
+  margin: 0;
 }
 
 /* --------------------------------------------------------------- columns -- */
 
 /**
- * A column per project, side by side, scrolling sideways when there are more
- * than fit.
+ * The busy projects, wrapping rather than scrolling sideways.
  *
- * `align-items: start` so a busy column does not stretch its idle neighbours to
- * its own height — an empty column at `0/N` should look empty.
+ * A fixed 20rem column in a horizontal scroller put the fourth busy project past
+ * the right edge of a 1280 window, where nothing said it was there. A grid that
+ * wraps shows every one of them; at 800px it is one column, and still no page
+ * scrolls sideways.
+ *
+ * `align-items: start` so a busy column does not stretch a quieter neighbour to
+ * its own height.
  */
 .fleet-columns {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
   align-items: start;
-  gap: var(--space-4);
-  overflow-x: auto;
-  padding-bottom: var(--space-4);
+  gap: var(--space-6) var(--space-5);
 }
 
+/* No box: a heading and the rule under it are what make a column. */
 .fleet-column {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  flex: 0 0 20rem;
   min-width: 0;
-  padding: var(--space-4);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
 }
 
 .fleet-column-head {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-3);
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
   padding-bottom: var(--space-2);
   border-bottom: 1px solid var(--border);
 }
 
 .fleet-column-title {
   margin: 0;
+  min-width: 0;
   font-family: var(--font-display);
   font-size: var(--text-md);
   font-weight: var(--weight-semibold);
@@ -101,141 +192,159 @@
   overflow-wrap: anywhere;
 }
 
-/* Monospaced so `1/2` and `10/12` line up down a row of columns. */
+.fleet-column-mode {
+  display: inline-flex;
+}
+
+/* Monospaced and tabular so `1/2` and `10/12` line up down a row of columns,
+   and pushed to the end of the head where a reader's eye looks for a count. */
 .fleet-column-count {
+  margin-left: auto;
   font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.fleet-column-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+/* ------------------------------------------------------------------ rack -- */
+
+/**
+ * Every project's slots, one line each, in an order that never moves.
+ *
+ * It recedes: no box, only a hairline above and below it, and every word in it muted. The pips are
+ * its only colour, and on a quiet day they are hollow.
+ *
+ * **Column-major**, through multi-column layout rather than a grid. A grid flows across — `alpha
+ * bravo / charlie delta` — and a list sorted by name is read down, the way a directory is. Columns
+ * at least 23rem wide, which is one whole entry on one line — name, mode, five pips and the New job
+ * glyph with their gaps. At 20rem, when New job was still a word, the entry did not fit and the
+ * action fell under its pips on every startable line. Two columns at 1280, one at 800, and nothing
+ * that scrolls sideways.
+ */
+.fleet-rack {
+  margin-bottom: var(--space-6);
+  padding-block: var(--space-2);
+  border-block: 1px solid var(--border);
+}
+
+.fleet-rack-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  column-width: 23rem;
+  column-gap: var(--space-6);
+}
+
+/* The last good reading, receded like the cards, and for their reason: a rack gone blank would
+   read as every slot given back. `StaleNote` says how old it is. */
+.fleet-rack-stale {
+  opacity: var(--opacity-quiet);
+}
+
+/**
+ * One project: its name, its mode, its pips, and its New job or the reason there is none.
+ *
+ * The name, the mode and the pips take fixed widths, so the pips start at the same x on every line
+ * and the actions stand in a column of their own — which is what makes the rack one instrument
+ * rather than a stack of sentences. Not at the right edge: with entries in two columns, an action
+ * pushed to its column's edge sat nearer the next column's name than its own pips, and read as
+ * belonging to it. Never wrapped: an action dropped under its pips broke the line it belongs to and
+ * the rhythm of every line beside it. Where a line is narrower than the column was sized for, the
+ * name gives way — it is the one cell that can be cut and still be whole, in its `title` and to a
+ * screen reader.
+ */
+.fleet-rack-entry {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+  min-height: 2rem;
+  padding-block: var(--space-1);
+  break-inside: avoid;
+}
+
+/* A real destination, in muted text with a quiet underline — the crumb's idiom. Cyan here would
+   make five names the loudest thing on the one strip whose job is to recede. One line, cut with an
+   ellipsis when an id outruns its cell: a name broken over two lines broke the rhythm of every
+   entry beside it. The whole id is still the link's text for a screen reader, and its `title`. */
+.fleet-rack-name {
+  flex: 0 1 10rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 0.2em;
+}
+
+.fleet-rack-name:hover {
+  color: var(--text);
+  text-decoration-color: currentColor;
+}
+
+.fleet-rack-mode {
+  display: inline-flex;
+  flex: 0 0 4.5rem;
+}
+
+/* Room for five pips (five at 0.625rem, four gaps of 0.25rem), so the actions line up for every
+   limit up to five — the common case — without holding an eight-pip gap open beside a three-slot
+   project, which set New job adrift from the pips it acts on. A longer limit pushes its own action
+   along, and past eight the pips give way to a count: the lines where alignment yields. */
+.fleet-rack-entry > .ui-pips {
+  min-width: 4.25rem;
+}
+
+.fleet-rack-act {
+  display: inline-flex;
+  align-items: center;
+}
+
+.fleet-rack-why {
   font-size: var(--text-sm);
   color: var(--text-muted);
   white-space: nowrap;
 }
 
-/* -------------------------------------------------------------- new job -- */
-
-.fleet-new-job {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin-top: auto;
-  padding-top: var(--space-3);
-  border-top: 1px dashed var(--border);
-}
-
-.fleet-new-job-prompt {
-  width: 100%;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font: inherit;
-  font-size: var(--text-sm);
-}
-
-.fleet-new-job-fields {
-  display: flex;
-  align-items: end;
-  gap: var(--space-2);
-}
-
-.fleet-new-job-field {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  min-width: 0;
-  flex: 1 1 0;
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.fleet-new-job-field input {
-  width: 100%;
-  padding: var(--space-1) var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  text-transform: none;
-  letter-spacing: normal;
-}
-
-/**
- * The team picker sits on its own line rather than in the fields row.
- *
- * Its options are sentences -- a name and a ceiling -- where budget and rounds
- * are two-character numbers, so sharing that row would either truncate the
- * option text or stretch the row to the width of the longest team name.
- */
-.fleet-new-job-team {
-  flex: none;
-}
-
-.fleet-new-job-field select {
-  width: 100%;
-  padding: var(--space-1) var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font: inherit;
-  font-size: var(--text-sm);
-  text-transform: none;
-  letter-spacing: normal;
-}
-
-.fleet-new-job-prompt:focus-visible,
-.fleet-new-job-field input:focus-visible,
-.fleet-new-job-field select:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
-}
-
 /* ------------------------------------------------------------- slot card -- */
 
 /**
- * One slot, in either view.
+ * One slot, in either view — the page's one box.
  *
- * A fixed width on the canvas and a fluid one in a column: the surface needs
- * cards it can lay out against each other, and the column has already decided
- * how wide things are.
- *
- * **It carried a 3px coloured left rule and a `--shadow-sm`, and both are
- * gone.** The stripe painted the kind of owner — job, run, item, undescribed,
- * orphaned — and it painted it in state tones, which is the state vocabulary
- * spent on a taxonomy: `--tone-active-border` is Acting Green, *it is really
- * executing, right now*, and it sat on every job card including one whose own
- * badge, an inch away, read "waiting for a slot". A card cannot say two things
- * about itself and be read.
- *
- * Nothing replaces it, because the replacement was already on the card. Every
- * kind names itself in the head — `job 41`, `run 7` — and the two kinds that
- * are genuinely states carry `StateBadge domain="slot"`: "detail unavailable"
- * against "awaiting reconciliation", the tone as its full triple, in words that
- * survive for the one reader in twelve who cannot separate the red from the
- * green. The stripe was a second, colour-only copy of a distinction the badge
- * already draws, and the tests that guard that distinction were already reading
- * the badge. The lift went with the stripe: this system is flat, and depth is a
- * rung rather than a shadow.
- *
- * What is left is `.ui-panel-inset` to the declaration — the box inside a box,
- * one rung up the ladder and one rank down it. It is written out here rather
- * than adopted from `Inset` because a slot card is an `<article>` whose
- * `aria-label` names the slot and its owner, and `Inset` renders a `div` or an
- * `li` and takes no accessible name. Widening it is the shared layer's call,
- * not this file's; until then this is the recipe, deliberately unchanged from
- * it, and it is the wrong place to answer a question about the box.
+ * The card's rank on the radius ladder (10px) and the Working rung, one up from
+ * the page ground now that the column under it has no box of its own. A fixed
+ * width on the canvas and a fluid one in a column: the surface needs cards it
+ * can lay out against each other, and the column has already decided how wide
+ * things are.
  */
 .fleet-card {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  padding: var(--space-3);
+  padding: var(--space-3) var(--space-4);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+/* The reading is the last good one. Receded, not hidden — `StaleNote` says how
+   old it is, and a card that vanished would read as a slot given back. */
+.fleet-card-stale {
+  opacity: var(--opacity-quiet);
 }
 
 .fleet-card-head {
@@ -245,17 +354,34 @@
   gap: var(--space-2);
 }
 
+/* Muted, not faint, throughout the card's metadata: faint on the card measured
+   3.45:1, under the 4.5:1 floor. */
 .fleet-card-slot {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 
 .fleet-card-owner {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   color: var(--text);
+}
+
+/* What the job or run IS. Three lines, then an ellipsis: a card is for knowing
+   which one this is, and the whole prompt is one click away in Runs. */
+.fleet-card-prompt {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text);
+  overflow-wrap: anywhere;
 }
 
 .fleet-card-line {
@@ -266,42 +392,57 @@
   margin: 0;
 }
 
-/**
- * The qualifier under a card's badge: which round, which mode, which item.
- *
- * `.fleet-card-of` joins the two it has always belonged with. It was emitted by
- * an item's card and defined nowhere — invisible to `scripts/css-contract.mjs`
- * because the modifier that used to sit beside it, `fleet-card-${kind}`, marked
- * the whole `fleet-card-` family as spoken for. Removing the modifier is what
- * made the hole visible, which is the check working in the direction it is
- * hardest to run by hand.
- */
-.fleet-card-rounds,
-.fleet-card-mode,
-.fleet-card-of {
+.fleet-card-meta {
   margin: 0;
   font-size: var(--text-xs);
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 
-.fleet-card-prompt {
+/* The run's mode is the literal the daemon records, so it wears the mono face. */
+.fleet-card-mode,
+.fleet-card-of {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.fleet-card-note {
   margin: 0;
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
   line-height: var(--leading-snug);
   color: var(--text-muted);
-  overflow-wrap: anywhere;
 }
 
-/* A real link out, so the accent is correct here — and it is not restated:
-   `base.css` already gives every `a` the accent, and a page that writes it
-   again is a page that has to be changed twice. */
+/* A real destination, so the one cyan on the card. Its own width: a link
+   stretched across the card has a focus ring around nothing. */
 .fleet-card-link {
-  align-self: start;
+  align-self: flex-start;
   font-size: var(--text-sm);
+}
+
+.fleet-card-note .fleet-card-link {
+  font-size: inherit;
+}
+
+/* Buttons at their own width, so the focus ring fits the control. */
+.fleet-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  align-self: flex-start;
+  gap: var(--space-2) var(--space-3);
 }
 
 /* ------------------------------------------------------------- collision -- */
 
+/**
+ * A warning about this card's own tree.
+ *
+ * §7 asks for two badges and not one: *this will collide* and *this collided*
+ * are different claims, and only the second is a measurement. The source is a
+ * badge of its own now, so it carries its tone's whole triple instead of a bare
+ * foreground colour on a word.
+ */
 .fleet-collide {
   display: flex;
   flex-wrap: wrap;
@@ -310,29 +451,6 @@
   margin: 0;
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
-}
-
-/**
- * The source, as a word.
- *
- * §7 asks for two badges and not one: *this will collide* and *this collided*
- * are different claims, and only the second is a measurement. Telling them
- * apart by colour alone would leave the distinction unreadable to the people
- * who most need the warning.
- */
-.fleet-collide-source {
-  font-family: var(--font-mono);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.fleet-collide-observed .fleet-collide-source {
-  color: var(--tone-danger-fg);
-}
-
-.fleet-collide-predicted .fleet-collide-source {
-  color: var(--tone-paused-fg);
 }
 
 .fleet-collide-what {
@@ -344,35 +462,64 @@
 
 /* ------------------------------------------------------------ exclusions -- */
 
+/* An inset line under its own hairline, where it used to be a tinted well. The
+   badge says which of the two lives the pair is in; the sentence says who waits. */
 .fleet-edge-note {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
   margin: 0;
-  padding: var(--space-2);
-  border-radius: var(--radius-sm);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border);
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
 }
 
-/* A rule in force. */
-.fleet-edge-active {
-  background: var(--tone-shadow-bg);
-  border: 1px solid var(--tone-shadow-border);
-}
-
-/* A question somebody asked. It is changing nothing yet, and it is drawn as a
-   dashed outline for exactly that reason. */
-.fleet-edge-pending {
-  background: transparent;
-  border: 1px dashed var(--tone-pending-border);
-}
-
 .fleet-edge-text {
-  flex: 1 1 12rem;
+  flex: 1 1 10rem;
   min-width: 0;
   color: var(--text-muted);
+}
+
+/**
+ * Lift, flush with the note it belongs to.
+ *
+ * The interlock reserves the armed label's width ("Lift the rule") so that arming moves nothing,
+ * and centres the resting label inside it — right for a button with a box, wrong for a quiet one,
+ * which is an underlined word with no box to be centred in. In a card the note wraps, Lift lands
+ * on a line of its own, and it read as indented from the badge above it.
+ *
+ * Start-aligned here and not in the primitive, because not every quiet interlock sits on a left
+ * edge: System stacks its quiet Restart against the right one (`.sy-subsystem-action`,
+ * `align-items: flex-end`), and start there would pull it off the edge it is aligned to. The
+ * reserved width stays.
+ */
+.fleet-edge-note .ui-confirm-stack {
+  justify-items: start;
+}
+
+.fleet-edge-note .ui-confirm-stack > * {
+  justify-content: flex-start;
+}
+
+/* The keyboard's way to the pairing question: a select and its button. */
+.fleet-peer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border);
+}
+
+.fleet-peer .ui-field {
+  flex: 1 1 10rem;
+}
+
+.fleet-peer .ui-field select {
+  width: 100%;
+  min-width: 0;
 }
 
 /* ----------------------------------------------------------- job items -- */
@@ -380,17 +527,24 @@
 .fleet-items-note {
   margin: 0;
   font-size: var(--text-xs);
-  color: var(--text-faint);
+  color: var(--text-muted);
+}
+
+/* The open queue: under a hairline, not in a sunken well inside the card. */
+.fleet-items-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border);
 }
 
 .fleet-items {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: var(--space-2);
   margin: 0;
-  padding: var(--space-2);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
+  padding: 0;
   list-style: none;
 }
 
@@ -412,32 +566,28 @@
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wider);
   text-transform: uppercase;
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 
 .fleet-item-row {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: var(--space-2);
+  gap: var(--space-1) var(--space-2);
   font-size: var(--text-xs);
 }
 
 .fleet-item-ordinal {
   font-family: var(--font-mono);
-  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
 }
 
 .fleet-item-what {
-  flex: 1 1 10rem;
+  flex: 1 1 8rem;
   min-width: 0;
   color: var(--text);
   overflow-wrap: anywhere;
-}
-
-.fleet-item-state {
-  color: var(--text-muted);
-  white-space: nowrap;
 }
 
 .fleet-item-why {
@@ -448,7 +598,7 @@
 
 /* Said once above the queue: it is a fact about the job, not about a row. */
 .fleet-items-team {
-  margin: 0 0 var(--space-1);
+  margin: 0;
   font-size: var(--text-xs);
   color: var(--text-muted);
 }
@@ -456,9 +606,10 @@
 /**
  * Who has the item, what it waits for, what it will touch.
  *
- * Indented under the row it belongs to and set in the muted colour, because it
- * explains a row rather than being one -- the same relationship, and the same
- * indent, `.fleet-item-why` already has to its own row.
+ * Indented under the row it belongs to, because it explains a row rather than
+ * being one -- the same relationship, and the same indent, `.fleet-item-why`
+ * already has to its own row. Muted rather than faint: 4.21:1 in the list was
+ * under the floor.
  */
 .fleet-item-direction {
   display: flex;
@@ -466,14 +617,30 @@
   gap: var(--space-2);
   margin: 0 0 0 var(--space-4);
   font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-
-.fleet-item-agent {
   color: var(--text-muted);
 }
 
+.fleet-item-agent {
+  color: var(--text);
+}
+
+/* The reading and the arrangement control share a line: one says where the queue
+   is, the other changes how you look at it. */
+.fleet-items-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
 /* ---------------------------------------------------------------- canvas -- */
+
+.fleet-canvas-frame {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
 
 /**
  * The surface.
@@ -489,6 +656,17 @@
   overflow: hidden;
 }
 
+/* The one line that explains the gesture the surface is for. */
+.fleet-canvas-key {
+  max-width: var(--measure-prose);
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+}
+
+/* The library's own variables, pointed at this app's tokens so the canvas is
+   not a light rectangle in a dark window. */
 /**
  * The library's own variables, pointed at this app's tokens so the canvas is
  * not a light rectangle in a dark window.
@@ -535,11 +713,12 @@
  * The wrapper still gets `.selected` from xyflow, so the mark goes on the card
  * inside it, and there the geometry the This-One Rule asks for works exactly:
  * `.ui-current`'s own recipe, a 2px inset rule on the leading edge in the top
- * neutral rung. The class itself is not used because `.fleet-card` may carry a
- * shadow of its own, and `box-shadow` does not merge — it replaces.
+ * neutral rung. The class itself is not used because `.fleet-card` carries a
+ * shadow of its own, and `box-shadow` does not merge — it replaces. So the card's
+ * `--shadow-sm` is restated after the rule, or selecting a card would flatten it.
  */
 .fleet-canvas .react-flow__node.selected .fleet-card {
-  box-shadow: inset 2px 0 0 var(--text);
+  box-shadow: inset 2px 0 0 var(--text), var(--shadow-sm);
 }
 
 /* A node is the card and nothing else — the library's own chrome would be a
@@ -557,35 +736,95 @@
 }
 
 /**
- * Where a line starts and where it lands.
+ * The focus ring the library takes away.
  *
- * `--text-muted` and not `--accent`: a handle is a control at rest, which is
- * the rung the ghost button already sits on, and the brand colour is the
- * wordmark, links and the focus ring — nothing else. It was the plainest of the
- * page's cyan sites, because a handle is not even a selection standing in for
- * one: it is a thing you grab. The 1px `--bg` ring stays, and it is what keeps
- * the dot off the card edge it is drawn on rather than decoration.
+ * xyflow writes `outline: none` on a focused node, so every card on the surface
+ * was a tab stop that showed no sign of being one. This is `base.css`'s own ring
+ * — the token, the width, the offset — at the card's radius. The extra class in
+ * the selector outranks the library's `.react-flow__node.selectable:focus-visible`
+ * rather than relying on which sheet loaded last.
  */
+.fleet-canvas .react-flow__node.selectable:focus-visible,
+.fleet-canvas .react-flow__node:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-lg);
+}
+
+/* An edge's ring is a stroke under the wire (see `ExclusionEdgeLine`): clear at
+   rest, the focus colour while the edge has keyboard focus. */
+.fleet-wire-ring {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 8;
+  pointer-events: none;
+}
+
+.fleet-canvas .react-flow__edge:focus-visible .fleet-wire-ring {
+  stroke: var(--focus-ring);
+}
+
 .fleet-handle {
   width: 10px;
   height: 10px;
   border: 1px solid var(--bg);
-  background: var(--text-muted);
+  background: var(--border-strong);
 }
 
-/* A rule in force is solid; a request still waiting is dashed and quieter,
-   because it is changing nothing about how either job is scheduled. */
+/* A rule in force is solid, in Held Ember — it holds a job back, which is that
+   tone's whole meaning; Deliberating Violet is shadow mode and nothing else. A
+   request still waiting is dashed and amber, because it is changing nothing
+   about how either job is scheduled until somebody answers it. */
 .fleet-wire {
   stroke-width: 2;
 }
 
 .fleet-wire-active {
-  stroke: var(--tone-shadow-fg);
+  stroke: var(--tone-paused-fg);
 }
 
 .fleet-wire-pending {
   stroke: var(--tone-pending-fg);
   stroke-dasharray: 6 4;
+}
+
+/**
+ * A project's region: a hairline box with the column head's reading on it.
+ *
+ * Absolutely placed in flow coordinates inside xyflow's viewport portal, so it
+ * pans and zooms with its cards. `pointer-events: none` so the surface under it
+ * still pans and the cards inside it still drag — the region is a label, not a
+ * thing to hold. No fill: the portal paints above the nodes, and a tint there
+ * would sit over every card in it.
+ */
+.fleet-zone {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  pointer-events: none;
+}
+
+.fleet-zone-label,
+.fleet-zone-note {
+  position: absolute;
+  top: var(--space-2);
+}
+
+.fleet-zone-label {
+  left: var(--space-3);
+  font-family: var(--font-display);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.fleet-zone-note {
+  right: var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
 }
 
 /* ---------------------------------------------------- the queue as a graph -- */
@@ -608,12 +847,18 @@
 }
 
 /* The graph is the one thing here that can outgrow its card: a wide round puts
-   boxes side by side and the panel is a fixed column. It scrolls sideways on its
-   own rather than widening the card, which would push the fleet's other cards
-   off screen to show one job's queue. */
-.jp-svg {
+   boxes side by side and the card is a fixed column. The drawing keeps its own
+   size and the box around it scrolls sideways — shrinking it to fit put a 753px
+   viewBox into 260px and its labels under 4px. Widening the card instead would
+   push the fleet's other cards off screen to show one job's queue. */
+.jp-scroll {
   max-width: 100%;
   overflow-x: auto;
+}
+
+.jp-svg {
+  display: block;
+  max-width: none;
 }
 
 .jp-edge {
@@ -638,12 +883,12 @@
 
 .jp-label {
   fill: var(--text);
-  font-size: 11px;
+  font-size: var(--text-xs);
 }
 
 .jp-ordinal {
   fill: var(--text-muted);
-  font-size: 9px;
+  font-size: var(--text-xs);
 }
 
 .jp-done .jp-box {
@@ -776,14 +1021,4 @@
 
 .jp-bar .jp-attention {
   background: var(--tone-pending-fg);
-}
-
-/* The reading and the arrangement control share a line: one says where the queue
-   is, the other changes how you look at it. */
-.fleet-items-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
-  flex-wrap: wrap;
 }

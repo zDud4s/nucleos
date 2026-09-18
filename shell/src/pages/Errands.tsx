@@ -17,17 +17,17 @@ import {
   type ErrandStatus,
 } from "../data/errands";
 import {
-  Badge,
   Button,
   ConfirmButton,
   Count,
   ErrorNote,
-  Inset,
   PageHeader,
   Panel,
   Quiet,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
   StaleNote,
   StateBadge,
   Teach,
@@ -138,16 +138,17 @@ function ErrandList({
   answered: boolean;
   selected: string | null;
 }) {
+  if (answered && rows.length === 0) return null;
+
   return (
     <Panel title="Errands" aside={<Count n={answered ? rows.length : undefined} />}>
       {!answered && <p className="errands-loading">reading the errands…</p>}
-      {answered && rows.length === 0 && <Quiet says="no errand has been opened yet." />}
       {rows.length > 0 && (
-        <ul className="errands-list" aria-label="Errands">
+        <Rows label="Errands">
           {rows.map((row) => (
             <ErrandRow key={row.id} errand={row} active={String(row.id) === selected} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
@@ -172,19 +173,18 @@ function investigationText(errand: Errand): string {
 
 function ErrandRow({ errand, active }: { errand: Errand; active: boolean }) {
   return (
-    <li>
-      {/* The current row is `.ui-current` — a 2px inset rule on the leading
-          edge, in a neutral — and nothing else. It sits on the link because the
-          link is the box; `aria-current` is what says the same thing to a
-          screen reader, and both stay. */}
+    // The row you are on is `current` — the shared 2px rule on the leading edge,
+    // in a neutral — and nothing else. `aria-current` on the link says the same
+    // thing to a screen reader, and both stay.
+    <Row current={active}>
       <Link
-        className={active ? "errands-row-link ui-current" : "errands-row-link"}
+        className="errands-row-link"
         to={`/errands/${errand.id}`}
         aria-current={active ? "page" : undefined}
       >
         <span className="errands-row-name">{errand.name}</span>
         <StateBadge domain="errand" state={errand.status} />
-        <Badge tone={errand.brain === "local" ? "active" : "info"}>{errand.brain}</Badge>
+        <span className="errands-row-brain">{errand.brain}</span>
         <span className="errands-row-folder">{errand.folder}</span>
         <span
           className={
@@ -196,7 +196,7 @@ function ErrandRow({ errand, active }: { errand: Errand; active: boolean }) {
           {investigationText(errand)}
         </span>
       </Link>
-    </li>
+    </Row>
   );
 }
 
@@ -214,6 +214,7 @@ function ErrandDetail({ errand }: { errand: Errand }) {
             <ConfirmButton
               label="Close"
               confirmLabel="Close this errand — nothing is deleted"
+              variant="quiet"
               intent="stop"
               disabled={close.isPending}
               onConfirm={() => close.mutate(errand.id)}
@@ -573,11 +574,11 @@ function RulesPanel({ errandId }: { errandId: number }) {
       {!rules.isError && rules.data === undefined && <p className="errands-loading">reading the rules…</p>}
       {rules.data !== undefined && rows.length === 0 && <Quiet says="no rule is armed on this errand." />}
       {rows.length > 0 && (
-        <ul className="errands-rules" aria-label="Rules">
+        <Rows label="Rules" className="errands-rules">
           {rows.map((rule) => (
             <RuleRow key={rule.id} errandId={errandId} rule={rule} />
           ))}
-        </ul>
+        </Rows>
       )}
 
       <CreateRuleForm errandId={errandId} />
@@ -596,7 +597,7 @@ function RuleRow({ errandId, rule }: { errandId: number; rule: ErrandRule }) {
   const del = useDeleteErrandRule();
 
   return (
-    <Inset as="li">
+    <Row className="errands-rule">
       <div className="errands-rule-head">
         <span className="errands-rule-name">{rule.name}</span>
         <code className="errands-rule-cron">{rule.cron}</code>
@@ -604,6 +605,7 @@ function RuleRow({ errandId, rule }: { errandId: number; rule: ErrandRule }) {
         <ConfirmButton
           label="Delete"
           confirmLabel="Delete this rule"
+          variant="danger"
           intent="stop"
           disabled={del.isPending}
           onConfirm={() => del.mutate({ id: errandId, ruleId: rule.id })}
@@ -623,7 +625,7 @@ function RuleRow({ errandId, rule }: { errandId: number; rule: ErrandRule }) {
         </div>
       </dl>
       {del.isError && <DeleteRuleRefusal error={del.error} />}
-    </Inset>
+    </Row>
   );
 }
 

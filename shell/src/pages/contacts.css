@@ -82,15 +82,14 @@
 
 /* ==================================================== identity questions == */
 
-/* The column of questions. Each item is an `Inset`, which paints its own box —
-   this only spaces them and takes the list markers off. */
+/* The column of questions. It is `Rows`, and each question is a `Row` — the
+   hairlines and the fill are the shared layer's; this only resets the margin. */
 .contacts-questions {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
   margin: 0;
-  padding: 0;
-  list-style: none;
+}
+
+.contacts-question {
+  gap: var(--space-2);
 }
 
 .contacts-question-head {
@@ -118,7 +117,7 @@
 
 .contacts-merge {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-3);
 }
 

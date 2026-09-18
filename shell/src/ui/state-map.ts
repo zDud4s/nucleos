@@ -15,12 +15,12 @@ import type { BadgeTone } from "./Badge";
  * makes those distinctions testable without rendering anything, and what stops
  * the fourteenth page from quietly picking a different colour for `expired`.
  *
- * **This table covers every domain whose states have been verified against
- * the núcleo.** Every §7 row landed across the slices that built each page,
- * each with its literals checked against the core rather than guessed — team
- * run, the last of them, lands with this slice, and the table is complete. An
- * unmapped state is rendered as itself — see `StateBadge` — because showing
- * the literal admits ignorance, while assigning it a tone would be a claim.
+ * Every domain backed by Rust literals is checked by
+ * `state-map-completeness.test.ts`, which reads those literals rather than
+ * trusting this file's claim. An unmapped state is rendered as itself — see
+ * `StateBadge` — because showing the literal admits ignorance, while assigning
+ * it a tone would be a claim.
+ * A domain the núcleo does not write is allowed here only when its own docstring says so.
  */
 export type StateDomain =
   | "run"
@@ -42,7 +42,19 @@ export type StateDomain =
   | "team_run"
   | "team_item"
   | "team_action"
-  | "autopilot";
+  | "job_item"
+  | "collision_source"
+  | "exclusion"
+  | "autopilot"
+  | "brake"
+  | "setting"
+  | "machine_file"
+  | "credential"
+  | "department"
+  | "feed"
+  | "rule"
+  | "folder"
+  | "refinement";
 
 export interface StateReading {
   tone: BadgeTone;
@@ -70,19 +82,198 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     shadow: { tone: "shadow", label: "shadow" },
     active: { tone: "active", label: "active" },
   },
+  /** A brake is a switch, not workload: released is switched off on purpose; not_read is wired to nothing. */
+  brake: {
+    held: { tone: "paused", label: "held" },
+    released: { tone: "off", label: "released" },
+    not_read: { tone: "off", label: "not read" },
+  },
+  /** A setting that is on is a stated fact, never work in flight; off is not a held rule. */
+  setting: {
+    enabled: { tone: "info", label: "enabled" },
+    disabled: { tone: "off", label: "disabled" },
+    armed: { tone: "info", label: "armed" },
+    unarmed: { tone: "off", label: "unarmed" },
+    disarmed: { tone: "off", label: "disarmed" },
+  },
   /**
-   * Run outcomes. The four that §7 forbids merging.
+   * Whether one of this machine's settings files exists (`MachineSetting.exists`, served by
+   * `core/src/machine_config.rs`). The núcleo sends a boolean, so the two words are this shell's
+   * derivation, allowed by this docstring. Never configured is a switch nobody set, not a fault.
+   */
+  machine_file: {
+    configured: { tone: "info", label: "configured" },
+    unconfigured: { tone: "off", label: "never configured" },
+  },
+  /**
+   * Whether a credential is in the store (`MachineSecret.present`: true, false, or null when the
+   * store could not be asked). A shell derivation, allowed by this docstring. `unknown` is amber
+   * and not grey: unlike `unset`, which wants a credential pasted, it wants somebody to look at the
+   * store.
+   */
+  credential: {
+    set: { tone: "info", label: "set" },
+    unset: { tone: "off", label: "not set" },
+    unknown: { tone: "pending", label: "could not be asked" },
+  },
+  /** The núcleo does not write department states: this shell derivation keeps Teams and Bench in one vocabulary. */
+  department: {
+    working: { tone: "active", label: "at work" },
+    waiting: { tone: "pending", label: "waiting" },
+    idle: { tone: "off", label: "idle" },
+  },
+  /**
+   * Every `kind` the núcleo writes into the feed, mapped to a reading.
+   *
+   * The enumeration is not this file's claim any more: `state-map-completeness.test.ts` reads the
+   * kind argument at every call of `feed::append` / `append_on` / `append_for_errand` and of the
+   * two wrappers that forward a caller's kind (`job.rs::say`, `notify.rs::deliver_or_defer`)
+   * across `core/src`, outside the test modules, and fails on a difference in either direction.
+   * It went in at 46 rows and found eighteen kinds the núcleo writes and this table did not read —
+   * the two the Teams pillar writes most among them — each of which had been rendering
+   * `.ui-state-unmapped`, the device for a word the shell has never heard of.
+   *
+   * The one exclusion is `email_urgent`: `triage.rs:835` builds `format!("email_{}", class)` from
+   * a project's configured notify classes, so the shell can read the class everybody has and not
+   * everybody's classes.
+   *
+   * This domain spends no Acting Green: a feed line is written once and never refreshed, so a
+   * fact that may have ended hours ago cannot claim work is executing now.
+   *
+   * Three kinds are ONE kind for two or three outcomes, and their summary is the only carrier of
+   * which one happened — `team_action`, `team_run_finished` and `command_finished`. Each is a fact
+   * here, with the verdict left to the sentence; splitting them is a change in `core/`, and is a
+   * named follow-up for the owner rather than a thing the shell may guess at.
+   */
+  feed: {
+    // Jobs.
+    job_started: { tone: "info", label: "job started" },
+    job_planned: { tone: "info", label: "job planned" },
+    job_replanned: { tone: "info", label: "job replanned" },
+    job_plan_failed: { tone: "danger", label: "job could not be planned" },
+    job_item_failed: { tone: "danger", label: "job item failed" },
+    // Held Ember, as `job_item.conflicted` is: the item is put down, not failed, and one event
+    // keeps one tone on both pages — the same reasoning `reverted` follows.
+    job_item_conflicted: { tone: "paused", label: "job item did not merge" },
+    job_item_orphaned: { tone: "off", label: "job item never attempted" },
+    job_gate_failed: { tone: "danger", label: "job gate failed" },
+    // A round in which no item passed has nothing for a review to judge, so none runs (job 27,
+    // 2026-09-14: a review read a reverted tree and reported "no work was done"). A fact, not a
+    // failure: the red items already said so.
+    job_review_skipped: { tone: "info", label: "job review skipped" },
+    // A review that never reached the API is run once more (job 26, 2026-09-13: a DNS outage ended
+    // it and the next round opened without a verdict). Stated Blue and not amber: the verdict it
+    // stands for is still to come, but it comes from the job, not from the reader — the same
+    // argument `job_waiting` makes below. The sequence stays open (`lanes.ts`) until it lands.
+    job_review_retried: { tone: "info", label: "job review retried" },
+    // Stated Blue, not Awaiting-You Amber. `job.rs::brakes` parks a job for exactly six reasons —
+    // `kill-switch`, `budget`, `excluded`, `attention`, `slot` and `disk` (`park` writes the line) — and
+    // none of them is a question put to the reader: an approval is `awaiting_approval`, a status
+    // and not a park. Amber on every parked job taught the Feed to summon somebody for a slot that
+    // frees itself. The verdict, where there is one, is the `wait_reason` badge beside it.
+    job_waiting: { tone: "info", label: "job waiting" },
+    job_finished: { tone: "info", label: "job finished" },
+    job_failed: { tone: "danger", label: "job failed" },
+    job_stopped: { tone: "off", label: "job stopped" },
+    job_cancelled: { tone: "off", label: "job cancelled" },
+    job_expired: { tone: "paused", label: "job expired" },
+    job_interrupted: { tone: "paused", label: "job interrupted" },
+    // Runs.
+    run_retry: { tone: "info", label: "run retried" },
+    run_failed_final: { tone: "danger", label: "run failed for good" },
+    run_interrupted: { tone: "paused", label: "run interrupted" },
+    run_stopped_probing: { tone: "danger", label: "run stopped after repeated refusals" },
+    resume_did_not_act: { tone: "info", label: "approved action never attempted" },
+    shadow_run_completed: { tone: "shadow", label: "shadow run completed" },
+    worktree_run_completed: { tone: "info", label: "worktree run completed" },
+    token_efficiency: { tone: "info", label: "efficiency observation" },
+    // Worktrees.
+    worktree_gate_failed: { tone: "danger", label: "worktree gate failed" },
+    worktree_provision_failed: { tone: "danger", label: "worktree could not be made" },
+    worktree_released: { tone: "off", label: "worktree released" },
+    worktree_branch_kept: { tone: "info", label: "unmerged branch kept" },
+    worktree_removed: { tone: "off", label: "worktree removed" },
+    worktree_gc_failed: { tone: "danger", label: "worktree cleanup failed" },
+    // Git.
+    vcs_request_finished: { tone: "info", label: "git request settled" },
+    vcs_request_cancelled: { tone: "off", label: "git request cancelled" },
+    vcs_request_interrupted: { tone: "paused", label: "git request interrupted" },
+    vcs_resolution_started: { tone: "info", label: "conflict resolution started" },
+    vcs_resolution_cancelled: { tone: "off", label: "conflict resolution stopped" },
+    vcs_resolution_discarded: { tone: "danger", label: "resolution discarded changes" },
+    land_resolution_failed: { tone: "danger", label: "resolution could not be landed" },
+    // Teams.
+    team_run_started: { tone: "info", label: "team run started" },
+    team_run_finished: { tone: "info", label: "team run settled" },
+    team_item_dropped: { tone: "off", label: "team item dropped" },
+    team_action: { tone: "info", label: "team action settled" },
+    team_trigger_armed: { tone: "info", label: "team trigger armed" },
+    team_trigger_skipped: { tone: "paused", label: "team trigger did not fire" },
+    // Council.
+    council_started: { tone: "info", label: "council started" },
+    council_stage: { tone: "info", label: "council stage" },
+    council_finished: { tone: "info", label: "council settled" },
+    // Schedules and errands.
+    schedule_rule_invalid: { tone: "danger", label: "schedule rule invalid" },
+    errand_rule_fired: { tone: "info", label: "errand rule fired" },
+    errand_rule_failed: { tone: "danger", label: "errand rule failed" },
+    errand_investigation_done: { tone: "info", label: "errand investigation done" },
+    errand_investigation_failed: { tone: "danger", label: "errand investigation failed" },
+    // Mail.
+    email_digest: { tone: "info", label: "e-mail digest" },
+    email_urgent: { tone: "pending", label: "urgent e-mail" },
+    email_triage_failed: { tone: "danger", label: "e-mail triage failed" },
+    email_triage_paused: { tone: "paused", label: "e-mail triage paused" },
+    email_triage_stalled: { tone: "paused", label: "e-mail triage stalled" },
+    email_fetch_skipped: { tone: "info", label: "e-mail skipped" },
+    email_sent_mailbox_foreign: { tone: "danger", label: "sent mail filed elsewhere" },
+    // Project settings and machine lines.
+    config_written: { tone: "info", label: "project file written" },
+    workflow_changed: { tone: "info", label: "workflow changed" },
+    command_finished: { tone: "info", label: "project command finished" },
+    action_authorized: { tone: "info", label: "action authorised by a grant" },
+    proposal_record_failed: { tone: "danger", label: "proposal not recorded" },
+    promotion_ready: { tone: "pending", label: "promotion ready" },
+    // A credential set or forgotten from the app. The line names the key and never the value.
+    secret_stored: { tone: "info", label: "credential set" },
+    secret_forgotten: { tone: "info", label: "credential forgotten" },
+    "web.read": { tone: "info", label: "web page read" },
+  },
+  /** Rule settings are shell derivations: armed is stated, capped is a ceiling, and never-fires is a fault. */
+  rule: { armed: { tone: "info", label: "armed" }, "never-fires": { tone: "danger", label: "never fires" }, capped: { tone: "paused", label: "capped today" }, unseen: { tone: "info", label: "no commit seen yet" } },
+  /** Folder facts are derived by the shell; an unnamed folder is off, while a missing named one is a fault.
+   * A healthy folder is the absence of a fact, so `ok` is absent rather than a map row nobody renders.
+   */
+  folder: { missing: { tone: "danger", label: "gone" }, unset: { tone: "off", label: "not named" } },
+  /** Refinement kinds are facts, not a severity scale, so all four use Stated Blue. */
+  refinement: { prompt: { tone: "info", label: "instruction" }, memory: { tone: "info", label: "fact" }, skill: { tone: "info", label: "how-to" }, subagent: { tone: "info", label: "delegation" } },
+  /**
+   * Run outcomes. `concurrency.rs`'s `LIVE_RUN_STATUSES` and `runs.rs`'s
+   * `TERMINAL_RUN_STATUSES` name all eight; `run_stop.rs` counts the same set.
    *
    * `interrupted` is the núcleo dying underneath a run — a defect in *us*, and
    * the run may well have been fine. It gets the held tone, not the failure
    * tone, so that a screen full of interruptions reads as "the daemon
-   * restarted" and sends you to look at the daemon.
+   * restarted" and sends you to look at the daemon. Acting Green means the núcleo is executing
+   * right now, so terminal success takes Stated Blue: a fact with no verdict attached, not `off`,
+   * which means switched off on purpose. A measurement's good outcome (`gate.passed`,
+   * `collision.clean`, `council_seat.ok`, `voice_cleanup.cleaned`, `web_trust.raw`,
+   * `web_extract.article`, `pillar.ok`) keeps Acting Green because it is the verdict; blueing it
+   * would erase the difference from "not measured". `timed_out` is a ceiling, not a
+   * verdict: `run_stop.rs` keeps `Kind::Timeout` apart from `Kind::Failed`, so
+   * it gets Held Ember like `council_seat.timeout` and `team_run.expired` and
+   * never says "fail". `superseded` is quiet because work continues in its
+   * successor; it asks nothing of the reader, so it is off rather than paused.
    */
   run: {
+    running: { tone: "active", label: "running" },
+    awaiting_approval: { tone: "pending", label: "awaiting approval" },
+    completed: { tone: "info", label: "completed" },
     interrupted: { tone: "paused", label: "interrupted" },
     failed: { tone: "danger", label: "failed" },
     cancelled: { tone: "off", label: "cancelled" },
-    awaiting_approval: { tone: "pending", label: "awaiting approval" },
+    timed_out: { tone: "paused", label: "timed out" },
+    superseded: { tone: "off", label: "superseded" },
   },
 
   /**
@@ -91,13 +282,102 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * `stopped` is a person or a rule halting the chain; `expired` is the window
    * closing on it; `cancelled` is the request being withdrawn. None of the
    * three is a failure and none of the three is a completion, so none of them
-   * borrows either tone.
+   * borrows either tone. Its completed state follows the terminal-success rule: Stated Blue is a
+   * fact, while Acting Green is work happening now.
    */
   job: {
-    completed: { tone: "active", label: "completed" },
+    // The six live statuses (`core/src/job.rs`, `LIVE_STATUSES`). A job that is running is not
+    // an unknown word — firing the unmapped badge on the one job actually working teaches the
+    // reader to ignore the device that exists to admit ignorance.
+    planning: { tone: "active", label: "planning" },
+    implementing: { tone: "active", label: "implementing" },
+    gating: { tone: "active", label: "running the gate" },
+    reviewing: { tone: "active", label: "reviewing" },
+    awaiting_approval: { tone: "pending", label: "awaiting approval" },
+    // Held by a brake — budget, a slot, or an exclusion. `wait_reason` says which.
+    waiting: { tone: "paused", label: "held" },
+    completed: { tone: "info", label: "completed" },
+    failed: { tone: "danger", label: "failed" },
+    gate_failed: { tone: "danger", label: "the gate failed" },
+    // The `gate` domain's rule, and for the same reason: a gate that could not run measured
+    // nothing, and red would say the code is broken when the measurement is.
+    gate_errored: { tone: "info", label: "gate not measured" },
+    // The núcleo died underneath it — the `run` domain's reading, unchanged.
+    interrupted: { tone: "paused", label: "interrupted" },
     stopped: { tone: "off", label: "stopped" },
     expired: { tone: "paused", label: "expired" },
     cancelled: { tone: "off", label: "cancelled" },
+  },
+
+  /**
+   * One item of a job's queue — every `job_items.status` the núcleo stores, read out of
+   * `item_state_from` in `core/src/job.rs`, plus `pending`, which that function reaches through
+   * its `_ =>` arm because it is the column's default. `GateRetriable` is absent on purpose: it is
+   * never stored, only derived from `gate_failed` and an attempt count, so the wire cannot say it.
+   * `state-map-completeness.test.ts` holds this row to that function.
+   *
+   * **`conflicted` is Held Ember — not Wrong Red, and not Awaiting-You Amber.** The daemon says
+   * which in the variant's own doc (`core/src/job.rs`, `ItemState::Conflicted`): "The item is put
+   * down rather than failed: a conflict is a question about two pieces of work, not a verdict on
+   * either", and it "Leaves for `Running` — the resolution node, in that same tree". Red would be
+   * the verdict the daemon declines to give. Amber would be a summons, and nobody is being waited
+   * on: `ItemState::claimable_as` answers `Some("conflicted")` and `batch_of` takes a claimable
+   * item as work (the comment above `next_step`'s positional search: "`Conflicted` is found by
+   * the same search, and it is work for the same reason: the item owes a run"), so the queue
+   * starts the resolution run itself. Put down and owed a run is `reverted`'s reading too — held,
+   * not wrong — and the feed's `job_item_conflicted` wears the same tone, because one event must
+   * not wear two tones on two pages.
+   *
+   * `skipped` is the one that does ask: the item put itself down with a `skipped-item` proposal,
+   * and that proposal is in Waiting. `orphaned` is the feed's `job_item_orphaned`, quiet for the
+   * reason given there. `passed` is terminal success, so Stated Blue.
+   */
+  job_item: {
+    pending: { tone: "off", label: "to do" },
+    running: { tone: "active", label: "running" },
+    implemented: { tone: "active", label: "written, not yet measured" },
+    merging: { tone: "active", label: "merging" },
+    reverted: { tone: "paused", label: "taken back off the branch" },
+    passed: { tone: "info", label: "done" },
+    failed: { tone: "danger", label: "failed" },
+    cancelled: { tone: "off", label: "cancelled" },
+    gate_failed: { tone: "danger", label: "the gate failed" },
+    // The `gate` domain's rule: a gate that could not run measured nothing.
+    gate_errored: { tone: "info", label: "gate not measured" },
+    skipped: { tone: "pending", label: "skipped, needs a decision" },
+    conflicted: { tone: "paused", label: "did not merge" },
+    orphaned: { tone: "off", label: "never attempted" },
+    // Taken over by an item of a later round (`job.rs`, `STATUS_SUPERSEDED`): terminal, and its
+    // work continues in the successor — quiet, as `run.superseded` is.
+    superseded: { tone: "off", label: "taken over by a later round" },
+  },
+
+  /**
+   * Which of the collision warning's two sources is speaking.
+   *
+   * The keys are the núcleo's own field names on `Collisions` (`declared`, `observed` —
+   * `data/fleet.ts`, read off `core/src/collision.rs`); the words and the tones are the shell's,
+   * and this docstring is the permission the header asks for. §7 asks for two badges because
+   * *this collided* is a measurement and *this will collide* is a prediction, so the source is
+   * worded apart AND toned apart: the measurement in Wrong Red, the prediction in Held Ember.
+   */
+  collision_source: {
+    observed: { tone: "danger", label: "observed" },
+    declared: { tone: "paused", label: "predicted" },
+  },
+
+  /**
+   * One "these two never run at the same time", in either of its two lives.
+   *
+   * A shell derivation, allowed by this docstring: `active` is a row of `fleet_exclusions` and
+   * `pending` is a `fleet-exclusion` proposal still in the queue (`canvas/model.ts`,
+   * `exclusionEdges`). A rule in force holds a job back, which is Held Ember's whole meaning —
+   * not Deliberating Violet, which is shadow mode and nothing else. A question nobody has answered
+   * asks something of the reader, so it is amber.
+   */
+  exclusion: {
+    active: { tone: "paused", label: "rule in force" },
+    pending: { tone: "pending", label: "asked, not decided" },
   },
 
   /**
@@ -132,10 +412,14 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * job as `slot`. Somebody reading that waits for a run to finish, or goes
    * looking for one, and nothing clears until somebody frees space. Paused
    * rather than pending for that reason — like budget, it waits on a hand.
+   *
+   * `slot` is Stated Blue and not amber: the slot frees itself when the run holding it ends, so the
+   * wait asks nothing of the reader — it is a fact about the queue. Budget, exclusion and disk keep
+   * Held Ember, because each is a rule or a ceiling somebody could lift.
    */
   wait_reason: {
     budget: { tone: "paused", label: "held by budget" },
-    slot: { tone: "pending", label: "waiting for a slot" },
+    slot: { tone: "info", label: "waiting for a slot" },
     excluded: { tone: "paused", label: "held by an exclusion" },
     disk: { tone: "paused", label: "held by a full disk" },
   },
@@ -181,16 +465,20 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * A request in the git queue.
    *
    * Two distinctions, both load-bearing. `blocked` is terminal but **not** a
-   * failure: the queue will not retry it, and the answer is to fix the tree and
-   * submit again — so it takes the held tone rather than the red one. And
+   * failure: the queue will not retry it, and the answer is to submit again —
+   * so it takes the held tone rather than the red one. The instruction lives on
+   * `pages/Waiting.tsx`'s `VcsRow`: a full sentence in an 11px pill at 0.08em
+   * tracking is a badge doing the row's work, while every other badge in the
+   * shots is one or two words. And
    * `escalated` is a *normal outcome*: a person owns the conflict now, which is
    * the queue working, not the queue breaking. Dressing either as `failed`
-   * sends somebody to debug a merge that behaved exactly as designed.
+   * sends somebody to debug a merge that behaved exactly as designed. `succeeded` is terminal
+   * success, so it is Stated Blue rather than Acting Green.
    */
   vcs: {
-    succeeded: { tone: "active", label: "landed" },
+    succeeded: { tone: "info", label: "landed" },
     failed: { tone: "danger", label: "failed" },
-    blocked: { tone: "paused", label: "blocked — submit it again" },
+    blocked: { tone: "paused", label: "blocked" },
     escalated: { tone: "pending", label: "escalated to you" },
     rejected: { tone: "off", label: "rejected" },
     cancelled: { tone: "off", label: "cancelled" },
@@ -220,12 +508,13 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * `running` gets the pending tone rather than an active one: nothing has been
    * decided yet, and drawing a deliberation in progress the same colour as a
    * settled one would tell a person to stop watching a card that still has
-   * something to say. `cancelled` is withdrawn work, not a verdict, so it takes
+   * something to say. `done` is terminal success, so it is Stated Blue rather than work in
+   * flight. `cancelled` is withdrawn work, not a verdict, so it takes
    * the same quiet `off` every other cancellation in this table does.
    */
   council: {
     running: { tone: "pending", label: "deliberating" },
-    done: { tone: "active", label: "settled" },
+    done: { tone: "info", label: "settled" },
     error: { tone: "danger", label: "failed" },
     cancelled: { tone: "off", label: "cancelled" },
   },
@@ -261,7 +550,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * stay. It takes neither the failure tone nor the completion tone, because
    * closing is an ending and not a verdict — an errand can be closed the
    * moment it starts and closed after months of real work, and both are the
-   * same status.
+   * same status. Closing is a decision to stop asking, so it remains `off`.
    */
   errand: {
     active: { tone: "active", label: "answering" },
@@ -348,24 +637,34 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * wrote the states: `stopped` and `expired` are not failures. One is a money
    * ceiling reached, the other the run's four-hour one, and "an owner shown
    * `failed` goes looking for an error that does not exist". Neither takes the
-   * danger tone, and neither says the word.
+   * danger tone, and neither says the word. `done` is terminal success, so it is Stated Blue
+   * rather than Acting Green.
    */
   team_run: {
-    planning: { tone: "pending", label: "planning" },
+    // Awaiting-You Amber asks something of the reader; a director planning a round asks nothing.
+    planning: { tone: "active", label: "planning" },
     working: { tone: "active", label: "working" },
     delivering: { tone: "active", label: "delivering" },
-    done: { tone: "active", label: "delivered" },
+    done: { tone: "info", label: "delivered" },
     stopped: { tone: "paused", label: "stopped at a ceiling" },
     expired: { tone: "paused", label: "ran out of time" },
     failed: { tone: "danger", label: "failed" },
     cancelled: { tone: "off", label: "cancelled" },
   },
 
-  /** One item of one round — the four states `team.rs` writes for `team_items`. */
+  /**
+   * One item of one round. Exactly four, and these four: `core/src/team.rs` writes
+   * `'pending'` (`:3398`), `'running'` (`:2890`), `'done'` (`:3253`) and `'failed'`
+   * (`:2669, :2852, :3229, :3265, :3813, :3842`) and writes nothing else into
+   * `team_items.state`. `working`, `planned` and `skipped` were this shell's own invention —
+   * see `state-map-completeness.test.ts`, which reads the Rust rather than trusting this line.
+   * Awaiting-You Amber asks something of the reader; unstarted work is queued, not a summons.
+   * `done` is a terminal fact, not work in flight, so it is Stated Blue.
+   */
   team_item: {
-    pending: { tone: "pending", label: "not started" },
+    pending: { tone: "off", label: "not started" },
     running: { tone: "active", label: "running" },
-    done: { tone: "active", label: "done" },
+    done: { tone: "info", label: "done" },
     failed: { tone: "danger", label: "failed" },
   },
 
@@ -378,12 +677,13 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * half of §7's team row, that a human decision is not an execution result.
    * `pending` is deliberately neutral: an action may be pending because
    * somebody has not answered, or because the grant was `allow` and nobody has
-   * to. Which of the two it is comes from `proposal_id`, not from here.
+   * to. Which of the two it is comes from `proposal_id`, not from here. `done` is terminal
+   * success, so it is Stated Blue rather than Acting Green.
    */
   team_action: {
     pending: { tone: "pending", label: "not carried out yet" },
     working: { tone: "active", label: "being carried out" },
-    done: { tone: "active", label: "carried out" },
+    done: { tone: "info", label: "carried out" },
     failed: { tone: "danger", label: "failed" },
     rejected: { tone: "off", label: "refused by you" },
   },
@@ -428,4 +728,9 @@ export function readState(domain: StateDomain, state: string | null | undefined)
     return ABSENT[domain] ?? null;
   }
   return READINGS[domain][state.trim().toLowerCase()] ?? null;
+}
+
+/** Every literal this table has a reading for, in one domain. For the completeness test. */
+export function statesOf(domain: StateDomain): string[] {
+  return Object.keys(READINGS[domain]);
 }

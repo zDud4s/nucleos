@@ -559,6 +559,7 @@ pub async fn ingest_batch(
                 skip.reason.trim()
             ),
             None,
+            None,
         )
         .await?;
     }
@@ -581,6 +582,7 @@ pub async fn ingest_batch(
                 if foreign_in_sent == 1 { "" } else { "s" },
                 if foreign_in_sent == 1 { "was" } else { "were" },
             ),
+            None,
             None,
         )
         .await?;

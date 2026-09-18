@@ -867,6 +867,7 @@ async fn apply_verdicts(
                     "email {id} filed as failed: no readable verdict after {attempts} attempts"
                 ),
                 None,
+                None,
             )
             .await;
         }
@@ -913,7 +914,7 @@ async fn release_after_infra_failure(
                 &format!(
                     "email {id} quarantined after {failures} infrastructure failures — its body is kept"
                 ),
-                None,
+                None, None,
             )
             .await;
         }
@@ -1016,6 +1017,7 @@ async fn pass(
                     None,
                     "email_triage_paused",
                     &pause_message,
+                    None,
                     None,
                 )
                 .await;
@@ -1147,7 +1149,7 @@ async fn collect_run(
                         "email triage paused for {STALL_PAUSE_MINUTES} minutes after {} failed runs",
                         loop_state.consecutive_infra_failures
                     ),
-                    None,
+                    None, None,
                 )
                 .await;
             }
@@ -1277,7 +1279,7 @@ async fn maybe_write_digest(
         summary.push_str("\nneeds action: ");
         summary.push_str(&action_subjects.join("; "));
     }
-    crate::feed::append(pool, None, "email_digest", &summary, None).await?;
+    crate::feed::append(pool, None, "email_digest", &summary, None, None).await?;
     Ok(true)
 }
 

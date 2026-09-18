@@ -27,15 +27,15 @@ describe("Inset", () => {
   });
 
   it("keeps the shared recipe when a page marks one box out from its siblings", () => {
-    // `ap-row-selected` is the only page modifier in the app, and it adds a rule
-    // rather than replacing the box. If the primitive's own class were dropped
-    // in favour of the caller's, adoption would silently return that page to a
-    // hand-written card.
-    const { container } = render(<Inset className="ap-row-selected">the project</Inset>);
+    // A page modifier adds a rule rather than replacing the box. If the primitive's
+    // own class were dropped in favour of the caller's, adoption would silently
+    // return that page to a hand-written card. The class here is a probe rather
+    // than a real page's, so no sheet owes a rule for a name only a test writes.
+    const { container } = render(<Inset className="probe-selected">the project</Inset>);
 
     const box = container.firstElementChild;
     expect(box?.classList.contains("ui-panel-inset")).toBe(true);
-    expect(box?.classList.contains("ap-row-selected")).toBe(true);
+    expect(box?.classList.contains("probe-selected")).toBe(true);
   });
 
   it("puts nothing between itself and its content", () => {

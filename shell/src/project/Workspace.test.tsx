@@ -243,6 +243,32 @@ describe("the project workspace", () => {
   });
 
   /**
+   * The loudest sentence on the page is the one with somewhere to go.
+   *
+   * Those two proposals are rows in the Waiting queue, and a page that names them without
+   * offering the way there makes somebody find the queue by hand and then find this project
+   * inside it. The destination carries the project, so what opens is this project's share of
+   * the queue and not the whole of it.
+   *
+   * Two further things are asserted here rather than in cases of their own, because they are
+   * properties of this same box under the same poll: the section announces itself, since its
+   * sentence changes underneath a reader with nothing else to say so; and it carries no
+   * `shadow-float`, which DESIGN.md’s shadow vocabulary calls “applied to nothing” — this box
+   * was the one place applying it, so DESIGN.md was describing a tree it did not have.
+   */
+  it("the decisions sentence is a link to that project's queue", async () => {
+    const { container } = await openWorkspace({ openProposals: 2 });
+
+    const link = await screen.findByRole("link", { name: /2 decisions waiting on you/ });
+    expect(link.getAttribute("href")).toBe("/waiting?project=nucleos");
+
+    const leading = container.querySelector('section[aria-label="Leading"]');
+    expect(leading?.getAttribute("aria-live")).toBe("polite");
+    expect(leading?.contains(link)).toBe(true);
+    expect(leading?.querySelector(".shadow-float")).toBeNull();
+  });
+
+  /**
    * The ladder, seen from the page rather than from the module. The kill switch
    * is machine-wide and outranks a project's own queue: telling somebody to go
    * and approve two things, while nothing can start, would send them to do work
@@ -336,7 +362,7 @@ describe("the project workspace", () => {
     });
 
     expect(await screen.findByText("84k")).toBeTruthy();
-    expect(screen.getByText("$ 128.40")).toBeTruthy();
+    expect(screen.getByText("$128.40")).toBeTruthy();
 
     // 26 of 30 judged — the twelve ungated runs are NOT in the denominator, so this is 87% and not
     // 62%. Getting that wrong is the whole reason `gateShare` exists.
@@ -730,7 +756,7 @@ describe("the settings this app authors", () => {
     const locked = await openState(
       settingsState({ promotable: false, classes_ready: 2, classes_total: 5 }),
     );
-    const active = await screen.findByRole("button", { name: "active" });
+    const active = await screen.findByRole("button", { name: "Let it act" });
     expect(active.hasAttribute("disabled")).toBe(true);
     expect(screen.getByText(/3 of 5 action classes are still short of the bar/)).toBeTruthy();
 
@@ -744,9 +770,157 @@ describe("the settings this app authors", () => {
         withheld_classes_ready: 1,
       }),
     );
-    expect((await screen.findByRole("button", { name: "active" })).hasAttribute("disabled")).toBe(
-      false,
+    expect(
+      (await screen.findByRole("button", { name: "Let it act" })).hasAttribute("disabled"),
+    ).toBe(false);
+  });
+
+  it("an action class and its tally do not run together", async () => {
+    // The Chip renders one row of the shadow scoreboard; `settingsState`'s project overrides
+    // alone leave it empty, since the block reads `useScoreboard`, not the project's own fields.
+    const state = daemonState({
+      projects: [
+        project({
+          project_id: "nucleos",
+          mode: "shadow",
+          project_root: "C:/p",
+          promotable: false,
+          classes_ready: 2,
+          classes_total: 5,
+        }),
+      ],
+      scoreboard: [
+        {
+          mode: "shadow",
+          action_class: "read-local",
+          total: 46,
+          would_allow: 40,
+          would_pend: 5,
+          would_deny: 1,
+          reviewed: 18,
+          agree: 12,
+          disagree: 6,
+        },
+      ],
+    });
+    await openState(state);
+
+    const chip = await screen.findByTitle(/decided, .* reviewed/);
+    const fraction = chip.querySelector("span") as HTMLElement;
+    expect(fraction.className).toContain("ml-2");
+    expect(fraction.className).not.toContain("ml-1");
+    expect(chip.getAttribute("title")).toContain("disagreed");
+  });
+
+  /**
+   * Arming it says what it would mean, under the switch — where nothing above the button moves.
+   *
+   * The sentence used to be the armed LABEL, and on the roster that was measurable damage: 52
+   * characters inside a fixed track wrapped and grew the row from 90.6 to 125.0 pixels, sliding
+   * the button out from under a pointer that has four seconds left to press it a second time.
+   * Here the block is a column, so the sentence goes immediately under the switch and above the
+   * standing copy: arming pushes what is below it down and moves the control itself not at all.
+   *
+   * The segment says a short line that names the project, because on a page reached by project
+   * the name is what says which one is about to be let loose.
+   */
+  it("the mode block says the consequence while the third segment is armed", async () => {
+    await openState(
+      settingsState({
+        promotable: true,
+        classes_ready: 5,
+        classes_total: 5,
+        withheld_classes_ready: 1,
+        wip_limit: 4,
+        open_review_items: 3,
+      }),
     );
+
+    const offer = await screen.findByRole("button", { name: "Let it act" });
+
+    // Nothing SHOWS it before it is armed: it is what confirming would do, not a standing
+    // fact. It is in the document all the same, hidden — see the case below for why.
+    expect(screen.getByText(/nucleos acts on its own/).className).toBe("sr-only");
+
+    fireEvent.click(offer);
+
+    const armed = await screen.findByRole("button", { name: "Let nucleos act" });
+    // The interlock claims no pressed state: in this group `aria-pressed` means "this IS the
+    // setting", and armed is the one moment nothing has been set.
+    expect(armed.getAttribute("aria-pressed")).toBeNull();
+
+    // Read through the description rather than by text: while armed the sentence is in the
+    // document twice — the paragraph under the switch, and the live region saying it — so
+    // `getByText` matches two elements and fails on the ambiguity.
+    const said = document.getElementById(armed.getAttribute("aria-describedby") ?? "");
+    // And the count reads as a count already taken, not as an allowance being granted.
+    expect(said?.textContent).toContain("3 of its 4 proposal slots already in use");
+    expect(said?.tagName).toBe("P");
+    expect(said?.className).toBe("text-xs text-text-muted");
+  });
+
+  /**
+   * And it is the switch's description before anybody presses it.
+   *
+   * The paragraph used to be mounted by the arming, which meant `aria-describedby` arrived in
+   * the same render that swapped a focused button's label — and a description added to an
+   * element that already has focus is not re-announced by any major screen reader. The
+   * sentence was attached at the one moment it could not be heard. It is a standing
+   * description now: the element is always there, `.sr-only` at rest (absolutely positioned,
+   * so nothing in the block moves), and arming only swaps the class.
+   */
+  it("the mode switch is described before it is armed", async () => {
+    await openState(
+      settingsState({
+        promotable: true,
+        classes_ready: 5,
+        classes_total: 5,
+        withheld_classes_ready: 1,
+        wip_limit: 4,
+        open_review_items: 3,
+      }),
+    );
+
+    const offer = await screen.findByRole("button", { name: "Let it act" });
+    const describedBy = offer.getAttribute("aria-describedby");
+    expect(describedBy).not.toBeNull();
+
+    const described = document.getElementById(describedBy ?? "");
+    expect(described).not.toBeNull();
+    expect(described?.className).toBe("sr-only");
+    expect(described?.textContent).toContain("nucleos acts on its own");
+
+    fireEvent.click(offer);
+
+    // Same element, same id, now visible — and the armed button still points at it.
+    expect(described?.className).toBe("text-xs text-text-muted");
+    expect(
+      screen.getByRole("button", { name: "Let nucleos act" }).getAttribute("aria-describedby"),
+    ).toBe(describedBy);
+  });
+
+  /**
+   * The same control the roster draws, saying the same three things.
+   *
+   * This block used to render the daemon's own words — `off`, `shadow`, `active` — as three
+   * buttons, while the Autopilot page offered the same decision in verbs. One decision said in two
+   * vocabularies is a decision a reader has to translate, so there is one control now
+   * (`ui/ModeSwitch`) and the nouns are gone from the controls.
+   */
+  it("the mode block offers the three verbs", async () => {
+    await openState(settingsState({ promotable: false, classes_ready: 2, classes_total: 5 }));
+
+    const group = await screen.findByRole("group", { name: "Autopilot mode" });
+    expect(within(group).getByRole("button", { name: "Turn off" })).toBeTruthy();
+    expect(within(group).getByRole("button", { name: "Watch in shadow" })).toBeTruthy();
+    expect(within(group).getByRole("button", { name: "Let it act" })).toBeTruthy();
+
+    // What is set now is said by which segment is pressed, not by a word beside them.
+    expect(
+      within(group).getByRole("button", { name: "Watch in shadow" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(screen.queryByRole("button", { name: "active" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "off" })).toBeNull();
   });
 
   /**
@@ -794,6 +968,47 @@ describe("what this project can be asked to do", () => {
     // And the door to the rest says how many there are, so a short bar is not mistaken for a short
     // list.
     expect(screen.getByRole("button", { name: /all 3/ })).toBeTruthy();
+  });
+
+  /**
+   * The other half of that rule, which nothing held: what is not in the bar has to be IN the
+   * palette. Asserting only the absence passes identically if the group never registers at all —
+   * the palette context's inert default swallows a failed registration without a word — so this
+   * opens the palette and reads the row.
+   *
+   * And it reads the outcome sentence's COUNT. It used to be drawn twice on every row: once in
+   * the label, left over from the page-local palette this group replaced, and once in the
+   * palette's own trailing slot. Two `margin-left: auto` spans in one flex row split the free
+   * space between them, so the same four words appeared at two different places on the row.
+   */
+  it("puts everything else in the palette, its outcome said once", async () => {
+    await openState(
+      withCommands([
+        projectCommand({
+          id: 1,
+          name: "gate",
+          is_gate: true,
+          last: {
+            outcome: "passed",
+            started_at: "2026-08-23T09:00:00Z",
+            ended_at: "2026-08-23T09:04:00Z",
+            exit_code: 0,
+            output: null,
+          },
+        }),
+        projectCommand({ id: 2, name: "fmt", command: "cargo fmt --check", is_gate: false }),
+      ]),
+    );
+    await screen.findByRole("button", { name: /^gate,/ });
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
+
+    expect(await within(palette).findByText("Run in nucleos")).toBeTruthy();
+    expect(within(palette).getByText("fmt")).toBeTruthy();
+    expect(within(palette).getByText("cargo fmt --check")).toBeTruthy();
+    // The gate's own row says "passed", so this sentence belongs to `fmt` alone — once.
+    expect(within(palette).getAllByText("never run here")).toHaveLength(1);
   });
 
   /**

@@ -100,6 +100,11 @@
 /* The transcript's own scroll. The head above it and the composer below it stay
    where they are, which is the whole point. */
 .chats-scroll {
+  /* A flex column so the transcript can be pushed to the bottom of it — see
+     `.chats-turns`. Everything in here was already a block laid out top to bottom, so the
+     column changes nothing about a full conversation and everything about a short one. */
+  display: flex;
+  flex-direction: column;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -359,19 +364,23 @@
   max-width: 42rem;
 }
 
+/* `--text-2xl`, which is the rank a page's own title has everywhere else in the app. At
+   `--text-3xl` the greeting on the front door was the largest type in the shell — larger
+   than any heading on any page — for a line that says the same thing every morning. */
 .chats-front-greeting {
   margin: 0;
   font-family: var(--font-display);
-  font-size: var(--text-3xl);
+  font-size: var(--text-2xl);
   font-weight: var(--weight-semibold);
   letter-spacing: -0.02em;
   text-align: center;
   color: var(--text);
 }
 
-.chats-front-box {
-  box-shadow: var(--shadow-md);
-}
+/* `.chats-front-box` carried `--shadow-md`, which lifted the composer off the page like a
+   dialog. Nothing else on the front door floats, and the box is the page rather than a
+   thing standing on it. The rule is gone; the element keeps its class in the markup and
+   nothing else styled it, so there is no rule left to keep. */
 
 .chats-front-note {
   margin: 0;
@@ -648,7 +657,7 @@
   overscroll-behavior: none;
   padding: var(--space-2);
   border-radius: var(--radius-sm);
-  background: var(--surface-sunken, rgba(0, 0, 0, 0.04));
+  background: var(--surface-sunken);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   line-height: 1.45;
@@ -683,9 +692,9 @@
   gap: var(--space-2);
   margin: var(--space-2) 0;
   padding: var(--space-3);
-  border: 1px solid var(--tone-attention-border, var(--tone-paused-border));
+  border: 1px solid var(--tone-paused-border);
   border-radius: var(--radius-md);
-  background: var(--tone-attention-bg, var(--tone-paused-bg));
+  background: var(--tone-paused-bg);
   list-style: none;
 }
 
@@ -794,6 +803,67 @@
   align-items: baseline;
   gap: var(--space-1);
   margin-bottom: var(--space-3);
+}
+
+/* ------------------------------------------------ the open conversation's head -- */
+
+/**
+ * The way back to the list, above the conversation's name.
+ *
+ * Muted and unlined against the app's accent-coloured links, because a crumb is
+ * orientation rather than an invitation: it is read once, on arrival, by somebody
+ * checking they are where they meant to be. `a:hover` in `base.css` is unlayered, so the
+ * hover is turned off by a selector of its own weight rather than by a utility.
+ */
+.chats-crumb {
+  margin: 0;
+  font-size: var(--text-xs);
+}
+
+.chats-crumb a,
+.chats-crumb a:hover,
+.chats-crumb a:focus-visible {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.chats-crumb a:hover {
+  color: var(--text);
+}
+
+/**
+ * The conversation's name, at the rank of a page title, and still a rename control.
+ *
+ * It is an `h1` carrying `.chats-title-name`'s button, so the two facts the design wants
+ * are both true: the largest words on the screen are what this page is about, and
+ * clicking them is how the conversation gets a better name. The size is stated here
+ * rather than on `.chats-title-name`, because the editor door's fixed title uses that
+ * class too and is a heading inside a column, not the page's own.
+ */
+.chats-head-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0;
+}
+
+.chats-head-title .chats-title-name,
+.chats-head-title .chats-title-input {
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.015em;
+}
+
+/* Where it runs, in the header's headline slot. Mono because a path is a machine's word,
+   and truncated because a deep path must not push the `⋯` off the row. */
+.chats-where {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* An icon travelling with a word in the page header. Smaller than the composer's
@@ -1112,7 +1182,12 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-7);
-  margin: 0 0 var(--space-6);
+  /* Anchored to the bottom of the scrolling box. A conversation two turns old used to
+     start at the top with a screen of nothing between the last answer and the place you
+     type — so the two things a person is looking at, what was just said and where to say
+     the next thing, were as far apart as the window allowed. `auto` only does anything
+     while the content is shorter than the box; a long transcript is unaffected. */
+  margin: auto 0 var(--space-6);
   padding: 0;
   list-style: none;
 }
@@ -1128,16 +1203,16 @@
  * It fades out after a couple of seconds because it is an answer to a gesture, not a state: a
  * highlight that stayed would still be there tomorrow, claiming to mean something.
  *
- * Stated Blue and not the accent. This ring marks the turn a search landed on, which is a
+ * A neutral rung and not the accent. This ring marks the turn a search landed on, which is a
  * selection — and the Reserved Cyan Rule spends the brand colour on the wordmark, links and the
  * focus ring, nowhere else. Wearing the focus ring's own colour was the worse half of it: a
  * keyboard user would have had two rings in the same cyan on the same screen, one meaning "you
- * are here" and one meaning "it is there". Stated Blue is the tone for a fact with no verdict
- * attached, which is exactly what "this is the one you asked for" is.
+ * are here" and one meaning "it is there". Not a state tone either — one meaning per tone, and
+ * "this is the one you asked for" says where the reader is, not what state the turn is in.
  */
 .chats-turn-lit {
   border-radius: var(--radius-md);
-  outline: 2px solid var(--tone-info-border);
+  outline: 2px solid var(--border-strong);
   outline-offset: var(--space-3);
   animation: chats-turn-lit-out 2500ms ease-out both;
 }
@@ -1505,16 +1580,26 @@
  * there. `LoaderCircle` is a circle with a piece missing, and a broken ring
  * held still says "damaged", not "working".
  *
- * So it is removed rather than stilled, and nothing is lost by it. The line it
- * sits in already says `thinking…` or `running <tool>…`, and the elapsed clock
- * beside it advances every second. A clock is a re-render, not an animation,
- * which means it survives this media query — it was always the honest proof of
- * life here, and the spinner was only ever decorating it. The icon is already
- * `aria-hidden`, so assistive technology reads exactly the same line either way.
+ * So it is removed rather than stilled. The line it sits in already says
+ * `thinking…` or `running <tool>…`, and the elapsed clock beside it advances
+ * every second — a re-render, not an animation, so it survives this media query
+ * and is the honest proof of life here. A still mark (three dots) takes the
+ * ring's width so the line does not reflow when the query flips. The icon is
+ * already `aria-hidden` and the mark is generated content, so assistive
+ * technology reads exactly the same line either way.
  */
 @media (prefers-reduced-motion: reduce) {
   .chats-turn-spinner {
     display: none;
+  }
+
+  .chats-turn-live::before {
+    content: "⋯";
+    flex: none;
+    width: 0.875rem;
+    font-family: var(--font-mono);
+    line-height: 1;
+    color: var(--tone-info-fg);
   }
 }
 
@@ -1774,18 +1859,12 @@
   cursor: pointer;
 }
 
-/* An open microphone is worth a colour. This control is the only one in the row whose "on" state
-   means something is being recorded, and it must not be mistakable for the "off" state at a glance.
-   The colour is the `active` tone, used as its full triple: the microphone really is doing the
-   thing. It was the brand accent, which is reserved for the wordmark, links and the focus ring —
-   worn by a status it made a running microphone look like something you could click. */
+/* The open microphone must be unmistakable at a glance: its fill and left rule, rather than hue,
+   distinguish recording from the off state. */
 .chats-handsfree-on {
-  color: var(--tone-active-fg);
-  background: var(--tone-active-bg);
-  /* The edge of the triple drawn as an inset shadow, because the resting button
-     is `border: none` and giving it a real one on only its "on" state would move
-     the row two pixels every time the microphone opened. */
-  box-shadow: inset 0 0 0 1px var(--tone-active-border);
+  color: var(--text);
+  background: var(--surface-raised);
+  box-shadow: inset 2px 0 0 var(--border-strong);
 }
 
 .chats-handsfree-phase {

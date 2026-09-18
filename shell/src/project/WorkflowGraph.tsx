@@ -10,7 +10,7 @@ import {
   type WorkflowGraph as Graph,
 } from "../data/workflow-graph";
 import { openInVscode } from "../lib/vscode";
-import { Quiet, RefusalNote } from "../ui";
+import { Button, Quiet, RefusalNote } from "../ui";
 
 /**
  * The canvas, its inspector, and the guard that stands between an overlay and an eject.
@@ -176,7 +176,7 @@ function Inspector({
           {node.role === "gate" ? "gate" : node.type}
         </span>
         {node.overridden ? (
-          <span className="rounded-pill border border-border px-1.5 text-[10px] text-text-muted">
+          <span className="rounded-pill border border-border px-1.5 text-xs text-text-muted">
             project
           </span>
         ) : null}
@@ -191,10 +191,10 @@ function Inspector({
       <dl className="flex flex-col gap-1.5">
         {node.fields.map((field) => (
           <div key={field.name} className="flex flex-col">
-            <dt className="text-[10px] uppercase tracking-wide text-text-faint">{field.name}</dt>
+            <dt className="text-xs uppercase tracking-wide text-text-faint">{field.name}</dt>
             <dd className="font-mono text-xs break-words text-text">{field.value}</dd>
             {field.origin === undefined ? null : (
-              <dd className="font-mono text-[10px] text-text-faint">
+              <dd className="font-mono text-xs text-text-faint">
                 {field.origin === "" ? "the bundle sets nothing here" : `the bundle says ${field.origin}`}
               </dd>
             )}
@@ -236,23 +236,24 @@ function Inspector({
           onSave={(tool) => overlay.mutate({ projectId, name, node: node.id, tool })}
         />
         {node.overridden ? (
-          <button
-            type="button"
-            onClick={() =>
-              overlay.mutate({
-                projectId,
-                name,
-                node: node.id,
-                disabled: null,
-                model: null,
-                tool: null,
-                command: null,
-              })
-            }
-            className="self-start text-xs text-text-faint underline-offset-2 hover:underline"
-          >
-            follow the bundle again
-          </button>
+          <span className="self-start">
+            <Button
+              variant="quiet"
+              onClick={() =>
+                overlay.mutate({
+                  projectId,
+                  name,
+                  node: node.id,
+                  disabled: null,
+                  model: null,
+                  tool: null,
+                  command: null,
+                })
+              }
+            >
+              follow the bundle again
+            </Button>
+          </span>
         ) : null}
         {/*
           A refusal is the middle weight of the escalation ladder, and it was being drawn at the
@@ -391,13 +392,11 @@ function EditGuard({
         >
           edit in the library
         </button>
-        <button
-          type="button"
-          onClick={onCancel}
-          className="px-2 py-1.5 text-xs text-text-faint underline-offset-2 hover:underline"
-        >
-          cancel
-        </button>
+        <span className="inline-flex px-2 py-1.5">
+          <Button variant="quiet" onClick={onCancel}>
+            cancel
+          </Button>
+        </span>
       </div>
       <p className="text-xs text-text-faint">
         To diverge instead, eject the workflow above — that is where the sentence about losing
@@ -434,7 +433,7 @@ export function WorkflowChain({
         <li
           key={node.id}
           title={`${node.label} — ${nodeMeaning(node.type, node.role)}`}
-          className={`flex items-center gap-1 rounded-pill border px-2 py-0.5 text-[10px] ${
+          className={`flex items-center gap-1 rounded-pill border px-2 py-0.5 text-xs ${
             node.disabled ? "border-dotted opacity-50" : ""
           }`}
           style={{ borderColor: `var(--tone-${nodeTone(node.type, node.role)}-border)` }}

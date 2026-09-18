@@ -1,5 +1,6 @@
 import type { Agent } from "../data/agents";
-import type { Concurrency, Job, JobDetail, JobItem } from "../data/fleet";
+import type { ClassTally } from "../data/autopilot";
+import type { Concurrency, Job, JobDetail, JobItem, RunSearchResult } from "../data/fleet";
 import type { MapImport, MapModule, ProjectMap } from "../data/project-map";
 import type {
   InspectEntry,
@@ -7,12 +8,15 @@ import type {
   ProjectRules,
 } from "../data/projects";
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
-import type { PendingNotification } from "../data/feed";
+import type { FeedEntry, FeedSeen, FeedTimeline, PendingNotification } from "../data/feed";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
-import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary } from "../data/system";
+import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary, Proposal, SidecarState } from "../data/system";
 import type { VoiceConfigView } from "../data/voice";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
+import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
+import type { EmailDetail } from "../data/mail";
+import type { VcsRequestSummary } from "../data/waiting";
 
 /**
  * A núcleo made of fixtures, for looking at pages with.
@@ -31,7 +35,9 @@ import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "..
  * question.
  */
 
-const DAY = 86_400_000;
+const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
 /** Fixed, because a screenshot taken twice should be the same screenshot. */
 export const NOW = Date.parse("2026-08-24T09:41:00Z");
 
@@ -238,7 +244,7 @@ export const RUNS: TeamRun[] = [
  * shape that says nothing. This one has two roots that can run at once, a join that waits on
  * both, a second round, and three of the readings that are easy to get wrong:
  * `gate_failed` (which the wire cannot tell from "going round again"), `cancelled` (withdrawn
- * work, never the failure tone) and `conflicted` (waiting on a person, not broken).
+ * work, never the failure tone) and `conflicted` (owed a resolution run, not waiting on a person).
  */
 function jobItem(overrides: Partial<JobItem>): JobItem {
   return {
@@ -320,15 +326,15 @@ export const RUN_VIEWS: Record<string, TeamRunView> = {
     items: [
       { ordinal: 1, round: 1, agent_id: "auditor", description: "pull the bank export", state: "done", run_id: 11, output_path: null },
       { ordinal: 2, round: 1, agent_id: "researcher", description: "pull the ledger", state: "done", run_id: 12, output_path: null },
-      { ordinal: 3, round: 2, agent_id: "controller", description: "match them line by line", state: "working", run_id: 13, output_path: null },
-      { ordinal: 4, round: 2, agent_id: "reviewer", description: "check the exceptions", state: "planned", run_id: null, output_path: null },
+      { ordinal: 3, round: 2, agent_id: "controller", description: "match them line by line", state: "running", run_id: 13, output_path: null },
+      { ordinal: 4, round: 2, agent_id: "reviewer", description: "check the exceptions", state: "pending", run_id: null, output_path: null },
     ],
   },
   "run-live-2": {
     ...RUNS[1],
     cost_usd: 0.08,
     items: [
-      { ordinal: 1, round: 1, agent_id: "writer", description: "draft it", state: "working", run_id: 21, output_path: null },
+      { ordinal: 1, round: 1, agent_id: "writer", description: "draft it", state: "running", run_id: 21, output_path: null },
     ],
   },
 };
@@ -473,6 +479,42 @@ export const RECRUITS = [
     decided_at: null,
   },
 ];
+
+export const PROPOSALS: Proposal[] = [
+  ...["alpha", "alpha", "alpha", "bravo", "bravo"].map((project_id, index) => ({
+    id: 101 + index,
+    kind: "action-approval",
+    status: "pending",
+    run_id: null,
+    session_id: null,
+    project_id,
+    errand_id: null,
+    errand_name: null,
+    tool_name: "Bash",
+    reasoning: "The next action needs an owner's approval.",
+    tool_input: JSON.stringify({ command: "git status" }),
+    read_from: null,
+    created_at: ago((index + 1) * 60 * 1000),
+    decided_at: null,
+  })),
+];
+
+export const TEAM_ACTION_PROPOSALS: Proposal[] = ACTIONS.map((action) => ({
+  id: action.proposal_id ?? action.id,
+  kind: "team-action",
+  status: action.state === "pending" ? "pending" : "approved",
+  run_id: null,
+  session_id: null,
+  project_id: "alpha",
+  errand_id: null,
+  errand_name: null,
+  tool_name: action.kind,
+  reasoning: action.why,
+  tool_input: action.payload,
+  read_from: null,
+  created_at: action.created_at,
+  decided_at: action.executed_at,
+}));
 
 /* ------------------------------------------------------------- the agents -- */
 
@@ -629,6 +671,19 @@ export const AGENTS: Agent[] = [
  * `alpha` works and is busy, `bravo` is broken in the two ways that stop a
  * project silently, `charlie` has never been given a folder, and `delta` has a
  * folder and no rules at all — which is ordinary and must not read as a fault.
+ *
+ * **`alpha` is `promotable`, and it is the only one.** Until it was, no fixture
+ * here had ever earned the third mode segment, so no shot had ever photographed
+ * that segment enabled — and none could photograph what it says once armed. The
+ * consequence sentence rode inside the segment as its armed label, wrapped, and
+ * grew the roster row from 90.6 to 125.0 pixels under the pointer about to press
+ * it again: a regression that shipped precisely because the state it broke had
+ * no picture. It is `shadow` with every class clearing the bar and two of them
+ * withheld, which is what the núcleo asks for, and it keeps `3 of 4` proposal
+ * slots so the armed sentence in the shot is the sentence the tests pin. `delta`
+ * took over the 2-of-5 classes, so the "still short of the bar" blocker is still
+ * photographed somewhere — a folder with no RULES is not contradicted by having
+ * shadow classes short of the bar.
  */
 function project(overrides: Partial<ProjectSummary>): ProjectSummary {
   return {
@@ -657,8 +712,13 @@ export const PROJECTS: ProjectSummary[] = [
     root_exists: true,
     open_review_items: 3,
     wip_limit: 4,
-    classes_ready: 2,
+    // Every class clears the bar and two are classes the classifier withheld — the daemon's
+    // own conditions for offering promotion. `promotable` is still carried, never derived:
+    // the shell prints the row's numbers and does not recompute the núcleo's arithmetic.
+    classes_ready: 5,
     classes_total: 5,
+    withheld_classes_ready: 2,
+    promotable: true,
     last_gate: "passed",
     last_gate_at: ago(3 * 3600_000),
   }),
@@ -680,8 +740,89 @@ export const PROJECTS: ProjectSummary[] = [
     project_root: "C:/repos/delta",
     root_exists: true,
     wip_limit: null,
+    // alpha's old numbers, so the "3 of 5 action classes are still short of the bar" blocker
+    // keeps a row to be photographed in. delta's story is a folder with no rules file, which
+    // shadow classes short of the bar do not contradict.
+    classes_ready: 2,
+    classes_total: 5,
   }),
 ];
+
+/* ------------------------------------------------------- the queue of pushes -- */
+
+/**
+ * Three rows through the queue that serialises every push, merge and rebase.
+ *
+ * There was no branch for this route at all, so every GET fell through to `[]` and the
+ * queue photographed as "nothing has been through" on every surface that reads it. That is
+ * the worst kind of missing fixture: an empty list is a legitimate state, so the picture
+ * looked fine and simply showed a panel nobody had ever seen do anything.
+ *
+ * Two of the three want a person and one does not, which is the whole shape of the panel:
+ * `escalated` means somebody owns a conflict now (the queue working, not breaking),
+ * `blocked` is terminal without being a failure, and `succeeded` is the history kept behind
+ * them. Nothing prunes the table, so a listing is a record and not a backlog.
+ */
+export const VCS_REQUESTS: VcsRequestSummary[] = [
+  {
+    id: 412,
+    op: "merge",
+    project_id: "alpha",
+    repo_key: "C:/repos/alpha",
+    origin: "run",
+    status: "escalated",
+    created_at: ago(40 * 60 * 1000),
+  },
+  {
+    id: 409,
+    op: "push",
+    project_id: "bravo",
+    repo_key: "C:/repos/bravo-servicos-partilhados",
+    origin: "run",
+    status: "blocked",
+    created_at: ago(5 * 3600_000),
+  },
+  {
+    id: 404,
+    op: "rebase",
+    project_id: "alpha",
+    repo_key: "C:/repos/alpha",
+    origin: "owner",
+    status: "succeeded",
+    created_at: ago(1 * DAY),
+  },
+];
+
+/**
+ * What the classifier has recorded for each project, class by class.
+ *
+ * The route had no branch, so the daemon fell through to `[]` and `10-project-state` said
+ * "Nothing recorded in shadow yet" beside a roster row claiming 5 of 5 classes clearing the
+ * bar — the contradiction reached a screen for the first time when round 8 made alpha
+ * promotable. The bar is `READINESS_MIN_REVIEWED` reviews at `READINESS_MIN_AGREE_PERCENT`
+ * agreement, per class; `ClassTally` carries no "withheld" field, so a class the classifier
+ * held back is one with `would_allow: 0` and the total sitting in `would_pend`/`would_deny`.
+ */
+export const SCOREBOARD: Record<string, ClassTally[]> = {
+  alpha: [
+    { mode: "shadow", action_class: "read-local", total: 46, would_allow: 46, would_pend: 0, would_deny: 0, reviewed: 18, agree: 18, disagree: 0 },
+    { mode: "shadow", action_class: "confined-to-workspace", total: 31, would_allow: 31, would_pend: 0, would_deny: 0, reviewed: 14, agree: 14, disagree: 0 },
+    { mode: "shadow", action_class: "vcs-local", total: 12, would_allow: 12, would_pend: 0, would_deny: 0, reviewed: 11, agree: 11, disagree: 0 },
+    // The two the classifier withheld — the other half of the bar, and the reason alpha's
+    // row carries `withheld_classes_ready: 2`.
+    { mode: "shadow", action_class: "unrecognized", total: 22, would_allow: 0, would_pend: 22, would_deny: 0, reviewed: 20, agree: 19, disagree: 1 },
+    { mode: "shadow", action_class: "push-merge-deploy", total: 15, would_allow: 0, would_pend: 15, would_deny: 0, reviewed: 12, agree: 12, disagree: 0 },
+  ],
+  delta: [
+    { mode: "shadow", action_class: "read-local", total: 30, would_allow: 30, would_pend: 0, would_deny: 0, reviewed: 12, agree: 12, disagree: 0 },
+    { mode: "shadow", action_class: "confined-to-workspace", total: 18, would_allow: 18, would_pend: 0, would_deny: 0, reviewed: 10, agree: 10, disagree: 0 },
+    // Short on evidence, not on agreement — the panel has to be able to show both ways of
+    // failing the bar, or "still short" reads as one thing.
+    { mode: "shadow", action_class: "vcs-local", total: 9, would_allow: 9, would_pend: 0, would_deny: 0, reviewed: 4, agree: 4, disagree: 0 },
+    { mode: "shadow", action_class: "unrecognized", total: 11, would_allow: 0, would_pend: 11, would_deny: 0, reviewed: 10, agree: 8, disagree: 2 },
+    { mode: "shadow", action_class: "destructive", total: 6, would_allow: 0, would_pend: 0, would_deny: 6, reviewed: 3, agree: 3, disagree: 0 },
+  ],
+};
 
 /**
  * A moment relative to the REAL clock, not the frozen one.
@@ -1061,6 +1202,177 @@ export const CALENDAR_CONFIG: CalendarConfigView = {
  * Both lists non-empty, because the panel keeps them apart and a preview with
  * only one of them photographs half a component.
  */
+/**
+ * Representative feed rows, including the unmapped-device state.
+ *
+ * Every summary is in the shape the núcleo's own writer builds, and that is the point rather than
+ * decoration. Two of the row's readings are PARSED out of the summary — `waitReasonFromSummary`
+ * and `readEfficiencySignal` — and the round-10 fixture's generic sentences ("job 40 is waiting",
+ * "efficiency observation") parsed to `null`, so neither device had ever appeared in a shot. The
+ * generic summaries also made the badge look redundant: six of twelve badge/summary pairs on
+ * `06-feed.png` were the same string, which is a fact about this fixture and not about the page.
+ */
+export const FEED: FeedEntry[] = [
+  { id: 14, project_id: "alpha", kind: "job_finished", summary: "job 41 finished `completed` after 6 item(s)", run_id: 41, errand_id: null, subject: "job:41", created_at: ago(3 * MINUTE) },
+  { id: 13, project_id: "alpha", kind: "job_started", summary: "job 42 started on job/42-tighten-the-gate", run_id: 42, errand_id: null, subject: "job:42", created_at: ago(9 * MINUTE) },
+  { id: 12, project_id: null, kind: "team_run_finished", summary: "a team run done: the department delivered", run_id: null, errand_id: null, subject: "team_run:30", created_at: ago(14 * MINUTE) },
+  { id: 11, project_id: "bravo", kind: "job_failed", summary: "job 39 could not start its implement node: the runner exited before the first turn", run_id: 39, errand_id: null, subject: "job:39", created_at: ago(31 * MINUTE) },
+  { id: 10, project_id: "bravo", kind: "job_waiting", summary: "job 40 is waiting: another run holds the project's worktree slot", run_id: 40, errand_id: null, subject: "job:40", created_at: ago(48 * MINUTE) },
+  { id: 9, project_id: "alpha", kind: "vcs_request_finished", summary: "vcs request 21 escalated — the merge would revert two files nobody asked about", run_id: null, errand_id: null, subject: "vcs:21", created_at: ago(HOUR) },
+  { id: 8, project_id: null, kind: "team_trigger_armed", summary: "`morning digest` is armed for support", run_id: null, errand_id: null, subject: null, created_at: ago(95 * MINUTE) },
+  { id: 7, project_id: null, kind: "email_urgent", summary: "the accountant is blocked on the Q3 reconciliation and has asked twice", run_id: null, errand_id: null, subject: null, created_at: ago(2 * HOUR) },
+  { id: 6, project_id: "alpha", kind: "token_efficiency", summary: "token efficiency (project alpha): 4 runs in a row sent a prompt of 38412 tokens and neither read nor wrote a single cached token", run_id: 38, errand_id: null, subject: null, created_at: ago(3 * HOUR) },
+  { id: 5, project_id: null, kind: "web.read", summary: "read https://docs.rs/sqlx/latest/sqlx/ (raw)", run_id: null, errand_id: 2, subject: "errand:2", created_at: ago(4 * HOUR) },
+  { id: 4, project_id: null, kind: "errand_rule_fired", summary: "the rule \"weekday sweep\" of the errand \"inbox\" started a turn", run_id: null, errand_id: 2, subject: "errand:2", created_at: ago(5 * HOUR) },
+  { id: 3, project_id: "delta", kind: "council_finished", summary: "council done", run_id: null, errand_id: null, subject: "council:11", created_at: ago(7 * HOUR) },
+  { id: 2, project_id: "bravo", kind: "worktree_released", summary: "released worktree C:/Projects/bravo/.nucleos/worktrees/run-318 + branch run/318-retry-the-gate", run_id: null, errand_id: null, subject: "run:318", created_at: ago(DAY) },
+  { id: 1, project_id: "alpha", kind: "map_stamp_recorded", summary: "module map stamp for core/src/feed.rs", run_id: null, errand_id: null, subject: null, created_at: ago(2 * DAY) },
+];
+
+/**
+ * A week of the feed as the time axis reads it — `GET /feed/timeline`.
+ *
+ * Its own list and not `FEED` above, because the two routes answer different questions: `FEED`
+ * is the listing's newest fifty and what a search finds, and those rows are pinned by
+ * `fixtures.test.ts` for the drawer and the embed. The trace needs TIME — a busy night with a
+ * silence in it, and a week of ordinary work behind it dense enough that a lane has to fold its
+ * routine sequences into one row — and fourteen rows cannot photograph either.
+ *
+ * The night is the one the owner approved the direction on: two lines that went wrong (a gate, a
+ * run given up on after three attempts), two held (an item that did not merge, a run the núcleo
+ * restarted under), two that ask for you (an urgent e-mail, a project ready for active mode), a
+ * four-hour quiet from 02:41, and the seen marker at 21:10 the evening before. Two sequences are
+ * still open at now — a job parked behind a slot and a run between attempts — so the trace has a
+ * dashed ghost to draw. Minutes are UTC offsets from `NOW`.
+ *
+ * Every line carries the subject the núcleo writes (`job:57`, `run:900598`, `council:12`), which
+ * is what folds a job's start, plan, failed gate and unmerged item into one row.
+ */
+const NIGHT: Omit<FeedEntry, "id">[] = [
+  { project_id: null, kind: "command_finished", summary: "project command `gates` on alpha exited 0 after 4m12s", run_id: null, errand_id: null, subject: null, created_at: ago(889 * MINUTE) },
+  { project_id: "alpha", kind: "map_stamp_recorded", summary: "module map stamp for core/src/feed.rs at 4d2c1e2", run_id: null, errand_id: null, subject: null, created_at: ago(851 * MINUTE) },
+  { project_id: "alpha", kind: "config_written", summary: "wrote .ai/autopilot.yaml: gate command set to scripts/gates.sh shell", run_id: null, errand_id: null, subject: null, created_at: ago(759 * MINUTE) },
+  { project_id: "bravo", kind: "run_interrupted", summary: "run 900585 interrupted: the núcleo restarted mid-turn", run_id: 900585, errand_id: null, subject: "run:900585", created_at: ago(686 * MINUTE) },
+  { project_id: "charlie", kind: "job_started", summary: "job 54 started on job/54-flaky-hunt from the rule flaky hunt", run_id: null, errand_id: null, subject: "job:54", created_at: ago(637 * MINUTE) },
+  { project_id: "charlie", kind: "job_finished", summary: "job 54 finished `completed` after 3 item(s)", run_id: null, errand_id: null, subject: "job:54", created_at: ago(593 * MINUTE) },
+  { project_id: "charlie", kind: "shadow_run_completed", summary: "shadow run 900590 completed: would have opened 2 pull requests", run_id: 900590, errand_id: null, subject: "run:900590", created_at: ago(561 * MINUTE) },
+  { project_id: "charlie", kind: "vcs_request_finished", summary: "vcs request 44 landed job/54-flaky-hunt into main", run_id: null, errand_id: null, subject: "vcs:44", created_at: ago(511 * MINUTE) },
+  { project_id: null, kind: "email_digest", summary: "digest: 23 e-mails triaged, 1 urgent held for the morning", run_id: null, errand_id: null, subject: null, created_at: ago(466 * MINUTE) },
+  { project_id: null, kind: "errand_rule_fired", summary: "the rule \"invoice follow-up\" of the errand \"inbox\" started a turn", run_id: null, errand_id: 2, subject: "errand:2", created_at: ago(449 * MINUTE) },
+  { project_id: null, kind: "team_run_started", summary: "team run 31 started: Finanças on the weekly close", run_id: null, errand_id: null, subject: "team_run:31", created_at: ago(458 * MINUTE) },
+  { project_id: null, kind: "team_action", summary: "Finanças's `ledger_summary` carried out: the Q3 ledger summary is drafted", run_id: null, errand_id: null, subject: "team_run:31", created_at: ago(431 * MINUTE) },
+  { project_id: null, kind: "team_run_finished", summary: "team run 31 done: Finanças delivered the weekly close with 3 action(s)", run_id: null, errand_id: null, subject: "team_run:31", created_at: ago(420 * MINUTE) },
+  { project_id: "charlie", kind: "worktree_removed", summary: "removed worktree C:/repos/charlie/.nucleos/worktrees/run-900577 after its branch merged", run_id: null, errand_id: null, subject: "run:900577", created_at: ago(175 * MINUTE) },
+  { project_id: null, kind: "errand_investigation_done", summary: "errand 2 investigation done: 4 invoice threads matched", run_id: null, errand_id: 2, subject: "errand:2", created_at: ago(151 * MINUTE) },
+  { project_id: "delta", kind: "run_retry", summary: "run 900598 attempt 1 failed, retrying: the sidecar handshake timed out", run_id: 900598, errand_id: null, subject: "run:900598", created_at: ago(70 * MINUTE) },
+  { project_id: "delta", kind: "run_retry", summary: "run 900598 attempt 2 failed, retrying: the sidecar handshake timed out", run_id: 900598, errand_id: null, subject: "run:900598", created_at: ago(62 * MINUTE) },
+  { project_id: "delta", kind: "run_failed_final", summary: "run 900598 failed after 3 attempts: the sidecar handshake timed out", run_id: 900598, errand_id: null, subject: "run:900598", created_at: ago(54 * MINUTE) },
+  { project_id: null, kind: "web.read", summary: "read https://docs.rs/git2/latest/git2/struct.Repository.html (raw)", run_id: null, errand_id: 2, subject: "errand:2", created_at: ago(51 * MINUTE) },
+  { project_id: "alpha", kind: "job_started", summary: "job 57 started on job/57-importer from the rule nightly reconciliation", run_id: null, errand_id: null, subject: "job:57", created_at: ago(46 * MINUTE) },
+  { project_id: "alpha", kind: "job_planned", summary: "job 57 planned 4 item(s) on job/57-importer", run_id: null, errand_id: null, subject: "job:57", created_at: ago(43 * MINUTE) },
+  { project_id: "alpha", kind: "job_gate_failed", summary: "job 57 gate failed on round 1: 2 tests in core/src/storage.rs", run_id: 900609, errand_id: null, subject: "job:57", created_at: ago(39 * MINUTE) },
+  { project_id: null, kind: "council_started", summary: "council 12 convened on 6 open proposals", run_id: null, errand_id: null, subject: "council:12", created_at: ago(36 * MINUTE) },
+  { project_id: "alpha", kind: "worktree_run_completed", summary: "worktree run 900604 completed on run/900604-flaky-gate", run_id: 900604, errand_id: null, subject: "run:900604", created_at: ago(33 * MINUTE) },
+  { project_id: null, kind: "council_stage", summary: "council 12 phase 2 done: 4 seats ranked", run_id: null, errand_id: null, subject: "council:12", created_at: ago(27 * MINUTE) },
+  { project_id: null, kind: "council_finished", summary: "council 12 done: the week's proposals are ranked", run_id: null, errand_id: null, subject: "council:12", created_at: ago(23 * MINUTE) },
+  { project_id: "charlie", kind: "promotion_ready", summary: "charlie has 5 of 5 action classes ready for active mode", run_id: null, errand_id: null, subject: null, created_at: ago(18 * MINUTE) },
+  { project_id: null, kind: "email_urgent", summary: "the accountant is blocked on the Q3 reconciliation and has asked twice", run_id: null, errand_id: null, subject: null, created_at: ago(14 * MINUTE) },
+  { project_id: "alpha", kind: "worktree_released", summary: "released worktree C:/repos/alpha/.nucleos/worktrees/run-900604 + branch run/900604-flaky-gate", run_id: null, errand_id: null, subject: "run:900604", created_at: ago(11 * MINUTE) },
+  { project_id: "bravo", kind: "job_waiting", summary: "job 58 is waiting: another run holds the project's worktree slot", run_id: null, errand_id: null, subject: "job:58", created_at: ago(6 * MINUTE) },
+  { project_id: "bravo", kind: "run_retry", summary: "run 900612 attempt 1 failed to launch, retrying: the runner exited before the first turn", run_id: 900612, errand_id: null, subject: "run:900612", created_at: ago(4 * MINUTE) },
+  { project_id: "alpha", kind: "job_item_conflicted", summary: "job 57 item 3 did not merge: core/src/storage.rs changed under it on job/57-importer", run_id: null, errand_id: null, subject: "job:57", created_at: ago(2 * MINUTE) },
+];
+
+/**
+ * The week behind the night: ordinary daytime work, generated and seeded.
+ *
+ * Working hours only (07:00–20:00 UTC), because a machine that works around the clock would leave
+ * the trace no silences to name. The work comes as whole sequences, the way the núcleo writes it —
+ * a job's start, plan and finish under one subject, a worktree run and its release under another —
+ * so a week of it is dozens of jobs in one lane, and the lane folds its routine ones. A handful of
+ * exceptions are placed by hand — a job failing on Wednesday, a worktree the núcleo could not clean
+ * up — so the seven-day window has something to find besides density.
+ */
+function weekBehind(): Omit<FeedEntry, "id">[] {
+  const random = seeded(24);
+  const rows: Omit<FeedEntry, "id">[] = [];
+  const projects = ["alpha", "bravo", "charlie", "delta"];
+  type Step = [kind: string, say: (n: number, project: string) => string, afterMinutes: number];
+  const stories: { subject: (n: number) => string | null; run: boolean; steps: Step[] }[] = [
+    {
+      subject: (n) => `job:${n}`,
+      run: false,
+      steps: [
+        ["job_started", (n) => `job ${n} started on job/${n}-maintenance`, 0],
+        ["job_planned", (n) => `job ${n} planned 3 item(s) on job/${n}-maintenance`, 3],
+        ["job_finished", (n) => `job ${n} finished \`completed\` after 3 item(s)`, 38],
+      ],
+    },
+    {
+      subject: (n) => `run:${900000 + n}`,
+      run: true,
+      steps: [
+        ["worktree_run_completed", (n) => `worktree run ${900000 + n} completed on run/${900000 + n}-tidy`, 0],
+        ["worktree_released", (n, project) => `released worktree C:/repos/${project}/.nucleos/worktrees/run-${900000 + n} + branch run/${900000 + n}-tidy`, 2],
+      ],
+    },
+    { subject: (n) => `vcs:${n}`, run: false, steps: [["vcs_request_finished", (n) => `vcs request ${n} landed job/${n}-maintenance into main`, 0]] },
+    { subject: () => "errand:2", run: false, steps: [["errand_rule_fired", () => 'the rule "weekday sweep" of the errand "inbox" started a turn', 0]] },
+    { subject: () => null, run: false, steps: [["team_trigger_armed", () => "`morning digest` is armed for support", 0]] },
+  ];
+  let n = 100;
+  for (let day = 7; day >= 1; day -= 1) {
+    const midnight = Date.parse(new Date(NOW - day * DAY).toISOString().slice(0, 10) + "T00:00:00Z");
+    rows.push({ project_id: null, kind: "email_digest", summary: "digest: 31 e-mails triaged, nothing urgent", run_id: null, errand_id: null, subject: null, created_at: new Date(midnight + 7 * HOUR + 2 * MINUTE).toISOString() });
+    for (let hour = 7; hour < 19; hour += 1) {
+      const count = 1 + Math.floor(random() * 3);
+      for (let i = 0; i < count; i += 1) {
+        const begin = midnight + hour * HOUR + Math.floor(random() * 50) * MINUTE;
+        const story = stories[Math.floor(random() * stories.length)];
+        const project = projects[Math.floor(random() * projects.length)];
+        n += 1;
+        const errand = story.subject(n) === "errand:2" ? 2 : null;
+        const owner = story.subject(n) === null || errand !== null ? null : project;
+        for (const [kind, say, after] of story.steps) {
+          const at = begin + after * MINUTE;
+          if (at > NOW - 900 * MINUTE) break;
+          rows.push({ project_id: owner, kind, summary: say(n, project), run_id: story.run ? 900000 + n : null, errand_id: errand, subject: story.subject(n), created_at: new Date(at).toISOString() });
+        }
+      }
+    }
+  }
+  const at = (days: number, hour: number, minute: number) => {
+    const midnight = Date.parse(new Date(NOW - days * DAY).toISOString().slice(0, 10) + "T00:00:00Z");
+    return new Date(midnight + hour * HOUR + minute * MINUTE).toISOString();
+  };
+  rows.push(
+    { project_id: "bravo", kind: "job_started", summary: "job 71 started on job/71-importer", run_id: null, errand_id: null, subject: "job:71", created_at: at(5, 14, 2) },
+    { project_id: "bravo", kind: "job_failed", summary: "job 71 could not start its implement node: the runner exited before the first turn", run_id: null, errand_id: null, subject: "job:71", created_at: at(5, 14, 12) },
+    { project_id: "delta", kind: "worktree_gc_failed", summary: "could not remove worktree C:/repos/delta/.nucleos/worktrees/run-900431: a file is in use", run_id: null, errand_id: null, subject: "run:900431", created_at: at(3, 10, 40) },
+    { project_id: null, kind: "email_triage_stalled", summary: "triage stalled: 4 messages could not be read after 3 attempts", run_id: null, errand_id: null, subject: null, created_at: at(2, 16, 5) },
+    { project_id: null, kind: "errand_rule_failed", summary: 'the rule "weekday sweep" of the errand "inbox" failed: the mailbox refused the login', run_id: null, errand_id: 2, subject: "errand:2", created_at: at(6, 9, 30) },
+  );
+  return rows;
+}
+
+/** Oldest first, numbered in that order, as the núcleo's row ids are. */
+export const FEED_TIMELINE: FeedEntry[] = [...weekBehind(), ...NIGHT]
+  .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
+  .map((row, index) => ({ ...row, id: 5000 + index }));
+
+/**
+ * Where the reader left off: 21:10 the evening before, eight minutes after the last line they saw.
+ *
+ * `seen_at` later than `through_created_at` on purpose — the marker is when somebody looked, and
+ * the line before it is merely the newest one there was to see.
+ */
+const SEEN_LINE = FEED_TIMELINE.find((row) => row.kind === "config_written" && row.created_at === ago(759 * MINUTE));
+export const FEED_SEEN: FeedSeen = {
+  through: SEEN_LINE?.id ?? null,
+  through_created_at: SEEN_LINE?.created_at ?? null,
+  seen_at: ago(751 * MINUTE),
+};
+
 export const HELD: PendingNotification[] = [
   {
     id: 1,
@@ -1411,6 +1723,137 @@ export const CHAT_MODELS = {
   efforts: ["low", "medium", "high", "xhigh", "max"],
 };
 
+const RUN_DETAIL = {
+  id: 1,
+  project_id: "alpha",
+  status: "completed",
+  gate_status: "passed",
+  gate_exit_code: 0,
+  gate_output: null,
+  exit_code: 0,
+  stdout: "Checked the changed files.\nThe gate passed.",
+  stderr: null,
+  session_id: "s-preview",
+  cost_usd: 0.0412,
+  input_tokens: 18_400,
+  output_tokens: 2_100,
+  cache_read_tokens: 96_000,
+  num_turns: 7,
+  context_fill: 132_000,
+  steerable: false,
+  successor_run_id: null,
+  // The prompt budget's two halves: what the daemon wrote, and the CLI's own residual.
+  authored_prompt_estimate: 2_400,
+  cli_own_estimate: 18_600,
+} satisfies RunDetail;
+
+/*
+ * Four costs are deliberately absent, including two finished runs: recording a
+ * cost is not guaranteed. Two excerpts are long enough to wrap, because a list
+ * that only sees short prompts has not been asked about its reading width.
+ */
+const RUN_INDEX: RunSearchResult[] = [
+  { id: 1, project_id: "alpha", status: "completed", mode: "real", created_at: ago(5 * 60_000), completed_at: ago(60_000), cost_usd: 0.0412, prompt_excerpt: "Check the changed files, run the selected gate, and summarise the result for the release note." },
+  { id: 2, project_id: "bravo", status: "running", mode: "real", created_at: ago(10 * 60_000), completed_at: null, cost_usd: null, prompt_excerpt: "Trace the approval queue delay and prepare a small, reversible fix." },
+  { id: 3, project_id: "charlie", status: "awaiting_approval", mode: "shadow", created_at: ago(18 * 60_000), completed_at: null, cost_usd: null, prompt_excerpt: "Review the proposed dependency update before it changes the build image." },
+  { id: 4, project_id: "delta", status: "superseded", mode: "worktree", created_at: ago(32 * 60_000), completed_at: ago(30 * 60_000), cost_usd: 0.0084, prompt_excerpt: "Map the incoming request to the owning team and queue the first safe step." },
+  { id: 5, project_id: null, status: "failed", mode: "real", created_at: ago(3 * 3_600_000), completed_at: ago(2 * 3_600_000), cost_usd: 0.0167, prompt_excerpt: "Reproduce the sidecar handshake failure with the production-shaped configuration." },
+  { id: 6, project_id: null, status: "cancelled", mode: "real", created_at: ago(7 * 3_600_000), completed_at: ago(6 * 3_600_000), cost_usd: 0.0031, prompt_excerpt: "Stop the duplicate migration review after the owner chose the newer branch." },
+  { id: 7, project_id: null, status: "timed_out", mode: "real", created_at: ago(13 * 3_600_000), completed_at: ago(11 * 3_600_000), cost_usd: null, prompt_excerpt: "Investigate why the preview service keeps returning an empty list to otherwise healthy screens." },
+  { id: 8, project_id: "alpha", status: "completed", mode: "real", created_at: ago(26 * 3_600_000), completed_at: ago(25 * 3_600_000), cost_usd: 0.0289, prompt_excerpt: "Add the missing status label to the activity summary." },
+  { id: 9, project_id: "bravo", status: "failed", mode: "shadow", created_at: ago(2 * DAY), completed_at: ago(47 * 3_600_000), cost_usd: 0.0195, prompt_excerpt: "Compare the changed policy with the current queue limits and report conflicts." },
+  { id: 10, project_id: "charlie", status: "cancelled", mode: "real", created_at: ago(3 * DAY), completed_at: ago(71 * 3_600_000), cost_usd: 0.0062, prompt_excerpt: "Prepare a recovery checklist for the paused integration." },
+  { id: 11, project_id: "delta", status: "interrupted", mode: "worktree", created_at: ago(4 * DAY), completed_at: ago(95 * 3_600_000), cost_usd: null, prompt_excerpt: "Refine the dashboard hierarchy so the queue state remains legible when several teams are blocked at once and the operator needs the cause before the chronology." },
+  { id: 12, project_id: null, status: "completed", mode: "real", created_at: ago(5 * DAY), completed_at: ago(119 * 3_600_000), cost_usd: 0.0528, prompt_excerpt: "Document the observed retry pattern, including the handoff signals that distinguish a delayed worker from a run that has silently stopped making progress." },
+];
+
+const RUN_STOP = {
+  run_id: 1,
+  status: "completed",
+  kind: "completed",
+  summary: "The run completed after the gate passed.",
+  decisions_recorded: true,
+  gate: null,
+  timeout: null,
+  leading_up: [],
+  exit_code: 0,
+  stderr_tail: null,
+  successor_run_id: null,
+} satisfies RunStop;
+
+const RUN_TAIL = { text: "", next: 0, live: false } satisfies RunTailChunk;
+
+const EMAIL_DETAIL = {
+  id: 1,
+  from_addr: "mira.chen@example.com",
+  from_name: "Mira Chen",
+  subject: "Tuesday planning notes",
+  received_at: ago(18 * 60 * 1000),
+  triage_class: "action",
+  triage_summary: "The team needs a reply with the agreed delivery date.",
+  triaged_at: ago(14 * 60 * 1000),
+  model_class: "action",
+  priority_rule: null,
+  body_text: "Hi team,\n\nCould you confirm the delivery date from today's planning session?\n\nThanks,\nMira",
+  has_attachments: 0,
+  attachments: [],
+} satisfies EmailDetail;
+
+/**
+ * Every supervised sidecar, and the second half of `/health/readout`'s story above.
+ *
+ * That readout says `browser_sidecar` is down; until this existed the Sidecars panel beneath it read
+ * "no sidecar is registered", which is a daemon with no sidecars rather than a daemon with a sidecar
+ * that will not start — the empty-list fall-through telling a different story from the row above it.
+ *
+ * The SUPERVISOR's keys (`sidecar.rs:16-20`), not the readout's row names: `/sidecars` answers about
+ * processes and `/health/readout` about pillars. Telegram is absent on purpose — the readout has it
+ * `disabled`, nothing supervises it, and a sidecar list that invented a row for it would contradict
+ * the row above.
+ */
+const SIDECARS: SidecarState[] = [
+  {
+    name: "echo",
+    state: "running",
+    started_at: "2026-09-13T06:00:00Z",
+    last_failure: null,
+    last_failure_at: null,
+    restarts: 0,
+    last_line: null,
+    last_line_at: null,
+  },
+  {
+    name: "email",
+    state: "running",
+    started_at: "2026-09-13T06:00:00Z",
+    last_failure: null,
+    last_failure_at: null,
+    restarts: 1,
+    last_line: "email: polled INBOX, 3 new",
+    last_line_at: "2026-09-13T08:55:00Z",
+  },
+  {
+    name: "web",
+    state: "running",
+    started_at: "2026-09-13T06:00:00Z",
+    last_failure: null,
+    last_failure_at: null,
+    restarts: 0,
+    last_line: null,
+    last_line_at: null,
+  },
+  {
+    name: "browser",
+    state: "down",
+    started_at: null,
+    last_failure: "could not start: The system cannot find the file specified. (os error 2)",
+    last_failure_at: "2026-09-13T08:58:00Z",
+    restarts: 14,
+    last_line: null,
+    last_line_at: null,
+  },
+];
+
 export function answer(path: string, init?: RequestInit): unknown {
   /*
     The house's capacity, with nobody holding a slot. It is here so the Codigo
@@ -1450,6 +1893,26 @@ export function answer(path: string, init?: RequestInit): unknown {
 
   if (path === "/jobs" || path.startsWith("/jobs?")) return [JOB];
   if (/^\/jobs\/\d+$/.test(path)) return JOB_VIEW;
+  if (/^\/runs\/\d+\/stop$/.test(path)) return RUN_STOP;
+  if (/^\/runs\/\d+\/tail/.test(path)) return RUN_TAIL;
+  if ((path === "/runs" || path.startsWith("/runs?")) && init?.method === undefined) {
+    const [, query] = splitQuery(path);
+    let runs = RUN_INDEX;
+    if (query.get("live") === "true") {
+      runs = runs.filter((run) => ["running", "awaiting_approval"].includes(run.status));
+    }
+    for (const key of ["status", "project_id", "mode"] as const) {
+      const value = query.get(key);
+      if (value !== null) runs = runs.filter((run) => run[key] === value);
+    }
+    const q = query.get("q");
+    if (q !== null) runs = runs.filter((run) => run.prompt_excerpt.toLowerCase().includes(q.toLowerCase()));
+    const rawLimit = query.get("limit");
+    const limit = rawLimit === null ? Number.NaN : Number(rawLimit);
+    return Number.isFinite(limit) ? runs.slice(0, limit) : runs;
+  }
+  if (/^\/runs\/\d+$/.test(path) && init?.method === undefined) return RUN_DETAIL;
+  if (/^\/email\/\d+$/.test(path) && init?.method === undefined) return EMAIL_DETAIL;
 
   if (path === "/projects") return PROJECTS;
 
@@ -1521,6 +1984,19 @@ export function answer(path: string, init?: RequestInit): unknown {
     } satisfies HealthReadout;
   }
 
+  if (path === "/sidecars" && init?.method === undefined) return SIDECARS;
+
+  /*
+    Asking a supervisor to try now. Stateless, like every other write in this file, and
+    deliberately: flipping `browser` to `running` here would make a shot's answer depend on which
+    shots ran before it, and would take the control out of every picture after the first press —
+    including the armed one, which is the picture this route exists to make possible.
+  */
+  const restart = /^\/sidecars\/([^/]+)\/restart$/.exec(path);
+  if (restart !== null && init?.method === "POST") {
+    return { name: decodeURIComponent(restart[1]), asked: true };
+  }
+
   /*
     What the voice pillar is configured to do, and the second half of the same
     story as `/health/readout` above: the Voice page reads `data.hints.length`
@@ -1571,6 +2047,32 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/calendar/busy") return { busy: true };
   if (path === "/calendar/config") return CALENDAR_CONFIG;
   if (path === "/notifications/pending") return HELD;
+  if (splitQuery(path)[0] === "/feed") return FEED;
+  /*
+    The axis and its marker. The window and the cursor are applied as the núcleo applies them, so
+    the page's incremental poll brings nothing new and a preset photographs exactly its window. A
+    POST moves nothing here — a preview is photographed, not used — and answers the marker it was
+    given, which is what the page reads back.
+  */
+  if (splitQuery(path)[0] === "/feed/timeline") {
+    const [, query] = splitQuery(path);
+    const since = Date.parse(query.get("since") ?? "");
+    const until = query.has("until") ? Date.parse(query.get("until") ?? "") : Infinity;
+    const after = query.has("after_id") ? Number(query.get("after_id")) : -Infinity;
+    const entries = FEED_TIMELINE.filter((row) => {
+      const at = Date.parse(row.created_at);
+      return at >= since && at <= until && row.id > after;
+    });
+    return { entries, truncated: false } satisfies FeedTimeline;
+  }
+  if (path === "/feed/seen") {
+    if (init?.method === "POST" && typeof init.body === "string") {
+      const { through } = JSON.parse(init.body) as { through: number };
+      const line = FEED_TIMELINE.find((row) => row.id === through);
+      return { through, through_created_at: line?.created_at ?? null, seen_at: new Date().toISOString() } satisfies FeedSeen;
+    }
+    return FEED_SEEN;
+  }
 
   /*
     The four readings the State mode leads with — and the reason that mode
@@ -1754,6 +2256,14 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/team-runs") return RUNS;
   if (path === "/team-triggers") return TRIGGERS;
   if (path === "/team-actions") return ACTIONS;
+  if (path === "/vcs/requests") return VCS_REQUESTS;
+  /* Matched on the route rather than the whole path: `useScoreboard` always sends
+     `?project_id=`, so a `path ===` comparison would never fire. */
+  if (splitQuery(path)[0] === "/scoreboard") {
+    return SCOREBOARD[splitQuery(path)[1].get("project_id") ?? ""] ?? [];
+  }
+  if (path === "/proposals") return PROPOSALS;
+  if (path === "/proposals/team-actions") return TEAM_ACTION_PROPOSALS;
   if (path === "/proposals/recruits") return RECRUITS;
   if (path === "/agents") return AGENTS;
   if (path === "/autopilot/budget") {

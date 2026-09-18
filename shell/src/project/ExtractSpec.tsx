@@ -133,7 +133,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
             /*
               Chosen is `.ui-current` — a 2px rule on the leading edge — and nothing else.
 
-              It was `border-accent` over a raised fill, which is the Reserved Cyan Rule broken for
+              It was an accent border over a raised fill, which is the Reserved Cyan Rule broken for
               a selection and, worse, a mark that only worked in one theme: `--surface` and
               `--surface-raised` are both `#ffffff` in light, so the fill said nothing there. The
               border also made the chosen row a pixel wider than its siblings, which is a list that

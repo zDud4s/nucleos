@@ -3,7 +3,6 @@ import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import { isApiRefusal } from "../data/client";
 import {
   DIFF_LINE_CAP,
-  RULE_STATE_WORD,
   VIEWS,
   autonomyOf,
   concernsOf,
@@ -28,14 +27,14 @@ import {
   type InspectEntry,
   type ProjectRules,
   type ProjectView,
-  type RuleState,
 } from "../data/projects";
 import { useAssistantModels, type ModelChoice } from "../data/chats";
 import { useProjects } from "../data/system";
 import {
-  Badge,
+  StateBadge,
   Button,
   Count,
+  Crumb,
   ErrorNote,
   Meter,
   PageHeader,
@@ -44,7 +43,6 @@ import {
   RefusalNote,
   RelativeTime,
   Teach,
-  type BadgeTone,
 } from "../ui";
 import "./projects.css";
 
@@ -208,15 +206,15 @@ export function Projects() {
       {/*
         Both ways back, because they are different places: the workspace is this project seen
         through the app's own readings, and the roster is every project. Somebody who arrived here
-        from the Código mode wants the first.
+        from the Código mode wants the first, which is why it is the one the arrow points at; the
+        roster sits in the crumb's second slot rather than in a second paragraph.
       */}
-      <p className="pj-back">
-        <Link to="/projects/$projectId/$view" params={{ projectId, view: "code" }}>
-          ‹ back to {projectId}
-        </Link>
-        {" · "}
-        <Link to="/projects">all projects</Link>
-      </p>
+      <Crumb
+        to={`/projects/${projectId}/code`}
+        here={<Link to="/projects">all projects</Link>}
+      >
+        {projectId}
+      </Crumb>
 
       <Concerns
         projectId={projectId}
@@ -928,12 +926,6 @@ const CLOCK_SAID: Record<AutonomyRule["clock"], string> = {
  * against fires nothing, by design, and drawing it in the same green as a rule
  * that will run tonight is how "armed" came to mean two different things.
  */
-const STATE_TONE: Record<RuleState, BadgeTone> = {
-  armed: "active",
-  "never-fires": "danger",
-  capped: "paused",
-  unseen: "pending",
-};
 
 /**
  * Everything that starts work here without you, as one table.
@@ -1026,7 +1018,7 @@ function RuleRows({ rule }: { rule: AutonomyRule }) {
           <Trigger rule={rule} />
         </td>
         <td>
-          <Badge tone={STATE_TONE[rule.state]}>{RULE_STATE_WORD[rule.state]}</Badge>
+          <StateBadge domain="rule" state={rule.state} />
         </td>
         <td className="pj-col-num">
           <Moment
@@ -1371,6 +1363,7 @@ function WipPanel({ projectId, rules }: { projectId: string; rules: ProjectRules
         &ldquo;how much unanswered work am I willing to have open&rdquo;, not a quota.
       </p>
 
+      {/* Open work occupies the ceiling; a full queue asks the reader to review it. */}
       <Meter
         label="open and unreviewed"
         value={rules.open_review_items}

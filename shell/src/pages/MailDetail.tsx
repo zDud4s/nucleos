@@ -18,11 +18,12 @@ import {
   Button,
   ConfirmButton,
   ErrorNote,
-  Inset,
   PageHeader,
   Panel,
   RefusalNote,
   RelativeTime,
+  Row,
+  Rows,
   StateBadge,
 } from "../ui";
 import "./mail.css";
@@ -96,7 +97,7 @@ function KnownEmail({ id }: { id: number }) {
 /** One derived sentence about who this is from and where triage got to. */
 function headline(email: EmailDetail): string {
   const from = email.from_name ?? email.from_addr;
-  const state = email.triage_class === null ? "not triaged yet" : `triaged as ${email.triage_class}`;
+  const state = typeof email.triage_class !== "string" ? "not triaged yet" : `triaged as ${email.triage_class}`;
   return `from ${from} — ${state}`;
 }
 
@@ -124,6 +125,7 @@ function FactsPanel({ email }: { email: EmailDetail }) {
           <ConfirmButton
             label="Requeue for triage"
             confirmLabel="Requeue it now"
+            variant="quiet"
             disabled={requeue.isPending}
             onConfirm={() => requeue.mutate()}
           />
@@ -193,7 +195,7 @@ function RequeueError({ error }: { error: unknown }) {
 function BodyPanel({ email }: { email: EmailDetail }) {
   return (
     <Panel title="Body">
-      {email.body_text === null ? (
+      {typeof email.body_text !== "string" ? (
         <p className="mail-detail-pruned">
           this message's body was pruned by retention — only the facts above remain
         </p>
@@ -220,11 +222,11 @@ function AttachmentsPanel({ emailId, attachments }: { emailId: number; attachmen
         ) : undefined
       }
     >
-      <ul className="mail-detail-attachments">
+      <Rows label="Attachments" className="mail-detail-attachments">
         {attachments.map((attachment) => (
           <AttachmentRow key={attachment.position} emailId={emailId} attachment={attachment} />
         ))}
-      </ul>
+      </Rows>
       {saveAll.isSuccess && <SavedAllNote result={saveAll.data} />}
       {saveAll.isError && <AttachmentError error={saveAll.error} what="not everything could be saved" />}
     </Panel>
@@ -246,36 +248,31 @@ function AttachmentRow({ emailId, attachment }: { emailId: number; attachment: E
   const download = useDownloadAttachment(emailId);
   const senderName = attachment.filename ?? `attachment ${attachment.position}`;
 
-  // One item of a list this panel has already opened, so `Inset` draws it as an
-  // `li`. It was the same box hand-rolled — border, `--radius-md`, `--space-3`
-  // of padding — on `--surface` rather than the inset's `--surface-raised`,
-  // which is the one rung it disagreed with the system on.
+  // One row of the panel's hairline-ruled list, not a box of its own: name, type
+  // and size, then both actions on the same line, and any outcome spanning the
+  // row underneath.
   return (
-    <Inset as="li">
-      <div className="mail-detail-attachment-head">
-        <span className="mail-detail-attachment-name">{senderName}</span>
-        <span className="mail-detail-attachment-meta">
-          {attachment.mime_type ?? "unknown type"} · {formatBytes(attachment.size_bytes)}
-        </span>
-      </div>
-      <div className="mail-detail-attachment-actions">
-        <Button
-          disabled={download.isPending}
-          onClick={() => download.mutate({ position: attachment.position, suggestedName: senderName })}
-        >
-          Download
-        </Button>
-        <Button disabled={save.isPending} onClick={() => save.mutate(attachment.position)}>
-          Save to files
-        </Button>
-      </div>
+    <Row className="mail-detail-attachment">
+      <span className="mail-detail-attachment-name">{senderName}</span>
+      <span className="mail-detail-attachment-meta">
+        {attachment.mime_type ?? "unknown type"} · {formatBytes(attachment.size_bytes)}
+      </span>
+      <Button
+        disabled={download.isPending}
+        onClick={() => download.mutate({ position: attachment.position, suggestedName: senderName })}
+      >
+        Download
+      </Button>
+      <Button disabled={save.isPending} onClick={() => save.mutate(attachment.position)}>
+        Save to files
+      </Button>
       {/* The name shown here is the one the DAEMON wrote it under — sanitised
           and de-collided, and never assumed to be `senderName` above; the two
           can legitimately differ for the same attachment. */}
       {save.isSuccess && <SavedOneNote result={save.data} />}
       {save.isError && <AttachmentError error={save.error} what="that attachment could not be saved" />}
       {download.isError && <AttachmentError error={download.error} what="that attachment could not be downloaded" />}
-    </Inset>
+    </Row>
   );
 }
 
@@ -370,7 +367,8 @@ function VerdictError({ error }: { error: unknown }) {
 function ReplyForm({ to, subject }: { to: string; subject: string | null }) {
   const send = useSendReply();
   const [body, setBody] = useState("");
-  const replySubject = subject === null ? "Re:" : subject.startsWith("Re:") ? subject : `Re: ${subject}`;
+  // The daemon may omit a field the type says is always present; absent is not null.
+  const replySubject = typeof subject !== "string" ? "Re:" : subject.startsWith("Re:") ? subject : `Re: ${subject}`;
 
   return (
     <Panel title="Reply">
@@ -399,6 +397,7 @@ function ReplyForm({ to, subject }: { to: string; subject: string | null }) {
         <ConfirmButton
           label="Send"
           confirmLabel="Send it now"
+          variant="approve"
           intent="go"
           disabled={body.trim() === "" || send.isPending}
           onConfirm={() =>

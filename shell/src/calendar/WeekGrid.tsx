@@ -1,4 +1,5 @@
 // §spec calendario-local
+import { useLayoutEffect, useRef } from "react";
 import {
   dayHours,
   isWorkingDay,
@@ -16,7 +17,9 @@ import {
   placeInDay,
   sameDay,
   weekOf,
+  workingStartFraction,
 } from "../lib/calendar-grid";
+import { UI_LOCALE } from "../lib/locale";
 import { dateKeyOf, groupByLocalDay, placementOf, type DragHandlers, type Slot } from "./slot";
 
 /**
@@ -71,10 +74,22 @@ export function WeekGrid({
   drag,
 }: WeekGridProps) {
   const days = weekOf(anchor);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const scrollerRef = useRef<HTMLDivElement>(null);
   const byDay = groupByLocalDay(occurrences);
   /* The gutter is labelled from the first day of the row — see the header. */
   const [gutterStart, gutterEnd] = dayBounds(days[0]);
   const marks = hourMarks(gutterStart, gutterEnd);
+
+  useLayoutEffect(() => {
+    const scroller = scrollerRef.current;
+    const body = bodyRef.current;
+    if (scroller === null || body === null) return;
+    const fraction = workingStartFraction(days[0], config);
+    if (fraction === null) return;
+    // Leave a tenth of an hour above the start so its 09:00 line remains visible.
+    scroller.scrollTop = Math.max(0, fraction * body.offsetHeight - 12);
+  }, [dateKeyOf(days[0]), config?.working_hours_start]);
 
   return (
     <div className="calendar-week-view">
@@ -92,8 +107,9 @@ export function WeekGrid({
         ))}
       </div>
 
-      <div className="calendar-week-body">
-        <div className="calendar-gutter" aria-hidden="true">
+      <div className="calendar-week-scroll" ref={scrollerRef}>
+        <div className="calendar-week-body" ref={bodyRef}>
+          <div className="calendar-gutter" aria-hidden="true">
           {marks.map((mark) => (
             <span
               className="calendar-gutter-hour"
@@ -103,20 +119,21 @@ export function WeekGrid({
               {String(mark.hour).padStart(2, "0")}
             </span>
           ))}
-        </div>
+          </div>
 
-        {days.map((day) => (
-          <DayColumn
-            key={dateKeyOf(day)}
-            day={day}
-            occurrences={byDay.get(dateKeyOf(day)) ?? []}
-            now={now}
-            config={config}
-            selected={selected}
-            onSelect={onSelect}
-            drag={drag}
-          />
-        ))}
+          {days.map((day) => (
+            <DayColumn
+              key={dateKeyOf(day)}
+              day={day}
+              occurrences={byDay.get(dateKeyOf(day)) ?? []}
+              now={now}
+              config={config}
+              selected={selected}
+              onSelect={onSelect}
+              drag={drag}
+            />
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -149,7 +166,7 @@ function DayHead({
       onClick={() => onSelect({ day, hour: null })}
     >
       <span className="calendar-week-head-name">
-        {day.toLocaleDateString(undefined, { weekday: "short" })}
+        {day.toLocaleDateString(UI_LOCALE, { weekday: "short" })}
       </span>
       <span className="calendar-week-head-number">{day.getDate()}</span>
       {(hours.short || hours.long) && (
@@ -243,7 +260,7 @@ function DayColumn({
             key={`${slot.hour}-${index}`}
             className={classes.join(" ")}
             style={{ top: `${slot.top * 100}%`, height: `${slot.height * 100}%` }}
-            aria-label={`${day.toLocaleDateString(undefined, {
+            aria-label={`${day.toLocaleDateString(UI_LOCALE, {
               weekday: "long",
               day: "numeric",
               month: "long",

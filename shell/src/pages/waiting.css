@@ -18,59 +18,44 @@
 
 /* =============================================================== the page == */
 
+/**
+ * The note that says rows are being withheld.
+ *
+ * Muted and small on purpose: it is a caption on the queue below it, not a heading of its
+ * own. The margin is the same `--space-4` that separates the sections, so the queue starts
+ * where it would have started without it.
+ */
+.waiting-narrowed {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  margin: 0 0 var(--space-4);
+}
+
+/**
+ * The column, at the page's own width.
+ *
+ * No `max-width` of its own, deliberately. It had 60rem while the page header
+ * above it runs the full 78rem `.app-page` allows, so the rule under the title
+ * ended 288px to the right of every panel below it — two right edges on one
+ * page, and the eye reads the shorter one as content that failed to fill.
+ */
 .waiting-sections {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  max-width: 60rem;
-}
-
-/**
- * What this section is for, said once above its list.
- *
- * Only above a list that has something in it. An empty section says the same
- * thing through `Quiet`, with this prose one click behind the line rather than
- * in front of it — a page of ten mostly-empty panels that each explain
- * themselves in a paragraph gets longer the emptier it is, which is backwards.
- */
-.waiting-note {
-  margin: 0 0 var(--space-3);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--text-muted);
 }
 
 /* =================================================================== lists == */
 
-.waiting-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
 /**
  * Above three items the section is being *worked*, not read.
  *
- * The gap closes and the reasoning is clamped to three lines: ten cards at
- * reading width is a page of scrolling before the tenth decision is even
- * visible, and a queue you cannot see the end of is a queue that gets abandoned
- * halfway.
- *
- * The padding used to close with the gap and no longer does. The card is
- * `.ui-panel-inset` now, and padding is one of the four properties — fill,
- * radius, shadow, padding — that nineteen pages each answered differently while
- * a shared box went unwritten. A page tightening one of them in one mode is how
- * that comes back a page at a time, so density here is the gap and the clamp,
- * which are this page's own.
+ * The rows tighten through `.ui-rows-row-dense`; what belongs to this page is
+ * the clamp on the reasoning. Ten cards at reading width is a page of scrolling
+ * before the tenth decision is even visible, and a queue you cannot see the end
+ * of is a queue that gets abandoned halfway.
  */
-.waiting-list-dense {
-  gap: var(--space-2);
-}
-
-.waiting-list-dense .waiting-reasoning {
+.waiting-dense .waiting-reasoning {
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
@@ -79,6 +64,20 @@
 }
 
 /* =================================================================== cards == */
+
+/**
+ * A decision, on a row of `.ui-rows`.
+ *
+ * The row brings the hairline rule, the padding and the surface; all this adds
+ * is the air between the parts of one card, which is larger here than on a list
+ * of *things* because a card is a head, some facts, a paragraph and two buttons
+ * rather than two lines. It carries no border and no raised fill of its own —
+ * a bordered card inside a bordered panel inside a bordered page is the pile of
+ * frames this recomposition exists to take out.
+ */
+.waiting-card {
+  gap: var(--space-2);
+}
 
 .waiting-card-head {
   display: flex;
@@ -120,6 +119,19 @@
   overflow-wrap: anywhere;
 }
 
+/* What to do about a row, on a line of its own.
+
+   It was a third clause on the mono `.waiting-meta` path line — `--text-faint`, 11px, the
+   quietest rank on the card — so the one sentence asking somebody to act was drawn as the
+   least important thing on the row, after a repository key and an origin. The badge says the
+   state in one word and this says what to do about it; body face at `--text-sm` and
+   `--text-muted` puts it between the two, which is where an instruction belongs. */
+.waiting-hint {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
 /**
  * Prose the card is read for, at the card's own rank.
  *
@@ -134,6 +146,7 @@
 .waiting-reasoning,
 .waiting-excerpt {
   margin: 0;
+  max-width: var(--measure-prose);
   font-size: var(--text-sm);
   line-height: var(--leading-snug);
   color: var(--text-muted);
@@ -227,10 +240,9 @@
   align-items: baseline;
 }
 
-/* The label rank again, in mono: an argument's name is a key the daemon sent,
-   and the recruitment form's fields are named after the same keys. */
-.waiting-input-name,
-.waiting-recruit-label {
+/* The label rank again, in mono: an argument's name is a key the daemon sent.
+   The recruitment form's labels are the same rank in the body face, below. */
+.waiting-input-name {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
@@ -326,10 +338,18 @@
 
 /* ================================================================ merges == */
 
+/**
+ * The two sides, as two columns and not as two boxes.
+ *
+ * They sat in bordered panels inside a bordered card inside a bordered section,
+ * which drew three nested frames around the one comparison somebody is here to
+ * make. What separates the sides is the gap — a full `--space-4`, wider than
+ * anything inside either column, so the split is visible without a rule.
+ */
 .waiting-merge {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
-  gap: var(--space-3);
+  gap: var(--space-4);
 }
 
 /**
@@ -389,6 +409,47 @@
   gap: var(--space-2);
 }
 
+/* =================================================================== batch == */
+
+/**
+ * The strip above the approvals: the way into a selection, and the decision the
+ * selection makes possible.
+ *
+ * Above the list rather than in the heading's corner, because it is a control over the rows
+ * below it and a person meets it on the way down to them. Deliberately NOT `role="status"`:
+ * each interlock inside it carries a live region of its own, and a region around them would
+ * read the whole bar aloud every time one of them said a word.
+ */
+.waiting-bulk {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+/**
+ * The selection, said. This is where the identifiers live in full: the interlock truncates
+ * above five and this line never does, so the roster is on screen — and in the live region —
+ * before anybody arms anything.
+ */
+.waiting-bulk-said {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/**
+ * The box a row is picked with. `accent-color` and not the bare default: an unstyled checkbox
+ * draws the UA's blue, a colour this app does not own and which reads as the accent it is not.
+ * `browser.css` settles the same question the same way. `align-self` because the head is
+ * baseline-aligned text and a box has no baseline worth aligning to.
+ */
+.waiting-select {
+  accent-color: var(--text);
+  align-self: center;
+}
+
 /* What the last decision did. Green-ish and quiet: it is a receipt, not a state
    of the machine. */
 .waiting-outcome {
@@ -399,20 +460,30 @@
 
 /* ========================================================= recruitment form == */
 
-/**
- * The one card in this queue that is a form, because the recruitment approval
- * is editable at the moment of decision — the corrections travel with it.
- */
-.waiting-recruit-form {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
+/* The one card in this queue that is a form, because the recruitment approval is
+   editable at the moment of decision — the corrections travel with it. Its box is
+   an `Inset`, which already stacks the fields at this gap. */
 
 .waiting-recruit-field {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
+}
+
+/**
+ * A field's name, at the same rank as every other label on the page.
+ *
+ * The body face and not mono: `.waiting-fact dt` is the recipe, and these are
+ * the same rank of thing — the name of a fact, not the fact. Mono here made six
+ * labels read as six values, and a form whose labels look like data is a form
+ * somebody has to re-read to find the input.
+ */
+.waiting-recruit-label {
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
 }
 
 .waiting-recruit-input,
@@ -441,29 +512,8 @@
 
 /* ==================================================================== rows == */
 
-/**
- * A row, for the two sections that are lists of *things* rather than of
- * decisions — the git queue and the parked runs. Flatter than a card, because
- * nothing on it is going to be pressed.
- */
-.waiting-row {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-}
-
-.waiting-row-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-2);
-}
-
-/* A real link, so the accent is the accent doing its one job. */
+/* The one place a run id is a link. Accent, because that is navigation and not
+   a state — the same colour the wordmark and the focus ring get. */
 .waiting-row-link {
   font-family: var(--font-mono);
   font-size: var(--text-sm);

@@ -229,7 +229,7 @@ function Run({ projectId }: { projectId: string }) {
             onClick={() => setBrain(candidate)}
             /*
               The chosen brain is `.ui-current` — a 2px rule on the leading edge — and nothing
-              else. It was `border-accent` over a raised fill: the brand colour marks the wordmark,
+              else. It was an accent border over a raised fill: the brand colour marks the wordmark,
               links and the focus ring and never a selection, and a fill marks nothing in the light
               theme, where `--surface` and `--surface-raised` are the same white.
             */

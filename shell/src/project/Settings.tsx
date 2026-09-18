@@ -1,3 +1,4 @@
+import { useId, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
   SHADOW_EVIDENCE_MODE,
@@ -9,10 +10,13 @@ import { useSetWipLimit } from "../data/projects";
 import { useProjects, type AutopilotMode, type ProjectSummary } from "../data/system";
 import {
   MODE_MEANING,
-  MODE_SENTENCES,
+  MODE_REFUSAL_PROSE,
+  PROMOTION_EARNED,
   promotionBlocker,
+  promotionConfirmLabel,
+  promotionConsequence,
 } from "../lib/mode";
-import { ErrorNote, Inset, Quiet } from "../ui";
+import { ErrorNote, Inset, ModeSwitch, Quiet } from "../ui";
 
 /**
  * The settings this app is the author of — the ones that live in the database.
@@ -81,8 +85,6 @@ function Block({
   );
 }
 
-const MODES: AutopilotMode[] = ["off", "shadow", "active"];
-
 /**
  * The biggest lever on the page, with the one setting that has to be earned.
  *
@@ -101,6 +103,16 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
   const refused = setMode.isError && isApiRefusal(setMode.error) ? setMode.error : null;
   const withheld = project.withheld_classes_ready ?? 0;
   const blocker = promotionBlocker(project, withheld);
+  /**
+   * Whether the third segment is armed, so this block can say what confirming it would do.
+   *
+   * The sentence is not the armed label any more: 52 characters inside a switch segment wrap,
+   * and a control that grows while you are deciding moves the button away from the pointer that
+   * has four seconds to press it again. It goes under the switch, where nothing above it moves.
+   */
+  const [armed, setArmed] = useState(false);
+  /** The id the armed switch points at, so the sentence is read as the button's description. */
+  const consequenceId = useId();
 
   function change(mode: AutopilotMode) {
     setMode.mutate({
@@ -115,30 +127,25 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
 
   return (
     <Block label="Mode">
-      <div className="flex flex-wrap gap-2" role="group" aria-label="Autopilot mode">
-        {MODES.map((mode) => {
-          const current = project.mode === mode;
-          const locked = mode === "active" && !project.promotable;
-          return (
-            <button
-              key={mode}
-              type="button"
-              aria-pressed={current}
-              disabled={current || locked || setMode.isPending}
-              title={locked ? blocker : undefined}
-              onClick={() => change(mode)}
-              className={
-                current
-                  ? `rounded-md border px-3 py-1.5 text-sm text-tone-${mode}-fg`
-                  : "rounded-md border border-border px-3 py-1.5 text-sm text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
-              }
-              style={current ? { borderColor: `var(--tone-${mode}-border)`, background: `var(--tone-${mode}-bg)` } : undefined}
-            >
-              {mode}
-            </button>
-          );
-        })}
-      </div>
+      <ModeSwitch
+        value={project.mode}
+        actAllowed={project.promotable}
+        actArmedLabel={promotionConfirmLabel(project)}
+        actConsequence={promotionConsequence(project)}
+        onArmedChange={setArmed}
+        actDescribedBy={consequenceId}
+        busy={setMode.isPending}
+        onChoose={change}
+      />
+
+      {/* Immediately under the switch and above everything else this block says, so arming
+          pushes the standing copy down rather than moving the button itself. In the document
+          at rest, hidden, so the switch can be described before it is armed: a description
+          attached at the moment of arming lands on a button that already has focus and is
+          not re-announced. `.sr-only` is absolutely positioned — nothing moves. */}
+      <p className={armed ? "text-xs text-text-muted" : "sr-only"} id={consequenceId}>
+        {promotionConsequence(project)}
+      </p>
 
       <p className="text-xs text-text-muted">{MODE_MEANING[project.mode]}.</p>
 
@@ -148,15 +155,13 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
         about something that is not happening.
       */}
       {project.mode !== "active" ? (
-        <p className={project.promotable ? "text-xs text-tone-active-fg" : "text-xs text-text-faint"}>
-          {project.promotable
-            ? "every class it has exercised clears the bar, and at least one is a class the classifier withheld — it has earned this"
-            : blocker}
+        <p className={project.promotable ? "text-xs text-text-muted" : "text-xs text-text-faint"}>
+          {project.promotable ? PROMOTION_EARNED : blocker}
         </p>
       ) : null}
 
       {refused !== null ? (
-        <ErrorNote>{MODE_SENTENCES[refused.code] ?? refused.detail}</ErrorNote>
+        <ErrorNote>{MODE_REFUSAL_PROSE[refused.code] ?? refused.detail}</ErrorNote>
       ) : null}
     </Block>
   );
@@ -196,7 +201,7 @@ function Ceiling({ project }: { project: ProjectSummary }) {
         >
           −
         </button>
-        <span className="min-w-16 text-center font-display text-xl text-text">
+        <span className="min-w-16 text-center font-display text-xl font-bold tabular-nums text-text">
           {/*
             `null` is the brake OFF and is not a ceiling of zero: the daemon compares
             `open >= limit`, so zero would mean "never start anything again" — the opposite end of
@@ -293,7 +298,8 @@ function Chip({ row }: { row: ClassTally }) {
       title={`${row.total} decided, ${row.reviewed} reviewed, ${row.disagree} disagreed`}
     >
       {row.action_class}
-      <span className="ml-1 text-text-faint">
+      {/* The fraction needs a real gap from the hyphenated class name. */}
+      <span className="ml-2 text-text-faint">
         {row.reviewed}/{row.total}
       </span>
     </span>

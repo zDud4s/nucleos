@@ -119,6 +119,26 @@ describe("Web — the reader", () => {
 /* ------------------------------------------------------------------ search -- */
 
 describe("Web — search", () => {
+  it("keeps the search field's name without repeating the panel", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/web/pages") return [];
+      return [];
+    });
+
+    await renderWeb("/web");
+
+    expect(screen.getByLabelText("Search query")).toBeInstanceOf(HTMLInputElement);
+    expect(screen.getByText("Search", { selector: ".ui-field-label" }).classList.contains("ui-field-said")).toBe(true);
+  });
+
+  it("the search box says what it searches", async () => {
+    daemon.apiFetch.mockImplementation(async () => []);
+
+    await renderWeb("/web");
+
+    expect(screen.getByRole("textbox", { name: "Search query" }).getAttribute("placeholder")).toContain("search");
+  });
+
   it("reads an unavailable provider as search not configured, not as a failure", async () => {
     daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
       if (path === "/web/pages") return [];

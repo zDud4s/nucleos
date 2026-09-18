@@ -573,6 +573,27 @@ describe("Projects - what starts work without you", () => {
     expect(within(table).queryByText("armed")).toBeNull();
   });
 
+  it("an armed rule is a stated setting, not work in flight", async () => {
+    answerWith(
+      projectsWorld({
+        rules: rules({
+          schedules: [{ name: "nightly", cron: "0 3 * * *", prompt: "tidy", cwd: null, timezone: null, next_fire_at: null, problem: null, last_fired_at: null, fires_today: 0, daily_cap: 4 }],
+          repo_triggers: [{ name: "on-main", branch: "main", prompt: "run", last_sha: null }],
+        }),
+      }),
+    );
+
+    await renderProjects("/projects/alpha/rules");
+
+    const table = await screen.findByRole("table", { name: /start work in this project/ });
+    const armed = within(table).getByText("armed");
+    expect(armed.className).toContain("ui-badge-info");
+    expect(armed.className).not.toContain("ui-badge-active");
+    const unseen = within(table).getByText("no commit seen yet");
+    expect(unseen.className).toContain("ui-badge-info");
+    expect(unseen.className).not.toContain("ui-badge-pending");
+  });
+
   /* The primitive that exists for exactly this and that this page had never
      used. "Nothing is scheduled" and "no commit starts anything here" were two
      sentences saying nothing twice. */
@@ -784,6 +805,40 @@ describe("Projects - the route", () => {
    * search param the router does not validate is a search param the page never
    * sees. This is the reload, through the tree the app actually ships.
    */
+  /**
+   * A8. The workspace's top is the app's top, and the project is the `h1`.
+   *
+   * It was a hand-rolled `header` — an `h1` with four utility classes of its own, a
+   * badge and a path beside it — which is the one place in this app where a page's title
+   * was drawn by the page rather than by `PageHeader`. That is how a heading ends up a
+   * different size on one screen for no reason anybody chose, and it had already
+   * happened: the workspace's title carried `tracking-[-0.02em]` against the shared
+   * header's `-0.015em`.
+   *
+   * The whole app, because the workspace's route is the one thing a locally built router
+   * could not prove: `/projects/$projectId/$view` is `Workspace` in the real tree and
+   * `Projects` in the stand-in above.
+   */
+  it("the workspace header is the shared page header", async () => {
+    answerWith(projectsWorld());
+
+    await renderApp({ initialPath: "/projects/alpha/state" });
+
+    const heading = await screen.findByRole("heading", { level: 1, name: "alpha" });
+    expect(heading.className).toContain("ui-page-title");
+    expect(heading.closest(".ui-page-header")).not.toBeNull();
+    // One, and only one. Two `h1`s on a page is two claims about what it is about.
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+
+    // The mode and the folder moved into the header's one derived line, which is where
+    // every other page in the app says how its subject is doing.
+    await waitFor(() => {
+      const headline = document.querySelector(".ui-page-headline");
+      expect(headline?.textContent).toContain("shadow");
+      expect(headline?.textContent).toContain("C:/repos/alpha");
+    });
+  });
+
   it("carries the folder through the real route, not just the one built here", async () => {
     answerWith(projectsWorld({ entries: [{ name: "gate.rs", is_dir: false }] }));
 

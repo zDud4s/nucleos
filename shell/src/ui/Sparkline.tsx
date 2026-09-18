@@ -40,6 +40,17 @@ export interface SparklineProps {
    * the eye, never from a reader.
    */
   labelHidden?: boolean;
+  /**
+   * What each bar is, one string per value, in the order `values` is in.
+   *
+   * Rendered as an SVG `<title>` — the first child of each bar's `<g>`, which is the
+   * tooltip the format has had all along and needs nothing from `@visx` to draw. The
+   * label says what the window IS; this says what one mark in it is, which is the
+   * question a reader has only once they have found the mark worth asking about.
+   *
+   * Absent is a real answer: a `<g>` with no `<title>` reads exactly as it did before.
+   */
+  titles?: string[];
   width?: number;
   height?: number;
 }
@@ -72,6 +83,7 @@ export function Sparkline({
   values,
   label,
   labelHidden = false,
+  titles,
   width = WIDTH,
   height = HEIGHT,
 }: SparklineProps) {
@@ -119,16 +131,22 @@ export function Sparkline({
             /* A day with nothing in it still gets a mark, or the row would have
                gaps that read as days the window does not cover. */
             const drawn = Math.max(y(value), 1);
+            const said = titles?.[index];
             return (
-              <Bar
-                key={index}
-                className={index === last ? "ui-spark-bar ui-spark-now" : "ui-spark-bar"}
-                x={left + index * slot + inset}
-                y={height - drawn}
-                width={bar}
-                height={drawn}
-                rx={1}
-              />
+              /* The `<title>` is the FIRST child of the group or it is not a tooltip —
+                 that is the format's rule, not a convention. No child at all when the
+                 caller has nothing to say about this bar. */
+              <g key={index}>
+                {said === undefined ? null : <title>{said}</title>}
+                <Bar
+                  className={index === last ? "ui-spark-bar ui-spark-now" : "ui-spark-bar"}
+                  x={left + index * slot + inset}
+                  y={height - drawn}
+                  width={bar}
+                  height={drawn}
+                  rx={1}
+                />
+              </g>
             );
           })}
         </Group>

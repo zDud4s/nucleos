@@ -8,6 +8,7 @@ import {
   type EventOccurrence,
 } from "../data/calendar";
 import { monthMatrix, nowFraction, sameDay, weekdayLabels } from "../lib/calendar-grid";
+import { UI_LOCALE } from "../lib/locale";
 import { dateKeyOf, groupByLocalDay, placementOf, type DragHandlers, type Slot } from "./slot";
 
 /**
@@ -71,7 +72,7 @@ export function MonthGrid({
   const days = weeks.flat();
   const byDay = groupByLocalDay(occurrences);
   const headings = weekdayLabels();
-  const label = anchor.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  const label = anchor.toLocaleDateString(UI_LOCALE, { month: "long", year: "numeric" });
 
   const grid = useRef<HTMLDivElement>(null);
   /*
@@ -215,7 +216,7 @@ function DayCell({ day, inMonth, occurrences, now, working, selected, onSelect, 
     from the DOM so the sentence stays one sentence.
   */
   const said = [
-    day.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" }),
+    day.toLocaleDateString(UI_LOCALE, { weekday: "long", day: "numeric", month: "long" }),
     today ? "today" : null,
     working ? null : "not a working day",
     hours.short ? `short day, ${hours.hours} hours` : null,

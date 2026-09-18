@@ -134,7 +134,9 @@ export function headline(rows: ProjectSummary[]): string {
   if (missing > 0) parts.push(`${missing} with the folder gone`);
   if (unset > 0) parts.push(`${unset} with no folder named`);
   if (failing > 0) parts.push(`${failing} failing the gate`);
-  if (waiting > 0) parts.push(`${waiting} waiting on you`);
+  // The number is `open_review_items`, which is proposals and shadow decisions together, so the
+  // word cannot be "proposal": master renamed the field precisely because the two are not the same.
+  if (waiting > 0) parts.push(`${waiting} item${waiting === 1 ? "" : "s"} to review`);
 
   return parts.join(" · ");
 }

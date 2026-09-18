@@ -131,8 +131,11 @@ const LIFECYCLE: Record<string, Lifecycle> = {
   // attempt or for `gate_failed` -- either way the queue is still holding it.
   reverted: "running",
   passed: "done",
-  // A question about two pieces of work, put down rather than failed, waiting on a person.
-  conflicted: "waiting",
+  // Put down rather than failed, and not waiting on anybody: `Conflicted` "leaves for `Running` —
+  // the resolution node, in that same tree", and `next_step` finds it by the same search as pending
+  // work because "the item owes a run" (`core/src/job.rs`). The queue is still holding it, as with
+  // `reverted`.
+  conflicted: "running",
   // The item asked for a decision and the job moved on. Nothing broke and nobody stopped it.
   skipped: "waiting",
   gate_failed: "gated",
@@ -156,7 +159,7 @@ const READING: Record<string, string> = {
   merging: "merging into the job's branch",
   reverted: "merged, gate went red, branch reset",
   passed: "done",
-  conflicted: "the merge hit a conflict — waiting on a person",
+  conflicted: "the merge hit a conflict — a run resolves it in the item's own tree",
   skipped: "put down: it asked for a decision",
   gate_failed: "the gate said no",
   gate_errored: "the gate could not run",

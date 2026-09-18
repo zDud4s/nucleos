@@ -2274,6 +2274,7 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
         "job_started",
         &started,
         None,
+        Some(&crate::feed::Subject::Job(job_id)),
     )
     .await;
     JobStart::Started(job_id)
@@ -2298,6 +2299,7 @@ async fn fail_early(state: &AppState, project_id: &str, job_id: i64, why: &str) 
         "job_failed",
         &format!("job {job_id} could not start: {why}"),
         None,
+        Some(&crate::feed::Subject::Job(job_id)),
     )
     .await;
     JobStart::Failed
@@ -3011,7 +3013,15 @@ async fn spec_is_written(worktree: &Path) -> bool {
 async fn say(pool: &SqlitePool, job: &JobRow, kind: &str, summary: &str) {
     // A job is not a run, so the feed row carries no run id — writing the job's id into that column
     // would point every reader at whatever run happens to share the number.
-    let _ = crate::feed::append(pool, Some(&job.project_id), kind, summary, None).await;
+    let _ = crate::feed::append(
+        pool,
+        Some(&job.project_id),
+        kind,
+        summary,
+        None,
+        Some(&crate::feed::Subject::Job(job.id)),
+    )
+    .await;
 }
 
 /// `say`, unless the feed already carries this exact line for this job's project.
@@ -5924,6 +5934,7 @@ pub async fn cancel(state: &AppState, job_id: i64) -> sqlx::Result<CancelOutcome
         "job_cancelled",
         &format!("job {job_id} was cancelled; what it finished is on its branch"),
         None,
+        Some(&crate::feed::Subject::Job(job_id)),
     )
     .await;
     Ok(CancelOutcome::Cancelled)
@@ -5964,6 +5975,7 @@ pub async fn reconcile_orphaned_jobs(pool: &SqlitePool) -> sqlx::Result<u64> {
                 job.id
             ),
             None,
+            Some(&crate::feed::Subject::Job(job.id)),
         )
         .await;
         retired += 1;
@@ -9645,12 +9657,13 @@ mod tests {
             "no rule asked for this job, so the column has to say so rather than carry a sentinel"
         );
 
-        let line: String = sqlx::query_scalar(
-            "SELECT summary FROM feed WHERE kind = 'job_started' ORDER BY id DESC LIMIT 1",
+        let (line, subject): (String, Option<String>) = sqlx::query_as(
+            "SELECT summary, subject FROM feed WHERE kind = 'job_started' ORDER BY id DESC LIMIT 1",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
+        assert_eq!(subject, Some(format!("job:{job_id}")));
         assert!(
             !line.contains("rule"),
             "a job with no rule must not name one: {line}"
@@ -11687,11 +11700,12 @@ mod tests {
         reconcile_nodes(&state, &job).await.unwrap();
 
         assert_eq!(item_statuses(&pool, job_id).await.len(), 5);
-        let summary: String =
-            sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'job_planned'")
+        let (summary, subject): (String, Option<String>) =
+            sqlx::query_as("SELECT summary, subject FROM feed WHERE kind = 'job_planned'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
+        assert_eq!(subject, Some(format!("job:{job_id}")));
         assert!(
             summary.contains('2'),
             "the feed must say what was left out: {summary}"

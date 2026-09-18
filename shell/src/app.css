@@ -59,6 +59,76 @@
   padding: var(--space-5) var(--space-6) var(--space-8);
 }
 
+/**
+ * The air between two blocks of a page, decided once.
+ *
+ * It names `.app-page`, so it lives here rather than in `ui.css` — a rule about
+ * what the page does to its own children is not a rule about the primitive. Only
+ * adjacent siblings, so the first block still sits where the header's own margin
+ * put it, and only direct children, so a panel nested inside another keeps
+ * whatever its container decided. The section-to-section pair covers quiet
+ * Voice lists, which render as consecutive direct section children.
+ */
+.app-page > .ui-panel + .ui-panel,
+.app-page > .ui-panel + .ui-section,
+.app-page > .ui-section + .ui-panel,
+.app-page > .ui-section + .ui-section {
+  margin-top: var(--space-4);
+}
+
+/* ----------------------------------------------------------- route error -- */
+
+/**
+ * The page that could not be drawn, drawn where the page would have been.
+ *
+ * It lives here and not in `ui.css` because it is not a primitive: it is one
+ * specific thing the app renders in one specific slot, `AppShell`'s outlet, and
+ * the whole reason it has a box at all is so the header, the sentence, the stack
+ * and the way out are spaced like a page rather than piled like a dump.
+ */
+.app-route-error {
+  display: flex;
+  flex-direction: column;
+  /* A column with a gap rather than margins on the children, because one of the
+     four children is absent whenever what was thrown carried no stack — and a
+     gap closes over a missing child where a margin would leave its hole. */
+  gap: var(--space-4);
+}
+
+/*
+  The stack, expanded, and the only monospaced block on this surface.
+
+  `pre-wrap` and not `pre`: a stack frame is a path plus a call, and on this
+  machine those paths are long enough that `pre` alone would push the whole
+  thing sideways past the fold with the interesting end off-screen. Wrapping
+  keeps the frame numbers on the left where they can be counted. `overflow-x`
+  is still there for the one line that cannot wrap — a minified frame with no
+  spaces in it — and `max-height` is there because a React stack is fifty frames
+  and the actions row below has to stay reachable without scrolling the page.
+*/
+.app-route-error-stack {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-x: auto;
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  max-height: 24rem;
+}
+
+/* `baseline` and not `center`: the two children are a link and a button with an
+   icon in it, and aligning their boxes would sit the words at two different
+   heights. The words are what is being read. */
+.app-route-error-actions {
+  display: flex;
+  flex-direction: row;
+  gap: var(--space-3);
+  align-items: baseline;
+}
+
 /* ------------------------------------------------------------------- nav -- */
 
 /**
@@ -317,7 +387,7 @@
   position: absolute;
   top: calc(100% + var(--space-1));
   left: 0;
-  z-index: 50;
+  z-index: var(--z-top);
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -354,11 +424,12 @@
   outline-offset: -2px;
 }
 
-/* Where you already are. The same accent the rail's current row uses, so "here"
-   looks like one thing in both places rather than two. */
+/* Where you already are. The same quiet fill the rail's current row uses, so "here"
+   looks like one thing in both places rather than two. The fill is identity and stays;
+   the label, glyph, and bar are structure and come off the cyan ladder. */
 .nav-switch-item[aria-current] {
   background: var(--accent-quiet);
-  color: var(--accent);
+  color: var(--text);
   font-weight: var(--weight-medium);
 }
 
@@ -448,25 +519,47 @@
   mask-image: var(--scroll-fade);
   -webkit-mask-image: var(--scroll-fade);
   /*
-    No scrollbar, and the fade above is what replaces it.
+    A thin scrollbar, and the fade above still does the other half of the job.
 
-    Worth being exact about, because hiding a scrollbar is how the pasted design
-    lost eight destinations: it hid the bar AND had nothing else to say there was
-    more list. Here the mask cuts the last row mid-height at the fold, which is
-    the oldest signal there is for "this continues" and the one this rail already
-    used. The region is still scrollable by wheel, by touch, by keyboard and by
-    the arrow keys the rail binds — only the furniture is gone.
+    This region used to have no scrollbar at all. The argument for that was
+    real and is kept here, because it is the argument this 4px bar has to
+    answer rather than contradict: a classic scrollbar is ~15px of the 40px
+    inside a collapsed rail, taken from the right, which pushed every icon five
+    pixels off the centre it was supposed to sit on. That is a genuine cost and
+    it is why the default bar is not what is here.
 
-    It also buys back the width. A classic scrollbar is ~15px of the 40px inside
-    a collapsed rail, and it takes that from the right, which pushed every icon
-    five pixels left of the centre it was supposed to sit on. The two complaints
-    were one complaint.
+    What the no-bar version got wrong is the other half. Hiding the furniture is
+    how the pasted design lost eight destinations, and the mask alone does not
+    replace it: the fade says "this continues", which is the oldest signal there
+    is, but it says nothing about HOW MUCH continues or where in the list you
+    are. On a rail of twenty destinations that is the difference between one more
+    row below the fold and twelve.
+
+    4px is the width at which both are true. It is a quarter of the ~15px the old
+    comment objected to, so a collapsed rail keeps 36 of its 40 and the icons stay
+    where the axis puts them; and it is a real thumb, sized to the list, so the
+    depth of the list is visible. The mask stays exactly as it was — the two are
+    not alternatives, they answer different questions.
   */
-  scrollbar-width: none;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
 
+/* WebKit says the same thing in its own vocabulary — this is the same 4px bar
+   the two `scrollbar-*` properties above declare, not a second decision. The
+   track is transparent so the rail's own surface runs under it: a track with a
+   colour would read as a second edge beside the one the rail already has. */
 .nav-scroll::-webkit-scrollbar {
-  display: none;
+  width: 4px;
+}
+
+.nav-scroll::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 2px;
+}
+
+.nav-scroll::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .nav-group + .nav-group {
@@ -719,6 +812,7 @@
  *
  * The bar itself is drawn in the motion section at the end of this file — it used
  * to be `box-shadow: inset 2px 0 0`, and a shadow has no geometry to grow from.
+ * The quiet fill is identity and stays; label, glyph, and bar are neutral structure.
  */
 .nav-item-active {
   background: var(--accent-quiet);
@@ -735,7 +829,7 @@
  * nobody a way to find out how to switch the thing on.
  */
 .nav-item-disabled {
-  opacity: 0.5;
+  opacity: var(--opacity-disabled);
 }
 
 /**
@@ -777,7 +871,7 @@
 
 .nav-item-active .nav-glyph,
 .nav-item-active .nav-icon {
-  color: var(--accent);
+  color: var(--text);
 }
 
 .nav-label {
@@ -1042,6 +1136,92 @@
   font-size: 0;
 }
 
+/* --------------------------------------------------- nav: go to anything -- */
+
+/**
+ * The footer row that opens the palette.
+ *
+ * Measured off `.app-notify` below, which is measured off a `nav-item` — the
+ * same 10px gap and the same 7px/8px insets, so the mark, the word and the
+ * chord sit on exactly the columns every destination above them uses. A row
+ * that opens the way out of this page should not look like a different kind of
+ * thing from the rows it is a shortcut to.
+ */
+.app-goto {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 2.125rem;
+  padding: 7px var(--nav-inset);
+  border: none;
+  /* Its word and its chord are clipped by the closing rail, exactly as a row's
+     label is — without this they would spill out over the page while the rail
+     narrowed past the width they need. */
+  overflow: hidden;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.app-goto:hover {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+/* The same 16px box `.nav-icon` occupies, so this row's mark lines up with every
+   destination above it rather than sitting on its own inset. */
+.app-goto-glyph {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  color: var(--text-faint);
+}
+
+.app-goto-label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The chord, in the mono face every literal in this app is set in. Quiet: it is
+   the row's footnote, not its label. */
+.app-goto-keys {
+  flex: none;
+  padding: 0 var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+}
+
+/* Collapsed to icons, the same treatment `.app-notify-label` gets one block
+   down: clipped rather than lifted out of the flow, so the control keeps its
+   line box — which is what stops the row changing height with the rail's width
+   — and `flex: none` so the zero-width box cannot grow back into the space the
+   mark needs to sit on the centre line. */
+.nav-collapsed .app-goto-label,
+.nav-collapsed .app-goto-keys {
+  width: 0;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  text-indent: -100vw;
+  white-space: nowrap;
+  flex: none;
+}
+
+.nav-collapsed .app-goto {
+  /* No gap, for the reason the rows above have none: the label beside the mark
+     is zero wide here, so ten pixels of gap is ten pixels of nothing. */
+  gap: 0;
+}
+
 /* --------------------------------------------------- notifications drawer -- */
 
 /**
@@ -1178,7 +1358,7 @@
   position: fixed;
   top: 0;
   right: 0;
-  z-index: 20;
+  z-index: var(--z-overlay);
   display: grid;
   grid-template-rows: auto 1fr;
   width: min(26rem, 100vw);
@@ -1253,23 +1433,22 @@
 .app-drawer-list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--hairline);
   margin: 0;
   padding: 0;
   list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--border);
+  overflow: hidden;
 }
 
 .app-drawer-row {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
-  padding-bottom: var(--space-3);
-  border-bottom: 1px solid var(--border);
-}
-
-.app-drawer-row:last-child {
-  padding-bottom: 0;
-  border-bottom: none;
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
 }
 
 .app-drawer-row-head {
@@ -1458,12 +1637,15 @@
   }
 }
 
+/* `--text`, not `--border-strong`: this is the "you are here" edge, which has to read
+   at the edge of vision. The row already lifts its label to `--text`; a marker dimmer
+   than the row it marks is not a marker. */
 .nav-item-active::before {
   content: "";
   position: absolute;
   inset: 0 auto 0 0;
   width: 2px;
-  background: var(--accent);
+  background: var(--text);
   animation: nav-here var(--dur-settle) var(--ease);
 }
 
@@ -1601,36 +1783,8 @@
   margin-bottom: var(--space-6);
 }
 
-.app-quicklinks {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
-  gap: var(--space-4);
-}
-
-.app-quicklink {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-4);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  color: var(--text-muted);
-  text-decoration: none;
-}
-
-.app-quicklink:hover {
-  border-color: var(--border-strong);
-  background: var(--surface-raised);
-}
-
-.app-quicklink-title {
-  font-family: var(--font-display);
-  font-size: var(--text-md);
-  font-weight: var(--weight-semibold);
-  color: var(--text);
-}
-
-.app-quicklink-text {
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-}
+/* The two quicklink CARDS were here — a bordered block per door, each with a display-face
+   title and a paragraph, drawn at the same weight as the four readings above them. Two
+   links do not need a frame each to be found, and the frames made the first screen read
+   as six things of equal importance when four of them are the news and two are doors.
+   What replaced them is a `Section` with two `ui-button-link`s and their sentences. */

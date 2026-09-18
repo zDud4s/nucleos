@@ -52,7 +52,7 @@ beforeEach(() => {
 
 /* ------------------------------------------------------------- fixtures -- */
 
-/** The daemon's own subsystem order — `health.rs:142-183`. Render, never sort. */
+/** The fixture's daemon order — the page sorts by health, worst first, and stays in daemon order inside each group. */
 const DAEMON_ORDER = [
   "sqlite_pool",
   "cli_binary",
@@ -185,7 +185,11 @@ function systemWorld(overrides: Partial<SystemWorld> = {}): SystemWorld {
  */
 function systemFetch(
   world: SystemWorld,
-  opts: { onRestore?: (name: string) => unknown; onMint?: (mint: { name: string; level: ApiTokenLevel }) => unknown } = {},
+  opts: {
+    onRestore?: (name: string) => unknown;
+    onRestart?: (name: string) => unknown;
+    onMint?: (mint: { name: string; level: ApiTokenLevel }) => unknown;
+  } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   const shared = daemonFetch(daemonState({ projects: world.projects }));
   return async (path, init) => {
@@ -245,6 +249,12 @@ function systemFetch(
           migration_version: backup?.migration_version ?? 0,
           applies: `applies on the núcleo's next start, replacing everything written after ${name}`,
         };
+      }
+      const restartMatch = /^\/sidecars\/([^/]+)\/restart$/.exec(path);
+      if (restartMatch !== null) {
+        const name = decodeURIComponent(restartMatch[1]);
+        if (opts.onRestart !== undefined) return opts.onRestart(name);
+        return { name, asked: true };
       }
       if (path === "/api-tokens" && typeof init.body === "string") {
         const mint = JSON.parse(init.body) as { name: string; level: ApiTokenLevel };
@@ -373,6 +383,33 @@ function rowFor(list: HTMLElement, name: string): HTMLElement {
 /* ---------------------------------------------------------------- health -- */
 
 describe("System - health readout", () => {
+  it("the headline says what is wrong in the tone for wrong", async () => {
+    const world = systemWorld({
+      readout: {
+        status: "degraded",
+        subsystems: [
+          { name: "sqlite_pool", status: "down" },
+          { name: "cli_binary", status: "degraded" },
+        ],
+      },
+    });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystem();
+
+    expect((await screen.findByText("1 down, 1 degraded")).className).toContain("ui-wrong");
+  });
+
+  it("leaves a healthy headline untoned", async () => {
+    daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
+
+    await renderSystem();
+
+    expect((await screen.findByText("every configured subsystem is healthy")).className).not.toContain(
+      "ui-wrong",
+    );
+  });
+
   it("renders the daemon's subsystems in order with reason and keeps disabled apart from down", async () => {
     const world = systemWorld({
       readout: {
@@ -397,11 +434,18 @@ describe("System - health readout", () => {
 
     const list = await screen.findByRole("list", { name: "Subsystems" });
 
-    // Rendered in the daemon's own order, not re-sorted.
+    // Down comes first, then degraded, with daemon order preserved inside each group.
     const names = within(list)
       .getAllByRole("listitem")
       .map((row) => row.querySelector(".sy-subsystem-name")?.textContent);
-    expect(names).toEqual([...DAEMON_ORDER]);
+    const expectedOrder = [
+      ...world.readout.subsystems.filter((subsystem) => subsystem.status === "down"),
+      ...world.readout.subsystems.filter((subsystem) => subsystem.status === "degraded"),
+      ...world.readout.subsystems.filter(
+        (subsystem) => subsystem.status !== "down" && subsystem.status !== "degraded",
+      ),
+    ].map((subsystem) => subsystem.name);
+    expect(names).toEqual(expectedOrder);
 
     // Reasons render for the rows that have one.
     expect(within(list).getByText(/low-disk-space/)).toBeDefined();
@@ -429,9 +473,14 @@ describe("System - health readout", () => {
 
     await renderSystem();
 
-    // Scoped to the panel's own status text: the page headline also says
-    // "timed out", and a bare `findByText` throws on the two matches.
-    const notice = await screen.findByRole("status");
+    // Found by its own opening words, and then checked to BE a live region.
+    //
+    // It used to be `findByRole("status")`, on the argument that the page headline also says
+    // "timed out" and a bare `findByText` would throw on two matches. Both halves still hold;
+    // what changed is that `ConfirmButton` now renders a polite region of its own — empty at
+    // rest — so "the only status on the page" is no longer a way to name anything.
+    const notice = await screen.findByText(/^The readout timed out before it could measure/);
+    expect(notice.getAttribute("role")).toBe("status");
     expect(notice.textContent).toMatch(/timed out/i);
     expect(screen.queryByText(/missing/i)).toBeNull();
 
@@ -442,6 +491,91 @@ describe("System - health readout", () => {
       expect(screen.queryByText(name)).toBeNull();
     }
     expect(screen.queryByRole("list", { name: "Subsystems" })).toBeNull();
+  });
+
+  it("offers a restart only beside a down sidecar", async () => {
+    const world = systemWorld({
+      readout: {
+        status: "degraded",
+        subsystems: [
+          { name: "sqlite_pool", status: "down", reason: "unreachable" },
+          { name: "echo_sidecar", status: "ok" },
+          { name: "browser_sidecar", status: "down", reason: "not-running" },
+          { name: "telegram_sidecar", status: "disabled", reason: "not-configured" },
+        ],
+      },
+    });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystem();
+
+    const list = await screen.findByRole("list", { name: "Subsystems" });
+    const restarts = within(list).getAllByRole("button", { name: "Restart" });
+    expect(restarts).toHaveLength(1);
+    expect(rowFor(list, "browser_sidecar").textContent).toContain("Restart");
+    expect(rowFor(list, "sqlite_pool").textContent).not.toContain("Restart");
+    expect(rowFor(list, "echo_sidecar").textContent).not.toContain("Restart");
+    expect(rowFor(list, "telegram_sidecar").textContent).not.toContain("Restart");
+  });
+
+  it("presses twice and asks the núcleo to restart the sidecar the row names", async () => {
+    const asked: string[] = [];
+    const world = systemWorld({
+      readout: {
+        status: "down",
+        subsystems: [{ name: "browser_sidecar", status: "down", reason: "not-running" }],
+      },
+    });
+    daemon.apiFetch.mockImplementation(
+      systemFetch(world, {
+        onRestart: (name) => {
+          asked.push(name);
+          return { name, asked: true };
+        },
+      }),
+    );
+
+    await renderSystem();
+
+    const list = await screen.findByRole("list", { name: "Subsystems" });
+    fireEvent.click(within(list).getByRole("button", { name: "Restart" }));
+    await afterDwell();
+    fireEvent.click(
+      await within(list).findByRole("button", { name: "Start it again · browser_sidecar" }),
+    );
+
+    await waitFor(() => {
+      expect(asked).toEqual(["browser"]);
+    });
+    const note = await within(list).findByText("asked — the supervisor is trying now");
+    expect(note.getAttribute("role")).toBe("status");
+  });
+
+  it("says why the núcleo refused a restart, in the row", async () => {
+    const world = systemWorld({
+      readout: {
+        status: "down",
+        subsystems: [{ name: "browser_sidecar", status: "down", reason: "not-running" }],
+      },
+    });
+    daemon.apiFetch.mockImplementation(
+      systemFetch(world, {
+        onRestart: () => {
+          throw new ApiRefusal(404, "not_supervised", "not_supervised");
+        },
+      }),
+    );
+
+    await renderSystem();
+
+    const list = await screen.findByRole("list", { name: "Subsystems" });
+    fireEvent.click(within(list).getByRole("button", { name: "Restart" }));
+    await afterDwell();
+    fireEvent.click(
+      await within(list).findByRole("button", { name: "Start it again · browser_sidecar" }),
+    );
+
+    expect(await within(list).findByText(/nothing is supervising it/)).toBeDefined();
   });
 });
 
@@ -712,7 +846,10 @@ describe("System - backups", () => {
     await afterDwell();
     fireEvent.click(within(snap1Row).getByRole("button", { name: "Restore snap-1 on next start" }));
 
-    const notice = await within(snap1Row).findByRole("status");
+    // By its words, not by being the row's only live region: the row's own interlock
+    // ("Stage a restore") now carries one too, so that arming it is announced.
+    const notice = await within(snap1Row).findByText(/^Nothing has changed yet/);
+    expect(notice.getAttribute("role")).toBe("status");
     expect(notice.textContent).toMatch(/applies on the núcleo's next start/i);
     expect(notice.textContent).toMatch(/nothing has changed yet/i);
   });
@@ -968,5 +1105,35 @@ describe("System - the route", () => {
     const healthTab = await screen.findByRole("link", { name: "Health" });
     expect(healthTab.getAttribute("aria-current")).toBe("page");
     expect(await screen.findByRole("heading", { level: 2, name: "Subsystems" })).toBeDefined();
+  });
+});
+
+describe("System - map-authored readings", () => {
+  it("a project brake reads held or released, and neither is Acting Green", async () => {
+    const world = systemWorld({ projects: [project({ project_id: "alpha" })] });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+    await renderSystem();
+    const alphaRow = rowFor(await screen.findByRole("list", { name: "Project brakes" }), "alpha");
+    const released = within(alphaRow).getByText("released");
+    expect(released.className).toContain("ui-badge-off");
+    expect(released.className).not.toContain("ui-badge-active");
+    fireEvent.click(within(alphaRow).getByRole("button", { name: "Hold alpha" }));
+    await waitFor(() => {
+      const held = within(alphaRow).getByText("held");
+      expect(held.className).toContain("ui-badge-paused");
+      expect(held.className).not.toContain("ui-badge-active");
+    });
+  });
+
+  it("an enabled mailbox and an armed one are facts, not work in flight", async () => {
+    daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
+    await renderSystemAt("/system/tokens");
+    const panel = (await screen.findByRole("heading", { level: 2, name: "Email configuration" })).closest("section");
+    if (panel === null) throw new Error("no email configuration panel");
+    for (const label of ["enabled", "armed"]) {
+      const badge = within(panel).getByText(label);
+      expect(badge.className).toContain("ui-badge-info");
+      expect(badge.className).not.toContain("ui-badge-active");
+    }
   });
 });

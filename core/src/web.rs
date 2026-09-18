@@ -500,6 +500,7 @@ pub async fn post_read(
         "web.read",
         &format!("read {} ({})", new_page.final_url, decision.trust.as_str()),
         None,
+        None,
     )
     .await;
 

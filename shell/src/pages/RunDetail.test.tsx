@@ -135,10 +135,12 @@ describe("RunDetail — the gate", () => {
 
     // A NULL `gate_status` means no gate was ever configured. Rendered in red it
     // would be the shell telling somebody their tests broke when they never
-    // wrote any.
+    // wrote any. The reading is the pipeline's gate stage — the page says each
+    // state once, and this is the once.
     const reading = await screen.findByText("no gate configured");
-    expect(reading.className).toContain("ui-badge-off");
-    expect(reading.className).not.toContain("ui-badge-danger");
+    const stage = reading.closest("g")!.getAttribute("class");
+    expect(stage).toContain("ui-runpipe-off");
+    expect(stage).not.toContain("ui-runpipe-danger");
     expect(screen.queryByText(/gate failed/i)).toBeNull();
     // And it does not borrow the passing tone either: nothing measured this.
     expect(screen.queryByText(/gate passed/i)).toBeNull();
@@ -427,6 +429,44 @@ describe("RunDetail — the handoff", () => {
     expect(await screen.findByRole("link", { name: "Run 6 continued it" })).toBeDefined();
     // And the meter says the run was past the point where the daemon splits it.
     expect(screen.getByText(/at the handoff mark/)).toBeDefined();
+  });
+});
+
+describe("RunDetail — absent readings", () => {
+  it("draws a run whose cost and context the daemon never sent", async () => {
+    const run = detail();
+    delete (run as { cost_usd?: unknown }).cost_usd;
+    delete (run as { context_fill?: unknown }).context_fill;
+    const asked: string[] = [];
+    daemon.apiFetch.mockImplementation(detailFetch(run, NO_TAIL, asked, stopReport()));
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(await screen.findByText("cost not recorded")).toBeDefined();
+    expect(screen.getByText("context fill not reported")).toBeDefined();
+  });
+});
+
+describe("RunDetail headline", () => {
+  it("a terminal run's headline says where it ran and leaves the state to the badge", async () => {
+    daemon.apiFetch.mockImplementation(detailFetch(detail({ status: "completed", project_id: "alpha" }), NO_TAIL, []));
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    const heading = await screen.findByText("ran in alpha");
+    expect(heading.textContent).toBe("ran in alpha");
+    expect(screen.getAllByText("completed").length).toBeGreaterThan(0);
+    expect(heading.textContent).not.toContain("completed");
+  });
+
+  it("keeps terminal state out of a timed-out headline", async () => {
+    daemon.apiFetch.mockImplementation(detailFetch(detail({ status: "timed_out" }), NO_TAIL, []));
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    const heading = await screen.findByText("ran in alpha");
+    expect(heading.textContent).not.toMatch(/ended /);
+    expect(heading.textContent).not.toContain("timed out");
   });
 });
 

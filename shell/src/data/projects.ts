@@ -601,14 +601,6 @@ export interface AutonomyRule {
   sha: string | null;
 }
 
-/** The word each state deserves, said once, in the one vocabulary. */
-export const RULE_STATE_WORD: Record<RuleState, string> = {
-  armed: "armed",
-  "never-fires": "never fires",
-  capped: "capped today",
-  unseen: "no commit seen yet",
-};
-
 /**
  * Everything that starts work in this project without being asked, as one list.
  *

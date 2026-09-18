@@ -34,20 +34,17 @@
 /* =============================================================== the page == */
 
 /**
- * The page's stacked views, capped at the column measure.
+ * The page's stacked views.
  *
- * `--width-column` rather than the raw `64rem` that stood here and on
- * `.pj-concerns` below: six declarations across three stylesheets had
- * independently agreed on that number without ever writing it down, which is
- * exactly how a seventh page gets to disagree by accident. It is a different
- * measurement from the `78rem` outer cap on `.app-page`, which is the window
- * and not the column, and both stay.
+ * Not capped at `--width-column`: the views here are rows, tables and file
+ * listings that read across, and the `78rem` outer cap on `.app-page` is the
+ * only width they answer to. `.pj-concerns` below follows the same rule, so the
+ * condition line spans exactly what the view beneath it does.
  */
 .pj-sections {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  max-width: var(--width-column);
 }
 
 /**
@@ -140,12 +137,9 @@
   color: var(--text-faint);
 }
 
-/* The way back out, under the headline. Two links, because the workspace and the
-   roster are different places — not a door to a wizard, which is the Roster's. */
-.pj-back {
-  margin: 0 0 var(--space-4);
-  font-size: var(--text-sm);
-}
+/* The way back out, under the headline, is `.ui-crumb` in `ui.css`. Still two places,
+   because the workspace and the roster are different ones — the arrow points at the
+   workspace and the roster sits in the crumb's second slot. */
 
 /**
  * A page asked to inspect nothing — and the one box here that is **not**
@@ -190,7 +184,6 @@
  */
 .pj-concerns {
   margin: 0 0 var(--space-4);
-  max-width: var(--width-column);
 }
 
 .pj-concern-list {
@@ -503,7 +496,10 @@
 .pj-file-nums,
 .pj-file-text {
   margin: 0;
-  line-height: var(--leading-snug);
+  /* Mono comes from the shared block above; a file being read is set a step up
+     from the xs identifiers, with the air a long listing needs. */
+  font-size: var(--text-sm);
+  line-height: 1.45;
   white-space: pre;
   tab-size: 4;
 }
@@ -559,7 +555,7 @@
    than the number field and narrower than a path, because the longest row here is a model label. */
 .pj-field-select {
   max-width: 26rem;
-  font-family: var(--font-sans);
+  font-family: var(--font-body);
 }
 
 .pj-field-input:focus-visible {
@@ -645,8 +641,8 @@
   overflow: auto;
   overscroll-behavior: none;
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  line-height: var(--leading-snug);
+  font-size: var(--text-sm);
+  line-height: 1.45;
   color: var(--text-muted);
   background: var(--surface-sunken);
   border: 1px solid var(--border);
@@ -950,7 +946,6 @@
   gap: var(--space-2);
   padding: var(--space-3);
   border: 1px solid var(--tone-danger-border);
-  border-left-width: 3px;
   border-radius: var(--radius-sm);
   background: var(--tone-danger-bg);
 }

@@ -105,11 +105,14 @@ function WhyNot({ error }: { error: unknown }) {
   );
 }
 
+/** How many steps this page has. Named once so a step cannot say "1." with no denominator. */
+const STEPS = 3;
+
 function Step({ n, label, children }: { n: number; label: string; children: React.ReactNode }) {
   return (
     <section aria-label={label} className="flex flex-col gap-2">
       <h2 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
-        {n}. {label}
+        {n} of {STEPS}. {label}
       </h2>
       <div className="rounded-lg border border-border bg-surface p-4">{children}</div>
     </section>
