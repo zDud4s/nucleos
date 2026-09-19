@@ -61,10 +61,15 @@ if (browser === undefined) die("no Chromium found. Looked for Chrome and Edge in
 /* ------------------------------------------------------------------ build */
 
 console.log("preview: building the bundle…");
+// Vite's own entry through this Node, not `npx`, which is what `csp-gate.mjs` does and the
+// reason this file says it is modelled on that one: a `.cmd` shim needs a shell on Windows,
+// and reaching for one buys a quoting bug, a DEP0190 warning about unescaped arguments, and
+// five seconds of shim startup per run. Measured here: 5.35s through `npx.cmd` against 0.28s
+// through this path, for the same `vite --version`.
 const build = spawn(
-  process.platform === "win32" ? "npx.cmd" : "npx",
-  ["vite", "build", "--config", "preview.vite.config.mjs"],
-  { cwd: SHELL, stdio: "inherit", shell: process.platform === "win32" },
+  process.execPath,
+  [join(SHELL, "node_modules/vite/bin/vite.js"), "build", "--config", "preview.vite.config.mjs"],
+  { cwd: SHELL, stdio: "inherit" },
 );
 const buildCode = await new Promise((ok) => build.on("close", ok));
 if (buildCode !== 0) die("the preview bundle did not build (vite exited " + buildCode + ")");
