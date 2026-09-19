@@ -29,6 +29,19 @@ export const POLL = {
    * not become a reason to run out of it.
    */
   quota: 60000,
+  /**
+   * Provider quota that is not answering, or answering from the table.
+   *
+   * The other cadence in the same plan, and the one that makes the minute above affordable: while
+   * the sidecar is down or a provider cannot be read at all, the displayed figure is already old
+   * and the next good answer is the one worth having quickly. Ten seconds is the error TTL the
+   * sidecar itself holds, so asking faster than this only re-reads its cache.
+   *
+   * Only conditions somebody is expected to come back from count — see `isDegraded` in `quota.ts`,
+   * which deliberately does not count a lone rolled-over window, because on a machine that does not
+   * run a provider that window is the steady state and this cadence would never end.
+   */
+  quotaDegraded: 10000,
 } as const;
 
 export type PollCadence = (typeof POLL)[keyof typeof POLL];

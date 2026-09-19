@@ -66,15 +66,59 @@ export interface QuotaReport {
 }
 
 /**
- * The current quota, refreshed once a minute.
+ * Whether the answer in hand is a degraded one, and therefore worth replacing sooner.
  *
- * No `pollWhile`: there is no terminal state to stop on. A quota that is spent is the reading most
- * worth keeping fresh, because the next thing it does is reopen.
+ * Two shapes of the same fact, and both of them are about the PROVIDER: the route fell back to the
+ * table (`source: "stored"`), or a provider could not be read at all (`fidelity: "unmeasured"`).
+ * Each says the number on screen is not the current one *and* that somebody is expected to fix it —
+ * the sidecar comes back up, the vendor stops refusing, the owner signs in again — so asking every
+ * ten seconds instead of every minute buys the recovery being noticed quickly.
+ *
+ * **A stale window on its own is deliberately NOT enough**, and that is the whole narrowing. A
+ * rolled-over window is not necessarily a transient condition: on a machine that never runs Codex,
+ * the Codex 5h window sits past its reset forever and no future poll will change it. Counting it
+ * would put the app on the ten-second cadence permanently, which is exactly the cost `POLL.quota`'s
+ * minute exists to avoid — a quota display must not become a reason to spend quota. The window's
+ * own `stale` flag is still how the ring is drawn; it is just not evidence that asking again sooner
+ * would help.
+ */
+export function isDegraded(report: QuotaReport): boolean {
+  return (
+    report.source === "stored" ||
+    report.providers.some((provider) => provider.fidelity === "unmeasured")
+  );
+}
+
+/**
+ * The cadence for the next poll, decided against the answer already in the cache.
+ *
+ * Exported and pure so the decision can be asserted without mounting anything — the same reason
+ * `pollWhile` is shaped the way it is. It is not `pollWhile` itself, because this never stops: a
+ * quota has no terminal state, and a quota that is spent is the reading most worth keeping fresh,
+ * since the next thing it does is reopen.
+ *
+ * **A failed request is not how this route reports an outage.** `GET /quota` answers 200 with
+ * `source: "stored"` when the sidecar is down, so a `refetchInterval` that only switched on
+ * `isError` would sit at a minute through exactly the outage it was meant to shorten. The error
+ * branch is still here for the case the route itself is gone — the shell not reaching its own
+ * núcleo — and it wants the same ten seconds.
+ */
+export function quotaCadence(query: {
+  state: { data: QuotaReport | undefined; status: string };
+}): number {
+  if (query.state.status === "error") return POLL.quotaDegraded;
+  const report = query.state.data;
+  if (report === undefined) return POLL.quota;
+  return isDegraded(report) ? POLL.quotaDegraded : POLL.quota;
+}
+
+/**
+ * The current quota, refreshed once a minute — every ten seconds while the answer is degraded.
  */
 export function useQuota() {
   return useQuery({
     queryKey: keys.quota,
     queryFn: () => apiFetch<QuotaReport>("/quota"),
-    refetchInterval: POLL.quota,
+    refetchInterval: quotaCadence,
   });
 }
