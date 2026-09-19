@@ -1,11 +1,12 @@
-// Package reading is the one shape this sidecar reports, and the place where the two providers'
-// different units are reconciled.
+// Package reading is the one shape this sidecar reports, and the place where every provider's own
+// percentage is converted to a single fraction.
 //
-// The Anthropic endpoint reports `utilization` as a float fraction, while the same payload's
-// `limits[].percent` and `seven_day_breakdown.rows[].percent` are integer percentages, and the
-// Codex rollouts carry `used_percent`. Three spellings of one idea in two sources is how a ring
-// ends up drawn a hundred times too full, so nothing past this package is allowed to see a
-// percentage: every provider converts at its own edge and hands back UsedFraction.
+// The Anthropic endpoint reports `utilization` as a PERCENTAGE carried in a float field — the name
+// reads like a fraction and is not one — while the same payload's `limits[].percent` and
+// `seven_day_breakdown.rows[].percent` are integer percentages, and the Codex rollouts carry
+// `used_percent`. Three spellings of one percentage is how a ring ends up drawn a hundred times too
+// full, so nothing past this package is allowed to see a percentage: every provider converts at its
+// own edge and hands back UsedFraction.
 package reading
 
 import "time"

@@ -63,15 +63,19 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	timeout, err := seconds("QUOTA_FETCH_TIMEOUT_SECS", defaultFetchTimeout, 1, 60)
+	// The bounds below are seconds, and must be scaled by time.Second before being passed in: min
+	// and max are time.Duration parameters, and a bare untyped constant assigned to a Duration is
+	// nanoseconds. Passing plain "60" here once clamped every fetch to 60 NANOSECONDS instead of 60
+	// seconds — silently, since a valid QUOTA_FETCH_TIMEOUT_SECS is exactly what triggers the clamp.
+	timeout, err := seconds("QUOTA_FETCH_TIMEOUT_SECS", defaultFetchTimeout, 1*time.Second, 60*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
-	successTTL, err := seconds("QUOTA_SUCCESS_TTL_SECS", defaultSuccessTTL, 5, 3600)
+	successTTL, err := seconds("QUOTA_SUCCESS_TTL_SECS", defaultSuccessTTL, 5*time.Second, 3600*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
-	errorTTL, err := seconds("QUOTA_ERROR_TTL_SECS", defaultErrorTTL, 1, 600)
+	errorTTL, err := seconds("QUOTA_ERROR_TTL_SECS", defaultErrorTTL, 1*time.Second, 600*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
