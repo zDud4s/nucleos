@@ -74,6 +74,8 @@ mod project_policy;
 mod project_readings;
 mod prompt_budget;
 mod proposals;
+mod quota;
+mod quota_client;
 mod recurrence;
 mod redact;
 mod refine;
@@ -907,6 +909,11 @@ async fn main() {
     // process it authenticates drives browsers holding the owner's logged-in profiles, so a secret
     // that leaked would hand those sessions to anything on the machine that can open a socket.
     let browser_sidecar_token = auth::generate_token();
+    // The quota sidecar's, the same way again. Nothing of the owner's travels on this connection in
+    // either direction — the request is empty and the answer is a handful of percentages — so this
+    // secret exists only to keep anything else on the machine from asking the daemon's sidecar how
+    // much of the owner's limit is gone.
+    let quota_sidecar_token = auth::generate_token();
     // Cleanup is armed SEPARATELY from transcription, and a failed probe costs only the tidying up.
     //
     // That asymmetry is deliberate. Local triage refuses to run at all when its probe fails, because
@@ -1230,6 +1237,10 @@ async fn main() {
             ollama_base_url: runner::OLLAMA_BASE_URL.to_string(),
             http: reqwest::Client::new(),
         }),
+        quota: Arc::new(quota::QuotaRuntime::new(quota_client::QuotaClient::new(
+            sidecar::QUOTA_ADDR,
+            quota_sidecar_token.clone(),
+        ))),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_tails: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1259,6 +1270,24 @@ async fn main() {
             sidecar_path,
             vec![],
         ));
+    }
+
+    // The quota sidecar. Supervised beside `echo` and NOT behind a pillar switch, which is the one
+    // choice here worth defending, because every other process that reaches off this machine is
+    // opt-in.
+    //
+    // It reaches a vendor only when the owner already has that vendor's CLI signed in on this
+    // machine, and it reads the credential that CLI wrote. On a machine with no Claude Code it
+    // makes no outbound call at all — it answers `unmeasured` and stops. So the switch an opt-in
+    // would offer is one the owner has already thrown, in the other application, and a second one
+    // here would mean the notch ships dark with no settings page to light it until phase 4.
+    if sidecars_wanted {
+        tokio::spawn(sidecar::supervise(
+            sidecar::QUOTA.to_string(),
+            sidecar::binary(sidecar::QUOTA),
+            sidecar::quota_env(&daemon_client::daemon_url(), &quota_sidecar_token),
+        ));
+        tracing::info!(addr = sidecar::QUOTA_ADDR, "quota sidecar supervised");
     }
 
     // The browser sidecar. Started only when the pillar is on, like the web one beside it.

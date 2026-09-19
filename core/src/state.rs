@@ -396,6 +396,14 @@ pub struct AppState {
     /// The web pillar: the trust allowlist, retention, and the client for the sidecar that is the
     /// only process here allowed to open a connection off this machine.
     pub web: Arc<crate::web::WebRuntime>,
+    /// The quota pillar: the client for the sidecar that reads how much of each assistant's usage
+    /// limit is gone.
+    ///
+    /// No token of any provider is here, and that absence is design D2 rather than an oversight.
+    /// The sidecar reads Claude Code's own credential file at the point of use and hands back a
+    /// fraction, so the one secret on this path is the daemon's bearer for its own sidecar. That is
+    /// also why this runtime needs no `Debug` guard of the kind `EmailRuntime` carries.
+    pub quota: Arc<crate::quota::QuotaRuntime>,
     /// The browser pillar: whether it is on, and the client for the process that drives Chromium.
     ///
     /// The site lists are deliberately NOT here. They live in `browser_sites` and are read per

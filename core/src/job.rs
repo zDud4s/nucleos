@@ -6040,6 +6040,7 @@ mod tests {
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
             github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             run_tails: Default::default(),
