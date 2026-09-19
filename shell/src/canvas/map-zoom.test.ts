@@ -1,6 +1,17 @@
 // §spec mapa-do-projeto
 import { describe, expect, it } from "vitest";
-import { ASSUMED_ROOM, NO_ZOOM, ZOOM_STEPS, fitZoom, matrixWidth, zoomBy, zoomLabel } from "./map-zoom";
+import {
+  ASSUMED_ROOM,
+  LEGIBLE_TYPE,
+  NO_ZOOM,
+  SMALLEST_TYPE,
+  ZOOM_STEPS,
+  fitZoom,
+  matrixWidth,
+  unreadableAt,
+  zoomBy,
+  zoomLabel,
+} from "./map-zoom";
 
 describe("how far out a drawing stands", () => {
   it("leaves a picture that already fits at its own size", () => {
@@ -25,8 +36,11 @@ describe("how far out a drawing stands", () => {
   });
 
   it("stops at the smallest step rather than shrinking a drawing out of legibility", () => {
-    // Past this the labels stop being words. Out is not the answer to a picture
-    // this big; going into it is, which is what the community list is for.
+    // Out is not the answer to a picture this big; going into it is, which is
+    // what the community list is for. NOT a legibility floor, though it was
+    // written as one: `unreadableAt` below shows the labels stop reading two
+    // steps above this, so the clamp and the legibility bound are different
+    // numbers and this one is only the clamp.
     expect(fitZoom(100_000, ASSUMED_ROOM)).toBe(ZOOM_STEPS[0]);
   });
 
@@ -70,5 +84,40 @@ describe("how wide the matrix wants to be", () => {
 
   it("grows with the longest name, because the labels are the left of the table", () => {
     expect(matrixWidth(30, 40)).toBeGreaterThan(matrixWidth(30, 8));
+  });
+});
+
+describe("what a drawing stops saying as it shrinks", () => {
+  it("says nothing is lost while the type still renders above the floor", () => {
+    expect(unreadableAt(1)).toEqual([]);
+    expect(unreadableAt(0.8)).toEqual([]);
+  });
+
+  it("names the loss at the step the real matrix actually opens at", () => {
+    // The regression this exists for, in the numbers that produce it: 64
+    // communities with a 17-character title want ~1,354px, the stage on a 1440
+    // desktop is 883px, and the largest step that fits is 0.5. At 0.5 the cell
+    // numbers are 6px. Nothing said so, and the picture went on looking like a
+    // complete answer.
+    const at = fitZoom(matrixWidth(64, 17), 883);
+    expect(at).toBe(0.5);
+    const lost = unreadableAt(at);
+    expect(lost).toHaveLength(1);
+    expect(lost[0]).toContain("6px");
+  });
+
+  it("draws the line between the steps rather than inside one", () => {
+    // Every step is either wholly readable or wholly not, so a reader pressing
+    // `+` crosses the boundary once and the note appears or goes for good.
+    const readable = ZOOM_STEPS.filter((step) => unreadableAt(step).length === 0);
+    expect(readable).toEqual([0.8, 1, 1.25, 1.5]);
+  });
+
+  it("keeps the message honest about the floor it is enforcing", () => {
+    // The floor and the type size are exported because the sentence quotes
+    // both; a change to either that did not reach the words would make the
+    // note say a number the code no longer uses.
+    expect(unreadableAt(0.25)[0]).toContain(`${LEGIBLE_TYPE}px`);
+    expect(unreadableAt(0.25)[0]).toContain(`${Math.round(SMALLEST_TYPE * 0.25)}px`);
   });
 });

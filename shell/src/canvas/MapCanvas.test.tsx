@@ -204,16 +204,79 @@ describe("MapCanvas theme utilities", () => {
   });
 
   it("the DSM draws both triangles on the neutral ladder and says which is heavier", () => {
+    // The weights are pinned because the contrast between them was measured, not picked:
+    // `/15` against the `/35` this held until 2026-09-19 is 1.93:1 in dark and 1.63:1 in
+    // light, under the 3:1 two graphical marks need to be told apart. `/55` is 3.51:1 and
+    // 2.95:1. Still one hue at two weights and still never a state tone — a back edge is
+    // coupling, not damage.
     expect(source).toContain('? "bg-text/15"');
-    expect(source).toContain('"bg-text/35"');
+    expect(source).toContain('"bg-text/55"');
     expect(source).not.toMatch(/bg-tone-danger/);
     draw(twoGroups.modules, twoGroups.imports);
     expect(screen.getByText(/heavier mark below/)).toBeTruthy();
   });
 
+  it("rules the diagonal, so above and below is a question about position", () => {
+    // What lets the weights above stay one hue. No pair of opacities on a single hue
+    // reaches 3:1 in the light theme, so colour cannot carry this distinction alone; a
+    // solid unbroken staircase can, and it still reads for somebody who separates no
+    // tones at all. `surface-sunken` is what it wore while it was scenery, and at the
+    // 50% this matrix opens at that made the faintest thing on the picture the one its
+    // whole geometry hangs off.
+    // The rule is full strength and the data marks are not, so the staircase cannot be
+    // mistaken for the heaviest cells in the picture.
+    expect(source).toMatch(/i === j\s*\?\s*"bg-text"/);
+    expect(source).not.toMatch(/i === j\s*\?\s*"bg-surface-sunken"/);
+  });
+
   it("a reversed arc is dashed and neutral, never red", () => {
     expect(source).toContain("stroke-border-strong");
     expect(source).not.toMatch(/stroke-danger\b/);
+  });
+});
+
+/* ------------------------------------- what the picture stops saying -- */
+
+/**
+ * Enough communities that the matrix cannot open at a size its own numbers can be read at.
+ *
+ * Disconnected pairs, because a pair is the smallest thing that is a community at all and
+ * separate pairs cannot be grouped into one by any arrangement. 70 of them puts the table
+ * at ~1,388px against the 1,040px column, so the largest step that fits is 0.67 and
+ * `text-xs` lands at 8px. The real project reaches the same place with 64 communities and
+ * longer names.
+ */
+const manyGroups = {
+  modules: Array.from({ length: 70 }, (_, i) => [
+    mod(`core/src/g${String(i).padStart(2, "0")}a.rs`),
+    mod(`core/src/g${String(i).padStart(2, "0")}b.rs`),
+  ]).flat(),
+  imports: Array.from({ length: 70 }, (_, i) =>
+    link(`core/src/g${String(i).padStart(2, "0")}a.rs`, `core/src/g${String(i).padStart(2, "0")}b.rs`),
+  ),
+};
+
+describe("a matrix too small to be read whole", () => {
+  it("says which reading survived, and does not take the picture away to say it", () => {
+    draw(manyGroups.modules, manyGroups.imports);
+
+    // The new half: it names the reading that is gone, in the pixels that decided it,
+    // and points at the ways out.
+    expect(screen.getByText(/At this size only the shape reads/)).toBeTruthy();
+    expect(screen.getByText(/8px/)).toBeTruthy();
+    expect(screen.getByText(/Stand closer, go full screen, or open a community/)).toBeTruthy();
+
+    // And the old half untouched: this is not a refusal, the table is still on the page,
+    // and the shape is still there to be read. Refusing the whole picture to protect the
+    // half that broke would throw away the half that works.
+    expect(screen.queryByText(/does not draw/)).toBeNull();
+    expect(screen.getAllByRole("table").length).toBeGreaterThan(0);
+  });
+
+  it("stays quiet about a matrix that fits at a size its numbers can be read at", () => {
+    // Two communities open at 100%, where nothing is lost and a warning would be noise.
+    draw(twoGroups.modules, twoGroups.imports);
+    expect(screen.queryByText(/At this size only the shape reads/)).toBeNull();
   });
 });
 

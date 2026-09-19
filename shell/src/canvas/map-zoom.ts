@@ -47,10 +47,16 @@ export const ASSUMED_ROOM = 1040;
  *
  * Never larger than 1: a small drawing blown up to fill the frame is a bigger
  * lie than one that leaves space, because it makes eleven boxes look like the
- * size of a project. And never smaller than the smallest step — past that the
- * labels stop being legible, and a picture nobody can read is the thing this
- * whole map refuses to draw. Below it, out is not the answer; the drawing has
- * to be entered instead.
+ * size of a project. And never smaller than the smallest step, because below
+ * that standing further out stops being an answer at all; the drawing has to
+ * be entered instead.
+ *
+ * **The clamp is silent, and that was the hole.** This used to say the floor
+ * was also where legibility ended — that at the steps above it the labels
+ * still read. They do not: `text-xs` is 12px, so the third step renders it at
+ * 6px, and 6px is what the 64-community matrix opens at on a 1440 desktop.
+ * That claim was never measured and nothing checked it. {@link unreadableAt}
+ * is the check, and it answers about the step this returns.
  */
 export function fitZoom(natural: number, room: number): number {
   if (natural <= 0 || room <= 0) return NO_ZOOM;
@@ -93,4 +99,54 @@ export function zoomLabel(zoom: number): string {
  */
 export function matrixWidth(columns: number, longestTitle: number): number {
   return columns * 19 + longestTitle * 6.1 + 34;
+}
+
+/**
+ * The type a drawing's smallest labels are set in: Tailwind's `text-xs`.
+ *
+ * The matrix sets three things in it — the cell numbers, the row rail and the
+ * rotated column rail — so one number covers everything a reader has to read
+ * off that picture.
+ */
+export const SMALLEST_TYPE = 12;
+
+/**
+ * Rendered pixels below which a digit stops being a digit.
+ *
+ * A floor taken from the common bound on legible interface type rather than
+ * measured here, and said out loud for that reason. What IS measured is the
+ * case it was written for: the matrix of 64 communities is 1,354px wide, the
+ * stage on a 1440 desktop is 883px, so {@link fitZoom} opens it at `0.5` and
+ * sets every number in it at 6px. Against the steps it lands in a clean place
+ * — `0.8` and up read, `0.67` and below do not.
+ */
+export const LEGIBLE_TYPE = 9;
+
+/**
+ * What a drawing stops saying at this zoom, in the reader's words. Empty means
+ * it still says everything.
+ *
+ * **Deliberately not a refusal, which is what separates it from
+ * `reasonsNotToDraw`.** That one judges a layered graph, whose failure is
+ * crossings: an unreadable one is unreadable at every size, so the honest
+ * answer is not to draw it at all. A matrix fails the other way. It carries two
+ * readings on one picture — the shape, which is where the marks fall either
+ * side of the diagonal, and the detail, which is the numbers inside them — and
+ * shrinking takes the second while leaving the first. Refusing the whole
+ * picture to protect the half that broke would throw away the half that works,
+ * and the shape is the reading the matrix was chosen over a node-link drawing
+ * to give in the first place.
+ *
+ * So this names what is gone rather than hiding what is left. The principle
+ * around it is unchanged and is why it exists: a picture nobody can read is
+ * worse than a sentence saying why, because the picture still looks like an
+ * answer. A picture read for more than it is still offering is the same fault
+ * one step quieter, and it had nothing watching for it.
+ */
+export function unreadableAt(zoom: number): string[] {
+  const type = SMALLEST_TYPE * zoom;
+  if (type >= LEGIBLE_TYPE) return [];
+  return [
+    `numbers and labels set at ${Math.round(type)}px, under the ${LEGIBLE_TYPE}px this reader can still make out`,
+  ];
 }
