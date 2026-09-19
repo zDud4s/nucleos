@@ -188,6 +188,11 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     shadow_run_completed: { tone: "shadow", label: "shadow run completed" },
     worktree_run_completed: { tone: "info", label: "worktree run completed" },
     token_efficiency: { tone: "info", label: "efficiency observation" },
+    // A provider's usage window crossed one of the owner's thresholds (`core/src/quota.rs`, design
+    // D11). Held Ember and not Stated Blue: unlike a slot, this one waits on a hand — the reader
+    // decides whether to spend the rest of the window, and nothing here frees itself before the
+    // reset. The same argument budget makes in `wait_reason`, and this is the same kind of ceiling.
+    quota_warning: { tone: "paused", label: "quota threshold crossed" },
     // Worktrees.
     worktree_gate_failed: { tone: "danger", label: "worktree gate failed" },
     worktree_provision_failed: { tone: "danger", label: "worktree could not be made" },

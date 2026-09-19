@@ -12,9 +12,11 @@
 //! `web.rs`. And it holds no provider credential — see design D2, whose whole point is that the
 //! token stays inside the sidecar.
 //!
-//! **Phase 1 draws; it does not act.** Warnings (D11) and the brake (phase 4) are separate phases on
-//! purpose, so the first thing that ships can be watched for a while before anything is allowed to
-//! stop the owner's work on its word.
+//! **This module draws and it speaks; it does not act.** Phase 3 added the warning (D11) — a feed
+//! line when a measured window crosses one of the owner's thresholds — and the brake is still
+//! phase 4's. The order is the point: a threshold gets to interrupt the owner long before it gets
+//! to stop their work, so the numbers can be watched being wrong at the cost of a ping rather than
+//! at the cost of a night's autonomous work.
 
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -44,6 +46,30 @@ const UNMEASURED: &str = QUOTA_STATES[4];
 /// watched the fixed one for a while and can say what it should have been.
 const WARN_AT: f64 = 0.75;
 const EXHAUSTED_AT: f64 = 0.95;
+
+/// Where the owner gets told, in per cent (`warn_at_percent`, design D9's default).
+///
+/// A constant here, and a row of the `QuotaPolicy` table in phase 4 — the order the module doc
+/// above already committed to, and the order D9 itself implies by making this a setting of a policy
+/// whose migration belongs to the brake. A settings page for a threshold nobody has yet watched
+/// fire is a page built before its question is known.
+///
+/// Separate from [`WARN_AT`] and [`EXHAUSTED_AT`] on purpose, and this is the one thing about this
+/// pair worth reading twice: those two colour a ring that somebody is looking at, so they may be
+/// generous; these two interrupt somebody who is not, so they are not the same numbers and must not
+/// become one set by tidying. 100 is a threshold and not a rounding artefact — the window is spent,
+/// which is precisely when a person far from the screen wants to hear about it.
+///
+/// Ascending, and [`crossed_threshold`] relies on it.
+const WARN_AT_PERCENT: [i64; 2] = [80, 100];
+
+/// The feed kind of a quota warning.
+///
+/// Named here, above the `#[cfg(test)]` cut and in the file that emits it, because
+/// `shell/src/ui/state-map-completeness.test.ts` rebuilds the map of kinds per file: it reads
+/// `const NAME: &str = "…"` beside the `append` that uses it, and a kind whose spelling lives in
+/// another module lands in that test's `unresolved` list instead of being checked at all.
+const FEED_KIND: &str = "quota_warning";
 
 /// How much the number is worth, and therefore what a later phase may do with it (design D3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -212,6 +238,20 @@ pub async fn report(
             if let Err(error) = record(pool, &providers, now).await {
                 tracing::warn!(%error, "the quota reading could not be stored");
             }
+            // Judged here, on the live path only, because this is the one place a NEW reading
+            // arrives — every caller of this module comes through it, so a warning cannot be
+            // skipped by a future second caller forgetting to ask for one.
+            //
+            // The stored fallback deliberately does not warn: those figures were already judged
+            // when they were read, and re-judging them would warn about a window that may well
+            // have rolled over while the sidecar was down.
+            //
+            // Best-effort, exactly like the write above: a warning that cannot be recorded must not
+            // cost the reader the figure already in hand. `observe_run` is called the same way, for
+            // the same reason.
+            if let Err(error) = warn(pool, &providers, now).await {
+                tracing::warn!(%error, "the quota warning was not delivered");
+            }
             QuotaReport {
                 providers,
                 source: Source::Sidecar,
@@ -365,6 +405,206 @@ pub async fn stored(pool: &SqlitePool) -> Result<Vec<Provider>, sqlx::Error> {
         }
     }
     Ok(providers)
+}
+
+/// PURE: the highest threshold this figure has crossed and nobody has announced yet.
+///
+/// `already_announced` is the highest threshold already said FOR THIS WINDOW INSTANCE — not for
+/// this window — which is what lets the same 80% be news again after the window rolls over.
+///
+/// The highest and not the lowest: a reading that jumps straight from 40% to 100% (a council
+/// firing three seats at once is exactly that shape) should say the true thing once, not walk the
+/// ladder with a ping per rung.
+fn crossed_threshold(used_fraction: f64, already_announced: Option<i64>) -> Option<i64> {
+    let used_percent = used_fraction * 100.0;
+    WARN_AT_PERCENT.iter().rev().copied().find(|threshold| {
+        used_percent >= *threshold as f64 && already_announced.is_none_or(|said| *threshold > said)
+    })
+}
+
+/// PURE: whether this reading describes a period that has already ended.
+///
+/// **The reset instant decides, and the stored flag is only the second opinion.** `stale` is fixed
+/// at the moment the reading is taken and is not recomputed when the reset passes, so a figure read
+/// at 16:39 is still flagged fresh at 17:00 although its window is gone. Warning from it would tell
+/// the owner that a window is spent when it has in fact reopened — the exact failure the fidelity
+/// ladder exists to prevent, arriving through the one field that looked trustworthy.
+///
+/// No reset instant is not evidence of age: the capture of 2026-09-19 carried a populated window
+/// with `resets_at: null`, and such a window falls back on the flag.
+fn is_outdated(window: &Window, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if window.stale {
+        return true;
+    }
+    window
+        .resets_at
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|resets_at| resets_at.with_timezone(&chrono::Utc) < now)
+}
+
+/// What the owner reads on their phone.
+///
+/// Names the quota in the first word, because design D9 obligation (a) is that a line from this
+/// module must never be mistaken for one from `budget.rs`: the residual question is not *why did
+/// work continue*, it is *which of the two ceilings let it*.
+///
+/// Carries the measured figure as well as the threshold. "you passed 80%" is a claim the reader
+/// cannot check; "you passed 80% — 82% of it is gone" is one they can, and the difference between
+/// the two numbers is how far past the line the reading already was when it arrived.
+fn summarise(provider: &str, window: &Window, threshold: i64) -> String {
+    let measured = (window.used_fraction * 100.0).floor() as i64;
+    let reset = match window.resets_at.as_deref() {
+        Some(at) => format!(", and it resets at {at}"),
+        // Said rather than left out. A window whose reset nobody reported is one the owner cannot
+        // wait out by a clock, and silence here would read as "resets imminently".
+        None => ", and no reset instant came with it".to_string(),
+    };
+    format!(
+        "quota: {provider}'s {} window has passed {threshold}% — {measured}% of it is gone{reset}",
+        window.window
+    )
+}
+
+/// The claim one provider window holds, read before it is contended for.
+struct Claim {
+    resets_at: Option<String>,
+    alerted_percent: i64,
+}
+
+async fn read_claim(
+    pool: &SqlitePool,
+    provider: &str,
+    window_name: &str,
+) -> Result<Option<Claim>, sqlx::Error> {
+    let row: Option<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT window_resets_at, alerted_percent FROM quota_warnings
+          WHERE provider = ? AND window_name = ?",
+    )
+    .bind(provider)
+    .bind(window_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(resets_at, alerted_percent)| Claim {
+        resets_at,
+        alerted_percent,
+    }))
+}
+
+/// Claims the right to say this, guarded on the row the caller read. `true` means speak.
+///
+/// One statement, and a compare-and-swap rather than a read followed by a write: the notch polls,
+/// and two readings landing in the same instant both see the same row, both compute the same
+/// crossing, and both would write the feed line whose whole purpose is to be one. The same shape
+/// `token_efficiency.rs` uses on `last_alerted_at`, and `runs.rs` on a run's terminal write.
+///
+/// `IS` and not `=` throughout, because both guarded values are nullable and `= NULL` matches
+/// nothing. `previous: None` binds NULL against a column declared `NOT NULL`, which by construction
+/// matches no row — so a caller that read no row loses to whoever inserted one in the meantime,
+/// which is the outcome wanted.
+async fn claim_the_right_to_warn(
+    pool: &SqlitePool,
+    provider: &str,
+    window_name: &str,
+    previous: Option<&Claim>,
+    threshold: i64,
+    resets_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, sqlx::Error> {
+    let affected = sqlx::query(
+        "INSERT INTO quota_warnings
+             (provider, window_name, window_resets_at, alerted_percent, last_alerted_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (provider, window_name) DO UPDATE SET
+             window_resets_at = excluded.window_resets_at,
+             alerted_percent  = excluded.alerted_percent,
+             last_alerted_at  = excluded.last_alerted_at
+          WHERE quota_warnings.alerted_percent IS ?
+            AND quota_warnings.window_resets_at IS ?",
+    )
+    .bind(provider)
+    .bind(window_name)
+    .bind(resets_at)
+    .bind(threshold)
+    .bind(now.to_rfc3339())
+    .bind(previous.map(|claim| claim.alerted_percent))
+    .bind(previous.and_then(|claim| claim.resets_at.as_deref()))
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+/// Warn about every measured window that has just crossed a threshold. Returns how many lines went
+/// out, which is what the tests assert and what a caller may log.
+///
+/// **Only measured and only current readings warn — it fails open, in the direction of silence**
+/// (design D3/D9/G4). Unmeasured carries no number; outdated carries one about a period that has
+/// ended. Both are the same mistake seen twice: a warning is an interruption, and interrupting
+/// somebody with a figure that was never true costs more than the warning was worth. The brake in
+/// phase 4 reads the same two guards for a heavier reason.
+pub async fn warn(
+    pool: &SqlitePool,
+    providers: &[Provider],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<usize, sqlx::Error> {
+    let mut spoken = 0;
+    for provider in providers {
+        if provider.fidelity == Fidelity::Unmeasured {
+            continue;
+        }
+        for window in &provider.windows {
+            if is_outdated(window, now) {
+                continue;
+            }
+            let previous = read_claim(pool, &provider.provider, &window.window).await?;
+            // A claim belongs to the window instance it was written for. Once a reading arrives
+            // with a different reset, the thresholds are armed again — see the column's own note.
+            let already = previous
+                .as_ref()
+                .filter(|claim| claim.resets_at.as_deref() == window.resets_at.as_deref())
+                .map(|claim| claim.alerted_percent);
+            let Some(threshold) = crossed_threshold(window.used_fraction, already) else {
+                continue;
+            };
+            if !claim_the_right_to_warn(
+                pool,
+                &provider.provider,
+                &window.window,
+                previous.as_ref(),
+                threshold,
+                window.resets_at.as_deref(),
+                now,
+            )
+            .await?
+            {
+                continue;
+            }
+
+            // Straight to the feed, NOT through `notify::deliver_or_defer`'s waiting room.
+            //
+            // The waiting room holds a notification until the calendar says the person is free,
+            // which is right for an efficiency observation and wrong for this: a window that is
+            // 100% gone stops being worth saying the moment it resets, so a warning held through a
+            // two-hour meeting either arrives about a limit that has since reopened or arrives
+            // while the run it was meant to save has already died. This is a ceiling, like the kill
+            // switch and the budget, and those are immediate by the same argument.
+            //
+            // Global scope: a quota is the machine's, not a project's — the burn came from every
+            // project at once, so filing it under one would hide it from the others.
+            crate::feed::append(
+                pool,
+                None,
+                FEED_KIND,
+                &summarise(&provider.provider, window, threshold),
+                None,
+                None,
+            )
+            .await?;
+            spoken += 1;
+        }
+    }
+    Ok(spoken)
 }
 
 #[cfg(test)]
@@ -547,6 +787,233 @@ mod tests {
             report.unreachable.is_some(),
             "an unanswered question must not look like an empty quota"
         );
+    }
+
+    // ---- The warning (design D11) ----
+
+    /// Well before the reset instant the helpers above carry, so a reading is fresh unless a test
+    /// says otherwise.
+    fn noon() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-19T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    async fn feed_kinds(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT kind FROM feed ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn lines(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT summary FROM feed ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The thresholds, at their edges.
+    #[test]
+    fn a_threshold_is_crossed_at_it_and_not_before_it() {
+        assert_eq!(crossed_threshold(0.79, None), None);
+        assert_eq!(crossed_threshold(0.80, None), Some(80));
+        assert_eq!(crossed_threshold(0.99, None), Some(80));
+        assert_eq!(crossed_threshold(1.0, None), Some(100));
+    }
+
+    /// The highest crossing is the one worth saying, and a threshold already said is not repeated.
+    #[test]
+    fn only_a_threshold_not_yet_announced_is_announced() {
+        assert_eq!(crossed_threshold(0.85, Some(80)), None);
+        assert_eq!(crossed_threshold(1.0, Some(80)), Some(100));
+        assert_eq!(crossed_threshold(1.0, Some(100)), None);
+    }
+
+    #[tokio::test]
+    async fn a_measured_window_over_the_threshold_writes_one_feed_line() {
+        let pool = pool().await;
+
+        assert_eq!(warn(&pool, &measured(0.82), noon()).await.unwrap(), 1);
+
+        assert_eq!(feed_kinds(&pool).await, vec![FEED_KIND]);
+        let summary = &lines(&pool).await[0];
+        assert!(
+            summary.contains("quota") && summary.contains("claude") && summary.contains("5h"),
+            "the line has to name the quota, the provider and the window: {summary}"
+        );
+    }
+
+    /// The same threshold of the same window says its piece once, however often it is read.
+    ///
+    /// The notch polls, so this path runs every minute for as long as the window stays over the
+    /// line. Without the claim, one burn past 80% would ping the owner's phone all afternoon.
+    #[tokio::test]
+    async fn the_same_threshold_of_the_same_window_warns_only_once() {
+        let pool = pool().await;
+
+        warn(&pool, &measured(0.82), noon()).await.unwrap();
+        let again = warn(&pool, &measured(0.91), noon()).await.unwrap();
+
+        assert_eq!(again, 0, "the same threshold spoke twice");
+        assert_eq!(feed_kinds(&pool).await.len(), 1);
+    }
+
+    /// Crossing the next threshold is news, even though the window has already spoken once.
+    #[tokio::test]
+    async fn a_higher_threshold_is_worth_a_second_line() {
+        let pool = pool().await;
+
+        warn(&pool, &measured(0.82), noon()).await.unwrap();
+        assert_eq!(warn(&pool, &measured(1.0), noon()).await.unwrap(), 1);
+        assert_eq!(warn(&pool, &measured(1.0), noon()).await.unwrap(), 0);
+
+        assert_eq!(feed_kinds(&pool).await.len(), 2);
+    }
+
+    /// Once the window rolls over, its thresholds are armed again.
+    ///
+    /// The window instance is identified by the reset instant the reading carries, not by a timer
+    /// here: a fresh reading with a later reset IS the next window, and that is the only fact this
+    /// module has that says so.
+    #[tokio::test]
+    async fn the_same_threshold_warns_again_once_the_window_has_reset() {
+        let pool = pool().await;
+        warn(&pool, &measured(0.82), noon()).await.unwrap();
+
+        let mut next = measured(0.83);
+        next[0].windows[0].resets_at = Some("2026-09-19T21:40:00+00:00".into());
+        let spoken = warn(&pool, &next, noon()).await.unwrap();
+
+        assert_eq!(
+            spoken, 1,
+            "a brand new window was still holding the old claim"
+        );
+        assert_eq!(feed_kinds(&pool).await.len(), 2);
+    }
+
+    /// Two readings landing in the same instant produce one line, not two.
+    ///
+    /// Asserted at the claim rather than by racing two tasks, because the race is what has to be
+    /// impossible: both callers read the same row, and the second one's compare-and-swap has to
+    /// match nothing. `token_efficiency.rs` guards `last_alerted_at` the same way, for the same
+    /// reason — a feed row IS a notification, so two winners are two pings.
+    #[tokio::test]
+    async fn two_readings_in_the_same_instant_leave_only_one_winner() {
+        let pool = pool().await;
+        let reset = Some("2026-09-19T16:40:00+00:00");
+
+        let first = claim_the_right_to_warn(&pool, "claude", "5h", None, 80, reset, noon())
+            .await
+            .unwrap();
+        // The same `None`: the second reader saw no row either, because it read before the first
+        // one wrote.
+        let second = claim_the_right_to_warn(&pool, "claude", "5h", None, 80, reset, noon())
+            .await
+            .unwrap();
+
+        assert!(first, "the first claim must win");
+        assert!(!second, "a claim guarded on a row that has moved must lose");
+    }
+
+    /// Fidelity first (design D3/G4): a reading nobody measured has no number to warn about.
+    #[tokio::test]
+    async fn an_unmeasured_reading_never_warns_however_high_the_number_beside_it() {
+        let pool = pool().await;
+
+        let providers = vec![Provider {
+            provider: "claude".into(),
+            fidelity: Fidelity::Unmeasured,
+            read_at: "2026-09-19T12:00:00+00:00".into(),
+            windows: vec![window(1.0, false)],
+            detail: "it expired 2m ago — sign in again in Claude Code".into(),
+            severity: String::new(),
+        }];
+
+        assert_eq!(warn(&pool, &providers, noon()).await.unwrap(), 0);
+        assert!(feed_kinds(&pool).await.is_empty());
+    }
+
+    /// A reading the sidecar itself called stale describes a period that has ended.
+    #[tokio::test]
+    async fn a_reading_marked_stale_never_warns() {
+        let pool = pool().await;
+        let mut providers = measured(0.99);
+        providers[0].windows[0].stale = true;
+
+        assert_eq!(warn(&pool, &providers, noon()).await.unwrap(), 0);
+        assert!(feed_kinds(&pool).await.is_empty());
+    }
+
+    /// **Outdated is decided here, from the reset instant, and not only from the stored flag.**
+    ///
+    /// The flag is fixed at the moment of the reading and is not recomputed when the reset passes
+    /// (a known defect of phase 1, being fixed elsewhere). A warning that trusted the flag alone
+    /// would shout about a window that has since rolled over — and it would do it from a stored
+    /// reading, hours after the figure stopped being true. So this module asks the only question
+    /// that cannot go stale: has the reset instant passed?
+    #[tokio::test]
+    async fn a_window_whose_reset_has_passed_never_warns_whatever_the_flag_says() {
+        let pool = pool().await;
+        // `stale: false`, and the reset instant is in the past: exactly the shape the phase 1
+        // defect produces.
+        let providers = measured(0.99);
+        let after_the_reset = chrono::DateTime::parse_from_rfc3339("2026-09-19T17:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(warn(&pool, &providers, after_the_reset).await.unwrap(), 0);
+        assert!(
+            feed_kinds(&pool).await.is_empty(),
+            "a window past its reset warned because a flag said it was fresh"
+        );
+    }
+
+    /// A window with no reset at all is measured and warnable — the 2026-09-19 capture carried
+    /// one. Absence of a reset is not evidence that the reading is old.
+    #[tokio::test]
+    async fn a_window_without_a_reset_instant_still_warns() {
+        let pool = pool().await;
+        let mut providers = measured(0.82);
+        providers[0].windows[0].resets_at = None;
+
+        assert_eq!(warn(&pool, &providers, noon()).await.unwrap(), 1);
+    }
+
+    /// The line the owner reads has to say which brake is talking (design D9, obligation (a)):
+    /// budget and quota are two different ceilings, and "why did this stop" is unanswerable if the
+    /// two sound alike.
+    #[tokio::test]
+    async fn the_line_names_the_quota_and_the_figure_behind_it() {
+        let pool = pool().await;
+        warn(&pool, &measured(0.82), noon()).await.unwrap();
+
+        let summary = lines(&pool).await.remove(0);
+        assert!(
+            summary.contains("82%"),
+            "the measured figure is missing: {summary}"
+        );
+        assert!(
+            summary.contains("80%"),
+            "the threshold crossed is missing: {summary}"
+        );
+        assert!(
+            !summary.contains("budget"),
+            "a quota line must not read as a budget line"
+        );
+    }
+
+    /// The warning rides on the live path and nothing else. A stored reading is an old figure being
+    /// redrawn, and warning from it would ping the owner about a window that may have rolled over
+    /// while the sidecar was down.
+    #[tokio::test]
+    async fn a_stored_fallback_report_writes_no_warning() {
+        let pool = pool().await;
+        record(&pool, &measured(0.99), noon()).await.unwrap();
+
+        report(&QuotaRuntime::disabled(), &pool, noon()).await;
+
+        assert!(feed_kinds(&pool).await.is_empty());
     }
 
     /// The fallback is only worth having if it actually carries the figures across.
