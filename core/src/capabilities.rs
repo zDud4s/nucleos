@@ -746,8 +746,10 @@ pub fn model_fit(model_bytes: u64, memory_bytes: u64) -> Fit {
 /// rather than what is free right now, which is the right number for a menu: what is free changes
 /// every second and would make a model appear and disappear from the picker while somebody read it.
 ///
-/// `None` off Windows — this app ships for Windows and a stub that guessed would be worse than a
-/// caller that knows it does not know.
+/// On Unix the same number comes from `sysconf`: `_SC_PHYS_PAGES` times `_SC_PAGESIZE` is the
+/// installed RAM, byte for byte what the `total` column of `free -b` reports. `None` only on a
+/// target that is neither — and on any failure of the call — because a stub that guessed would be
+/// worse than a caller that knows it does not know.
 #[cfg(windows)]
 pub fn total_memory_bytes() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -762,7 +764,20 @@ pub fn total_memory_bytes() -> Option<u64> {
     (status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+pub fn total_memory_bytes() -> Option<u64> {
+    // SAFETY: `sysconf` reads a system constant and takes no pointers.
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    // SAFETY: same contract as above — a constant read, no pointers, no ownership.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    // `sysconf` answers -1 for a name it does not support, and 0 is as unreadable as that.
+    if pages <= 0 || page_size <= 0 {
+        return None;
+    }
+    (pages as u64).checked_mul(page_size as u64)
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn total_memory_bytes() -> Option<u64> {
     None
 }
@@ -2315,6 +2330,23 @@ mod tests {
         assert!(
             memory > 1_000_000_000 && memory < 100_000_000_000_000,
             "a plausible amount of RAM, got {memory}"
+        );
+    }
+
+    /// Off Windows too, because every machine has some physical memory.
+    ///
+    /// `#[cfg(unix)]` and deliberately NOT `#[ignore]`d, which is the whole difference from the
+    /// Windows sibling above: that one pins a RANGE, which is a fact about one host, while this
+    /// one pins only that an answer exists at all. Any machine that can run this suite has RAM,
+    /// so a `None` here is the platform gap — `total_memory_bytes` is implemented against the
+    /// Windows API alone — and never a property of the host the test ran on.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_machine_reports_its_memory() {
+        let memory = total_memory_bytes();
+        assert!(
+            matches!(memory, Some(bytes) if bytes > 0),
+            "a Unix machine has physical memory and must report some of it, got {memory:?}"
         );
     }
 
