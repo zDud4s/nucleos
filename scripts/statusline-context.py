@@ -18,7 +18,18 @@ excluded because it is not re-read next turn, and at 0.4% of the total it would
 not move the number anyway.
 
 Only the TAIL of the transcript is read. They reach hundreds of megabytes here,
-and this runs on every redraw.
+and this runs on every redraw. 256 KB covers the last turn in ordinary use --
+but not always, and the exception is silent. One record carrying a screenshot is
+megabytes of base64 on a single line and fills the window by itself, so no turn
+with a `usage` block falls inside it and the number simply vanishes from the
+status line. Measured 2026-09-18: it vanished immediately after a session read
+an image, which is to say immediately after the turn that most deserved a
+number. A missing number reads as "nothing to report" rather than as a failure,
+which is the expensive way to be wrong.
+
+So the window widens when a read finds no turn at all, up to MAX_SCAN. The
+ordinary case still costs exactly one 256 KB read; only the case that used to
+print nothing pays for more.
 
 Configure the ceiling with NUCLEOS_CONTEXT_CEILING (default 250000).
 
@@ -35,6 +46,11 @@ import sys
 
 DEFAULT_CEILING = 250_000
 TAIL_BYTES = 256 * 1024
+# How far back the widening is allowed to go before the number is given up on.
+# A transcript here reaches hundreds of megabytes and this runs on every redraw,
+# so the search has to stop somewhere; 16 MB is far past any honest turn and
+# still a few milliseconds to read.
+MAX_SCAN = 16 * 1024 * 1024
 
 # ANSI: dim for the ordinary case, yellow approaching the ceiling, red past it.
 DIM = "\033[2m"
@@ -54,24 +70,14 @@ def ceiling() -> int:
     return value if value > 0 else DEFAULT_CEILING
 
 
-def last_context(transcript_path: str):
-    """Context carried by the most recent assistant turn, or None.
+def context_in(tail: bytes):
+    """The newest assistant turn's context inside this slice, or None.
 
-    Scans backwards through the tail. Subagent turns (`isSidechain`) are skipped
-    -- they run in their own window, so their context is not what this session
-    is carrying, and counting one would make the number jump and then fall back
-    for no reason the user could see.
+    Subagent turns (`isSidechain`) are skipped -- they run in their own window,
+    so their context is not what this session is carrying, and counting one
+    would make the number jump and then fall back for no reason the user could
+    see.
     """
-    try:
-        size = os.path.getsize(transcript_path)
-        with open(transcript_path, "rb") as fh:
-            if size > TAIL_BYTES:
-                fh.seek(size - TAIL_BYTES)
-                fh.readline()  # discard the partial line the seek landed inside
-            tail = fh.read()
-    except OSError:
-        return None
-
     for raw in reversed(tail.splitlines()):
         if b'"usage"' not in raw:
             continue
@@ -88,6 +94,36 @@ def last_context(transcript_path: str):
                 + (usage.get("cache_read_input_tokens") or 0)
                 + (usage.get("cache_creation_input_tokens") or 0))
     return None
+
+
+def last_context(transcript_path: str):
+    """Context carried by the most recent assistant turn, or None.
+
+    Reads the tail, and widens the window when that finds no turn at all rather
+    than reporting nothing -- see the note on MAX_SCAN above. Widening is the
+    exception, so the cost of the ordinary redraw is unchanged.
+    """
+    try:
+        size = os.path.getsize(transcript_path)
+    except OSError:
+        return None
+
+    window = TAIL_BYTES
+    while True:
+        try:
+            with open(transcript_path, "rb") as fh:
+                if size > window:
+                    fh.seek(size - window)
+                    fh.readline()  # discard the partial line the seek landed inside
+                tail = fh.read()
+        except OSError:
+            return None
+        found = context_in(tail)
+        if found is not None:
+            return found
+        if window >= size or window >= MAX_SCAN:
+            return None
+        window = min(window * 8, MAX_SCAN)
 
 
 def main() -> int:

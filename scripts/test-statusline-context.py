@@ -15,9 +15,12 @@ Three properties, each of which was a decision rather than an accident:
   own lane   a subagent turn (``isSidechain``) is skipped. It runs in its own
              window; counting it would make the number jump and drop back for
              no reason a reader could see.
-  tail only  transcripts here reach hundreds of megabytes and this runs on every
-             redraw, so only the last 256 KB is read. The test writes padding
-             past that window and checks the old value beyond it is not found.
+  tail first transcripts here reach hundreds of megabytes and this runs on every
+             redraw, so the first read is the last 256 KB. It WIDENS when that
+             finds no turn at all -- one screenshot record fills the window on
+             its own and the number used to vanish, silently, right after the
+             turn that most deserved one -- and gives up past MAX_SCAN. The test
+             writes padding past the first window and checks all three.
 
 Run:  python scripts/test-statusline-context.py
 """
@@ -81,17 +84,29 @@ def cases(tmp):
     yield ("a missing transcript yields None",
            statusline.last_context(os.path.join(tmp, "absent.jsonl")), None)
 
-    # Only the tail is read: bury an old value under more than TAIL_BYTES of
-    # padding and it must not be the answer.
+    # The tail is read first, and an old value buried under more than
+    # TAIL_BYTES of padding must not beat the recent one.
     padding = json.dumps({"type": "padding", "blob": "x" * 4000})
     n = (statusline.TAIL_BYTES // len(padding)) + 40
     write(p, [turn(fresh=111111)] + [padding] * n + [turn(fresh=42)])
-    yield ("only the tail is read, and it finds the recent turn",
+    yield ("the first read finds the recent turn",
            statusline.last_context(p), 42)
 
+    # The regression, and the reason this widens at all: a screenshot arrives as
+    # one record of megabytes on one line, which fills the first window by
+    # itself. The old tail-only read printed nothing here -- no number, no
+    # error, right after the most expensive turn in the session.
     write(p, [turn(fresh=111111)] + [padding] * n)
-    yield ("a value buried beyond the tail window is not found",
-           statusline.last_context(p), None)
+    yield ("a turn past the first window is still found",
+           statusline.last_context(p), 111111)
+
+    # But bounded: past MAX_SCAN the number is given up rather than reading a
+    # 400 MB transcript on every redraw. Shrunk here so the file need not be.
+    was = (statusline.TAIL_BYTES, statusline.MAX_SCAN)
+    statusline.TAIL_BYTES, statusline.MAX_SCAN = 2048, 8192
+    write(p, [turn(fresh=111111)] + [padding] * n)
+    yield ("a turn past MAX_SCAN is given up on", statusline.last_context(p), None)
+    statusline.TAIL_BYTES, statusline.MAX_SCAN = was
 
     # Ceiling
     for raw, want, label in [(None, 250_000, "absent"), ("100000", 100_000, "valid"),
