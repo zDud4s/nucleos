@@ -103,7 +103,7 @@ fn validate_council(contents: &str) -> Result<(), String> {
 /// Parses, and then asks the one question parsing cannot: whether the local route this file
 /// describes is a route the daemon will actually build.
 ///
-/// All three of `local_engine`'s refusals deserialise perfectly -- `openai` with no address, an
+/// All three of `local_engine`'s refusals deserialise perfectly -- `openai_compatible` with no address, an
 /// engine name that is neither, an address on some other machine -- so a door that stopped at
 /// serde accepted the write, reported success, and left the daemon to refuse the same file on its
 /// next start. That is the failure the module header calls the one that looks most like success.
@@ -460,7 +460,7 @@ mod tests {
     /// The models door refuses a local engine the daemon would refuse at startup.
     ///
     /// `parse_models_config` alone answers only whether the YAML deserialises, and all three of
-    /// `local_engine`'s refusals deserialise perfectly: `openai` with no address, an engine name
+    /// `local_engine`'s refusals deserialise perfectly: `openai_compatible` with no address, an engine name
     /// that is neither, an address on some other machine. Without this the settings page accepts
     /// the write, reports success, and the daemon then refuses the same file on its next start —
     /// which is the failure the module header calls the one that looks most like success.
@@ -471,8 +471,8 @@ mod tests {
     /// engine, and that is not this machine" is a question the text answers by itself.
     #[test]
     fn the_models_door_refuses_a_local_engine_the_daemon_would_refuse_at_startup() {
-        let refused = validate_models(&models_file("local_engine: openai\n"))
-            .expect_err("`openai` with no address is refused");
+        let refused = validate_models(&models_file("local_engine: openai_compatible\n"))
+            .expect_err("`openai_compatible` with no address is refused");
         assert_eq!(
             refused,
             crate::config::LocalEngineRefusal::NoBaseUrl.message(),
@@ -485,7 +485,7 @@ mod tests {
         );
         assert!(
             validate_models(&models_file(
-                "local_engine: openai\nlocal_base_url: http://127.0.0.1.example.com/v1\n"
+                "local_engine: openai_compatible\nlocal_base_url: http://127.0.0.1.example.com/v1\n"
             ))
             .is_err(),
             "an address that only begins like the loopback is refused"

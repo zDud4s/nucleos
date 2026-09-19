@@ -60,7 +60,7 @@ mod mentions;
 mod notes;
 mod notify;
 mod notify_policy;
-mod openai;
+mod openai_compatible;
 mod ownership;
 mod pii_shadow;
 mod presets;
@@ -126,7 +126,7 @@ const EMAIL_PASSWORD_KEY: &str = "email-imap-password";
 const WEB_SEARCH_KEY: &str = "web-search-api-key";
 /// OpenRouter's own API key, in Credential Manager for the same reason every secret above is: it
 /// never sits in `.ai/models.yaml`, which only ever names the model (`hosted_assistant_model`) and
-/// is a versioned file. `openai::OpenAiChat::new` refuses outright when this comes back
+/// is a versioned file. `openai_compatible::OpenAiCompatibleChat::new` refuses outright when this comes back
 /// `None` — see its own doc comment for why that refusal happens before any request leaves the
 /// machine rather than after a 401 comes back.
 const OPENROUTER_KEY: &str = "openrouter-api-key";
@@ -1021,7 +1021,7 @@ async fn main() {
     // being reported disabled while the server the operator named answers perfectly — so both are
     // handed the same `ResolvedLocalEngine` and cannot disagree.
     //
-    // A refusal — an engine name this daemon does not serve, `openai` with no address, an address
+    // A refusal — an engine name this daemon does not serve, `openai_compatible` with no address, an address
     // off this machine — DISABLES the route rather than falling back to Ollama. That fallback is
     // the worst outcome available: the operator named a server, was told nothing, and their turns
     // went somewhere else. `local_model: None` is how this crate already says "route off" —

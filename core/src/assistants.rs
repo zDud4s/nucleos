@@ -249,7 +249,7 @@ pub struct ConfiguredAssistants {
     hosted_key: Option<String>,
     /// The loopback address of this daemon's own MCP server (e.g. `http://127.0.0.1:8791`), which
     /// `mcp_tools::LocalToolBox` calls back into to answer its own tools — unrelated to the
-    /// *model* endpoints `runner::OLLAMA_BASE_URL` and `openai::OPENROUTER_BASE_URL`, despite
+    /// *model* endpoints `runner::OLLAMA_BASE_URL` and `openai_compatible::OPENROUTER_BASE_URL`, despite
     /// the shared "base url" name those two carry.
     loopback_url: String,
     token: String,
@@ -292,7 +292,7 @@ pub struct ConfiguredAssistants {
     local_engine: crate::config::LocalEngine,
     /// The window `config::ModelsConfig::local_context_tokens` declared for that server, or `None`
     /// when nobody declared one - never a guess, never a zero. Its one reader is `declared_one`'s
-    /// OpenAI arm, as `capabilities::discover_openai`'s `declared` argument: an OpenAI-compatible
+    /// OpenAI arm, as `capabilities::discover_openai_compatible`'s `declared` argument: an OpenAI-compatible
     /// `GET /models` need not state a `context_length` for the model it serves, and this is the
     /// file's answer for when it does not.
     ///
@@ -301,12 +301,12 @@ pub struct ConfiguredAssistants {
     /// serving it would be a number nothing reads.
     local_declared_context_tokens: Option<usize>,
     /// Where `can_serve`/`declared_for` discover a HOSTED model's capabilities
-    /// (`capabilities::discover_openai`, against `{base}/models`) — NOT a constructor
+    /// (`capabilities::discover_openai_compatible`, against `{base}/models`) — NOT a constructor
     /// parameter like `local_base_url` above: adding one would grow `new`'s argument list, which
     /// would force an edit to every existing seven-argument call site (`main.rs`'s included, and
     /// the four `can_serve` tests this task's own RED phase already froze), none of which this fix
-    /// may touch. Defaults to `openai::OPENROUTER_BASE_URL` — the same constant
-    /// `assistant_for` already builds an `OpenAiChat` against — and `with_hosted_base_url`
+    /// may touch. Defaults to `openai_compatible::OPENROUTER_BASE_URL` — the same constant
+    /// `assistant_for` already builds an `OpenAiCompatibleChat` against — and `with_hosted_base_url`
     /// below is the test-only seam for pointing it at a stub instead.
     hosted_base_url: String,
     /// One probe per (route, model) pair, not per `can_serve`/`declared_for` call — the reason
@@ -359,7 +359,7 @@ impl ConfiguredAssistants {
                 .build()
                 .expect("HTTP client for the local model (check TLS and proxy environment)"),
             hosted_client: reqwest::Client::builder()
-                .timeout(crate::openai::OPENROUTER_EXCHANGE_TIMEOUT)
+                .timeout(crate::openai_compatible::OPENROUTER_EXCHANGE_TIMEOUT)
                 .build()
                 .expect("HTTP client for the hosted model (check TLS and proxy environment)"),
             local_model,
@@ -374,7 +374,7 @@ impl ConfiguredAssistants {
             // install that has never named an engine must keep the one this daemon always used.
             local_engine: crate::config::LocalEngine::Ollama,
             local_declared_context_tokens: None,
-            hosted_base_url: crate::openai::OPENROUTER_BASE_URL.to_string(),
+            hosted_base_url: crate::openai_compatible::OPENROUTER_BASE_URL.to_string(),
             discovery_cache: crate::capabilities::DiscoveryCache::new(),
             introspection_client: reqwest::Client::builder()
                 .timeout(CAPABILITY_PROBE_TIMEOUT)
@@ -429,7 +429,7 @@ impl ConfiguredAssistants {
 }
 
 /// `can_serve`/`declared_for`'s own timeout — see `introspection_client`'s field doc for why it is
-/// not `runner::OLLAMA_EXCHANGE_TIMEOUT`/`openai::OPENROUTER_EXCHANGE_TIMEOUT`. Matches
+/// not `runner::OLLAMA_EXCHANGE_TIMEOUT`/`openai_compatible::OPENROUTER_EXCHANGE_TIMEOUT`. Matches
 /// `http.rs`'s own `OLLAMA_TAGS_TIMEOUT` value for the same reasoning, kept as its own constant
 /// rather than imported from there: every timeout in this crate is declared beside the client that
 /// uses it (`OLLAMA_EXCHANGE_TIMEOUT` beside the local generation client, `OPENROUTER_EXCHANGE_TIMEOUT`
@@ -484,18 +484,20 @@ impl Assistants for ConfiguredAssistants {
                 self.local_base_url.clone(),
                 model.to_string(),
             )),
-            crate::config::LocalEngine::OpenAi => Box::new(crate::openai::OpenAiChat::with_client(
-                self.local_client.clone(),
-                self.local_base_url.clone(),
-                model.to_string(),
-                // `None`, always, on this route - the other half of the choice that made
-                // `with_client`'s key an `Option`, whose `Some(key)` case is the hosted arm of
-                // `assistant_for`. `config::ModelsConfig::local_engine` has already refused any
-                // address that is not this machine's, so what is dialled here is a loopback
-                // server, and a loopback server is sent no `Authorization` header at all rather
-                // than an empty or invented one.
-                None,
-            )),
+            crate::config::LocalEngine::OpenAiCompatible => {
+                Box::new(crate::openai_compatible::OpenAiCompatibleChat::with_client(
+                    self.local_client.clone(),
+                    self.local_base_url.clone(),
+                    model.to_string(),
+                    // `None`, always, on this route - the other half of the choice that made
+                    // `with_client`'s key an `Option`, whose `Some(key)` case is the hosted arm of
+                    // `assistant_for`. `config::ModelsConfig::local_engine` has already refused any
+                    // address that is not this machine's, so what is dialled here is a loopback
+                    // server, and a loopback server is sent no `Authorization` header at all rather
+                    // than an empty or invented one.
+                    None,
+                ))
+            }
         };
         Ok(chat)
     }
@@ -544,9 +546,9 @@ impl Assistants for ConfiguredAssistants {
                     .hosted_key
                     .clone()
                     .ok_or(Refusal::HostedModelNamedButNoKey)?;
-                let chat = crate::openai::OpenAiChat::with_client(
+                let chat = crate::openai_compatible::OpenAiCompatibleChat::with_client(
                     self.hosted_client.clone(),
-                    // The FIELD, not `openai::OPENROUTER_BASE_URL` directly. Behaviour-neutral
+                    // The FIELD, not `openai_compatible::OPENROUTER_BASE_URL` directly. Behaviour-neutral
                     // in production — the field is initialised to that same constant and only
                     // `with_hosted_base_url`, which is `#[cfg(test)]`, ever changes it — but it is
                     // what lets a test point this route at a stub and read which model actually
@@ -668,11 +670,11 @@ impl ConfiguredAssistants {
     /// `declared_for` used to send EVERY non-Cloud route through `discover_ollama_as` against the
     /// LOCAL Ollama, so asking about a hosted model asked the wrong service about a name it had
     /// never heard, failed closed, and refused (or unmarked) a model that may have served fine.
-    /// `Brain::Local` -> `capabilities::discover_ollama_as` or `capabilities::discover_openai`
+    /// `Brain::Local` -> `capabilities::discover_ollama_as` or `capabilities::discover_openai_compatible`
     /// against `self.local_base_url`, by `self.local_engine` - the same fact `assistant_for`'s own
     /// `Brain::Local` arm decides for a turn, so the menu cannot probe one server while the turn
     /// it approves goes to another;
-    /// `Brain::OpenRouter` -> `capabilities::discover_openai` against `self.hosted_base_url`;
+    /// `Brain::OpenRouter` -> `capabilities::discover_openai_compatible` against `self.hosted_base_url`;
     /// `Brain::Cloud` -> the CLI's own constant declaration, no network call, per
     /// `capabilities::declared_for_cli`'s own doc. Both network routes go over
     /// `self.introspection_client` — see its own field doc for why that is not
@@ -718,18 +720,18 @@ impl ConfiguredAssistants {
                             })
                             .await
                     }
-                    crate::config::LocalEngine::OpenAi => {
+                    crate::config::LocalEngine::OpenAiCompatible => {
                         // The declared window from the config file, and the one place it is read.
                         // Unlike the hosted arm below - where OpenRouter's catalogue always states
                         // its own `context_length`, so a fallback would never be reached - a
                         // llama.cpp or LM Studio `GET /models` often states no window at all, and
                         // `local_context_tokens` is how the operator answers for it. `None` when
-                        // they did not, which `discover_openai` reports as undeclared rather than
+                        // they did not, which `discover_openai_compatible` reports as undeclared rather than
                         // filling in with a guess.
                         let declared = self.local_declared_context_tokens;
                         self.discovery_cache
                             .get_or_discover(&key, move || async move {
-                                crate::capabilities::discover_openai(
+                                crate::capabilities::discover_openai_compatible(
                                     &client,
                                     &base_url,
                                     &owned_model,
@@ -748,7 +750,7 @@ impl ConfiguredAssistants {
                 let owned_model = model.to_string();
                 self.discovery_cache
                     .get_or_discover(&key, move || async move {
-                        crate::capabilities::discover_openai(
+                        crate::capabilities::discover_openai_compatible(
                             &client,
                             &base_url,
                             &owned_model,
@@ -1357,7 +1359,7 @@ mod tests {
     }
 
     /// A loopback OpenRouter catalogue, answering the same canned body every time over `GET
-    /// /models` — the route `capabilities::discover_openai` reads, the same idiom
+    /// /models` — the route `capabilities::discover_openai_compatible` reads, the same idiom
     /// `stub_show_counting` above uses for Ollama's own `POST /api/show`.
     async fn stub_models_counting(
         body: serde_json::Value,
@@ -1429,7 +1431,7 @@ mod tests {
     // --- F. which model actually goes on the wire ------------------------------------------------
 
     /// A loopback `/chat/completions` that KEEPS the request bodies it was sent, answering the one
-    /// shape `openai::assistant_message` reads. The hosted sibling of `stub_show_counting`
+    /// shape `openai_compatible::assistant_message` reads. The hosted sibling of `stub_show_counting`
     /// above: that one counts calls because the fact under test is how many, this one records them
     /// because the fact under test is what was asked.
     async fn stub_completions_recording() -> (
@@ -1467,7 +1469,7 @@ mod tests {
     /// hand-written entry could "name a model the daemon never built a client for, and then a
     /// person picks one model and a different one answers, silently". This is that failure, asked
     /// at the seam where it would happen — `resolve_model` returns `pinned.unwrap_or(configured)`
-    /// and `assistant_for` builds the `OpenAiChat` out of that, so the model on the wire is the
+    /// and `assistant_for` builds the `OpenAiCompatibleChat` out of that, so the model on the wire is the
     /// one that was picked and not the configured default.
     ///
     /// End-to-end through `verdict` — one exchange, no tools — rather than an assertion about
@@ -1571,7 +1573,7 @@ mod tests {
 
     /// The discovery half of `stub_both_local_dialects` above: one address answering BOTH
     /// capability routes — Ollama's `POST /api/show` and the OpenAI-compatible `GET /models`,
-    /// which is what `capabilities::discover_openai` actually requests — each with its own
+    /// which is what `capabilities::discover_openai_compatible` actually requests — each with its own
     /// counter, and co-hosted for the same reason that stub co-hosts its two.
     async fn stub_both_local_catalogues(
         catalogue: serde_json::Value,
@@ -1614,7 +1616,7 @@ mod tests {
         (format!("http://{address}"), show_hits, models_hits)
     }
 
-    /// Without this, `local_engine: openai` is a line in a config file that changes nothing at the
+    /// Without this, `local_engine: openai_compatible` is a line in a config file that changes nothing at the
     /// only moment it matters: `assistant_for`'s `Brain::Local` arm reads the CONSTANT
     /// `runner::OLLAMA_BASE_URL` and builds an `OllamaChat` whatever the operator wrote, so the
     /// turn is posted to an Ollama that may not even be installed while the llama.cpp or LM Studio
@@ -1625,7 +1627,8 @@ mod tests {
     /// a whole turn's worth of a model nobody chose, sent to a service this install may have
     /// deliberately stopped running.
     #[tokio::test]
-    async fn a_local_turn_reaches_the_configured_openai_server_and_never_the_ollama_wire() {
+    async fn a_local_turn_reaches_the_configured_openai_compatible_server_and_never_the_ollama_wire()
+     {
         let (base_url, ollama_hits, seen) = stub_both_local_dialects().await;
         let factory = ConfiguredAssistants::new(
             Some("qwen3-coder-30b".to_string()),
@@ -1636,7 +1639,7 @@ mod tests {
             test_pool().await,
             base_url,
         )
-        .with_local_engine(crate::config::LocalEngine::OpenAi, None);
+        .with_local_engine(crate::config::LocalEngine::OpenAiCompatible, None);
 
         let assistant = factory
             .assistant_for(Brain::Local, None)
@@ -1716,7 +1719,7 @@ mod tests {
     /// address as the catalogue, so a route that probed both would be caught here rather than
     /// passing on the strength of its second attempt.
     #[tokio::test]
-    async fn a_local_model_is_discovered_against_the_openai_models_route() {
+    async fn a_local_model_is_discovered_against_the_openai_compatible_models_route() {
         let (base_url, show_hits, models_hits) = stub_both_local_catalogues(serde_json::json!({
             "data": [{
                 "id": "qwen3-coder-30b",
@@ -1735,7 +1738,7 @@ mod tests {
             test_pool().await,
             base_url,
         )
-        .with_local_engine(crate::config::LocalEngine::OpenAi, Some(32_768));
+        .with_local_engine(crate::config::LocalEngine::OpenAiCompatible, Some(32_768));
 
         let _ = factory.can_serve(Brain::Local, "qwen3-coder-30b").await;
 
@@ -1754,7 +1757,7 @@ mod tests {
     }
 
     /// A refused engine must leave the local route OFF, not half on. `ModelsConfig::local_engine()`
-    /// refuses three ways — an engine name nobody serves, `openai` with no address, an address off
+    /// refuses three ways — an engine name nobody serves, `openai_compatible` with no address, an address off
     /// this machine — and `main.rs` answers each by building the factory with `local_model: None`,
     /// which is the route-off state this crate already has a vocabulary for.
     ///

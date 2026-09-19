@@ -33,8 +33,8 @@ pub struct ModelsConfig {
     /// change nothing at all until somebody asks for it by name.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub local_assistant_model: Option<String>,
-    /// Which model a hosted chat turn is sent to over OpenRouter — `openai.rs`'s
-    /// `OpenAiChat`, the second `LocalChat` implementation beside `runner::OllamaChat`. Not the
+    /// Which model a hosted chat turn is sent to over OpenRouter — `openai_compatible.rs`'s
+    /// `OpenAiCompatibleChat`, the second `LocalChat` implementation beside `runner::OllamaChat`. Not the
     /// hosted route's alone: since `local_engine` below, the model `local_assistant_model` names
     /// is answered by one or the other of the same two, so what distinguishes this key is the
     /// endpoint and the key it needs, never which client it ends up holding.
@@ -44,10 +44,10 @@ pub struct ModelsConfig {
     /// `openrouter` is refused (`assistant::NO_HOSTED_MODEL`) rather than answered by the cloud CLI
     /// on the strength of this field never having been read. Naming a model here is what an
     /// operator does once they have also put a key in the OS credential store — this field alone
-    /// gets a conversation no further, since `OpenAiChat::new` still refuses without one.
+    /// gets a conversation no further, since `OpenAiCompatibleChat::new` still refuses without one.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub hosted_assistant_model: Option<String>,
-    /// Which local server answers a local turn: `ollama`, or `openai` for any OpenAI-compatible
+    /// Which local server answers a local turn: `ollama`, or `openai_compatible` for any OpenAI-compatible
     /// server running on this machine (llama.cpp, LM Studio, vLLM).
     ///
     /// Absent means `ollama`, which is the ship-dark posture `local_assistant_model` and
@@ -58,7 +58,7 @@ pub struct ModelsConfig {
     ///
     /// A name this daemon does not serve is REFUSED rather than fallen back to Ollama, and that is
     /// the one place this key parts from `primary_runner` above. There, falling back keeps the
-    /// proven path a typo was never trying to leave. Here, a mistyped `openai` would keep sending
+    /// proven path a typo was never trying to leave. Here, a mistyped `openai_compatible` would keep sending
     /// turns to the very server the operator wrote this line to stop using — and the silence about
     /// it, not the typo, is the failure.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
@@ -66,8 +66,8 @@ pub struct ModelsConfig {
     /// Where that server listens. Loopback only.
     ///
     /// Absent resolves to `runner::OLLAMA_BASE_URL` for the ollama engine — the address the runner
-    /// already uses, read from its constant so the two cannot drift — and is REFUSED for `openai`,
-    /// because no port may be guessed. An `openai` engine quietly resolved onto Ollama's own
+    /// already uses, read from its constant so the two cannot drift — and is REFUSED for `openai_compatible`,
+    /// because no port may be guessed. An `openai_compatible` engine quietly resolved onto Ollama's own
     /// `11434` would post a turn's contents — mail, a transcript, a repository — to whatever
     /// program happens to be listening there, under a file that named no address at all.
     ///
@@ -410,7 +410,7 @@ impl ModelsConfig {
             // refuses `RouteNotConfigured` whatever a pin says while it is absent. So a file that
             // lists local models with no route configured lists nothing the picker may offer.
             //
-            // A REFUSED engine -- unknown name, `openai` with no address, an address off this
+            // A REFUSED engine -- unknown name, `openai_compatible` with no address, an address off this
             // machine -- is the second, and dropping the rows is half the fix rather than an
             // extra: refusing only at `local_engine()` would leave the picker offering the models,
             // so the person picks one, the turn dies, and nothing on screen connects that to the
@@ -444,7 +444,7 @@ impl ModelsConfig {
                     // hand-written one "could name a model the daemon never built a client for, and
                     // then a person picks one model and a different one answers, silently". That was
                     // wrong about this code: `assistants::resolve_model` returns
-                    // `pinned.unwrap_or(configured)` and `assistant_for` builds the `OpenAiChat`
+                    // `pinned.unwrap_or(configured)` and `assistant_for` builds the `OpenAiCompatibleChat`
                     // out of that resolved name, so the client is built PER TURN from the pick. The
                     // model on the wire is the one that was picked --
                     // `assistants.rs`'s `a_pinned_hosted_model_beats_the_configured_one_on_the_hosted_route`
@@ -459,7 +459,7 @@ impl ModelsConfig {
                     // for this route rather than guessing one that might not exist for the model named.
                     efforts: Vec::new(),
                     // Not filtered by `active_runner()` and never spawned as either CLI:
-                    // `OpenAiChat` is reached over HTTP, so which agent CLI is installed has
+                    // `OpenAiCompatibleChat` is reached over HTTP, so which agent CLI is installed has
                     // nothing to do with whether this entry belongs on the menu.
                     runner: None,
                     // Unmarked here for the same reason the local entry above is: this function never
@@ -521,7 +521,7 @@ impl ModelsConfig {
         let engine = match self.local_engine.as_deref() {
             // Absent is today's engine, never a new default nobody chose.
             None | Some("ollama") => LocalEngine::Ollama,
-            Some("openai") => LocalEngine::OpenAi,
+            Some("openai_compatible") => LocalEngine::OpenAiCompatible,
             Some(other) => return Err(LocalEngineRefusal::UnknownEngine(other.to_string())),
         };
         let base_url = match (&self.local_base_url, engine) {
@@ -529,7 +529,7 @@ impl ModelsConfig {
             // Read from the runner's own constant, so the default address and the address the
             // runner posts to cannot drift apart without a test failing.
             (None, LocalEngine::Ollama) => crate::runner::OLLAMA_BASE_URL.to_string(),
-            (None, LocalEngine::OpenAi) => return Err(LocalEngineRefusal::NoBaseUrl),
+            (None, LocalEngine::OpenAiCompatible) => return Err(LocalEngineRefusal::NoBaseUrl),
         };
         if !is_loopback_url(&base_url) {
             // Carried verbatim rather than described: a refusal that paraphrases the address it
@@ -552,7 +552,7 @@ pub enum LocalEngine {
     Ollama,
     /// Any OpenAI-compatible server on this machine — llama.cpp, LM Studio, vLLM. Named for the
     /// wire protocol and not for the vendor: nothing about this route leaves the loopback.
-    OpenAi,
+    OpenAiCompatible,
 }
 
 /// A local route that may actually run: which server, at which address, with whatever window the
@@ -576,7 +576,7 @@ pub struct ResolvedLocalEngine {
 pub enum LocalEngineRefusal {
     /// `local_engine` names something neither engine answers to, carried verbatim.
     UnknownEngine(String),
-    /// `local_engine: openai` with no address — the one case where a default would be a guessed
+    /// `local_engine: openai_compatible` with no address — the one case where a default would be a guessed
     /// port rather than a remembered one.
     NoBaseUrl,
     /// The resolved address is somewhere other than this machine, carried verbatim so the message
@@ -598,10 +598,10 @@ impl LocalEngineRefusal {
         match self {
             Self::UnknownEngine(named) => format!(
                 "`local_engine: {named}` names no local engine this daemon serves; write `ollama` \
-                 or `openai` in {MODELS_CONFIG_PATH}, or remove the key to keep Ollama"
+                 or `openai_compatible` in {MODELS_CONFIG_PATH}, or remove the key to keep Ollama"
             ),
             Self::NoBaseUrl => format!(
-                "`local_engine: openai` needs a `local_base_url` in {MODELS_CONFIG_PATH}: no port \
+                "`local_engine: openai_compatible` needs a `local_base_url` in {MODELS_CONFIG_PATH}: no port \
                  is guessed here, because the only port worth guessing is Ollama's and a turn sent \
                  to it would reach whatever is listening there"
             ),
@@ -2588,7 +2588,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     /// else lets an operator hand-write an `assistant_choices` entry with `brain: "openrouter"`
     /// whose `id` names a different model than `hosted_assistant_model`: `chosen_brain` resolves
     /// the picked id through this same catalogue and gets `Brain::OpenRouter`, so the turn is
-    /// answered by the `OpenAiChat` `main.rs` built from `hosted_assistant_model` -- a
+    /// answered by the `OpenAiCompatibleChat` `main.rs` built from `hosted_assistant_model` -- a
     /// different model than the one the person picked, silently.
     #[test]
     fn the_catalogue_names_the_hosted_model_when_one_is_configured() {
@@ -2608,14 +2608,14 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
             1,
             "expected exactly one hosted entry: {catalogue:?}"
         );
-        // Same string as the model `main.rs` actually built the `OpenAiChat` with -- the two
+        // Same string as the model `main.rs` actually built the `OpenAiCompatibleChat` with -- the two
         // cannot come apart because there is only one place either of them is written.
         assert_eq!(hosted[0].id, "anthropic/claude-sonnet-4.5");
     }
 
     /// The `retain` a few lines up in `catalogue()` filters `cloud` entries by `active_runner()`
     /// because `sonnet` offered to a daemon running Codex is a turn that dies at spawn. A hosted
-    /// model has nothing to do with which agent CLI is installed -- `OpenAiChat` is reached
+    /// model has nothing to do with which agent CLI is installed -- `OpenAiCompatibleChat` is reached
     /// over HTTP, not spawned as either CLI -- so the hosted entry must survive that filter
     /// regardless of `primary_runner`. Pinned because someone reading the retain in isolation could
     /// reasonably "tidy" it into filtering every entry, hosted included.
@@ -2653,7 +2653,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     /// 1. A `brain: openrouter` row written into `assistant_choices` reaches the menu. The comment
     ///    that used to forbid this feared an entry naming "a model the daemon never built a client
     ///    for" -- but `assistants::resolve_model` returns `pinned.unwrap_or(configured)` and
-    ///    `assistant_for` builds the `OpenAiChat` from that resolved name, so the client is
+    ///    `assistant_for` builds the `OpenAiCompatibleChat` from that resolved name, so the client is
     ///    built PER TURN out of the pick. The fear does not describe this code;
     ///    `assistants.rs`'s `a_pinned_hosted_model_beats_the_configured_one_on_the_hosted_route`
     ///    is the proof at the seam where it would have happened.
@@ -3980,16 +3980,16 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
 
     /// A local route with no address is a route with nowhere to go, and the obvious repair is the
     /// one thing that must never happen: falling back to Ollama's port because it is the only
-    /// local port this daemon has ever known. `local_engine: openai` on `11434` would post a turn
+    /// local port this daemon has ever known. `local_engine: openai_compatible` on `11434` would post a turn
     /// -- mail, a transcript, a repository's contents -- to whatever program happens to be
     /// listening there, under a config file that named no address at all. Somebody who wrote the
     /// engine and forgot the URL has to be told so at the config, not left to infer it from a
     /// reply that came back from the wrong server.
     #[test]
-    fn a_local_openai_engine_with_no_base_url_is_refused_rather_than_guessing_a_port() {
+    fn a_local_openai_compatible_engine_with_no_base_url_is_refused_rather_than_guessing_a_port() {
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
-            local_engine: Some("openai".to_string()),
+            local_engine: Some("openai_compatible".to_string()),
             local_base_url: None,
             ..ModelsConfig::default()
         };
@@ -3997,7 +3997,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         match config.local_engine() {
             Err(LocalEngineRefusal::NoBaseUrl) => {}
             other => panic!(
-                "an openai engine with no address must be refused, never resolved onto Ollama's \
+                "an openai_compatible engine with no address must be refused, never resolved onto Ollama's \
                  own port: {other:?}"
             ),
         }
@@ -4025,7 +4025,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         let off_machine = "https://api.example.com/v1";
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
-            local_engine: Some("openai".to_string()),
+            local_engine: Some("openai_compatible".to_string()),
             local_base_url: Some(off_machine.to_string()),
             ..ModelsConfig::default()
         };
@@ -4142,7 +4142,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         };
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
-            local_engine: Some("openai".to_string()),
+            local_engine: Some("openai_compatible".to_string()),
             local_base_url: Some("http://127.0.0.1:1234/v1".to_string()),
             assistant_choices: vec![written_by_hand()],
             ..ModelsConfig::default()

@@ -1394,7 +1394,7 @@ pub(crate) const ROOTED_APPROVAL_DENY_REASON: &str = "this needs approving, and 
 ///
 /// **Not a detail of implementation.** `verdict` reaches `LocalChat::exchange`, and both clients
 /// underneath it hold a two-minute ceiling of their own — `runner::OLLAMA_EXCHANGE_TIMEOUT` and
-/// `openai::OPENROUTER_EXCHANGE_TIMEOUT`, both `from_secs(120)`. Reading "ten seconds" and
+/// `openai_compatible::OPENROUTER_EXCHANGE_TIMEOUT`, both `from_secs(120)`. Reading "ten seconds" and
 /// assuming the client enforces it leaves a detached task alive for up to two minutes, spending a
 /// whole exchange on a question that was answered, expired and taken down 110 seconds earlier.
 ///

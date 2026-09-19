@@ -1,6 +1,6 @@
 //! The núcleo↔**OpenAI-compatible chat** boundary.
 //!
-//! `OpenAiChat` is a second `crate::local_agent::LocalChat` implementation, beside
+//! `OpenAiCompatibleChat` is a second `crate::local_agent::LocalChat` implementation, beside
 //! `runner::OllamaChat`, so the same tool loop the local model uses can instead be pointed at any
 //! endpoint speaking OpenAI's `/chat/completions` — unlike Ollama's own `/api/chat` body. The
 //! dialect is what this module knows; the vendor is not. OpenRouter is one user of it, reached
@@ -42,7 +42,7 @@ pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// Credential Manager for the endpoint that needs it, and an `Authorization` header is a secret
 /// leaving the process whether or not the receiver ever reads it. `None` is that absence said
 /// outright, told apart from a caller inventing an empty string to mean the same thing.
-pub struct OpenAiChat {
+pub struct OpenAiCompatibleChat {
     client: reqwest::Client,
     base_url: String,
     model: String,
@@ -60,7 +60,7 @@ pub struct OpenAiChat {
 pub(crate) const OPENROUTER_EXCHANGE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(120);
 
-impl OpenAiChat {
+impl OpenAiCompatibleChat {
     /// Builds the client, or refuses.
     ///
     /// `key` arrives as `Option<String>` because the caller has already done the one read that
@@ -113,7 +113,7 @@ impl OpenAiChat {
     }
 
     /// Builds from a client the caller already owns, rather than one built fresh here — what
-    /// `assistants::ConfiguredAssistants` needs so every `OpenAiChat` it hands out shares the
+    /// `assistants::ConfiguredAssistants` needs so every `OpenAiCompatibleChat` it hands out shares the
     /// ONE `reqwest::Client` the hosted route was constructed with. `key` arrives as
     /// `Option<String>` and is taken at its word both ways. `Some` is the hosted route: the refusal
     /// `new`'s `key.ok_or_else` performs above has moved up into
@@ -176,7 +176,7 @@ fn assistant_message(response: &Value) -> std::io::Result<Value> {
 }
 
 #[async_trait]
-impl crate::local_agent::LocalChat for OpenAiChat {
+impl crate::local_agent::LocalChat for OpenAiCompatibleChat {
     async fn exchange(
         &self,
         messages: Vec<Value>,
@@ -326,7 +326,7 @@ mod tests {
     // could have said immediately.
     #[test]
     fn construction_without_a_key_is_refused_rather_than_producing_a_client_that_will_401_later() {
-        let result = OpenAiChat::new(
+        let result = OpenAiCompatibleChat::new(
             OPENROUTER_BASE_URL.to_string(),
             "anthropic/claude-sonnet-4.5".to_string(),
             None,
@@ -391,7 +391,7 @@ mod tests {
     async fn a_keyless_local_server_is_asked_with_no_authorization_header() {
         let (base_url, seen) = stub_completions_recording_headers().await;
 
-        let chat = OpenAiChat::with_client(
+        let chat = OpenAiCompatibleChat::with_client(
             reqwest::Client::new(),
             base_url,
             "qwen3:8b".to_string(),
@@ -433,7 +433,7 @@ mod tests {
     async fn the_hosted_route_still_carries_its_bearer_key() {
         let (base_url, seen) = stub_completions_recording_headers().await;
 
-        let chat = OpenAiChat::with_client(
+        let chat = OpenAiCompatibleChat::with_client(
             reqwest::Client::new(),
             base_url,
             "anthropic/claude-sonnet-4.5".to_string(),

@@ -252,7 +252,7 @@ pub fn picker_refusal(missing: &[MissingCapability]) -> Option<String> {
 /// `interpret_context_probe` already names `UnparseableResponse` — declares NOTHING: every boolean
 /// field comes back `false`, never guessed `true` from silence.
 ///
-/// Scoped to the non-test build, for the same reason `discover_openai` below is: every
+/// Scoped to the non-test build, for the same reason `discover_openai_compatible` below is: every
 /// production call site now goes through `discover_ollama_as` directly so it can pass its own
 /// probe label, which leaves this four-argument wrapper with no caller but its own tests —
 /// `a_descoberta_le_a_janela_de_uma_resposta_do_api_show` and its siblings below exercise it, and
@@ -325,16 +325,16 @@ pub async fn discover_ollama_as(
 ///
 /// `main.rs`'s local-assistant startup called `discover_ollama_as` against
 /// `runner::OLLAMA_BASE_URL` directly, which made the dialect a property of the CALL SITE rather
-/// than of the configuration. On a `local_engine: openai` install that probe posts `/api/show` to a
+/// than of the configuration. On a `local_engine: openai_compatible` install that probe posts `/api/show` to a
 /// llama.cpp or LM Studio server that has no such route, the reading fails closed exactly as this
 /// module's doc requires, `local_assistant_posture` answers `FellBackToCli`, and the local
 /// assistant is reported disabled on a machine whose server was answering all along. The engine is
 /// read from the file in exactly ONE place -- `config::ModelsConfig::local_engine` -- and this
 /// function is how that one reading reaches the probe.
 ///
-/// `role` is kept on BOTH arms even though it is inert on the OpenAi one. `discover_ollama_as`
+/// `role` is kept on BOTH arms even though it is inert on the OpenAiCompatible one. `discover_ollama_as`
 /// interpolates it into the `could not read the {probe} probe response` wording an operator
-/// actually reads, while `discover_openai` names no probe at all: its failures ride in
+/// actually reads, while `discover_openai_compatible` names no probe at all: its failures ride in
 /// `Declared.context` and are worded once, by `missing_capabilities`. Dropping it would mean the
 /// two arms take different arguments, and then every call site has to decide which dialect it is
 /// talking to in order to know what to pass -- which is precisely the shape that let a hardcoded
@@ -357,8 +357,8 @@ pub async fn discover_local_as(
         crate::config::LocalEngine::Ollama => {
             discover_ollama_as(client, base_url, model, required_tokens, role).await
         }
-        crate::config::LocalEngine::OpenAi => {
-            discover_openai(client, base_url, model, required_tokens, declared).await
+        crate::config::LocalEngine::OpenAiCompatible => {
+            discover_openai_compatible(client, base_url, model, required_tokens, declared).await
         }
     }
 }
@@ -398,7 +398,7 @@ fn string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
 /// tells a measured fact about a server apart from a number somebody wrote in a configuration file.
 /// A caller that cannot tell them apart reports the second as if it were the first — the same
 /// confusion this module refuses everywhere else by failing closed rather than guessing. Carrying
-/// the source is also what lets `discover_openai` below say, in one log line, which number an
+/// the source is also what lets `discover_openai_compatible` below say, in one log line, which number an
 /// operator is actually running under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextWindow {
@@ -410,7 +410,7 @@ pub enum ContextWindow {
 
 /// PURE: an OpenAI-compatible `/models` body + a possibly-declared window -> the window in force.
 ///
-/// Split out of `discover_openai` below for exactly the reason this module already splits
+/// Split out of `discover_openai_compatible` below for exactly the reason this module already splits
 /// `interpret_tags` from `discover_models` and `runner::interpret_context_probe` from
 /// `discover_ollama_as`: READING a body and FETCHING one are different jobs, and only the first is
 /// testable with no listener anywhere near it. Nothing here touches a socket.
@@ -475,7 +475,7 @@ pub fn resolve_context_window(
 
 /// PURE: the one entry in an OpenAI-compatible `/models` body whose `id` is this model.
 ///
-/// Shared by `resolve_context_window` above and `discover_openai` below rather than written twice:
+/// Shared by `resolve_context_window` above and `discover_openai_compatible` below rather than written twice:
 /// the window and the capability booleans are read off the SAME entry, and two copies of "find the
 /// model" is how one of them ends up matching on a different field than the other.
 fn catalogue_entry<'a>(
@@ -492,10 +492,10 @@ fn catalogue_entry<'a>(
         })
 }
 
-/// OpenAI-compatible route: `GET {base_url}/models`, the catalogue half of the dialect `openai.rs`
+/// OpenAI-compatible route: `GET {base_url}/models`, the catalogue half of the dialect `openai_compatible.rs`
 /// speaks on `/chat/completions`.
 ///
-/// Named for the WIRE and not for a provider, the same choice `openai::OpenAiChat` makes one module
+/// Named for the WIRE and not for a provider, the same choice `openai_compatible::OpenAiCompatibleChat` makes one module
 /// over: the shape is OpenAI's — `{"data": [{"id", "context_length", "supported_parameters", ..}]}`
 /// — and OpenRouter is one server that answers it, beside a `llama.cpp`, vLLM or LM Studio on
 /// loopback answering the same route. A server states each model's window and parameters in its own
@@ -516,7 +516,7 @@ fn catalogue_entry<'a>(
 /// gone, per its own instruction to delete it "the day the model picker calls it": that day is
 /// this one, and a caller that stops reaching this function is a regression clippy should now
 /// catch, not one this attribute should keep hiding.
-pub async fn discover_openai(
+pub async fn discover_openai_compatible(
     client: &reqwest::Client,
     base_url: &str,
     model: &str,
@@ -981,7 +981,7 @@ pub async fn pull_local_model(
 /// this daemon could probe — so this is a constant rather than a route, the same reason
 /// `hosted_assistant`'s comment in `main.rs` gives for needing no probe of its own.
 ///
-/// Scoped to the non-test build, for the same reason `discover_openai` above is: no production
+/// Scoped to the non-test build, for the same reason `discover_openai_compatible` above is: no production
 /// caller until the model picker packet, exercised under `cfg(test)` by
 /// `uma_cli_declara_as_suas_capacidades_sem_tocar_na_rede` in the meantime.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1000,7 +1000,7 @@ pub fn declared_for_cli() -> Declared {
 /// fixed requirement: the daemon discovers each configured model once at the point a role first
 /// needs it, and a role's own requirement never changes under it while the daemon runs.
 ///
-/// Scoped to the non-test build, for the same reason `discover_openai` above is: every role
+/// Scoped to the non-test build, for the same reason `discover_openai_compatible` above is: every role
 /// `main.rs` wires up today probes once per startup, so none of them needs this cache yet — the
 /// model picker packet is the production caller, and this module's own tests already exercise both
 /// the single-model and the two-model cases in the meantime.
@@ -1340,7 +1340,7 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
 
-        let declared = discover_openai(
+        let declared = discover_openai_compatible(
             &client,
             &base_url,
             "anthropic/claude-sonnet-4.5",
@@ -2487,7 +2487,7 @@ mod tests {
     // `default-features = false, features = ["json"]` — no `native-tls`, no `rustls`, nothing at
     // all in `Cargo.lock` — and which therefore could not complete a single `https://` request.
     //
-    // It mattered to exactly the two constants that are not loopback: `openai::
+    // It mattered to exactly the two constants that are not loopback: `openai_compatible::
     // OPENROUTER_BASE_URL` and `OLLAMA_REGISTRY_URL`. The hosted assistant route had never
     // successfully made a request in its life, and nobody noticed because using it needs a key
     // nobody on this machine had. Found by pointing the size route at the real registry and
@@ -2539,16 +2539,16 @@ mod tests {
 
     /// The hosted route's own catalogue read, for real, over TLS. Also keyless.
     ///
-    /// `discover_openai` takes no key — `GET {base}/models` is public — so the one part of the
+    /// `discover_openai_compatible` takes no key — `GET {base}/models` is public — so the one part of the
     /// hosted route that can be exercised without an account is exercised here. That is the point:
     /// the route was unreachable for a reason that had nothing to do with credentials, and this is
     /// the cheapest test that would have said so.
     #[tokio::test]
     #[ignore = "needs the internet: reaches the real OpenRouter catalogue over TLS"]
     async fn the_real_openrouter_catalogue_is_readable_over_tls() {
-        let declared = discover_openai(
+        let declared = discover_openai_compatible(
             &reqwest::Client::new(),
-            crate::openai::OPENROUTER_BASE_URL,
+            crate::openai_compatible::OPENROUTER_BASE_URL,
             "anthropic/claude-sonnet-4.5",
             8_000,
             None,
@@ -2628,13 +2628,13 @@ mod tests {
         (format!("http://{address}"), show_hits, models_hits)
     }
 
-    /// Without this, `local_engine: openai` is a feature that is green in every test and dead in
+    /// Without this, `local_engine: openai_compatible` is a feature that is green in every test and dead in
     /// production, which is the worst of the two ways to be broken.
     ///
     /// `main.rs`'s startup decides `local_model` by probing `discover_ollama_as` against the
     /// hardcoded `runner::OLLAMA_BASE_URL` — the Ollama dialect, at Ollama's address — BEFORE it
     /// reaches the `local_engine()` block that would have told it neither is what the operator
-    /// configured. On an `local_engine: openai` install that probe posts `/api/show` to a
+    /// configured. On an `local_engine: openai_compatible` install that probe posts `/api/show` to a
     /// llama.cpp or LM Studio server that has no such route, `interpret_context_probe` fails
     /// closed on the 404 body exactly as this module's doc requires, `local_assistant_posture`
     /// answers `FellBackToCli`, and `local_model` becomes `None`. The route the factory was
@@ -2649,9 +2649,9 @@ mod tests {
     /// by accident goes wrong the moment Ollama is uninstalled.
     ///
     /// On the `role` argument, since this test is what fixes the signature: it is kept on both
-    /// arms and is inert on the OpenAi one. `discover_ollama_as` interpolates it into the
+    /// arms and is inert on the OpenAiCompatible one. `discover_ollama_as` interpolates it into the
     /// `could not read the {probe} probe response` wording an operator actually reads, while
-    /// `discover_openai` names no probe at all — its failures ride in `Declared.context` and are
+    /// `discover_openai_compatible` names no probe at all — its failures ride in `Declared.context` and are
     /// worded once, by `missing_capabilities`. Kept anyway so the three `main.rs` call sites keep
     /// ONE signature to call rather than choosing one per engine, which is the shape that let the
     /// hardcoded dialect survive in the first place.
@@ -2670,7 +2670,7 @@ mod tests {
 
         let declared = discover_local_as(
             &reqwest::Client::new(),
-            crate::config::LocalEngine::OpenAi,
+            crate::config::LocalEngine::OpenAiCompatible,
             &base_url,
             "qwen3-coder-30b",
             8192,
@@ -2682,7 +2682,7 @@ mod tests {
         assert_eq!(
             models_hits.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "an `openai` engine must discover over `GET /models`, which this stub counts"
+            "an `openai_compatible` engine must discover over `GET /models`, which this stub counts"
         );
         assert_eq!(
             declared.context,
@@ -2694,7 +2694,7 @@ mod tests {
         assert_eq!(
             show_hits.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "an `openai` engine must never post Ollama's `/api/show`: that request is the \
+            "an `openai_compatible` engine must never post Ollama's `/api/show`: that request is the \
              hardcoded dialect this test exists to remove, and on a machine without Ollama it is \
              the request that disables the local assistant"
         );

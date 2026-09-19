@@ -2932,7 +2932,7 @@ async fn spawn_agent(
         // `runner::OLLAMA_BASE_URL`. This was the last reader in the daemon still doing so: the
         // chat route and the council seat both ask `assistants::Assistants::local_chat`, which is
         // the one place that decides which server a local model gets. On an install whose
-        // `local_engine` is `openai`, a team member left here reached an Ollama that may not be
+        // `local_engine` is `openai_compatible`, a team member left here reached an Ollama that may not be
         // running, may not hold the model, and may not be the machine that was paid for -- while
         // the owner's own chat reached the server they configured. Half a daemon on each engine.
         let chat = match state.assistants.local_chat(&model) {
@@ -7188,7 +7188,7 @@ mod tests {
 
     /// An OpenAI-compatible server on this machine, answering one sentence that exists nowhere
     /// else in this module — so a member that wrote it down can only have got it from here.
-    async fn stub_openai_member(answer: &str) -> String {
+    async fn stub_openai_compatible_member(answer: &str) -> String {
         let answer = answer.to_string();
         let app = axum::Router::new().route(
             "/chat/completions",
@@ -7229,14 +7229,16 @@ mod tests {
                 .lock()
                 .expect("the double's recorder is never held across an await")
                 .push(model.to_string());
-            Ok(Box::new(crate::openai::OpenAiChat::with_client(
-                reqwest::Client::new(),
-                self.base_url.clone(),
-                model.to_string(),
-                // `None`, deliberately: a loopback OpenAI-compatible server asks for no key, which
-                // is the case `OpenAiChat::new` refuses and `with_client` exists to express.
-                None,
-            )))
+            Ok(Box::new(
+                crate::openai_compatible::OpenAiCompatibleChat::with_client(
+                    reqwest::Client::new(),
+                    self.base_url.clone(),
+                    model.to_string(),
+                    // `None`, deliberately: a loopback OpenAI-compatible server asks for no key, which
+                    // is the case `OpenAiCompatibleChat::new` refuses and `with_client` exists to express.
+                    None,
+                ),
+            ))
         }
 
         fn assistant_for(
@@ -7372,7 +7374,7 @@ mod tests {
     ///
     /// Without this, `spawn_agent` keeps building its own `runner::OllamaChat` against
     /// `runner::OLLAMA_BASE_URL` — the last reader in this daemon still doing so. On an install
-    /// whose `local_engine` is `openai`, the owner's chat and every council seat then reach the
+    /// whose `local_engine` is `openai_compatible`, the owner's chat and every council seat then reach the
     /// server that was configured while every TEAM member quietly reaches an Ollama that may not
     /// be running, may not hold the model, and may not be the machine that was paid for. What is
     /// asserted is the member's own recorded answer, because that sentence exists only on the
@@ -7380,7 +7382,7 @@ mod tests {
     #[tokio::test]
     async fn a_local_team_member_is_served_by_the_configured_engine() {
         const ANSWER: &str = "the answer that exists only on this loopback server";
-        let base_url = stub_openai_member(ANSWER).await;
+        let base_url = stub_openai_compatible_member(ANSWER).await;
 
         let (mut state, _root) = state_with_root().await;
         let assistants = std::sync::Arc::new(MemberAssistants {

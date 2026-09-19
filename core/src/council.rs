@@ -1992,7 +1992,7 @@ impl Driver {
         // `runner::OLLAMA_BASE_URL`. `assistants::Assistants::local_chat` is the one place that
         // decides which client a local model gets, and asking it here is what stops the two halves
         // of one daemon drifting onto different engines: on an install whose `local_engine` is
-        // `openai`, the owner's chat reached the server they configured while every seat reached
+        // `openai_compatible`, the owner's chat reached the server they configured while every seat reached
         // an Ollama that may not be running, may not hold the model, and may not be the machine
         // that was paid for. A seat that fails for that reason — or answers as some other model —
         // looks from outside exactly like a seat that simply had nothing to say.
@@ -5291,11 +5291,11 @@ mod tests {
     // -----------------------------------------------------------------------------------------
 
     /// A loopback `POST /chat/completions` answering one fixed sentence in the shape
-    /// `openai::assistant_message` reads — the council's own copy of
+    /// `openai_compatible::assistant_message` reads — the council's own copy of
     /// `assistants::stub_completions_recording`, and it records nothing because what matters here
     /// is not what was asked but what came back. The sentence exists nowhere else in this module,
     /// so a seat that wrote it down can only have got it from this address.
-    async fn stub_openai_seat(answer: &str) -> String {
+    async fn stub_openai_compatible_seat(answer: &str) -> String {
         let answer = answer.to_string();
         let app = axum::Router::new().route(
             "/chat/completions",
@@ -5338,14 +5338,16 @@ mod tests {
                 .lock()
                 .expect("the double's recorder is never held across an await")
                 .push(model.to_string());
-            Ok(Box::new(crate::openai::OpenAiChat::with_client(
-                reqwest::Client::new(),
-                self.base_url.clone(),
-                model.to_string(),
-                // `None`, deliberately: a loopback OpenAI-compatible server asks for no key, which
-                // is the case `OpenAiChat::new` refuses and `with_client` exists to express.
-                None,
-            )))
+            Ok(Box::new(
+                crate::openai_compatible::OpenAiCompatibleChat::with_client(
+                    reqwest::Client::new(),
+                    self.base_url.clone(),
+                    model.to_string(),
+                    // `None`, deliberately: a loopback OpenAI-compatible server asks for no key, which
+                    // is the case `OpenAiCompatibleChat::new` refuses and `with_client` exists to express.
+                    None,
+                ),
+            ))
         }
 
         /// A seat never asks for one, and a double that invented an answer here would be
@@ -5392,7 +5394,7 @@ mod tests {
     /// A local seat asks the factory for its chat, exactly as a chat turn does.
     ///
     /// Without this, `run_local_seat` keeps building its own `runner::OllamaChat` against
-    /// `runner::OLLAMA_BASE_URL` — and on an install whose `local_engine` is `openai`, the two
+    /// `runner::OLLAMA_BASE_URL` — and on an install whose `local_engine` is `openai_compatible`, the two
     /// halves of the same daemon then run on DIFFERENT engines: the owner's chat reaches the
     /// OpenAI-compatible server they configured, while every council seat quietly reaches an
     /// Ollama that may not be running, may not hold the model, or may not be the machine that was
@@ -5403,9 +5405,9 @@ mod tests {
     /// Through `start` rather than by calling `run_local_seat` directly: the run row is where a
     /// seat's answer is written down, and only the whole path writes it.
     #[tokio::test]
-    async fn a_local_seat_is_served_by_the_configured_openai_engine() {
+    async fn a_local_seat_is_served_by_the_configured_openai_compatible_engine() {
         const ANSWER: &str = "the answer that exists only on this loopback server";
-        let base_url = stub_openai_seat(ANSWER).await;
+        let base_url = stub_openai_compatible_seat(ANSWER).await;
 
         let config = CouncilConfig {
             timeout_seconds: 10,
@@ -5492,8 +5494,8 @@ mod tests {
             .expect("`local_engine` must resolve for this test to mean anything");
         assert_eq!(
             engine.engine,
-            crate::config::LocalEngine::OpenAi,
-            "this is the OpenAI transport's end-to-end check: set `local_engine: openai` and \
+            crate::config::LocalEngine::OpenAiCompatible,
+            "this is the OpenAI transport's end-to-end check: set `local_engine: openai_compatible` and \
              `local_base_url` to the server holding the MoE before running it"
         );
         let model = models
