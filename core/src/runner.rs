@@ -2375,31 +2375,13 @@ pub struct OllamaChat {
 pub(crate) const OLLAMA_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl OllamaChat {
-    pub fn new(base_url: String, model: String) -> Self {
-        Self {
-            // A client timeout, not a default client. `reqwest::Client::new()` waits for ever, and
-            // for ever here means the chat slot is never released and every later message in that
-            // chat is refused with 409 until the daemon restarts.
-            // `expect` rather than `unwrap_or_default`, which read like a fallback and is not one:
-            // `Client::default()` is `Client::new()`, which builds with the same settings and
-            // panics on the same failure — so the "fallback" would panic identically, one line
-            // later, with a message naming nothing. The causes are TLS backend and proxy
-            // environment problems, which are startup misconfiguration; saying so is worth more
-            // than pretending to recover.
-            client: reqwest::Client::builder()
-                .timeout(OLLAMA_EXCHANGE_TIMEOUT)
-                .build()
-                .expect("HTTP client for the local model (check TLS and proxy environment)"),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            model,
-        }
-    }
-
-    /// Builds from a client the caller already owns, rather than one built fresh here — what
-    /// `assistants::ConfiguredAssistants` needs so every `OllamaChat` it hands out for the local
-    /// route shares the ONE `reqwest::Client` that route was constructed with, instead of a new
-    /// client per assistant. `new` above stays as it is for every other caller.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Builds from a client the caller already owns, and is the only constructor: every
+    /// `OllamaChat` in the daemon comes from `assistants::Assistants::local_chat`, so every one of
+    /// them shares the ONE `reqwest::Client` the local route was built with in
+    /// `assistants::ConfiguredAssistants::new` — which is also where the reason that client has a
+    /// timeout now lives. There was a `new` beside this that built its own; its last caller was
+    /// `team.rs`, and a second constructor is a second way for a reader to reach Ollama without
+    /// asking the factory which engine is configured.
     pub fn with_client(client: reqwest::Client, base_url: String, model: String) -> Self {
         Self {
             client,

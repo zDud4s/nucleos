@@ -344,6 +344,16 @@ impl ConfiguredAssistants {
         local_base_url: String,
     ) -> Self {
         Self {
+            // A client timeout, not a default client. `reqwest::Client::new()` waits for ever, and
+            // for ever here means the chat slot is never released and every later message in that
+            // chat is refused with 409 until the daemon restarts.
+            // `expect` rather than `unwrap_or_default`, which read like a fallback and is not one:
+            // `Client::default()` is `Client::new()`, which builds with the same settings and
+            // panics on the same failure — so the "fallback" would panic identically, one line
+            // later, with a message naming nothing. The causes are TLS backend and proxy
+            // environment problems, which are startup misconfiguration; saying so is worth more
+            // than pretending to recover. (This reasoning lived on `runner::OllamaChat::new` until
+            // that constructor lost its last caller; this is the builder every local chat now uses.)
             local_client: reqwest::Client::builder()
                 .timeout(crate::runner::OLLAMA_EXCHANGE_TIMEOUT)
                 .build()

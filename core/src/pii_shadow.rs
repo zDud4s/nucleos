@@ -598,12 +598,12 @@ async fn observe_column(
 
 /// Runs a sweep every `SWEEP_INTERVAL` for as long as the daemon is up.
 pub async fn run_sweep_loop(pool: sqlx::SqlitePool, base_url: String, model: String) {
-    // A client with a timeout, not the default one. `runner.rs::OllamaChat::new` records why in one
-    // line — "`reqwest::Client::new()` waits for ever" — and reasoning mode is what makes it bite: a
-    // 4B can stall mid-trace, and a request that never returns is a sweep loop that never ticks
-    // again, filling nothing and warning about nothing.
-    // `expect`, not a fallback, for the reason `runner.rs::OllamaChat::new` sets out at this exact
-    // line: the fallback here was `Client::new()`, which has no timeout — so the downgrade path
+    // A client with a timeout, not the default one. `assistants::ConfiguredAssistants::new` records
+    // why at its `local_client`, in one line — "`reqwest::Client::new()` waits for ever" — and
+    // reasoning mode is what makes it bite: a 4B can stall mid-trace, and a request that never
+    // returns is a sweep loop that never ticks again, filling nothing and warning about nothing.
+    // `expect`, not a fallback, for the reason the same comment sets out at that exact line: the
+    // fallback here was `Client::new()`, which has no timeout — so the downgrade path
     // silently produced the very thing the timeout exists to prevent, and nothing logged it. The
     // causes of a builder failure are TLS backend and proxy misconfiguration, which are startup
     // problems and should look like one.

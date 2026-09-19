@@ -594,7 +594,6 @@ impl LocalEngineRefusal {
     ///
     /// `String` and not `&'static str` like `LandRefusal::message`, because two of the three carry
     /// the offending value and a refusal that cannot quote it is one nobody can act on.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn message(&self) -> String {
         match self {
             Self::UnknownEngine(named) => format!(

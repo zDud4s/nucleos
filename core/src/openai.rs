@@ -95,7 +95,8 @@ impl OpenAiChat {
             )
         })?;
         Ok(Self {
-            // A client timeout, not a default client, for the same reason `OllamaChat::new` gives:
+            // A client timeout, not a default client, for the same reason
+            // `assistants::ConfiguredAssistants::new` gives at its `local_client`:
             // `reqwest::Client::new()` waits for ever, and for ever here means the chat slot is
             // never released and every later message in that chat is refused until the caller
             // restarts it. `expect` rather than a fallback, because `Client::default()` is
