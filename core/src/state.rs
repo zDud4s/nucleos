@@ -401,8 +401,10 @@ pub struct AppState {
     ///
     /// No token of any provider is here, and that absence is design D2 rather than an oversight.
     /// The sidecar reads Claude Code's own credential file at the point of use and hands back a
-    /// fraction, so the one secret on this path is the daemon's bearer for its own sidecar. That is
-    /// also why this runtime needs no `Debug` guard of the kind `EmailRuntime` carries.
+    /// fraction, so the one secret on this path is the daemon's bearer for its own sidecar. That
+    /// bearer is a smaller secret than the ones `EmailRuntime` and `CouncilRuntime` hold and it is
+    /// still a secret, so `QuotaClient` carries a `Debug` guard of the same kind — see
+    /// `quota_client.rs`. What D2 buys is that a leak here opens the sidecar, never the vendor.
     pub quota: Arc<crate::quota::QuotaRuntime>,
     /// The browser pillar: whether it is on, and the client for the process that drives Chromium.
     ///

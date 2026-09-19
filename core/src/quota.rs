@@ -199,19 +199,24 @@ pub async fn report(
     now: chrono::DateTime<chrono::Utc>,
 ) -> QuotaReport {
     let Some(client) = runtime.client.as_ref() else {
-        return stored_report(pool, "the quota sidecar is not running").await;
+        return stored_report(pool, "the quota sidecar is not running", now).await;
     };
 
     match client.report().await {
         Ok(live) => {
             let cached = live.cached;
-            let providers: Vec<Provider> = live.providers.into_iter().map(from_reading).collect();
+            let providers: Vec<Provider> = live
+                .providers
+                .into_iter()
+                .map(|raw| from_reading(raw, now))
+                .collect();
             // Recorded before answering, and a write that fails does NOT fail the answer: the table
             // is a fallback, so losing it costs the next reader a fresh figure and must not cost
             // this one the figure already in hand.
             if let Err(error) = record(pool, &providers, now).await {
                 tracing::warn!(%error, "the quota reading could not be stored");
             }
+            let providers = degrade_to_last_good(pool, providers, now).await;
             QuotaReport {
                 providers,
                 source: Source::Sidecar,
@@ -222,13 +227,110 @@ pub async fn report(
         Err(error) => {
             // The sidecar's own message, which by construction carries no token — see
             // `sidecars/quota/claude`, where that property has a test of its own.
-            stored_report(pool, &error.to_string()).await
+            stored_report(pool, &error.to_string(), now).await
         }
     }
 }
 
-async fn stored_report(pool: &SqlitePool, why: &str) -> QuotaReport {
-    let providers = match stored(pool).await {
+/// The start of every `detail` the Claude sidecar writes when the owner's CREDENTIAL is the
+/// problem, as opposed to the vendor or the network.
+///
+/// Prose is the only signal the sidecar sends for this: `reading.Unavailable` carries a name, a
+/// detail and a time, and no machine-readable reason. So these are matched as prefixes of the
+/// sidecar's own sentences, and `the_credential_markers_are_still_what_the_sidecar_writes` reads
+/// `sidecars/quota/claude/claude.go` to fail the day either sentence is reworded. A marker that
+/// silently stopped matching would quietly turn "sign in again" into a stale ring.
+///
+/// - `no usable Claude credential` is `ErrNoToken`, which prefixes every missing, unreadable or
+///   expired token.
+/// - `the usage endpoint refused the credential` is a 401/403: a token the vendor revoked.
+const CREDENTIAL_MARKERS: [&str; 2] = [
+    "no usable Claude credential",
+    "the usage endpoint refused the credential",
+];
+
+/// Whether an unmeasured reading says the owner has to sign in again (design §5, first row).
+fn is_credential_failure(detail: &str) -> bool {
+    CREDENTIAL_MARKERS
+        .iter()
+        .any(|marker| detail.starts_with(marker))
+}
+
+/// Serve the last good figures, marked stale, for a provider the sidecar could not read this time.
+///
+/// Design §5: a 429 or a 5xx from the vendor degrades to the last good reading marked `stale`. The
+/// sidecar reports such a failure INSIDE a successful answer, as an `unmeasured` provider with a
+/// reason, so the sidecar being reachable is not the same as the figures being fresh. Without this,
+/// one rate-limited call would dash the Claude rings for a whole poll, and the next good call would
+/// fill them again.
+///
+/// Two cases keep the provider `unmeasured` all the same. A provider with nothing stored has no
+/// last good figure to degrade to. And a credential failure is not a bad moment at the vendor: it
+/// is D3's "present, with no quota source", which the same §5 table draws as a dashed ring so the
+/// owner sees that signing in again is theirs to do. A stale figure there would look like the
+/// vendor having a slow day, for as long as nobody noticed.
+///
+/// The sidecar's `detail` travels with the stored windows, so the reason the figure is old stays
+/// on screen beside it.
+///
+/// **Note for phase 4's brake.** A degraded provider keeps the fidelity it was stored with —
+/// usually [`Fidelity::Official`] — and the ONLY mark that it is not a current reading is
+/// `stale: true` on each window. So a brake that gates on a minimum fidelity alone would act on a
+/// figure that is hours old at full fidelity, which is precisely what D3's "only trusts what is
+/// measured" forbids. Gate on `stale` as well as on fidelity. Raising the degraded provider's
+/// fidelity instead was rejected: the number really was measured officially, and lying about its
+/// provenance would make the ring's own tooltip wrong to keep the brake simple.
+async fn degrade_to_last_good(
+    pool: &SqlitePool,
+    providers: Vec<Provider>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Provider> {
+    let degradable =
+        |p: &Provider| p.fidelity == Fidelity::Unmeasured && !is_credential_failure(&p.detail);
+    if !providers.iter().any(degradable) {
+        return providers;
+    }
+    let last_good = match stored(pool, now).await {
+        Ok(last_good) => last_good,
+        Err(error) => {
+            tracing::warn!(%error, "the stored quota readings could not be read");
+            return providers;
+        }
+    };
+    providers
+        .into_iter()
+        .map(|live| {
+            if !degradable(&live) {
+                return live;
+            }
+            match last_good.iter().find(|p| p.provider == live.provider) {
+                Some(good) => Provider {
+                    windows: good
+                        .windows
+                        .iter()
+                        .cloned()
+                        .map(|w| Window {
+                            state: state_of(good.fidelity, w.used_fraction, true),
+                            stale: true,
+                            ..w
+                        })
+                        .collect(),
+                    detail: live.detail,
+                    severity: live.severity,
+                    ..good.clone()
+                },
+                None => live,
+            }
+        })
+        .collect()
+}
+
+async fn stored_report(
+    pool: &SqlitePool,
+    why: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> QuotaReport {
+    let providers = match stored(pool, now).await {
         Ok(providers) => providers,
         Err(error) => {
             tracing::warn!(%error, "the stored quota readings could not be read");
@@ -245,8 +347,36 @@ async fn stored_report(pool: &SqlitePool, why: &str) -> QuotaReport {
     }
 }
 
+/// Whether a window has rolled over, whatever the reading said when it was taken.
+///
+/// `stale` is a function of the clock, not a property frozen into a reading. A window recorded at
+/// 0.97 with a 16:40 reset, whose sidecar then died at 16:00, still says 0.97 at 18:00, and
+/// serving the flag it was stored with would keep calling a period that has ended `exhausted`.
+/// Phase 4's brake reads this table, so that is not a cosmetic lie.
+///
+/// The boundary is `<=`: a window whose reset is exactly `now` has reopened and is therefore stale
+/// here, the stricter of the two readings — chosen because this side re-derives the flag and a
+/// wrong answer costs a shout about a limit that no longer binds. The Go sidecar's
+/// `reading.MarkStale` uses `<` and may disagree for the one instant they straddle; that is
+/// harmless and not worth a shared constant, because `from_reading` and `stored` both run this
+/// function over whatever the sidecar sent, so the núcleo's answer is always the one the shell sees.
+fn is_stale(
+    flagged: bool,
+    resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    flagged || resets_at.is_some_and(|at| at <= now)
+}
+
 /// Turn one sidecar reading into the shape the shell is sent.
-fn from_reading(raw: crate::quota_client::ProviderReading) -> Provider {
+///
+/// Staleness is re-derived here too, though the sidecar already marks it: the sidecar answers from
+/// a cache of up to a minute, and the process that decides the state should judge it against the
+/// clock its caller passed in, not the one the reading was taken under.
+fn from_reading(
+    raw: crate::quota_client::ProviderReading,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Provider {
     let fidelity = Fidelity::parse(&raw.fidelity);
     Provider {
         provider: raw.provider,
@@ -255,12 +385,15 @@ fn from_reading(raw: crate::quota_client::ProviderReading) -> Provider {
         windows: raw
             .windows
             .into_iter()
-            .map(|w| Window {
-                state: state_of(fidelity, w.used_fraction, w.stale),
-                window: w.window,
-                used_fraction: w.used_fraction,
-                resets_at: w.resets_at.map(|at| at.to_rfc3339()),
-                stale: w.stale,
+            .map(|w| {
+                let stale = is_stale(w.stale, w.resets_at, now);
+                Window {
+                    state: state_of(fidelity, w.used_fraction, stale),
+                    window: w.window,
+                    used_fraction: w.used_fraction,
+                    resets_at: w.resets_at.map(|at| at.to_rfc3339()),
+                    stale,
+                }
             })
             .collect(),
         detail: raw.detail,
@@ -326,8 +459,11 @@ struct Row {
     read_at: String,
 }
 
-/// The last stored reading of every provider.
-pub async fn stored(pool: &SqlitePool) -> Result<Vec<Provider>, sqlx::Error> {
+/// The last stored reading of every provider, with staleness judged against `now`.
+pub async fn stored(
+    pool: &SqlitePool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<Provider>, sqlx::Error> {
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT provider, window_name, used_fraction, resets_at, fidelity, stale, read_at
            FROM quota_readings
@@ -339,7 +475,14 @@ pub async fn stored(pool: &SqlitePool) -> Result<Vec<Provider>, sqlx::Error> {
     let mut providers: Vec<Provider> = Vec::new();
     for row in rows {
         let fidelity = Fidelity::parse(&row.fidelity);
-        let stale = row.stale != 0;
+        // A reset that does not parse cannot prove the window has rolled over, so it leaves the
+        // stored flag to decide. `record` writes RFC3339 and nothing else writes this column.
+        let resets_at = row
+            .resets_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&chrono::Utc));
+        let stale = is_stale(row.stale != 0, resets_at, now);
         let window = Window {
             state: state_of(fidelity, row.used_fraction, stale),
             window: row.window_name,
@@ -385,11 +528,26 @@ mod tests {
         pool
     }
 
+    /// The reset every helper below writes, and the clock they are read under.
+    ///
+    /// Far apart on purpose: staleness is now decided against the reader's clock, so a fixture
+    /// whose reset sits near the real `Utc::now()` would start calling itself stale on the day the
+    /// machine's date caught up with it, and the bands would be asserted against the wrong state.
+    const RESET: &str = "2026-09-19T16:40:00+00:00";
+    const BEFORE_RESET: &str = "2026-09-19T15:00:00+00:00";
+    const AFTER_RESET: &str = "2026-09-19T18:00:00+00:00";
+
+    fn at(moment: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(moment)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
     fn window(used: f64, stale: bool) -> Window {
         Window {
             window: "5h".into(),
             used_fraction: used,
-            resets_at: Some("2026-09-19T16:40:00+00:00".into()),
+            resets_at: Some(RESET.into()),
             stale,
             state: "ok",
         }
@@ -469,11 +627,11 @@ mod tests {
     #[tokio::test]
     async fn a_stored_reading_comes_back_as_it_went_in() {
         let pool = pool().await;
-        record(&pool, &measured(0.56), chrono::Utc::now())
+        record(&pool, &measured(0.56), at(BEFORE_RESET))
             .await
             .unwrap();
 
-        let back = stored(&pool).await.unwrap();
+        let back = stored(&pool, at(BEFORE_RESET)).await.unwrap();
 
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].provider, "claude");
@@ -489,14 +647,14 @@ mod tests {
     #[tokio::test]
     async fn a_second_reading_of_the_same_window_replaces_the_first() {
         let pool = pool().await;
-        record(&pool, &measured(0.10), chrono::Utc::now())
+        record(&pool, &measured(0.10), at(BEFORE_RESET))
             .await
             .unwrap();
-        record(&pool, &measured(0.80), chrono::Utc::now())
+        record(&pool, &measured(0.80), at(BEFORE_RESET))
             .await
             .unwrap();
 
-        let back = stored(&pool).await.unwrap();
+        let back = stored(&pool, at(BEFORE_RESET)).await.unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].windows.len(), 1);
         assert!((back[0].windows[0].used_fraction - 0.80).abs() < f64::EPSILON);
@@ -511,7 +669,7 @@ mod tests {
     #[tokio::test]
     async fn an_unmeasured_reading_does_not_erase_what_was_measured_before() {
         let pool = pool().await;
-        record(&pool, &measured(0.56), chrono::Utc::now())
+        record(&pool, &measured(0.56), at(BEFORE_RESET))
             .await
             .unwrap();
 
@@ -525,21 +683,180 @@ mod tests {
                 detail: "it expired 2m ago — sign in again in Claude Code".into(),
                 severity: String::new(),
             }],
-            chrono::Utc::now(),
+            at(BEFORE_RESET),
         )
         .await
         .unwrap();
 
-        let back = stored(&pool).await.unwrap();
+        let back = stored(&pool, at(BEFORE_RESET)).await.unwrap();
         assert_eq!(back.len(), 1, "the last measured figure was forgotten");
         assert!((back[0].windows[0].used_fraction - 0.56).abs() < f64::EPSILON);
+    }
+
+    /// **The reading is stale when it is read, not when it was taken.**
+    ///
+    /// The window that motivated this: recorded at 0.97 with a 16:40 reset, the sidecar dies at
+    /// 16:00, and at 18:00 the table still answered `exhausted` — shouting about a limit that had
+    /// reopened two hours earlier. Phase 4's brake reads exactly this table.
+    #[tokio::test]
+    async fn a_reset_that_passes_between_recording_and_reading_makes_the_window_stale() {
+        let pool = pool().await;
+        record(&pool, &measured(0.97), at(BEFORE_RESET))
+            .await
+            .unwrap();
+
+        let before = stored(&pool, at(BEFORE_RESET)).await.unwrap();
+        assert_eq!(before[0].windows[0].state, "exhausted");
+
+        let after = stored(&pool, at(AFTER_RESET)).await.unwrap();
+        assert!(
+            after[0].windows[0].stale,
+            "a window past its reset was served fresh"
+        );
+        assert_eq!(
+            after[0].windows[0].state, "stale",
+            "a period that has ended was still called exhausted"
+        );
+    }
+
+    /// The same clock decides a live reading, because the sidecar answers from a cache of its own.
+    #[test]
+    fn a_live_window_past_its_reset_is_stale_however_the_sidecar_flagged_it() {
+        let reading = crate::quota_client::ProviderReading {
+            provider: "claude".into(),
+            fidelity: "official".into(),
+            read_at: at(BEFORE_RESET),
+            windows: vec![crate::quota_client::WindowReading {
+                window: "5h".into(),
+                used_fraction: 0.97,
+                resets_at: Some(at(RESET)),
+                stale: false,
+            }],
+            detail: String::new(),
+            severity: String::new(),
+        };
+
+        let fresh = from_reading(reading.clone(), at(BEFORE_RESET));
+        assert_eq!(fresh.windows[0].state, "exhausted");
+
+        let rolled = from_reading(reading, at(AFTER_RESET));
+        assert!(rolled.windows[0].stale);
+        assert_eq!(rolled.windows[0].state, "stale");
+    }
+
+    fn unmeasured(detail: &str) -> Vec<Provider> {
+        vec![Provider {
+            provider: "claude".into(),
+            fidelity: Fidelity::Unmeasured,
+            read_at: BEFORE_RESET.into(),
+            windows: Vec::new(),
+            detail: detail.into(),
+            severity: String::new(),
+        }]
+    }
+
+    /// **A bad moment at the vendor degrades; it does not dash the ring** (design §5).
+    ///
+    /// A 429 or a 5xx reaches the núcleo as a perfectly reachable sidecar reporting an `unmeasured`
+    /// provider. Serving that as-is emptied the Claude rings for one poll and filled them again on
+    /// the next, which is a flicker that says nothing true.
+    #[tokio::test]
+    async fn a_vendor_failure_serves_the_last_good_figures_marked_stale() {
+        let pool = pool().await;
+        record(&pool, &measured(0.56), at(BEFORE_RESET))
+            .await
+            .unwrap();
+
+        let degraded = degrade_to_last_good(
+            &pool,
+            unmeasured("the usage endpoint answered 429"),
+            at(BEFORE_RESET),
+        )
+        .await;
+
+        assert_eq!(degraded.len(), 1);
+        assert_eq!(
+            degraded[0].fidelity,
+            Fidelity::Official,
+            "the stored reading was official"
+        );
+        assert!((degraded[0].windows[0].used_fraction - 0.56).abs() < f64::EPSILON);
+        assert_eq!(degraded[0].windows[0].state, "stale");
+        assert_eq!(
+            degraded[0].detail, "the usage endpoint answered 429",
+            "the reason the figure is old has to stay beside it"
+        );
+    }
+
+    /// **A credential failure stays unmeasured** (design D3 and §5's first row).
+    ///
+    /// "Sign in again in Claude Code" is something only the owner can do, and a stale-looking
+    /// figure would read as the vendor having a slow day for as long as nobody noticed.
+    #[tokio::test]
+    async fn an_expired_token_is_not_degraded_to_a_stale_figure() {
+        let pool = pool().await;
+        record(&pool, &measured(0.56), at(BEFORE_RESET))
+            .await
+            .unwrap();
+
+        let kept = degrade_to_last_good(
+            &pool,
+            unmeasured(
+                "no usable Claude credential: it expired 2m ago — sign in again in Claude Code",
+            ),
+            at(BEFORE_RESET),
+        )
+        .await;
+
+        assert_eq!(kept[0].fidelity, Fidelity::Unmeasured);
+        assert!(
+            kept[0].windows.is_empty(),
+            "an unmeasured provider must carry no number"
+        );
+    }
+
+    /// Nothing stored is nothing to degrade to, and inventing a zero is the one thing this feature
+    /// must never do.
+    #[tokio::test]
+    async fn a_provider_with_nothing_stored_stays_unmeasured() {
+        let pool = pool().await;
+
+        let kept = degrade_to_last_good(
+            &pool,
+            unmeasured("the usage endpoint answered 503"),
+            at(BEFORE_RESET),
+        )
+        .await;
+
+        assert_eq!(kept[0].fidelity, Fidelity::Unmeasured);
+        assert!(kept[0].windows.is_empty());
+    }
+
+    /// The credential signal is the sidecar's own prose, so this reads the sidecar.
+    ///
+    /// `reading.Unavailable` carries no machine-readable reason — only a sentence — and a marker
+    /// that quietly stopped matching would turn "sign in again" into a stale ring nobody acts on.
+    /// This fails on the commit that rewords the sentence, in the repository where both live.
+    #[test]
+    fn the_credential_markers_are_still_what_the_sidecar_writes() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../sidecars/quota/claude/claude.go");
+        let go = std::fs::read_to_string(&source).expect("the quota sidecar's claude package");
+        for marker in CREDENTIAL_MARKERS {
+            assert!(
+                go.contains(marker),
+                "{marker:?} is no longer what {} writes, so a credential failure now degrades to a \
+                 stale figure instead of asking the owner to sign in",
+                source.display()
+            );
+        }
     }
 
     /// With no sidecar and an empty table, the answer says so rather than drawing nothing.
     #[tokio::test]
     async fn no_sidecar_answers_from_the_table_and_names_the_reason() {
         let pool = pool().await;
-        let report = report(&QuotaRuntime::disabled(), &pool, chrono::Utc::now()).await;
+        let report = report(&QuotaRuntime::disabled(), &pool, at(BEFORE_RESET)).await;
 
         assert_eq!(report.source, Source::Stored);
         assert!(report.providers.is_empty());
@@ -553,14 +870,85 @@ mod tests {
     #[tokio::test]
     async fn with_the_sidecar_down_the_last_stored_figures_are_what_is_drawn() {
         let pool = pool().await;
-        record(&pool, &measured(0.56), chrono::Utc::now())
+        record(&pool, &measured(0.56), at(BEFORE_RESET))
             .await
             .unwrap();
 
-        let report = report(&QuotaRuntime::disabled(), &pool, chrono::Utc::now()).await;
+        let report = report(&QuotaRuntime::disabled(), &pool, at(BEFORE_RESET)).await;
 
         assert_eq!(report.source, Source::Stored);
         assert_eq!(report.providers.len(), 1);
         assert!((report.providers[0].windows[0].used_fraction - 0.56).abs() < f64::EPSILON);
+    }
+
+    /// A stub sidecar on a loopback port, answering one canned `GET /quota`.
+    ///
+    /// `QuotaClient` owns a `reqwest::Client` rather than sitting behind a trait, so the cheapest
+    /// honest fake is a real socket — the same shape, and for the same reason, as
+    /// `browser_client.rs`'s stub.
+    async fn stub_sidecar(answer: serde_json::Value) -> String {
+        let app = axum::Router::new().route(
+            "/quota",
+            axum::routing::get(move || {
+                let answer = answer.clone();
+                async move { axum::Json(answer) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        address.to_string()
+    }
+
+    /// **The degradation is wired into `report()`**, not merely available beside it.
+    ///
+    /// The three cases above call `degrade_to_last_good` directly, so deleting its one call site in
+    /// `report()` left all of them green while the shell went back to receiving a dashed ring on
+    /// every rate-limited poll. This is the case that goes red for that deletion: it enters through
+    /// the route's own function, with the sidecar reporting the failure the way it really does —
+    /// inside a 200, as an `unmeasured` provider carrying a reason.
+    #[tokio::test]
+    async fn report_serves_the_stored_figures_marked_stale_when_a_provider_comes_back_unmeasured() {
+        let pool = pool().await;
+        record(&pool, &measured(0.56), at(BEFORE_RESET))
+            .await
+            .unwrap();
+        let address = stub_sidecar(serde_json::json!({
+            "providers": [{
+                "provider": "claude",
+                "fidelity": "unmeasured",
+                "read_at": BEFORE_RESET,
+                "windows": [],
+                "detail": "the usage endpoint answered 429",
+            }],
+            "cached": false,
+        }))
+        .await;
+        let runtime = QuotaRuntime::new(crate::quota_client::QuotaClient::new(
+            &address,
+            "bearer".into(),
+        ));
+
+        let report = report(&runtime, &pool, at(BEFORE_RESET)).await;
+
+        assert_eq!(report.source, Source::Sidecar);
+        assert_eq!(report.providers.len(), 1);
+        let provider = &report.providers[0];
+        assert_eq!(
+            provider.fidelity,
+            Fidelity::Official,
+            "the route answered with the live unmeasured reading instead of the stored one"
+        );
+        assert_eq!(provider.windows.len(), 1);
+        assert!((provider.windows[0].used_fraction - 0.56).abs() < f64::EPSILON);
+        assert!(
+            provider.windows[0].stale,
+            "an old figure was served as fresh"
+        );
+        assert_eq!(provider.windows[0].state, "stale");
+        assert_eq!(
+            provider.detail, "the usage endpoint answered 429",
+            "the reason the figure is old has to reach the shell with it"
+        );
     }
 }
