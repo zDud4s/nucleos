@@ -10,6 +10,8 @@ import "./ui.css";
 import "./app.css";
 import { createAppQueryClient } from "./app/queryClient";
 import { lastPlace, rememberPlace } from "./app/last-place";
+import { NotchWindow } from "./app/NotchWindow";
+import { windowKind } from "./app/notch-mode";
 import { createAppRouter } from "./router";
 import { adoptStyleNonce } from "./lib/style-nonce";
 
@@ -38,23 +40,41 @@ import { adoptStyleNonce } from "./lib/style-nonce";
 adoptStyleNonce();
 
 const queryClient = createAppQueryClient();
-/**
- * Opened where it was left, and remembered as it moves.
- *
- * `onResolved` and not `onBeforeLoad`: what is worth remembering is where the window ENDED UP, and
- * a navigation that is redirected away resolves somewhere else than it started. Subscribed once,
- * out here beside the router it belongs to, because the router lives for the life of the window and
- * an effect inside a component would attach and detach with a re-render.
- */
-const router = createAppRouter(lastPlace());
-router.subscribe("onResolved", ({ toLocation }) => {
-  rememberPlace(toLocation.pathname);
-});
+const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement);
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
-    </QueryClientProvider>
-  </React.StrictMode>,
-);
+/*
+  The floating quota notch loads this same bundle with `?window=notch` (design D8), and gets the
+  notch alone: no router, no remembered place, and a document whose background is see-through, so
+  the window is the drawing and not a box round it.
+*/
+if (windowKind(window.location.search) === "notch") {
+  document.documentElement.classList.add("notch-host");
+  root.render(
+    <React.StrictMode>
+      <QueryClientProvider client={queryClient}>
+        <NotchWindow />
+      </QueryClientProvider>
+    </React.StrictMode>,
+  );
+} else {
+  /**
+   * Opened where it was left, and remembered as it moves.
+   *
+   * `onResolved` and not `onBeforeLoad`: what is worth remembering is where the window ENDED UP,
+   * and a navigation that is redirected away resolves somewhere else than it started. Subscribed
+   * once, out here beside the router it belongs to, because the router lives for the life of the
+   * window and an effect inside a component would attach and detach with a re-render.
+   */
+  const router = createAppRouter(lastPlace());
+  router.subscribe("onResolved", ({ toLocation }) => {
+    rememberPlace(toLocation.pathname);
+  });
+
+  root.render(
+    <React.StrictMode>
+      <QueryClientProvider client={queryClient}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>
+    </React.StrictMode>,
+  );
+}

@@ -87,6 +87,10 @@ That gives the frontend a command that reads an absolute path, which is the part
 
 The shell already holds the daemon's control token, so this does not widen who can act as the owner on this machine; it narrows what the webview can name. `drop.rs` also caps a drop at 500 files and refuses to read one larger than the daemon would accept, so a dropped folder cannot spend the daemon's memory before being told no.
 
+### The floating quota notch
+
+The shell can open a second webview, labelled `notch` (`shell/src-tauri/src/notch.rs`): borderless, always in front, and alive while the main window sits hidden in the tray. It holds **no capability**. `capabilities/default.json` stays scoped to `main`, and a test in `lib.rs` holds it there. It still reaches every command the app itself defines, `get_daemon_token` and `read_dropped` included, because Tauri 2 checks the ACL of an app's own commands only when the app ships an ACL manifest or the caller is a remote origin. This app ships none, and the notch loads the app's own bundle under the same CSP. So the notch can do nothing a second copy of the main window could not do, and it can do nothing a plugin command would allow. What would change this is either of those two conditions flipping: an app ACL manifest (then the notch needs its own grant, or it goes mute), or a remote URL loaded in any window (then the app's commands, the token among them, would be one ACL decision away from that origin).
+
 ## Web content
 
 The web is not a trigger. It is a content origin *inside* triggers that already exist, and it is the first one that

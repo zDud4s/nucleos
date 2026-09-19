@@ -92,6 +92,38 @@
 }
 
 /**
+ * The floating host: the notch window's whole document (design D8).
+ *
+ * The ground is see-through, so the window is the drawing and not a box round it — which is also
+ * why the scrollbar gutter `base.css` reserves is given back: in a window this size it would be a
+ * visible stripe beside the rings. Nothing scrolls here; the Rust side fits the window to the
+ * drawing instead.
+ */
+.notch-host,
+.notch-host body {
+  background: transparent;
+  scrollbar-gutter: auto;
+  overflow: hidden;
+}
+
+/*
+ * Sized by the drawing and never by the window. `max-content` is the load-bearing word: the window
+ * is still folded-narrow at the moment the notch unfolds, and a box that took its width from the
+ * viewport would measure that old width, hand it to `notch_fit`, and grow a few pixels per round —
+ * measured in the spike, where the names landed on top of the next provider's rings.
+ */
+.notch-window {
+  width: max-content;
+}
+
+/* Hung from the top of the screen rather than from the top of a page: no stickiness and no
+   centring, because the window is already centred and exactly this wide. */
+.quota-notch-global {
+  position: static;
+  margin-inline: 0;
+}
+
+/**
  * The page, centred in whatever room the rail leaves it.
  *
  * `max-width` without `margin-inline` is a width that is never used: the page stopped growing at

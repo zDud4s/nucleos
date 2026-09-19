@@ -5,6 +5,8 @@
 pub mod dictation;
 /// What a drop onto the window means, and the only paths this process will read because of one.
 pub mod drop;
+/// Where the quota notch is drawn: inside the main window, or in a floating window of its own.
+pub mod notch;
 /// Dictation decisions. `pub` because it is genuinely this crate's surface: the platform layer
 /// calls into it, and a private module of not-yet-wired functions would be dead code under the
 /// `-D warnings` clippy gate that `scripts/gates.sh` now runs over this package.
@@ -37,6 +39,20 @@ const CLOSE: CloseAction = if cfg!(target_os = "linux") {
 } else {
     CloseAction::Hide
 };
+
+/// What a close request does to the window it arrived on.
+///
+/// The notch is told apart by label because the handler below is shared by every window, and before
+/// the notch existed it hid whichever one asked: closing the floating notch would have hidden it
+/// and left the owner with no notch at all and no setting that said so (design D8, wall 3).
+/// Closing it docks it instead — the notch goes back inside the app, and the mode on disk says so.
+fn close_action_for(label: &str) -> Option<CloseAction> {
+    if label == notch::LABEL {
+        None
+    } else {
+        Some(CLOSE)
+    }
+}
 
 /// Brings the main window back: unminimized, shown and focused. Errors are ignored because there is
 /// nothing useful to do with one here. The label is the default `main`: tauri.conf.json names none.
@@ -155,20 +171,31 @@ pub fn run() {
                 let _ = window.with_webview(|webview| allow_the_microphone(&webview.inner()));
             }
 
+            // The owner's last choice of host. A notch window that fails to open is not a reason to
+            // refuse to start: the contained one is still drawn, because the main window reads the
+            // mode it asked for, not whether the window came up.
+            if notch::stored(app.handle()) == notch::Mode::Global {
+                let _ = notch::open(app.handle());
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
             match event {
-                WindowEvent::CloseRequested { api, .. } => match CLOSE {
+                WindowEvent::CloseRequested { api, .. } => match close_action_for(window.label()) {
                     // Hide instead of quit: the app stays alive in the tray. "Quit" there is the
                     // shell's own process exit; there is NO child daemon process to kill (the
                     // daemon's lifecycle is entirely independent now, Part A).
-                    CloseAction::Hide => {
+                    Some(CloseAction::Hide) => {
                         api.prevent_close();
                         let _ = window.hide();
                     }
                     // No guaranteed tray to come back from, so closing leaves the app.
-                    CloseAction::Exit => window.app_handle().exit(0),
+                    Some(CloseAction::Exit) => window.app_handle().exit(0),
+                    // The notch: let it close, and dock it.
+                    None => {
+                        let _ = notch::record(window.app_handle(), notch::Mode::Contained);
+                    }
                 },
                 // The OS drop is handled HERE rather than in the page, because the page never sees
                 // it: Tauri takes the drop so it can hand over real paths, which is also what makes
@@ -199,6 +226,9 @@ pub fn run() {
             dictation::voice_abandon,
             dictation::voice_register_hotkeys,
             drop::read_dropped,
+            notch::notch_fit,
+            notch::notch_mode,
+            notch::notch_set_mode,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -236,6 +266,24 @@ mod tests {
             CloseAction::Hide,
             "the tray brings the window back here"
         );
+    }
+
+    /// Closing the floating notch must not reach the main window's rule, or it hides the app.
+    #[test]
+    fn closing_the_notch_docks_it_and_leaves_the_app_alone() {
+        assert_eq!(close_action_for(notch::LABEL), None);
+        assert_eq!(close_action_for("main"), Some(CLOSE));
+    }
+
+    /// The notch reaches the token without a capability of its own (see `notch`), so the one
+    /// capability there is must stay scoped to the main window: widening it would hand the floating
+    /// notch every plugin command the app has.
+    #[test]
+    fn the_only_capability_stays_on_the_main_window() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json"))
+                .expect("default.json parses");
+        assert_eq!(capability["windows"], serde_json::json!(["main"]));
     }
 
     /// Spec 1.10: without these, macOS refuses `getUserMedia` (capture.ts, conversation.ts).

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { waitFor } from "@testing-library/react";
+import { fireEvent, waitFor } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -76,5 +76,48 @@ describe("QuotaNotch", () => {
     const { findByText } = renderWithQuery(<QuotaNotch />);
     const note = await findByText("last known");
     expect(note.getAttribute("title")).toContain("unreachable");
+  });
+
+  /**
+   * Floating over every other window, the notch at rest is the rings and nothing else — the D7
+   * readings stay visible without interaction, and the names wait for the pointer.
+   */
+  it("floats folded to its rings, and unfolds when the pointer reaches it", async () => {
+    answer({ providers: [claude()] });
+    const onMove = vi.fn();
+    const { container, findByText, queryByText, getByRole } = renderWithQuery(
+      <QuotaNotch host="global" onMove={onMove} />,
+    );
+    await findByText(/claude: 7d 46% /);
+    expect(container.querySelectorAll(".ui-ring")).toHaveLength(1);
+    expect(queryByText("claude")).toBeNull();
+    expect(container.querySelector("button")).toBeNull();
+
+    fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
+    await findByText("claude");
+    fireEvent.click(getByRole("button", { name: "Put the notch back inside NucleOS" }));
+    expect(onMove).toHaveBeenCalledOnce();
+
+    fireEvent.pointerLeave(container.querySelector(".quota-notch")!);
+    await waitFor(() => expect(queryByText("claude")).toBeNull());
+  });
+
+  /** Inside the app the notch is always unfolded, and its control offers the other host. */
+  it("offers to float when it is contained", async () => {
+    answer({ providers: [claude()] });
+    const onMove = vi.fn();
+    const { findByRole } = renderWithQuery(<QuotaNotch onMove={onMove} />);
+    fireEvent.click(
+      await findByRole("button", { name: "Keep the notch in front of every window" }),
+    );
+    expect(onMove).toHaveBeenCalledOnce();
+  });
+
+  /** A notch with nowhere else to go offers nowhere else. */
+  it("draws no move control when it is given none", async () => {
+    answer({ providers: [claude()] });
+    const { container, findByText } = renderWithQuery(<QuotaNotch />);
+    await findByText("claude");
+    expect(container.querySelector("button")).toBeNull();
   });
 });
