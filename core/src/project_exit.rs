@@ -523,10 +523,16 @@ pub async fn delete_folder(
 
 /// A recursive removal, with the two things the standard one does not do on this machine.
 ///
-/// **Read-only files.** Git marks everything under `.git/objects` read-only, and a plain removal
-/// refuses a read-only file on Windows with `Access is denied`. So the attribute is cleared on the
-/// way down. A repository is the overwhelmingly common case here, which makes this the ordinary
-/// path rather than an edge one.
+/// **Permissions in the way.** Which permission blocks a removal is a platform question, and the
+/// answer on one platform is wrong on the other. On Windows the obstacle is the read-only ATTRIBUTE
+/// of the file: git marks everything under `.git/objects` read-only, and a plain removal refuses
+/// such a file with `Access is denied`, so the attribute is cleared on the way down. On Unix a
+/// file's own write bit is never consulted by `unlink` — the write bit of the DIRECTORY holding the
+/// entry is — so clearing the file's would buy no deletion at all. What has to be widened there is
+/// a directory missing its owner-write bit, `0o555` being how Go's module cache ships its
+/// directories. Both halves live in `prepare_for_removal`, which is called on the way down. A
+/// repository is the overwhelmingly common case here, which makes this the ordinary path rather
+/// than an edge one.
 ///
 /// **Junctions and symlinks.** `symlink_metadata` rather than `metadata`, and a link is unlinked
 /// rather than descended into. Not hypothetical in this repository: `nucleos/target` is a junction
@@ -546,14 +552,7 @@ fn remove_tree(path: &Path) -> std::io::Result<()> {
         };
     }
 
-    let mut permissions = meta.permissions();
-    if permissions.readonly() {
-        #[allow(clippy::permissions_set_readonly_false)]
-        permissions.set_readonly(false);
-        // Best effort: a permission that will not clear is reported by the removal below, in words
-        // about the file that actually refused rather than about this attempt.
-        let _ = std::fs::set_permissions(path, permissions);
-    }
+    prepare_for_removal(path, &meta);
 
     if meta.is_dir() {
         for entry in std::fs::read_dir(path)? {
@@ -562,6 +561,44 @@ fn remove_tree(path: &Path) -> std::io::Result<()> {
         std::fs::remove_dir(path)
     } else {
         std::fs::remove_file(path)
+    }
+}
+
+/// Widens exactly what the removal underneath needs, which is not the same permission on the two
+/// platforms.
+///
+/// On Windows the read-only attribute belongs to the entry itself and a removal refuses while it is
+/// set, so it is cleared — the arm below is that rule and nothing else.
+///
+/// On Unix the same gesture would be a leak in exchange for nothing. `set_readonly(false)` grants
+/// write to the owner, the group AND everybody else — `0o444` becomes `0o666` — which is precisely
+/// why clippy ships `permissions_set_readonly_false` as a lint. And it buys no deletion: `unlink`
+/// never consults the FILE's write bit, only the write bit of the DIRECTORY the entry lives in. So
+/// files are left exactly as they are. A directory is the one thing that can genuinely stand in the
+/// way: `0o555` grants read and execute, which is enough to walk it and not enough to unlink
+/// anything inside it, and that is the mode Go's module cache writes for every directory it
+/// creates. The grant is the owner's three bits and stops there; the group and the world need
+/// nothing, because the process doing the deleting is the owner.
+fn prepare_for_removal(path: &Path, meta: &std::fs::Metadata) {
+    #[cfg(windows)]
+    {
+        let mut permissions = meta.permissions();
+        if permissions.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            // Best effort: a permission that will not clear is reported by the removal below, in words
+            // about the file that actually refused rather than about this attempt.
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+
+    #[cfg(unix)]
+    if meta.is_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o700));
+        }
     }
 }
 
@@ -1178,5 +1215,81 @@ mod tests {
         assert_eq!(fresh.unwrap().forgets.runs, 0);
 
         assert!(record(&pool, "ghost").await.unwrap().is_none());
+    }
+
+    /// **Unlinking needs the parent directory's write bit, never the file's.**
+    ///
+    /// Clearing the read-only attribute is a Windows necessity that Unix answers far too
+    /// generously: `set_readonly(false)` on a `0o444` file writes `0o666`, handing write to the
+    /// group and to everybody else in exchange for nothing at all. The removal underneath it would
+    /// have succeeded either way, because what `unlink` consults is the mode of the DIRECTORY the
+    /// entry lives in and never the mode of the file itself. So the widening buys no deletion and
+    /// leaks a permission on every file of every project folder this app has ever deleted — on
+    /// paths whose names are already known, for as long as the walk takes to reach them.
+    #[cfg(unix)]
+    #[test]
+    fn preparing_a_read_only_file_never_widens_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let holder = tempfile::tempdir().unwrap();
+        let object = holder.path().join("ab12");
+        std::fs::write(&object, b"an object").unwrap();
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let meta = std::fs::symlink_metadata(&object).unwrap();
+        prepare_for_removal(&object, &meta);
+
+        let mode = std::fs::metadata(&object).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o444, "got {mode:o}");
+    }
+
+    /// **A locked directory is the one thing that cannot be emptied without its owner bits.**
+    ///
+    /// Go's module cache ships its directories `0o555`, and a project folder that has ever built Go
+    /// code holds thousands of them. Read and execute are enough to walk such a directory and not
+    /// enough to unlink anything inside it, so this is the single case on Unix where the walk must
+    /// widen something before it can descend. It widens it for the owner and stops there: `0o755`,
+    /// not the `0o777` that `set_readonly(false)` would write, because the group and the world need
+    /// nothing here and the process doing the deleting is the owner.
+    #[cfg(unix)]
+    #[test]
+    fn preparing_a_locked_directory_grants_only_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let holder = tempfile::tempdir().unwrap();
+        let locked = holder.path().join("pkg");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let meta = std::fs::symlink_metadata(&locked).unwrap();
+        prepare_for_removal(&locked, &meta);
+
+        let mode = std::fs::metadata(&locked).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "got {mode:o}");
+    }
+
+    /// Both halves at once, on a real tree: the narrow grant still deletes.
+    ///
+    /// A `0o444` file inside a `0o555` directory is what a Go module cache looks like on disk, and
+    /// it is the shape that would appear to justify widening the file — it is read-only, and the
+    /// tree must go. It does not justify it: the directory's new owner-write bit is the whole of
+    /// what lets the entry be unlinked, and the file's own bits are never consulted. Asserting that
+    /// the tree is gone is what separates a permission left alone from a deletion left undone.
+    #[cfg(unix)]
+    #[test]
+    fn a_locked_tree_of_read_only_files_is_still_deleted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let holder = tempfile::tempdir().unwrap();
+        let d = holder.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let f = d.join("f");
+        std::fs::write(&f, b"a module file").unwrap();
+        // The file first and the directory second: writing into `d` is refused once `d` is locked.
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        remove_tree(&d).unwrap();
+        assert!(!d.exists(), "the locked tree is still there");
     }
 }
