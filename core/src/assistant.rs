@@ -1994,7 +1994,7 @@ pub(crate) async fn recent_exchanges(
 /// Every `runs.answered_by` wire word `spawn_local_turn` below ever writes.
 ///
 /// One array, read by `answered_by_a_local_agent_loop` below and by nothing else — the single place
-/// that has to grow the day a third `LocalChat` joins `runner::OllamaChat` and `openrouter::OpenRouterChat`,
+/// that has to grow the day a third `LocalChat` joins `runner::OllamaChat` and `openai_compatible::OpenAiCompatibleChat`,
 /// because `spawn_local_turn`'s own `answered_by` parameter is generalised to accept whatever wire
 /// word a caller passes it, and this is the one spot that says which words those calls actually use.
 const LOCAL_AGENT_ANSWERED_BY: &[&str] = &["local", "openrouter"];
@@ -2018,7 +2018,7 @@ pub(crate) fn answered_by_a_local_agent_loop(answered_by: &str) -> bool {
 /// than the agent CLI — the local model on this machine (`answered_by == "local"`) or the hosted
 /// one reached over OpenRouter (`answered_by == "openrouter"`). One body for both: the two differ
 /// only in which `LocalChat` the assistant was built with (`runner::OllamaChat` or
-/// `openrouter::OpenRouterChat`) and in that one wire word, and a second copy of everything else
+/// `openai_compatible::OpenAiCompatibleChat`) and in that one wire word, and a second copy of everything else
 /// here is exactly the drift this module's map exists to prevent.
 ///
 /// Deliberately NOT a variant inside `spawn_assistant_turn`. That body is almost entirely about
