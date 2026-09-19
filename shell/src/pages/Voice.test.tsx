@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -169,6 +169,33 @@ describe("Voice — hotkey registration", () => {
     expect(capture).not.toBeNull();
     expect(within(capture as HTMLElement).getByText("hotkeys failed")).toBeDefined();
     expect(within(capture as HTMLElement).queryByText("idle")).toBeNull();
+  });
+
+  it("says there are no global hotkeys on Wayland instead of registering them", async () => {
+    // The sentence belongs to the host, not to this page: `dictation.rs` answers
+    // `voice_hotkeys_unavailable` with it only when the session is Wayland.
+    const sentence =
+      "this desktop runs Wayland, which gives no application global hotkeys; use the buttons below";
+    daemon.apiFetch.mockImplementation(daemonBaseline(voiceConfig()));
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "voice_phase") return "idle";
+      if (cmd === "voice_hotkeys_unavailable") return sentence;
+      if (cmd === "voice_register_hotkeys") return [];
+      return undefined;
+    });
+
+    renderWithQuery(<Voice />);
+
+    // `textContent` and not a matcher: this suite has no jest-dom.
+    await waitFor(() => {
+      expect(document.body.textContent).toContain(sentence);
+    });
+    // The half that matters. Saying the words while still registering chords no
+    // compositor will ever deliver is worse than today's silence - the page would
+    // claim to have hotkeys and explain that it has none, in the same breath.
+    expect(
+      mockInvoke.mock.calls.filter(([cmd]) => cmd === "voice_register_hotkeys"),
+    ).toEqual([]);
   });
 });
 

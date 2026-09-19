@@ -198,6 +198,7 @@ pub fn run() {
             dictation::voice_paste,
             dictation::voice_abandon,
             dictation::voice_register_hotkeys,
+            dictation::voice_hotkeys_unavailable,
             drop::read_dropped,
         ])
         .build(tauri::generate_context!())

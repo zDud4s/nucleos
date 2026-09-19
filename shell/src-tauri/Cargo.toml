@@ -49,7 +49,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-autostart = "2.5.1"
 tauri-plugin-global-shortcut = "2.3.2"
-arboard = "3.6.1"
+# `wayland-data-control` costs nothing on Windows: it only enables arboard's optional
+# `wl-clipboard-rs` dependency, which is itself gated on unix in arboard's manifest, so
+# outside Linux the feature pulls in no crate and changes no code path. On Wayland it is
+# what lets the clipboard be written at all, and writing the clipboard is the whole of the
+# fallback there (see `WAYLAND_HELD` in `dictation.rs`).
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 # No tauri-plugin-updater: it was registered with a placeholder signing key and an
 # example.invalid endpoint, held no updater capability and was imported by no frontend code,
@@ -63,6 +68,25 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Wi
 # webkit2gtk 2.0.2, glib 0.18.5), so this declares what is built rather than adding a crate.
 webkit2gtk = "2.0"
 glib = "0.18"
+# The X11 protocol, spoken directly rather than through a synthetic-input crate. `xtest` is
+# the extension that lets one client inject a key event into another's focused window, which
+# is the Linux half of `dictation::platform::send_paste`. x11rb is already in the lock at this
+# version (arboard reaches for it), so this declares what is built rather than adding a crate.
+x11rb = { version = "0.13", features = ["xtest"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Quartz, for the macOS half of `dictation::platform`: the on-screen window list that names the
+# application in front, the event source whose flags say which modifiers are physically down, and
+# the synthesised Cmd+V itself. `core-foundation` comes in beside it because the window list is a
+# `CFArray` of `CFDictionary`, and reading one means wrapping CF types by hand. Both are already in
+# `Cargo.lock` at these versions (core-graphics 0.25.0, core-foundation 0.10.1 - arboard and wry
+# reach for them on macOS), so this declares what is built rather than adding a crate.
+#
+# `CGEventSourceFlagsState` and `AXIsProcessTrusted` are NOT wrapped by either crate and are
+# declared `extern "C"` in `dictation.rs` against `CoreGraphics` and `ApplicationServices`, which
+# need no manifest entry: a framework is named by the `#[link]` attribute, not by a dependency.
+core-graphics = "0.25"
+core-foundation = "0.10"
 
 [dev-dependencies]
 # For `drop.rs`'s walk tests, which need a real directory tree to walk.
