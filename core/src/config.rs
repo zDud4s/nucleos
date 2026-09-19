@@ -654,6 +654,36 @@ Do NOT rephrase or restructure sentences that are already clear, and keep number
 versions, units and paths exactly as they were said — digits stay digits.
 Keep the original language. Return only the corrected text.";
 
+/// The chords the pillar ships with when `.ai/voice.yaml` names none, per platform.
+///
+/// macOS is the reason this is a constant rather than three literals in `Default`: the
+/// `Ctrl+Alt` family is not free there. Cmd+Space is Spotlight, Ctrl+Space switches the input
+/// source, Cmd+Option+Space opens Finder search, Ctrl+Cmd+Space is the Character Viewer, and
+/// Ctrl+Option is the modifier pair VoiceOver reserves for itself; a global Cmd+Shift+letter
+/// would steal an application shortcut in every application at once. Three modifiers held
+/// together reach no default macOS binding, which is why that arm adds Command — a chord the
+/// desktop already owns does not fail loudly, it simply never reaches this app, and on screen
+/// that is indistinguishable from dictation being broken.
+///
+/// The spelling is `Super` and not `Cmd` because `global-hotkey`'s parser (`hotkey.rs:205`)
+/// accepts "COMMAND" | "CMD" | "SUPER" as one and the same modifier, so this name parses and
+/// reads the same on every host.
+///
+/// **UNVERIFIED on a real Mac.** The collision list above is read from Apple's documented
+/// shortcuts, not pressed: CI compiles this arm, and only a person on a Mac can confirm that
+/// the three chords it ships are free.
+#[cfg(target_os = "macos")]
+const DEFAULT_HOTKEYS: [&str; 3] = [
+    "Ctrl+Alt+Super+Space",
+    "Ctrl+Alt+Super+M",
+    "Ctrl+Alt+Super+C",
+];
+
+/// Windows and Linux leave the `Ctrl+Alt` family alone, so the shorter chords stay — see the
+/// macOS arm above for why that platform needs a third modifier.
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_HOTKEYS: [&str; 3] = ["Ctrl+Alt+Space", "Ctrl+Alt+M", "Ctrl+Alt+C"];
+
 /// `.ai/voice.yaml`. Every field defaults, so a partial file is valid and an absent one leaves the
 /// pillar off without comment.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -713,9 +743,9 @@ impl Default for VoiceConfig {
             stt_command: String::new(),
             tts_command: String::new(),
             tts_url: String::new(),
-            hotkey: "Ctrl+Alt+Space".to_string(),
-            memo_hotkey: "Ctrl+Alt+M".to_string(),
-            conversation_hotkey: "Ctrl+Alt+C".to_string(),
+            hotkey: DEFAULT_HOTKEYS[0].to_string(),
+            memo_hotkey: DEFAULT_HOTKEYS[1].to_string(),
+            conversation_hotkey: DEFAULT_HOTKEYS[2].to_string(),
             retain_dictations_days: 7,
             hints: Vec::new(),
             closing_words: vec!["câmbio".into()],
@@ -3446,6 +3476,47 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         let clamped = load_voice_config(&path);
         assert_eq!(clamped.cleanup_prompt, DEFAULT_CLEANUP_PROMPT);
         assert_eq!(clamped.retain_dictations_days, 30);
+    }
+
+    /// The shipped chords have to be chords THIS platform's own desktop leaves free.
+    ///
+    /// macOS is the one that breaks: `Ctrl+Alt+Space` is taken by the system's input-source
+    /// switcher there, so registering it wins nothing and costs the person a key they already
+    /// use. Adding the Command key clears the whole family at once. `Super` is the spelling and
+    /// not `Cmd` only because `global-hotkey`'s parser treats "COMMAND" | "CMD" | "SUPER" as one
+    /// modifier, so the name is free and this one reads the same on every host.
+    ///
+    /// The second half is what keeps the constant honest: a default written twice is two places
+    /// to change, and the platform that gets forgotten is the one nobody develops on.
+    #[test]
+    fn the_default_hotkeys_avoid_this_platforms_system_chords() {
+        #[cfg(target_os = "macos")]
+        let expected = [
+            "Ctrl+Alt+Super+Space",
+            "Ctrl+Alt+Super+M",
+            "Ctrl+Alt+Super+C",
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let expected = ["Ctrl+Alt+Space", "Ctrl+Alt+M", "Ctrl+Alt+C"];
+
+        assert_eq!(
+            DEFAULT_HOTKEYS, expected,
+            "the defaults this platform ships have to be the chords its desktop leaves free"
+        );
+
+        let defaults = VoiceConfig::default();
+        assert_eq!(
+            defaults.hotkey, DEFAULT_HOTKEYS[0],
+            "the dictation default must come from DEFAULT_HOTKEYS, not from a second literal"
+        );
+        assert_eq!(
+            defaults.memo_hotkey, DEFAULT_HOTKEYS[1],
+            "the memo default must come from DEFAULT_HOTKEYS, not from a second literal"
+        );
+        assert_eq!(
+            defaults.conversation_hotkey, DEFAULT_HOTKEYS[2],
+            "the conversation default must come from DEFAULT_HOTKEYS, not from a second literal"
+        );
     }
 
     /// The second runner ships dark, so what this key parses to is what decides whether a run is
