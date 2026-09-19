@@ -12986,6 +12986,57 @@ mod tests {
         );
     }
 
+    /// The bound that keeps a megabyte of test runner out of the database and out of the next
+    /// prompt, and the boundary walk that keeps that bound from being a crash.
+    ///
+    /// Two claims, and the second is the one with teeth. `gate.rs` caps what it captures at 1 MiB,
+    /// which is the right bound against a runaway suite and far too much to paste into a retry — so
+    /// `record_gate` stores the TAIL and nothing else. The tail and not the head: a runner prints
+    /// its failures and its summary line last, and that is the part a retry can act on.
+    ///
+    /// The second claim is that the cut lands where a character ends. Slicing a `str` by a raw byte
+    /// index panics, `record_gate` runs inside the daemon, and a gate prints whatever the project's
+    /// tools print — an accented test name, a `✗`, a path off a non-ASCII branch. Nothing asserted
+    /// this until now, which is worse than it sounds: the guard and its absence look identical from
+    /// outside, because both pass every ASCII gate anybody has ever run. The failure was reserved
+    /// for the first non-ASCII one.
+    #[test]
+    fn the_stored_gate_output_is_a_tail_that_never_cuts_a_character_in_half() {
+        let short = "FAILED test_x\ntest result: FAILED. 1 failed";
+        assert_eq!(
+            gate_output_tail(short),
+            short,
+            "an output already inside the bound must arrive whole"
+        );
+
+        let long = format!("{}test result: FAILED. 3 failed", "noise\n".repeat(20_000));
+        let kept = gate_output_tail(&long);
+        assert!(
+            kept.len() <= GATE_OUTPUT_TAIL,
+            "kept {} bytes, over the {GATE_OUTPUT_TAIL}-byte bound",
+            kept.len()
+        );
+        assert!(
+            kept.ends_with("test result: FAILED. 3 failed"),
+            "the summary line is the part a retry acts on, and it did not survive: {kept}"
+        );
+
+        // `€` is three bytes and 4096 is not a multiple of three, so the naive cut lands INSIDE a
+        // character here. Chosen rather than stumbled upon: a two-byte character divides 4096
+        // evenly, so an implementation with no walk at all would pass a test written with `é`.
+        let accented = "€".repeat(2_000);
+        let walked = gate_output_tail(&accented);
+        assert!(
+            accented.ends_with(walked),
+            "the walk moved the cut past the end of the output"
+        );
+        assert!(
+            GATE_OUTPUT_TAIL - walked.len() < 4,
+            "the walk skipped {} bytes looking for a boundary, which is more than one character",
+            GATE_OUTPUT_TAIL - walked.len()
+        );
+    }
+
     /// §5.4: the review node's independence is structural, not requested. It is never given a
     /// builder's session because no builder session is kept for it to resume.
     #[test]
