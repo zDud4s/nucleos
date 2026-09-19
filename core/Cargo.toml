@@ -17,7 +17,7 @@ rand = "0.10.2"
 # `native-tls` is NOT optional and must not be trimmed as an unused feature. Without a TLS backend
 # `reqwest` builds fine and every `https://` request fails at runtime with "error sending request
 # for url" — which is how this crate shipped for months unable to reach either of its two non-loopback
-# hosts (`openrouter::OPENROUTER_BASE_URL`, `capabilities::OLLAMA_REGISTRY_URL`). The hosted assistant
+# hosts (`openai::OPENROUTER_BASE_URL`, `capabilities::OLLAMA_REGISTRY_URL`). The hosted assistant
 # route had never completed a request; 3339 tests missed it because every fixture is an `axum`
 # listener on plain `http://127.0.0.1`. `capabilities::tests::
 # the_crate_is_built_with_a_tls_backend_and_stops_compiling_without_one` is the guard, and it fails

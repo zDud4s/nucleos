@@ -60,7 +60,7 @@ mod mentions;
 mod notes;
 mod notify;
 mod notify_policy;
-mod openrouter;
+mod openai;
 mod ownership;
 mod pii_shadow;
 mod presets;
@@ -126,7 +126,7 @@ const EMAIL_PASSWORD_KEY: &str = "email-imap-password";
 const WEB_SEARCH_KEY: &str = "web-search-api-key";
 /// OpenRouter's own API key, in Credential Manager for the same reason every secret above is: it
 /// never sits in `.ai/models.yaml`, which only ever names the model (`hosted_assistant_model`) and
-/// is a versioned file. `openrouter::OpenRouterChat::new` refuses outright when this comes back
+/// is a versioned file. `openai::OpenAiChat::new` refuses outright when this comes back
 /// `None` — see its own doc comment for why that refusal happens before any request leaves the
 /// machine rather than after a 401 comes back.
 const OPENROUTER_KEY: &str = "openrouter-api-key";
@@ -1013,30 +1013,66 @@ async fn main() {
         None
     };
 
+    // WHICH local server answers a local turn, and whether the local route may run at all, read
+    // from the file ONCE, here — above BOTH of its readers: the capability probe immediately below
+    // and the assistant factory further down. One resolution and not two is the whole point. A
+    // probe that picked its own dialect and a factory that read the file again could disagree about
+    // which engine is configured, and the way that disagreement shows up is the local assistant
+    // being reported disabled while the server the operator named answers perfectly — so both are
+    // handed the same `ResolvedLocalEngine` and cannot disagree.
+    //
+    // A refusal — an engine name this daemon does not serve, `openai` with no address, an address
+    // off this machine — DISABLES the route rather than falling back to Ollama. That fallback is
+    // the worst outcome available: the operator named a server, was told nothing, and their turns
+    // went somewhere else. `local_model: None` is how this crate already says "route off" —
+    // `assistants::serves(Brain::Local)` refuses `RouteNotConfigured`, which `http.rs` renders as
+    // `assistant::NO_LOCAL_MODEL` — so no new refusal variant is needed to say it here.
+    let resolved_local_engine = match models_config.local_engine() {
+        Ok(resolved) => Some(resolved),
+        Err(refusal) => {
+            // `error!` and not `warn!`, unlike the hosted half-setup lines below: those describe a
+            // setup somebody has not finished, while this one is a line somebody WROTE that this
+            // daemon will not honour, and the message names the key that repairs it.
+            tracing::error!(
+                reason = %refusal.message(),
+                "the configured local engine is refused; chats marked local will refuse \
+                 rather than answer"
+            );
+            None
+        }
+    };
+
     // The model that answers a chat turn asking to be answered on this machine — resolved here to
     // an `Option<String>` (was, before the assistant factory, a whole `LocalAssistant` built once)
     // and handed to `assistants::ConfiguredAssistants` below, which builds the assistant per turn.
     //
-    // Probed exactly like local triage and voice cleanup, against this feature's own window: a turn
-    // accumulates its tool schemas and every result on each round, so it needs more room than a
-    // single triage prompt and the probe has to say so or Ollama silently truncates the middle of a
-    // conversation.
+    // Probed against this feature's own window, in whichever dialect the engine resolved above
+    // names: a turn accumulates its tool schemas and every result on each round, so it needs more
+    // room than a single triage prompt and the probe has to say so, or a local server silently
+    // truncates the middle of a conversation. Local triage and voice cleanup above still probe
+    // Ollama directly — they are different roles on a different config key, and moving them is
+    // not this change.
     //
     // A failed probe falls back rather than disabling, which is the opposite of local triage and for
     // a reason worth stating: triage refuses because the alternative is mail bodies leaving the
     // machine, while this turn reads only the daemon's own state, so the fallback is what already
     // happens today. Warning and carrying on is right here and would be wrong there.
-    let local_model = match models_config.local_assistant_model.clone() {
-        Some(model) => {
+    let local_model = match (
+        models_config.local_assistant_model.clone(),
+        resolved_local_engine.as_ref(),
+    ) {
+        (Some(model), Some(resolved)) => {
             // The requirement's own field, not `local_agent::TURN_NUM_CTX` directly — see the
             // same note on the local-triage probe above; `CAPABILITY_REQUIREMENT` is defined
             // from `TURN_NUM_CTX`, so the two stay linked without a second number to keep in
             // step.
-            let declared = capabilities::discover_ollama_as(
+            let declared = capabilities::discover_local_as(
                 &reqwest::Client::new(),
-                runner::OLLAMA_BASE_URL,
+                resolved.engine,
+                &resolved.base_url,
                 &model,
                 local_agent::CAPABILITY_REQUIREMENT.context_tokens,
+                resolved.declared_context_tokens,
                 "local assistant",
             )
             .await;
@@ -1067,7 +1103,9 @@ async fn main() {
                 }
             }
         }
-        None => None,
+        // No model named, or an engine this daemon refused: either way there is nothing to probe
+        // and nothing to enable, and the refusal was already said out loud where it was read.
+        _ => None,
     };
 
     // The hosted model (and key) that answer a chat turn asking to be answered over OpenRouter —
@@ -1157,6 +1195,32 @@ async fn main() {
         None => None,
     };
 
+    // The factory reads the SAME resolution the probe above read — resolved once, beside the probe,
+    // and destructured here. Reading `local_engine()` a second time would be a second decision, and
+    // two decisions about which engine is configured are two decisions that can disagree; this pair
+    // cannot, because there is only one of it.
+    let (local_model, local_base_url, local_engine, local_context_tokens) =
+        match resolved_local_engine {
+            Some(resolved) => (
+                local_model,
+                resolved.base_url,
+                resolved.engine,
+                resolved.declared_context_tokens,
+            ),
+            // Inert values beside a `local_model` of `None`: with the route off, nothing ever
+            // reads the address or the engine. Today's constant and today's engine, so that if
+            // anything ever does read them it reads the daemon's own default rather than half of
+            // the configuration that was just refused. `local_model` is stated `None` here rather
+            // than left to the probe having skipped: the route being off is what the factory is
+            // handed, never something it has to infer from a branch it cannot see.
+            None => (
+                None,
+                runner::OLLAMA_BASE_URL.to_string(),
+                config::LocalEngine::Ollama,
+                None,
+            ),
+        };
+
     // Assembles the assistant that answers a turn from what was just resolved above — one factory
     // in place of the two singletons `local_assistant`/`hosted_assistant` used to be. No production
     // caller until this packet; `AppState.assistants` below is the first one.
@@ -1168,8 +1232,12 @@ async fn main() {
             "http://127.0.0.1:8791".to_string(),
             token_value.clone(),
             pool.clone(),
-            runner::OLLAMA_BASE_URL.to_string(),
+            // The RESOLVED address, not `runner::OLLAMA_BASE_URL` directly. Identical for an
+            // install that named no engine — `local_engine()` resolves absence to Ollama on that
+            // same constant — and the whole point for one that named another server.
+            local_base_url,
         )
+        .with_local_engine(local_engine, local_context_tokens)
         .with_agent_clis(Arc::new(claude_runner()), models_config.codex_model.clone()),
     );
 

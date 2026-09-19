@@ -11484,11 +11484,25 @@ async fn menu(
     Vec<crate::config::AssistantChoice>,
 ) {
     let config = models_config();
-    let installed = crate::capabilities::installed_local_models(
-        ollama_tags_client(),
-        crate::runner::OLLAMA_BASE_URL,
-    )
-    .await;
+    // "Which models has `ollama pull` fetched?" is an Ollama question, asked of `/api/tags`, which
+    // only Ollama serves. On any other resolved engine — and on a refused one, whose local rows
+    // `catalogue_scoped` drops entirely — the probe is a dial nothing reads, paid on every menu
+    // open against a server that does not answer it, so the list is simply empty instead.
+    let installed = if matches!(
+        config.local_engine(),
+        Ok(crate::config::ResolvedLocalEngine {
+            engine: crate::config::LocalEngine::Ollama,
+            ..
+        })
+    ) {
+        crate::capabilities::installed_local_models(
+            ollama_tags_client(),
+            crate::runner::OLLAMA_BASE_URL,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
     let choices = match asking {
         Asking::Daemon => config.catalogue_with_installed(&installed),
         Asking::Chat { rooted } => config.catalogue_for_chat(&installed, rooted),
