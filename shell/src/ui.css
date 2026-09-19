@@ -1633,6 +1633,75 @@ ol.ui-well {
   border-color: var(--tone-info-border);
 }
 
+/**
+ * A reading drawn as concentric arcs (`Ring.tsx`).
+ *
+ * Every colour here is a tone token, never a literal and never `--accent`: the tone is chosen by
+ * `readState` in TypeScript and this file only spends it. A ring that picked its own colour would
+ * be a second state map nobody greps.
+ *
+ * `--tone-*-fg` rather than `--tone-*-border` — unlike a pip, an arc IS the stroke, so it needs the
+ * weight of a foreground rather than the hairline a filled dot sits inside.
+ */
+.ui-ring {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+
+.ui-ring-face {
+  display: block;
+  overflow: visible;
+}
+
+/* The unfilled part of a track. Faint on purpose: it is the shape of the question, not an answer. */
+.ui-ring-groove {
+  fill: none;
+  stroke: var(--surface-sunken);
+}
+
+/* A track with no measurement behind it: dashed and empty, the convention `.ui-runpipe-unreached`
+   already carries. No arc is drawn over it at all — an empty ring and an unreadable one must not
+   be the same picture, and a dash says *this number is not real* without borrowing a state's
+   colour to say it. */
+.ui-ring-unmeasured {
+  stroke: var(--tone-off-border);
+  stroke-dasharray: 3 3;
+}
+
+.ui-ring-arc {
+  fill: none;
+  stroke-linecap: round;
+}
+
+.ui-ring-active {
+  stroke: var(--tone-active-fg);
+}
+
+.ui-ring-shadow {
+  stroke: var(--tone-shadow-fg);
+}
+
+.ui-ring-off {
+  stroke: var(--tone-off-fg);
+}
+
+.ui-ring-pending {
+  stroke: var(--tone-pending-fg);
+}
+
+.ui-ring-paused {
+  stroke: var(--tone-paused-fg);
+}
+
+.ui-ring-danger {
+  stroke: var(--tone-danger-fg);
+}
+
+.ui-ring-info {
+  stroke: var(--tone-info-fg);
+}
+
 /* Past eight slots only the held pips are drawn, and this says out of how many — the daemon's
    numbers, so its face, and tabular so `3/12` and `11/12` hold one width. */
 .ui-pips-count {

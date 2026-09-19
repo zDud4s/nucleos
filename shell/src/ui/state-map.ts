@@ -27,6 +27,7 @@ export type StateDomain =
   | "job"
   | "gate"
   | "wait_reason"
+  | "quota"
   | "pillar"
   | "collision"
   | "slot"
@@ -422,6 +423,34 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     slot: { tone: "info", label: "waiting for a slot" },
     excluded: { tone: "paused", label: "held by an exclusion" },
     disk: { tone: "paused", label: "held by a full disk" },
+  },
+
+  /**
+   * How much of one provider's usage window is gone (`core/src/quota.rs`).
+   *
+   * The vocabulary is the Rust `QUOTA_STATES` array and is checked against it
+   * by `state-map-completeness.test.ts` — the daemon computes the state from
+   * the owner's thresholds and sends the word, so this table only paints it.
+   *
+   * The two quiet tones are the point of the domain, not an afterthought.
+   * `unmeasured` is a provider with no readable source: there is no number, so
+   * the ring is drawn dashed and empty, and the later brake ignores it
+   * entirely. `stale` is a real number about a window that has already rolled
+   * over. Both are `off` rather than `info`, because `info` would state them
+   * with the same confidence as a figure somebody measured — which is the one
+   * thing a quota display must never do, since the same reading is what a
+   * brake is later allowed to stop work on.
+   *
+   * `warn` is Awaiting-You Amber and `exhausted` is red: the first asks the
+   * owner to decide what to spend the rest on, the second says the decision has
+   * been made for them.
+   */
+  quota: {
+    ok: { tone: "info", label: "within the window" },
+    warn: { tone: "pending", label: "most of the window is gone" },
+    exhausted: { tone: "danger", label: "the window is spent" },
+    stale: { tone: "off", label: "this window has since reset" },
+    unmeasured: { tone: "off", label: "no quota source to read" },
   },
 
   /**

@@ -20,6 +20,15 @@ export const POLL = {
   slow: 30000,
   /** Voice captures, which arrive from outside the window. */
   voice: 5000,
+  /**
+   * Provider quota. A minute, and the number is not a taste.
+   *
+   * It is the TTL the quota sidecar holds a good reading for, which is itself the one the Python
+   * dashboard settled on against the same endpoint. Asking faster buys nothing — the sidecar
+   * answers from its cache — and the whole point of a quota display is that watching the quota must
+   * not become a reason to run out of it.
+   */
+  quota: 60000,
 } as const;
 
 export type PollCadence = (typeof POLL)[keyof typeof POLL];

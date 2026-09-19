@@ -12,6 +12,7 @@ import { ConnectionGate } from "./ConnectionGate";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { NotificationsDrawer } from "./NotificationsDrawer";
 import { PaletteTrigger } from "./PaletteTrigger";
+import { QuotaNotch } from "./QuotaNotch";
 import { Sidebar } from "./Sidebar";
 import { NAV_ITEMS } from "./nav";
 
@@ -154,6 +155,13 @@ function Frame() {
           <KillSwitchControl />
         </Sidebar>
         <main className="app-main">
+          {/*
+            The notch, contained. At the top edge of the page area rather than inside it, because it
+            is about the machine and not about whatever page is open — and because that is where
+            the second window will sit when it exists, so nothing about the drawing has to change
+            when the mode becomes a setting.
+          */}
+          <QuotaNotch />
           <div className="app-page">
             <Outlet />
           </div>
