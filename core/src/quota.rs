@@ -229,41 +229,54 @@ pub async fn report(
     };
 
     match client.report().await {
-        Ok(live) => {
-            let cached = live.cached;
-            let providers: Vec<Provider> = live.providers.into_iter().map(from_reading).collect();
-            // Recorded before answering, and a write that fails does NOT fail the answer: the table
-            // is a fallback, so losing it costs the next reader a fresh figure and must not cost
-            // this one the figure already in hand.
-            if let Err(error) = record(pool, &providers, now).await {
-                tracing::warn!(%error, "the quota reading could not be stored");
-            }
-            // Judged here, on the live path only, because this is the one place a NEW reading
-            // arrives — every caller of this module comes through it, so a warning cannot be
-            // skipped by a future second caller forgetting to ask for one.
-            //
-            // The stored fallback deliberately does not warn: those figures were already judged
-            // when they were read, and re-judging them would warn about a window that may well
-            // have rolled over while the sidecar was down.
-            //
-            // Best-effort, exactly like the write above: a warning that cannot be recorded must not
-            // cost the reader the figure already in hand. `observe_run` is called the same way, for
-            // the same reason.
-            if let Err(error) = warn(pool, &providers, now).await {
-                tracing::warn!(%error, "the quota warning was not delivered");
-            }
-            QuotaReport {
-                providers,
-                source: Source::Sidecar,
-                cached,
-                unreachable: None,
-            }
-        }
+        Ok(live) => live_report(pool, live, now).await,
         Err(error) => {
             // The sidecar's own message, which by construction carries no token — see
             // `sidecars/quota/claude`, where that property has a test of its own.
             stored_report(pool, &error.to_string()).await
         }
+    }
+}
+
+/// Everything that happens to a reading the sidecar has just answered: store it, judge it, return
+/// it.
+///
+/// Split out of [`report`] so that it can be tested without an HTTP server. That is not tidiness:
+/// every test of `report` uses [`QuotaRuntime::disabled`], which returns at the guard above before
+/// either of these two calls, so with the body inline the storing and the warning are wired by
+/// lines no test executes — and deleting either call left the suite green.
+async fn live_report(
+    pool: &SqlitePool,
+    live: crate::quota_client::QuotaReport,
+    now: chrono::DateTime<chrono::Utc>,
+) -> QuotaReport {
+    let cached = live.cached;
+    let providers: Vec<Provider> = live.providers.into_iter().map(from_reading).collect();
+    // Recorded before answering, and a write that fails does NOT fail the answer: the table is a
+    // fallback, so losing it costs the next reader a fresh figure and must not cost this one the
+    // figure already in hand.
+    if let Err(error) = record(pool, &providers, now).await {
+        tracing::warn!(%error, "the quota reading could not be stored");
+    }
+    // Judged here, on the live path only, because this is the one place a NEW reading arrives —
+    // every caller of this module comes through it, so a warning cannot be skipped by a future
+    // second caller forgetting to ask for one.
+    //
+    // The stored fallback deliberately does not warn: those figures were already judged when they
+    // were read, and re-judging them would warn about a window that may well have rolled over while
+    // the sidecar was down.
+    //
+    // Best-effort, exactly like the write above: a warning that cannot be recorded must not cost
+    // the reader the figure already in hand. `observe_run` is called the same way, for the same
+    // reason.
+    if let Err(error) = warn(pool, &providers, now).await {
+        tracing::warn!(%error, "the quota warning was not delivered");
+    }
+    QuotaReport {
+        providers,
+        source: Source::Sidecar,
+        cached,
+        unreachable: None,
     }
 }
 
@@ -470,6 +483,7 @@ fn summarise(provider: &str, window: &Window, threshold: i64) -> String {
 struct Claim {
     resets_at: Option<String>,
     alerted_percent: i64,
+    last_alerted_at: String,
 }
 
 async fn read_claim(
@@ -477,18 +491,77 @@ async fn read_claim(
     provider: &str,
     window_name: &str,
 ) -> Result<Option<Claim>, sqlx::Error> {
-    let row: Option<(Option<String>, i64)> = sqlx::query_as(
-        "SELECT window_resets_at, alerted_percent FROM quota_warnings
+    let row: Option<(Option<String>, i64, String)> = sqlx::query_as(
+        "SELECT window_resets_at, alerted_percent, last_alerted_at FROM quota_warnings
           WHERE provider = ? AND window_name = ?",
     )
     .bind(provider)
     .bind(window_name)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(resets_at, alerted_percent)| Claim {
-        resets_at,
-        alerted_percent,
-    }))
+    Ok(
+        row.map(|(resets_at, alerted_percent, last_alerted_at)| Claim {
+            resets_at,
+            alerted_percent,
+            last_alerted_at,
+        }),
+    )
+}
+
+/// PURE: how long the window this name describes lasts.
+///
+/// `5h` and `7d` are the two the sidecar sends today, and the shape — a count and a unit — is read
+/// generically so that a third window a later sidecar invents is understood rather than silently
+/// mishandled. A name this build cannot read answers `None`, and every caller treats that as "do
+/// not act on a length I had to guess".
+fn window_length(window_name: &str) -> Option<chrono::Duration> {
+    let (count, unit) = window_name.split_at(window_name.len().checked_sub(1)?);
+    let count: i64 = count.parse().ok()?;
+    match unit {
+        "h" => Some(chrono::Duration::hours(count)),
+        "d" => Some(chrono::Duration::days(count)),
+        "m" => Some(chrono::Duration::minutes(count)),
+        _ => None,
+    }
+}
+
+/// PURE: whether the claim on this window has stopped covering the reading in hand.
+///
+/// Two ways out, and the second is the one that matters.
+///
+/// **A strictly later reset is a new window.** Not "a different reset": a reset that moves
+/// BACKWARDS is the same window reported differently — a `derived` Codex figure recomputed from
+/// another rollout, or two readings taken across a clock adjustment — and re-arming on it would ping
+/// twice for one burn. Worse, a reset that merely jitters in its spelling would re-arm on every
+/// poll, which is a ping a minute: exactly what this table exists to prevent.
+///
+/// **A claim older than its own window has outlived the window it was made for.** This is what
+/// keeps a reset-less window from being silenced for ever. `resets_at` is genuinely absent
+/// sometimes — the capture of 2026-09-19 had one, and the Claude sidecar has a fixture of it — and
+/// with only the first rule such a window would warn once in the lifetime of the database and never
+/// again. Nothing is double-warned by this: a reading whose reset has passed never reaches here,
+/// because [`is_outdated`] drops it first.
+fn claim_has_expired(claim: &Claim, window: &Window, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let instant = |at: Option<&str>| {
+        at.and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&chrono::Utc))
+    };
+    if let (Some(claimed), Some(fresh)) = (
+        instant(claim.resets_at.as_deref()),
+        instant(window.resets_at.as_deref()),
+    ) && fresh > claimed
+    {
+        return true;
+    }
+    match (
+        window_length(&window.window),
+        instant(Some(&claim.last_alerted_at)),
+    ) {
+        (Some(length), Some(said_at)) => now.signed_duration_since(said_at) >= length,
+        // A window whose name this build cannot read, or a stamp it cannot parse. Holding the claim
+        // errs towards silence, which is the direction a warning should err in.
+        _ => false,
+    }
 }
 
 /// Claims the right to say this, guarded on the row the caller read. `true` means speak.
@@ -558,11 +631,12 @@ pub async fn warn(
                 continue;
             }
             let previous = read_claim(pool, &provider.provider, &window.window).await?;
-            // A claim belongs to the window instance it was written for. Once a reading arrives
-            // with a different reset, the thresholds are armed again — see the column's own note.
+            // A claim belongs to the window instance it was written for, and stops counting once
+            // that instance is over — see `claim_has_expired`, which is where the two ways of being
+            // over are argued.
             let already = previous
                 .as_ref()
-                .filter(|claim| claim.resets_at.as_deref() == window.resets_at.as_deref())
+                .filter(|claim| !claim_has_expired(claim, window, now))
                 .map(|claim| claim.alerted_percent);
             let Some(threshold) = crossed_threshold(window.used_fraction, already) else {
                 continue;
@@ -592,7 +666,15 @@ pub async fn warn(
             //
             // Global scope: a quota is the machine's, not a project's — the burn came from every
             // project at once, so filing it under one would hide it from the others.
-            crate::feed::append(
+            //
+            // Logged rather than propagated, which is the same choice `token_efficiency.rs` makes
+            // beside its own claim and for a reason worth repeating: a `?` here would abandon every
+            // remaining provider and window in this round — in practice the second provider and the
+            // `7d` window — over one failed write. The claim above is already committed either way,
+            // so this line is lost rather than retried; losing one line is the smaller failure, and
+            // the alternative (claim after speaking) trades it for a duplicate ping on every crash
+            // between the two.
+            if let Err(error) = crate::feed::append(
                 pool,
                 None,
                 FEED_KIND,
@@ -600,7 +682,11 @@ pub async fn warn(
                 None,
                 None,
             )
-            .await?;
+            .await
+            {
+                tracing::warn!(%error, provider = %provider.provider, window = %window.window, "a quota warning was claimed but not written");
+                continue;
+            }
             spoken += 1;
         }
     }
@@ -820,6 +906,9 @@ mod tests {
         assert_eq!(crossed_threshold(0.80, None), Some(80));
         assert_eq!(crossed_threshold(0.99, None), Some(80));
         assert_eq!(crossed_threshold(1.0, None), Some(100));
+        // Above the top of the ladder there is nothing further to say, and a figure the sidecar
+        // should never send must not produce a threshold nobody configured.
+        assert_eq!(crossed_threshold(1.4, None), Some(100));
     }
 
     /// The highest crossing is the one worth saying, and a threshold already said is not repeated.
@@ -828,6 +917,9 @@ mod tests {
         assert_eq!(crossed_threshold(0.85, Some(80)), None);
         assert_eq!(crossed_threshold(1.0, Some(80)), Some(100));
         assert_eq!(crossed_threshold(1.0, Some(100)), None);
+        // A figure that falls back below a threshold already announced says nothing: the window did
+        // not un-burn, the vendor revised its arithmetic.
+        assert_eq!(crossed_threshold(0.85, Some(100)), None);
     }
 
     #[tokio::test]
@@ -890,6 +982,62 @@ mod tests {
             "a brand new window was still holding the old claim"
         );
         assert_eq!(feed_kinds(&pool).await.len(), 2);
+        // And the new window's claim is the one now stored. Without this second call the test
+        // passes even if the claim were written back with the OLD reset — every later poll would
+        // then see a mismatch, re-arm, and ping once a minute.
+        assert_eq!(warn(&pool, &next, noon()).await.unwrap(), 0);
+        assert_eq!(feed_kinds(&pool).await.len(), 2);
+    }
+
+    /// A reset that moves BACKWARDS is the same window reported differently, not a new one.
+    ///
+    /// A `derived` figure recomputed from another rollout, or two readings taken across a clock
+    /// adjustment, both produce this. Re-arming on any change rather than on a later one would ping
+    /// twice for one burn — and a reset that merely jitters in its spelling would ping every poll.
+    #[tokio::test]
+    async fn a_reset_that_moves_backwards_does_not_re_arm_the_threshold() {
+        let pool = pool().await;
+        warn(&pool, &measured(0.82), noon()).await.unwrap();
+
+        let mut earlier = measured(0.84);
+        earlier[0].windows[0].resets_at = Some("2026-09-19T16:10:00+00:00".into());
+
+        assert_eq!(warn(&pool, &earlier, noon()).await.unwrap(), 0);
+        assert_eq!(feed_kinds(&pool).await.len(), 1);
+    }
+
+    /// A window with no reset instant must not be silenced for the life of the database.
+    ///
+    /// With the window instance identified by its reset alone, a reset-less window warns once and
+    /// never again — and reset-less windows are real: the capture of 2026-09-19 carried one, and
+    /// the Claude sidecar has a fixture of it. The claim expires with the window's own length
+    /// instead, which is what its name carries.
+    #[tokio::test]
+    async fn a_reset_less_window_warns_again_once_its_own_length_has_passed() {
+        let pool = pool().await;
+        let mut providers = measured(0.82);
+        providers[0].windows[0].resets_at = None;
+
+        warn(&pool, &providers, noon()).await.unwrap();
+        // Four hours later it is still the same five-hour window: still one line.
+        let four_hours = noon() + chrono::Duration::hours(4);
+        assert_eq!(warn(&pool, &providers, four_hours).await.unwrap(), 0);
+
+        // Six hours later it cannot be the window that was claimed.
+        let six_hours = noon() + chrono::Duration::hours(6);
+        assert_eq!(warn(&pool, &providers, six_hours).await.unwrap(), 1);
+        assert_eq!(feed_kinds(&pool).await.len(), 2);
+    }
+
+    #[test]
+    fn a_window_name_is_read_as_a_count_and_a_unit_or_not_at_all() {
+        assert_eq!(window_length("5h"), Some(chrono::Duration::hours(5)));
+        assert_eq!(window_length("7d"), Some(chrono::Duration::days(7)));
+        // A name this build cannot read must not be guessed at: every caller treats `None` as "do
+        // not act on a length I had to invent".
+        assert_eq!(window_length("month"), None);
+        assert_eq!(window_length(""), None);
+        assert_eq!(window_length("h"), None);
     }
 
     /// Two readings landing in the same instant produce one line, not two.
@@ -978,6 +1126,12 @@ mod tests {
         providers[0].windows[0].resets_at = None;
 
         assert_eq!(warn(&pool, &providers, noon()).await.unwrap(), 1);
+        // And it says so, rather than leaving a silence that reads as "resets imminently".
+        let summary = lines(&pool).await.remove(0);
+        assert!(
+            summary.contains("no reset instant"),
+            "a window with no reset must say so: {summary}"
+        );
     }
 
     /// The line the owner reads has to say which brake is talking (design D9, obligation (a)):
@@ -998,22 +1152,111 @@ mod tests {
             "the threshold crossed is missing: {summary}"
         );
         assert!(
-            !summary.contains("budget"),
-            "a quota line must not read as a budget line"
+            summary.starts_with("quota: "),
+            "design D9 (a): which of the two brakes is talking has to be the first thing read, and \
+             `!contains(\"budget\")` cannot fail — this can"
+        );
+    }
+
+    /// One provider being unreadable must not cost the other one its warning.
+    ///
+    /// `warn` walks every provider and every window, so a reading of two providers with two windows
+    /// each has three quiet ones and a fourth that speaks. Without this, the whole loop is exercised
+    /// only by single-window readings and an early `return` in place of a `continue` would pass.
+    #[tokio::test]
+    async fn an_unmeasured_provider_does_not_silence_a_measured_one() {
+        let pool = pool().await;
+        let providers = vec![
+            Provider {
+                provider: "claude".into(),
+                fidelity: Fidelity::Unmeasured,
+                read_at: "2026-09-19T12:00:00+00:00".into(),
+                windows: vec![window(1.0, false)],
+                detail: "it expired 2m ago — sign in again in Claude Code".into(),
+                severity: String::new(),
+            },
+            Provider {
+                provider: "codex".into(),
+                fidelity: Fidelity::Derived,
+                read_at: "2026-09-19T12:00:00+00:00".into(),
+                windows: vec![
+                    window(0.10, false),
+                    Window {
+                        window: "7d".into(),
+                        used_fraction: 0.90,
+                        resets_at: Some("2026-09-24T16:40:00+00:00".into()),
+                        stale: false,
+                        state: "warn",
+                    },
+                ],
+                detail: String::new(),
+                severity: String::new(),
+            },
+        ];
+
+        assert_eq!(warn(&pool, &providers, noon()).await.unwrap(), 1);
+
+        let summary = lines(&pool).await.remove(0);
+        assert!(
+            summary.contains("codex") && summary.contains("7d"),
+            "the wrong window spoke: {summary}"
         );
     }
 
     /// The warning rides on the live path and nothing else. A stored reading is an old figure being
     /// redrawn, and warning from it would ping the owner about a window that may have rolled over
     /// while the sidecar was down.
+    ///
+    /// Asserted against [`live_report`] and [`stored_report`] rather than against [`report`],
+    /// because `report` with a disabled runtime returns at its first guard: a test that went
+    /// through it would leave the storing and the warning wired by lines it never executes, and
+    /// deleting either call would keep the suite green.
     #[tokio::test]
     async fn a_stored_fallback_report_writes_no_warning() {
         let pool = pool().await;
         record(&pool, &measured(0.99), noon()).await.unwrap();
 
-        report(&QuotaRuntime::disabled(), &pool, noon()).await;
+        let report = stored_report(&pool, "the quota sidecar is not running").await;
 
+        assert_eq!(report.source, Source::Stored);
+        assert!(
+            !report.providers.is_empty(),
+            "the stored figure was not drawn"
+        );
         assert!(feed_kinds(&pool).await.is_empty());
+    }
+
+    /// The whole live path, end to end: the sidecar's answer is stored AND judged.
+    ///
+    /// Built from the JSON the sidecar actually sends, so the reading crosses the same
+    /// deserialisation the daemon uses rather than a hand-built struct that cannot catch a field
+    /// renamed on one side.
+    #[tokio::test]
+    async fn a_live_reading_is_both_stored_and_judged() {
+        let pool = pool().await;
+        let live: crate::quota_client::QuotaReport = serde_json::from_str(
+            r#"{"providers":[{"provider":"claude","fidelity":"official",
+                 "read_at":"2026-09-19T12:00:00Z","severity":"normal",
+                 "windows":[{"window":"5h","used_fraction":0.82,
+                             "resets_at":"2026-09-19T16:40:00Z","stale":false}]}],
+                "cached":false}"#,
+        )
+        .unwrap();
+
+        let report = live_report(&pool, live, noon()).await;
+
+        assert_eq!(report.source, Source::Sidecar);
+        assert_eq!(report.providers[0].windows[0].state, "warn");
+        assert_eq!(
+            feed_kinds(&pool).await,
+            vec![FEED_KIND],
+            "the live reading was not judged"
+        );
+        assert_eq!(
+            stored(&pool).await.unwrap().len(),
+            1,
+            "the live reading was not stored"
+        );
     }
 
     /// The fallback is only worth having if it actually carries the figures across.
