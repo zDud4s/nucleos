@@ -7,7 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 /**
  * Which host draws the quota notch — design D8.
  *
- * `contained` is the main window, at the top of the page area. `global` is a borderless window of
+ * `contained` is the main window, against its right edge. `global` is a borderless window of
  * its own, always in front, that stays on screen with the app hidden in the tray. The word lives on
  * the Rust side (`shell/src-tauri/src/notch.rs`), in a file beside the autostart marker, because it
  * decides whether a window exists at launch — before any page has loaded to ask.

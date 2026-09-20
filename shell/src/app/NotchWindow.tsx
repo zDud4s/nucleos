@@ -15,7 +15,7 @@ import { useSetNotchMode } from "./notch-mode";
  * zero, and zero hides the window — nothing measured yet puts nothing on screen.
  *
  * No router and no `ConnectionGate` here. A daemon that is not answering leaves the quota query
- * without data, which draws nothing — the right picture for a strip at the top of the screen, where
+ * without data, which draws nothing — the right picture for a column on the edge of the screen, where
  * a takeover explaining the handshake would cover whatever the owner was doing.
  */
 export function NotchWindow() {

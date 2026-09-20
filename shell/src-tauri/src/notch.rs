@@ -37,9 +37,9 @@ const MODE_FILE: &str = "notch-mode";
 /// Which host draws the notch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Drawn by the main window, at the top of the page area. What Phase 1 shipped.
+    /// Drawn by the main window, against its right edge. What Phase 1 shipped.
     Contained,
-    /// Drawn by a borderless, always-on-top window of its own, at the top edge of the screen.
+    /// Drawn by a borderless, always-on-top window of its own, on the right edge of the screen.
     Global,
 }
 
@@ -199,7 +199,7 @@ pub fn restore(app: &AppHandle) {
 
 /// Opens the notch window, hidden. It is shown by the first `notch_fit` that has something to
 /// draw, so a quota that has not answered yet puts nothing on screen — not even an invisible
-/// rectangle that swallows clicks at the top of the desktop.
+/// rectangle that swallows clicks at the edge of the desktop.
 pub fn open(app: &AppHandle) -> tauri::Result<()> {
     if app.get_webview_window(LABEL).is_some() {
         return Ok(());
@@ -226,15 +226,34 @@ pub fn open(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Where the notch window sits: centred on the top edge of the work area, which is the screen
-/// minus the taskbar. All physical pixels.
-pub fn top_centre(area_x: i32, area_y: i32, area_width: u32, window_width: u32) -> (i32, i32) {
-    let slack = area_width.saturating_sub(window_width) / 2;
-    (area_x + slack as i32, area_y)
+/// Where the notch window sits: against the right edge of the work area — the screen minus the
+/// taskbar — and centred down it. All physical pixels.
+///
+/// **`x` is derived from the right edge, and that is what makes the unfold work.** The window's
+/// width follows its drawing, so when the pointer arrives and the panel opens, this is called again
+/// with a bigger width and returns a smaller `x`: the window grows LEFTWARDS and the edge it hangs
+/// from does not move. Computed from the left instead, the same unfold would walk the notch off the
+/// side of the screen, which is the one direction there is no room in.
+///
+/// Both slacks saturate. `fit_size` has already clamped the drawing to the work area, so a window
+/// bigger than the area cannot reach here from the app — but a screen that shrinks under a window
+/// can, and a notch pinned to the top-left corner is recoverable where one placed at a negative
+/// coordinate off the edge is not.
+pub fn right_middle(
+    area_x: i32,
+    area_y: i32,
+    area_width: u32,
+    area_height: u32,
+    window_width: u32,
+    window_height: u32,
+) -> (i32, i32) {
+    let x = area_width.saturating_sub(window_width);
+    let y = area_height.saturating_sub(window_height) / 2;
+    (area_x + x as i32, area_y + y as i32)
 }
 
 /// Which window may be fitted to its content: the notch's, and no other. The main window asking
-/// would resize itself into a strip at the top of the screen.
+/// would resize itself into a strip against the edge of the screen.
 pub fn may_be_fitted(label: &str) -> Result<(), String> {
     if label == LABEL {
         Ok(())
@@ -285,14 +304,8 @@ fn physical(css: f64, scale: f64, area: u32) -> u32 {
     (css * scale).ceil().clamp(1.0, area.max(1) as f64) as u32
 }
 
-/// Puts the window round a drawing of this CSS size, centred on the top edge of the work area.
-///
-/// The scale factor is the **window's own** and not the primary monitor's. They are the same
-/// number only on a machine with one display or with every display at one DPI; anywhere else the
-/// notch was sized for a monitor it is not on, which on this machine is a notch drawn at 125% on a
-/// 100% second screen. The monitor is the one the window is currently on for the same reason, and
-/// the primary is only the fallback for a window the runtime cannot place.
-/// Puts the window round a drawing of this CSS size, centred on the top edge of the work area.
+/// Puts the window round a drawing of this CSS size, against the middle of the right edge of the
+/// work area.
 ///
 /// The scale factor is the **window's own** and not the primary monitor's. They are the same
 /// number only on a machine with one display or with every display at one DPI; anywhere else the
@@ -315,7 +328,14 @@ fn place(window: &WebviewWindow, width: f64, height: f64) -> Result<(), String> 
         return window.hide().map_err(|e| e.to_string());
     };
     let size = tauri::PhysicalSize::new(width, height);
-    let (x, y) = top_centre(area.position.x, area.position.y, area.size.width, width);
+    let (x, y) = right_middle(
+        area.position.x,
+        area.position.y,
+        area.size.width,
+        area.size.height,
+        width,
+        height,
+    );
     let position = tauri::PhysicalPosition::new(x, y);
     // Written only when it is not already so. `Moved` is one of the events that brings us back here
     // (see the arm in `lib.rs`), and a `set_position` that fires another `Moved` would be a loop;
@@ -340,8 +360,9 @@ fn place(window: &WebviewWindow, width: f64, height: f64) -> Result<(), String> 
 /// so the page's `ResizeObserver` never fires. `refit` is what spends it.
 static ASKED: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
-/// The notch window's size follows its content, in CSS pixels, and it re-centres on every change —
-/// which is also how it unfolds when the pointer reaches it: the page grows, and asks to be fitted.
+/// The notch window's size follows its content, in CSS pixels, and it is re-placed on every change
+/// — which is also how it unfolds when the pointer reaches it: the page grows, asks to be fitted,
+/// and `right_middle` opens it leftwards off an edge that stays where it is.
 ///
 /// Zero in either dimension hides the window. That is what the page sends when it has nothing to
 /// draw, and a hidden window is the only honest picture of "nothing measured yet".
@@ -429,14 +450,29 @@ mod tests {
         assert!(Mode::parse("floating").is_err());
     }
 
-    /// Centred on the work area's own origin, which is not the screen's on a second monitor or with
-    /// the taskbar at the top.
+    /// Against the work area's own right edge and centred down it — neither of which is the
+    /// screen's on a second monitor or with the taskbar down one side.
     #[test]
-    fn the_notch_hangs_from_the_middle_of_the_top_edge() {
-        assert_eq!(top_centre(0, 0, 1920, 200), (860, 0));
-        assert_eq!(top_centre(-1920, 40, 1920, 200), (-1060, 40));
-        // Wider than the screen: pinned to the left edge rather than pushed off it.
-        assert_eq!(top_centre(0, 0, 100, 200), (0, 0));
+    fn the_notch_hangs_from_the_middle_of_the_right_edge() {
+        assert_eq!(right_middle(0, 0, 1920, 1040, 200, 140), (1720, 450));
+        assert_eq!(right_middle(-1920, 40, 1920, 1000, 200, 140), (-200, 470));
+        // Bigger than the work area in both axes: pinned to its top-left corner rather than pushed
+        // off the screen. `fit_size` clamps before this is reached, so what this covers is a screen
+        // that changed under a window already placed.
+        assert_eq!(right_middle(0, 0, 100, 100, 200, 140), (0, 0));
+    }
+
+    /// The property the unfold rests on: a wider drawing opens LEFTWARDS, because `x` is measured
+    /// back from the right edge. Written as the edge staying put rather than as two coordinates,
+    /// because the coordinates are arithmetic and the edge is the promise.
+    #[test]
+    fn a_wider_notch_keeps_its_right_edge_where_it_was() {
+        let folded = right_middle(0, 0, 1920, 1040, 46, 96);
+        let unfolded = right_middle(0, 0, 1920, 1040, 240, 96);
+        assert_eq!(folded.0 + 46, 1920);
+        assert_eq!(unfolded.0 + 240, 1920);
+        // And down the edge it has not moved either: the height did not change, so neither did `y`.
+        assert_eq!(folded.1, unfolded.1);
     }
 
     /// The main window asking to be fitted would resize itself into a strip.

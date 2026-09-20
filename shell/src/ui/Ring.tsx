@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import type { StateBadgeProps } from "./StateBadge";
 import { readState } from "./state-map";
 
@@ -25,6 +26,19 @@ export interface RingProps {
   tracks: RingTrack[];
   /** Outer diameter in pixels. */
   size?: number;
+  /**
+   * Drawn at the centre, inside the innermost track.
+   *
+   * A slot and not a `provider` argument, so this primitive goes on knowing nothing about quota:
+   * it draws arcs, and it draws whatever it was handed in the hole they leave. `QuotaNotch` is the
+   * only thing that knows a provider has a mark, which is where that knowledge belongs — the same
+   * division `tracks` already has, where the caller decides what a track means and the ring only
+   * decides where it sits.
+   *
+   * Absent, the middle stays empty. It carries `pointer-events: none` in the stylesheet, so
+   * whatever goes in there cannot take the hover the arcs' own `<title>` elements answer.
+   */
+  mark?: ReactNode;
 }
 
 /** The default outer diameter: what fits legibly in a notch beside a second provider. */
@@ -53,7 +67,7 @@ const GAP = 2.5;
  * 99.6% is not drawn full — being near the cap and being at it are different facts, and this is the
  * second place that distinction has to survive.
  */
-export function Ring({ label, tracks, size = SIZE }: RingProps) {
+export function Ring({ label, tracks, size = SIZE, mark }: RingProps) {
   const drawn = tracks.map((track, index) => {
     const reading = readState(track.domain, track.state);
     const used = Math.min(1, Math.max(0, track.used));
@@ -117,6 +131,7 @@ export function Ring({ label, tracks, size = SIZE }: RingProps) {
           </g>
         ))}
       </svg>
+      {mark !== undefined && <span className="ui-ring-mark">{mark}</span>}
       <span className="sr-only">{sentence}</span>
     </span>
   );
