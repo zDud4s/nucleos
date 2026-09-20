@@ -3,194 +3,253 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 
 /* The audio graph and the route, which are the two things jsdom cannot have: it has no
    `AudioContext`, no `getUserMedia`, and no daemon. What is left under test is the whole of what
-   this hook decides. */
-const capture = vi.hoisted(() => ({ startCapture: vi.fn(), finishCapture: vi.fn() }));
-vi.mock("../lib/capture", () => capture);
+   this hook decides — and since 2026-09-20 that is a choreography rather than a single round trip,
+   so the fake microphone below is driven frame by frame. */
+const listening = vi.hoisted(() => ({ useListening: vi.fn() }));
+vi.mock("./listening", () => listening);
 
-const silero = vi.hoisted(() => ({ loadSileroSession: vi.fn() }));
-vi.mock("../lib/silero", () => ({
-  loadSileroSession: silero.loadSileroSession,
-  SpeechProbe: class {},
-}));
-
-const voice = vi.hoisted(() => ({ postCapture: vi.fn() }));
+const voice = vi.hoisted(() => ({ postCapture: vi.fn(), postDraft: vi.fn() }));
 vi.mock("./voice", async (original) => ({
   ...(await original<typeof import("./voice")>()),
   ...voice,
 }));
 
-import { useDictation } from "./dictation";
+import { DRAFT_EVERY_FRAMES, useDictation } from "./dictation";
+import type { ListeningHandlers } from "./listening";
 
-/** A microphone that opens and closes without ever touching an audio API. */
-function anOpenMicrophone() {
-  const opened = { frames: [] } as unknown as Awaited<ReturnType<typeof capture.startCapture>>;
-  capture.startCapture.mockResolvedValue(opened);
-  capture.finishCapture.mockResolvedValue({ bytes: new Uint8Array([1]), ms: 900 });
-  return opened;
+/** A microphone with no audio in it, whose handlers the test calls in place of the device. */
+function aMicrophone() {
+  const mic = {
+    handlers: null as ListeningHandlers | null,
+    open: vi.fn().mockResolvedValue(true),
+    close: vi.fn(),
+    record: vi.fn(),
+    peek: vi.fn(() => ({ samples: new Float32Array(8000), rate: 16000, ms: 500 })),
+    take: vi.fn(() => ({ samples: new Float32Array(32000), rate: 16000, ms: 2000 })),
+    isRecording: vi.fn(() => true),
+  };
+  listening.useListening.mockImplementation((handlers: ListeningHandlers) => {
+    mic.handlers = handlers;
+    return mic;
+  });
+  return mic;
+}
+
+/** Enough frames of somebody talking for the loop to want another draft. */
+function talks(mic: ReturnType<typeof aMicrophone>, frames = DRAFT_EVERY_FRAMES) {
+  act(() => {
+    for (let at = 0; at < frames; at += 1) mic.handlers?.onFrame?.(true);
+  });
+}
+
+/** What the box was told, as `[text, final]` pairs. */
+function recorder() {
+  const said: Array<[string, boolean]> = [];
+  return { said, onText: (text: string, final: boolean) => said.push([text, final]) };
 }
 
 beforeEach(() => {
-  capture.startCapture.mockReset();
-  capture.finishCapture.mockReset();
+  listening.useListening.mockReset();
   voice.postCapture.mockReset();
-  silero.loadSileroSession.mockReset();
-  // A runtime that loads: the ordinary case, and the one where nothing should be reported as trouble.
-  // `lib/capture` is mocked, so no gate ever actually runs here — what is under test is the wiring.
-  silero.loadSileroSession.mockResolvedValue({ session: {}, why: null });
+  voice.postDraft.mockReset();
 });
 
 describe("useDictation", () => {
-  it("hands back what was heard, and is off again afterwards", async () => {
-    const opened = anOpenMicrophone();
-    voice.postCapture.mockResolvedValue({ text: "olá mundo" });
-    const heard: string[] = [];
-    const { result } = renderHook(() => useDictation((said) => heard.push(said)));
+  it("opens the microphone on the first press and closes it on the second", async () => {
+    const mic = aMicrophone();
+    const { result } = renderHook(() => useDictation(() => {}));
 
     expect(result.current.phase).toBe("off");
-
     act(() => result.current.toggle());
     await waitFor(() => expect(result.current.phase).toBe("listening"));
+    expect(mic.open).toHaveBeenCalledTimes(1);
 
+    mic.isRecording.mockReturnValue(false);
     act(() => result.current.toggle());
     await waitFor(() => expect(result.current.phase).toBe("off"));
-
-    expect(heard).toEqual(["olá mundo"]);
-    expect(voice.postCapture).toHaveBeenCalledWith(new Uint8Array([1]), "dictation", 900);
-    expect(capture.finishCapture).toHaveBeenCalledWith(opened, expect.any(Function));
-    expect(result.current.trouble).toBeNull();
+    expect(mic.close).toHaveBeenCalled();
   });
 
-  /* 204 is the one success-family status in this shell that is a negative answer. Saying nothing
-     into an open microphone is ordinary, so it must not put text in the box and must not read as
-     a fault. */
-  it("says nothing was heard rather than writing an empty sentence into the box", async () => {
-    anOpenMicrophone();
-    voice.postCapture.mockResolvedValue(undefined);
-    const heard: string[] = [];
-    const { result } = renderHook(() => useDictation((said) => heard.push(said)));
-
+  /* The point of the whole thing: words while somebody is still talking, each revision replacing the
+     last rather than following it. "come" then "come view" then "câmbio" is not a made-up example —
+     it is what `ggml-base` actually did to "câmbio" on this machine on 2026-09-18. */
+  it("revises the box while the sentence is still being spoken", async () => {
+    const mic = aMicrophone();
+    const box = recorder();
+    const { result } = renderHook(() => useDictation(box.onText));
     act(() => result.current.toggle());
     await waitFor(() => expect(result.current.phase).toBe("listening"));
-    act(() => result.current.toggle());
 
-    await waitFor(() => expect(result.current.trouble).toBe("nothing was heard"));
-    expect(heard).toEqual([]);
-    expect(result.current.phase).toBe("off");
+    act(() => mic.handlers?.onSignal("speechStarted"));
+    expect(mic.record).toHaveBeenCalledTimes(1);
+
+    voice.postDraft.mockResolvedValue("come");
+    talks(mic);
+    await waitFor(() => expect(box.said).toEqual([["come", false]]));
+
+    voice.postDraft.mockResolvedValue("come view");
+    talks(mic);
+    await waitFor(() => expect(box.said).toHaveLength(2));
+    expect(box.said[1]).toEqual(["come view", false]);
+
+    expect(voice.postCapture).not.toHaveBeenCalled();
   });
 
-  it("says so when the machine has no microphone, and stays off", async () => {
-    capture.startCapture.mockRejectedValue(new Error("NotAllowedError"));
+  /* One in flight at a time. Without this the loop would post a draft every 256 ms regardless of how
+     long the last one took, and a transcriber having a slow moment would be handed a queue it can
+     only fall further behind — the same failure `listening.ts` drops frames to avoid. */
+  it("never has two drafts in flight at once", async () => {
+    const mic = aMicrophone();
+    let answer: (text: string) => void = () => {};
+    voice.postDraft.mockImplementation(() => new Promise<string>((done) => (answer = done)));
     const { result } = renderHook(() => useDictation(() => {}));
-
     act(() => result.current.toggle());
+    await waitFor(() => expect(result.current.phase).toBe("listening"));
+    act(() => mic.handlers?.onSignal("speechStarted"));
 
-    await waitFor(() => expect(result.current.trouble).toMatch(/no microphone/));
-    expect(result.current.phase).toBe("off");
+    talks(mic);
+    talks(mic);
+    talks(mic);
+    await waitFor(() => expect(voice.postDraft).toHaveBeenCalledTimes(1));
+
+    await act(async () => answer("olá"));
+    talks(mic);
+    await waitFor(() => expect(voice.postDraft).toHaveBeenCalledTimes(2));
   });
 
-  /* On the first ever press the await is a PERMISSION PROMPT, which somebody can leave standing.
-     A second press during it used to take the "nothing is recording" branch and open a second
-     device — two microphones, and only one of them ever closed. */
-  it("opens one device however many times it is pressed while the prompt is up", async () => {
-    let allow: (value: unknown) => void = () => {};
-    capture.startCapture.mockReturnValue(
-      new Promise((resolve) => {
-        allow = resolve;
-      }),
-    );
-    const { result } = renderHook(() => useDictation(() => {}));
-
+  /* The sentence that ends goes as `dictation`, which is the call that writes the row — and it is
+     the same audio the drafts were guesses at, so the text does not change under somebody's feet
+     after they have stopped looking at it. */
+  it("writes down the sentence that ended, and that is the last word on it", async () => {
+    const mic = aMicrophone();
+    const box = recorder();
+    voice.postCapture.mockResolvedValue({ text: "câmbio" });
+    const { result } = renderHook(() => useDictation(box.onText));
     act(() => result.current.toggle());
-    act(() => result.current.toggle());
-    act(() => result.current.toggle());
-    expect(result.current.phase).toBe("off");
+    await waitFor(() => expect(result.current.phase).toBe("listening"));
 
-    await act(async () => {
-      allow({ frames: [] });
-    });
+    act(() => mic.handlers?.onSignal("speechStarted"));
+    await act(async () => mic.handlers?.onSignal("speechEnded"));
 
-    expect(capture.startCapture).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(box.said).toEqual([["câmbio", true]]));
+    expect(voice.postCapture).toHaveBeenCalledWith(expect.any(Uint8Array), "dictation", 2000);
+    // Still listening: a second sentence follows the first without anybody pressing anything.
     expect(result.current.phase).toBe("listening");
   });
 
-  /* An open microphone must not survive the box it belongs to. On the front door, unmounting is
-     exactly what happens when the first message opens a conversation — so a graph left up there
-     would leave the device light on for the rest of the session. */
-  it("closes the device when the box it belongs to goes away", async () => {
-    const opened = anOpenMicrophone();
-    const { result, unmount } = renderHook(() => useDictation(() => {}));
-
+  /* The defect this hook had until 2026-09-20: `toggle` refused to start while a transcription was
+     in flight, which was right when a dictation was one recording and one round trip. Sentences
+     overlap now — the second begins while the first is still being written down — and a microphone
+     that went deaf for the length of a round trip would eat the start of every other sentence. */
+  it("records the next sentence while the last one is still being written down", async () => {
+    const mic = aMicrophone();
+    const box = recorder();
+    let answer: (result: { text: string }) => void = () => {};
+    voice.postCapture.mockImplementation(
+      () => new Promise<{ text: string }>((done) => (answer = done)),
+    );
+    const { result } = renderHook(() => useDictation(box.onText));
     act(() => result.current.toggle());
     await waitFor(() => expect(result.current.phase).toBe("listening"));
 
-    unmount();
+    act(() => mic.handlers?.onSignal("speechStarted"));
+    act(() => mic.handlers?.onSignal("speechEnded"));
+    act(() => mic.handlers?.onSignal("speechStarted"));
 
-    expect(capture.finishCapture).toHaveBeenCalledWith(opened);
+    expect(mic.record).toHaveBeenCalledTimes(2);
+    // The first sentence is genuinely in flight — this is what "still being written down" means, and
+    // answering before it was asked would resolve a promise that does not exist yet.
+    await waitFor(() => expect(voice.postCapture).toHaveBeenCalledTimes(1));
+    await act(async () => answer({ text: "a primeira" }));
+    await waitFor(() => expect(box.said).toEqual([["a primeira", true]]));
   });
 
-  /**
-   * The measured failure of 2026-09-18: 40 s of a quiet room reached whisper and came back as
-   * `[IMHA METALL [ ice / ice / ice …`, which is what whisper does with audio that has no speech in
-   * it. A recording the speech gate finds nothing in must not be sent at all — and must read as the
-   * ordinary "nothing was heard", because saying nothing into an open microphone is ordinary.
-   */
-  it("never sends a recording the speech gate found no speech in", async () => {
-    anOpenMicrophone();
-    capture.finishCapture.mockResolvedValue({ bytes: null, ms: 0 });
-    const heard: string[] = [];
-    const { result } = renderHook(() => useDictation((said) => heard.push(said)));
-
+  /* A draft is a guess at a sentence that is still open. Once that sentence has been written down,
+     its guesses are worth less than what replaced them — and one arriving late would re-open a
+     region over text the person has stopped expecting to move. */
+  it("drops a draft that arrives after its own sentence closed", async () => {
+    const mic = aMicrophone();
+    const box = recorder();
+    let answerDraft: (text: string) => void = () => {};
+    voice.postDraft.mockImplementation(() => new Promise<string>((done) => (answerDraft = done)));
+    voice.postCapture.mockResolvedValue({ text: "a frase toda" });
+    const { result } = renderHook(() => useDictation(box.onText));
     act(() => result.current.toggle());
     await waitFor(() => expect(result.current.phase).toBe("listening"));
-    act(() => result.current.toggle());
-    await waitFor(() => expect(result.current.phase).toBe("off"));
 
-    expect(voice.postCapture).not.toHaveBeenCalled();
-    expect(heard).toEqual([]);
+    act(() => mic.handlers?.onSignal("speechStarted"));
+    talks(mic);
+    await waitFor(() => expect(voice.postDraft).toHaveBeenCalledTimes(1));
+
+    await act(async () => mic.handlers?.onSignal("speechEnded"));
+    await waitFor(() => expect(box.said).toEqual([["a frase toda", true]]));
+
+    await act(async () => answerDraft("a frase"));
+    expect(box.said).toEqual([["a frase toda", true]]);
+  });
+
+  /* 204: the microphone was open and nothing in it was speech. An empty final revision is what takes
+     the drafts back out of the box — see `lib/provisional.ts` — so the person is not left holding a
+     guess at a sentence nobody said. */
+  it("takes its own words back when the daemon heard nothing", async () => {
+    const mic = aMicrophone();
+    const box = recorder();
+    voice.postCapture.mockResolvedValue(undefined);
+    const { result } = renderHook(() => useDictation(box.onText));
+    act(() => result.current.toggle());
+    await waitFor(() => expect(result.current.phase).toBe("listening"));
+
+    act(() => mic.handlers?.onSignal("speechStarted"));
+    await act(async () => mic.handlers?.onSignal("speechEnded"));
+
+    await waitFor(() => expect(box.said).toEqual([["", true]]));
     expect(result.current.trouble).toBe("nothing was heard");
   });
 
-  /**
-   * The runtime is 13 MB of WebAssembly and the model 2.3 MB. Loaded when the microphone CLOSES, all
-   * of that sits between somebody finishing a sentence and the transcription starting; loaded while
-   * the recording runs, it costs nothing, because a person talking is already the slow part.
-   */
-  it("asks for the speech runtime while the microphone is open, not once it closes", async () => {
-    anOpenMicrophone();
-    const { result } = renderHook(() => useDictation(() => {}));
-
+  /* Pressing stop mid-sentence is the ordinary way a dictation ends: nobody waits out the hangover.
+     The half-said sentence still has to be written down, or the last thing anybody said is lost. */
+  it("writes down a sentence that was still open when the microphone was closed", async () => {
+    const mic = aMicrophone();
+    const box = recorder();
+    voice.postCapture.mockResolvedValue({ text: "por fim" });
+    const { result } = renderHook(() => useDictation(box.onText));
     act(() => result.current.toggle());
     await waitFor(() => expect(result.current.phase).toBe("listening"));
+    act(() => mic.handlers?.onSignal("speechStarted"));
 
-    expect(silero.loadSileroSession).toHaveBeenCalled();
-  });
-
-  /**
-   * A machine whose runtime will not load still has a dictation: the gate degrades to sending
-   * everything rather than to sending nothing. Getting this backwards would turn one invisible
-   * problem — hallucinated text — into a worse one, a microphone that silently discards speech.
-   */
-  it("sends the whole recording when there is no runtime to gate it with", async () => {
-    anOpenMicrophone();
-    silero.loadSileroSession.mockResolvedValue({
-      session: null,
-      why: "Compiling WebAssembly violates the Content Security Policy",
-    });
-    voice.postCapture.mockResolvedValue({ text: "olá" });
-    const { result } = renderHook(() => useDictation(() => {}));
-
-    act(() => result.current.toggle());
-    await waitFor(() => expect(result.current.phase).toBe("listening"));
     act(() => result.current.toggle());
     await waitFor(() => expect(result.current.phase).toBe("off"));
+    expect(box.said).toEqual([["por fim", true]]);
+  });
 
-    const gate = capture.finishCapture.mock.calls[0][1] as (
-      samples: Float32Array,
-    ) => Promise<Float32Array | null>;
-    const recording = new Float32Array(4096).fill(0.5);
-    expect(await gate(recording)).toBe(recording);
-    // And it says so. A dictation with no gate transcribes silence, which is the failure that
-    // produced `ice / ice / ice` — degrading is right, degrading quietly is what cost a session.
-    expect(result.current.trouble).toContain("Content Security Policy");
+  it("says so when the microphone will not open, and stays off", async () => {
+    const mic = aMicrophone();
+    mic.open.mockImplementation(async () => {
+      mic.handlers?.onTrouble("the microphone could not be opened");
+      return false;
+    });
+    const { result } = renderHook(() => useDictation(() => {}));
+
+    act(() => result.current.toggle());
+    await waitFor(() => expect(result.current.trouble).toBe("the microphone could not be opened"));
+    expect(result.current.phase).toBe("off");
+  });
+
+  /* Whatever `listening.ts` says about the detector it got is the person's to see: a gate running on
+     loudness opens a sentence on a fridge, and that reads as a broken microphone unless it is named. */
+  it("carries the reason the good detector was not used", async () => {
+    const mic = aMicrophone();
+    mic.open.mockImplementation(async () => {
+      mic.handlers?.onDetector?.("energy", "the policy refuses to compile WebAssembly");
+      return true;
+    });
+    const { result } = renderHook(() => useDictation(() => {}));
+
+    act(() => result.current.toggle());
+    await waitFor(() =>
+      expect(result.current.trouble).toBe(
+        "no speech gate — the policy refuses to compile WebAssembly",
+      ),
+    );
   });
 });

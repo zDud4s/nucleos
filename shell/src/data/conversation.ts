@@ -2,9 +2,15 @@
  * Running a hands-free conversation: the microphone, the gate, the turns and the answer's audio.
  *
  * The decisions are elsewhere and on purpose. `lib/conversation.ts` owns what each event means,
- * `lib/vad.ts` owns when somebody started and stopped talking, and `core/src/voice.rs` owns what a
- * turn IS. What is left here is the part that cannot be pure: a `MediaStream`, an `AudioContext`, an
- * `<audio>` element, and the order they go in.
+ * `lib/vad.ts` owns when somebody started and stopped talking, `data/listening.ts` owns the open
+ * microphone that applies it, and `core/src/voice.rs` owns what a turn IS. What is left here is the
+ * half that makes it a CONVERSATION rather than a transcript: the turn being assembled, the message
+ * sent to the agent, and the answer played back.
+ *
+ * That last split is recent. Everything about hearing a sentence lived here until 2026-09-20, when
+ * progressive dictation needed the same ears without the mouth — `data/dictation.ts` now drives the
+ * same `useListening` and does something else entirely with what it hears. The seam between the two
+ * halves turned out to be one edge: a closed turn becoming a sent one.
  *
  * The same division `pages/Voice.tsx` already lives under, one layer up.
  */
@@ -18,7 +24,7 @@ import {
   ConversationPhase,
   onConversationEvent,
 } from "../lib/conversation";
-import { durationMs, encodeCapture } from "../lib/audio";
+import { encodeCapture } from "../lib/audio";
 import {
   EMPTY_TURN,
   onIdle,
@@ -26,16 +32,8 @@ import {
   TurnSignal,
   TurnState,
 } from "../lib/turn-assembly";
-import {
-  energyOf,
-  FRAME_MS,
-  FRAME_SAMPLES,
-  GateState,
-  IDLE_GATE,
-  onFrame,
-  PREROLL_FRAMES,
-} from "../lib/vad";
-import { loadSileroSession, SpeechProbe } from "../lib/silero";
+import { FRAME_MS } from "../lib/vad";
+import { useListening, type Listening } from "./listening";
 import { apiFetch } from "./client";
 import { fetchSpeechUnit, postSegment } from "./voice";
 
@@ -43,13 +41,18 @@ import { fetchSpeechUnit, postSegment } from "./voice";
 const TOGGLE_EVENT = "voice://conversation-toggle";
 
 /**
- * Samples per `onaudioprocess` callback.
+ * The three constraints that make hands-free possible at all.
  *
- * A multiple of `FRAME_SAMPLES` so a callback splits into whole frames with nothing left over. A
- * remainder would have to be carried between callbacks, and a carry that is ever dropped shifts every
- * later frame — which reads as the gate becoming erratic rather than as an arithmetic mistake.
+ * `echoCancellation` is the load-bearing one: the microphone is open WHILE the answer plays, so
+ * without it the gate hears the núcleo's own voice, opens a turn on it, and the conversation talks
+ * to itself. It works because capture and playback share this webview's audio graph — which is why
+ * this module keeps the playback here rather than in the other process.
  */
-const BUFFER_SAMPLES = FRAME_SAMPLES * 8;
+const CONVERSATION_AUDIO: MediaTrackConstraints = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
 
 /** What the window needs to show, and nothing it does not. */
 export interface ConversationView {
@@ -79,14 +82,6 @@ export interface ConversationView {
   toggle: () => void;
 }
 
-interface Live {
-  stream: MediaStream;
-  context: AudioContext;
-  source: MediaStreamAudioSourceNode;
-  processor: ScriptProcessorNode;
-  sink: GainNode;
-}
-
 /**
  * The hands-free conversation, for one chat.
  *
@@ -103,11 +98,8 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
 
   const phaseRef = useRef<ConversationPhase>("off");
   const chatRef = useRef<string | null>(chatId);
-  const liveRef = useRef<Live | null>(null);
-  const gateRef = useRef<GateState>(IDLE_GATE);
-  /** The last `PREROLL_FRAMES` frames, kept always — see `PREROLL_FRAMES` for why. */
-  const prerollRef = useRef<Float32Array[]>([]);
-  const recordingRef = useRef<Float32Array[] | null>(null);
+  /** The ears: the microphone, the gate and the pre-roll, shared with `data/dictation.ts`. */
+  const listenerRef = useRef<Listening | null>(null);
   const turnRef = useRef<TurnState>(EMPTY_TURN);
   const pendingTurnRef = useRef<string | null>(null);
   /** Segment requests stay in speech order even when the next pause arrives before one completes. */
@@ -115,48 +107,18 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
   const playerRef = useRef<HTMLAudioElement | null>(null);
   /** Bumped on every barge-in and every exit, so audio from an abandoned turn cannot start playing. */
   const generationRef = useRef(0);
-  /** `null` until the model has been loaded, and permanently so if it could not be. */
-  const probeRef = useRef<SpeechProbe | null>(null);
-  /**
-   * Inference is async and Silero's state is sequential, so frames are run one at a time in order.
-   * Two in flight would interleave their state updates and the model's memory would describe audio
-   * that never happened.
-   */
-  const chainRef = useRef<Promise<void>>(Promise.resolve());
-  /** How many frames are waiting on the chain, so a slow runtime cannot grow it without bound. */
-  const pendingRef = useRef(0);
-  /**
-   * Mirrors `listeningWith`, so the load is attempted once and not once per toggle.
-   *
-   * A ref beside the state because the check happens inside `openMic`, which is a stable callback:
-   * reading the state there would read whatever it was when the callback was built, which is `null`
-   * forever.
-   */
-  const listeningWithRef = useRef<"silero" | "energy" | null>(null);
 
   chatRef.current = chatId;
 
+  /* The turn, and nothing about the audio — `listening.ts` owns the graph, the gate and Silero's
+     memory of what it just heard, and resets all three on its way out. */
   const closeMic = useCallback(() => {
-    const live = liveRef.current;
-    liveRef.current = null;
-    recordingRef.current = null;
-    prerollRef.current = [];
-    gateRef.current = IDLE_GATE;
+    listenerRef.current?.close();
     turnRef.current = EMPTY_TURN;
     pendingTurnRef.current = null;
     segmentChainRef.current = Promise.resolve();
     // A segment already at the core cannot be cancelled, so invalidate its answer before closing.
     generationRef.current += 1;
-    // Silero's state is a memory of what it just heard. Carried across a closed microphone, the next
-    // conversation would start mid-thought about a sentence from the last one.
-    probeRef.current?.reset();
-    pendingRef.current = 0;
-    if (live === null) return;
-    live.processor.disconnect();
-    live.source.disconnect();
-    live.sink.disconnect();
-    for (const track of live.stream.getTracks()) track.stop();
-    void live.context.close();
   }, []);
 
   const stopPlayback = useCallback(() => {
@@ -266,16 +228,18 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
   }, []);
 
   const transcribeSegment = useCallback(() => {
-    const frames = recordingRef.current ?? [];
-    recordingRef.current = null;
-    const samples = concat(frames);
-    const rate = liveRef.current?.context.sampleRate ?? 16000;
-    const elapsedMs = durationMs(samples.length, rate);
+    /* Nothing recorded is still a segment. `onSegment` is what zeroes the turn's idle clock, and a
+       pause that skipped it would abandon a turn somebody was in the middle of. */
+    const recorded = listenerRef.current?.take() ?? { samples: new Float32Array(0), rate: 16000, ms: 0 };
+    const elapsedMs = recorded.ms;
     const generation = generationRef.current;
 
     segmentChainRef.current = segmentChainRef.current.then(async () => {
       try {
-        const segment = await postSegment(encodeCapture(samples, 1, rate), elapsedMs);
+        const segment = await postSegment(
+          encodeCapture(recorded.samples, 1, recorded.rate),
+          elapsedMs,
+        );
         if (generationRef.current !== generation) return;
         const next = onSegment(turnRef.current, { ...segment, elapsedMs });
         turnRef.current = next.state;
@@ -325,108 +289,14 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
   }, [speakAnswer]);
 
   const openMic = useCallback(async () => {
-    try {
-      // Loaded once and kept: the model is 2.3 MB and the runtime's wasm is larger still, so paying
-      // for it on every toggle would put a second of dead air at the front of every session.
-      if (probeRef.current === null && listeningWithRef.current === null) {
-        const { session, why } = await loadSileroSession();
-        probeRef.current = session === null ? null : new SpeechProbe(session);
-        listeningWithRef.current = session === null ? "energy" : "silero";
-        setListeningWith(listeningWithRef.current);
-        setWhyByLoudness(why);
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        // The three that make hands-free possible at all. `echoCancellation` is the load-bearing
-        // one: the microphone is open WHILE the answer plays, so without it the gate hears the
-        // núcleo's own voice, opens a turn on it, and the conversation talks to itself. It works
-        // because capture and playback share this webview's audio graph — which is why
-        // `lib/conversation.ts` keeps the playback here rather than in the other process.
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-      const AudioContextCtor =
-        window.AudioContext ??
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const context = new AudioContextCtor();
-      const source = context.createMediaStreamSource(stream);
-      const processor = context.createScriptProcessor(BUFFER_SAMPLES, 1, 1);
-      // Zero gain, for the reason `pages/Voice.tsx` records: the graph has to reach `destination`
-      // for `onaudioprocess` to fire, and a live path there plays the microphone out loud.
-      const sink = context.createGain();
-      sink.gain.value = 0;
-
-      processor.onaudioprocess = (event) => {
-        const buffer = event.inputBuffer.getChannelData(0);
-        for (let at = 0; at + FRAME_SAMPLES <= buffer.length; at += FRAME_SAMPLES) {
-          const frame = new Float32Array(buffer.subarray(at, at + FRAME_SAMPLES));
-          onAudioFrame(frame);
-        }
-      };
-      source.connect(processor);
-      processor.connect(sink);
-      sink.connect(context.destination);
-      liveRef.current = { stream, context, source, processor, sink };
+    if (await (listenerRef.current?.open(CONVERSATION_AUDIO) ?? Promise.resolve(false))) {
       setTrouble(null);
-    } catch {
-      setTrouble("the microphone could not be opened");
-      // Straight back out rather than sitting in `listening` with no microphone: a mode that looks
-      // armed and hears nothing is the failure this pillar's design keeps calling out by name.
-      dispatchRef.current({ type: "toggled" });
-    }
-  }, []);
-
-  /**
-   * One frame, through the gate, into whatever the mode makes of it.
-   *
-   * Kept in a ref and not a dependency, because `onaudioprocess` is assigned once when the graph is
-   * built and would otherwise hold the first render's closure for the life of the microphone.
-   */
-  const onAudioFrame = useCallback((frame: Float32Array) => {
-    // Synchronous and first, because these two are what the recording IS. Deferring them behind the
-    // probe below would put the audio's order at the mercy of how fast inference happens to be.
-    const recording = recordingRef.current;
-    if (recording === null) {
-      // Until transcription returns, `onSegment` cannot zero the clock. Counting recorded frames
-      // here can therefore abandon the mode in the middle of a sentence that began near the limit.
-      const idle = onIdle(turnRef.current, FRAME_MS);
-      turnRef.current = idle.state;
-      if (idle.signal !== null) {
-        actOnTurnSignal(idle.signal);
-        return;
-      }
-    }
-    if (recording !== null) recording.push(frame);
-
-    prerollRef.current.push(frame);
-    if (prerollRef.current.length > PREROLL_FRAMES) prerollRef.current.shift();
-
-    const decide = (probability: number) => {
-      const { state, signal } = onFrame(gateRef.current, probability);
-      gateRef.current = state;
-      if (signal !== null) dispatchRef.current({ type: signal });
-    };
-
-    const probe = probeRef.current;
-    if (probe === null) {
-      decide(energyOf(frame));
       return;
     }
-
-    // Dropped rather than queued once the chain is behind. A frame decided three frames late is a
-    // barge-in noticed a tenth of a second late, and every one kept makes the next one later still —
-    // the lag would grow for as long as the runtime stayed slow, and never recover.
-    if (pendingRef.current > 3) return;
-
-    pendingRef.current += 1;
-    chainRef.current = chainRef.current
-      .then(() => probe.probability(frame))
-      .then(decide)
-      // One frame that failed is one frame of silence, not a broken mode. A runtime that fails every
-      // frame presents as a gate that never opens, which is what the fallback below is for.
-      .catch(() => undefined)
-      .finally(() => {
-        pendingRef.current -= 1;
-      });
-  }, [actOnTurnSignal]);
+    // Straight back out rather than sitting in `listening` with no microphone: a mode that looks
+    // armed and hears nothing is the failure this pillar's design keeps calling out by name.
+    dispatchRef.current({ type: "toggled" });
+  }, []);
 
   const perform = useCallback(
     (action: ConversationAction) => {
@@ -442,13 +312,11 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
           closeMic();
           return;
         case "startRecording":
-          // Seeded with the pre-roll, so the recording contains the syllable the gate needed in
-          // order to decide there was one.
-          recordingRef.current = [...prerollRef.current];
+          listenerRef.current?.record();
           return;
         case "stopPlaybackAndRecord":
           stopPlayback();
-          recordingRef.current = [...prerollRef.current];
+          listenerRef.current?.record();
           return;
         case "transcribeSegment":
           transcribeSegment();
@@ -478,6 +346,29 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
   const dispatchRef = useRef(dispatch);
   dispatchRef.current = dispatch;
 
+  /* Declared after `dispatchRef` because every handler below goes through it, and placed in a ref so
+     the callbacks above — built before this line runs — can reach the microphone they drive. */
+  listenerRef.current = useListening({
+    onFrame: (recording) => {
+      if (recording) return;
+      // Until transcription returns, `onSegment` cannot zero the clock. Counting recorded frames
+      // here can therefore abandon the mode in the middle of a sentence that began near the limit.
+      const idle = onIdle(turnRef.current, FRAME_MS);
+      turnRef.current = idle.state;
+      if (idle.signal === null) return;
+      actOnTurnSignal(idle.signal);
+      // The frame goes no further: the mode is on its way out, and letting the gate see it would
+      // open a segment on the way.
+      return false;
+    },
+    onSignal: (signal) => dispatchRef.current({ type: signal }),
+    onTrouble: setTrouble,
+    onDetector: (using, why) => {
+      setListeningWith(using);
+      setWhyByLoudness(why);
+    },
+  });
+
   useEffect(() => {
     let stop: (() => void) | undefined;
     listen(TOGGLE_EVENT, () => dispatchRef.current({ type: "toggled" }))
@@ -499,18 +390,6 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
   const toggle = useCallback(() => dispatchRef.current({ type: "toggled" }), []);
 
   return { phase, heard, trouble, hasVoice, listeningWith, whyByLoudness, toggle };
-}
-
-function concat(frames: Float32Array[]): Float32Array {
-  let length = 0;
-  for (const frame of frames) length += frame.length;
-  const out = new Float32Array(length);
-  let at = 0;
-  for (const frame of frames) {
-    out.set(frame, at);
-    at += frame.length;
-  }
-  return out;
 }
 
 function sentenceFor(error: unknown): string {

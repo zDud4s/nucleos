@@ -130,6 +130,7 @@ import { attachmentFrom, isPicture } from "../lib/picture";
 import { stillGoing } from "../lib/editor";
 import { diffLines } from "../lib/diff";
 import { useDictation, type DictationView } from "../data/dictation";
+import { revise, type Provisional } from "../lib/provisional";
 import type { LocalPull, ModelChoice } from "../data/chats";
 import {
   Button,
@@ -1422,7 +1423,7 @@ function StartBox({
   const box = useRef<HTMLTextAreaElement | null>(null);
   const sayable = text.trim() !== "" && !pending;
 
-  const dictation = useDictationInto(setText, setCaret, box);
+  const dictation = useDictationInto(text, setText, setCaret, box);
 
   const command = commandAt(text, caret);
   const mention = mentionAt(text, caret);
@@ -1633,28 +1634,53 @@ function StartBox({
  * appending is not the obvious `setText(was + said)` and getting it subtly wrong in one of them would
  * read as the microphone misbehaving rather than as two implementations drifting.
  *
- * Appended, not substituted: somebody who typed half a sentence and then reached for the microphone
- * meant to continue it. The separating space is added only where there is not already one, so
- * dictating twice in a row does not open a gap that widens on every turn. The caret is moved to the
- * end because the box is written into next, and a caret left where it was would put the following
- * word in the middle of what was just said.
+ * Added after what was typed, not instead of it: somebody who typed half a sentence and then reached
+ * for the microphone meant to continue it. The separating space is added only where there is not
+ * already one, so dictating twice in a row does not open a gap that widens on every turn. The caret
+ * is moved to the end because the box is written into next, and a caret left where it was would put
+ * the following word in the middle of what was just said.
+ *
+ * **The microphone owns a span of the box, and revises it.** Progressive dictation says the same
+ * sentence several times over as the transcriber hears more of it, so every revision but the first
+ * REPLACES the last — `lib/provisional.ts` does that arithmetic and says why. The span closes when
+ * the sentence does, and the next sentence opens a new one after it.
+ *
+ * **What the person does to the box wins, always.** The span is only honoured while the box still
+ * holds exactly what the microphone last left there; anything else — a word typed, a character
+ * deleted, the box emptied by sending the message — makes the next revision open a fresh span at the
+ * end instead of writing over text somebody has since made their own. Checked rather than signalled
+ * from the textarea's `onChange`, because that would leave the same rule to be remembered at two
+ * call sites and silently half-applied at the one that forgot.
  */
 function useDictationInto(
+  text: string,
   setText: Dispatch<SetStateAction<string>>,
   setCaret: Dispatch<SetStateAction<number>>,
   box: RefObject<HTMLTextAreaElement | null>,
 ): DictationView {
-  return useDictation((said) => {
-    setText((was) => {
-      const joined = was === "" || /\s$/.test(was) ? `${was}${said}` : `${was} ${said}`;
-      setCaret(joined.length);
-      queueMicrotask(() => {
-        const field = box.current;
-        if (field === null) return;
-        field.focus();
-        field.setSelectionRange(joined.length, joined.length);
-      });
-      return joined;
+  /* The box's current text, and the microphone's span of it. Refs because a revision may land
+     between two renders — a draft resolves right behind the final it was waiting on — and the state
+     React would hand back is the one from before the last revision. Kept level with the state on
+     every render, which is what makes a keystroke visible here. */
+  const textRef = useRef(text);
+  const regionRef = useRef<Provisional | null>(null);
+  /** The last thing the microphone wrote, whole. A box that no longer matches it is not ours. */
+  const wroteRef = useRef<string | null>(null);
+  textRef.current = text;
+
+  return useDictation((said, final) => {
+    const was = textRef.current;
+    const next = revise(was, wroteRef.current === was ? regionRef.current : null, said);
+    textRef.current = next.text;
+    regionRef.current = final ? null : next.region;
+    wroteRef.current = next.text;
+    setText(next.text);
+    setCaret(next.caret);
+    queueMicrotask(() => {
+      const field = box.current;
+      if (field === null) return;
+      field.focus();
+      field.setSelectionRange(next.caret, next.caret);
     });
   });
 }
@@ -5343,7 +5369,7 @@ function Composer({
   const send = useSendMessage(chatId);
   // Held here rather than inside the toggle, because the toggle and the line below the box are two
   // views of ONE microphone. Two `useDictation` calls would be two recordings.
-  const dictation = useDictationInto(setText, setCaret, box);
+  const dictation = useDictationInto(text, setText, setCaret, box);
 
   /**
    * A question put back in the box, and the caret at the end of it.

@@ -281,6 +281,46 @@ export async function postSegment(
   return heard ?? { text: "", verdict: "continues" };
 }
 
+/** The wire spelling of the fifth kind — a contract with `core/src/voice.rs`'s `Kind`. */
+const DRAFT_KIND = "draft";
+
+/**
+ * What the transcriber makes of a sentence that is still being spoken.
+ *
+ * A fifth kind rather than a flag on {@link postCapture}, because it is a different thing on every
+ * axis that matters: it writes no row in `voice_captures`, it runs no cleanup model, it is
+ * cancellable, and — unlike `segment` — it keeps every word, where a segment strips the closing
+ * "câmbio" that ends a hands-free turn. A word eaten off the end of a draft would present as the
+ * microphone swallowing syllables.
+ *
+ * Always a string, never `undefined`, and that is the whole reason this wrapper exists: the caller
+ * revises a span of a text box with whatever comes back, and `""` is the revision that empties the
+ * span. Most drafts of the first half-second of a sentence are empty — `voice.rs` answers a draft
+ * with `{"text": ""}` rather than the `204` the other kinds use, so the `?? ""` here is a guard on
+ * that contract rather than the ordinary path.
+ *
+ * Only worth asking for against a resident transcriber (`stt_url`). Measured 2026-09-20 on this
+ * machine, whisper.cpp's server answers a short clip in 96 ms where spawning `whisper-cli` takes
+ * 1250 ms — and a revision every 1.25 s is not a revision, it is the old behaviour with extra steps.
+ */
+export async function postDraft(
+  bytes: Uint8Array,
+  durationMs: number,
+  format = "wav",
+): Promise<string> {
+  const params = new URLSearchParams({
+    kind: DRAFT_KIND,
+    duration_ms: String(Math.max(0, Math.round(durationMs))),
+    format,
+  });
+  const heard = await apiFetch<{ text: string } | undefined>(`/voice/capture?${params.toString()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: bytes,
+  });
+  return heard?.text ?? "";
+}
+
 /**
  * The wire spelling of the third kind.
  *

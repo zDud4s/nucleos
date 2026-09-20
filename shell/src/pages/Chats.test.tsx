@@ -32,12 +32,12 @@ vi.mock("../data/client", async (original) => ({
    `data/dictation.test.ts`; what is left here is what the box does with a sentence once it has one,
    so the mock keeps the callback and a test hands it words as if they had been spoken. */
 const dictation = vi.hoisted(() => ({
-  said: null as ((text: string) => void) | null,
+  said: null as ((text: string, final: boolean) => void) | null,
   trouble: null as string | null,
   toggle: vi.fn(),
 }));
 vi.mock("../data/dictation", () => ({
-  useDictation: (onText: (text: string) => void) => {
+  useDictation: (onText: (text: string, final: boolean) => void) => {
     dictation.said = onText;
     return { phase: "off", trouble: dictation.trouble, toggle: dictation.toggle };
   },
@@ -2327,7 +2327,7 @@ describe("Chats - what it may do without asking", () => {
     const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: "olá" } });
 
-    act(() => dictation.said!("mundo"));
+    act(() => dictation.said!("mundo", true));
 
     await waitFor(() => expect(textarea.value).toBe("olá mundo"));
     // The list read on this route is a GET and happens anyway; what must not have happened is the
@@ -5277,6 +5277,50 @@ describe("Chats - the microphone in an open conversation", () => {
     expect(screen.queryByRole("button", { name: /^Talk$/ })).toBeNull();
   });
 
+  /* Progressive dictation, from the box's side. The transcriber revises the sentence it is hearing,
+     and every revision but the first replaces the last — "come" becoming "come view" becoming
+     "câmbio" is one word being corrected, not three being dictated. The old behaviour here was
+     append-only, which is what this would have produced: "olá come come view câmbio". */
+  it("replaces what the microphone last put in the box rather than adding to it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "olá" } });
+
+    act(() => dictation.said!("come", false));
+    await waitFor(() => expect(textarea.value).toBe("olá come"));
+    act(() => dictation.said!("come view", false));
+    await waitFor(() => expect(textarea.value).toBe("olá come view"));
+    act(() => dictation.said!("câmbio", true));
+    await waitFor(() => expect(textarea.value).toBe("olá câmbio"));
+
+    // The sentence closed, so the next one is a new span and lands after it rather than over it.
+    act(() => dictation.said!("e agora isto", true));
+    await waitFor(() => expect(textarea.value).toBe("olá câmbio e agora isto"));
+  });
+
+  /* Whatever the person does to the box wins. A revision landing on text somebody has since edited
+     must not overwrite it — it opens a fresh span at the end, which is the same thing that happens
+     when the box is emptied by sending the message mid-dictation. */
+  it("stops revising a span the person has typed into", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+
+    act(() => dictation.said!("câmbio", false));
+    await waitFor(() => expect(textarea.value).toBe("câmbio"));
+    fireEvent.change(textarea, { target: { value: "câmbio e corte" } });
+
+    act(() => dictation.said!("câmbio e corte no fim", true));
+    await waitFor(() => expect(textarea.value).toBe("câmbio e corte câmbio e corte no fim"));
+  });
+
   it("lands a spoken sentence after what was already typed, and sends nothing", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
@@ -5286,7 +5330,7 @@ describe("Chats - the microphone in an open conversation", () => {
     const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: "olá" } });
 
-    act(() => dictation.said!("mundo"));
+    act(() => dictation.said!("mundo", true));
 
     await waitFor(() => expect(textarea.value).toBe("olá mundo"));
     // The gesture writes; it does not send. A misheard sentence must be correctable first.
