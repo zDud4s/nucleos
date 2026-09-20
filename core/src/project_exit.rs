@@ -59,7 +59,6 @@ const PROJECT_SCOPED: &[&str] = &[
     "project_shell_rules",
     "project_slots",
     "proposals",
-    "refinements",
     "repo_trigger_state",
     "run_presets",
     "runs",
@@ -91,7 +90,14 @@ const VIA_PARENT: &[(&str, &str, &str)] = &[
     ("map_anchors", "decision_id", "map_decisions"),
     ("map_stamps", "decision_id", "map_decisions"),
     ("map_triage", "decision_id", "map_decisions"),
-    ("refinement_events", "refinement_id", "refinements"),
+    // A run's briefing trail. It belongs to the project through its run and through nothing else,
+    // which is enough: a trace row only exists if there is a run, and every run of this project is
+    // being deleted in this same transaction.
+    //
+    // Its sibling `knowledge_events` is NOT here and could not be: this list joins on the `id` of a
+    // parent that is itself project-scoped, and `knowledge` is not — the store keeps its scope in
+    // two columns. See the two statements written out in `remove`.
+    ("run_knowledge", "run_id", "runs"),
 ];
 
 /// What a project has on record, in the nouns somebody would recognise.
@@ -264,6 +270,54 @@ pub async fn remove(
         // from the two consts at the top of this file, no caller reaches either with a string of its
         // own, and the one value that does come from a caller is the bound `?`.
         //
+        // Two shapes neither list can express, and both are this store's. The scope is two columns,
+        // so `PROJECT_SCOPED`'s `WHERE project_id = ?` does not reach it; and a job-scoped row names
+        // its job in a polymorphic TEXT column with no foreign key, so `VIA_PARENT`'s join on a
+        // parent's `id` does not either. Written out here rather than bent into a list, because a
+        // list entry that means something different from its neighbours is a list nobody can read.
+        //
+        // **BEFORE the two loops, and that position is load-bearing.** `defer_foreign_keys` makes
+        // the order indifferent to the foreign-key CHECKS, and it does nothing at all for a
+        // statement that READS a table another statement deletes: `jobs` is in `PROJECT_SCOPED`, so
+        // run after that loop these two find no jobs, match no rows, and leave every job-scoped row
+        // behind — silently, and for ever. Measured, not reasoned: written after the loop, both
+        // `forgetting_a_project_also_takes_the_knowledge_of_its_jobs` and
+        // `forgetting_a_project_leaves_no_history_of_the_knowledge_it_took` failed with alpha's job
+        // row still on record.
+        //
+        // `knowledge_events` before `knowledge` for the same reason one step down: it reads the
+        // rows the next statement deletes.
+        //
+        // CAST, and it is not decoration. `jobs.id` is INTEGER (`0042_jobs.sql:5`) and `scope_id` is
+        // TEXT, so comparing them without it matches NOTHING — the same silent nothing as the wrong
+        // position above, arriving by a different route.
+        //
+        // `machine` and `errand` appear in neither statement, and that is correct: machine rows are
+        // not a project's, and an errand has no project at all.
+        forgotten += sqlx::query(
+            "DELETE FROM knowledge_events
+              WHERE knowledge_id IN (
+                    SELECT id FROM knowledge
+                     WHERE (scope_kind = 'project' AND scope_id = ?1)
+                        OR (scope_kind = 'job'
+                            AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1)))",
+        )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        forgotten += sqlx::query(
+            "DELETE FROM knowledge
+              WHERE (scope_kind = 'project' AND scope_id = ?1)
+                 OR (scope_kind = 'job'
+                     AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1))",
+        )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
         // Children first. The deferral above means it would work in any order, and doing it in the
         // order the rows actually depend on keeps the statement log readable when one of them fails.
         for (child, key, parent) in VIA_PARENT {
@@ -681,7 +735,7 @@ mod tests {
     /// asks the schema which tables point at a project-scoped parent and requires every one of them
     /// to have been considered.
     ///
-    /// Self-references are excluded — a run naming its successor, a refinement naming what it
+    /// Self-references are excluded — a run naming its successor, one thing known naming what it
     /// supersedes — because the parent is already going and the child is the same table.
     #[tokio::test]
     async fn every_child_of_a_project_scoped_table_is_listed() {
@@ -758,6 +812,199 @@ mod tests {
         assert_eq!(
             runs, 1,
             "the history is kept unless somebody says otherwise"
+        );
+    }
+
+    /// A project, a job of that project, a run of that job, and one thing known at each of the two
+    /// scopes the forget has to reach — plus the trail that says the run was briefed.
+    ///
+    /// One helper and not four seeded blocks, because the four tests below differ in what they
+    /// assert and not in what they are about: forgetting a project that used the store.
+    async fn briefed_project(pool: &SqlitePool, project_id: &str) -> (i64, i64) {
+        register(pool, project_id).await;
+        let job: i64 = sqlx::query_scalar(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
+             VALUES (?, 'C:/tmp', 'done', 1, '2026-01-01T00:00:00Z') RETURNING id",
+        )
+        .bind(project_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let run: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (project_id, job_id, prompt, status, created_at)
+             VALUES (?, ?, 'go', 'done', '2026-01-01T00:00:00Z') RETURNING id",
+        )
+        .bind(project_id)
+        .bind(job)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        for (scope_kind, scope_id, layer) in [
+            ("project", project_id.to_owned(), "semantic"),
+            ("job", job.to_string(), "working"),
+        ] {
+            let known: i64 = sqlx::query_scalar(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+                 VALUES (?, ?, ?, 'run', 'memory', 'a lesson', 'body', 'active',
+                         '2026-01-01T00:00:00Z') RETURNING id",
+            )
+            .bind(layer)
+            .bind(scope_kind)
+            .bind(&scope_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+                 VALUES (?, 'proposed', 'active', 'approved by the owner', '2026-01-01T00:00:00Z')",
+            )
+            .bind(known)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO run_knowledge
+                   (run_id, knowledge_id, shown, s_fts, s_scope, s_structure, s_recency, s_use, at)
+                 VALUES (?, ?, 1, 0.0, 1.0, 0.0, 0.0, 0.0, '2026-01-01T00:00:00Z')",
+            )
+            .bind(run)
+            .bind(known)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        (job, run)
+    }
+
+    async fn count(pool: &SqlitePool, sql: &'static str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    /// Forgetting a project whose runs received a briefing must not fail at COMMIT. Before
+    /// `run_knowledge` joined `VIA_PARENT` this presented as `Removed::Referenced` — "something
+    /// outside this project's history still points into it" — the right message for the wrong
+    /// mechanism. And `every_project_scoped_table_is_listed` structurally cannot catch it: its query
+    /// filters on `c.name = 'project_id'`, and this table has no such column.
+    #[tokio::test]
+    async fn forgetting_a_project_whose_runs_were_briefed_does_not_fail_at_commit() {
+        let pool = pool().await;
+        briefed_project(&pool, "alpha").await;
+
+        let removed = remove(&pool, "alpha", true).await.unwrap();
+        assert!(
+            matches!(removed, Removed::Done { .. }),
+            "the forget was refused rather than performed: {removed:?}"
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM run_knowledge").await,
+            0,
+            "the briefing trail of a forgotten project is still on record"
+        );
+    }
+
+    /// The scope lives in two columns now, so `DELETE ... WHERE project_id = ?` no longer reaches
+    /// it. And machine-scoped rows are not a project's to forget.
+    #[tokio::test]
+    async fn forgetting_a_project_takes_its_project_scope_and_leaves_the_machine_alone() {
+        let pool = pool().await;
+        briefed_project(&pool, "alpha").await;
+        briefed_project(&pool, "bravo").await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'machine', NULL, 'owner', 'prompt', 'about the house', 'body',
+                     'active', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        remove(&pool, "alpha", true).await.unwrap();
+
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'project' AND scope_id = 'alpha'"
+            )
+            .await,
+            0,
+            "the project's own knowledge outlived the project"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'machine'"
+            )
+            .await,
+            1,
+            "forgetting one project took what is known about the house"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'project' AND scope_id = 'bravo'"
+            )
+            .await,
+            1,
+            "forgetting one project took another project's knowledge"
+        );
+    }
+
+    /// The leak the spec found on its fourth pass: every `working` row is `scope_kind='job'`,
+    /// `scope_id` is polymorphic and therefore has no FK, and neither list can say "delete where the
+    /// job belongs to this project". Without a third form of DELETE, forgetting a project leaves the
+    /// knowledge of its jobs behind FOR EVER — and the test first prescribed passed while the leak
+    /// existed, because it only compared `project` against `machine`.
+    #[tokio::test]
+    async fn forgetting_a_project_also_takes_the_knowledge_of_its_jobs() {
+        let pool = pool().await;
+        let (alpha_job, _) = briefed_project(&pool, "alpha").await;
+        let (bravo_job, _) = briefed_project(&pool, "bravo").await;
+
+        remove(&pool, "alpha", true).await.unwrap();
+
+        let left: Vec<String> = sqlx::query_scalar(
+            "SELECT scope_id FROM knowledge WHERE scope_kind = 'job' ORDER BY scope_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            left,
+            vec![bravo_job.to_string()],
+            "what a forgotten project's jobs knew is still on record, or another project's went \
+             with it (the forgotten job was {alpha_job})"
+        );
+    }
+
+    /// And the history of those rows goes with them. Asserted rather than left to surface as a
+    /// dangling-FK commit failure: the deferred check would catch it, but it would present as
+    /// `Removed::Referenced` — the one message this whole task exists to stop meaning the wrong
+    /// thing.
+    #[tokio::test]
+    async fn forgetting_a_project_leaves_no_history_of_the_knowledge_it_took() {
+        let pool = pool().await;
+        briefed_project(&pool, "alpha").await;
+        briefed_project(&pool, "bravo").await;
+
+        remove(&pool, "alpha", true).await.unwrap();
+
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM knowledge_events").await,
+            2,
+            "the events of a forgotten project's knowledge outlived it, or bravo's went too"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM knowledge_events AS e
+                  WHERE NOT EXISTS (SELECT 1 FROM knowledge AS k WHERE k.id = e.knowledge_id)"
+            )
+            .await,
+            0,
+            "an event row points at knowledge that is gone"
         );
     }
 
