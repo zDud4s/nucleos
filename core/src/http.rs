@@ -13787,7 +13787,7 @@ async fn post_knowledge(
 /// showed only what is in force could not answer "what did it try to learn that I said no to".
 async fn list_knowledge(
     State(state): State<AppState>,
-) -> Result<Json<Vec<crate::knowledge::Refinement>>, StatusCode> {
+) -> Result<Json<Vec<crate::knowledge::Known>>, StatusCode> {
     crate::knowledge::all(&state.pool)
         .await
         .map(Json)
