@@ -48,7 +48,15 @@
 # worktree GC's preservation commit then overflows its ceiling on every pass, for ever (run-900388,
 # 2026-09-02..04: 77 Telegram notices in 38 hours). Any depth on purpose: `core/` builds land there too.
 .cargo-target*/
-/shell/node_modules/
+# Any depth on purpose, like `.cargo-target*/` above. vitest writes its cache to
+# `<cwd>/node_modules/.vite/`, so running it from the repo root instead of from `shell/`
+# leaves a stray root `node_modules/` with no `package.json` beside it. Anchored to
+# `/shell/`, that stray stayed unignored, `git status` listed it, and
+# `select_tests.py --gate` exited 2 (STALE CATALOG, no group claims the path) — which
+# parks the mandated test gate for EVERY task, not just the one that created it.
+# Measured 2026-09-18; same failure shape the `no_gate` list in `.ai/tests/catalog.yaml`
+# records for `preview-shots-all.mjs` on 2026-09-07.
+node_modules/
 /shell/dist/
 /shell/src-tauri/target/
 # Output of `node scripts/preview-shots.mjs` — pictures to look at, not a baseline to diff.

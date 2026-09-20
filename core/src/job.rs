@@ -2737,17 +2737,54 @@ pub fn replan_prompt(
     let broke = if unfinished.is_empty() {
         String::new()
     } else {
+        // Which items get to spend [`REPLAN_GATE_BUDGET`], decided before anything is written.
+        //
+        // Spent NEWEST-FIRST and rendered oldest-first, which is the whole of the design. `ordinal`
+        // is job-wide and increasing, so the list arrives chronological and the freshest failure —
+        // the one this round is actually answering — is at the END. A budget spent in list order
+        // would hand every byte to the oldest failures on the job and leave the current one
+        // wordless, which is the opposite of useful and would look like it was working.
+        let mut budget = REPLAN_GATE_BUDGET;
+        let mut shown = vec![false; unfinished.len()];
+        for (index, item) in unfinished.iter().enumerate().rev() {
+            let Some(output) = &item.gate_output else {
+                continue;
+            };
+            // All or nothing per item: half a gate's tail is half a stack trace, and the half that
+            // survives a budget cut is the earlier half — the summary line a node needs is the part
+            // that would be dropped. An item that does not fit keeps its place in the list and
+            // says what it is missing.
+            //
+            // The walk CONTINUES past an item that does not fit rather than stopping, so a short
+            // older failure can still use room a long newer one could not. That is deliberate: the
+            // guarantee worth having is that recency decides PRIORITY, and stopping at the first
+            // miss would throw away room already paid for to buy a tidier rule.
+            if output.len() <= budget {
+                budget -= output.len();
+                shown[index] = true;
+            }
+        }
         let mut lines = String::from(
             "\n\nWhat the last round could not finish, and what is known about why:\n\n",
         );
-        for item in unfinished {
+        for (index, item) in unfinished.iter().enumerate() {
             lines.push_str(&format!(
                 "- item {}: {}\n",
                 item.ordinal + 1,
                 item.description
             ));
             match &item.gate_output {
-                Some(output) => lines.push_str(&format!("  the gate said:\n{output}\n")),
+                Some(output) if shown[index] => {
+                    lines.push_str(&format!("  the gate said:\n{output}\n"))
+                }
+                Some(output) => lines.push_str(&format!(
+                    "  the gate said {} bytes, not shown: this prompt carries at most {} bytes of \
+                     gate output and newer failures took it. The item is listed because it still \
+                     decides how the job ends; read the gate's words from this item's own run if \
+                     you take it over.\n",
+                    output.len(),
+                    REPLAN_GATE_BUDGET
+                )),
                 None => lines.push_str(
                     "  its node ended before any gate looked at it, so nothing measured this one.\n",
                 ),
@@ -4356,6 +4393,27 @@ pub async fn revert_target(
 /// database, and a megabyte pasted into a prompt, is its own defect. A few KB of the TAIL is where
 /// a test runner puts its failures and its summary line, which is the part a retry can act on.
 const GATE_OUTPUT_TAIL: usize = 4096;
+
+/// How much gate output ONE replan prompt may carry, across every unfinished item in it.
+///
+/// [`GATE_OUTPUT_TAIL`] bounds what a single item contributes and nothing bounded the sum, which is
+/// a different quantity: `unfinished_items` has no `LIMIT` and no round filter, so a replan lists
+/// every failure of the whole job that nothing has taken over. `MAX_ROUNDS_CEILING` is 20 and
+/// `MAX_ITEMS_CEILING` is 5 — the ceiling's own comment already says "100 items in the worst case" —
+/// so the unbounded sum is 100 × 4 KiB ≈ **400 KiB** of gate output in the one prompt that decides
+/// what the job does next. At the harness's own 4 chars/token that is ~100k tokens spent on
+/// re-reading old failures.
+///
+/// Derived rather than picked: `GATE_OUTPUT_TAIL * MAX_ITEMS_CEILING` is exactly one full round's
+/// failures at full detail. That is the round the replan is answering, and it is the number that
+/// moves if either input does.
+///
+/// The budget buys gate OUTPUT and never an item's identity. Every unfinished item stays listed
+/// whatever the budget does, because — in `replan_prompt`'s own words — "a failure nothing takes
+/// over still decides how the job ends", so dropping one from the list would hide from the node the
+/// very thing it needs a `"replaces"` for. What a squeezed item loses is the gate's words, and it
+/// says so where they would have been.
+const REPLAN_GATE_BUDGET: usize = GATE_OUTPUT_TAIL * crate::config::MAX_ITEMS_CEILING;
 
 /// The last [`GATE_OUTPUT_TAIL`] bytes of a gate's output, cut where a character actually ends.
 ///
@@ -8496,6 +8554,90 @@ mod tests {
         // be reproposed, and a round that lost that half would redo its own finished work.
         assert!(prompt.contains("the parts of it that LANDED"), "{prompt}");
         assert!(!prompt.contains("Do not repropose any of it."), "{prompt}");
+    }
+
+    /// The worst case `unfinished_items` can hand a replan, bounded — and the bound spent on the
+    /// failures the round is actually answering.
+    ///
+    /// The numbers are the job's own ceilings rather than a scenario invented for the test:
+    /// `MAX_ROUNDS_CEILING` rounds of `MAX_ITEMS_CEILING` items, every one of them red and none
+    /// taken over, which is the 100 items `MAX_ROUNDS_CEILING`'s own comment names. At
+    /// `GATE_OUTPUT_TAIL` each that is ~400 KiB of gate output in one prompt.
+    ///
+    /// Verified by mutation: with the budget removed (every item shown), this test fails on the
+    /// size assertion at 409,600 bytes of gate output against a 20,480-byte bound.
+    #[test]
+    fn the_replan_prompt_bounds_the_gate_output_it_carries_and_spends_it_on_the_newest_failures() {
+        let worst_case =
+            crate::config::MAX_ROUNDS_CEILING as usize * crate::config::MAX_ITEMS_CEILING;
+        let unfinished: Vec<Unfinished> = (0..worst_case)
+            .map(|ordinal| Unfinished {
+                ordinal,
+                // Each item's own marker, so which ones kept their words is readable from the
+                // prompt rather than inferred from its length.
+                description: format!("item {ordinal}"),
+                // Exactly `GATE_OUTPUT_TAIL` bytes, because that is what `record_gate` stores and
+                // therefore what the worst case actually is. Padded rather than repeated to that
+                // length: a marker per item, then filler, so the sum is the real 100 x 4 KiB.
+                gate_output: Some(format!(
+                    "{:x<width$}",
+                    format!("gate-{ordinal} "),
+                    width = GATE_OUTPUT_TAIL
+                )),
+            })
+            .collect();
+
+        let prompt = replan_prompt("t", 19, &[], "/wt/.nucleos", None, &unfinished);
+
+        let carried: usize = unfinished
+            .iter()
+            .filter(|item| {
+                prompt.contains(&format!(
+                    "the gate said:\n{}",
+                    item.gate_output.as_ref().unwrap()
+                ))
+            })
+            .map(|item| item.gate_output.as_ref().unwrap().len())
+            .sum();
+        assert!(
+            carried <= REPLAN_GATE_BUDGET,
+            "carried {carried} bytes of gate output, over the {REPLAN_GATE_BUDGET}-byte budget"
+        );
+
+        // Every item is still LISTED. Spending the budget must never cost an item its identity:
+        // a failure nothing takes over decides how the job ends, and a node that cannot see one
+        // cannot write the `"replaces"` that would take it over.
+        for ordinal in 0..worst_case {
+            assert!(
+                prompt.contains(&format!("- item {}: item {ordinal}\n", ordinal + 1)),
+                "item {ordinal} is not listed"
+            );
+        }
+
+        // The budget went to the END of the list, which is the most recent round. The first item
+        // on a 100-item job is nineteen rounds old; the last is the one this replan is answering.
+        assert!(
+            prompt.contains(&format!(
+                "the gate said:\n{}",
+                unfinished[worst_case - 1].gate_output.as_ref().unwrap()
+            )),
+            "the newest failure lost its gate output"
+        );
+        assert!(
+            !prompt.contains(&format!(
+                "the gate said:\n{}",
+                unfinished[0].gate_output.as_ref().unwrap()
+            )),
+            "the oldest failure kept its gate output"
+        );
+
+        // A squeezed item says what it is missing rather than reading as a gate that stayed quiet —
+        // the same distinction the `None` arm above exists to preserve.
+        assert!(
+            prompt.contains("not shown: this prompt carries at most"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("nothing measured this one"), "{prompt}");
     }
 
     /// A dead node stops ending the queue at the item it died on, and the items after it run.
@@ -12983,6 +13125,57 @@ mod tests {
         assert!(
             retry.starts_with(&first),
             "the gate's output is appended to the brief, not substituted for part of it: {retry}"
+        );
+    }
+
+    /// The bound that keeps a megabyte of test runner out of the database and out of the next
+    /// prompt, and the boundary walk that keeps that bound from being a crash.
+    ///
+    /// Two claims, and the second is the one with teeth. `gate.rs` caps what it captures at 1 MiB,
+    /// which is the right bound against a runaway suite and far too much to paste into a retry — so
+    /// `record_gate` stores the TAIL and nothing else. The tail and not the head: a runner prints
+    /// its failures and its summary line last, and that is the part a retry can act on.
+    ///
+    /// The second claim is that the cut lands where a character ends. Slicing a `str` by a raw byte
+    /// index panics, `record_gate` runs inside the daemon, and a gate prints whatever the project's
+    /// tools print — an accented test name, a `✗`, a path off a non-ASCII branch. Nothing asserted
+    /// this until now, which is worse than it sounds: the guard and its absence look identical from
+    /// outside, because both pass every ASCII gate anybody has ever run. The failure was reserved
+    /// for the first non-ASCII one.
+    #[test]
+    fn the_stored_gate_output_is_a_tail_that_never_cuts_a_character_in_half() {
+        let short = "FAILED test_x\ntest result: FAILED. 1 failed";
+        assert_eq!(
+            gate_output_tail(short),
+            short,
+            "an output already inside the bound must arrive whole"
+        );
+
+        let long = format!("{}test result: FAILED. 3 failed", "noise\n".repeat(20_000));
+        let kept = gate_output_tail(&long);
+        assert!(
+            kept.len() <= GATE_OUTPUT_TAIL,
+            "kept {} bytes, over the {GATE_OUTPUT_TAIL}-byte bound",
+            kept.len()
+        );
+        assert!(
+            kept.ends_with("test result: FAILED. 3 failed"),
+            "the summary line is the part a retry acts on, and it did not survive: {kept}"
+        );
+
+        // `€` is three bytes and 4096 is not a multiple of three, so the naive cut lands INSIDE a
+        // character here. Chosen rather than stumbled upon: a two-byte character divides 4096
+        // evenly, so an implementation with no walk at all would pass a test written with `é`.
+        let accented = "€".repeat(2_000);
+        let walked = gate_output_tail(&accented);
+        assert!(
+            accented.ends_with(walked),
+            "the walk moved the cut past the end of the output"
+        );
+        assert!(
+            GATE_OUTPUT_TAIL - walked.len() < 4,
+            "the walk skipped {} bytes looking for a boundary, which is more than one character",
+            GATE_OUTPUT_TAIL - walked.len()
         );
     }
 

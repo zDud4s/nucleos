@@ -8,7 +8,9 @@ intentional: a Stop hook has no packet to assess until the controller creates
 that marker immediately before dispatching execute.
 
 Malformed packets fail closed (exit 2), while a well-formed packet with missing
-evidence exits 1 and names each unproven validation command.
+evidence exits 1 and names each unproven validation command.  A packet still
+carrying the schema's own placeholders exits 1 as well, reported as "not yet
+authored" rather than as damage -- see `UnfilledPacket`.
 """
 
 from __future__ import annotations
@@ -26,6 +28,21 @@ EXIT = re.compile(r"^exit:\s*\d+\s*$")
 
 class MalformedPacket(ValueError):
     """The packet cannot be safely interpreted."""
+
+
+class UnfilledPacket(ValueError):
+    """The packet is intact but still carries the schema's placeholders.
+
+    Separate from `MalformedPacket` because the two send a reader to different places.
+    "Malformed" says the file is damaged; this says nobody has written it yet -- the
+    controller created `.ai/local/active-packet` before filling the packet, when the
+    contract puts that marker "immediately before dispatching execute", by which point
+    the commands exist. Reporting the second as the first sends whoever is on call
+    hunting for corruption that is not there, which is what happened on 2026-09-19.
+
+    Still refuses. The distinction is in the message and never in the verdict: this
+    gate can refuse but it can never approve, and an unwritten packet proves nothing.
+    """
 
 
 def section(lines: list[str], name: str) -> list[str]:
@@ -54,9 +71,15 @@ def validation_commands(lines: list[str]) -> list[str]:
         raise MalformedPacket("missing Validation Commands:") from exc
 
     commands: list[str] = []
+    # Kept alongside the commands so an empty result can say WHICH empty it is. The
+    # schema ships `Commands:` trailing an HTML comment that explains what to write;
+    # a packet still carrying it has not been authored, which is a different failure
+    # from a packet whose author deliberately listed nothing.
+    region: list[str] = [body[start]]
     for line in body[start + 1 :]:
         if line.startswith("Expected result:"):
             break
+        region.append(line)
         match = re.match(r"^\s*-\s+`(.+?)`\s*$", line)
         if not match:
             continue
@@ -65,6 +88,8 @@ def validation_commands(lines: list[str]) -> list[str]:
             raise MalformedPacket("empty validation command")
         commands.append(command)
     if not commands:
+        if "<!--" in "\n".join(region):
+            raise UnfilledPacket("Validation Commands: still holds the schema template")
         raise MalformedPacket("Validation Commands: has no commands")
     if len(commands) != len(set(commands)):
         raise MalformedPacket("Validation Commands: contains a duplicate command")
@@ -125,6 +150,11 @@ def check_packet(text: str) -> list[str]:
 def check_path(path: Path) -> int:
     try:
         missing = check_packet(path.read_text(encoding="utf-8"))
+    except UnfilledPacket as exc:
+        # Refuses like any other failure -- 1 rather than 2 only because nothing here
+        # is damaged. Never 0: an unwritten packet has proven nothing.
+        print(f"evidence gate: packet not yet authored: {exc}", file=sys.stderr)
+        return 1
     except (OSError, UnicodeError, MalformedPacket) as exc:
         print(f"evidence gate: malformed input: {exc}", file=sys.stderr)
         return 2
