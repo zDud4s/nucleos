@@ -242,10 +242,24 @@ await mkdir(SHOTS, { recursive: true });
  * that reads well above the fold and falls apart below it is exactly the defect
  * a viewport-sized screenshot hides.
  */
-async function shoot(name, { path, tab, press, drag, theme = "dark" }) {
+async function shoot(name, { path, tab, press, drag, hover, window: windowKind, viewport, theme = "dark" }) {
   await send("Emulation.setEmulatedMedia", {
     features: [{ name: "prefers-color-scheme", value: theme }],
   }, sessionId);
+
+  /*
+    A per-shot viewport, overriding WIDTH/HEIGHT for this one picture and restored afterward — same
+    override/restore shape the tall-page growth below already uses, and for the same reason: a size
+    one shot needs is not a size every shot should inherit. The floating quota notch is on the order
+    of a couple hundred pixels; the default 1440x960 canvas would photograph it as a speck on a field
+    of black.
+  */
+  const { width, height } = viewport ?? { width: WIDTH, height: HEIGHT };
+  await send(
+    "Emulation.setDeviceMetricsOverride",
+    { width, height, deviceScaleFactor: 2, mobile: false },
+    sessionId,
+  );
 
   pageErrors.length = 0;
   const query = new URLSearchParams({
@@ -257,6 +271,12 @@ async function shoot(name, { path, tab, press, drag, theme = "dark" }) {
     /* The title of an occurrence to pick up and hold. A drag is a state the
        page enters, and everything it turns on exists only while it lasts. */
     ...(drag === undefined ? {} : { drag }),
+    /* A selector to hover once the page has settled — the gesture a surface that opens on
+       `onPointerEnter` needs, where `press`'s click would land on a control instead. */
+    ...(hover === undefined ? {} : { hover }),
+    /* Which face of the bundle to mount: absent is the router, `notch` is the floating quota
+       window `?window=notch` opens in the packaged app. See `preview/main.tsx` and `main.tsx`. */
+    ...(windowKind === undefined ? {} : { window: windowKind }),
   });
   await send("Page.navigate", { url: `${origin}/preview.html?${query}` }, sessionId);
 
@@ -281,22 +301,34 @@ async function shoot(name, { path, tab, press, drag, theme = "dark" }) {
     So: measure the scrolling column, grow the VIEWPORT to fit it, and let the
     layout reflow. The picture is then of a window tall enough to hold the page,
     which is the honest way to show a page taller than any window.
-  */
-  const needed = await evaluate(`(() => {
-    const main = document.querySelector("main") ?? document.body;
-    const chrome = window.innerHeight - main.clientHeight;
-    return Math.ceil(chrome + main.scrollHeight);
-  })()`);
-  const tall = Math.min(Math.max(needed, HEIGHT), 5000);
 
-  if (tall !== HEIGHT) {
-    await send(
-      "Emulation.setDeviceMetricsOverride",
-      { width: WIDTH, height: tall, deviceScaleFactor: 2, mobile: false },
-      sessionId,
-    );
-    // One beat for the reflow, and one for anything that measures itself.
-    await new Promise((ok) => setTimeout(ok, 350));
+    Skipped entirely when a `viewport` was given. That measurement reads `main`,
+    which does not exist in the notch window — `NotchWindow` renders no `<main>`
+    at all — and falls back to `document.body`, whose own height there is just
+    the notch's drawing (`.notch-host body` sizes to content, `app.css`). Feeding
+    THAT into the same "grow to fit a scrolling column" arithmetic a console page
+    needs is not a smaller version of the same problem, it is a different
+    question with no `main` to answer it: a `viewport` shot is asking for an
+    exact frame around a small drawing, not for room to keep growing.
+  */
+  let tall = height;
+  if (viewport === undefined) {
+    const needed = await evaluate(`(() => {
+      const main = document.querySelector("main") ?? document.body;
+      const chrome = window.innerHeight - main.clientHeight;
+      return Math.ceil(chrome + main.scrollHeight);
+    })()`);
+    tall = Math.min(Math.max(needed, HEIGHT), 5000);
+
+    if (tall !== HEIGHT) {
+      await send(
+        "Emulation.setDeviceMetricsOverride",
+        { width, height: tall, deviceScaleFactor: 2, mobile: false },
+        sessionId,
+      );
+      // One beat for the reflow, and one for anything that measures itself.
+      await new Promise((ok) => setTimeout(ok, 350));
+    }
   }
 
   /*
@@ -318,19 +350,21 @@ async function shoot(name, { path, tab, press, drag, theme = "dark" }) {
 
   const { data } = await send("Page.captureScreenshot", { format: "png" }, sessionId);
 
-  if (tall !== HEIGHT) {
+  // Restore the harness's default canvas, whether this shot grew for a tall page or was given its
+  // own `viewport` — either way the NEXT shot in the loop has to start from a known size rather than
+  // inherit whatever this one left behind.
+  if (width !== WIDTH || tall !== HEIGHT) {
     await send(
       "Emulation.setDeviceMetricsOverride",
       { width: WIDTH, height: HEIGHT, deviceScaleFactor: 2, mobile: false },
       sessionId,
     );
   }
-  const height = tall;
 
   const file = join(SHOTS, name + ".png");
   await writeFile(file, Buffer.from(data, "base64"));
   console.log(
-    "  " + (pageErrors.length === 0 ? "ok  " : "err ") + name + "  " + Math.round(height) + "px" +
+    "  " + (pageErrors.length === 0 ? "ok  " : "err ") + name + "  " + Math.round(width) + "x" + Math.round(tall) + "px" +
       (pageErrors.length > 0 ? "  — " + pageErrors[0].split("\n")[0] : ""),
   );
   return pageErrors.length === 0;
@@ -484,6 +518,32 @@ const SHOTS_TO_TAKE = [
   ["57-calendar-dragging", { path: "/calendar?on=2026-08-24", drag: "Reconcile the ledger" }],
   ["58-calendar-dragging-light", { path: "/calendar?on=2026-08-24", drag: "Reconcile the ledger", theme: "light" }],
   ["59-calendar-week-dragging", { path: "/calendar?view=week&on=2026-08-25", drag: "Design review" }],
+
+  /* The floating quota notch (design D8): `NotchWindow`, mounted the way `?window=notch` mounts it
+     in the packaged app (`main.tsx`, mirrored by `preview/main.tsx`) — a borderless window of its
+     own, over everything, rather than a piece of some page. Folded is the state it spends almost
+     all its life in: two rings and nothing behind them but the transparent ground `.notch-host`
+     gives it. A `viewport` frames it with a little room around the drawing instead of the harness's
+     default 1440x960 canvas, which would photograph a couple hundred pixels of notch on most of a
+     thousand pixels of black. */
+  ["60-notch-floating-folded", { path: "/teams", window: "notch", viewport: { width: 640, height: 240 } }],
+  /* Unfolded, via `hover` rather than `press`: `QuotaNotch` opens on `onPointerEnter`, and this is
+     the one state of it nothing could photograph before — a click would land on whichever control
+     sits under the pointer instead of on the wrapper the gesture actually needs. This is the
+     provider names, the arcs read in full, and — if the sidecar has gone stale — the way back into
+     the app, none of which the folded shot above shows at all. */
+  ["61-notch-floating-unfolded", { path: "/teams", window: "notch", hover: ".quota-notch", viewport: { width: 640, height: 240 } }],
+  /* And in light, for the reason several pairs above already are one: the unfolded notch draws its
+     "last known" caption on `--text-faint`, and whether faint text over a transparent, borderless
+     window still reads is a contrast question a dark shot alone cannot answer. */
+  [
+    "62-notch-floating-unfolded-light",
+    { path: "/teams", window: "notch", hover: ".quota-notch", viewport: { width: 640, height: 240 }, theme: "light" },
+  ],
+  /* The other host, same component: `host="contained"` draws it at the top of an ordinary page
+     (`AppShell.tsx`) rather than floating, and needs none of the options above — `contained` is
+     always unfolded, so any page path already shows it. */
+  ["63-notch-contained", { path: "/teams" }],
 ];
 
 const wanted = SHOTS_TO_TAKE.filter(([name]) => ONLY === undefined || name.includes(ONLY));

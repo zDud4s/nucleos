@@ -41,6 +41,7 @@ export function AppShell() {
  * the log with failures nobody can act on.
  */
 function Frame() {
+  const notched = useNotchMode() === "contained";
   /**
    * Whether anything in the machine wants looking at, for the rail's one dot.
    *
@@ -155,11 +156,18 @@ function Frame() {
           <hr className="nav-rule" />
           <KillSwitchControl />
         </Sidebar>
-        <main className="app-main">
+        {/*
+          The gutter the contained notch stands in. Asked for here rather than reserved always,
+          because with the notch floating there is nothing at the page's right edge to make room
+          for — and asked for by the same hook the notch itself reads, which is one cache entry in
+          react-query and therefore one answer, not two that can disagree.
+        */}
+        <main className={notched ? "app-main app-main-notched" : "app-main"}>
           {/*
-            The notch, contained. At the top edge of the page area rather than inside it, because it
-            is about the machine and not about whatever page is open — and because that is where
-            the floating window hangs too, so the drawing does not move between the two hosts.
+            The notch, contained. Against the right edge of the window rather than inside the page,
+            because it is about the machine and not about whatever page is open — and because that
+            is the edge the floating window hangs from too, so the drawing does not move between
+            the two hosts.
           */}
           <ContainedNotch />
           <div className="app-page">

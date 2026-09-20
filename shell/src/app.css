@@ -39,50 +39,160 @@
 }
 
 /**
- * The notch: how much of each assistant's usage window is gone, at the top edge of the page area.
+ * The notch: how much of each assistant's usage window is gone, hanging off the right edge.
  *
- * `sticky` and not `fixed`. Fixed would take it out of the grid and put it over a rail whose width
- * this file is careful never to know; sticky keeps it inside the column the grid hands over, so it
- * centres over the page and stays put while the page scrolls under it, with nothing here having
- * been told how wide anything else is.
+ * **The edge decides the axis.** Left and right keep a vertical column; top and bottom would lay
+ * the readings out side by side. This draws the right edge, so everything below is a column — and
+ * the two hosts differ only in what glues it there, not in the shape.
  *
- * `width: fit-content` with `margin-inline: auto` is what centres it: a sticky block is still a
- * block, and a full-width one would have nothing to centre.
+ * **`fixed` here, where `sticky` was right for a bar along the top.** The old rule argued against
+ * `fixed` because it would take the notch out of the grid and put it over a rail whose width this
+ * file is careful never to know. That objection was about a CENTRED thing: centring over the page
+ * column needs to know where the column is. `right: 0` needs to know nothing at all — the rail is
+ * on the left — so the argument does not carry over, and `fixed` buys what `sticky` cannot give a
+ * tall column: it is pinned to the middle of the window instead of taking a row of its own at the
+ * top of the page and then sliding over the text underneath as it scrolls.
+ *
+ * What that costs, named rather than discovered later: on a window narrow enough that the page has
+ * no slack to spare, a folded notch sits over about forty pixels of its right edge. The page is
+ * centred with a `max-width`, so above roughly 1250px it covers only slack. The old placement made
+ * the same trade against the top of the page; this one is at least the edge the floating window
+ * uses too, so the drawing does not move between the two hosts.
  *
  * The z-index is `1` and deliberately small. It has to sit over the page it hovers above and over
  * nothing else — a modal, a palette or a drawer must still come out in front of it, and a notch
  * that outranked them would be a quota reading covering the control somebody opened.
  */
 .quota-notch {
-  position: sticky;
-  top: 0;
   z-index: 1;
   width: fit-content;
-  margin-inline: auto;
   display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  padding: var(--space-2) var(--space-4);
+  flex-direction: column;
+  /* The rings are what is glued to the edge, so they are what the column aligns by. Unfolded, each
+     slot grows leftwards from its own ring and the ring does not move — the alternative is a
+     drawing that jumps sideways the moment the pointer arrives. */
+  align-items: flex-end;
+  /* Folded only. Tightened from `--space-3` after the first photograph: two rings with that much
+     air between them read as two separate things parked beside each other rather than as one
+     reading. Unfolded the same distance is too little, and the rule further down says why — the
+     right gap depends on what is in the column, which is the one thing that changes here. */
+  gap: var(--space-2);
+  padding: var(--space-2);
   background: var(--surface-raised);
   border: 1px solid var(--border);
-  /* Square at the top, round below: it hangs from the edge rather than floating free, which is the
-     whole shape of a notch. */
-  border-top: none;
-  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  /* Round on the left, square against the edge: it hangs off the side rather than floating free,
+     which is the whole shape of a notch. */
+  border-right: none;
+  border-radius: var(--radius-lg) 0 0 var(--radius-lg);
 }
 
+/**
+ * The width the page gives back so the folded notch stands beside it rather than on top of it.
+ *
+ * Measured off the drawing rather than derived from it, because the drawing's width comes from its
+ * content and CSS cannot ask: a 44px ring, `--space-2` of padding either side, one border — 61px,
+ * rounded up to a whole rem. The first photograph of this design is what made it necessary —
+ * pinned over a page at 1440px wide, the folded notch sat on the right-hand column of the Teams
+ * table and hid the pulse bars in it.
+ *
+ * Unfolding still covers something, and that is the right trade: a page that reflowed every time
+ * the pointer crossed the notch would be worse than a panel that overlaps for as long as somebody
+ * is reading it. Anything that changes `Ring`'s size or this element's padding has to come back
+ * here.
+ */
+.app-main-notched {
+  padding-right: 4rem;
+}
+
+/*
+  Unfolded, each slot is three lines of text tall instead of one ring, and `--space-2` between two
+  of them stops reading as a gap at all — the second provider's window names sit right under the
+  first's fidelity line. The padding is deliberately NOT part of this: it is what holds the rings
+  off the edge, and changing it would slide them sideways every time the pointer arrived.
+*/
+.quota-notch[data-unfolded="true"] {
+  gap: var(--space-3);
+}
+
+/* Pinned to the middle of the window's right edge. See the header for why this is `fixed`. */
+.quota-notch-contained {
+  position: fixed;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+/*
+  One provider: its rings, and — unfolded — what they add up to in words.
+
+  `row-reverse` rather than a different DOM order. The ring comes first in the markup because it is
+  the thing, and its detail second because it is about the thing: that is the order assistive tech
+  reads and the order focus moves in. Reversing only the drawing puts the ring against the edge
+  without lying to either.
+*/
 .quota-notch-slot {
   display: flex;
+  flex-direction: row-reverse;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-3);
 }
 
-/* The provider's name, in the daemon's own face. Text, so that the rings are never the only thing
-   on screen carrying the reading. */
-.quota-notch-name {
+/**
+ * The numbers, in three columns: the window, its percentage, and when it reopens.
+ *
+ * One grid for both windows, with each line `display: contents`, so the three columns line up
+ * across them — `7d` over `5h`, `46%` over `82%`, and the two reset phrases sharing a left edge.
+ * A grid per line would align nothing, and two rows of independently sized text read as a list of
+ * fragments rather than as a table of one provider's state.
+ *
+ * `text-align: right` on the percentage is what makes `46%` and `100%` end at the same place. It
+ * is the only column whose width changes with its content.
+ */
+.quota-notch-detail {
+  display: grid;
+  grid-template-columns: auto auto auto;
+  /* Three mono columns at `--space-2` ran together into one stripe of text: `7d` `46%` `resets in
+     3d` read as a single word before it read as three facts. */
+  column-gap: var(--space-3);
+  /* Was 1px, which is not a gap — two lines of mono at that distance are a block, and the unfolded
+     notch read as a paragraph nobody would finish. */
+  row-gap: var(--space-1);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.quota-notch-line {
+  display: contents;
+}
+
+/*
+  The figure the unfold exists to show, so it is the one thing here drawn at full size and full ink
+  — the window beside it and the reset after it are its labels, and a percentage set in the same
+  small grey as both of them is a table with no subject.
+*/
+.quota-notch-percent {
+  text-align: right;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.quota-notch-reset,
+.quota-notch-fidelity {
+  color: var(--text-faint);
+}
+
+/*
+  Across all three columns, under them, and ruled off: it is about the reading, not about one
+  window of it, and without the rule it read as a third window whose name had gone missing.
+*/
+.quota-notch-fidelity {
+  grid-column: 1 / -1;
+  margin-top: var(--space-1);
+  padding-top: var(--space-1);
+  border-top: 1px solid var(--border);
 }
 
 /**
@@ -99,7 +209,7 @@
   display: contents;
 }
 
-/* Shown only when the sidecar could not be reached. The figures beside it are real and old. */
+/* Shown only when the sidecar could not be reached. The figures above it are real and old. */
 .quota-notch-stale {
   font-size: var(--text-xs);
   color: var(--text-faint);
@@ -130,12 +240,12 @@
   width: max-content;
 }
 
-/* Hung from the top of the screen rather than from the top of a page: no stickiness and no
-   centring, because the window is already centred and exactly this wide. */
+/* Hung from the edge of the screen rather than from the edge of a page: nothing pins it, because
+   the window IS the drawing and the Rust side is what puts the window against the edge. */
 .quota-notch-global {
   position: static;
-  margin-inline: 0;
 }
+
 
 /**
  * The page, centred in whatever room the rail leaves it.

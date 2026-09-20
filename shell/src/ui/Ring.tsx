@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import type { StateBadgeProps } from "./StateBadge";
 import { readState } from "./state-map";
 
@@ -25,13 +26,34 @@ export interface RingProps {
   tracks: RingTrack[];
   /** Outer diameter in pixels. */
   size?: number;
+  /**
+   * Drawn at the centre, inside the innermost track.
+   *
+   * A slot and not a `provider` argument, so this primitive goes on knowing nothing about quota:
+   * it draws arcs, and it draws whatever it was handed in the hole they leave. `QuotaNotch` is the
+   * only thing that knows a provider has a mark, which is where that knowledge belongs — the same
+   * division `tracks` already has, where the caller decides what a track means and the ring only
+   * decides where it sits.
+   *
+   * Absent, the middle stays empty. It carries `pointer-events: none` in the stylesheet, so
+   * whatever goes in there cannot take the hover the arcs' own `<title>` elements answer.
+   */
+  mark?: ReactNode;
 }
 
-/** The default outer diameter: what fits legibly in a notch beside a second provider. */
-const SIZE = 34;
+/**
+ * The default outer diameter: what fits legibly in a notch beside a second provider.
+ *
+ * Forty-four and not thirty-four, and what the extra ten pixels buy is the hole rather than the
+ * ring. Two tracks cost a fixed `2 * STROKE + GAP` of radius whatever the diameter, so the clear
+ * middle is what a small ring runs out of first: at 34 it was 15px across, and a mark with any air
+ * round it had nowhere to be. At 44 it is 22px. `.app-main-notched` in `app.css` is measured off
+ * this number and has to follow it.
+ */
+const SIZE = 44;
 /** Track thickness, and the gap between two tracks. Both in pixels, at `SIZE`. */
-const STROKE = 3.5;
-const GAP = 2.5;
+const STROKE = 4;
+const GAP = 3;
 
 /**
  * A reading drawn as concentric arcs — the outer track the long window, the inner track the short
@@ -53,7 +75,7 @@ const GAP = 2.5;
  * 99.6% is not drawn full — being near the cap and being at it are different facts, and this is the
  * second place that distinction has to survive.
  */
-export function Ring({ label, tracks, size = SIZE }: RingProps) {
+export function Ring({ label, tracks, size = SIZE, mark }: RingProps) {
   const drawn = tracks.map((track, index) => {
     const reading = readState(track.domain, track.state);
     const used = Math.min(1, Math.max(0, track.used));
@@ -117,6 +139,7 @@ export function Ring({ label, tracks, size = SIZE }: RingProps) {
           </g>
         ))}
       </svg>
+      {mark !== undefined && <span className="ui-ring-mark">{mark}</span>}
       <span className="sr-only">{sentence}</span>
     </span>
   );

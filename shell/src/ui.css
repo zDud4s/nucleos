@@ -1644,9 +1644,50 @@ ol.ui-well {
  * weight of a foreground rather than the hairline a filled dot sits inside.
  */
 .ui-ring {
+  position: relative;
   display: inline-flex;
   align-items: center;
   flex: none;
+}
+
+/**
+ * The hole in the middle of the tracks, and whatever the caller put there.
+ *
+ * Absolutely positioned over the drawing rather than laid out beside it, because the arcs are the
+ * only thing that decides how big a ring is: a mark in the flow would widen the ring by its own
+ * width and the tracks would no longer be concentric with anything.
+ *
+ * `pointer-events: none` so the hover belongs to the arcs underneath. Each of them carries a
+ * `<title>` — the per-window hover text — and a glyph sitting on top would eat the one in the
+ * centre, which is the inner track, which is the short window: the reading most worth hovering.
+ */
+.ui-ring-mark {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  /* Full ink, not muted. A mark is identity and not a reading, so it does not compete with the
+     arcs for meaning — but at muted it lost to them for attention, which is the opposite of what
+     the mark replaced the provider's printed name to do. Neutral ink also keeps design D12: the
+     only thing here that carries a state's colour is still the arc. */
+  color: var(--text);
+  pointer-events: none;
+}
+
+/* A provider's mark, drawn in the ink of whatever it sits in (`ProviderMark.tsx`). */
+.ui-provider-mark {
+  display: block;
+  fill: currentColor;
+}
+
+/* The stand-in for a provider with no mark: its initial, in the face the rest of the notch uses. */
+.ui-provider-mark-initial {
+  fill: currentColor;
+  font-family: var(--font-mono);
+  /* In the path data's own 24x24 box, so it scales with the glyph rather than with the page: at
+     `ProviderMark`'s 16px this draws at about 11. */
+  font-size: 17px;
+  font-weight: 600;
 }
 
 .ui-ring-face {
