@@ -22,7 +22,7 @@ import {
 } from "./map-graphs";
 import { buildFileItems, fileFacts } from "./map-items";
 import { claimedFiles, claimsFor, isSettled, standingLabel } from "./map-claims";
-import { ASSUMED_ROOM, fitZoom, matrixWidth, zoomBy, zoomLabel } from "./map-zoom";
+import { ASSUMED_ROOM, fitZoom, matrixWidth, unreadableAt, zoomBy, zoomLabel } from "./map-zoom";
 
 /**
  * How this project is built, as three nested pictures under one header.
@@ -572,6 +572,29 @@ function Around({
   );
 }
 
+/**
+ * The same honesty one step quieter: the picture IS drawn, and part of it has
+ * stopped arriving.
+ *
+ * Separate from {@link Refused} in tone as well as in words, and the difference
+ * is the whole point. A refusal is final — that drawing is not coming. This is a
+ * condition of the size it is being looked at at, the reader holds the controls
+ * that change it, and the sentence is only useful if it says which one to reach
+ * for. So it names the reading that survived, the one that did not, and the two
+ * ways out, and it does not borrow the refusal's red-flag framing for something
+ * a press of `+` undoes.
+ */
+function TooSmall({ reasons }: { reasons: string[] }) {
+  if (reasons.length === 0) return null;
+  return (
+    <p className="max-w-prose text-xs text-text-muted">
+      <span className="text-text">At this size only the shape reads</span> — which side of the
+      diagonal the marks fall on, and how much is below it. The detail does not:{" "}
+      {reasons.join("; ")}. Stand closer, go full screen, or open a community to read it.
+    </p>
+  );
+}
+
 /** The honest half: why a picture is not being drawn, in the numbers that decided it. */
 function Refused({ reasons }: { reasons: string[] }) {
   return (
@@ -861,6 +884,7 @@ function Matrix({
           matrix.order.length,
           matrix.order.reduce((longest, title) => Math.max(longest, title.length), 0),
         )}
+        note={(zoom) => <TooSmall reasons={unreadableAt(zoom)} />}
       >
         <table className="m-3 border-collapse font-mono text-xs">
           <thead>
@@ -898,19 +922,37 @@ function Matrix({
                     The two marks this whole matrix exists to be counted by, and neither used to be
                     drawable: forwards wore the brand colour hand-diluted, and backwards a bare
                     `danger` name this app has never declared, so the utility compiled to nothing
-                    and every dependency pointing backwards shipped as an empty cell. Both are now
-                    real fills of `--text` at two weights — never a state tone, because red means
-                    destroyed and a back edge is coupling, not damage.
+                    and every dependency pointing backwards shipped as an empty cell. Both are
+                    fills of `--text` at two weights — never a state tone, because red means
+                    destroyed and a back edge is coupling, not damage. That rule stands; what
+                    follows is what it cost to keep it.
+
+                    THE DIAGONAL IS THE RULE, and the weights are the second reading rather than
+                    the only one. Two weights of one hue cannot carry this distinction on their
+                    own: `/15` against `/35` measured 1.93:1 in dark and 1.63:1 in light, against
+                    the 3:1 a graphical object needs to be told apart, and no pair of opacities on
+                    one hue reaches 3:1 in the light theme at all — `/15` against `/55` is the best
+                    available and stops at 2.95:1. The way out was not a second hue, which would
+                    have bought the number and spent the rule above. It was to stop asking colour
+                    to do it alone: a solid, unbroken staircase down the diagonal turns "above or
+                    below" into a question about POSITION against a visible boundary, which needs
+                    no contrast between the two fills, survives both themes, and survives a reader
+                    who cannot separate them by tone at all. The weights then only have to rank
+                    two things the eye has already placed, and at `/15` against `/55` they measure
+                    3.51:1 in dark and 2.95:1 in light.
+
+                    Full strength and not `surface-sunken`, which is what the diagonal wore while
+                    it was scenery: at the 50% this opens at, a near-background staircase was the
+                    faintest thing on a picture whose whole geometry hangs off it.
                   */
                   const tone =
                     i === j
-                      ? "bg-surface-sunken"
+                      ? "bg-text"
                       : weight === undefined
                         ? ""
                         : j > i
                           ? "bg-text/15"
-                          // Both triangles are the same hue at two weights: a back edge is a structural fact, not a fault. At the default 50% zoom the lighter mark was close to invisible, even though the 358 forward marks are the primary signal.
-                          : "bg-text/35";
+                          : "bg-text/55";
                   return (
                     <td
                       key={column}
@@ -963,10 +1005,21 @@ function Stage({
   natural,
   full,
   onFull,
+  note,
   children,
 }: {
   /** What is being looked at, said inside the frame so full screen still says it. */
   title: ReactNode;
+  /**
+   * What this drawing stops saying at the zoom it is actually being shown at.
+   *
+   * Takes the zoom because the answer changes with it, and the zoom lives here:
+   * the stage owns `chosen`, re-fits itself against its own box, and is the only
+   * thing that knows how big the picture ended up. A caller computing this from
+   * `fit` would be describing the drawing nobody is looking at the moment the
+   * reader presses `+`.
+   */
+  note?: (zoom: number) => ReactNode;
   /** The drawing's own width in pixels, before anything shrinks it. */
   natural: number;
   /** Whether the whole map surface has the window. Owned by `Shell`, not here. */
@@ -1029,6 +1082,7 @@ function Stage({
           </button>
         </span>
       </div>
+      {note?.(at)}
       {/*
         A window of its own size, and the zoom happens inside it.
 

@@ -121,6 +121,8 @@ export function Voice() {
   const [delivery, setDelivery] = useState<Delivery | null>(null);
   const [hotkeyConflicts, setHotkeyConflicts] = useState<string[] | null>(null);
   const [hotkeyRegisterFailed, setHotkeyRegisterFailed] = useState(false);
+  /** The host's own sentence when this desktop hands out no global hotkeys at all — Wayland. */
+  const [hotkeysUnavailable, setHotkeysUnavailable] = useState<string | null>(null);
 
   const captureRef = useRef<ActiveRecording | null>(null);
   const registeredHotkeysRef = useRef<string | null>(null);
@@ -150,6 +152,13 @@ export function Voice() {
    * That is also why the conversation chord is registered from this page even though the mode it
    * toggles is driven from the chat: the registration is indivisible, and this is the page that
    * already holds the config it comes from.
+   *
+   * The host is asked FIRST whether this desktop gives global hotkeys at all, and the ask lives in
+   * THIS effect rather than an earlier one of its own on purpose: on Wayland the answer is a
+   * sentence and the registration must not happen. Two effects would order themselves by render
+   * timing, so the sentence could be on screen while the chords were registered anyway — the page
+   * claiming to have hotkeys and explaining that it has none, in the same breath. Sequenced here,
+   * "there is a sentence" and "nothing was registered" are the same decision.
    */
   useEffect(() => {
     const dictationHotkey = config.data?.hotkey;
@@ -160,13 +169,24 @@ export function Voice() {
     const key = `${dictationHotkey} ${memoHotkey} ${conversation}`;
     if (registeredHotkeysRef.current === key) return;
     registeredHotkeysRef.current = key;
-    invoke<string[]>("voice_register_hotkeys", {
-      dictation: dictationHotkey,
-      memo: memoHotkey,
-      conversation,
-    })
-      .then((failed) => setHotkeyConflicts(failed))
-      .catch(() => setHotkeyRegisterFailed(true));
+    invoke<string | null>("voice_hotkeys_unavailable")
+      // A host that does not know the command is a host with nothing to refuse, and so is one
+      // that answers `undefined` rather than `null` — both mean "register them". Treated as the
+      // same answer because the alternative is a page that silently stops registering hotkeys
+      // the day it runs against an older shell.
+      .catch(() => null)
+      .then((answer) => {
+        const sentence = answer ?? null;
+        setHotkeysUnavailable(sentence);
+        if (sentence !== null) return;
+        return invoke<string[]>("voice_register_hotkeys", {
+          dictation: dictationHotkey,
+          memo: memoHotkey,
+          conversation,
+        })
+          .then((failed) => setHotkeyConflicts(failed))
+          .catch(() => setHotkeyRegisterFailed(true));
+      });
   }, [config.data?.hotkey, config.data?.memo_hotkey, config.data?.conversation_hotkey]);
 
   async function beginRecording(kind: "dictation" | "memo") {
@@ -217,8 +237,8 @@ export function Voice() {
       setDelivery(result);
     } catch {
       // The host did not answer at all — distinct from `held`, which is the
-      // host answering with a named reason. Neither is one of the five
-      // sentences `held` carries, so this is not shown as one.
+      // host answering with a named reason. Neither is one of the sentences
+      // the host sends verbatim, so this is not shown as one.
       setDelivery(null);
     }
   }
@@ -296,7 +316,15 @@ export function Voice() {
       <PageHeader title="Voice" headline={headline(config.data, memos.data, dictations.data, hotkeyConflicts, hotkeyRegisterFailed)} />
 
       <Panel title="Capture" aside={<PhaseBadge phase={phase} registerFailed={hotkeyRegisterFailed} />}>
-        <HotkeyConflictNote failed={hotkeyConflicts} registerFailed={hotkeyRegisterFailed} />
+        {hotkeysUnavailable === null ? (
+          <HotkeyConflictNote failed={hotkeyConflicts} registerFailed={hotkeyRegisterFailed} />
+        ) : (
+          // The host's words, not this page's: `dictation.rs` owns the sentence, and a conflict
+          // note would be the wrong one anyway — nothing was registered to conflict with.
+          <p className="voice-hotkey-conflict" role="status">
+            {hotkeysUnavailable}
+          </p>
+        )}
         <CaptureButtons
           phase={phase}
           armed={config.data?.armed ?? false}
@@ -434,7 +462,7 @@ function CaptureRefusal({ error }: { error: unknown }) {
   return <ErrorNote>the núcleo did not answer — this capture was not sent</ErrorNote>;
 }
 
-/** `held` is one of exactly five sentences the host sends verbatim — rendered as-is, never paraphrased. */
+/** `held` is one of the sentences the host sends verbatim — rendered as-is, never paraphrased. */
 function DeliveryNote({ delivery }: { delivery: Delivery | null }) {
   if (delivery === null) return null;
   if (delivery.pasted) {

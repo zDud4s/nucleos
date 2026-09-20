@@ -28,10 +28,22 @@ import { openUrl } from "@tauri-apps/plugin-opener";
  */
 export function vscodeUrl(absolutePath: string, line: number | null): string {
   const forwardSlashed = absolutePath.replace(/\\/g, "/");
+  // `file` is the URL's authority and the path follows it, so the slash in
+  // `vscode://file/` is already the path's first separator — a POSIX path that
+  // brings its own leading slash would double it. That is not cosmetic: VS
+  // Code's handler passes the URL's `fsPath` to `URI.file()`, and
+  // `URI.file("//home/x/a.rs")` reads the leading `//` as a UNC share, so the
+  // host becomes `home` and the file is never asked for on this machine. One
+  // slash gives `file:///home/x/a.rs`, which is the local file. A Windows path
+  // never reaches this branch — its drive letter follows the single slash
+  // already — which is why one shape cannot serve both.
+  const afterAuthority = forwardSlashed.startsWith("/")
+    ? forwardSlashed.slice(1)
+    : forwardSlashed;
   // `encodeURI` is the right encoder — it leaves `/` and the drive letter's `:`
   // alone, which a component encoder would destroy — but it also leaves `#` and
   // `?` alone, and those two end the path early rather than sitting in it.
-  const encoded = encodeURI(forwardSlashed).replace(/#/g, "%23").replace(/\?/g, "%3F");
+  const encoded = encodeURI(afterAuthority).replace(/#/g, "%23").replace(/\?/g, "%3F");
   // A line number is a place in a file and there is no zeroth line. Anything
   // that cannot be one is dropped, which opens the file — the honest remainder
   // of the request — rather than landing the cursor somewhere nobody meant.

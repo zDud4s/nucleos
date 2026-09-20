@@ -851,9 +851,10 @@ fn worktree_available_space() -> io::Result<u64> {
 /// The probe above keeps the old behaviour because a health readout is about the machine, not about
 /// one project.
 ///
-/// Blocking, and deliberately not wrapped in `spawn_blocking` here: `GetDiskFreeSpaceExW` is a
-/// metadata read against an already-mounted volume, and every caller is either already on a
-/// blocking thread or paying microseconds.
+/// Blocking, and deliberately not wrapped in `spawn_blocking` here: the underlying call —
+/// `GetDiskFreeSpaceExW` on Windows, `statvfs` on Unix — is a metadata read against an
+/// already-mounted volume, and every caller is either already on a blocking thread or paying
+/// microseconds.
 pub fn free_space_for_worktrees(project_root: &Path) -> io::Result<u64> {
     let root = worktree::worktree_root(project_root);
     let existing_root = root
@@ -900,7 +901,30 @@ fn disk_free_space(path: &Path) -> io::Result<u64> {
     }
 }
 
-#[cfg(not(windows))]
+/// `f_bavail` and not `f_bfree`: `f_bfree` counts every block free on the filesystem, including
+/// the reserve only root may spend, while `f_bavail` is what an unprivileged process can actually
+/// take — which is the honest answer to "is there room" for a daemon that runs as nobody special.
+///
+/// The `#[allow]` is on the function because the cast is unnecessary on exactly the platforms
+/// where `f_bavail`/`f_frsize` are already `u64` (Linux) and load-bearing where they are `u32`
+/// (macOS); one `cfg`-free spelling has to be wrong for one of them, and widening is the safe way
+/// to be wrong.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn disk_free_space(path: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is NUL-terminated and alive for the call; `stat` is a writable `statvfs`.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(any(windows, unix)))]
 fn disk_free_space(_path: &Path) -> io::Result<u64> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -1354,6 +1378,26 @@ mod tests {
         assert_eq!(
             category_from_io(io::Error::from(io::ErrorKind::NotFound)),
             FailureCategory::NotConfigured
+        );
+    }
+
+    /// The probe measures a real filesystem off Windows too.
+    ///
+    /// The temp directory is writable on any host that can run this suite, and a writable
+    /// directory sits on a mounted filesystem with some room left on it. So an `Unsupported`
+    /// error here is the platform gap — `disk_free_space` is implemented against the Windows
+    /// filesystem API alone — and never a property of the host the test ran on, which is also
+    /// why the assertion is `> 0` rather than a threshold.
+    ///
+    /// It lives in this module because `disk_free_space` is private to it, and widening that
+    /// visibility to test it from outside would change production code to suit a test.
+    #[cfg(unix)]
+    #[test]
+    fn the_disk_probe_measures_free_space_on_unix() {
+        let free = disk_free_space(&std::env::temp_dir());
+        assert!(
+            matches!(&free, Ok(bytes) if *bytes > 0),
+            "the volume holding the temp directory has free space to report, got {free:?}"
         );
     }
 }

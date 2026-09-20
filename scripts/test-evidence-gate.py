@@ -78,4 +78,30 @@ assert extra.returncode == 0, extra.stderr
 malformed = run("# not a packet\n")
 assert malformed.returncode == 2 and "malformed input" in malformed.stderr, malformed.stderr
 
+# A packet still carrying the schema's own comment has not been authored. It must still
+# refuse -- nothing is proven -- but as "not yet authored", not as damage. Reporting it
+# as malformed is what sent somebody looking for a corrupt file on 2026-09-19 when the
+# real fault was a controller writing the active-packet marker before filling the packet.
+TEMPLATE = """  <!-- exact commands to run after implementation.
+  Test gate (all sizes): python .ai/scripts/select_tests.py --gate --run
+  Never the full suite here -- the controller runs it exactly once. -->"""
+
+unfilled = run(packet("", commands=TEMPLATE))
+assert unfilled.returncode == 1, unfilled.stderr
+assert "not yet authored" in unfilled.stderr, unfilled.stderr
+assert "malformed" not in unfilled.stderr, unfilled.stderr
+
+# The real schema opens the comment on the `Commands:` line itself, so the detection
+# cannot look only at the lines below it.
+inline = run(
+    "# Execution Packet\n\n## Validation\nCommands: <!-- what to run\n  and why -->\n"
+    "Expected result: <!-- what success looks like -->\n\n## Handoff\nValidation evidence:\n"
+)
+assert inline.returncode == 1 and "not yet authored" in inline.stderr, inline.stderr
+
+# With the placeholder deliberately removed and nothing put in its place, the packet is
+# authored and wrong -- that stays exit 2.
+empty = run(packet("$ python check.py\nexit: 0\ntail: all good", commands=""))
+assert empty.returncode == 2 and "has no commands" in empty.stderr, empty.stderr
+
 print("evidence gate tests passed")

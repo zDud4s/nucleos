@@ -224,13 +224,58 @@ fn signal_group(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
     }
 }
 
+/// How long a group is given to act on the ask before the signal it cannot refuse arrives.
+///
+/// Read by the tests as well as by [`kill_process_group`], deliberately: a test carrying its own
+/// copy of this number would still pass if the grace here grew to an hour.
+#[cfg(not(windows))]
+const GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the group is asked whether it is still there. Short beside [`GRACE`], so the common
+/// case — a tree that stops when told — costs a tenth of a second rather than the whole grace.
+#[cfg(not(windows))]
+const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Asks the process group `pid` leads to stop, and kills it once [`GRACE`] has passed without it.
+///
 /// `pid` names a process GROUP here, which is why `spawn_in_own_group` is not optional. A child
 /// spawned without it inherits the daemon's group, and then no group with this id exists: `killpg`
 /// fails with ESRCH and kills nothing, rather than reaching processes nobody asked us to touch.
+///
+/// **SIGTERM first, and that ordering is the point.** SIGKILL cannot be trapped, so a tree that is
+/// only ever sent one is destroyed where it stands having never been *asked* to stop: a half-written
+/// file stays half-written, and a lock taken inside the worktree is released by the kernel rather
+/// than by the program that took it. Asking cannot be the whole of it either — a process is free to
+/// ignore SIGTERM, and a cancel that only asked would leave the daemon waiting forever on a run it
+/// told to stop. So the ask goes out, the grace runs, and SIGKILL ends whatever is still standing.
+///
+/// The grace is waited out on a plain `std::thread`, NOT a tokio task, because `terminate` is called
+/// from `Drop`: a destructor cannot await, and a task that blocked here would hold a tokio worker
+/// for two seconds of doing nothing. The thread is detached on purpose — outliving this call is what
+/// it is for — which also means it is only as durable as this process: a daemon that exits inside
+/// the grace never sends the SIGKILL, the same best-effort bargain `taskkill_tree` makes.
+///
+/// Residual, recorded because it cannot be closed from here: once the leader is reaped its pid is
+/// free for the kernel to issue again, and a process that became a group leader under that same id
+/// inside the grace window would receive a SIGKILL meant for the group that is gone. The poll returns
+/// the moment the group is empty, which makes that window as small as it can be made without help
+/// from the kernel — there is no pidfd for a process group to wait on instead.
 #[cfg(not(windows))]
 fn kill_process_group(pid: u32) {
     // Best effort, as `taskkill_tree` is: this runs from `Drop` and has nobody to report to.
-    let _ = signal_group(pid, libc::SIGKILL);
+    let _ = signal_group(pid, libc::SIGTERM);
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + GRACE;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(POLL);
+            // Signal 0 delivers nothing and only reports. An error is ESRCH: the group is empty, so
+            // everything in it stopped on the ask and there is nothing left to kill.
+            if signal_group(pid, 0).is_err() {
+                return;
+            }
+        }
+        let _ = signal_group(pid, libc::SIGKILL);
+    });
 }
 
 #[cfg(windows)]
@@ -569,5 +614,86 @@ mod tests {
             .await
             .expect("the grandchild still holds the pipe, so the tree was not killed")
             .expect("reading the pipe to EOF must succeed");
+    }
+
+    /// **SIGKILL cannot be trapped**, which is why an implementation that only ever sends it is
+    /// incomplete rather than merely blunt: the tree is destroyed where it stands, having never been
+    /// *asked* to stop, so nothing it holds is released in order — a half-written file stays
+    /// half-written and a lock inside the worktree is freed by the kernel rather than by the program
+    /// that took it. This test proves the ask ARRIVES; its sibling below proves the ask is not the
+    /// end of it.
+    ///
+    /// Read through the pipe, as the grandchild test above is, and for the same reason: `read_to_string`
+    /// returns only once every holder of the write end has closed it, so one reading carries both what
+    /// the tree said and the fact that the tree is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_tree_is_asked_to_stop_before_it_is_killed() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(r#"trap 'echo asked; exit 0' TERM; sleep 30 & wait"#)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        spawn_in_own_group(&mut command);
+        let mut child = command.spawn().expect("`sh` must be on PATH");
+        let mut stdout = child.stdout.take().expect("stdout was piped");
+        let mut killer = TreeKiller::new(child.id().expect("a live child has a pid"));
+
+        // Give `sh` time to install the trap: a signal that lands before it exists would be ignored
+        // for reasons that have nothing to do with what this test measures.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        killer.kill_now();
+
+        let mut said = String::new();
+        tokio::time::timeout(Duration::from_secs(10), stdout.read_to_string(&mut said))
+            .await
+            .expect("the tree outlived the cancel")
+            .expect("reading the pipe to EOF must succeed");
+        assert!(
+            said.contains("asked"),
+            "SIGTERM never reached the tree: {said:?}"
+        );
+    }
+
+    /// The other half, and the reason asking cannot be the whole of it: a process is free to ignore
+    /// SIGTERM, and a tree that is only ever asked would then be cancelled in name only — the daemon
+    /// waits forever on a run that was told to stop and did not. So the grace expires and SIGKILL,
+    /// which nothing can trap, ends it.
+    ///
+    /// `trap '' TERM` is inherited across `exec`, so the `sleep` this shell becomes ignores TERM too:
+    /// nothing in the group stops on the ask. `GRACE` is read from the production code on purpose —
+    /// a test carrying its own copy of the timeout would still pass if the implementation's grace
+    /// grew to an hour.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tree_that_ignores_the_request_is_killed_after_the_grace() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        spawn_in_own_group(&mut command);
+        let mut child = command.spawn().expect("`sh` must be on PATH");
+        let mut stdout = child.stdout.take().expect("stdout was piped");
+        let mut killer = TreeKiller::new(child.id().expect("a live child has a pid"));
+
+        // Long enough for `sh` to have reached its `sleep`, short beside the grace that follows.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        killer.kill_now();
+
+        let mut sink = Vec::new();
+        tokio::time::timeout(
+            GRACE + Duration::from_secs(10),
+            stdout.read_to_end(&mut sink),
+        )
+        .await
+        .expect("still alive after the grace")
+        .expect("reading the pipe to EOF must succeed");
     }
 }

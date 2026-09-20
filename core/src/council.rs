@@ -1988,13 +1988,51 @@ impl Driver {
         prompt: String,
         with_tools: bool,
     ) -> SeatOutcome {
-        let chat = crate::runner::OllamaChat::new(
-            crate::runner::OLLAMA_BASE_URL.to_string(),
-            seat.model_ref.clone(),
-        );
+        // The FACTORY's client, where this built its own `runner::OllamaChat` against
+        // `runner::OLLAMA_BASE_URL`. `assistants::Assistants::local_chat` is the one place that
+        // decides which client a local model gets, and asking it here is what stops the two halves
+        // of one daemon drifting onto different engines: on an install whose `local_engine` is
+        // `openai_compatible`, the owner's chat reached the server they configured while every seat reached
+        // an Ollama that may not be running, may not hold the model, and may not be the machine
+        // that was paid for. A seat that fails for that reason — or answers as some other model —
+        // looks from outside exactly like a seat that simply had nothing to say.
+        let chat = match self.state.assistants.local_chat(&seat.model_ref) {
+            Ok(chat) => chat,
+            Err(refusal) => {
+                // An outcome, never a panic and never an `unwrap`. This runs inside a spawned
+                // task's caller and the council's whole design is that a seat which failed casts
+                // no votes (`council.rs:14`), so the remaining seats go on without this one. The
+                // refusal's OWN sentence travels — `Refusal::message` is what the chat route
+                // already shows an operator for the same misconfiguration, and a second, looser
+                // wording invented here would describe the same problem differently depending on
+                // which door somebody came through.
+                let message = refusal.message(crate::chats::Brain::Local);
+                // The row is closed here rather than left `running`, exactly as the transport
+                // error arm below closes it: nothing was spawned, so nothing else ever will.
+                let _ = sqlx::query(
+                    "UPDATE runs SET status = 'failed', stderr = ?, cost_usd = 0, completed_at = ?
+                     WHERE id = ? AND status = 'running'",
+                )
+                .bind(&message)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(run_id)
+                .execute(&self.state.pool)
+                .await;
+                return SeatOutcome {
+                    status: SEAT_ERROR,
+                    answer: String::new(),
+                    error: Some(message),
+                };
+            }
+        };
         // The council's list, not the chat's: `LOCAL_TOOLS` carries `create_run` and `create_job`,
         // which is exactly what a seat must not have. Phases 2 and 3 get an empty box — no tools is
         // no tools whichever machine answers.
+        //
+        // UNCHANGED by the move to the factory above, and deliberately so: `local_chat` hands out
+        // the engine and nothing else, so the toolbox stays `LocalToolBox::for_council` here. It
+        // is this half — not the client — that keeps `create_run` and `create_job` away from a
+        // seat, and taking the chat route's box along with its client would have handed them over.
         let tools = crate::mcp_tools::LocalToolBox::for_council(
             daemon_url(),
             self.token.clone(),
@@ -2016,7 +2054,9 @@ impl Driver {
             let turn = tokio::time::timeout(
                 timeout,
                 crate::local_agent::run_turn(
-                    &chat,
+                    // `as_ref`, because what the factory hands back is a `Box<dyn LocalChat>` and
+                    // the loop takes the trait object itself - the box is the seam, not the value.
+                    chat.as_ref(),
                     tool_box,
                     crate::local_agent::SYSTEM_PROMPT,
                     &[],
@@ -5245,5 +5285,297 @@ mod tests {
         assert!(get_council_row(&pool, "ancient").await.unwrap().is_some());
 
         pool.close().await;
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Which engine a local seat actually reaches
+    // -----------------------------------------------------------------------------------------
+
+    /// A loopback `POST /chat/completions` answering one fixed sentence in the shape
+    /// `openai_compatible::assistant_message` reads — the council's own copy of
+    /// `assistants::stub_completions_recording`, and it records nothing because what matters here
+    /// is not what was asked but what came back. The sentence exists nowhere else in this module,
+    /// so a seat that wrote it down can only have got it from this address.
+    async fn stub_openai_compatible_seat(answer: &str) -> String {
+        let answer = answer.to_string();
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move || {
+                let answer = answer.clone();
+                async move {
+                    axum::Json(serde_json::json!({
+                        "choices": [{ "message": { "role": "assistant", "content": answer } }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    /// An `Assistants` whose local route is ONE OpenAI-compatible address, recording every model it
+    /// was asked to build a chat for.
+    ///
+    /// None of the three doubles in `assistants.rs` can stand in: each answers `assistant_for`,
+    /// which hands back a whole `LocalAssistant`, and a council seat does not want one — it wants
+    /// the chat, and `local_chat` is the seam that gives it the same one a chat turn would get.
+    struct SeatAssistants {
+        base_url: String,
+        /// Every model `local_chat` was asked for, in call order.
+        asked_for: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::assistants::Assistants for SeatAssistants {
+        fn local_chat(
+            &self,
+            model: &str,
+        ) -> Result<Box<dyn crate::local_agent::LocalChat>, crate::assistants::Refusal> {
+            self.asked_for
+                .lock()
+                .expect("the double's recorder is never held across an await")
+                .push(model.to_string());
+            Ok(Box::new(
+                crate::openai_compatible::OpenAiCompatibleChat::with_client(
+                    reqwest::Client::new(),
+                    self.base_url.clone(),
+                    model.to_string(),
+                    // `None`, deliberately: a loopback OpenAI-compatible server asks for no key, which
+                    // is the case `OpenAiCompatibleChat::new` refuses and `with_client` exists to express.
+                    None,
+                ),
+            ))
+        }
+
+        /// A seat never asks for one, and a double that invented an answer here would be
+        /// describing a route this test says nothing about.
+        fn assistant_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: Option<&str>,
+        ) -> Result<std::sync::Arc<crate::local_agent::LocalAssistant>, crate::assistants::Refusal>
+        {
+            Err(crate::assistants::Refusal::NotServedByThisFactory)
+        }
+
+        /// Local only — the honest answer for a factory holding one local address, and what
+        /// `resolve_seat` reads before it lets a local seat be filled at all.
+        fn serves(&self, brain: crate::chats::Brain) -> Result<(), crate::assistants::Refusal> {
+            match brain {
+                crate::chats::Brain::Local => Ok(()),
+                _ => Err(crate::assistants::Refusal::RouteNotConfigured),
+            }
+        }
+
+        // As trivial as `serves` above: this double serves the local route, so it serves every
+        // model somebody points it at.
+        async fn can_serve(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: &str,
+        ) -> Result<(), crate::assistants::Refusal> {
+            Ok(())
+        }
+
+        // Trivial for the same reason `can_serve` above is: nothing on the council's path asks
+        // what a model declares, and an empty map — nothing known about anybody — is honest.
+        async fn declared_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _models: &[String],
+        ) -> std::collections::HashMap<String, crate::capabilities::Declared> {
+            std::collections::HashMap::new()
+        }
+    }
+
+    /// A local seat asks the factory for its chat, exactly as a chat turn does.
+    ///
+    /// Without this, `run_local_seat` keeps building its own `runner::OllamaChat` against
+    /// `runner::OLLAMA_BASE_URL` — and on an install whose `local_engine` is `openai_compatible`, the two
+    /// halves of the same daemon then run on DIFFERENT engines: the owner's chat reaches the
+    /// OpenAI-compatible server they configured, while every council seat quietly reaches an
+    /// Ollama that may not be running, may not hold the model, or may not be the machine that was
+    /// paid for. Nothing about that failure is visible from outside — the seat simply fails, or
+    /// answers as a different model — which is why what is asserted here is that the seat's own
+    /// recorded answer is the one only the configured engine could have produced.
+    ///
+    /// Through `start` rather than by calling `run_local_seat` directly: the run row is where a
+    /// seat's answer is written down, and only the whole path writes it.
+    #[tokio::test]
+    async fn a_local_seat_is_served_by_the_configured_openai_compatible_engine() {
+        const ANSWER: &str = "the answer that exists only on this loopback server";
+        let base_url = stub_openai_compatible_seat(ANSWER).await;
+
+        let config = CouncilConfig {
+            timeout_seconds: 10,
+            rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+            consumers: crate::config::CouncilConsumers::default(),
+            chairman: spec(SeatKind::Cloud, "the-chairman"),
+            members: vec![spec(SeatKind::Local, "a-frontier-moe")],
+        };
+        let mut state =
+            council_state(std::sync::Arc::new(ScriptedRunner::default()), Some(config)).await;
+        let assistants = std::sync::Arc::new(SeatAssistants {
+            base_url,
+            asked_for: std::sync::Mutex::new(Vec::new()),
+        });
+        state.assistants = assistants.clone();
+
+        let id = start(&state, "why?", None).await.unwrap();
+        settled(&state, &id).await;
+
+        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
+        assert_eq!(seats.len(), 1);
+        assert_eq!(
+            seats[0].stage1_status, SEAT_OK,
+            "the local seat did not answer: {:?}",
+            seats[0].stage1_error
+        );
+        let answer: Option<String> = sqlx::query_scalar("SELECT stdout FROM runs WHERE id = ?")
+            .bind(
+                seats[0]
+                    .stage1_run_id
+                    .expect("a local seat lands a run row like any other"),
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.as_deref(),
+            Some(ANSWER),
+            "the seat's answer must have come from the engine the factory serves, not from \
+             whatever `runner::OLLAMA_BASE_URL` happens to be"
+        );
+
+        // And it asked for the seat's OWN model, not the route's configured default: a seat's row
+        // records which model answered, and a factory handed a different name would make that
+        // record a fiction.
+        let asked_for = assistants
+            .asked_for
+            .lock()
+            .expect("the double's recorder is never held across an await")
+            .clone();
+        assert_eq!(asked_for, vec!["a-frontier-moe".to_string()]);
+    }
+
+    /// The one thing the stub above cannot say: whether a REAL frontier MoE, served by a real
+    /// OpenAI-compatible server on this machine, actually answers a council seat end to end.
+    ///
+    /// Without it, every claim this module makes about the OpenAI transport rests on a stub that
+    /// answers instantly, in one exchange, out of a body this repository wrote itself — and the
+    /// three things a real server does differently (a first token that arrives only once the
+    /// weights are paged in, a `/chat/completions` body assembled by somebody else's template, a
+    /// model that may answer with a tool call the council's own box has to refuse) are exactly the
+    /// three a stub cannot produce.
+    ///
+    /// `#[ignore]` for hardware and not for taste, and the reason is worth stating plainly: the
+    /// owner's machine has 15.8 GB of RAM, a frontier MoE's expert pool does not fit in it, and so
+    /// the server this test dials cannot be started here at all. That is a fact about this desk
+    /// rather than about this crate — the same kind of caveat
+    /// `capabilities::um_ollama_real_declara_um_array_de_capacidades` carries for its own live
+    /// Ollama — so the body below is written as a test that WOULD pass the day the hardware
+    /// exists, never as a `todo!()` standing in for one.
+    ///
+    /// Run it deliberately, from the repository root, with the server already serving the model:
+    ///   cargo test -p nucleos-core -- --ignored --nocapture council::tests::a_real_frontier_moe_answers_a_council_seat
+    #[tokio::test]
+    #[ignore = "needs a loopback OpenAI-compatible server (FreeToken / vLLM / llama.cpp / LM Studio) already serving the configured `local_assistant_model`, on a machine with enough RAM to hold a frontier MoE's expert pool — the 15.8 GB on this one is not enough"]
+    async fn a_real_frontier_moe_answers_a_council_seat() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("core/ has a parent");
+        let models = crate::config::load_models_config(&repo.join(".ai/nucleos-models.yaml"))
+            .expect("the daemon's own models config must parse");
+        let engine = models
+            .local_engine()
+            .expect("`local_engine` must resolve for this test to mean anything");
+        assert_eq!(
+            engine.engine,
+            crate::config::LocalEngine::OpenAiCompatible,
+            "this is the OpenAI transport's end-to-end check: set `local_engine: openai_compatible` and \
+             `local_base_url` to the server holding the MoE before running it"
+        );
+        let model = models
+            .local_assistant_model
+            .clone()
+            .expect("`local_assistant_model` must name the model this test asks");
+
+        let config = CouncilConfig {
+            // Ten minutes, where every stubbed roster in this module gets one second: a real MoE's
+            // first token arrives once its experts are paged in, and a seat that timed out waiting
+            // for that would be written down as a broken transport rather than as a slow disk.
+            timeout_seconds: 600,
+            rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+            consumers: crate::config::CouncilConsumers::default(),
+            chairman: spec(SeatKind::Cloud, "the-chairman"),
+            members: vec![spec(SeatKind::Local, &model)],
+        };
+        let mut state =
+            council_state(std::sync::Arc::new(ScriptedRunner::default()), Some(config)).await;
+        // The REAL factory, built off the same file the daemon reads. A double here would exercise
+        // this test's own wiring and say nothing whatever about the server.
+        state.assistants = std::sync::Arc::new(
+            crate::assistants::ConfiguredAssistants::new(
+                Some(model.clone()),
+                None,
+                None,
+                daemon_url(),
+                "council-key".to_string(),
+                state.pool.clone(),
+                engine.base_url.clone(),
+            )
+            .with_local_engine(engine.engine, engine.declared_context_tokens),
+        );
+
+        let id = start(
+            &state,
+            "Name one thing a council of models can do that one model cannot.",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // `settled` gives up after twelve seconds, which is a stub's budget and not a model's.
+        // The same poll, on the clock this seat was actually given.
+        let mut settled_row = None;
+        for _ in 0..1_300 {
+            let current = get_council_row(&state.pool, &id).await.unwrap().unwrap();
+            if current.status != STATUS_RUNNING {
+                settled_row = Some(current);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let row = settled_row.expect("the council never settled inside the seat's own wall clock");
+        assert_ne!(row.status, STATUS_RUNNING);
+
+        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
+        assert_eq!(seats.len(), 1);
+        assert_eq!(
+            seats[0].stage1_status, SEAT_OK,
+            "the real server refused the seat: {:?}",
+            seats[0].stage1_error
+        );
+        let answer: Option<String> = sqlx::query_scalar("SELECT stdout FROM runs WHERE id = ?")
+            .bind(
+                seats[0]
+                    .stage1_run_id
+                    .expect("a local seat lands a run row like any other"),
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        // Prose, not a particular sentence: what a real model says is its own business, and a test
+        // that pinned the words would fail on the next model rather than on the next defect.
+        assert!(
+            answer
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "a real model must answer the seat with prose, not with nothing: {answer:?}"
+        );
     }
 }
