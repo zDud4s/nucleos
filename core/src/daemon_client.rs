@@ -652,7 +652,7 @@ impl DaemonClient {
         reasoning: &str,
     ) -> Result<Value, String> {
         let response = self
-            .request(reqwest::Method::POST, "/refinements")
+            .request(reqwest::Method::POST, "/knowledge")
             .json(&serde_json::json!({
                 "project_id": project_id,
                 "kind": kind,

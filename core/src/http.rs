@@ -495,9 +495,9 @@ pub fn build_router(state: AppState) -> Router {
         // every project on the machine. **How a RUN declares one is deliberately not here** — that
         // is an agent writing into what agents are told, which is the governance question
         // `notes.rs` refuses in its own words, and it is the owner's to answer rather than mine.
-        .route("/refinements", get(list_refinements).post(post_refinement))
-        .route("/refinements/{id}", get(get_refinement))
-        .route("/refinements/{id}/revert", post(revert_refinement))
+        .route("/knowledge", get(list_knowledge).post(post_knowledge))
+        .route("/knowledge/{id}", get(get_knowledge))
+        .route("/knowledge/{id}/revert", post(revert_knowledge))
         .route("/assistant/message", post(post_assistant_message))
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
@@ -12924,19 +12924,20 @@ async fn post_proposal_approve(
         // others give — a dropped request must not leave the proposal and the layer disagreeing
         // about whether the agent was allowed to learn something.
         let state = state.clone();
-        let activated = uncancellable(async move { crate::refine::approve(&state.pool, id).await })
-            .await
-            .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        let activated =
+            uncancellable(async move { crate::knowledge::approve(&state.pool, id).await })
+                .await
+                .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
         return match activated {
             Ok(refinement_id) => Ok(Json(serde_json::json!({ "refinement_id": refinement_id }))),
-            Err(crate::refine::DecisionError::NotFound) => {
+            Err(crate::knowledge::DecisionError::NotFound) => {
                 Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
             }
-            Err(crate::refine::DecisionError::NotPending) => Err((
+            Err(crate::knowledge::DecisionError::NotPending) => Err((
                 StatusCode::CONFLICT,
                 "this proposal has already been decided".to_owned(),
             )),
-            Err(crate::refine::DecisionError::Malformed) => Err((
+            Err(crate::knowledge::DecisionError::Malformed) => Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "this proposal does not name a refinement".to_owned(),
             )),
@@ -13342,14 +13343,16 @@ async fn post_proposal_reject(
         // refinement `rejected` rather than dropping it, because what the agent kept trying to
         // learn and was told no to is the record the layer's history exists to keep.
         let state = state.clone();
-        let refused = uncancellable(async move { crate::refine::reject(&state.pool, id).await })
+        let refused = uncancellable(async move { crate::knowledge::reject(&state.pool, id).await })
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         return match refused {
             Ok(_) => Ok(StatusCode::NO_CONTENT),
-            Err(crate::refine::DecisionError::NotFound) => Err(StatusCode::NOT_FOUND),
-            Err(crate::refine::DecisionError::NotPending) => Err(StatusCode::CONFLICT),
-            Err(crate::refine::DecisionError::Malformed) => Err(StatusCode::UNPROCESSABLE_ENTITY),
+            Err(crate::knowledge::DecisionError::NotFound) => Err(StatusCode::NOT_FOUND),
+            Err(crate::knowledge::DecisionError::NotPending) => Err(StatusCode::CONFLICT),
+            Err(crate::knowledge::DecisionError::Malformed) => {
+                Err(StatusCode::UNPROCESSABLE_ENTITY)
+            }
         };
     }
 
@@ -13688,7 +13691,7 @@ struct LeaveNoteResponse {
 }
 
 #[derive(serde::Deserialize)]
-struct ProposeRefinementRequest {
+struct ProposeKnowledgeRequest {
     project_id: Option<String>,
     kind: String,
     title: String,
@@ -13713,12 +13716,12 @@ struct ProposeRefinementRequest {
 /// It still goes through the proposal, rather than inserting an `active` row: the review trail is
 /// what makes the layer safe to have at all, and a second way in that skipped it would be the way
 /// everything eventually got written. The owner simply approves their own in the next call.
-async fn post_refinement(
+async fn post_knowledge(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<ProposeRefinementRequest>,
+    Json(request): Json<ProposeKnowledgeRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
-    let kind = crate::refine::Kind::parse(request.kind.trim()).ok_or((
+    let kind = crate::knowledge::Kind::parse(request.kind.trim()).ok_or((
         StatusCode::BAD_REQUEST,
         "kind must be one of prompt, memory, skill, subagent".to_owned(),
     ))?;
@@ -13731,9 +13734,9 @@ async fn post_refinement(
             "a refinement needs both a title and a body".to_owned(),
         ));
     }
-    let (refinement_id, proposal_id) = crate::refine::propose(
+    let (knowledge_id, proposal_id) = crate::knowledge::propose(
         &state.pool,
-        crate::refine::Declaration {
+        crate::knowledge::Declaration {
             project_id: request.project_id.as_deref(),
             // Off the header and never off the body: `RUN_ID_HEADER` is set from an environment
             // variable the run's own tools have nothing able to read or alter, so a run can name
@@ -13755,13 +13758,13 @@ async fn post_refinement(
     // Which precondition failed, rather than a bare status: a caller told only "409" has to guess
     // between "that id is not there" and "that id is not yours", and the two have different fixes.
     .map_err(|error| match error {
-        crate::refine::ProposeError::UnknownPredecessor(_) => {
+        crate::knowledge::ProposeError::UnknownPredecessor(_) => {
             (StatusCode::NOT_FOUND, error.to_string())
         }
-        crate::refine::ProposeError::ForeignPredecessor(_) => {
+        crate::knowledge::ProposeError::ForeignPredecessor(_) => {
             (StatusCode::CONFLICT, error.to_string())
         }
-        crate::refine::ProposeError::Db(error) => {
+        crate::knowledge::ProposeError::Db(error) => {
             tracing::warn!(%error, "proposing a refinement failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -13772,7 +13775,7 @@ async fn post_refinement(
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
-            "refinement_id": refinement_id,
+            "knowledge_id": knowledge_id,
             "proposal_id": proposal_id,
         })),
     ))
@@ -13782,9 +13785,9 @@ async fn post_refinement(
 ///
 /// Not filtered to `active`, deliberately: the reviewable history IS the feature, and a screen that
 /// showed only what is in force could not answer "what did it try to learn that I said no to".
-async fn list_refinements(
+async fn list_knowledge(
     State(state): State<AppState>,
-) -> Result<Json<Vec<crate::refine::Refinement>>, StatusCode> {
+) -> Result<Json<Vec<crate::knowledge::Refinement>>, StatusCode> {
     crate::knowledge::all(&state.pool)
         .await
         .map(Json)
@@ -13797,46 +13800,46 @@ async fn list_refinements(
 /// One refinement, read the way a person decides about it: the text, every decision it has been
 /// through, what it replaced, and what replaced it.
 ///
-/// The chain is the half `GET /refinements` cannot give you. A list answers "what is in force";
+/// The chain is the half `GET /knowledge` cannot give you. A list answers "what is in force";
 /// this answers "what did it say before I changed it, and would I want that back" — which is the
 /// question somebody asks at the moment they are considering a revert.
-async fn get_refinement(
+async fn get_knowledge(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<crate::refine::History>, StatusCode> {
-    match crate::refine::history(&state.pool, id).await {
+) -> Result<Json<crate::knowledge::History>, StatusCode> {
+    match crate::knowledge::history(&state.pool, id).await {
         Ok(Some(history)) => Ok(Json(history)),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(error) => {
-            tracing::warn!(refinement_id = id, %error, "reading a refinement's history failed");
+            tracing::warn!(knowledge_id = id, %error, "reading the history of what is known failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
 
 /// Taking one back. The half that makes approving safe to do at all.
-async fn revert_refinement(
+async fn revert_knowledge(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(request): Json<RevertRefinementRequest>,
+    Json(request): Json<RevertKnowledgeRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let note = request
         .note
         .unwrap_or_else(|| "reverted by the owner".to_owned());
-    match crate::refine::revert(&state.pool, id, &note).await {
+    match crate::knowledge::revert(&state.pool, id, &note).await {
         // 409 and not 404: the row may well exist and simply not be active, which is a different
         // thing for the caller to do about it.
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err(StatusCode::CONFLICT),
         Err(error) => {
-            tracing::warn!(refinement_id = id, %error, "reverting a refinement failed");
+            tracing::warn!(knowledge_id = id, %error, "reverting what is known failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
 
 #[derive(serde::Deserialize)]
-struct RevertRefinementRequest {
+struct RevertKnowledgeRequest {
     note: Option<String>,
 }
 
@@ -33038,7 +33041,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/refinements")
+                    .uri("/knowledge")
                     .header("Authorization", "Bearer test-token")
                     .header("content-type", "application/json")
                     .header(crate::daemon_client::RUN_ID_HEADER, "4242")
@@ -33058,13 +33061,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
-        let refinement_id = json_body(response).await["refinement_id"]
+        let knowledge_id = json_body(response).await["knowledge_id"]
             .as_i64()
-            .expect("a created refinement answers its own id");
+            .expect("what was created answers its own id");
 
         let origin: Option<i64> =
             sqlx::query_scalar("SELECT origin_run_id FROM knowledge WHERE id = ?")
-                .bind(refinement_id)
+                .bind(knowledge_id)
                 .fetch_one(&state.pool)
                 .await
                 .unwrap();
@@ -33078,7 +33081,7 @@ mod tests {
     /// The owner writing from the app is not a run, and stays unattributed.
     ///
     /// The companion of the test above, and the reason the header is read as an `Option` rather
-    /// than demanded: `POST /refinements` is also the door the owner writes through, where there is
+    /// than demanded: `POST /knowledge` is also the door the owner writes through, where there is
     /// no run to name. A missing header must leave the column NULL — never fail the write, and
     /// never invent an id.
     #[tokio::test]
@@ -33089,7 +33092,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/refinements")
+                    .uri("/knowledge")
                     .header("Authorization", "Bearer test-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -33107,13 +33110,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
-        let refinement_id = json_body(response).await["refinement_id"]
+        let knowledge_id = json_body(response).await["knowledge_id"]
             .as_i64()
-            .expect("a created refinement answers its own id");
+            .expect("what was created answers its own id");
 
         let origin: Option<i64> =
             sqlx::query_scalar("SELECT origin_run_id FROM knowledge WHERE id = ?")
-                .bind(refinement_id)
+                .bind(knowledge_id)
                 .fetch_one(&state.pool)
                 .await
                 .unwrap();
