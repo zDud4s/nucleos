@@ -25,16 +25,17 @@ CREATE TABLE quota_warnings (
     -- 80% would be the last warning this machine ever gave.
     --
     -- NULL is a real answer: the capture of 2026-09-19 carried a populated window with no reset at
-    -- all. A window with no reset instant can never be told apart from its successor, so its claim
-    -- simply holds — which errs towards silence rather than towards a repeated ping.
+    -- all. Two claims that cannot be compared by instant are told apart by `last_alerted_at`
+    -- instead; `quota::claim_has_expired` is where that is argued, and where it goes on being
+    -- corrected, because a migration a live database has applied is frozen (0128, 2026-09-04).
     window_resets_at TEXT,
     -- The highest threshold already announced for this window instance, in per cent. Percent and
     -- not a fraction because the thresholds are the owner's numbers (`warn_at_percent`, D9) and
     -- they are written as 80 and 100 everywhere a human reads them.
     alerted_percent  INTEGER NOT NULL CHECK (alerted_percent > 0 AND alerted_percent <= 100),
-    -- When it was announced, RFC3339. Not read by the gate — the claim is decided by the threshold
-    -- and the window instance, not by elapsed time — and kept because the first question about an
-    -- unexpected ping is when the last one went out.
+    -- When it was announced, RFC3339. Two readings: the first question about an unexpected ping is
+    -- when the last one went out, and it is how a claim is aged out when the window instances
+    -- themselves cannot be compared.
     last_alerted_at  TEXT NOT NULL,
     PRIMARY KEY (provider, window_name)
 );

@@ -510,17 +510,31 @@ async fn read_claim(
 
 /// PURE: how long the window this name describes lasts.
 ///
-/// `5h` and `7d` are the two the sidecar sends today, and the shape — a count and a unit — is read
-/// generically so that a third window a later sidecar invents is understood rather than silently
-/// mishandled. A name this build cannot read answers `None`, and every caller treats that as "do
-/// not act on a length I had to guess".
+/// `5h` and `7d` are the two the sidecar sends today (`sidecars/quota/reading/reading.go`), and the
+/// shape — a count and a unit — is read generically so that a third window a later sidecar invents
+/// is understood rather than silently mishandled. A name this build cannot read answers `None`, and
+/// every caller treats that as "do not act on a length I had to guess".
+///
+/// Hours and days, and deliberately not minutes. `m` is the one unit where guessing is wrong in the
+/// expensive direction: a provider that writes `1m` for a MONTHLY window would have its claim
+/// expire after sixty seconds and ping once a poll for thirty days — the exact failure
+/// `quota_warnings` exists to prevent, arriving through the rule written to prevent another one.
+/// An unreadable name costs silence; a misread one costs a ping a minute.
+///
+/// **Nothing here may panic on a name it dislikes.** The string is whatever the sidecar put in its
+/// JSON and it reaches this function inside the `GET /quota` handler, so `split_at` on a byte index
+/// that is not a char boundary (`"1月"`) or `Duration::hours` on a count it cannot hold
+/// (`"999999999999d"`) would kill the request and blank the notch with no line saying why. Hence the
+/// trailing CHARACTER rather than the trailing byte, and the `try_` constructors, which are the
+/// `Option` this function already promised to return.
 fn window_length(window_name: &str) -> Option<chrono::Duration> {
-    let (count, unit) = window_name.split_at(window_name.len().checked_sub(1)?);
-    let count: i64 = count.parse().ok()?;
+    let unit = window_name.chars().next_back()?;
+    let count: i64 = window_name[..window_name.len() - unit.len_utf8()]
+        .parse()
+        .ok()?;
     match unit {
-        "h" => Some(chrono::Duration::hours(count)),
-        "d" => Some(chrono::Duration::days(count)),
-        "m" => Some(chrono::Duration::minutes(count)),
+        'h' => chrono::Duration::try_hours(count),
+        'd' => chrono::Duration::try_days(count),
         _ => None,
     }
 }
@@ -539,28 +553,41 @@ fn window_length(window_name: &str) -> Option<chrono::Duration> {
 /// keeps a reset-less window from being silenced for ever. `resets_at` is genuinely absent
 /// sometimes — the capture of 2026-09-19 had one, and the Claude sidecar has a fixture of it — and
 /// with only the first rule such a window would warn once in the lifetime of the database and never
-/// again. Nothing is double-warned by this: a reading whose reset has passed never reaches here,
-/// because [`is_outdated`] drops it first.
+/// again.
+///
+/// **The second rule is the FALLBACK for the first, not a second opinion on top of it.** Two
+/// readable reset instants settle the question by themselves — the window either rolled or it did
+/// not — and letting age speak as well can only ever add a wrong `true`: a window whose real
+/// duration outlives what its name says (`5h` whose reset is a year out, which is what
+/// `codex_test.go` guards against by pinning `resets_at` to epoch SECONDS) would be re-armed by the
+/// clock while its own instant says it never rolled. That is a duplicate ping inside a live window,
+/// which is the one thing this table exists to prevent. So age is consulted only when the instants
+/// cannot be compared, which is exactly the hole it was added to fill.
+///
+/// Either instant may be the missing one, and both directions land here on purpose: a claim written
+/// with a reset against a reading that arrives without one (the sidecar degraded), and a claim
+/// written without one against a reading that now has one. Neither can be compared, so both are
+/// decided by age — and the cost, up to one window's silence before the new instance gets its word,
+/// is paid in the direction this module errs in.
 fn claim_has_expired(claim: &Claim, window: &Window, now: chrono::DateTime<chrono::Utc>) -> bool {
     let instant = |at: Option<&str>| {
         at.and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
             .map(|at| at.with_timezone(&chrono::Utc))
     };
-    if let (Some(claimed), Some(fresh)) = (
+    match (
         instant(claim.resets_at.as_deref()),
         instant(window.resets_at.as_deref()),
-    ) && fresh > claimed
-    {
-        return true;
-    }
-    match (
-        window_length(&window.window),
-        instant(Some(&claim.last_alerted_at)),
     ) {
-        (Some(length), Some(said_at)) => now.signed_duration_since(said_at) >= length,
-        // A window whose name this build cannot read, or a stamp it cannot parse. Holding the claim
-        // errs towards silence, which is the direction a warning should err in.
-        _ => false,
+        (Some(claimed), Some(fresh)) => fresh > claimed,
+        _ => match (
+            window_length(&window.window),
+            instant(Some(&claim.last_alerted_at)),
+        ) {
+            (Some(length), Some(said_at)) => now.signed_duration_since(said_at) >= length,
+            // A window whose name this build cannot read, or a stamp it cannot parse. Holding the
+            // claim errs towards silence, which is the direction a warning should err in.
+            _ => false,
+        },
     }
 }
 
@@ -575,8 +602,11 @@ fn claim_has_expired(claim: &Claim, window: &Window, now: chrono::DateTime<chron
 /// nothing. `previous: None` binds NULL against a column declared `NOT NULL`, which by construction
 /// matches no row — so a caller that read no row loses to whoever inserted one in the meantime,
 /// which is the outcome wanted.
+///
+/// Takes a connection rather than the pool so the caller can put this statement and the feed line
+/// it authorises inside one transaction; see [`warn`], which is why that matters.
 async fn claim_the_right_to_warn(
-    pool: &SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     provider: &str,
     window_name: &str,
     previous: Option<&Claim>,
@@ -602,7 +632,7 @@ async fn claim_the_right_to_warn(
     .bind(now.to_rfc3339())
     .bind(previous.map(|claim| claim.alerted_percent))
     .bind(previous.and_then(|claim| claim.resets_at.as_deref()))
-    .execute(pool)
+    .execute(conn)
     .await?
     .rows_affected();
     Ok(affected == 1)
@@ -641,8 +671,16 @@ pub async fn warn(
             let Some(threshold) = crossed_threshold(window.used_fraction, already) else {
                 continue;
             };
+            // The claim and the line it authorises, or neither. `feed::append_on` exists for
+            // exactly this ("a writer that must be atomic with its feed entry"), and without it the
+            // two are a trade: claim first and a failed write loses the crossing for good, because
+            // the claim is already committed and the next poll reads it as said; speak first and a
+            // crash between the two says it twice. `token_efficiency.rs` has to live with that
+            // trade — it speaks through `notify::deliver_or_defer`, which cannot be folded into a
+            // transaction — and this module copied its shape before noticing it does not have to.
+            let mut claiming = pool.begin().await?;
             if !claim_the_right_to_warn(
-                pool,
+                &mut claiming,
                 &provider.provider,
                 &window.window,
                 previous.as_ref(),
@@ -668,14 +706,13 @@ pub async fn warn(
             // project at once, so filing it under one would hide it from the others.
             //
             // Logged rather than propagated, which is the same choice `token_efficiency.rs` makes
-            // beside its own claim and for a reason worth repeating: a `?` here would abandon every
-            // remaining provider and window in this round — in practice the second provider and the
-            // `7d` window — over one failed write. The claim above is already committed either way,
-            // so this line is lost rather than retried; losing one line is the smaller failure, and
-            // the alternative (claim after speaking) trades it for a duplicate ping on every crash
-            // between the two.
-            if let Err(error) = crate::feed::append(
-                pool,
+            // beside its own claim: a `?` here would abandon every remaining provider and window in
+            // this round — in practice the second provider and the `7d` window — over one failed
+            // write. What is NOT the same is what the failure costs. The transaction is dropped
+            // unfinished, so the claim goes down with the line and the next poll finds the window
+            // still unannounced and tries again. Nothing is lost and nothing is said twice.
+            if let Err(error) = crate::feed::append_on(
+                &mut claiming,
                 None,
                 FEED_KIND,
                 &summarise(&provider.provider, window, threshold),
@@ -684,7 +721,11 @@ pub async fn warn(
             )
             .await
             {
-                tracing::warn!(%error, provider = %provider.provider, window = %window.window, "a quota warning was claimed but not written");
+                tracing::warn!(%error, provider = %provider.provider, window = %window.window, "a quota warning was claimed but not written; the claim was rolled back with it");
+                continue;
+            }
+            if let Err(error) = claiming.commit().await {
+                tracing::warn!(%error, provider = %provider.provider, window = %window.window, "a quota warning could not be committed");
                 continue;
             }
             spoken += 1;
@@ -1029,6 +1070,80 @@ mod tests {
         assert_eq!(feed_kinds(&pool).await.len(), 2);
     }
 
+    /// A window whose own reset says it has not rolled is never re-armed by the clock.
+    ///
+    /// The reading is a `5h` window whose reset is a month out — what a provider writing epoch
+    /// MILLIseconds would produce, which is the mistake `sidecars/quota/codex/codex_test.go` exists
+    /// to pin down. Six hours later the name says the window is over and the instant says it is not,
+    /// and the instant wins: re-arming here would be a second ping inside one live window, which is
+    /// the failure `quota_warnings` was built to prevent.
+    #[tokio::test]
+    async fn a_window_whose_reset_has_not_moved_is_not_re_armed_by_its_name() {
+        let pool = pool().await;
+        let mut providers = measured(0.82);
+        providers[0].windows[0].resets_at = Some("2026-10-19T12:00:00+00:00".into());
+
+        assert_eq!(warn(&pool, &providers, noon()).await.unwrap(), 1);
+        let six_hours = noon() + chrono::Duration::hours(6);
+        assert_eq!(
+            warn(&pool, &providers, six_hours).await.unwrap(),
+            0,
+            "a name is not evidence against the instant the reading carried"
+        );
+        assert_eq!(feed_kinds(&pool).await.len(), 1);
+    }
+
+    /// A reset that disappears between readings costs silence, never a duplicate.
+    ///
+    /// The sidecar degrades: it answered with a reset instant, then answers without one (a real
+    /// answer — the capture of 2026-09-19 had one). The two instants can no longer be compared, so
+    /// the claim is decided by age, and the new window goes unannounced until the old claim outlives
+    /// its own length. That wait is the price of not guessing, and it is paid in the direction this
+    /// module errs in.
+    #[tokio::test]
+    async fn a_reset_that_disappears_buys_silence_and_not_a_second_ping() {
+        let pool = pool().await;
+        let mut providers = measured(0.82);
+        providers[0].windows[0].resets_at = Some("2026-09-19T13:00:00+00:00".into());
+        assert_eq!(warn(&pool, &providers, noon()).await.unwrap(), 1);
+
+        // The window rolled at 13:00, and the reading that follows carries no instant at all.
+        providers[0].windows[0].resets_at = None;
+        let two_hours = noon() + chrono::Duration::hours(2);
+        assert_eq!(
+            warn(&pool, &providers, two_hours).await.unwrap(),
+            0,
+            "nothing here can tell the new window from the old one yet"
+        );
+
+        let five_hours = noon() + chrono::Duration::hours(5);
+        assert_eq!(warn(&pool, &providers, five_hours).await.unwrap(), 1);
+        assert_eq!(feed_kinds(&pool).await.len(), 2);
+    }
+
+    /// A line that cannot be written takes its claim down with it.
+    ///
+    /// The feed is made unwritable, which is the one failure the claim cannot survive on its own:
+    /// claimed but unsaid, the window reads as announced for ever and the crossing is lost in
+    /// silence. Inside one transaction there is nothing to lose — the next poll finds the window
+    /// exactly as it left it.
+    #[tokio::test]
+    async fn a_warning_that_cannot_be_written_leaves_no_claim_behind() {
+        let pool = pool().await;
+        sqlx::query("DROP TABLE feed").execute(&pool).await.unwrap();
+
+        assert_eq!(warn(&pool, &measured(0.82), noon()).await.unwrap(), 0);
+
+        let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM quota_warnings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            claims, 0,
+            "a claim is worth nothing without the line it bought"
+        );
+    }
+
     #[test]
     fn a_window_name_is_read_as_a_count_and_a_unit_or_not_at_all() {
         assert_eq!(window_length("5h"), Some(chrono::Duration::hours(5)));
@@ -1038,6 +1153,13 @@ mod tests {
         assert_eq!(window_length("month"), None);
         assert_eq!(window_length(""), None);
         assert_eq!(window_length("h"), None);
+        // `m` is refused rather than guessed: a provider that means one MONTH by `1m` would have
+        // its claim expire every sixty seconds, which is a ping a poll for thirty days.
+        assert_eq!(window_length("1m"), None);
+        // A name is whatever the sidecar put in its JSON, and it is read inside an HTTP handler, so
+        // neither a multi-byte tail nor a count no duration can hold may abort the request.
+        assert_eq!(window_length("1月"), None);
+        assert_eq!(window_length("999999999999d"), None);
     }
 
     /// Two readings landing in the same instant produce one line, not two.
@@ -1051,12 +1173,16 @@ mod tests {
         let pool = pool().await;
         let reset = Some("2026-09-19T16:40:00+00:00");
 
-        let first = claim_the_right_to_warn(&pool, "claude", "5h", None, 80, reset, noon())
+        // One connection for both, because the test pool holds exactly one and the guard being
+        // asserted is the row's, not the connection's: `previous` is what each reader SAW, and the
+        // second reader having seen the same nothing is the whole scenario.
+        let mut conn = pool.acquire().await.unwrap();
+        let first = claim_the_right_to_warn(&mut conn, "claude", "5h", None, 80, reset, noon())
             .await
             .unwrap();
         // The same `None`: the second reader saw no row either, because it read before the first
         // one wrote.
-        let second = claim_the_right_to_warn(&pool, "claude", "5h", None, 80, reset, noon())
+        let second = claim_the_right_to_warn(&mut conn, "claude", "5h", None, 80, reset, noon())
             .await
             .unwrap();
 
