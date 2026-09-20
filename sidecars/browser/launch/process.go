@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -61,6 +60,8 @@ func Start(ctx context.Context, opts Options, wait time.Duration) (*Process, err
 	}
 
 	cmd := exec.CommandContext(ctx, opts.ExecutablePath, args...)
+	// Its own process group on Unix, so Stop can take every helper it spawns at once.
+	ownProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting chromium: %w", err)
 	}
@@ -128,15 +129,9 @@ func (p *Process) Stop() {
 		return
 	}
 	pid := p.cmd.Process.Pid
-	switch runtime.GOOS {
-	case "windows":
-		// /T is the whole point: it takes the descendants too.
-		kill := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid))
-		_ = kill.Run()
-	default:
-		// Negative pid signals the process group, which is the same idea on POSIX.
-		_ = exec.Command("kill", "-9", "--", "-"+strconv.Itoa(pid)).Run()
-	}
+	// The group Start made Chromium lead on Unix, or the whole tree on Windows: see killGroup in
+	// procattr_unix.go and procattr_windows.go.
+	killGroup(pid)
 	_ = p.cmd.Process.Kill()
 	_, _ = p.cmd.Process.Wait()
 }

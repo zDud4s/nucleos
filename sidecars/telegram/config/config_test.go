@@ -200,3 +200,72 @@ func TestTheUpdateOffsetSurvivesARestart(t *testing.T) {
 		t.Errorf("LoadOffset(corrupt) = %d, want 0 so the bot still starts", got)
 	}
 }
+
+// withoutLocalAppData makes a machine where LOCALAPPDATA is not set, which is every macOS and Linux
+// one. It moves the user config directory into a temp dir on each OS (APPDATA on Windows,
+// XDG_CONFIG_HOME on Linux, HOME on macOS) and returns it as the standard library resolves it, so
+// no test hard-codes a platform's layout or touches the real one.
+func withoutLocalAppData(t *testing.T) string {
+	t.Helper()
+	base := t.TempDir()
+	t.Setenv("LOCALAPPDATA", "")
+	t.Setenv("APPDATA", base)
+	t.Setenv("XDG_CONFIG_HOME", base)
+	t.Setenv("HOME", base)
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("os.UserConfigDir() error = %v", err)
+	}
+	return dir
+}
+
+// On Windows LOCALAPPDATA is always set, and the offset must stay exactly where it has always been.
+func TestTheOffsetLivesUnderLocalAppDataWhenItIsSet(t *testing.T) {
+	local := t.TempDir()
+	t.Setenv("NUCLEOS_TELEGRAM_OFFSET", "")
+	t.Setenv("LOCALAPPDATA", local)
+
+	want := filepath.Join(local, "nucleos", "telegram-offset")
+	if got := OffsetPath(); got != want {
+		t.Errorf("OffsetPath() = %q, want %q", got, want)
+	}
+}
+
+// Without LOCALAPPDATA the offset used to be the RELATIVE path nucleos/telegram-offset, so a sidecar
+// started from another directory lost its place and read Telegram's backlog again.
+func TestWithoutLocalAppDataTheOffsetLivesInTheUserConfigDir(t *testing.T) {
+	dir := withoutLocalAppData(t)
+	t.Setenv("NUCLEOS_TELEGRAM_OFFSET", "")
+
+	got := OffsetPath()
+	if want := filepath.Join(dir, "nucleos", "telegram-offset"); got != want {
+		t.Errorf("OffsetPath() = %q, want %q", got, want)
+	}
+	if !filepath.IsAbs(got) {
+		t.Errorf("OffsetPath() = %q, want an absolute path", got)
+	}
+}
+
+func TestWithoutLocalAppDataLoadReadsTheConfigFromTheUserConfigDir(t *testing.T) {
+	dir := withoutLocalAppData(t)
+	t.Setenv("NUCLEOS_DAEMON_URL", "")
+	t.Setenv("NUCLEOS_DAEMON_TOKEN", "daemon-token")
+	t.Setenv("TELEGRAM_BOT_TOKEN", "bot-token")
+	t.Setenv("NUCLEOS_TELEGRAM_CONFIG", "")
+
+	path := filepath.Join(dir, "nucleos", "telegram-config.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create config directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"allowed_chat_id":42}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AllowedChatID != 42 {
+		t.Errorf("AllowedChatID = %d, want 42 read from %s", cfg.AllowedChatID, path)
+	}
+}

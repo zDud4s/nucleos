@@ -153,8 +153,11 @@ func defaultRoot() string {
 	if local := os.Getenv("LOCALAPPDATA"); local != "" {
 		return filepath.Join(local, "NucleOS", "browser")
 	}
-	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".local", "share", "nucleos", "browser")
+	// Off Windows the same argument picks the user CACHE directory (~/Library/Caches on macOS,
+	// XDG_CACHE_HOME or ~/.cache on Linux): the pinned Chromium can be downloaded again. The old
+	// ~/.local/share fallback ignored XDG_DATA_HOME and was the wrong place on macOS.
+	if cache, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(cache, "nucleos", "browser")
 	}
 	// Deliberately relative and deliberately named: a root that silently became the working
 	// directory would put profile directories wherever the daemon happened to be started from.

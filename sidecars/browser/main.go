@@ -60,6 +60,15 @@ func main() {
 		shutdown()
 		os.Exit(0)
 	}()
+	// The lifeline (spec D3): a daemon that is gone takes the same graceful path a signal takes.
+	// Non-blocking because a real signal may already fill the one-slot channel, and then that path
+	// is running anyway.
+	watchLifeline(os.Getenv, os.Stdin, func() {
+		select {
+		case stop <- os.Interrupt:
+		default:
+		}
+	})
 
 	log.Fatal(serve.Serve(cfg, driver))
 }

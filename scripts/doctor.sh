@@ -55,10 +55,10 @@ need node  node  "install Node.js 20+ from https://nodejs.org"
 need npm   npm   "ships with Node.js"
 
 # Python is part of the definition of green, which is easy to miss because none of the product is
-# written in it. `scripts/gates.sh hooks` runs the cover for `.claude/hooks/ask_daemon.py` — a file
-# `core/src/triage.rs` compiles INTO the daemon and which decides what a person's git commands are
-# allowed to do. Checked under both names: `python3` on Linux and CI, `python` on most Windows
-# installs, and a machine with neither cannot run the gate.
+# written in it. `scripts/gates.sh hooks` runs the cover for `core/hooks/ask_daemon.py` — a file
+# `core/src/autopilot.rs` and `core/src/triage.rs` compile INTO the daemon and which decides what a
+# person's git commands are allowed to do. Checked under both names: `python3` on Linux and CI,
+# `python` on most Windows installs, and a machine with neither cannot run the gate.
 #
 # RUN it rather than locate it. Windows ships an App Execution Alias named `python3` that is not an
 # interpreter — it prints "Python was not found", points at the Microsoft Store, and exits 49.

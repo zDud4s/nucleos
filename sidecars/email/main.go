@@ -8,6 +8,7 @@ package main
 
 import (
 	"log"
+	"os"
 
 	"nucleosemail/config"
 	"nucleosemail/daemon"
@@ -17,6 +18,8 @@ import (
 
 func main() {
 	log.SetPrefix("email-sidecar: ")
+	// Stateless (see the package comment), so the orderly shutdown when the daemon is gone is to exit.
+	watchLifeline(os.Getenv, os.Stdin, func() { os.Exit(0) })
 	cfg, err := config.Load()
 	if err != nil {
 		// The daemon only starts this process once the pillar is configured, so a missing variable

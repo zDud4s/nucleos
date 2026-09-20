@@ -19,6 +19,7 @@ pub const TELEGRAM: &str = "telegram";
 pub const EMAIL: &str = "email";
 pub const WEB: &str = "web";
 pub const BROWSER: &str = "browser";
+pub const QUOTA: &str = "quota";
 
 /// The two values [`SidecarState::state`] takes, written once because it is serialized to the shell.
 const RUNNING: &str = "running";
@@ -278,16 +279,26 @@ where
 /// The variable that says where the sidecar binaries are, for a daemon that does not sit beside them.
 pub const SIDECAR_DIR_VAR: &str = "NUCLEOS_SIDECAR_DIR";
 
-/// Where the sidecar whose executable is called `file` is, for this daemon.
+/// The file name of the sidecar called `name`: `<name>-sidecar` plus this platform's executable
+/// suffix, so `.exe` on Windows and nothing on macOS or Linux.
+///
+/// The one place that name is spelled. `scripts/build-sidecars.sh` writes the same name with
+/// `go env GOEXE`, which is `.exe` on Windows and empty elsewhere; the two change together.
+pub fn binary_file_name(name: &str) -> String {
+    format!("{name}-sidecar{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Where the sidecar called `name` ([`ECHO`], [`BROWSER`], ...) is, for this daemon.
 ///
 /// Beside the daemon's own executable unless [`SIDECAR_DIR_VAR`] says otherwise. The default is the
 /// layout `scripts/build-sidecars.sh` produces and an installation ships; the variable is for a
 /// daemon built anywhere else. That is not rare on this machine: a build that must not overwrite the
 /// running daemon's binary goes to a target directory of its own, which has no sidecars in it, and
 /// on 2026-09-09 a daemon swapped in from one came up with all five down.
-pub fn binary(file: &str) -> PathBuf {
+pub fn binary(name: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("the daemon can name its own executable");
-    binary_in(std::env::var_os(SIDECAR_DIR_VAR).as_deref(), &exe, file)
+    let file = binary_file_name(name);
+    binary_in(std::env::var_os(SIDECAR_DIR_VAR).as_deref(), &exe, &file)
 }
 
 /// PURE: [`binary`], given what the environment and the executable's own path said. An empty
@@ -312,6 +323,26 @@ fn spawn_failure(binary_path: &Path, error: &io::Error) -> String {
     format!("could not start {}: {error}{remedy}", binary_path.display())
 }
 
+/// The variable that tells a sidecar its stdin is the daemon's lifeline (portability spec, D3).
+///
+/// Without it a sidecar reads nothing from stdin: one started by hand, or by a script with stdin at
+/// `/dev/null`, must not take that immediate EOF as its cue to leave.
+pub const LIFELINE_VAR: &str = "NUCLEOS_LIFELINE";
+
+/// Gives a sidecar its lifeline: stdin piped from THIS process, and [`LIFELINE_VAR`] set.
+///
+/// The write end lives here, and `supervise` holds it for as long as the child lives. However this
+/// process dies -- orderly, `SIGKILL`, `TerminateProcess`, a crash -- the kernel closes that end and
+/// the sidecar reads EOF, which each sidecar takes as its cue to shut down. That is what takes the
+/// sidecars down with a hard-killed daemon on macOS and Linux, where `LITTER` adopts nothing; on
+/// Windows the job object holds as well. Rust opens this process's end close-on-exec
+/// (non-inheritable on Windows), so no other child of the daemon can keep a sidecar alive by
+/// holding a copy of it.
+fn arm_lifeline(cmd: &mut Command) {
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.env(LIFELINE_VAR, "1");
+}
+
 pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, String)>) {
     let mut delay = RESTART_BASE;
     let mut attempts: u32 = 0;
@@ -331,6 +362,8 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
         // to make impossible.
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // The lifeline (spec D3); see `arm_lifeline`.
+        arm_lifeline(&mut cmd);
         match cmd.spawn() {
             Ok(mut child) => {
                 // Adopted before anything else is done with it, and while the `Child` is still held
@@ -346,6 +379,11 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
                 if let Some(stderr) = child.stderr.take() {
                     tokio::spawn(pump(name.clone(), "stderr", stderr));
                 }
+                // Held, not dropped: the lifeline must live exactly as long as the child. Taken out
+                // of `child` because tokio's `Child::wait` closes a stdin the `Child` still holds
+                // before waiting, which every sidecar would read as "the daemon is gone". A named
+                // binding, so it drops at the end of this arm, after `wait()` has returned.
+                let _lifeline = child.stdin.take();
                 let started_at = chrono::Utc::now().to_rfc3339();
                 let launched = std::time::Instant::now();
                 let restarts = attempts;
@@ -445,6 +483,37 @@ pub const WEB_ADDR: &str = "127.0.0.1:8794";
 /// browsers holding the owner's logged-in profiles, so `requireLoopback` on the Go side refuses to
 /// bind anything else. A listener off this machine would hand those sessions to whoever asked.
 pub const BROWSER_ADDR: &str = "127.0.0.1:8795";
+
+/// Where the quota sidecar answers the núcleo. 8796 follows the browser sidecar (8795).
+///
+/// A constant for the same reason the three above are: one fact shared by two processes, and a fact
+/// with two homes eventually has two values. The Go side's copy is `config.DefaultAddr` in
+/// `sidecars/quota/config/config.go`, and it too refuses to bind anything that is not loopback —
+/// this process answers with how much of the owner's usage limit is gone, which is nobody else's
+/// business, and it reaches the vendor holding the owner's own token (design D2).
+pub const QUOTA_ADDR: &str = "127.0.0.1:8796";
+
+/// The quota sidecar's environment (spec §1.4, design D2).
+///
+/// Deliberately SHORT, and the absences are the design. No credential is passed: the sidecar reads
+/// the owner's Claude token out of Claude Code's own file at the point of use and hands back a
+/// percentage, so the núcleo never holds it — which is why it is not in the Credential Manager and
+/// not a parameter here. No thresholds either: what counts as alarming is decided in `quota.rs`
+/// against settings the owner can change, and a copy out here would only change when the process
+/// restarts.
+///
+/// The TTLs are named rather than left to the sidecar's defaults because they are the floor that
+/// stops the núcleo's polling from becoming a reason to run out of quota, and a floor nobody can
+/// see is one somebody later assumes is lower.
+pub fn quota_env(daemon_url: &str, daemon_token: &str) -> Vec<(String, String)> {
+    vec![
+        ("NUCLEOS_DAEMON_URL".to_string(), daemon_url.to_string()),
+        ("NUCLEOS_DAEMON_TOKEN".to_string(), daemon_token.to_string()),
+        ("QUOTA_ADDR".to_string(), QUOTA_ADDR.to_string()),
+        ("QUOTA_SUCCESS_TTL_SECS".to_string(), "60".to_string()),
+        ("QUOTA_ERROR_TTL_SECS".to_string(), "10".to_string()),
+    ]
+}
 
 /// The browser sidecar's environment (spec §8).
 ///
@@ -750,6 +819,30 @@ mod tests {
         assert_eq!(env["EMAIL_SMTP_PORT"], "465");
     }
 
+    /// The quota sidecar is handed no secret, and that is the property worth a test rather than a
+    /// comment.
+    ///
+    /// Design D2 turns on the núcleo never taking custody of Claude Code's token: the sidecar reads
+    /// it where it lies and hands back a percentage. The cheapest way to break that is for somebody
+    /// later to "fix" a 401 by passing the token through here, which would put another application's
+    /// credential into this process's environment, its child's command line, and every crash dump
+    /// either of them produces.
+    #[test]
+    fn the_quota_sidecar_is_given_the_port_and_no_credential_of_the_providers() {
+        let env: HashMap<String, String> = quota_env("http://127.0.0.1:8791", "daemon-token")
+            .into_iter()
+            .collect();
+
+        assert_eq!(env["QUOTA_ADDR"], QUOTA_ADDR);
+        assert_eq!(env["NUCLEOS_DAEMON_TOKEN"], "daemon-token");
+        for name in env.keys() {
+            assert!(
+                !name.contains("CLAUDE") && !name.contains("CODEX") && !name.contains("OAUTH"),
+                "{name} looks like a provider credential; the quota sidecar reads those itself"
+            );
+        }
+    }
+
     /// An unconfigured submission host must reach the sidecar as an ABSENCE, not as an empty string.
     ///
     /// The sidecar decides whether it can send at all from whether this variable arrived. A blank
@@ -1000,6 +1093,23 @@ mod tests {
         );
     }
 
+    /// The daemon looks for exactly the name `scripts/build-sidecars.sh` writes, and Go adds `.exe`
+    /// only on Windows (`go env GOEXE` is empty elsewhere). A literal `.exe` was right on one
+    /// platform by coincidence.
+    #[test]
+    fn a_sidecar_binary_carries_this_platforms_executable_suffix() {
+        let expected = if cfg!(windows) {
+            "echo-sidecar.exe"
+        } else {
+            "echo-sidecar"
+        };
+        assert_eq!(binary_file_name(ECHO), expected);
+        assert_eq!(
+            binary_file_name(BROWSER),
+            format!("browser-sidecar{}", std::env::consts::EXE_SUFFIX)
+        );
+    }
+
     /// The failure a missing sidecar records names the file it looked for, and the two ways out.
     #[test]
     fn a_sidecar_that_cannot_start_says_where_it_looked() {
@@ -1014,5 +1124,51 @@ mod tests {
             &io::Error::from(io::ErrorKind::PermissionDenied),
         );
         assert!(!refused.contains(SIDECAR_DIR_VAR), "{refused}");
+    }
+
+    /// D3: a sidecar reads its lifeline to EOF and leaves, so dropping the write end -- what the
+    /// kernel does to a dead daemon's descriptors, however it died -- ends it. The stand-in honours
+    /// the contract the Go sidecars implement: without `NUCLEOS_LIFELINE=1` it exits 3 before saying
+    /// anything, so a pass cannot come from a bare `cat`.
+    #[tokio::test]
+    async fn a_sidecar_lives_exactly_as_long_as_its_lifeline() {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            r#"[ "$NUCLEOS_LIFELINE" = 1 ] || exit 3; echo up; cat >/dev/null; exit 0"#,
+        ]);
+        command.stdout(std::process::Stdio::piped());
+        command.kill_on_drop(true);
+        arm_lifeline(&mut command);
+        let mut child = command.spawn().expect("`sh` must be on PATH");
+        let lifeline = child.stdin.take().expect("the lifeline must be piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+
+        let mut first = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::BufReader::new(stdout).read_line(&mut first),
+        )
+        .await
+        .expect("the stand-in never started")
+        .expect("reading the stand-in's stdout");
+        assert_eq!(
+            first.trim(),
+            "up",
+            "the stand-in did not see {LIFELINE_VAR}=1"
+        );
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "left while the lifeline was still held"
+        );
+
+        drop(lifeline);
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("the sidecar outlived its lifeline")
+            .expect("wait");
+        assert!(status.success(), "{status}");
     }
 }

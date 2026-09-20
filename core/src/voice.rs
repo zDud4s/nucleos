@@ -2082,6 +2082,7 @@ mod tests {
             browser: Arc::new(crate::browser::BrowserRuntime::disabled()),
             github: Arc::new(crate::github::GithubRuntime::default()),
             web: Arc::new(crate::web::WebRuntime::disabled()),
+            quota: Arc::new(crate::quota::QuotaRuntime::disabled()),
             calendar: Arc::new(crate::calendar::CalendarRuntime::default()),
             council: Arc::new(crate::council::CouncilRuntime::default()),
             workflow_library: None,

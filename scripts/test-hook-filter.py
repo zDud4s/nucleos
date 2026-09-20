@@ -31,6 +31,8 @@ Run:  python scripts/test-hook-filter.py
 import importlib.util
 import io
 import os
+import re
+import subprocess
 import sys
 import tempfile
 from unittest import mock
@@ -232,6 +234,114 @@ def report_outcome_silence_cases():
     return cases
 
 
+def binary_candidate_cases():
+    """Where `control_token` looks for the daemon binary, and in what order, per platform.
+
+    `os_name` is spelled out, so both orders are checked on whatever machine runs this file.
+    Windows must keep the list it always had, in the same order, as the head of the new one.
+    """
+    roots = [os.path.join("A", "target"), os.path.join("B", "target")]
+    exe = [os.path.join(r, b, "nucleos-core.exe") for r in roots for b in ("debug", "release")]
+    bare = [os.path.join(r, b, "nucleos-core") for r in roots for b in ("debug", "release")]
+    labels = (
+        "on Windows the old .exe list comes first, unchanged, then the bare names",
+        "off Windows the bare names come first, then the .exe names",
+    )
+    try:
+        windows = hook.daemon_binary_candidates(roots, os_name="nt")
+        other = hook.daemon_binary_candidates(roots, os_name="posix")
+    except Exception as exc:  # noqa: BLE001 - reported, not raised, so every other case still runs
+        return [(label, f"raised {exc!r}") for label in labels]
+    return [
+        (labels[0], "" if windows == exe + bare else f"got {windows!r}"),
+        (labels[1], "" if other == bare + exe else f"got {other!r}"),
+    ]
+
+
+def _token_found_at(wanted):
+    """`control_token` with exactly one daemon binary on disk, at `wanted`: `""` if it read `tok`.
+
+    Nothing real runs. `cargo_target_dirs`, `os.path.exists` and `subprocess.run` are answered
+    here, the ambient `NUCLEOS_DAEMON_TOKEN` is removed, and `deny()` exits, so its `SystemExit`
+    is caught and reported with what it printed.
+    """
+    target = [os.path.join("T", "target")]
+
+    def run(args, **_kwargs):
+        if args[0] == G:
+            return subprocess.CompletedProcess(args, 0, stdout="/repo/.git\n", stderr="")
+        if list(args) == [wanted, "--print-token"]:
+            return subprocess.CompletedProcess(args, 0, stdout="tok\n", stderr="")
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="unexpected call")
+
+    captured = io.StringIO()
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("NUCLEOS_DAEMON_TOKEN", None)
+        with mock.patch.object(hook, "cargo_target_dirs", lambda _root: target):
+            with mock.patch.object(hook.os.path, "exists", lambda path: path == wanted):
+                with mock.patch.object(hook.subprocess, "run", side_effect=run):
+                    with mock.patch("sys.stdout", captured):
+                        try:
+                            token = hook.control_token("/repo")
+                        except SystemExit:
+                            return f"refused: {captured.getvalue().strip()!r}"
+    return "" if token == "tok" else f"returned {token!r}"
+
+
+def control_token_cases():
+    """The token is read from the daemon binary under either of its names.
+
+    The bare name is the fix: off Windows cargo writes no `.exe`, and a lookup that knew only the
+    `.exe` refused every queue operation an agent asked for. The `.exe` case guards Windows.
+    """
+    return [
+        (
+            f"control_token reads the token from debug/{name}",
+            _token_found_at(os.path.join("T", "target", "debug", name)),
+        )
+        for name in ("nucleos-core", "nucleos-core.exe")
+    ]
+
+
+def one_source_cases():
+    """One hook source compiled into the daemon, and the tracked `.claude/` copy equal to it.
+
+    Owner decision, 2026-09-14: `core/hooks/ask_daemon.py` is the source, every `include_str!` of
+    the hook in `core/src` embeds it, and `.claude/hooks/ask_daemon.py` (the hook this repository's
+    own sessions run) is a byte copy. Compared with line endings normalised: a Windows checkout
+    with `core.autocrlf` holds CRLF working copies and CI holds LF, and either way it is one script.
+    """
+    source = os.path.join(ROOT, "core", "hooks", "ask_daemon.py")
+    copy = os.path.join(ROOT, ".claude", "hooks", "ask_daemon.py")
+    with open(source, "rb") as handle:
+        want = handle.read().replace(b"\r\n", b"\n")
+    with open(copy, "rb") as handle:
+        got = handle.read().replace(b"\r\n", b"\n")
+    cases = [(
+        ".claude/hooks/ask_daemon.py is a copy of core/hooks/ask_daemon.py",
+        "" if got == want else "they differ; copy core/hooks/ask_daemon.py over the .claude/ one",
+    )]
+
+    embed = re.compile(r'include_str!\(\s*"([^"]*ask_daemon\.py)"\s*\)')
+    found = []
+    for folder, _dirs, files in os.walk(os.path.join(ROOT, "core", "src")):
+        for name in sorted(files):
+            if not name.endswith(".rs"):
+                continue
+            with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as handle:
+                for relative in embed.findall(handle.read()):
+                    found.append((name, os.path.normpath(os.path.join(folder, relative))))
+    strays = [(name, target) for name, target in found if target != os.path.normpath(source)]
+    if len(found) < 2:
+        failure = f"expected the embeddings in autopilot.rs and triage.rs, found {found!r}"
+    elif strays:
+        failure = f"embeds something other than core/hooks/ask_daemon.py: {strays!r}"
+    else:
+        failure = ""
+    cases.append(("every include_str! of ask_daemon.py in core/src embeds core/hooks/", failure))
+    return cases
+
+
 def main() -> int:
     failures = 0
     for command, want in CASES:
@@ -260,6 +370,12 @@ def main() -> int:
         if failure:
             failures += 1
             print(f"FAIL report_outcome, {label}: {failure}")
+
+    for label, failure in binary_candidate_cases() + control_token_cases() + one_source_cases():
+        total += 1
+        if failure:
+            failures += 1
+            print(f"FAIL {label}: {failure}")
 
     print(f"{total - failures}/{total} as expected")
     return 1 if failures else 0

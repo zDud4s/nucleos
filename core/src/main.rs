@@ -60,7 +60,7 @@ mod mentions;
 mod notes;
 mod notify;
 mod notify_policy;
-mod openrouter;
+mod openai_compatible;
 mod ownership;
 mod pii_shadow;
 mod presets;
@@ -74,6 +74,8 @@ mod project_policy;
 mod project_readings;
 mod prompt_budget;
 mod proposals;
+mod quota;
+mod quota_client;
 mod recurrence;
 mod redact;
 mod refine;
@@ -126,7 +128,7 @@ const EMAIL_PASSWORD_KEY: &str = "email-imap-password";
 const WEB_SEARCH_KEY: &str = "web-search-api-key";
 /// OpenRouter's own API key, in Credential Manager for the same reason every secret above is: it
 /// never sits in `.ai/models.yaml`, which only ever names the model (`hosted_assistant_model`) and
-/// is a versioned file. `openrouter::OpenRouterChat::new` refuses outright when this comes back
+/// is a versioned file. `openai_compatible::OpenAiCompatibleChat::new` refuses outright when this comes back
 /// `None` — see its own doc comment for why that refusal happens before any request leaves the
 /// machine rather than after a 401 comes back.
 const OPENROUTER_KEY: &str = "openrouter-api-key";
@@ -344,7 +346,7 @@ async fn main() {
                 std::process::exit(1);
             }
             Err(e) => {
-                eprintln!("failed to read token from Credential Manager: {e}");
+                eprintln!("failed to read token from the system credential store: {e}");
                 std::process::exit(1);
             }
         }
@@ -488,7 +490,7 @@ async fn main() {
     if std::env::args().any(|a| a == "--set-telegram-token") {
         match read_secret_from_stdin("paste the bot token, then press Enter:") {
             Some(value) => match secrets::store_secret(TELEGRAM_TOKEN_KEY, &value) {
-                Ok(()) => println!("telegram bot token stored in Credential Manager"),
+                Ok(()) => println!("telegram bot token stored in the system credential store"),
                 Err(e) => {
                     eprintln!("failed to store telegram token: {e}");
                     std::process::exit(1);
@@ -514,7 +516,7 @@ async fn main() {
         ) {
             Some(value) => match secrets::store_secret(github::TOKEN_KEY, &value) {
                 Ok(()) => {
-                    println!("github token stored in Credential Manager");
+                    println!("github token stored in the system credential store");
                     // Said here because this is the last moment the person is listening, and the
                     // alternative is discovering it from a health row that says permission-denied.
                     eprintln!(
@@ -537,7 +539,7 @@ async fn main() {
     if std::env::args().any(|a| a == "--set-email-password") {
         match read_secret_from_stdin("paste the app password, then press Enter:") {
             Some(value) => match secrets::store_secret(EMAIL_PASSWORD_KEY, &value) {
-                Ok(()) => println!("email password stored in Credential Manager"),
+                Ok(()) => println!("email password stored in the system credential store"),
                 Err(e) => {
                     eprintln!("failed to store email password: {e}");
                     std::process::exit(1);
@@ -565,7 +567,7 @@ async fn main() {
         match read_secret_from_stdin("paste the OpenRouter API key, then press Enter:") {
             Some(value) => match secrets::store_secret(OPENROUTER_KEY, &value) {
                 Ok(()) => {
-                    println!("openrouter key stored in Credential Manager");
+                    println!("openrouter key stored in the system credential store");
                     // Said here because this is the last moment the person is listening, and the
                     // alternative is a chat that refuses with no visible reason: the key alone
                     // gets a conversation nowhere, and the daemon reads both ONCE, at startup.
@@ -637,15 +639,15 @@ async fn main() {
     let log_dir = data_dir.join("logs");
     let _log_guard = logging::init(&log_dir);
 
-    // Only the machine's daemon claims the logon task. `ensure_registered` writes it with
-    // `schtasks /F`, so a secondary doing this would point the machine's autostart at whatever
+    // Only the machine's daemon claims the logon entry. `ensure_registered` overwrites it (on
+    // Windows with `schtasks /F`), so a secondary doing this would point the autostart at whatever
     // build is under test — typically one inside a worktree that is about to be deleted, leaving a
     // task that runs nothing.
     if is_primary {
         match std::env::current_exe() {
             Ok(exe_path) => {
                 if let Err(e) = autostart::ensure_registered(&exe_path) {
-                    tracing::warn!("failed to self-register Windows autostart task: {e}");
+                    tracing::warn!("failed to register the daemon's autostart entry: {e}");
                 }
             }
             Err(e) => {
@@ -778,16 +780,21 @@ async fn main() {
         Err(error) => tracing::warn!(%error, "orphaned-worktree reconciliation failed"),
     }
 
-    let token_value =
-        match secrets::load_secret(TOKEN_KEY).expect("failed to read Credential Manager") {
-            Some(existing) => existing,
-            None => {
-                let fresh = auth::generate_token();
-                secrets::store_secret(TOKEN_KEY, &fresh).expect("failed to persist daemon token");
-                fresh
-            }
-        };
-    tracing::info!("nucleos-core token loaded from Credential Manager");
+    let token_value = match secrets::daemon_token(
+        secrets::load_secret(TOKEN_KEY),
+        auth::generate_token,
+        |fresh| secrets::store_secret(TOKEN_KEY, fresh),
+    ) {
+        Ok(token) => token,
+        Err(sentence) => {
+            // Said on stderr as well as in the log: whoever launched a daemon that refuses to
+            // start is the one person who can fix the store, and may not be reading the log.
+            tracing::error!("{sentence}");
+            eprintln!("{sentence}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!("nucleos-core token loaded from the system credential store");
 
     let models_config_path = std::path::PathBuf::from(config::MODELS_CONFIG_PATH);
     let models_config = config::load_models_config(&models_config_path).unwrap_or_else(|e| {
@@ -902,6 +909,11 @@ async fn main() {
     // process it authenticates drives browsers holding the owner's logged-in profiles, so a secret
     // that leaked would hand those sessions to anything on the machine that can open a socket.
     let browser_sidecar_token = auth::generate_token();
+    // The quota sidecar's, the same way again. Nothing of the owner's travels on this connection in
+    // either direction — the request is empty and the answer is a handful of percentages — so this
+    // secret exists only to keep anything else on the machine from asking the daemon's sidecar how
+    // much of the owner's limit is gone.
+    let quota_sidecar_token = auth::generate_token();
     // Cleanup is armed SEPARATELY from transcription, and a failed probe costs only the tidying up.
     //
     // That asymmetry is deliberate. Local triage refuses to run at all when its probe fails, because
@@ -1008,30 +1020,66 @@ async fn main() {
         None
     };
 
+    // WHICH local server answers a local turn, and whether the local route may run at all, read
+    // from the file ONCE, here — above BOTH of its readers: the capability probe immediately below
+    // and the assistant factory further down. One resolution and not two is the whole point. A
+    // probe that picked its own dialect and a factory that read the file again could disagree about
+    // which engine is configured, and the way that disagreement shows up is the local assistant
+    // being reported disabled while the server the operator named answers perfectly — so both are
+    // handed the same `ResolvedLocalEngine` and cannot disagree.
+    //
+    // A refusal — an engine name this daemon does not serve, `openai_compatible` with no address, an address
+    // off this machine — DISABLES the route rather than falling back to Ollama. That fallback is
+    // the worst outcome available: the operator named a server, was told nothing, and their turns
+    // went somewhere else. `local_model: None` is how this crate already says "route off" —
+    // `assistants::serves(Brain::Local)` refuses `RouteNotConfigured`, which `http.rs` renders as
+    // `assistant::NO_LOCAL_MODEL` — so no new refusal variant is needed to say it here.
+    let resolved_local_engine = match models_config.local_engine() {
+        Ok(resolved) => Some(resolved),
+        Err(refusal) => {
+            // `error!` and not `warn!`, unlike the hosted half-setup lines below: those describe a
+            // setup somebody has not finished, while this one is a line somebody WROTE that this
+            // daemon will not honour, and the message names the key that repairs it.
+            tracing::error!(
+                reason = %refusal.message(),
+                "the configured local engine is refused; chats marked local will refuse \
+                 rather than answer"
+            );
+            None
+        }
+    };
+
     // The model that answers a chat turn asking to be answered on this machine — resolved here to
     // an `Option<String>` (was, before the assistant factory, a whole `LocalAssistant` built once)
     // and handed to `assistants::ConfiguredAssistants` below, which builds the assistant per turn.
     //
-    // Probed exactly like local triage and voice cleanup, against this feature's own window: a turn
-    // accumulates its tool schemas and every result on each round, so it needs more room than a
-    // single triage prompt and the probe has to say so or Ollama silently truncates the middle of a
-    // conversation.
+    // Probed against this feature's own window, in whichever dialect the engine resolved above
+    // names: a turn accumulates its tool schemas and every result on each round, so it needs more
+    // room than a single triage prompt and the probe has to say so, or a local server silently
+    // truncates the middle of a conversation. Local triage and voice cleanup above still probe
+    // Ollama directly — they are different roles on a different config key, and moving them is
+    // not this change.
     //
     // A failed probe falls back rather than disabling, which is the opposite of local triage and for
     // a reason worth stating: triage refuses because the alternative is mail bodies leaving the
     // machine, while this turn reads only the daemon's own state, so the fallback is what already
     // happens today. Warning and carrying on is right here and would be wrong there.
-    let local_model = match models_config.local_assistant_model.clone() {
-        Some(model) => {
+    let local_model = match (
+        models_config.local_assistant_model.clone(),
+        resolved_local_engine.as_ref(),
+    ) {
+        (Some(model), Some(resolved)) => {
             // The requirement's own field, not `local_agent::TURN_NUM_CTX` directly — see the
             // same note on the local-triage probe above; `CAPABILITY_REQUIREMENT` is defined
             // from `TURN_NUM_CTX`, so the two stay linked without a second number to keep in
             // step.
-            let declared = capabilities::discover_ollama_as(
+            let declared = capabilities::discover_local_as(
                 &reqwest::Client::new(),
-                runner::OLLAMA_BASE_URL,
+                resolved.engine,
+                &resolved.base_url,
                 &model,
                 local_agent::CAPABILITY_REQUIREMENT.context_tokens,
+                resolved.declared_context_tokens,
                 "local assistant",
             )
             .await;
@@ -1062,7 +1110,9 @@ async fn main() {
                 }
             }
         }
-        None => None,
+        // No model named, or an engine this daemon refused: either way there is nothing to probe
+        // and nothing to enable, and the refusal was already said out loud where it was read.
+        _ => None,
     };
 
     // The hosted model (and key) that answer a chat turn asking to be answered over OpenRouter —
@@ -1099,7 +1149,7 @@ async fn main() {
             tracing::warn!(
                 %model,
                 %error,
-                "could not read the OpenRouter key from Credential Manager; \
+                "could not read the OpenRouter key from the system credential store; \
                  chats marked openrouter will refuse rather than answer"
             );
             (Some(model), None)
@@ -1152,6 +1202,32 @@ async fn main() {
         None => None,
     };
 
+    // The factory reads the SAME resolution the probe above read — resolved once, beside the probe,
+    // and destructured here. Reading `local_engine()` a second time would be a second decision, and
+    // two decisions about which engine is configured are two decisions that can disagree; this pair
+    // cannot, because there is only one of it.
+    let (local_model, local_base_url, local_engine, local_context_tokens) =
+        match resolved_local_engine {
+            Some(resolved) => (
+                local_model,
+                resolved.base_url,
+                resolved.engine,
+                resolved.declared_context_tokens,
+            ),
+            // Inert values beside a `local_model` of `None`: with the route off, nothing ever
+            // reads the address or the engine. Today's constant and today's engine, so that if
+            // anything ever does read them it reads the daemon's own default rather than half of
+            // the configuration that was just refused. `local_model` is stated `None` here rather
+            // than left to the probe having skipped: the route being off is what the factory is
+            // handed, never something it has to infer from a branch it cannot see.
+            None => (
+                None,
+                runner::OLLAMA_BASE_URL.to_string(),
+                config::LocalEngine::Ollama,
+                None,
+            ),
+        };
+
     // Assembles the assistant that answers a turn from what was just resolved above — one factory
     // in place of the two singletons `local_assistant`/`hosted_assistant` used to be. No production
     // caller until this packet; `AppState.assistants` below is the first one.
@@ -1163,8 +1239,12 @@ async fn main() {
             "http://127.0.0.1:8791".to_string(),
             token_value.clone(),
             pool.clone(),
-            runner::OLLAMA_BASE_URL.to_string(),
+            // The RESOLVED address, not `runner::OLLAMA_BASE_URL` directly. Identical for an
+            // install that named no engine — `local_engine()` resolves absence to Ollama on that
+            // same constant — and the whole point for one that named another server.
+            local_base_url,
         )
+        .with_local_engine(local_engine, local_context_tokens)
         .with_agent_clis(Arc::new(claude_runner()), models_config.codex_model.clone()),
     );
 
@@ -1225,6 +1305,10 @@ async fn main() {
             ollama_base_url: runner::OLLAMA_BASE_URL.to_string(),
             http: reqwest::Client::new(),
         }),
+        quota: Arc::new(quota::QuotaRuntime::new(quota_client::QuotaClient::new(
+            sidecar::QUOTA_ADDR,
+            quota_sidecar_token.clone(),
+        ))),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_tails: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1247,13 +1331,31 @@ async fn main() {
     // two browser or web sidecars fight over the same fixed ports. A second daemon is for
     // exercising this process's own HTTP and MCP surface, and it does that without any of them.
     let sidecars_wanted = is_primary;
-    let sidecar_path = sidecar::binary("echo-sidecar.exe");
+    let sidecar_path = sidecar::binary(sidecar::ECHO);
     if sidecars_wanted {
         tokio::spawn(sidecar::supervise(
             sidecar::ECHO.to_string(),
             sidecar_path,
             vec![],
         ));
+    }
+
+    // The quota sidecar. Supervised beside `echo` and NOT behind a pillar switch, which is the one
+    // choice here worth defending, because every other process that reaches off this machine is
+    // opt-in.
+    //
+    // It reaches a vendor only when the owner already has that vendor's CLI signed in on this
+    // machine, and it reads the credential that CLI wrote. On a machine with no Claude Code it
+    // makes no outbound call at all — it answers `unmeasured` and stops. So the switch an opt-in
+    // would offer is one the owner has already thrown, in the other application, and a second one
+    // here would mean the notch ships dark with no settings page to light it until phase 4.
+    if sidecars_wanted {
+        tokio::spawn(sidecar::supervise(
+            sidecar::QUOTA.to_string(),
+            sidecar::binary(sidecar::QUOTA),
+            sidecar::quota_env(&daemon_client::daemon_url(), &quota_sidecar_token),
+        ));
+        tracing::info!(addr = sidecar::QUOTA_ADDR, "quota sidecar supervised");
     }
 
     // The browser sidecar. Started only when the pillar is on, like the web one beside it.
@@ -1271,7 +1373,7 @@ async fn main() {
             Err(error) => tracing::error!(%error, "could not retire open browsing sessions"),
         }
 
-        let path = sidecar::binary("browser-sidecar.exe");
+        let path = sidecar::binary(sidecar::BROWSER);
         let env = sidecar::browser_env(
             &daemon_client::daemon_url(),
             &browser_sidecar_token,
@@ -1302,7 +1404,7 @@ async fn main() {
                 String::new()
             }
         };
-        let path = sidecar::binary("web-sidecar.exe");
+        let path = sidecar::binary(sidecar::WEB);
         let env = sidecar::web_env(
             &daemon_client::daemon_url(),
             &web_sidecar_token,
@@ -1339,7 +1441,7 @@ async fn main() {
     }
     match secrets::load_secret(TELEGRAM_TOKEN_KEY) {
         Ok(Some(bot_token)) => {
-            let telegram_path = sidecar::binary("telegram-sidecar.exe");
+            let telegram_path = sidecar::binary(sidecar::TELEGRAM);
             let telegram_env =
                 sidecar::telegram_env(&daemon_client::daemon_url(), &state.token.0, &bot_token);
             if sidecars_wanted {
@@ -1357,7 +1459,7 @@ async fn main() {
             );
         }
         Err(e) => {
-            tracing::warn!("failed to read telegram-token from Credential Manager: {e}");
+            tracing::warn!("failed to read telegram-token from the system credential store: {e}");
         }
     }
     tokio::spawn(scheduler::run_scheduler(state.clone()));
@@ -1479,7 +1581,7 @@ async fn main() {
                     // everything is the arrangement being removed.
                     match state.email.sidecar_token.as_deref() {
                         Some(token) => {
-                            let path = sidecar::binary("email-sidecar.exe");
+                            let path = sidecar::binary(sidecar::EMAIL);
                             let env = sidecar::email_env(
                                 &daemon_client::daemon_url(),
                                 token,
@@ -1504,7 +1606,7 @@ async fn main() {
                     "no email-imap-password stored — the email sidecar will not start (set with --set-email-password)"
                 ),
                 Err(error) => {
-                    tracing::warn!(%error, "could not read the email password from Credential Manager")
+                    tracing::warn!(%error, "could not read the email password from the system credential store")
                 }
             }
         });

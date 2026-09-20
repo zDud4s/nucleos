@@ -33,17 +33,61 @@ pub struct ModelsConfig {
     /// change nothing at all until somebody asks for it by name.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub local_assistant_model: Option<String>,
-    /// Which model a hosted chat turn is sent to over OpenRouter — `openrouter.rs`'s
-    /// `OpenRouterChat`, the second `LocalChat` beside `local_assistant_model`'s Ollama one.
+    /// Which model a hosted chat turn is sent to over OpenRouter — `openai_compatible.rs`'s
+    /// `OpenAiCompatibleChat`, the second `LocalChat` implementation beside `runner::OllamaChat`. Not the
+    /// hosted route's alone: since `local_engine` below, the model `local_assistant_model` names
+    /// is answered by one or the other of the same two, so what distinguishes this key is the
+    /// endpoint and the key it needs, never which client it ends up holding.
     ///
     /// Ship-dark, on exactly the posture `local_assistant_model` already carries: absent, nothing
     /// about a conversation's behaviour changes, and a chat row that somehow already says
     /// `openrouter` is refused (`assistant::NO_HOSTED_MODEL`) rather than answered by the cloud CLI
     /// on the strength of this field never having been read. Naming a model here is what an
     /// operator does once they have also put a key in the OS credential store — this field alone
-    /// gets a conversation no further, since `OpenRouterChat::new` still refuses without one.
+    /// gets a conversation no further, since `OpenAiCompatibleChat::new` still refuses without one.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub hosted_assistant_model: Option<String>,
+    /// Which local server answers a local turn: `ollama`, or `openai_compatible` for any OpenAI-compatible
+    /// server running on this machine (llama.cpp, LM Studio, vLLM).
+    ///
+    /// Absent means `ollama`, which is the ship-dark posture `local_assistant_model` and
+    /// `primary_runner` already carry, arriving through the one key where absence is not merely
+    /// "unarmed" but "the engine this machine has always used": every `.ai/nucleos-models.yaml` on
+    /// disk was written before this key existed and names none of them, so absence has to resolve
+    /// to exactly today's behaviour or a file that worked this morning refuses this afternoon.
+    ///
+    /// A name this daemon does not serve is REFUSED rather than fallen back to Ollama, and that is
+    /// the one place this key parts from `primary_runner` above. There, falling back keeps the
+    /// proven path a typo was never trying to leave. Here, a mistyped `openai_compatible` would keep sending
+    /// turns to the very server the operator wrote this line to stop using — and the silence about
+    /// it, not the typo, is the failure.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub local_engine: Option<String>,
+    /// Where that server listens. Loopback only.
+    ///
+    /// Absent resolves to `runner::OLLAMA_BASE_URL` for the ollama engine — the address the runner
+    /// already uses, read from its constant so the two cannot drift — and is REFUSED for `openai_compatible`,
+    /// because no port may be guessed. An `openai_compatible` engine quietly resolved onto Ollama's own
+    /// `11434` would post a turn's contents — mail, a transcript, a repository — to whatever
+    /// program happens to be listening there, under a file that named no address at all.
+    ///
+    /// Whatever is written here is checked by `is_loopback_url` before it is used. `Brain::Local`'s
+    /// promise is that a local turn never leaves this machine, and one line in a config file must
+    /// not be able to turn that into "whatever address the file says": an off-machine URL earns
+    /// `LocalEngineRefusal::NotLoopback` and the route leaves the menu with it, rather than being
+    /// offered and then refusing every turn it is picked for.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub local_base_url: Option<String>,
+    /// The context window this local server serves, DECLARED here because for one of the two
+    /// engines nothing can discover it: Ollama answers `/api/show`, and an OpenAI-compatible
+    /// `/v1/models` states no window at all.
+    ///
+    /// Absent stays `None` and nothing invents a number. A guessed window is not a harmless default
+    /// — it is a figure the daemon would then act on when deciding what fits in a turn — which is
+    /// the argument `AssistantChoice::tools` makes for never marking `Some(false)` on a guess,
+    /// arriving here as a count instead of a flag.
+    #[serde(default)]
+    pub local_context_tokens: Option<usize>,
     /// The models a conversation may be moved to, in the order the window offers them.
     ///
     /// A list here rather than a list in the window, because the window cannot know it. The agent
@@ -300,14 +344,25 @@ impl ModelsConfig {
                 },
             );
         }
-        if let Some(local) = &self.local_assistant_model {
+        // Which server the local route resolves to, asked once for both questions below: whether
+        // these rows belong on the menu at all, and whether "is it installed?" is even a question
+        // this engine's server can be asked.
+        let local_route = self.local_engine();
+        if let (Some(local), Ok(resolved)) = (&self.local_assistant_model, local_route.as_ref()) {
+            // `installed` answers one question -- "has `ollama pull` fetched this?" -- and it is
+            // asked of `/api/tags`, which only Ollama serves. On any other engine the question
+            // stops applying exactly as it never applied to a cloud row, and `installed`'s own doc
+            // says `None` is what that means. `Some(false)` would hang a "not installed" warning on
+            // every local row whose one obvious repair -- `ollama pull` -- has nothing to do with
+            // the server actually serving them.
+            let pulling_is_a_question = resolved.engine == LocalEngine::Ollama;
             // The file's own `brain: local` rows are marked IN PLACE rather than regenerated, so a
             // row written with a readable label ("Llama 3.2 3B") keeps it instead of being replaced
             // by its bare id. Their whole point is naming models this machine may NOT have yet:
             // Ollama has no endpoint that enumerates what is pullable, so a model nobody has
             // installed can only reach the menu by somebody writing it down.
             for choice in choices.iter_mut().filter(|choice| choice.brain == "local") {
-                choice.installed = Some(installed.contains(&choice.id));
+                choice.installed = pulling_is_a_question.then(|| installed.contains(&choice.id));
             }
             let listed: Vec<String> = choices
                 .iter()
@@ -330,7 +385,7 @@ impl ModelsConfig {
                 // rather than against the configured name: the configured model is the one entry
                 // that appears whether or not it is pulled, so it is exactly the one that must be
                 // allowed to say `false`.
-                let pulled = installed.contains(&id);
+                let pulled = pulling_is_a_question.then(|| installed.contains(&id));
                 choices.push(AssistantChoice {
                     id: id.clone(),
                     label: id,
@@ -343,14 +398,23 @@ impl ModelsConfig {
                     // whether THIS local entry declares tools is `marked_with`'s job, over what
                     // discovery actually found — never guessed at build time.
                     tools: None,
-                    installed: Some(pulled),
+                    installed: pulled,
                 });
             }
         } else {
-            // The switch, exactly as the hosted block below states it: `local_assistant_model` is
-            // what turns this route on, and `assistants::resolve_model` refuses
-            // `RouteNotConfigured` whatever a pin says while it is absent. So a file that lists
-            // local models with no route configured lists nothing the picker may offer.
+            // Two causes, one consequence, and the same argument behind both: a menu must not
+            // offer a route that can only earn a refusal.
+            //
+            // No model configured is the switch, exactly as the hosted block below states it:
+            // `local_assistant_model` is what turns this route on, and `assistants::resolve_model`
+            // refuses `RouteNotConfigured` whatever a pin says while it is absent. So a file that
+            // lists local models with no route configured lists nothing the picker may offer.
+            //
+            // A REFUSED engine -- unknown name, `openai_compatible` with no address, an address off this
+            // machine -- is the second, and dropping the rows is half the fix rather than an
+            // extra: refusing only at `local_engine()` would leave the picker offering the models,
+            // so the person picks one, the turn dies, and nothing on screen connects that to the
+            // line in `.ai/nucleos-models.yaml` that caused it.
             choices.retain(|choice| choice.brain != "local");
         }
         match &self.hosted_assistant_model {
@@ -380,7 +444,7 @@ impl ModelsConfig {
                     // hand-written one "could name a model the daemon never built a client for, and
                     // then a person picks one model and a different one answers, silently". That was
                     // wrong about this code: `assistants::resolve_model` returns
-                    // `pinned.unwrap_or(configured)` and `assistant_for` builds the `OpenRouterChat`
+                    // `pinned.unwrap_or(configured)` and `assistant_for` builds the `OpenAiCompatibleChat`
                     // out of that resolved name, so the client is built PER TURN from the pick. The
                     // model on the wire is the one that was picked --
                     // `assistants.rs`'s `a_pinned_hosted_model_beats_the_configured_one_on_the_hosted_route`
@@ -395,7 +459,7 @@ impl ModelsConfig {
                     // for this route rather than guessing one that might not exist for the model named.
                     efforts: Vec::new(),
                     // Not filtered by `active_runner()` and never spawned as either CLI:
-                    // `OpenRouterChat` is reached over HTTP, so which agent CLI is installed has
+                    // `OpenAiCompatibleChat` is reached over HTTP, so which agent CLI is installed has
                     // nothing to do with whether this entry belongs on the menu.
                     runner: None,
                     // Unmarked here for the same reason the local entry above is: this function never
@@ -440,6 +504,146 @@ impl ModelsConfig {
         }
         levels
     }
+
+    /// PURE: which local server a local turn is sent to, or why the route may not run at all.
+    ///
+    /// Sync, and it touches no network: `catalogue()` is sync and pure and this is what it asks, so
+    /// "with no Ollama on this machine nothing changes" stays true by construction rather than by
+    /// somebody remembering not to probe. Nothing here asks a port what is listening on it — the
+    /// only questions are which engine the file names and whether the address it gives is this
+    /// machine's, and both are answerable from the file alone.
+    ///
+    /// Three refusals and no fallbacks, each argued at the field it reads: `UnknownEngine` at
+    /// `local_engine`, `NoBaseUrl` at `local_base_url`, `NotLoopback` at both. Absence is the one
+    /// thing that resolves rather than refuses, and it resolves to the engine and address this
+    /// daemon has always used.
+    pub fn local_engine(&self) -> Result<ResolvedLocalEngine, LocalEngineRefusal> {
+        let engine = match self.local_engine.as_deref() {
+            // Absent is today's engine, never a new default nobody chose.
+            None | Some("ollama") => LocalEngine::Ollama,
+            Some("openai_compatible") => LocalEngine::OpenAiCompatible,
+            Some(other) => return Err(LocalEngineRefusal::UnknownEngine(other.to_string())),
+        };
+        let base_url = match (&self.local_base_url, engine) {
+            (Some(written), _) => written.clone(),
+            // Read from the runner's own constant, so the default address and the address the
+            // runner posts to cannot drift apart without a test failing.
+            (None, LocalEngine::Ollama) => crate::runner::OLLAMA_BASE_URL.to_string(),
+            (None, LocalEngine::OpenAiCompatible) => return Err(LocalEngineRefusal::NoBaseUrl),
+        };
+        if !is_loopback_url(&base_url) {
+            // Carried verbatim rather than described: a refusal that paraphrases the address it
+            // refused cannot tell its reader which line to go and edit.
+            return Err(LocalEngineRefusal::NotLoopback(base_url));
+        }
+        Ok(ResolvedLocalEngine {
+            engine,
+            base_url,
+            declared_context_tokens: self.local_context_tokens,
+        })
+    }
+}
+
+/// Which server answers the local route. Two values and not a boolean, for the reason
+/// `trust::Requester` gives: `is_ollama: bool` reads fine here and terribly at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalEngine {
+    /// The engine this daemon has always used, and what an untouched config file still gets.
+    Ollama,
+    /// Any OpenAI-compatible server on this machine — llama.cpp, LM Studio, vLLM. Named for the
+    /// wire protocol and not for the vendor: nothing about this route leaves the loopback.
+    OpenAiCompatible,
+}
+
+/// A local route that may actually run: which server, at which address, with whatever window the
+/// file declared for it.
+///
+/// The resolved address travels WITH the engine rather than being re-derived by each caller,
+/// because deriving it twice is how a turn ends up posted somewhere the menu never approved.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLocalEngine {
+    pub engine: LocalEngine,
+    /// Checked loopback before this value existed — a `ResolvedLocalEngine` is never off-machine.
+    pub base_url: String,
+    /// `None` means nobody declared one, never "zero" and never a guess. Only
+    /// `local_context_tokens` can put a number here.
+    pub declared_context_tokens: Option<usize>,
+}
+
+/// Why a local route may not run. Every arm names the config key that repairs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalEngineRefusal {
+    /// `local_engine` names something neither engine answers to, carried verbatim.
+    UnknownEngine(String),
+    /// `local_engine: openai_compatible` with no address — the one case where a default would be a guessed
+    /// port rather than a remembered one.
+    NoBaseUrl,
+    /// The resolved address is somewhere other than this machine, carried verbatim so the message
+    /// and the menu can both name it.
+    NotLoopback(String),
+}
+
+impl LocalEngineRefusal {
+    /// What an operator is told, in the voice of this crate's other refusals: the fault, then the
+    /// key in `.ai/nucleos-models.yaml` that fixes it.
+    ///
+    /// Naming the key is the whole point. A refusal that only describes the fault sends its reader
+    /// looking for which line produced it, and "local model refused" reads like a defect in the
+    /// daemon rather than a line somebody wrote.
+    ///
+    /// `String` and not `&'static str` like `LandRefusal::message`, because two of the three carry
+    /// the offending value and a refusal that cannot quote it is one nobody can act on.
+    pub fn message(&self) -> String {
+        match self {
+            Self::UnknownEngine(named) => format!(
+                "`local_engine: {named}` names no local engine this daemon serves; write `ollama` \
+                 or `openai_compatible` in {MODELS_CONFIG_PATH}, or remove the key to keep Ollama"
+            ),
+            Self::NoBaseUrl => format!(
+                "`local_engine: openai_compatible` needs a `local_base_url` in {MODELS_CONFIG_PATH}: no port \
+                 is guessed here, because the only port worth guessing is Ollama's and a turn sent \
+                 to it would reach whatever is listening there"
+            ),
+            Self::NotLoopback(refused) => format!(
+                "`local_base_url: {refused}` is not on this machine, and the local route only ever \
+                 talks to the loopback; fix `local_base_url` in {MODELS_CONFIG_PATH}, or choose a \
+                 hosted route deliberately"
+            ),
+        }
+    }
+}
+
+/// PURE: whether an address is served by this machine, decided on the PARSED host and never on the
+/// string.
+///
+/// `url::Url` and not a prefix test: `http://127.0.0.1.example.com/v1` BEGINS with the loopback
+/// address and belongs to whoever registered that domain, and every hand-rolled extractor gets
+/// that wrong at least once. Closing that hole is this function's entire job. The crate costs
+/// this module nothing to reach for: `core/Cargo.toml` already declared `url` for `trust.rs`,
+/// which refuses to parse a URL by hand for exactly the same reason, and that line predates this
+/// function.
+///
+/// `127.0.0.0/8` whole and not `127.0.0.1` alone — a server bound to `127.0.0.2` is just as much on
+/// this machine — plus the IPv6 loopback and the name `localhost`, which resolves to one of them.
+/// Any other hostname is refused even though a resolver might point it at 127.0.0.1 today: this
+/// question is answered once, at the config, and a name's answer can change between here and the
+/// connection.
+///
+/// Scheme-checked too. `file://` and `ws://` parse happily and are not what `LocalChat` posts to.
+pub fn is_loopback_url(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
 /// PURE: the menu, with each local choice marked by what its model was found to declare.
@@ -475,6 +679,9 @@ impl Default for ModelsConfig {
             review_model: None,
             local_assistant_model: None,
             hosted_assistant_model: None,
+            local_engine: None,
+            local_base_url: None,
+            local_context_tokens: None,
             assistant_choices: default_assistant_choices(),
         }
     }
@@ -654,6 +861,36 @@ Do NOT rephrase or restructure sentences that are already clear, and keep number
 versions, units and paths exactly as they were said — digits stay digits.
 Keep the original language. Return only the corrected text.";
 
+/// The chords the pillar ships with when `.ai/voice.yaml` names none, per platform.
+///
+/// macOS is the reason this is a constant rather than three literals in `Default`: the
+/// `Ctrl+Alt` family is not free there. Cmd+Space is Spotlight, Ctrl+Space switches the input
+/// source, Cmd+Option+Space opens Finder search, Ctrl+Cmd+Space is the Character Viewer, and
+/// Ctrl+Option is the modifier pair VoiceOver reserves for itself; a global Cmd+Shift+letter
+/// would steal an application shortcut in every application at once. Three modifiers held
+/// together reach no default macOS binding, which is why that arm adds Command — a chord the
+/// desktop already owns does not fail loudly, it simply never reaches this app, and on screen
+/// that is indistinguishable from dictation being broken.
+///
+/// The spelling is `Super` and not `Cmd` because `global-hotkey`'s parser (`hotkey.rs:205`)
+/// accepts "COMMAND" | "CMD" | "SUPER" as one and the same modifier, so this name parses and
+/// reads the same on every host.
+///
+/// **UNVERIFIED on a real Mac.** The collision list above is read from Apple's documented
+/// shortcuts, not pressed: CI compiles this arm, and only a person on a Mac can confirm that
+/// the three chords it ships are free.
+#[cfg(target_os = "macos")]
+const DEFAULT_HOTKEYS: [&str; 3] = [
+    "Ctrl+Alt+Super+Space",
+    "Ctrl+Alt+Super+M",
+    "Ctrl+Alt+Super+C",
+];
+
+/// Windows and Linux leave the `Ctrl+Alt` family alone, so the shorter chords stay — see the
+/// macOS arm above for why that platform needs a third modifier.
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_HOTKEYS: [&str; 3] = ["Ctrl+Alt+Space", "Ctrl+Alt+M", "Ctrl+Alt+C"];
+
 /// `.ai/voice.yaml`. Every field defaults, so a partial file is valid and an absent one leaves the
 /// pillar off without comment.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -713,9 +950,9 @@ impl Default for VoiceConfig {
             stt_command: String::new(),
             tts_command: String::new(),
             tts_url: String::new(),
-            hotkey: "Ctrl+Alt+Space".to_string(),
-            memo_hotkey: "Ctrl+Alt+M".to_string(),
-            conversation_hotkey: "Ctrl+Alt+C".to_string(),
+            hotkey: DEFAULT_HOTKEYS[0].to_string(),
+            memo_hotkey: DEFAULT_HOTKEYS[1].to_string(),
+            conversation_hotkey: DEFAULT_HOTKEYS[2].to_string(),
             retain_dictations_days: 7,
             hints: Vec::new(),
             closing_words: vec!["câmbio".into()],
@@ -2381,7 +2618,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     /// else lets an operator hand-write an `assistant_choices` entry with `brain: "openrouter"`
     /// whose `id` names a different model than `hosted_assistant_model`: `chosen_brain` resolves
     /// the picked id through this same catalogue and gets `Brain::OpenRouter`, so the turn is
-    /// answered by the `OpenRouterChat` `main.rs` built from `hosted_assistant_model` -- a
+    /// answered by the `OpenAiCompatibleChat` `main.rs` built from `hosted_assistant_model` -- a
     /// different model than the one the person picked, silently.
     #[test]
     fn the_catalogue_names_the_hosted_model_when_one_is_configured() {
@@ -2401,14 +2638,14 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
             1,
             "expected exactly one hosted entry: {catalogue:?}"
         );
-        // Same string as the model `main.rs` actually built the `OpenRouterChat` with -- the two
+        // Same string as the model `main.rs` actually built the `OpenAiCompatibleChat` with -- the two
         // cannot come apart because there is only one place either of them is written.
         assert_eq!(hosted[0].id, "anthropic/claude-sonnet-4.5");
     }
 
     /// The `retain` a few lines up in `catalogue()` filters `cloud` entries by `active_runner()`
     /// because `sonnet` offered to a daemon running Codex is a turn that dies at spawn. A hosted
-    /// model has nothing to do with which agent CLI is installed -- `OpenRouterChat` is reached
+    /// model has nothing to do with which agent CLI is installed -- `OpenAiCompatibleChat` is reached
     /// over HTTP, not spawned as either CLI -- so the hosted entry must survive that filter
     /// regardless of `primary_runner`. Pinned because someone reading the retain in isolation could
     /// reasonably "tidy" it into filtering every entry, hosted included.
@@ -2446,7 +2683,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     /// 1. A `brain: openrouter` row written into `assistant_choices` reaches the menu. The comment
     ///    that used to forbid this feared an entry naming "a model the daemon never built a client
     ///    for" -- but `assistants::resolve_model` returns `pinned.unwrap_or(configured)` and
-    ///    `assistant_for` builds the `OpenRouterChat` from that resolved name, so the client is
+    ///    `assistant_for` builds the `OpenAiCompatibleChat` from that resolved name, so the client is
     ///    built PER TURN out of the pick. The fear does not describe this code;
     ///    `assistants.rs`'s `a_pinned_hosted_model_beats_the_configured_one_on_the_hosted_route`
     ///    is the proof at the seam where it would have happened.
@@ -3448,6 +3685,47 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         assert_eq!(clamped.retain_dictations_days, 30);
     }
 
+    /// The shipped chords have to be chords THIS platform's own desktop leaves free.
+    ///
+    /// macOS is the one that breaks: `Ctrl+Alt+Space` is taken by the system's input-source
+    /// switcher there, so registering it wins nothing and costs the person a key they already
+    /// use. Adding the Command key clears the whole family at once. `Super` is the spelling and
+    /// not `Cmd` only because `global-hotkey`'s parser treats "COMMAND" | "CMD" | "SUPER" as one
+    /// modifier, so the name is free and this one reads the same on every host.
+    ///
+    /// The second half is what keeps the constant honest: a default written twice is two places
+    /// to change, and the platform that gets forgotten is the one nobody develops on.
+    #[test]
+    fn the_default_hotkeys_avoid_this_platforms_system_chords() {
+        #[cfg(target_os = "macos")]
+        let expected = [
+            "Ctrl+Alt+Super+Space",
+            "Ctrl+Alt+Super+M",
+            "Ctrl+Alt+Super+C",
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let expected = ["Ctrl+Alt+Space", "Ctrl+Alt+M", "Ctrl+Alt+C"];
+
+        assert_eq!(
+            DEFAULT_HOTKEYS, expected,
+            "the defaults this platform ships have to be the chords its desktop leaves free"
+        );
+
+        let defaults = VoiceConfig::default();
+        assert_eq!(
+            defaults.hotkey, DEFAULT_HOTKEYS[0],
+            "the dictation default must come from DEFAULT_HOTKEYS, not from a second literal"
+        );
+        assert_eq!(
+            defaults.memo_hotkey, DEFAULT_HOTKEYS[1],
+            "the memo default must come from DEFAULT_HOTKEYS, not from a second literal"
+        );
+        assert_eq!(
+            defaults.conversation_hotkey, DEFAULT_HOTKEYS[2],
+            "the conversation default must come from DEFAULT_HOTKEYS, not from a second literal"
+        );
+    }
+
     /// The second runner ships dark, so what this key parses to is what decides whether a run is
     /// answered by the proven CLI or by one nobody asked for.
     ///
@@ -3764,6 +4042,215 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
             marked[0].tools, None,
             "a model absent from the declared map must be marked neither servable nor broken: \
              {marked:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `local_engine()` -- WHICH local server a turn is sent to, and whether it is on this machine
+    // ---------------------------------------------------------------------------------------
+
+    /// A local route with no address is a route with nowhere to go, and the obvious repair is the
+    /// one thing that must never happen: falling back to Ollama's port because it is the only
+    /// local port this daemon has ever known. `local_engine: openai_compatible` on `11434` would post a turn
+    /// -- mail, a transcript, a repository's contents -- to whatever program happens to be
+    /// listening there, under a config file that named no address at all. Somebody who wrote the
+    /// engine and forgot the URL has to be told so at the config, not left to infer it from a
+    /// reply that came back from the wrong server.
+    #[test]
+    fn a_local_openai_compatible_engine_with_no_base_url_is_refused_rather_than_guessing_a_port() {
+        let config = ModelsConfig {
+            local_assistant_model: Some("qwen3.5:4b".to_string()),
+            local_engine: Some("openai_compatible".to_string()),
+            local_base_url: None,
+            ..ModelsConfig::default()
+        };
+
+        match config.local_engine() {
+            Err(LocalEngineRefusal::NoBaseUrl) => {}
+            other => panic!(
+                "an openai_compatible engine with no address must be refused, never resolved onto Ollama's \
+                 own port: {other:?}"
+            ),
+        }
+
+        let refusal = LocalEngineRefusal::NoBaseUrl;
+        assert!(
+            refusal.message().contains("local_base_url"),
+            "a refusal that does not name the key that fixes it sends its reader looking: {}",
+            refusal.message()
+        );
+    }
+
+    /// `Brain::Local`'s promise is that a local turn never leaves this machine. Written in a doc
+    /// comment that is a claim; asserted here it is a check. Without it, `local_base_url` makes
+    /// "local" mean "whatever address the file says", and one line in `.ai/nucleos-models.yaml`
+    /// is enough to post mail and repository contents to a third party under the name of the
+    /// route chosen precisely to avoid that.
+    ///
+    /// Both halves are asserted together, because either one alone is a half-fix. Refusing only
+    /// at `local_engine()` leaves the picker still offering the local rows: the person picks a
+    /// model, the turn dies, and nothing on screen connects the refusal to the address. A menu
+    /// must not offer a route that cannot legally run.
+    #[test]
+    fn a_local_engine_pointed_off_this_machine_is_refused_and_its_route_leaves_the_menu() {
+        let off_machine = "https://api.example.com/v1";
+        let config = ModelsConfig {
+            local_assistant_model: Some("qwen3.5:4b".to_string()),
+            local_engine: Some("openai_compatible".to_string()),
+            local_base_url: Some(off_machine.to_string()),
+            ..ModelsConfig::default()
+        };
+
+        match config.local_engine() {
+            Err(LocalEngineRefusal::NotLoopback(named)) => assert_eq!(
+                named, off_machine,
+                "the refusal must carry the address it refused, or its message cannot name it"
+            ),
+            other => panic!(
+                "an address off this machine must be refused, whatever `local` is written beside \
+                 it: {other:?}"
+            ),
+        }
+
+        let installed = vec!["qwen3.5:4b".to_string(), "llama3.2:3b".to_string()];
+        assert!(
+            config
+                .catalogue_with_installed(&installed)
+                .iter()
+                .all(|choice| choice.brain != "local"),
+            "a route that will refuse every turn must not be on the menu: {:?}",
+            config.catalogue_with_installed(&installed)
+        );
+        assert!(
+            config
+                .catalogue_scoped(&installed, true)
+                .iter()
+                .all(|choice| choice.brain != "local"),
+            "the every-runner scope feeds the same picker and must drop them too: {:?}",
+            config.catalogue_scoped(&installed, true)
+        );
+
+        // The single rule both halves rest on, asserted where it is written rather than only
+        // through its two callers -- a loopback test that is wrong is wrong in both of them.
+        assert!(is_loopback_url("http://127.0.0.1:11434"));
+        assert!(is_loopback_url("http://localhost:1234/v1"));
+        assert!(
+            is_loopback_url("http://[::1]:1234/v1"),
+            "a server bound to the IPv6 loopback is on this machine; refusing it would send \
+             somebody editing the code instead of the config"
+        );
+        assert!(!is_loopback_url(off_machine));
+        assert!(
+            !is_loopback_url("http://127.0.0.1.example.com/v1"),
+            "a host that merely BEGINS with the loopback address belongs to whoever registered \
+             it -- a prefix match here is the whole hole this check exists to close"
+        );
+    }
+
+    /// Every `.ai/nucleos-models.yaml` on this machine was written before these three keys
+    /// existed and names none of them. If absence resolved to anything but Ollama on
+    /// `runner::OLLAMA_BASE_URL`, a file that worked this morning would answer a refusal this
+    /// afternoon, for a feature its owner never asked for -- the same "an existing file keeps
+    /// working" argument every `#[serde(default)]` on these fields is making.
+    ///
+    /// Asserted against the constant rather than a second copy of the literal, so the default and
+    /// the runner's own address cannot drift apart without this failing.
+    #[test]
+    fn no_local_engine_configured_still_resolves_to_ollama_on_the_loopback_constant() {
+        let config = ModelsConfig {
+            local_assistant_model: Some("qwen3.5:4b".to_string()),
+            ..ModelsConfig::default()
+        };
+        assert_eq!(
+            (
+                &config.local_engine,
+                &config.local_base_url,
+                &config.local_context_tokens
+            ),
+            (&None, &None, &None),
+            "the fixture is the pre-existing file: all three keys absent"
+        );
+
+        let resolved = config
+            .local_engine()
+            .expect("a file naming none of the new keys must keep resolving, not start refusing");
+
+        assert_eq!(
+            resolved.engine,
+            LocalEngine::Ollama,
+            "absent means today's engine, never a new default nobody chose"
+        );
+        assert_eq!(
+            resolved.base_url,
+            crate::runner::OLLAMA_BASE_URL,
+            "absent means the address the runner already uses, read from the constant itself"
+        );
+        assert_eq!(
+            resolved.declared_context_tokens, None,
+            "nobody declared a window, and a guessed one is a number the daemon would then act on"
+        );
+    }
+
+    /// `installed` answers exactly one question -- "has `ollama pull` fetched this?" -- and it is
+    /// asked of `/api/tags`, which only Ollama serves. Point the local route at an
+    /// OpenAI-compatible server and the question stops applying, precisely as it never applied to
+    /// a cloud row, and `AssistantChoice::installed`'s own doc says `None` is what that means.
+    ///
+    /// `Some(false)` would be worse than a wrong answer: it would hang a "not installed" warning
+    /// on every local row on the menu, and the one repair anybody would reach for -- `ollama
+    /// pull` -- has nothing to do with the server actually serving them. That is the failure the
+    /// `tools` field's doc argues against, arriving through the other field.
+    #[test]
+    fn a_local_row_is_unmarked_rather_than_uninstalled_when_the_engine_is_not_ollama() {
+        let written_by_hand = || AssistantChoice {
+            id: "llama3.2:3b".to_string(),
+            label: "Llama 3.2 3B".to_string(),
+            brain: "local".to_string(),
+            efforts: Vec::new(),
+            runner: None,
+            tools: None,
+            installed: None,
+        };
+        let config = ModelsConfig {
+            local_assistant_model: Some("qwen3.5:4b".to_string()),
+            local_engine: Some("openai_compatible".to_string()),
+            local_base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+            assistant_choices: vec![written_by_hand()],
+            ..ModelsConfig::default()
+        };
+
+        let catalogue = config.catalogue_with_installed(&["qwen3.5:4b".to_string()]);
+        let local: Vec<&AssistantChoice> = catalogue
+            .iter()
+            .filter(|choice| choice.brain == "local")
+            .collect();
+        assert!(
+            !local.is_empty(),
+            "the route is configured and the address is on this machine, so its rows belong on \
+             the menu: {catalogue:?}"
+        );
+        for choice in &local {
+            assert_eq!(
+                choice.installed, None,
+                "`installed` is an `/api/tags` question and this engine does not serve it, so the \
+                 row is unmarked, not marked absent: {choice:?}"
+            );
+        }
+
+        // The other side of the same rule: on Ollama the question DOES apply, so this must not
+        // have been bought by blanking the field for every local row everywhere.
+        let on_ollama = ModelsConfig {
+            local_engine: None,
+            local_base_url: None,
+            ..config.clone()
+        };
+        assert!(
+            on_ollama
+                .catalogue_with_installed(&["qwen3.5:4b".to_string()])
+                .iter()
+                .filter(|choice| choice.brain == "local")
+                .any(|choice| choice.installed.is_some()),
+            "on Ollama `/api/tags` answers the question and the menu must still say so"
         );
     }
 }

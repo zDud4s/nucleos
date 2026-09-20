@@ -64,6 +64,15 @@ node_modules/
 *.db
 *.db-journal
 sidecars/**/*.exe
+# The same binaries off Windows, where Go writes no extension (`go env GOEXE` is empty):
+# `scripts/build-sidecars.sh` names them `<name>-sidecar`, and a bare `go build` inside a sidecar
+# names its output after the last element of that module's path (each `sidecars/*/go.mod`).
+sidecars/*/*-sidecar
+/sidecars/browser/nucleosbrowser
+/sidecars/echo/echo
+/sidecars/email/nucleosemail
+/sidecars/telegram/nucleostelegram
+/sidecars/web/nucleosweb
 
 # TypeScript incremental-build artifacts (emitted by `tsc -b`)
 *.tsbuildinfo

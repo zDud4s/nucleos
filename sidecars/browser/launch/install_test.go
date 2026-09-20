@@ -187,3 +187,57 @@ func TestPresentIsFalseForAnEmptyExecutable(t *testing.T) {
 		t.Fatal("a zero-byte chrome.exe counted as installed")
 	}
 }
+
+// TestEveryDesktopTargetCarriesAPinnedDigest. An empty Sha256 makes Download refuse (ErrNoDigest), so a
+// desktop target without one has no browser at all.
+func TestEveryDesktopTargetCarriesAPinnedDigest(t *testing.T) {
+	for _, target := range [][2]string{{"windows", "amd64"}, {"linux", "amd64"}, {"darwin", "arm64"}} {
+		pin := pinFor(target[0], target[1])
+		digest, err := hex.DecodeString(pin.Sha256)
+		if err != nil || len(digest) != sha256.Size || strings.ToLower(pin.Sha256) != pin.Sha256 {
+			t.Errorf("%s/%s: Sha256 %q is not a lowercase sha256 hex digest", target[0], target[1], pin.Sha256)
+		}
+		if !strings.HasPrefix(pin.URL, snapshotBase+"/") || !strings.HasSuffix(pin.URL, ".zip") {
+			t.Errorf("%s/%s: URL %q is not a snapshot archive", target[0], target[1], pin.URL)
+		}
+	}
+	if got := pinFor("windows", "amd64").Sha256; got != "ef6c1ad450235f616e22d20ced338293a7f08abb9dda59ce9d534c7f4136f2f7" {
+		t.Errorf("the windows/amd64 digest changed: %s", got)
+	}
+	if other := pinFor("darwin", "amd64"); other.Sha256 != "" || other.URL != "" {
+		t.Errorf("darwin/amd64 has no measured pin, got %+v", other)
+	}
+}
+
+func TestAnArchivesPermissionBitsAreKeptButNeverWidened(t *testing.T) {
+	for _, c := range []struct{ set, want os.FileMode }{
+		{0o644, 0o644},
+		{0o755, 0o755},
+		{0o777, 0o755},
+		{0o400, 0o600},
+		{0o500, 0o700},
+	} {
+		header := &zip.FileHeader{Name: "chrome-linux/file"}
+		header.SetMode(c.set)
+		if got := fileMode(header); got != c.want {
+			t.Errorf("archive bits %o: extracted as %o, want %o", c.set, got, c.want)
+		}
+	}
+	// No Unix bits recorded (a FAT "version made by"): the 0o755 every entry got before.
+	if got := fileMode(&zip.FileHeader{Name: "chrome-win/chrome.exe"}); got != 0o755 {
+		t.Errorf("an entry with no Unix bits: %o, want 755", got)
+	}
+}
+
+func TestASymlinkMayOnlyPointDownIntoTheInstall(t *testing.T) {
+	for _, fine := range []string{"A", "Versions/Current/Chromium Framework", "./Resources"} {
+		if err := linkRefusal(fine); err != nil {
+			t.Errorf("refused %q: %v", fine, err)
+		}
+	}
+	for _, evil := range []string{"", "/etc", "../outside", "Versions/../../outside", "a/..", strings.Repeat("a", 4097)} {
+		if linkRefusal(evil) == nil {
+			t.Errorf("accepted a symlink target of %d bytes starting %.20q", len(evil), evil)
+		}
+	}
+}

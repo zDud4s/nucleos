@@ -256,6 +256,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         email,
         web,
         browser,
+        quota,
         voice,
         speaker,
         github,
@@ -288,10 +289,20 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             "browser_sidecar",
             sidecar_probe("browser_sidecar", crate::sidecar::BROWSER, browser_enabled),
         ),
+        // Always `true`, unlike its three neighbours, because this sidecar has no pillar switch:
+        // it is supervised beside `echo`. A provider with no credential on this machine is a
+        // reading that says `unmeasured`, not a subsystem that is off.
+        run_subsystem(
+            "quota_sidecar",
+            sidecar_probe("quota_sidecar", crate::sidecar::QUOTA, true),
+        ),
         run_subsystem("voice_transcriber", voice_probe(voice_armed, stt_command)),
         run_subsystem("voice_speaker", speaker_probe(voice_speaks, tts_command)),
         run_subsystem("github", github_probe(github_asked_for, github_binary)),
-        run_subsystem("hook_interpreter", hook_interpreter_probe()),
+        run_subsystem(
+            "hook_interpreter",
+            hook_interpreter_probe(state.pool.clone()),
+        ),
     );
     let subsystems = vec![
         pool,
@@ -303,6 +314,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         email,
         web,
         browser,
+        quota,
         voice,
         speaker,
         github,
@@ -376,10 +388,15 @@ async fn cli_probe() -> SubsystemReadout {
     .await
 }
 
-fn hook_interpreter_row(resolved: Option<PathBuf>) -> SubsystemReadout {
-    match resolved {
-        Some(_) => SubsystemReadout::ok("hook_interpreter"),
-        None => SubsystemReadout::down("hook_interpreter", FailureCategory::Missing),
+/// PURE: the row, from whether the interpreter resolved and whether any rostered project wires
+/// the hook. A resolvable interpreter is `ok` either way.
+fn hook_interpreter_row(resolved: Option<PathBuf>, wired_anywhere: bool) -> SubsystemReadout {
+    match (resolved, wired_anywhere) {
+        (Some(_), _) => SubsystemReadout::ok("hook_interpreter"),
+        (None, true) => SubsystemReadout::down("hook_interpreter", FailureCategory::Missing),
+        (None, false) => {
+            SubsystemReadout::disabled("hook_interpreter", FailureCategory::NotConfigured)
+        }
     }
 }
 
@@ -387,15 +404,53 @@ fn hook_interpreter_row(resolved: Option<PathBuf>) -> SubsystemReadout {
 ///
 /// Claude Code runs the command, gets 127, and treats every exit but 2 as non-blocking, so the tool
 /// call goes ahead unclassified.
-async fn hook_interpreter_probe() -> SubsystemReadout {
-    match tokio::task::spawn_blocking(|| {
+///
+/// **`disabled`, not `down`, when no project in the roster wires the hook** (owner decision,
+/// 2026-09-14). Then no session runs the hook, so a missing interpreter harms nothing, and a `down`
+/// here would turn the whole readout `down` and, with `health_breach_intent` on, write a breach
+/// record for a hole nobody has. With the hook wired in at least one project the row is unchanged:
+/// `ok` when the interpreter resolves, `down`/`missing` when it does not.
+///
+/// The roster is read only when the interpreter does not resolve, so the common case costs what it
+/// always did. Both lookups run on the blocking pool, as `get_projects` does for the same roots.
+async fn hook_interpreter_probe(pool: SqlitePool) -> SubsystemReadout {
+    let resolved = match tokio::task::spawn_blocking(|| {
         resolve_program(std::ffi::OsStr::new(crate::autopilot::HOOK_INTERPRETER))
     })
     .await
     {
-        Ok(resolved) => hook_interpreter_row(resolved),
-        Err(_) => SubsystemReadout::down("hook_interpreter", FailureCategory::Unknown),
-    }
+        Ok(resolved) => resolved,
+        Err(_) => return SubsystemReadout::down("hook_interpreter", FailureCategory::Unknown),
+    };
+    let wired_anywhere = resolved.is_none() && hook_wired_in_any_project(&pool).await;
+    hook_interpreter_row(resolved, wired_anywhere)
+}
+
+/// Whether any `autopilot_state` row with a root has THIS daemon's classifier hook wired, asked of
+/// `autopilot::classifier_hook_is_wired` (the function activation and `runs.rs` ask) rather than
+/// restated. Not filtered by mode. Today only shadow/active rows keep a root, because
+/// `set_project_mode` clears it on `off`, so an `off` project that still carries the hook is not
+/// seen here.
+///
+/// An unreadable roster, or a check that panicked, answers `true`. That keeps the row as it was
+/// before it knew about projects, while `false` would turn a real hole into `disabled` exactly
+/// when nobody can check. The database fault itself is `sqlite_pool`'s row to report.
+async fn hook_wired_in_any_project(pool: &SqlitePool) -> bool {
+    let Ok(roots) = sqlx::query_scalar::<_, String>(
+        "SELECT project_root FROM autopilot_state WHERE project_root IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    else {
+        return true;
+    };
+    tokio::task::spawn_blocking(move || {
+        roots
+            .iter()
+            .any(|root| crate::autopilot::classifier_hook_is_wired(Path::new(root)))
+    })
+    .await
+    .unwrap_or(true)
 }
 
 /// Whether the configured transcriber is a program that runs here.
@@ -796,9 +851,10 @@ fn worktree_available_space() -> io::Result<u64> {
 /// The probe above keeps the old behaviour because a health readout is about the machine, not about
 /// one project.
 ///
-/// Blocking, and deliberately not wrapped in `spawn_blocking` here: `GetDiskFreeSpaceExW` is a
-/// metadata read against an already-mounted volume, and every caller is either already on a
-/// blocking thread or paying microseconds.
+/// Blocking, and deliberately not wrapped in `spawn_blocking` here: the underlying call —
+/// `GetDiskFreeSpaceExW` on Windows, `statvfs` on Unix — is a metadata read against an
+/// already-mounted volume, and every caller is either already on a blocking thread or paying
+/// microseconds.
 pub fn free_space_for_worktrees(project_root: &Path) -> io::Result<u64> {
     let root = worktree::worktree_root(project_root);
     let existing_root = root
@@ -845,7 +901,30 @@ fn disk_free_space(path: &Path) -> io::Result<u64> {
     }
 }
 
-#[cfg(not(windows))]
+/// `f_bavail` and not `f_bfree`: `f_bfree` counts every block free on the filesystem, including
+/// the reserve only root may spend, while `f_bavail` is what an unprivileged process can actually
+/// take — which is the honest answer to "is there room" for a daemon that runs as nobody special.
+///
+/// The `#[allow]` is on the function because the cast is unnecessary on exactly the platforms
+/// where `f_bavail`/`f_frsize` are already `u64` (Linux) and load-bearing where they are `u32`
+/// (macOS); one `cfg`-free spelling has to be wrong for one of them, and widening is the safe way
+/// to be wrong.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn disk_free_space(path: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is NUL-terminated and alive for the call; `stat` is a writable `statvfs`.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(any(windows, unix)))]
 fn disk_free_space(_path: &Path) -> io::Result<u64> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -886,15 +965,120 @@ mod tests {
         }
     }
 
+    /// Every migration applied, like `autopilot.rs`'s `test_pool`. One connection, because each
+    /// `sqlite::memory:` connection is a database of its own.
+    async fn migrated_pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
     #[test]
     fn an_interpreter_that_does_not_resolve_is_a_red_row() {
-        let missing = hook_interpreter_row(None);
+        let missing = hook_interpreter_row(None, true);
         assert_eq!(missing.status, HealthState::Down);
         assert_eq!(missing.reason, Some(FailureCategory::Missing));
 
-        let resolved = hook_interpreter_row(Some(PathBuf::from("x")));
+        let resolved = hook_interpreter_row(Some(PathBuf::from("x")), true);
         assert_eq!(resolved.status, HealthState::Ok);
         assert_eq!(resolved.reason, None);
+    }
+
+    /// Owner decision, 2026-09-14: nobody wires the hook, so a missing interpreter harms nothing.
+    #[test]
+    fn a_missing_interpreter_is_disabled_when_no_project_wires_the_hook() {
+        let missing = hook_interpreter_row(None, false);
+        assert_eq!(missing.status, HealthState::Disabled);
+        assert_eq!(missing.reason, Some(FailureCategory::NotConfigured));
+
+        let resolved = hook_interpreter_row(Some(PathBuf::from("x")), false);
+        assert_eq!(resolved.status, HealthState::Ok);
+        assert_eq!(resolved.reason, None);
+    }
+
+    /// Why not `down`: a `down` row takes the whole readout down, and with `health_breach_intent`
+    /// on that writes a breach record for a hole nobody has.
+    #[test]
+    fn an_unwired_missing_interpreter_leaves_the_aggregate_up_and_writes_no_breach() {
+        let subsystems = vec![
+            SubsystemReadout::ok("sqlite_pool"),
+            hook_interpreter_row(None, false),
+        ];
+        let readout = HealthReadout {
+            status: aggregate_state(&subsystems),
+            subsystems,
+        };
+        assert_eq!(readout.status, HealthState::Ok);
+        assert!(!readout.is_breach());
+
+        let root = tempfile::tempdir().unwrap();
+        let rules = crate::config::AutopilotRules {
+            health_breach_intent: true,
+            ..Default::default()
+        };
+        assert!(!record_breach_intent(root.path(), &rules, &readout).unwrap());
+        assert!(!root.path().join(".ai/local/ledgers/intents.jsonl").exists());
+
+        // The control: wired somewhere, the same missing interpreter still takes the readout down.
+        assert_eq!(
+            aggregate_state(&[
+                SubsystemReadout::ok("sqlite_pool"),
+                hook_interpreter_row(None, true),
+            ]),
+            HealthState::Down
+        );
+    }
+
+    /// A project counts only when the hook `wire_classifier_hook` writes is really at its root.
+    #[tokio::test]
+    async fn the_roster_is_wired_only_when_some_project_wires_the_hook() {
+        let pool = migrated_pool().await;
+        assert!(
+            !hook_wired_in_any_project(&pool).await,
+            "an empty roster wires nothing"
+        );
+
+        let bare = tempfile::tempdir().unwrap();
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('bare', 'shadow', ?)")
+            .bind(bare.path().to_string_lossy().into_owned())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('rootless', 'off')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !hook_wired_in_any_project(&pool).await,
+            "no rostered root has the hook"
+        );
+
+        let wired = tempfile::tempdir().unwrap();
+        crate::autopilot::wire_classifier_hook(wired.path()).unwrap();
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('wired', 'active', ?)")
+            .bind(wired.path().to_string_lossy().into_owned())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            hook_wired_in_any_project(&pool).await,
+            "one wired project is enough"
+        );
+    }
+
+    /// Conservative on failure: this pool has no `autopilot_state` table at all.
+    #[tokio::test]
+    async fn an_unreadable_roster_counts_as_wired() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        assert!(hook_wired_in_any_project(&pool).await);
     }
 
     #[test]
@@ -1194,6 +1378,26 @@ mod tests {
         assert_eq!(
             category_from_io(io::Error::from(io::ErrorKind::NotFound)),
             FailureCategory::NotConfigured
+        );
+    }
+
+    /// The probe measures a real filesystem off Windows too.
+    ///
+    /// The temp directory is writable on any host that can run this suite, and a writable
+    /// directory sits on a mounted filesystem with some room left on it. So an `Unsupported`
+    /// error here is the platform gap — `disk_free_space` is implemented against the Windows
+    /// filesystem API alone — and never a property of the host the test ran on, which is also
+    /// why the assertion is `> 0` rather than a threshold.
+    ///
+    /// It lives in this module because `disk_free_space` is private to it, and widening that
+    /// visibility to test it from outside would change production code to suit a test.
+    #[cfg(unix)]
+    #[test]
+    fn the_disk_probe_measures_free_space_on_unix() {
+        let free = disk_free_space(&std::env::temp_dir());
+        assert!(
+            matches!(&free, Ok(bytes) if *bytes > 0),
+            "the volume holding the temp directory has free space to report, got {free:?}"
         );
     }
 }

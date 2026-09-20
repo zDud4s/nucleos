@@ -3,6 +3,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -133,5 +134,46 @@ func TestTheRootCanBeMoved(t *testing.T) {
 	}
 	if filepath.Base(cfg.Root) != "elsewhere" {
 		t.Errorf("root: got %q", cfg.Root)
+	}
+}
+
+// On Windows LOCALAPPDATA is always set, and the root must stay exactly where it has always been.
+func TestTheRootLivesUnderLocalAppDataWhenItIsSet(t *testing.T) {
+	local := t.TempDir()
+	t.Setenv("NUCLEOS_DAEMON_TOKEN", "tok")
+	t.Setenv("BROWSER_ROOT", "")
+	t.Setenv("LOCALAPPDATA", local)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if want := filepath.Join(local, "NucleOS", "browser"); cfg.Root != want {
+		t.Errorf("root: got %q, want %q", cfg.Root, want)
+	}
+}
+
+// Without LOCALAPPDATA (every macOS and Linux machine) the root is the user CACHE directory, moved
+// into a temp dir here (XDG_CACHE_HOME on Linux, HOME on macOS). On Windows the standard library
+// reads the cache directory from LocalAppData itself, so there it has none and the named relative
+// fallback is the answer.
+func TestWithoutLocalAppDataTheRootIsInTheUserCacheDir(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("NUCLEOS_DAEMON_TOKEN", "tok")
+	t.Setenv("BROWSER_ROOT", "")
+	t.Setenv("LOCALAPPDATA", "")
+	t.Setenv("XDG_CACHE_HOME", base)
+	t.Setenv("HOME", base)
+
+	want := "nucleos-browser-root"
+	if cache, err := os.UserCacheDir(); err == nil {
+		want = filepath.Join(cache, "nucleos", "browser")
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Root != want {
+		t.Errorf("root: got %q, want %q", cfg.Root, want)
 	}
 }

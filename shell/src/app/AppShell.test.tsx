@@ -9,6 +9,7 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
+import { invoke } from "@tauri-apps/api/core";
 import { NAV_ITEMS } from "./nav";
 import { daemonFetch, daemonState, renderApp } from "../test/harness";
 
@@ -148,5 +149,53 @@ describe("AppShell - the rail's control", () => {
     await waitFor(() => {
       expect(document.activeElement).toBe(trigger);
     });
+  });
+});
+
+/* ------------------------------------------------------------- the quota notch -- */
+
+describe("AppShell - the quota notch", () => {
+  function withQuota() {
+    const rest = daemonFetch(daemonState());
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/quota"
+        ? {
+            providers: [
+              {
+                provider: "claude",
+                fidelity: "official",
+                read_at: "2026-09-19T05:00:00Z",
+                windows: [
+                  { window: "5h", used_fraction: 0.5, resets_at: null, stale: false, state: "ok" },
+                ],
+                detail: "",
+                severity: "normal",
+              },
+            ],
+            source: "sidecar",
+            cached: false,
+          }
+        : rest(path, init),
+    );
+  }
+
+  it("draws the notch inside the app when it is kept there", async () => {
+    withQuota();
+    vi.mocked(invoke).mockResolvedValue("contained");
+    await renderApp({ initialPath: "/" });
+    await screen.findByRole("button", { name: "Keep the notch in front of every window" });
+  });
+
+  /** Floating, the notch is the other window's to draw; drawn here too it would say it twice. */
+  it("leaves it to the floating window when it floats", async () => {
+    withQuota();
+    vi.mocked(invoke).mockResolvedValue("global");
+    await renderApp({ initialPath: "/" });
+    await screen.findByRole("navigation", { name: "Sections" });
+    await waitFor(() => expect(vi.mocked(invoke)).toHaveBeenCalledWith("notch_mode"));
+    // Not even asked for: the contained notch is not mounted at all, rather than mounted and empty.
+    await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalled());
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/quota");
+    expect(document.querySelector(".quota-notch")).toBeNull();
   });
 });

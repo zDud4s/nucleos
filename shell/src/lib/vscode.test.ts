@@ -41,13 +41,20 @@ describe("vscodeUrl", () => {
 
   /**
    * The daemon reports whatever the platform gave it, and the same shell will
-   * one day read a project on a machine that spells paths the other way. The
-   * doubled slash is the scheme's own shape — `vscode://file/` plus a path that
-   * already begins with one — not a defect to trim.
+   * one day read a project on a machine that spells paths the other way — so
+   * what matters is what VS Code does with the URL, not what looks symmetrical.
+   * Its shipped handler (`getWindowOpenableFromProtocolUrl`) passes the URL's
+   * `fsPath` to `URI.file()`, and `URI.file("//home/x/a.rs")` reads the leading
+   * `//` as a UNC authority: the host becomes `home` and the file is never asked
+   * for locally. One slash after `file/` gives `file:///home/x/a.rs`, which is
+   * the local file. Measured 2026-09-18 against Linux VS Code 1.138.0 and the
+   * `vscode-uri` module VS Code itself uses. Windows paths are unaffected —
+   * there the drive letter follows that single slash, so the authority stays
+   * empty either way, which is why one shape cannot serve both.
    */
-  it("leaves a POSIX path alone", () => {
+  it("opens a POSIX path with a single slash after the authority", () => {
     expect(vscodeUrl("/home/x/nucleos/core/src/http.rs", 12)).toBe(
-      "vscode://file//home/x/nucleos/core/src/http.rs:12",
+      "vscode://file/home/x/nucleos/core/src/http.rs:12",
     );
   });
 

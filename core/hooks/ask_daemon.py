@@ -173,11 +173,36 @@ def cargo_target_dirs(main_root, environ=None, configs=None):
     return roots
 
 
+def daemon_binary_candidates(roots, os_name=None):
+    """Every path the daemon binary might have, in the order `control_token` tries them.
+
+    cargo names the binary `nucleos-core.exe` on Windows and `nucleos-core` everywhere else.
+    Looking only for the `.exe` failed CLOSED off Windows: no candidate ever existed, so every
+    queue operation an agent asked for was refused for a token that could not be read.
+
+    The platform's own name comes first. On Windows that keeps the old list, in the old order, as
+    the exact head of this one, so a machine that found its binary before finds the same one now,
+    and the extension-less names are tried only after every `.exe` has missed. Off Windows the
+    `.exe` names come last; where no such file exists they cost one `os.path.exists` each.
+    """
+    os_name = os.name if os_name is None else os_name
+    if os_name == "nt":
+        names = ("nucleos-core.exe", "nucleos-core")
+    else:
+        names = ("nucleos-core", "nucleos-core.exe")
+    return [
+        os.path.join(root, build, name)
+        for name in names
+        for root in roots
+        for build in ("debug", "release")
+    ]
+
+
 def control_token(cwd: str) -> str:
     """The daemon's own token, read the way the desktop app reads it.
 
     An editor session inherits no NucleOS environment, so the token has to be fetched
-    rather than found. It lives in Credential Manager under the person's own account,
+    rather than found. It lives in the system credential store under the person's own account,
     which is exactly who is sitting here — this grants nothing the session did not
     already have, it only stops the session having to be told how.
 
@@ -204,15 +229,13 @@ def control_token(cwd: str) -> str:
         deny("could not locate the repository to find the daemon binary - failing closed")
     main_root = os.path.dirname(common.stdout.strip())
 
-    for root in cargo_target_dirs(main_root):
-        for build in ("debug", "release"):
-            binary = os.path.join(root, build, "nucleos-core.exe")
-            if os.path.exists(binary):
-                printed = subprocess.run(
-                    [binary, "--print-token"], capture_output=True, text=True, timeout=20
-                )
-                if printed.returncode == 0 and printed.stdout.strip():
-                    return printed.stdout.strip()
+    for binary in daemon_binary_candidates(cargo_target_dirs(main_root)):
+        if os.path.exists(binary):
+            printed = subprocess.run(
+                [binary, "--print-token"], capture_output=True, text=True, timeout=20
+            )
+            if printed.returncode == 0 and printed.stdout.strip():
+                return printed.stdout.strip()
     deny(
         "this is a git operation the queue performs, and the daemon token could not be "
         "read to queue it - failing closed. Run it from a terminal if you meant to act "

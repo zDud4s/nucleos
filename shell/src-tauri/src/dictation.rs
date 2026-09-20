@@ -89,6 +89,87 @@ pub struct Delivery {
 }
 
 // -------------------------------------------------------------------------------------------------
+// Which display server is in front of us, and what to say when it is one that cannot be typed into.
+// -------------------------------------------------------------------------------------------------
+
+/// Offered to the person when the desktop itself forbids the paste, and read verbatim by
+/// `shell/src/components/Voice.tsx`. Wayland is a design decision, not a fault: no client may
+/// synthesise input into another client's window, so the text goes to the clipboard and the
+/// sentence says where it went and what to do about it.
+#[cfg(target_os = "linux")]
+const WAYLAND_HELD: &str = "this desktop runs Wayland, which lets no application type into another; the text is on the clipboard, paste it yourself";
+
+/// Offered to the person when the desktop gives no application a system-wide key grab, and read
+/// verbatim by `shell/src/pages/Voice.tsx`. Sibling of `WAYLAND_HELD` above and the same design
+/// decision seen from the other end: a Wayland compositor hands an ordinary client no global
+/// hotkey, so the chords would "register" and then never fire. Saying so is the whole value - a
+/// hotkey that never arrives is indistinguishable from the feature being broken.
+///
+/// Compiled in test builds on every host, so the decision below can be tested anywhere.
+#[cfg(any(target_os = "linux", test))]
+const NO_GLOBAL_HOTKEYS: &str =
+    "this desktop runs Wayland, which gives no application global hotkeys; use the buttons below";
+
+/// Which display server this session runs, as far as the environment is willing to say.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Session {
+    Wayland,
+    X11,
+    Unknown,
+}
+
+/// Reads the session out of the three variables that carry it, in the only order that is safe.
+///
+/// A Wayland claim beats a `DISPLAY`, and that ordering is the whole reason this is a function
+/// rather than two inline conditions: XWayland exports `DISPLAY` too, so "there is a DISPLAY,
+/// therefore X11" reads a Wayland desktop as X11 and then synthesises a keystroke into a
+/// compositor that permits no such thing. Nothing fails loudly - the events are simply never
+/// delivered, which on screen is indistinguishable from dictation being ignored.
+///
+/// An empty string is absent, not present-and-blank. An exported-but-cleared `WAYLAND_DISPLAY` is
+/// a variable somebody unset badly, and reading it as a compositor would refuse to type on a
+/// desktop that could have been typed into - the opposite mistake, and just as invisible. By the
+/// same rule a session type naming X11 with nothing behind it names no server anything can reach,
+/// so that is `Unknown` rather than `X11`.
+#[cfg(any(target_os = "linux", test))]
+fn session_from(
+    wayland_display: Option<&str>,
+    xdg_session_type: Option<&str>,
+    display: Option<&str>,
+) -> Session {
+    fn present(value: Option<&str>) -> Option<&str> {
+        value.filter(|value| !value.is_empty())
+    }
+
+    if present(wayland_display).is_some() || present(xdg_session_type) == Some("wayland") {
+        Session::Wayland
+    } else if present(display).is_some() {
+        Session::X11
+    } else {
+        Session::Unknown
+    }
+}
+
+/// Whether this session has global hotkeys to give, and the sentence to show when it has not.
+///
+/// `None` means "no reason to refuse" and not "no desktop": X11 delivers the grabs, and a session
+/// nothing could identify is an environment that arrived incomplete rather than a compositor that
+/// forbids them - refusing there would take working chords away from an X11 desktop. Only Wayland
+/// is answered with a sentence, because only Wayland is known to accept the registration and then
+/// deliver nothing.
+///
+/// Pure, and compiled in test builds everywhere, so the rule is tested on the host that runs the
+/// gate rather than only on the one platform it governs.
+#[cfg(any(target_os = "linux", test))]
+fn hotkeys_unavailable_for(session: Session) -> Option<&'static str> {
+    match session {
+        Session::Wayland => Some(NO_GLOBAL_HOTKEYS),
+        Session::X11 | Session::Unknown => None,
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
 // The Windows shim. Three calls, no decisions.
 // -------------------------------------------------------------------------------------------------
 
@@ -165,11 +246,395 @@ mod platform {
         };
         sent as usize == events.len()
     }
+
+    /// Nothing about Windows forbids one process typing into another's window, so there is never a
+    /// reason to hold the text. A function rather than a constant so that every platform answers
+    /// the same question, and so `deliver` needs no `cfg` of its own.
+    pub fn paste_unsupported() -> Option<&'static str> {
+        None
+    }
 }
 
-/// Off-Windows the shim reports "cannot tell", which every decision already treats as "do not type".
-/// The shell targets Windows (spec §2); this exists so the crate builds and tests elsewhere.
-#[cfg(not(windows))]
+// -------------------------------------------------------------------------------------------------
+// The Linux shim. The X11 protocol spoken directly, and an honest refusal on Wayland.
+// -------------------------------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{
+        AtomEnum, ConnectionExt as _, KeyButMask, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
+    };
+    use x11rb::protocol::xtest::ConnectionExt as _;
+    use x11rb::wrapper::ConnectionExt as _;
+
+    use super::{session_from, Session, WAYLAND_HELD};
+
+    /// `Control_L` and lowercase `v`, as keysyms. A keysym is what a key MEANS; XTest wants a
+    /// keycode, which is where on this particular keyboard that meaning currently sits - so the
+    /// mapping is read at paste time rather than hardcoded, or a Dvorak layout pastes whatever key
+    /// happens to sit where QWERTY keeps its V.
+    const CONTROL_L: u32 = 0xffe3;
+    const LOWERCASE_V: u32 = 0x0076;
+
+    /// The session, read from this process's own environment.
+    fn session() -> Session {
+        let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+        let xdg_session_type = std::env::var("XDG_SESSION_TYPE").ok();
+        let display = std::env::var("DISPLAY").ok();
+        session_from(
+            wayland_display.as_deref(),
+            xdg_session_type.as_deref(),
+            display.as_deref(),
+        )
+    }
+
+    /// The window the window manager says is active, or `None` when there is no answer to trust.
+    ///
+    /// `_NET_ACTIVE_WINDOW` on the root window is the EWMH answer, and it is the window manager's
+    /// rather than the server's - a desktop running no EWMH-compliant WM simply has no such
+    /// property, which is a real answer and not an error. Anything that is not a live X11 session
+    /// gets `None` too, because `voice::decide_paste` already treats `None` as "do not type".
+    pub fn foreground_window() -> Option<isize> {
+        if session() != Session::X11 {
+            return None;
+        }
+        let (conn, screen) = x11rb::connect(None).ok()?;
+        let root = conn.setup().roots.get(screen)?.root;
+        // `only_if_exists`: asking for the atom must not create it. A zero back means no window
+        // manager ever set the property, so there is nothing to read.
+        let atom = conn
+            .intern_atom(true, b"_NET_ACTIVE_WINDOW")
+            .ok()?
+            .reply()
+            .ok()?
+            .atom;
+        if atom == x11rb::NONE {
+            return None;
+        }
+        let reply = conn
+            .get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        let window = reply.value32()?.next()?;
+        if window == 0 {
+            None
+        } else {
+            Some(window as isize)
+        }
+    }
+
+    /// Whether any key a hotkey chord can use is still physically down.
+    ///
+    /// `true` on every failure, and that is the point: the honest answer to "is a modifier down"
+    /// when the X server cannot be reached is "cannot tell", and this module already treats
+    /// "cannot tell" as "do not type". Reporting `false` would let the paste go ahead into a
+    /// window whose state nobody has read.
+    ///
+    /// The four bits are X11's own names for the chord keys: `MOD1` is Alt on every layout in
+    /// practice and `MOD4` is Super. X reports the modifier and not the key, so there is no
+    /// separate left/right bit - this is the Windows shim's five virtual keys in four masks.
+    pub fn modifiers_down() -> bool {
+        let chord = KeyButMask::SHIFT | KeyButMask::CONTROL | KeyButMask::MOD1 | KeyButMask::MOD4;
+        let Ok((conn, screen)) = x11rb::connect(None) else {
+            return true;
+        };
+        let Some(root) = conn.setup().roots.get(screen).map(|screen| screen.root) else {
+            return true;
+        };
+        let Ok(cookie) = conn.query_pointer(root) else {
+            return true;
+        };
+        let Ok(reply) = cookie.reply() else {
+            return true;
+        };
+        u16::from(reply.mask & chord) != 0
+    }
+
+    /// Sends Ctrl+V through the XTest extension.
+    ///
+    /// XTest rather than `send_event`, because an event delivered by `send_event` is flagged as
+    /// synthetic and most toolkits drop it; XTest injects at the server's own input queue, where it
+    /// is indistinguishable from a keypress. The four events go as four requests - X has no atomic
+    /// batch - then `flush` and `sync`, and `sync` is what turns a request the server refused into
+    /// an error this function can see rather than a silent nothing.
+    pub fn send_paste() -> bool {
+        let Ok((conn, screen)) = x11rb::connect(None) else {
+            return false;
+        };
+        let Some(root) = conn.setup().roots.get(screen).map(|screen| screen.root) else {
+            return false;
+        };
+        let (Some(control), Some(v)) = (
+            keycode_for(&conn, CONTROL_L),
+            keycode_for(&conn, LOWERCASE_V),
+        ) else {
+            return false;
+        };
+        let events = [
+            (KEY_PRESS_EVENT, control),
+            (KEY_PRESS_EVENT, v),
+            (KEY_RELEASE_EVENT, v),
+            (KEY_RELEASE_EVENT, control),
+        ];
+        for (kind, keycode) in events {
+            if conn
+                .xtest_fake_input(kind, keycode, 0, root, 0, 0, 0)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        conn.flush().is_ok() && conn.sync().is_ok()
+    }
+
+    /// Why the text cannot be typed on this desktop, when it cannot.
+    ///
+    /// Wayland is the only such desktop here, and the refusal is by design rather than by bug: a
+    /// compositor delivers input to the focused client and to nobody else, so there is no call this
+    /// process could make. `None` everywhere else, a session nobody could identify included -
+    /// `foreground_window` refuses that one on its own, with the reason the rest of the module
+    /// already uses.
+    pub fn paste_unsupported() -> Option<&'static str> {
+        if session() == Session::Wayland {
+            Some(WAYLAND_HELD)
+        } else {
+            None
+        }
+    }
+
+    /// Where this keyboard currently keeps a given keysym, or `None` when it keeps it nowhere.
+    ///
+    /// The server reports the whole table at once - `keysyms_per_keycode` entries per key, from
+    /// `min_keycode` up - so the position of the first chunk holding the keysym, offset by
+    /// `min_keycode`, is the keycode.
+    fn keycode_for(conn: &impl Connection, keysym: u32) -> Option<u8> {
+        let (min, max) = {
+            let setup = conn.setup();
+            (setup.min_keycode, setup.max_keycode)
+        };
+        let count = max.checked_sub(min)?.checked_add(1)?;
+        let mapping = conn.get_keyboard_mapping(min, count).ok()?.reply().ok()?;
+        let per_keycode = usize::from(mapping.keysyms_per_keycode);
+        if per_keycode == 0 {
+            return None;
+        }
+        let index = mapping
+            .keysyms
+            .chunks(per_keycode)
+            .position(|keysyms| keysyms.contains(&keysym))?;
+        u8::try_from(usize::from(min) + index).ok()
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// The macOS shim. Quartz events, and an honest refusal until Accessibility has been granted.
+// -------------------------------------------------------------------------------------------------
+
+/// Offered to the person when macOS has not granted this application Accessibility access, and read
+/// verbatim by `shell/src/pages/Voice.tsx`. Like the Wayland refusal this is a design decision and
+/// not a fault: synthesising input into another application is exactly the power macOS asks the
+/// person to hand over explicitly, so until they have, the text goes to the clipboard and the
+/// sentence says where it went and where to turn the permission on.
+#[cfg(target_os = "macos")]
+const ACCESSIBILITY_HELD: &str = "macOS has not given NucleOS Accessibility access, so it cannot type; the text is on the clipboard. Allow it in System Settings > Privacy & Security > Accessibility";
+
+/// Whether the flags Quartz reports include any key a hotkey chord can use.
+///
+/// A function rather than an inline mask because it is the one macOS decision that can be checked
+/// without a Mac: `CGEventSourceFlagsState` cannot be called here, but the bits it returns are
+/// documented constants, so the READING of them is tested on every platform.
+///
+/// The four are `CGEventFlags`' own names: `CGEventFlagShift` 0x20000, `CGEventFlagControl`
+/// 0x40000, `CGEventFlagAlternate` 0x80000 (the Option key) and `CGEventFlagCommand` 0x100000.
+/// Everything else the field carries is state nobody is holding down - `CGEventFlagAlphaShift` is
+/// caps lock being ON, `CGEventFlagNumericPad` is which part of the keyboard a key came from - and
+/// reading one of those as a held modifier would refuse every paste forever, which on screen looks
+/// exactly like dictation being ignored.
+#[cfg(any(target_os = "macos", test))]
+fn flags_hold_a_modifier(flags: u64) -> bool {
+    const SHIFT: u64 = 0x20000;
+    const CONTROL: u64 = 0x40000;
+    const OPTION: u64 = 0x80000;
+    const COMMAND: u64 = 0x100000;
+    flags & (SHIFT | CONTROL | OPTION | COMMAND) != 0
+}
+
+/// Which window a dictation will be compared against, from the PID that owns the frontmost one.
+///
+/// macOS gives an ordinary application no supported way to name another application's window, so
+/// the window this process remembers is really its owner PID - and two windows of the SAME
+/// application therefore compare equal. `deliver()` will not notice somebody moving between two
+/// documents of one editor, only a move to a different application. That is a deliberate,
+/// documented loss of precision and not an oversight to be tidied away later; it errs on the side
+/// of letting a paste through that a finer comparison would have held, into an application the
+/// person did dictate into.
+///
+/// `None` survives the mapping untouched, because `voice::decide_paste` reads `None` as "do not
+/// type" and turning it into an id would let delivery paste into whatever happens to be in front.
+#[cfg(any(target_os = "macos", test))]
+fn macos_front_window_id(pid: Option<i32>) -> Option<isize> {
+    pid.map(|pid| pid as isize)
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use core_foundation::base::{CFGetTypeID, TCFType};
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::number::{CFNumber, CFNumberRef};
+    use core_foundation::string::CFStringRef;
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use core_graphics::window::{
+        copy_window_info, kCGNullWindowID, kCGWindowLayer, kCGWindowListExcludeDesktopElements,
+        kCGWindowListOptionOnScreenOnly, kCGWindowOwnerPID,
+    };
+
+    use super::{flags_hold_a_modifier, macos_front_window_id, ACCESSIBILITY_HELD};
+
+    /// `V`. `kVK_ANSI_V` from `<Carbon/HIToolbox/Events.h>`, which names a POSITION on an ANSI
+    /// keyboard rather than a letter - a virtual keycode is the physical key - so this stays the
+    /// paste key whatever layout is active, the way the Linux shim has to look its keycode up.
+    const KEY_V: CGKeyCode = 9;
+
+    /// `kCGEventSourceStateHIDSystemState`. The hardware's own state, which is what "is a key
+    /// physically down" means; the combined session state would answer for synthesised events too.
+    const HID_SYSTEM_STATE: i32 = 1;
+
+    /// Not in `core-graphics` 0.25 - it wraps `CGEventSourceCreate` and the event constructors but
+    /// not the flags query - so it is declared here, against the framework the rest of this module
+    /// already links.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        /// The modifier flags currently held for a given source state, as `CGEventFlags` bits.
+        fn CGEventSourceFlagsState(state_id: i32) -> u64;
+    }
+
+    /// Whether this process has been granted Accessibility access.
+    ///
+    /// It lives in `ApplicationServices` rather than `CoreGraphics`, and in no wrapper crate this
+    /// project already depends on. Deliberately the reading call and not
+    /// `AXIsProcessTrustedWithOptions`, which is the one that can raise the system prompt: raising
+    /// a prompt from inside a paste is not this function's business.
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        /// Declared returning `u8` and not `bool`: C's `Boolean` is `typedef unsigned char`, and
+        /// a Rust `bool` holding anything but 0 or 1 is undefined behaviour rather than a wrong
+        /// answer. Apple returns 0 or 1, so the byte is taken as a byte and compared at the call
+        /// site.
+        fn AXIsProcessTrusted() -> u8;
+    }
+
+    /// The application in front, named by the PID that owns its frontmost window, or `None` when
+    /// there is no answer to trust.
+    ///
+    /// `kCGWindowListOptionOnScreenOnly` returns the on-screen windows in front-to-back order, so
+    /// the FIRST entry at layer 0 is the frontmost ordinary window. The layer filter is what keeps
+    /// the menu bar, the Dock, a notification and every other floating panel from being read as
+    /// the window somebody dictated into; `kCGWindowListExcludeDesktopElements` drops the desktop
+    /// itself for the same reason.
+    ///
+    /// Note what this does NOT need: the window list is public information, so it answers before
+    /// Accessibility has been granted. `paste_unsupported` is what refuses in that case.
+    pub fn foreground_window() -> Option<isize> {
+        let windows = copy_window_info(
+            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID,
+        )?;
+        let owner = windows.iter().find_map(|window| {
+            let window = *window;
+            if window.is_null() {
+                return None;
+            }
+            // Get rule: the array owns the dictionary, so this retains it for as long as the
+            // borrow lasts and releases it at the end of the closure.
+            let info = unsafe { CFDictionary::wrap_under_get_rule(window as CFDictionaryRef) };
+            if number(&info, unsafe { kCGWindowLayer })? != 0 {
+                return None;
+            }
+            i32::try_from(number(&info, unsafe { kCGWindowOwnerPID })?).ok()
+        });
+        macos_front_window_id(owner)
+    }
+
+    /// One integer-valued entry of a window description, or `None` when it is absent or is not a
+    /// number.
+    ///
+    /// The type check is not defensive tidiness. These dictionaries are heterogeneous - strings,
+    /// booleans and rectangles live beside the numbers - and handing a `CFStringRef` to
+    /// `CFNumberGetValue` is undefined behaviour rather than a wrong answer.
+    fn number(info: &CFDictionary, key: CFStringRef) -> Option<i64> {
+        let value = *info.find(key as *const std::ffi::c_void)?;
+        if value.is_null() || unsafe { CFGetTypeID(value) } != CFNumber::type_id() {
+            return None;
+        }
+        unsafe { CFNumber::wrap_under_get_rule(value as CFNumberRef) }.to_i64()
+    }
+
+    /// Whether any key a hotkey chord can use is still physically down.
+    ///
+    /// The convention the Windows and Linux shims follow is that "cannot tell" means "do not
+    /// type", and every caller reads it that way. There is no failure to report here to hold that
+    /// line with: `CGEventSourceFlagsState` returns flags or a zero and has no error channel at
+    /// all, so a state it could not read is indistinguishable from nothing being held. That is the
+    /// one place this module is less careful than the other two, and it is the API's shape rather
+    /// than a choice made here - the honest `true` the other two return on a failed connection has
+    /// no call to hang off.
+    pub fn modifiers_down() -> bool {
+        flags_hold_a_modifier(unsafe { CGEventSourceFlagsState(HID_SYSTEM_STATE) })
+    }
+
+    /// Sends Cmd+V as two Quartz events, each carrying the Command flag.
+    ///
+    /// Two events and not the Windows shim's four: on macOS the modifier travels ON the key event
+    /// as a flag rather than as a keystroke of its own, so a Cmd-down/Cmd-up pair is neither needed
+    /// nor correct - and the flag has to be set before the event is posted, because posting is what
+    /// hands it to the system.
+    ///
+    /// `CGEventTapLocation::HID` posts at the hardware event tap, the earliest point, which is
+    /// where a key the person actually pressed would enter; a session-level post skips taps a real
+    /// keystroke would have passed through. Posting reports nothing back at all, so the only honest
+    /// answer this function has is whether both events could be created - a paste refused for want
+    /// of Accessibility is caught by `paste_unsupported` before ever reaching here.
+    pub fn send_paste() -> bool {
+        let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+            return false;
+        };
+        let (Ok(down), Ok(up)) = (
+            CGEvent::new_keyboard_event(source.clone(), KEY_V, true),
+            CGEvent::new_keyboard_event(source, KEY_V, false),
+        ) else {
+            return false;
+        };
+        for event in [down, up] {
+            event.set_flags(CGEventFlags::CGEventFlagCommand);
+            event.post(CGEventTapLocation::HID);
+        }
+        true
+    }
+
+    /// Why the text cannot be typed on this Mac, when it cannot.
+    ///
+    /// Accessibility is the only such reason here, and it is a permission rather than a bug: macOS
+    /// asks the person, in System Settings and not from inside the application, to hand over the
+    /// power to type into another application. Until they have, a posted event is accepted and
+    /// delivered nowhere - which on screen is indistinguishable from dictation being ignored - so
+    /// the question is asked before any event is created, and `deliver()` puts the text on the
+    /// clipboard when it answers.
+    pub fn paste_unsupported() -> Option<&'static str> {
+        if unsafe { AXIsProcessTrusted() } != 0 {
+            None
+        } else {
+            Some(ACCESSIBILITY_HELD)
+        }
+    }
+}
+
+/// Everywhere else the shim reports "cannot tell", which every decision already treats as "do not
+/// type". The shell targets Windows, Linux and macOS; this exists so the crate builds and tests on
+/// whatever else somebody compiles it on.
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
 mod platform {
     pub fn foreground_window() -> Option<isize> {
         None
@@ -179,6 +644,9 @@ mod platform {
     }
     pub fn send_paste() -> bool {
         false
+    }
+    pub fn paste_unsupported() -> Option<&'static str> {
+        None
     }
 }
 
@@ -273,6 +741,30 @@ pub fn voice_abandon(state: State<'_, Dictation>) -> Result<(), String> {
     Ok(())
 }
 
+/// Asked by the Voice tab BEFORE it registers anything: a desktop that gives no global hotkeys
+/// gets the sentence instead of three chords nobody will ever hear.
+///
+/// Only Linux has a session to read - Windows and macOS both hand an application real grabs, so
+/// there is nothing to refuse and the answer is `None` by construction rather than by probing.
+#[tauri::command]
+pub fn voice_hotkeys_unavailable() -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+        let xdg_session_type = std::env::var("XDG_SESSION_TYPE").ok();
+        let display = std::env::var("DISPLAY").ok();
+        hotkeys_unavailable_for(session_from(
+            wayland_display.as_deref(),
+            xdg_session_type.as_deref(),
+            display.as_deref(),
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// Called by the Voice tab once it has read `GET /voice/config`, because that is the only place the
 /// configured chords exist — `.ai/voice.yaml` is self-governing and the shell may not read it.
 /// Re-registering replaces what was there, so editing the config and reloading the tab is enough.
@@ -296,6 +788,15 @@ fn deliver(text: &str, recorded_into: Option<WindowId>) -> Delivery {
         held: Some(reason),
     };
 
+    // Asked before anything else, because on a desktop that lets no application type into
+    // another there is nothing left to check: the clipboard IS the delivery, and every question
+    // below - which window, which modifiers, whose clipboard to give back - is about a keystroke
+    // that will not be sent. On Windows this is always `None`, so the path below stays exactly
+    // what it was.
+    if let Some(reason) = platform::paste_unsupported() {
+        let _ = set_clipboard_text(text);
+        return held(reason);
+    }
     if decide_paste(recorded_into, platform::foreground_window()) != PasteDecision::Paste {
         return held("the window you dictated into is no longer in front");
     }
@@ -440,11 +941,121 @@ mod tests {
     }
 
     /// Off-Windows every shim answer has to be the one that refuses to type.
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
     #[test]
     fn the_non_windows_shim_never_types() {
         assert_eq!(platform::foreground_window(), None);
         assert!(platform::modifiers_down());
         assert!(!platform::send_paste());
+    }
+
+    /// A Wayland desktop is still Wayland when XWayland has handed us a `DISPLAY`.
+    #[test]
+    fn wayland_wins_over_an_xwayland_display() {
+        // This is the whole reason the question is asked by a function rather than inline: XWayland
+        // exports `DISPLAY` as well, so "there is a DISPLAY, therefore X11" reads a Wayland desktop
+        // as X11 and then synthesises a keystroke no compositor will deliver. The paste fails
+        // silently, which looks exactly like dictation being ignored.
+        assert_eq!(
+            session_from(Some("wayland-0"), None, Some(":0")),
+            Session::Wayland
+        );
+        // The other route to the same answer. A process started outside the compositor's own
+        // environment can be missing `WAYLAND_DISPLAY` while the session type still says plainly
+        // what the desktop is, and that claim is enough on its own.
+        assert_eq!(
+            session_from(None, Some("wayland"), Some(":0")),
+            Session::Wayland
+        );
+    }
+
+    /// X11 is what is left once nothing claims Wayland.
+    #[test]
+    fn x11_is_a_display_with_no_wayland() {
+        // A plain X11 session: a display, and no claim of Wayland from either direction.
+        assert_eq!(session_from(None, None, Some(":0")), Session::X11);
+        // A session type naming something else is not a Wayland claim. Only the exact word counts,
+        // because it is the one the desktop's own session files agree on.
+        assert_eq!(session_from(None, Some("x11"), Some(":0")), Session::X11);
+        assert_eq!(session_from(None, Some("tty"), Some(":1")), Session::X11);
+        // An exported-but-empty `WAYLAND_DISPLAY` is a variable somebody cleared, not a compositor.
+        // Reading it as present would refuse to type on a desktop that can be typed into — the
+        // opposite mistake, and just as invisible.
+        assert_eq!(session_from(Some(""), None, Some(":0")), Session::X11);
+    }
+
+    /// With nothing to type into, the answer has to be "cannot tell" rather than a guess.
+    #[test]
+    fn no_display_at_all_is_unknown() {
+        // A headless run — ssh, a systemd service, a container — has no desktop at all. `Unknown` is
+        // what lets the refusal say so, instead of picking X11 and dying at the XTest call.
+        assert_eq!(session_from(None, None, None), Session::Unknown);
+        // Empty is absent on all three, not present-and-blank.
+        assert_eq!(session_from(Some(""), Some(""), Some("")), Session::Unknown);
+        // And a session type with no display behind it names no server anything can reach.
+        assert_eq!(session_from(None, Some("x11"), Some("")), Session::Unknown);
+    }
+
+    /// A Wayland session has no global hotkeys to give, and the page has to be told so.
+    ///
+    /// The failure this prevents is a silent one: no Wayland compositor hands an ordinary client
+    /// a system-wide grab, so the chords "register" and then simply never fire. On screen that is
+    /// indistinguishable from the feature being broken, and there is nowhere to read why. X11 and
+    /// a session nothing identified both keep their hotkeys - `None` here means "no reason to
+    /// refuse", not "no desktop": refusing on Unknown would take the chords away from a working
+    /// X11 session whose environment merely arrived incomplete.
+    #[test]
+    fn no_global_hotkeys_on_a_wayland_session() {
+        let wayland = hotkeys_unavailable_for(Session::Wayland);
+        assert!(
+            wayland.is_some_and(|sentence| !sentence.trim().is_empty()),
+            "a Wayland session has to come back with a sentence to show, got {wayland:?}"
+        );
+        assert_eq!(
+            hotkeys_unavailable_for(Session::X11),
+            None,
+            "X11 delivers global hotkeys, so there is nothing to refuse"
+        );
+        assert_eq!(
+            hotkeys_unavailable_for(Session::Unknown),
+            None,
+            "a session nothing could identify is not a reason to take the hotkeys away"
+        );
+    }
+
+    /// A modifier the person is still holding turns a synthesized Cmd+V into another chord.
+    #[test]
+    fn any_held_modifier_blocks_the_paste() {
+        // Cmd+V is only Cmd+V when nothing else is down. With Shift held, the same synthesized
+        // chord arrives as Cmd+Shift+V, which pastes without formatting in some applications and
+        // is a different command altogether in others; with Option or Control it is something
+        // else again. So a held modifier HOLDS the paste instead of sending it, and the person
+        // keeps the text on the clipboard rather than getting a surprise typed into their window.
+        assert!(!flags_hold_a_modifier(0));
+        // The four `CGEventFlags` bits that count, each one alone: Shift, Control, Option, Command.
+        assert!(flags_hold_a_modifier(0x20000));
+        assert!(flags_hold_a_modifier(0x40000));
+        assert!(flags_hold_a_modifier(0x80000));
+        assert!(flags_hold_a_modifier(0x100000));
+        // Two of them together are still "something is held".
+        assert!(flags_hold_a_modifier(0x20000 | 0x100000));
+        // A bit outside the mask is not a held key. `CGEventFlags` also carries state nobody is
+        // holding down at all, and reading one of those as a modifier would refuse every paste
+        // forever, which on screen looks exactly like dictation being ignored.
+        assert!(!flags_hold_a_modifier(0x1));
+    }
+
+    /// A front window is named by the process that owns it, and that costs precision on purpose.
+    #[test]
+    fn a_front_window_is_named_by_its_owner_pid() {
+        // macOS gives an ordinary application no supported way to name another application's
+        // window, so the window we remember is really its owner PID. Two windows of the SAME
+        // application therefore compare equal, and `deliver()` will not notice the person moving
+        // between them - it only notices a move to a different app. That is a deliberate,
+        // documented loss of precision, not an oversight to be tidied away later.
+        assert_eq!(macos_front_window_id(Some(4321)), Some(4321));
+        // Nothing in front is nothing to remember, and the `None` has to survive the mapping:
+        // turning it into an id would let delivery paste into whatever happens to be there.
+        assert_eq!(macos_front_window_id(None), None);
     }
 }

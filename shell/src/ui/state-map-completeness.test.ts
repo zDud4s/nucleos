@@ -10,6 +10,7 @@ const jobRs = readFileSync(`${repoRoot}core/src/job.rs`, "utf8");
 const teamRs = readFileSync(`${repoRoot}core/src/team.rs`, "utf8");
 const concurrencyRs = readFileSync(`${repoRoot}core/src/concurrency.rs`, "utf8");
 const runsRs = readFileSync(`${repoRoot}core/src/runs.rs`, "utf8");
+const quotaRs = readFileSync(`${repoRoot}core/src/quota.rs`, "utf8");
 
 function coreFiles(): { name: string; source: string }[] {
   const dir = `${repoRoot}core/src`;
@@ -169,6 +170,33 @@ describe("state-map completeness", () => {
     // wrong; and not a summons either, because the queue starts the resolution run itself.
     expect(readState("job_item", "conflicted")?.tone).toBe("paused");
     expect(readState("job_item", "conflicted")?.tone).toBe(readState("feed", "job_item_conflicted")?.tone);
+  });
+
+  /**
+   * The `quota` domain, which nothing else in this file covers.
+   *
+   * Every other block here fixes one domain and one shape in the Rust — an array by name, the arms
+   * of one function, four fixed strings, the feed's emitters. None of them has a generic mechanism
+   * over `StateDomain`, so a domain added to `state-map.ts` is checked by nothing unless somebody
+   * writes the block for it. That was true of this one until this test existed, and the map would
+   * have drifted from `QUOTA_STATES` without a single gate turning red.
+   *
+   * What a drift costs is worth naming: `readState` returns null for a state it has no row for,
+   * `StateBadge` then renders the bare literal, and a ring falls back to a neutral tone. A quota
+   * that is spent would be painted the same as one that is fine.
+   */
+  it("every quota state the núcleo can produce has a reading", () => {
+    const states = literals(quotaRs, /pub const QUOTA_STATES: \[&str; \d+\] = \[([^\]]*)\];/);
+
+    expect(states).toHaveLength(5);
+    expect(new Set(statesOf("quota"))).toEqual(new Set(states));
+    // The two that must never be stated with the confidence of a measurement: one is a number
+    // about a window that has ended, the other is no number at all. A brake is later allowed to
+    // act on this domain, so a quiet tone here is a safety property and not a taste.
+    expect(readState("quota", "stale")?.tone).toBe("off");
+    expect(readState("quota", "unmeasured")?.tone).toBe("off");
+    // And the one that asks the owner for a decision wears the colour that means exactly that.
+    expect(readState("quota", "warn")?.tone).toBe("pending");
   });
 
   it("a team item has four states and planned is not one of them", () => {

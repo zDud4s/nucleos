@@ -12,6 +12,8 @@ import { ConnectionGate } from "./ConnectionGate";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { NotificationsDrawer } from "./NotificationsDrawer";
 import { PaletteTrigger } from "./PaletteTrigger";
+import { QuotaNotch } from "./QuotaNotch";
+import { useNotchMode, useSetNotchMode } from "./notch-mode";
 import { Sidebar } from "./Sidebar";
 import { NAV_ITEMS } from "./nav";
 
@@ -154,6 +156,12 @@ function Frame() {
           <KillSwitchControl />
         </Sidebar>
         <main className="app-main">
+          {/*
+            The notch, contained. At the top edge of the page area rather than inside it, because it
+            is about the machine and not about whatever page is open — and because that is where
+            the floating window hangs too, so the drawing does not move between the two hosts.
+          */}
+          <ContainedNotch />
           <div className="app-page">
             <Outlet />
           </div>
@@ -161,6 +169,20 @@ function Frame() {
       </div>
     </PaletteProvider>
   );
+}
+
+/**
+ * The quota notch, when the owner keeps it inside the app (design D8).
+ *
+ * Drawn only once the mode has answered `contained`. Before that answer the right picture is
+ * nothing, not a guess: with the notch floating, a contained one drawn "until we know" would show
+ * the same reading twice on every launch.
+ */
+function ContainedNotch() {
+  const mode = useNotchMode();
+  const setMode = useSetNotchMode();
+  if (mode !== "contained") return null;
+  return <QuotaNotch host="contained" onMove={() => void setMode("global").catch(() => {})} />;
 }
 
 /**

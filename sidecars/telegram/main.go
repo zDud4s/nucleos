@@ -26,6 +26,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// The lifeline (spec D3): a daemon that is gone cancels the same context a signal does, so the
+	// loop below ends and in-flight updates finish through the shutdown at the bottom of main.
+	ctx, cut := context.WithCancel(ctx)
+	defer cut()
+	watchLifeline(os.Getenv, os.Stdin, cut)
 
 	dc := daemon.New(cfg.DaemonURL, cfg.DaemonToken)
 	bot := telegram.New(cfg.BotToken)

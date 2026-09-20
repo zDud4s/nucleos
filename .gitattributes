@@ -20,3 +20,15 @@
 # them would report the built-in workflow as changed and restore it. Same failure
 # the `*.sql` rule at the top prevents, one directory over.
 core/assets/** text eol=lf
+
+# LF in the working tree for the languages this repository embeds, formats or executes. The blobs
+# are already LF everywhere (`git ls-files --eol` reads `i/lf`); what this stops is a Windows
+# checkout with core.autocrlf=true writing CRLF copies — which rustfmt then rewrites file by file,
+# which `include_str!` embeds (core/hooks/ask_daemon.py), and which a diff shows as churn nobody
+# made. `*.tsx`, `*.json` and `*.css` are deliberately not listed yet: add them the same way when
+# their churn costs something.
+*.py text eol=lf
+*.rs text eol=lf
+*.ts text eol=lf
+*.mjs text eol=lf
+*.yml text eol=lf

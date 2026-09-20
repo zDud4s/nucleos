@@ -2928,8 +2928,25 @@ async fn spawn_agent(
             fail_run(&pool, run_id, "a local agent with no model").await;
             return;
         };
-        let chat =
-            crate::runner::OllamaChat::new(crate::runner::OLLAMA_BASE_URL.to_string(), model);
+        // The FACTORY's chat, where this built its own `runner::OllamaChat` against
+        // `runner::OLLAMA_BASE_URL`. This was the last reader in the daemon still doing so: the
+        // chat route and the council seat both ask `assistants::Assistants::local_chat`, which is
+        // the one place that decides which server a local model gets. On an install whose
+        // `local_engine` is `openai_compatible`, a team member left here reached an Ollama that may not be
+        // running, may not hold the model, and may not be the machine that was paid for -- while
+        // the owner's own chat reached the server they configured. Half a daemon on each engine.
+        let chat = match state.assistants.local_chat(&model) {
+            Ok(chat) => chat,
+            Err(refusal) => {
+                // The refusal's OWN sentence, for the reason `council.rs` gives at its seat:
+                // `Refusal::message` is already what the chat route shows an operator for this
+                // misconfiguration, and a second wording invented here would describe one problem
+                // in two voices depending on which door somebody came through. The row is closed
+                // rather than left `running` -- nothing was spawned, so nothing else ever closes it.
+                fail_run(&pool, run_id, &refusal.message(crate::chats::Brain::Local)).await;
+                return;
+            }
+        };
         // The TEAM's box, never `LocalToolBox::new`: `LOCAL_TOOLS` carries `create_run` and
         // `create_job`, and the local path never passes through `hooks.rs` at all.
         let tools =
@@ -2943,7 +2960,10 @@ async fn spawn_agent(
             let turn = tokio::time::timeout(
                 timeout,
                 crate::local_agent::run_turn(
-                    &chat,
+                    // `as_ref`, because what the factory hands back is a `Box<dyn LocalChat>`
+                    // and the loop takes the trait object itself -- the box is the seam, not
+                    // the value.
+                    chat.as_ref(),
                     tool_box,
                     crate::local_agent::SYSTEM_PROMPT,
                     &[],
@@ -3156,9 +3176,12 @@ async fn spawn_agent(
 /// list of the right length would be read as a record of which tools ran. NULL means nobody asked;
 /// an invented list would be an answer, and a false one.
 ///
-/// Separate from the branch that calls it so that it can be tested at all: the local path builds
-/// its own `OllamaChat` against `OLLAMA_BASE_URL`, so nothing can exercise the surrounding task
-/// without a live Ollama. What this function does with a turn is the part that can be wrong.
+/// Separate from the branch that calls it because what it does with a turn is the part that can
+/// be wrong, independently of who answered. This used to say the surrounding task could not be
+/// exercised at all without a live Ollama, and that was true for exactly as long as the local
+/// path built its own `OllamaChat` against `OLLAMA_BASE_URL`: it asks the factory now, so a test
+/// can hand it a chat pointed anywhere and `a_local_team_member_is_served_by_the_configured_engine`
+/// does.
 async fn record_local_turn(
     pool: &sqlx::SqlitePool,
     run_id: i64,
@@ -4822,6 +4845,7 @@ mod tests {
             browser: Arc::new(crate::browser::BrowserRuntime::disabled()),
             github: Arc::new(crate::github::GithubRuntime::default()),
             web: Arc::new(crate::web::WebRuntime::disabled()),
+            quota: Arc::new(crate::quota::QuotaRuntime::disabled()),
             calendar: Arc::new(crate::calendar::CalendarRuntime::default()),
             council: Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
@@ -7161,6 +7185,266 @@ mod tests {
         assert_eq!(status, "completed");
         assert_eq!(turns, Some(7), "the calls it made are the steps it took");
         assert_eq!(cost, Some(0.0), "zero and not NULL — see the doc comment");
+    }
+
+    /// An OpenAI-compatible server on this machine, answering one sentence that exists nowhere
+    /// else in this module — so a member that wrote it down can only have got it from here.
+    async fn stub_openai_compatible_member(answer: &str) -> String {
+        let answer = answer.to_string();
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move || {
+                let answer = answer.clone();
+                async move {
+                    axum::Json(serde_json::json!({
+                        "choices": [{ "message": { "role": "assistant", "content": answer } }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    /// An `Assistants` whose local route is ONE OpenAI-compatible address, recording every model it
+    /// was asked to build a chat for. The same double `council.rs` keeps for a seat, for the same
+    /// reason: `NoAssistants` answers `assistant_for`, and a team member does not want one — it
+    /// wants the chat, which is what `local_chat` hands out.
+    struct MemberAssistants {
+        base_url: String,
+        /// Every model `local_chat` was asked for, in call order.
+        asked_for: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::assistants::Assistants for MemberAssistants {
+        fn local_chat(
+            &self,
+            model: &str,
+        ) -> Result<Box<dyn crate::local_agent::LocalChat>, crate::assistants::Refusal> {
+            self.asked_for
+                .lock()
+                .expect("the double's recorder is never held across an await")
+                .push(model.to_string());
+            Ok(Box::new(
+                crate::openai_compatible::OpenAiCompatibleChat::with_client(
+                    reqwest::Client::new(),
+                    self.base_url.clone(),
+                    model.to_string(),
+                    // `None`, deliberately: a loopback OpenAI-compatible server asks for no key, which
+                    // is the case `OpenAiCompatibleChat::new` refuses and `with_client` exists to express.
+                    None,
+                ),
+            ))
+        }
+
+        fn assistant_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: Option<&str>,
+        ) -> Result<std::sync::Arc<crate::local_agent::LocalAssistant>, crate::assistants::Refusal>
+        {
+            Err(crate::assistants::Refusal::NotServedByThisFactory)
+        }
+
+        fn serves(&self, brain: crate::chats::Brain) -> Result<(), crate::assistants::Refusal> {
+            match brain {
+                crate::chats::Brain::Local => Ok(()),
+                _ => Err(crate::assistants::Refusal::RouteNotConfigured),
+            }
+        }
+
+        async fn can_serve(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: &str,
+        ) -> Result<(), crate::assistants::Refusal> {
+            Ok(())
+        }
+
+        async fn declared_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _models: &[String],
+        ) -> std::collections::HashMap<String, crate::capabilities::Declared> {
+            std::collections::HashMap::new()
+        }
+    }
+
+    /// A factory with no local route at all, which is what an install that configured none has.
+    struct NoLocalRoute;
+
+    #[async_trait::async_trait]
+    impl crate::assistants::Assistants for NoLocalRoute {
+        fn local_chat(
+            &self,
+            _model: &str,
+        ) -> Result<Box<dyn crate::local_agent::LocalChat>, crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::RouteNotConfigured)
+        }
+
+        fn assistant_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: Option<&str>,
+        ) -> Result<std::sync::Arc<crate::local_agent::LocalAssistant>, crate::assistants::Refusal>
+        {
+            Err(crate::assistants::Refusal::RouteNotConfigured)
+        }
+
+        fn serves(&self, _brain: crate::chats::Brain) -> Result<(), crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::RouteNotConfigured)
+        }
+
+        async fn can_serve(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: &str,
+        ) -> Result<(), crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::RouteNotConfigured)
+        }
+
+        async fn declared_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _models: &[String],
+        ) -> std::collections::HashMap<String, crate::capabilities::Declared> {
+            std::collections::HashMap::new()
+        }
+    }
+
+    /// A local member's agent row, the one shape both tests below need.
+    fn local_member(model: &str) -> crate::agent::Agent {
+        crate::agent::Agent {
+            id: "researcher".to_owned(),
+            name: "researcher".to_owned(),
+            speciality: "reads".to_owned(),
+            prompt: "read".to_owned(),
+            engine: "local".to_owned(),
+            model: Some(model.to_owned()),
+            // Not `mcp_only`: what is under test is which server answered, and the MCP branch
+            // would write a config file into the machine's temp directory to prove nothing.
+            tool_policy: "unrestricted".to_owned(),
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            updated_at: "2026-08-26T00:00:00Z".to_owned(),
+        }
+    }
+
+    /// Opens a team run this module's helpers can drive a member off.
+    async fn team_run_for_member(state: &AppState, id: &str) -> TeamRun {
+        marketing(state).await;
+        sqlx::query(
+            "INSERT INTO team_runs (id, team_id, request, workspace, token, state,
+                                    created_at, updated_at)
+             VALUES (?, 'marketing', 'find it', 'ws', 'a-secret', 'working',
+                     '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
+        )
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        fetch_run(state, id).await
+    }
+
+    /// Polls until the run leaves `running`, and answers what it recorded.
+    async fn settled_run(
+        state: &AppState,
+        run_id: i64,
+    ) -> (String, Option<String>, Option<String>) {
+        for _ in 0..80 {
+            let row: (String, Option<String>, Option<String>) =
+                sqlx::query_as("SELECT status, stdout, stderr FROM runs WHERE id = ?")
+                    .bind(run_id)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            if row.0 != "running" {
+                return row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the member's run never reached a terminal status");
+    }
+
+    /// A local team member asks the factory for its chat, exactly as a chat turn and a council
+    /// seat do.
+    ///
+    /// Without this, `spawn_agent` keeps building its own `runner::OllamaChat` against
+    /// `runner::OLLAMA_BASE_URL` — the last reader in this daemon still doing so. On an install
+    /// whose `local_engine` is `openai_compatible`, the owner's chat and every council seat then reach the
+    /// server that was configured while every TEAM member quietly reaches an Ollama that may not
+    /// be running, may not hold the model, and may not be the machine that was paid for. What is
+    /// asserted is the member's own recorded answer, because that sentence exists only on the
+    /// loopback server the factory was pointed at.
+    #[tokio::test]
+    async fn a_local_team_member_is_served_by_the_configured_engine() {
+        const ANSWER: &str = "the answer that exists only on this loopback server";
+        let base_url = stub_openai_compatible_member(ANSWER).await;
+
+        let (mut state, _root) = state_with_root().await;
+        let assistants = std::sync::Arc::new(MemberAssistants {
+            base_url,
+            asked_for: std::sync::Mutex::new(Vec::new()),
+        });
+        state.assistants = assistants.clone();
+
+        let run = team_run_for_member(&state, "tr-local-member").await;
+        let agent = local_member("a-frontier-moe");
+        let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+
+        spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+
+        let (status, stdout, _) = settled_run(&state, run_id).await;
+        assert_eq!(status, "completed");
+        assert_eq!(
+            stdout.as_deref(),
+            Some(ANSWER),
+            "the member answered from the configured engine, not from Ollama"
+        );
+        assert_eq!(
+            assistants
+                .asked_for
+                .lock()
+                .expect("the recorder is never held across an await")
+                .as_slice(),
+            ["a-frontier-moe"],
+            "the factory was asked for the member's own model, once"
+        );
+    }
+
+    /// A member whose factory has no local route fails carrying the refusal's OWN sentence.
+    ///
+    /// The refusal travels verbatim for the reason `council.rs` gives at its seat: `Refusal::
+    /// message` is already what the chat route shows an operator for this misconfiguration, and a
+    /// second wording invented here would describe one problem in two voices depending on which
+    /// door somebody came through. The row is closed rather than left `running`, because nothing
+    /// was spawned and so nothing else will ever close it.
+    #[tokio::test]
+    async fn a_local_team_member_whose_factory_has_no_local_route_says_so_and_stops() {
+        let (mut state, _root) = state_with_root().await;
+        state.assistants = std::sync::Arc::new(NoLocalRoute);
+
+        let run = team_run_for_member(&state, "tr-no-local-route").await;
+        let agent = local_member("a-frontier-moe");
+        let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+
+        spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+
+        let (status, _, stderr) = settled_run(&state, run_id).await;
+        assert_eq!(status, "failed");
+        assert_eq!(
+            stderr.as_deref(),
+            Some(
+                crate::assistants::Refusal::RouteNotConfigured
+                    .message(crate::chats::Brain::Local)
+                    .as_str()
+            ),
+            "the operator is told what the chat route would have told them"
+        );
     }
 
     async fn fetch_run(state: &AppState, id: &str) -> TeamRun {
