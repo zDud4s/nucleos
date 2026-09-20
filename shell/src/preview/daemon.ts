@@ -17,6 +17,7 @@ import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "..
 import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
 import type { EmailDetail } from "../data/mail";
 import type { VcsRequestSummary } from "../data/waiting";
+import type { QuotaReport } from "../data/quota";
 
 /**
  * A núcleo made of fixtures, for looking at pages with.
@@ -1854,6 +1855,63 @@ const SIDECARS: SidecarState[] = [
   },
 ];
 
+/**
+ * One quota reading, carrying every visual the notch can draw.
+ *
+ * Deliberately awkward rather than tidy, the rule the fixtures above follow: `claude` is the
+ * vendor's own endpoint, read a minute ago, with one comfortable window and one past the warning
+ * threshold; `codex` is the derived kind — computed from files on this machine, so hours old is
+ * normal rather than a fault — with a window that has since rolled over and no long window at all.
+ * Between them that is all four tones (`ok`, `warn`, `stale`, and the dashed `unmeasured` a missing
+ * window draws), both fidelities, and a countdown in days beside one in hours. A happy path here
+ * would photograph a notch that has never been asked a question.
+ */
+const QUOTA: QuotaReport = {
+  source: "sidecar",
+  cached: false,
+  providers: [
+    {
+      provider: "claude",
+      fidelity: "official",
+      read_at: ago(MINUTE),
+      detail: "",
+      severity: "warning",
+      windows: [
+        {
+          window: "7d",
+          used_fraction: 0.46,
+          resets_at: "2026-08-28T11:00:00Z",
+          stale: false,
+          state: "ok",
+        },
+        {
+          window: "5h",
+          used_fraction: 0.82,
+          resets_at: "2026-08-24T11:00:00Z",
+          stale: false,
+          state: "warn",
+        },
+      ],
+    },
+    {
+      provider: "codex",
+      fidelity: "derived",
+      read_at: ago(3 * HOUR),
+      detail: "",
+      severity: "",
+      windows: [
+        {
+          window: "5h",
+          used_fraction: 0.97,
+          resets_at: "2026-08-24T06:00:00Z",
+          stale: true,
+          state: "stale",
+        },
+      ],
+    },
+  ],
+};
+
 export function answer(path: string, init?: RequestInit): unknown {
   /*
     The house's capacity, with nobody holding a slot. It is here so the Codigo
@@ -1985,6 +2043,9 @@ export function answer(path: string, init?: RequestInit): unknown {
   }
 
   if (path === "/sidecars" && init?.method === undefined) return SIDECARS;
+
+  /* The notch's own reading. See `QUOTA` above for why these figures are the shape they are. */
+  if (path === "/quota") return QUOTA;
 
   /*
     Asking a supervisor to try now. Stateless, like every other write in this file, and

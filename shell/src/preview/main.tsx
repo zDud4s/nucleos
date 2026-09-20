@@ -8,6 +8,8 @@ import "../base.css";
 import "../ui.css";
 import "../app.css";
 import { createAppQueryClient } from "../app/queryClient";
+import { NotchWindow } from "../app/NotchWindow";
+import { windowKind } from "../app/notch-mode";
 import { createAppRouter } from "../router";
 import { adoptStyleNonce } from "../lib/style-nonce";
 import { NOW, answer, answerText, refusal } from "./daemon";
@@ -112,6 +114,13 @@ const tab = params.get("tab");
 const press = params.get("press");
 /** The title of an occurrence to pick up and hold, so the drag state can be photographed. */
 const drag = params.get("drag");
+/**
+ * A selector to hover once the page has settled, for a surface that opens on the pointer arriving
+ * rather than on a click — `QuotaNotch`'s floating host is the reason this exists: it unfolds on
+ * `onPointerEnter`, and `press` would land on a control inside it instead of on the gesture the
+ * surface actually needs.
+ */
+const hover = params.get("hover");
 
 interface PreviewWindow {
   /** Set once the page has settled, so the driver shoots a finished frame and not a spinner. */
@@ -127,7 +136,7 @@ declare global {
 window.__preview = { ready: false };
 
 const queryClient = createAppQueryClient();
-const router = createAppRouter(path);
+const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement);
 
 /*
   No `StrictMode`, the one place this differs from the app's entry — same
@@ -135,11 +144,36 @@ const router = createAppRouter(path);
   production build, and leaving it out removes a question about whether an
   effect ran once or twice. Nothing about what the page LOOKS like changes.
 */
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <QueryClientProvider client={queryClient}>
-    <RouterProvider router={router} />
-  </QueryClientProvider>,
-);
+if (windowKind(window.location.search) === "notch") {
+  /*
+    The floating quota notch (design D8) loads this same bundle with
+    `?window=notch` in the packaged app — see `main.tsx`, which this mirrors
+    so the harness can reach the window at all. `notch-host` on
+    `documentElement` is what `app.css` keys its transparent-ground rules off
+    of (`.notch-host, .notch-host body`); without it the notch would
+    photograph on the ordinary page background instead of the see-through
+    ground the real floating window draws over the desktop.
+
+    No router and none of `path`/`tab`/`press`/`drag` apply here — the notch
+    window never had one, same as it never has one in the packaged app — but
+    the fixture daemon and the pinned clock set up above are unaffected: both
+    branches share the one `queryClient` and the one faked `fetch`, so
+    `useQuota` reads the same `/quota` fixture either way.
+  */
+  document.documentElement.classList.add("notch-host");
+  root.render(
+    <QueryClientProvider client={queryClient}>
+      <NotchWindow />
+    </QueryClientProvider>,
+  );
+} else {
+  const router = createAppRouter(path);
+  root.render(
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+}
 
 /**
  * Move to a named tab before declaring the page ready.
@@ -251,6 +285,29 @@ function startDrag(title: string): boolean {
   return true;
 }
 
+/**
+ * Hover a selector before the page is declared ready.
+ *
+ * A pointer arriving, not a click: `QuotaNotch` unfolds on `onPointerEnter`, and React does not
+ * attach a listener on the element for that — like every event, it delegates to one listener at the
+ * root and synthesizes `enter`/`leave` from the BUBBLING `pointerover`/`mouseover` pair as it walks
+ * the path back up. `pointerenter`/`mouseenter` themselves never bubble, so dispatching either
+ * straight on the target does not reach the root listener at all, and the notch stays folded. Both
+ * pairs dispatched, because a real cursor fires both and a handler bound to either kind has to see
+ * one of them.
+ */
+function hoverElement(selector: string): boolean {
+  const element = document.querySelector(selector);
+  if (element === null) return false;
+  const at = element.getBoundingClientRect();
+  const origin = { clientX: at.left + at.width / 2, clientY: at.top + at.height / 2 };
+  element.dispatchEvent(
+    new PointerEvent("pointerover", { ...origin, bubbles: true, cancelable: true, pointerId: 1, pointerType: "mouse" }),
+  );
+  element.dispatchEvent(new MouseEvent("mouseover", { ...origin, bubbles: true, cancelable: true }));
+  return true;
+}
+
 /* Long enough for the queries to answer and the fonts to land. */
 window.setTimeout(() => {
   if (tab !== null) openTab(tab);
@@ -259,6 +316,9 @@ window.setTimeout(() => {
   if (drag !== null) startDrag(drag);
   window.setTimeout(
     () => {
+      // Before `ready`: the hover has to have landed and React has to have painted the unfolded
+      // state, or the screenshot races the frame it exists to catch.
+      if (hover !== null) hoverElement(hover);
       window.__preview.ready = true;
     },
     // Each extra press costs a tick before the page has settled; declaring ready on the old
