@@ -237,14 +237,12 @@ async fn collect_readout(state: AppState) -> HealthReadout {
     let browser_enabled = state.browser.enabled;
     let github_asked_for = state.github.enabled && state.github.configured;
     let github_binary = state.github.binary.clone();
-    let voice_armed = state.voice.armed;
     let stt_command = state.voice.stt_command.clone();
+    let voice_armed = probes_a_program(state.voice.armed, &stt_command);
     // `speaker.is_some()` and not `!tts_command.is_empty()`: `speaker_for` is the one place that
     // decides whether a command becomes a capability, and a probe that re-derives that condition is a
     // second opinion about it. The transcriber probe learned this the hard way with `split_command`.
-    // A COMMAND speaker only. A resident one has no program to look for, and the núcleo does not
-    // probe Ollama either — see `speaker_probe`.
-    let voice_speaks = state.voice.speaker.is_some() && !state.voice.tts_command.trim().is_empty();
+    let voice_speaks = probes_a_program(state.voice.speaker.is_some(), &state.voice.tts_command);
     let tts_command = state.voice.tts_command.clone();
     let (
         pool,
@@ -451,6 +449,23 @@ async fn hook_wired_in_any_project(pool: &SqlitePool) -> bool {
     })
     .await
     .unwrap_or(true)
+}
+
+/// PURE: whether a configured engine is a program this daemon would spawn, and so a program to grade.
+///
+/// Both voice rows ask this, and they ask it together rather than each in its own words: the
+/// transcriber row learned once already, with `split_command`, what it costs when a probe reasons
+/// about its subject differently from the code that runs it.
+///
+/// **A resident engine answers `false`, and that is the whole point.** `stt_url` and `tts_url` arm
+/// their halves of the pillar with no program anywhere, so grading them as programs would resolve an
+/// empty string, fail, and paint a machine red for being configured the faster way. Probing them over
+/// HTTP instead is the other wrong answer: this module grades programs this daemon spawns, and a row
+/// that graded the operator's whisper-server while saying nothing about their Ollama would be
+/// describing their setup rather than this daemon's. The failure surfaces where it can be acted on --
+/// a refused connection becomes a 502 and the window says which engine failed.
+fn probes_a_program(configured: bool, command: &str) -> bool {
+    configured && !command.trim().is_empty()
 }
 
 /// Whether the configured transcriber is a program that runs here.
@@ -1164,6 +1179,27 @@ mod tests {
         let encoded = serde_json::to_string(&readout).unwrap();
         assert!(!encoded.contains("password"));
         assert!(!encoded.contains("user:password@host"));
+    }
+
+    /// A resident transcriber has no program to look for, and must not be graded as if it had.
+    ///
+    /// `speaker_probe`'s twin, arrived at the same way and for the same reason. The regression is
+    /// concrete: `stt_url` alone arms the pillar, so without this the row would resolve the empty
+    /// string as a program, fail, and paint `voice_transcriber` red on a machine configured entirely
+    /// correctly -- and configured for the FASTER path at that. An HTTP probe is not the answer
+    /// either: this module probes programs this daemon spawns, and a row that graded the operator's
+    /// whisper-server while saying nothing about their Ollama would be describing their setup rather
+    /// than this daemon's. The failure still surfaces where it is actionable -- `HttpTranscriber`
+    /// reports a refused connection, `voice.rs` turns it into a 502.
+    #[test]
+    fn a_resident_engine_is_not_probed_as_a_program() {
+        // A command, on an armed pillar: there is a program, so it is graded.
+        assert!(probes_a_program(true, "whisper-cli -m model.bin"));
+        // `stt_url` alone. Armed, and nothing to resolve.
+        assert!(!probes_a_program(true, ""));
+        assert!(!probes_a_program(true, "   "));
+        // Off is off, whatever is written beside it.
+        assert!(!probes_a_program(false, "whisper-cli"));
     }
 
     /// A working transcriber behind a quoted path must not be reported as missing.

@@ -101,6 +101,18 @@ pub enum Kind {
     /// The fourth `Kind` and not a flag because it changes what the recording IS: part of a sentence
     /// whose speaker has not finished, so it gets no answer, no row, and no cleanup.
     Segment,
+    /// What a sentence being dictated sounds like SO FAR: transcribed, returned, and forgotten.
+    ///
+    /// The fifth `Kind`, and the one that makes dictation progressive. While somebody speaks, the
+    /// shell re-transcribes the sentence in flight and replaces what is provisional in the box, so
+    /// the same seconds of audio are transcribed many times over and only the last one is kept.
+    ///
+    /// Near-identical to `Segment` and deliberately not it, for one reason that would be a silent
+    /// data loss: `segment` strips the closing word from the tail, because in a hands-free turn that
+    /// word is punctuation addressed to the machine. In a dictation it is a word the person said, and
+    /// eating it would leave them proofreading against their own memory. A draft also needs no
+    /// verdict -- nothing is accumulating a turn -- so the two paths differ at both ends.
+    Draft,
 }
 
 impl Kind {
@@ -110,6 +122,7 @@ impl Kind {
             Kind::Memo => "memo",
             Kind::Conversation => "conversation",
             Kind::Segment => "segment",
+            Kind::Draft => "draft",
         }
     }
 }
@@ -886,6 +899,34 @@ pub async fn segment(
     Ok(SegmentTranscribed { text, verdict })
 }
 
+/// What a sentence still being spoken sounds like so far.
+///
+/// One field, and it stays a struct rather than becoming a bare string so the wire shape matches
+/// every other answer this endpoint gives. A caller that has to remember which kinds answer with an
+/// object and which with a scalar is a caller that will get it wrong once.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Drafted {
+    pub text: String,
+}
+
+/// One revision of a sentence in flight: transcribed, and nothing else at all.
+///
+/// The shortest path through this module, and the shortness is the design. Everything the other kinds
+/// do after `heard` -- cleaning up, storing a row, judging a verdict, stripping a control word,
+/// delivering to a chat -- is work that only makes sense once for a finished utterance, and this
+/// audio will be transcribed again in a fraction of a second. Hints still apply, because they run
+/// inside `heard`: a term heard wrong is heard wrong in a draft too, and the person is reading it.
+pub async fn draft(
+    voice: &VoiceRuntime,
+    wav: &[u8],
+    extension: &str,
+    duration: Duration,
+) -> Result<Drafted, CaptureError> {
+    Ok(Drafted {
+        text: heard(voice, wav, extension, duration).await?,
+    })
+}
+
 #[derive(Deserialize)]
 pub struct CaptureQuery {
     pub kind: Kind,
@@ -955,6 +996,15 @@ pub async fn post_capture(
             Err(error) => capture_error(error).into_response(),
         };
     }
+    // A draft is a sentence somebody is still saying, so it is transcribed and returned with nothing
+    // done to it. Cancellable for a sharper reason than the others: the shell abandons a revision the
+    // moment the next one is worth asking for, and that abandonment is how the loop keeps up.
+    if query.kind == Kind::Draft {
+        return match draft(&state.voice, &wav, extension, duration).await {
+            Ok(drafted) => axum::Json(drafted).into_response(),
+            Err(error) => capture_error(error).into_response(),
+        };
+    }
 
     let work = capture_and_record(
         state.pool.clone(),
@@ -980,11 +1030,12 @@ pub async fn post_capture(
             Ok(outcome) => outcome,
             Err(status) => return status.into_response(),
         },
-        // A dictation dies with its request. Conversation turns and unfinished segments do too — but
-        // neither reaches here, because both returned above before `work` was built. The arm is
-        // written out rather than folded into a `_` so that a new kind is a compile error here instead
-        // of silently inheriting a cancellation policy nobody chose for it.
-        Kind::Dictation | Kind::Conversation | Kind::Segment => work.await,
+        // A dictation dies with its request. Conversation turns, unfinished segments and drafts do
+        // too — but none of the three reaches here, because each returned above before `work` was
+        // built. The arms are written out rather than folded into a `_` so that a new kind is a
+        // compile error here instead of silently inheriting a cancellation policy nobody chose for
+        // it; `Kind::Draft` is what that guard caught, and it wanted the same answer.
+        Kind::Dictation | Kind::Conversation | Kind::Segment | Kind::Draft => work.await,
     };
 
     match outcome {
@@ -1286,15 +1337,30 @@ pub fn speaker_for(config: &crate::config::VoiceConfig) -> Option<Arc<dyn crate:
     Some(Arc::new(crate::speak::HttpSpeaker::new(url.to_string())))
 }
 
-/// Builds the transcriber a configured command implies, or `None` when voice is off.
+/// Builds the transcriber the configuration implies, or `None` when voice is off.
+///
+/// Shaped exactly like `speaker_for` above, and the reasoning transfers whole: both keys set is not
+/// an error, the resident one is simply better, and the one that is ignored says so in the log.
 pub fn transcriber_for(
     config: &crate::config::VoiceConfig,
 ) -> Option<Arc<dyn crate::transcribe::Transcriber>> {
-    config.armed().then(|| {
-        Arc::new(crate::transcribe::CommandTranscriber::new(
+    if !config.armed() {
+        return None;
+    }
+    let url = config.stt_url.trim();
+    if url.is_empty() {
+        return Some(Arc::new(crate::transcribe::CommandTranscriber::new(
             config.stt_command.clone(),
-        )) as Arc<dyn crate::transcribe::Transcriber>
-    })
+        )));
+    }
+    if !config.stt_command.trim().is_empty() {
+        tracing::warn!(
+            "voice: both stt_url and stt_command are set; using stt_url, which is roughly six times faster per clip and thirteen on a short one"
+        );
+    }
+    Some(Arc::new(crate::transcribe::HttpTranscriber::new(
+        url.to_string(),
+    )))
 }
 
 #[cfg(test)]
@@ -2138,6 +2204,69 @@ mod tests {
         assert!(list(&state.pool, Kind::Memo).await.unwrap().is_empty());
     }
 
+    #[test]
+    fn the_draft_kind_has_the_wire_spelling_the_shell_sends() {
+        assert_eq!(Kind::Draft.as_str(), "draft");
+        assert_eq!(
+            serde_json::from_str::<Kind>("\"draft\"").unwrap(),
+            Kind::Draft
+        );
+    }
+
+    /// A draft is returned WHOLE, and that is the entire reason it is not a segment.
+    ///
+    /// `segment` strips the closing word from the tail, which is right for a turn somebody ends by
+    /// saying "câmbio" and catastrophic for a dictation: it would eat a word that was said, silently,
+    /// and the person would be left proofreading a sentence against a memory of what they said. This
+    /// test says the same sentence to both paths, so the difference is the assertion.
+    #[tokio::test]
+    async fn a_draft_keeps_every_word_a_segment_would_strip() {
+        let state = conversing_state(hearing("muda o ficheiro câmbio")).await;
+
+        let drafted = draft(&state.voice, b"fake wav", "wav", Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(drafted.text, "muda o ficheiro câmbio");
+
+        // The same audio, the same runtime, the other path — and the word is gone.
+        let segmented = segment(&state, b"fake wav", "wav", Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(segmented.text, "muda o ficheiro");
+    }
+
+    /// Nothing is stored and nothing is cleaned up, because a sentence in flight is not a capture.
+    ///
+    /// A progressive dictation re-transcribes the sentence being spoken several times a second. A row
+    /// per revision would fill `voice_captures` with dozens of discarded guesses per utterance and
+    /// bury the one that was finally accepted; a cleanup model per revision would spend a 4B model on
+    /// a fragment — which is exactly the input it was measured inventing words on, 2026-09-20.
+    #[tokio::test]
+    async fn a_draft_is_recorded_nowhere_and_cleaned_up_never() {
+        let state = conversing_state(hearing("estou a meio de uma frase")).await;
+
+        draft(&state.voice, b"fake wav", "wav", Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert!(list(&state.pool, Kind::Dictation).await.unwrap().is_empty());
+        assert!(list(&state.pool, Kind::Memo).await.unwrap().is_empty());
+    }
+
+    /// Silence between two words is not a failure of the same shape it is for a whole dictation.
+    ///
+    /// `NothingHeard` becomes a 204, and the shell must read that as "no words yet" and keep the
+    /// revision it already has on screen — not blank the box mid-sentence. The status is the same one
+    /// `segment` answers, deliberately: two paths that mean the same thing may not say it differently.
+    #[tokio::test]
+    async fn a_draft_the_transcriber_heard_nothing_in_is_not_an_error() {
+        let state = conversing_state(hearing("")).await;
+        assert!(matches!(
+            draft(&state.voice, b"fake wav", "wav", Duration::from_secs(1)).await,
+            Err(CaptureError::NothingHeard)
+        ));
+    }
+
     #[tokio::test]
     async fn a_segment_the_transcriber_heard_nothing_in_is_not_an_error() {
         let state = conversing_state(hearing("")).await;
@@ -2287,6 +2416,49 @@ mod tests {
             std::io::ErrorKind::ConnectionRefused,
             "the spawning speaker was built instead of the resident one: {error}"
         );
+    }
+
+    /// A resident transcriber is built when `stt_url` is set, and it wins over a command.
+    ///
+    /// Asserted the way the speaker's twin is, and for the same reason there is no other way: the
+    /// two implementations have distinct failure signatures. A spawning transcriber built from this
+    /// command would fail trying to run a program that does not exist; a resident one fails with a
+    /// refused connection. Measured 2026-09-20, the difference the URL buys is 1210 ms a clip
+    /// against 191 ms -- six times, and thirteen on a short one, because what the spawning path
+    /// pays for is loading 487 MB of model rather than transcribing.
+    #[tokio::test]
+    async fn a_resident_transcriber_wins_over_a_spawning_one() {
+        let config = crate::config::VoiceConfig {
+            enabled: true,
+            stt_command: "no-such-program-anywhere".to_string(),
+            // Nothing listens here, which is the point.
+            stt_url: "http://127.0.0.1:1".to_string(),
+            ..Default::default()
+        };
+
+        let transcriber = transcriber_for(&config).expect("either key means a transcriber exists");
+        let error = transcriber
+            .transcribe(b"RIFF", "wav", std::time::Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "the spawning transcriber was built instead of the resident one: {error}"
+        );
+    }
+
+    /// And `stt_url` alone is enough: the pillar must not need a command it will never run.
+    #[test]
+    fn a_resident_transcriber_needs_no_command_beside_it() {
+        let config = crate::config::VoiceConfig {
+            enabled: true,
+            stt_url: "http://127.0.0.1:5018".to_string(),
+            ..Default::default()
+        };
+
+        assert!(config.armed());
+        assert!(transcriber_for(&config).is_some());
     }
 
     /// And a voice configured on a pillar that is off is not a capability either.

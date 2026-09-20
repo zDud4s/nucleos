@@ -903,6 +903,19 @@ pub struct VoiceConfig {
     /// contains spaces, which anything installed under `C:\Program Files` needs. Empty means there is
     /// no transcriber, which is indistinguishable from the pillar being off and is treated as such.
     pub stt_command: String,
+    /// A resident transcriber on loopback, e.g. `http://127.0.0.1:5018` for whisper.cpp's own
+    /// `whisper-server`.
+    ///
+    /// **Preferred over `stt_command` when both are set**, for the reason `tts_url` is preferred over
+    /// `tts_command`, and by a wider margin than that one. Measured here 2026-09-20 with
+    /// `ggml-small` on an RTX 3060: a 1.3 s clip costs 1250 ms spawned and 96 ms resident, a 5.6 s
+    /// clip 1210 ms against 191 ms. The floor is identical for a one-second clip and a five-second
+    /// one because what the spawning path pays for is loading 487 MB of model and waking CUDA, not
+    /// transcribing. `transcribe.rs` carries the table.
+    ///
+    /// That floor is why this key exists at all: progressive dictation re-transcribes the sentence
+    /// in flight as it is spoken, and a 1.2 s floor per revision is not progressive.
+    pub stt_url: String,
     /// Split into program + args exactly as `stt_command` is, but the text goes on STDIN and a WAV
     /// comes back on STDOUT — `speak.rs` explains why the two contracts differ. Empty means the
     /// núcleo has no voice, which is a smaller loss than having no transcriber: conversation still
@@ -948,6 +961,7 @@ impl Default for VoiceConfig {
         Self {
             enabled: false,
             stt_command: String::new(),
+            stt_url: String::new(),
             tts_command: String::new(),
             tts_url: String::new(),
             hotkey: DEFAULT_HOTKEYS[0].to_string(),
@@ -969,7 +983,11 @@ impl VoiceConfig {
     /// `enabled: true` with no transcriber is not half-on, it is off: the hotkey would record and then
     /// have nowhere to send the audio, which presents as the feature being broken rather than absent.
     pub fn armed(&self) -> bool {
-        self.enabled && !self.stt_command.trim().is_empty()
+        // Either engine arms it. Naming only `stt_command` here would leave a machine pointed at a
+        // resident server -- the configuration that is six times faster -- reporting no voice at all,
+        // which is the regression `a_resident_engine_is_a_voice_even_with_no_command` already had to
+        // be written for on the speaking side.
+        self.enabled && !(self.stt_command.trim().is_empty() && self.stt_url.trim().is_empty())
     }
 
     /// Whether this machine can say anything out loud.
@@ -3683,6 +3701,32 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         let clamped = load_voice_config(&path);
         assert_eq!(clamped.cleanup_prompt, DEFAULT_CLEANUP_PROMPT);
         assert_eq!(clamped.retain_dictations_days, 30);
+    }
+
+    /// A resident transcriber is a transcriber, and `armed()` may not be a synonym for `stt_command`.
+    ///
+    /// The same regression `a_resident_engine_is_a_voice_even_with_no_command` guards on the speaking
+    /// side, and it bites harder here: `armed()` gates the WHOLE pillar, so a machine pointed only at
+    /// a resident `whisper-server` -- the configuration that is six times faster -- would report
+    /// having no voice at all and hide every control for it.
+    #[test]
+    fn a_resident_transcriber_arms_the_pillar_with_no_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice.yaml");
+
+        std::fs::write(&path, "enabled: true\nstt_url: http://127.0.0.1:5018\n").unwrap();
+        let resident = load_voice_config(&path);
+        assert_eq!(resident.stt_url, "http://127.0.0.1:5018");
+        assert!(resident.armed());
+
+        // And blank is still blank, by both keys at once: whitespace is what a half-finished edit
+        // leaves behind, and it must not arm anything.
+        std::fs::write(
+            &path,
+            "enabled: true\nstt_url: \"   \"\nstt_command: \"  \"\n",
+        )
+        .unwrap();
+        assert!(!load_voice_config(&path).armed());
     }
 
     /// The shipped chords have to be chords THIS platform's own desktop leaves free.

@@ -212,6 +212,111 @@ impl Transcriber for CommandTranscriber {
     }
 }
 
+/// A transcriber that is already running, addressed over loopback.
+///
+/// The second implementation the module header promised, and the measurement that justifies it, taken
+/// on this machine 2026-09-20 with `ggml-small` on an RTX 3060, GPU warm:
+///
+/// | audio | `CommandTranscriber` | `HttpTranscriber` |
+/// |---|---|---|
+/// | 1.3 s | 1250 ms | 96 ms |
+/// | 5.6 s | 1210 ms | 191 ms |
+/// | 11.7 s | 2080 ms | 541 ms |
+/// | 37.2 s | 2680 ms | 1214 ms |
+///
+/// Read the first two rows together: a clip four times longer costs the spawning path nothing extra.
+/// That is the tell -- what it pays for is starting a process, loading 487 MB of weights and waking
+/// CUDA, and the transcription itself is the cheap part. A resident server pays that once, at
+/// startup, in 2.7 s.
+///
+/// So this is not a faster way of doing the same thing; it is what makes a different thing possible.
+/// Dictation that writes into the box as somebody speaks re-transcribes the sentence in flight, and
+/// at a 1.2 s floor per revision there is nothing progressive about it.
+///
+/// The contract is whisper.cpp's own server: `POST {base}/inference`, multipart, the audio under
+/// `file`, `response_format=text`, the transcript as the body. Chosen over inventing one for the
+/// reason `HttpSpeaker` gives about Piper -- an invented contract needs an adapter, and the adapter
+/// is the thing that breaks when the engine is upgraded.
+///
+/// What this deliberately does NOT send: the language, the model, the beam size. Those are the
+/// operator's, passed on the server's own command line exactly as they are passed in `stt_command`
+/// today. A daemon that sent `-l pt` per request would be quietly overriding a running service it
+/// does not own, and the two keys would then mean different things.
+pub struct HttpTranscriber {
+    base_url: String,
+    /// Built once and held. At one request per revision of a sentence in flight this is most of what
+    /// there is left to save once the model load is gone.
+    client: reqwest::Client,
+}
+
+impl HttpTranscriber {
+    pub fn new(base_url: String) -> Self {
+        Self {
+            // Trimmed rather than trusted, for the reason `HttpSpeaker` trims: `{base}//inference`
+            // against a URL that already ends in a slash is routed by some servers and 404'd by
+            // others, and a config file is exactly where a trailing slash gets typed.
+            base_url: base_url.trim().trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Transcriber for HttpTranscriber {
+    async fn transcribe(
+        &self,
+        audio: &[u8],
+        extension: &str,
+        duration: Duration,
+    ) -> std::io::Result<String> {
+        // The filename is built from `extension_for`'s output, never from a request's own string --
+        // the same rule the temp file above obeys, for the same reason, one layer further out.
+        let part = reqwest::multipart::Part::bytes(audio.to_vec())
+            .file_name(format!("capture.{extension}"))
+            .mime_str("application/octet-stream")
+            .map_err(std::io::Error::other)?;
+        let form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("response_format", "text");
+
+        let response = self
+            .client
+            .post(format!("{}/inference", self.base_url))
+            // The same deadline the spawning path is held to. It is never the binding constraint
+            // here -- 37 s of audio came back in 1.2 s -- so what it catches is a wedged server
+            // rather than a slow one, which is exactly what a deadline is for.
+            .timeout(deadline_for(duration))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| {
+                // `ConnectionRefused` and not `Other`, because this is the failure that actually
+                // happens: the server is simply not running. `voice.rs` turns it into a 502 and the
+                // window says the transcriber failed, which is true and is what to act on.
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!(
+                        "could not reach the transcriber at {}: {error}",
+                        self.base_url
+                    ),
+                )
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(std::io::Error::other(format!(
+                "the transcriber answered {status}"
+            )));
+        }
+
+        let text = response.text().await.map_err(std::io::Error::other)?;
+        // Trimmed like the spawning path trims stdout, so one transcript does not depend on which
+        // engine produced it. `voice.rs` treats an empty transcript as "nothing was heard", and a
+        // stray newline would make that judgement differ between the two implementations.
+        Ok(text.trim().to_string())
+    }
+}
+
 /// PURE: splits the configured command into program and arguments, honouring double quotes.
 ///
 /// A bare whitespace split is what `transcribe.go` does, and it is wrong here for a reason this very
@@ -596,5 +701,63 @@ mod tests {
     fn nothing_but_whitespace_is_no_command_at_all() {
         assert!(split_command("   ").is_empty());
         assert!(split_command("").is_empty());
+    }
+
+    /// A trailing slash in a config file is not a typo anybody notices, and `{base}//inference` is
+    /// routed by some servers and 404'd by others -- the same trap `HttpSpeaker` already trims for.
+    #[tokio::test]
+    async fn a_trailing_slash_in_the_url_does_not_become_a_double_one() {
+        for written in [
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1/",
+            "  http://127.0.0.1:1///  ",
+        ] {
+            let transcriber = HttpTranscriber::new(written.to_string());
+            let error = transcriber
+                .transcribe(b"RIFF", "wav", Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            // Nothing listens on port 1, so the request is REFUSED rather than answered -- which is
+            // the outcome that proves a URL was built and attempted at all.
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused,
+                "{written:?} produced {error}"
+            );
+            assert!(
+                !error.to_string().contains("1//"),
+                "{written:?} kept a double slash: {error}"
+            );
+        }
+    }
+
+    /// A server that is simply not running is the failure that actually happens, and it says so.
+    ///
+    /// `ConnectionRefused` and not `Other`, for the reason `speak.rs` gives: `voice.rs` turns it into
+    /// a 502 and the window says the transcriber failed, which is true and is what to act on. The
+    /// address is in the message because "transcription failed" with no port names nothing to check.
+    #[tokio::test]
+    async fn a_resident_server_that_is_not_there_reports_a_refused_connection() {
+        let transcriber = HttpTranscriber::new("http://127.0.0.1:1".to_string());
+        let error = transcriber
+            .transcribe(b"RIFF", "wav", Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(error.to_string().contains("127.0.0.1:1"), "{error}");
+    }
+
+    /// Both implementations answer the same deadline, because the trait's caller sizes it and neither
+    /// implementation may quietly decide the caller was wrong. Measured 2026-09-20, the resident
+    /// server does 37 s of audio in 1.2 s -- so this deadline is never the binding constraint there,
+    /// and it exists for the case where the server is wedged rather than slow.
+    #[test]
+    fn the_resident_path_is_held_to_the_same_deadline_as_the_spawning_one() {
+        assert_eq!(deadline_for(Duration::from_secs(2)), MIN_DEADLINE);
+        assert_eq!(
+            deadline_for(Duration::from_secs(60)),
+            Duration::from_secs(180)
+        );
     }
 }
