@@ -13785,18 +13785,13 @@ async fn post_refinement(
 async fn list_refinements(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::refine::Refinement>>, StatusCode> {
-    sqlx::query_as::<_, crate::refine::Refinement>(
-        "SELECT id, project_id, kind, title, body, status, proposal_id, supersedes, origin_run_id,
-                created_at, activated_at, ended_at
-           FROM refinements ORDER BY id DESC LIMIT 500",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map(Json)
-    .map_err(|error| {
-        tracing::warn!(%error, "listing refinements failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
+    crate::knowledge::all(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing refinements failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 /// One refinement, read the way a person decides about it: the text, every decision it has been
@@ -33068,7 +33063,7 @@ mod tests {
             .expect("a created refinement answers its own id");
 
         let origin: Option<i64> =
-            sqlx::query_scalar("SELECT origin_run_id FROM refinements WHERE id = ?")
+            sqlx::query_scalar("SELECT origin_run_id FROM knowledge WHERE id = ?")
                 .bind(refinement_id)
                 .fetch_one(&state.pool)
                 .await
@@ -33117,7 +33112,7 @@ mod tests {
             .expect("a created refinement answers its own id");
 
         let origin: Option<i64> =
-            sqlx::query_scalar("SELECT origin_run_id FROM refinements WHERE id = ?")
+            sqlx::query_scalar("SELECT origin_run_id FROM knowledge WHERE id = ?")
                 .bind(refinement_id)
                 .fetch_one(&state.pool)
                 .await
