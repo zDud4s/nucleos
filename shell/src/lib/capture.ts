@@ -17,7 +17,14 @@
  * callers here only want the whole thing at the end. Same three nodes, genuinely different job.
  */
 
-import { durationMs, encodeCapture } from "./audio";
+import {
+  durationMs,
+  encodeCapture,
+  monoAt16k,
+  TARGET_SAMPLE_RATE,
+  toPcm16,
+  wavBytes,
+} from "./audio";
 
 /** A microphone that is open, and everything needed to close it again. */
 export interface ActiveCapture {
@@ -70,17 +77,45 @@ export async function startCapture(
 
 /** What a finished recording is, once the graph is torn down: bytes to post, and how long they are. */
 export interface FinishedCapture {
-  bytes: Uint8Array;
+  /** `null` when a gate found no speech in the recording — see `finishCapture`. */
+  bytes: Uint8Array | null;
   ms: number;
 }
+
+/**
+ * Given the recording as 16 kHz mono samples, the part of it worth sending — or `null` for none.
+ *
+ * A function the caller supplies rather than something this file does, because deciding what counts as
+ * speech needs a model, and this file owns an audio graph and no opinions. `lib/speech.ts` has the
+ * implementation both callers would want.
+ */
+export type SpeechGate = (samples: Float32Array) => Promise<Float32Array | null>;
 
 /**
  * Closes the microphone and encodes what it heard.
  *
  * The device rate is read BEFORE the context is closed — a closed `AudioContext` reports nothing,
  * and encoding at the wrong rate produces audio that plays at the wrong speed rather than an error.
+ *
+ * With a `gate`, what is encoded is what the gate answered, and `bytes` is `null` when it answered
+ * nothing. The duration is measured from the samples that survive rather than from the ones recorded:
+ * the daemon turns it into a transcription deadline and stores it on the row, so 40 s of silence
+ * trimmed down to a sentence must not go on saying it was 40 s long.
  */
-export async function finishCapture(active: ActiveCapture): Promise<FinishedCapture> {
+/* Two overloads so the promise a caller gets back says the truth about its own call: without a gate
+   there is nothing that can decide against sending, so `bytes` is never `null` and a caller must not
+   be made to write a branch that cannot happen. */
+export async function finishCapture(
+  active: ActiveCapture,
+): Promise<{ bytes: Uint8Array; ms: number }>;
+export async function finishCapture(
+  active: ActiveCapture,
+  gate: SpeechGate,
+): Promise<FinishedCapture>;
+export async function finishCapture(
+  active: ActiveCapture,
+  gate?: SpeechGate,
+): Promise<FinishedCapture> {
   active.processor.disconnect();
   active.source.disconnect();
   active.sink.disconnect();
@@ -89,9 +124,19 @@ export async function finishCapture(active: ActiveCapture): Promise<FinishedCapt
   await active.context.close();
 
   const interleaved = concatFrames(active.frames);
+  if (gate === undefined) {
+    return {
+      bytes: encodeCapture(interleaved, 1, deviceRate),
+      ms: durationMs(interleaved.length, deviceRate),
+    };
+  }
+
+  const samples = monoAt16k(interleaved, 1, deviceRate);
+  const speech = await gate(samples);
+  if (speech === null) return { bytes: null, ms: 0 };
   return {
-    bytes: encodeCapture(interleaved, 1, deviceRate),
-    ms: durationMs(interleaved.length, deviceRate),
+    bytes: wavBytes(toPcm16(speech), TARGET_SAMPLE_RATE),
+    ms: durationMs(speech.length, TARGET_SAMPLE_RATE),
   };
 }
 

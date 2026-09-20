@@ -33,12 +33,13 @@ vi.mock("../data/client", async (original) => ({
    so the mock keeps the callback and a test hands it words as if they had been spoken. */
 const dictation = vi.hoisted(() => ({
   said: null as ((text: string) => void) | null,
+  trouble: null as string | null,
   toggle: vi.fn(),
 }));
 vi.mock("../data/dictation", () => ({
   useDictation: (onText: (text: string) => void) => {
     dictation.said = onText;
-    return { phase: "off", trouble: null, toggle: dictation.toggle };
+    return { phase: "off", trouble: dictation.trouble, toggle: dictation.toggle };
   },
 }));
 
@@ -74,6 +75,7 @@ beforeEach(() => {
   daemon.apiText.mockResolvedValue("daemon running");
   opener.openUrl.mockReset();
   opener.openUrl.mockResolvedValue(undefined);
+  dictation.trouble = null;
   localStorage.clear();
 });
 
@@ -2264,7 +2266,7 @@ describe("Chats - what it may do without asking", () => {
   // own for one commit, which put it in the right corner and cost every composer that row's height
   // whether or not anybody ever talked; "not in the settings row" was true of that arrangement too.
 
-  it("keeps voice on the typing line and the rung next to send", async () => {
+  it("keeps the microphone on the typing line and the rung next to send", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], {
         "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
@@ -2276,9 +2278,9 @@ describe("Chats - what it may do without asking", () => {
       ".chats-composer-actions",
     ) as HTMLElement;
     const line = container.querySelector(".chats-composer-line") as HTMLElement;
-    const voice = await screen.findByRole("button", { name: /^Talk$/ });
-    expect(settings.contains(voice)).toBe(false);
-    expect(line.contains(voice)).toBe(true);
+    const mic = await screen.findByRole("button", { name: /^Dictate$/ });
+    expect(settings.contains(mic)).toBe(false);
+    expect(line.contains(mic)).toBe(true);
     expect(line.contains(screen.getByRole("textbox", { name: /message/i }))).toBe(
       true,
     );
@@ -2336,6 +2338,24 @@ describe("Chats - what it may do without asking", () => {
           String(call[0]) === "/assistant/chats" && (call[1] as RequestInit)?.method === "POST",
       ),
     ).toBe(false);
+  });
+
+  /* A sentence about the microphone must not move the page it is reported on.
+     It used to be a paragraph UNDER the box, so every "nothing was heard" added a line and shifted
+     everything around it, and the next press took the line away again. The row of controls inside
+     the box is already there at that height whatever it says, so the notice goes in it — and is
+     ellipsized with the whole of it on `title`, because a long one growing the row is the same
+     defect one step further along. */
+  it("says what went wrong inside the row of controls, adding no line under the box", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}));
+    dictation.trouble = "nothing was heard";
+
+    const { container } = await renderChats("/chats");
+
+    const notice = await screen.findByText("nothing was heard");
+    const actions = container.querySelector(".chats-composer-actions") as HTMLElement;
+    expect(actions.contains(notice)).toBe(true);
+    expect(notice.title).toBe("nothing was heard");
   });
 
   // The owner's decision, and the reason the menu opens at all rather than being greyed whole: a
@@ -5229,5 +5249,70 @@ describe("Chats - how large the conversation is drawn", () => {
       // `scripts/css-contract.mjs` cannot tell from a typo.
       expect(other.className).not.toContain("chats-zoom-90");
     }
+  });
+});
+
+/* ------------------------------------- the microphone in an open chat -- */
+
+/**
+ * What the microphone in an open conversation's composer does.
+ *
+ * It used to run the hands-free conversation: press it and the núcleo listens, answers out loud, and
+ * nothing is ever written in the box. The owner's decision of 2026-09-19 splits the two — a chat is
+ * DICTATED to, and the spoken conversation lives on the Voice page — and the reason is the one the
+ * front door's microphone already had: what was heard has to be readable, and fixable, before it is
+ * sent. `câmbio` came back as `Campeu`, and a hands-free turn sends that without ever showing it.
+ */
+describe("Chats - the microphone in an open conversation", () => {
+  it("dictates into the box rather than starting a spoken conversation", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByRole("button", { name: /^Dictate$/ })).toBeDefined();
+    // And not the other one, because two microphones in one box is a choice nobody can make from
+    // the icons: both are a Mic, and both say "listening" once they are on.
+    expect(screen.queryByRole("button", { name: /^Talk$/ })).toBeNull();
+  });
+
+  it("lands a spoken sentence after what was already typed, and sends nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "olá" } });
+
+    act(() => dictation.said!("mundo"));
+
+    await waitFor(() => expect(textarea.value).toBe("olá mundo"));
+    // The gesture writes; it does not send. A misheard sentence must be correctable first.
+    expect(
+      daemon.apiFetch.mock.calls.some(
+        (call) =>
+          String(call[0]) === "/assistant/chats/c-1/messages" &&
+          (call[1] as RequestInit)?.method === "POST",
+      ),
+    ).toBe(false);
+  });
+
+  /* The same notice, in the same place, and here the reason is sharper than at the front door: this
+     box is pinned to the bottom of a conversation, so a line appearing under it pushed the whole
+     transcript up — the owner's words, 2026-09-20: "acaba por mudar a posição toda do resto da
+     página". */
+  it("says what went wrong inside the row of controls, adding no line under the box", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+    dictation.trouble = "nothing was heard";
+
+    const { container } = await renderChats("/chats/c-1");
+
+    const notice = await screen.findByText("nothing was heard");
+    const actions = container.querySelector(".chats-composer-actions") as HTMLElement;
+    expect(actions.contains(notice)).toBe(true);
   });
 });

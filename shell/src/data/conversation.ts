@@ -68,6 +68,14 @@ export interface ConversationView {
    * talking rather than the feature being broken. `null` until the microphone has been opened once.
    */
   listeningWith: "silero" | "energy" | null;
+  /**
+   * Why it is listening by loudness, in the runtime's own words, or `null` when it is not.
+   *
+   * Carried beside `listeningWith` because "it fell back" and "it fell back BECAUSE the policy refuses
+   * to compile WebAssembly" cost very different amounts to act on, and for one session this app knew
+   * the second and reported the first.
+   */
+  whyByLoudness: string | null;
   toggle: () => void;
 }
 
@@ -91,6 +99,7 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
   const [trouble, setTrouble] = useState<string | null>(null);
   const [hasVoice, setHasVoice] = useState(true);
   const [listeningWith, setListeningWith] = useState<"silero" | "energy" | null>(null);
+  const [whyByLoudness, setWhyByLoudness] = useState<string | null>(null);
 
   const phaseRef = useRef<ConversationPhase>("off");
   const chatRef = useRef<string | null>(chatId);
@@ -320,10 +329,11 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
       // Loaded once and kept: the model is 2.3 MB and the runtime's wasm is larger still, so paying
       // for it on every toggle would put a second of dead air at the front of every session.
       if (probeRef.current === null && listeningWithRef.current === null) {
-        const session = await loadSileroSession();
+        const { session, why } = await loadSileroSession();
         probeRef.current = session === null ? null : new SpeechProbe(session);
         listeningWithRef.current = session === null ? "energy" : "silero";
         setListeningWith(listeningWithRef.current);
+        setWhyByLoudness(why);
       }
       const stream = await navigator.mediaDevices.getUserMedia({
         // The three that make hands-free possible at all. `echoCancellation` is the load-bearing
@@ -488,7 +498,7 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
 
   const toggle = useCallback(() => dispatchRef.current({ type: "toggled" }), []);
 
-  return { phase, heard, trouble, hasVoice, listeningWith, toggle };
+  return { phase, heard, trouble, hasVoice, listeningWith, whyByLoudness, toggle };
 }
 
 function concat(frames: Float32Array[]): Float32Array {

@@ -1873,26 +1873,23 @@
   color: var(--text-muted);
 }
 
-/* Under the box, where every other answer about a message already appears. Wrapping rather than
-   growing: the transcript is a whole spoken sentence, and a row that widened for it would move the
-   controls above as somebody talks. */
-.chats-handsfree-status {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  min-width: 0;
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
+/* On the row of controls inside the box, not under it. Under it is under a composer pinned to the
+   foot of a conversation, so the notice appearing added a line and moved everything above it -- and
+   the next press took the line away and moved it all back. This row is drawn at this height whether
+   the microphone has anything to say or not, so saying it here costs no layout at all.
 
-/* Kept to one line. What matters is seeing AT A GLANCE that the question was heard wrong; reading
-   all of a long one back is what the chat's own transcript is for. */
-.chats-handsfree-status > span {
-  max-width: 48ch;
+   `min-width: 0` plus the ellipsis is the second half of the same promise: `.chats-composer-gap` is
+   `flex: 1` with a zero basis, so it yields nothing under pressure, and without a floor here a long
+   message ("no speech gate -- ...") would push the send button out of the box instead of shrinking.
+   The whole sentence stays reachable on `title`. */
+.chats-dictation-trouble {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
 }
 
 /* Pushes send to the far end without giving the row a `space-between`, which

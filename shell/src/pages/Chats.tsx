@@ -5,7 +5,10 @@ import {
   useEffect,
   useRef,
   useState,
+  type Dispatch,
   type ReactNode,
+  type RefObject,
+  type SetStateAction,
 } from "react";
 import { createPortal } from "react-dom";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
@@ -126,9 +129,7 @@ import { fetchFileBlob } from "../data/files";
 import { attachmentFrom, isPicture } from "../lib/picture";
 import { stillGoing } from "../lib/editor";
 import { diffLines } from "../lib/diff";
-import { ConversationView, useVoiceConversation } from "../data/conversation";
 import { useDictation, type DictationView } from "../data/dictation";
-import type { ConversationPhase } from "../lib/conversation";
 import type { LocalPull, ModelChoice } from "../data/chats";
 import {
   Button,
@@ -1421,24 +1422,7 @@ function StartBox({
   const box = useRef<HTMLTextAreaElement | null>(null);
   const sayable = text.trim() !== "" && !pending;
 
-  /* Appended, not substituted: somebody who typed half a sentence and then reached for the
-     microphone meant to continue it. The separating space is added only where there is not already
-     one, so dictating twice in a row does not open a gap that widens on every turn. The caret is
-     moved to the end because the box is written into next, and a caret left where it was would put
-     the following word in the middle of what was just said. */
-  const dictation = useDictation((said) => {
-    setText((was) => {
-      const joined = was === "" || /\s$/.test(was) ? `${was}${said}` : `${was} ${said}`;
-      setCaret(joined.length);
-      queueMicrotask(() => {
-        const field = box.current;
-        if (field === null) return;
-        field.focus();
-        field.setSelectionRange(joined.length, joined.length);
-      });
-      return joined;
-    });
-  });
+  const dictation = useDictationInto(setText, setCaret, box);
 
   const command = commandAt(text, caret);
   const mention = mentionAt(text, caret);
@@ -1600,6 +1584,16 @@ function StartBox({
             onPick={setEffort}
           />
           <span className="chats-composer-gap" />
+          {/* The one word about the microphone, on a row that exists at this height whether it
+              says anything or not. It was a paragraph under the box until 2026-09-20, and under
+              the box is under a composer pinned to the foot of a conversation: every "nothing was
+              heard" pushed the transcript up a line and the next press pulled it back down. It
+              shrinks rather than grows, with the whole sentence on `title`. */}
+          {dictation.trouble !== null && (
+            <span className="chats-dictation-trouble" title={dictation.trouble}>
+              {dictation.trouble}
+            </span>
+          )}
           {/* Here and not only in the conversation's own composer, which is where it went first and
               was the wrong half of the app: a session carried on from the editor is not a chat
               until its first message opens one, so until now the only way to reach a rung was to
@@ -1628,26 +1622,60 @@ function StartBox({
           </button>
         </div>
       </form>
-      {dictation.trouble !== null && (
-        <p className="chats-handsfree-status">{dictation.trouble}</p>
-      )}
     </>
   );
 }
 
 /**
+ * Dictation, wired into whichever box is being typed in.
+ *
+ * One copy for the two boxes that exist — the front door's and an open conversation's — because the
+ * appending is not the obvious `setText(was + said)` and getting it subtly wrong in one of them would
+ * read as the microphone misbehaving rather than as two implementations drifting.
+ *
+ * Appended, not substituted: somebody who typed half a sentence and then reached for the microphone
+ * meant to continue it. The separating space is added only where there is not already one, so
+ * dictating twice in a row does not open a gap that widens on every turn. The caret is moved to the
+ * end because the box is written into next, and a caret left where it was would put the following
+ * word in the middle of what was just said.
+ */
+function useDictationInto(
+  setText: Dispatch<SetStateAction<string>>,
+  setCaret: Dispatch<SetStateAction<number>>,
+  box: RefObject<HTMLTextAreaElement | null>,
+): DictationView {
+  return useDictation((said) => {
+    setText((was) => {
+      const joined = was === "" || /\s$/.test(was) ? `${was}${said}` : `${was} ${said}`;
+      setCaret(joined.length);
+      queueMicrotask(() => {
+        const field = box.current;
+        if (field === null) return;
+        field.focus();
+        field.setSelectionRange(joined.length, joined.length);
+      });
+      return joined;
+    });
+  });
+}
+
+/**
  * Speaking into the box instead of typing into it.
  *
- * **Not `HandsFreeToggle`, and the two must not be confused by whoever maintains them.** That one
- * runs a conversation: it hears a sentence, sends it as a turn, and plays the answer out loud. This
- * one produces TEXT and stops. The reason is not a smaller ambition — it is that neither end of the
- * conversation exists here. `data/dictation.ts` carries the whole argument; the short version is
- * that on this box the first sentence is what CREATES the conversation, and a conversation opened on
- * a misheard sentence is a billed row that can be archived and never deleted.
+ * **What it is not: a spoken conversation.** That one hears a sentence, sends it as a turn, and plays
+ * the answer out loud, never showing what it heard until it has already acted on it. This one
+ * produces TEXT and stops — and by the owner's decision of 2026-09-19 it is what BOTH boxes on this
+ * page do, the front door's and an open conversation's alike. The spoken conversation moves to the
+ * Voice page.
+ *
+ * The reason is the same in both places and it is not a smaller ambition. On the front door the first
+ * sentence is what CREATES the conversation, and one opened on a misheard sentence is a billed row
+ * that can be archived and never deleted. In an open chat the sentence is a turn, and `câmbio` coming
+ * back as `Campeu` — measured with the owner's voice on 2026-09-20 — is a turn spent on a question
+ * nobody asked. Transcription is wrong often enough that the correction has to be possible.
  *
  * So what lands is a draft, in the box, with the caret after it — read it, fix the word it got
- * wrong, and press send. Appended rather than replacing, because somebody who typed half a sentence
- * and then reached for the microphone meant to continue it.
+ * wrong, and press send.
  */
 function DictateToggle({ dictation }: { dictation: DictationView }) {
   const listening = dictation.phase === "listening";
@@ -5313,9 +5341,9 @@ function Composer({
   const [attached, setAttached] = useState<Attachment[]>([]);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const send = useSendMessage(chatId);
-  // Held here rather than inside the toggle, because the toggle and the status line below the box
-  // are two views of ONE conversation. Two `useVoiceConversation` calls would be two microphones.
-  const voice = useVoiceConversation(chatId);
+  // Held here rather than inside the toggle, because the toggle and the line below the box are two
+  // views of ONE microphone. Two `useDictation` calls would be two recordings.
+  const dictation = useDictationInto(setText, setCaret, box);
 
   /**
    * A question put back in the box, and the caret at the end of it.
@@ -5543,7 +5571,7 @@ function Composer({
               say();
             }}
           />
-          <HandsFreeToggle voice={voice} />
+          <DictateToggle dictation={dictation} />
         </div>
         {/* The controls belong to the words being typed, so they live in the box with them — which
             is the one structure every reference for this page shares. They used to be scattered:
@@ -5578,6 +5606,16 @@ function Composer({
             />
           )}
           <span className="chats-composer-gap" />
+          {/* The one word about the microphone, on a row that exists at this height whether it
+              says anything or not. It was a paragraph under the box until 2026-09-20, and under
+              the box is under a composer pinned to the foot of a conversation: every "nothing was
+              heard" pushed the transcript up a line and the next press pulled it back down. It
+              shrinks rather than grows, with the whole sentence on `title`. */}
+          {dictation.trouble !== null && (
+            <span className="chats-dictation-trouble" title={dictation.trouble}>
+              {dictation.trouble}
+            </span>
+          )}
           {/* Last before send, because it is the answer most likely to be changed in the moment of
               sending — "actually, plan this one" — and the hand is already on that corner. */}
           <PermissionMenu chatId={chatId} />
@@ -5591,94 +5629,10 @@ function Composer({
           </button>
         </div>
       </div>
-      <HandsFreeStatus voice={voice} />
       {send.isError && <MessageRefusal error={send.error} />}
     </form>
   );
 }
-
-/**
- * Talking to this chat instead of typing to it.
- *
- * Lives in the composer rather than in the Voice tab, because it belongs to a CONVERSATION and the
- * Voice tab has none: a spoken turn has to name the chat it joins, and `core/src/voice.rs` refuses
- * one that does not rather than guessing. In the box's top right corner, on the line being typed on,
- * and no longer in the row of message settings below -- what it starts is a turn, not a setting for
- * one. The Voice tab still owns the
- * chord that toggles this, for the unrelated reason that registering hotkeys is indivisible.
- *
- * Split from its own status line because the two want different places. The control belongs with the
- * other things you set about a message; what was heard and what went wrong belong under the box,
- * where every other answer about a message already appears.
- *
- * Every decision it appears to make is somewhere else: `lib/conversation.ts` decides what the phases
- * are, `lib/vad.ts` and `lib/silero.ts` decide when somebody is talking, and `data/conversation.ts`
- * runs the microphone.
- */
-function HandsFreeToggle({ voice }: { voice: ConversationView }) {
-  const on = voice.phase !== "off";
-
-  return (
-    <button
-      type="button"
-      className={on ? "chats-handsfree chats-handsfree-on" : "chats-handsfree"}
-      aria-pressed={on}
-      aria-label={on ? "Stop talking" : "Talk"}
-      title={
-        on
-          ? "stop the hands-free conversation"
-          : "talk to this conversation instead of typing — it answers out loud"
-      }
-      onClick={voice.toggle}
-    >
-      {on ? (
-        <MicOff className="chats-tool-icon" aria-hidden="true" />
-      ) : (
-        <Mic className="chats-tool-icon" aria-hidden="true" />
-      )}
-      {on && <span className="chats-handsfree-phase">{HANDS_FREE_PHASES[voice.phase]}</span>}
-    </button>
-  );
-}
-
-/** What the conversation heard, and anything that stopped it working. */
-function HandsFreeStatus({ voice }: { voice: ConversationView }) {
-  const on = voice.phase !== "off";
-  if (!on && voice.heard === null && voice.trouble === null) return null;
-
-  return (
-    <div className="chats-handsfree-status">
-      {/* Shown as soon as it is heard and BEFORE the answer, because a misheard question that only
-          becomes visible once it has been answered is a question nobody got to correct. */}
-      {voice.heard !== null && <span>heard: “{voice.heard}”</span>}
-      {on && !voice.hasVoice && (
-        <span>no voice on this machine — the answer will be written</span>
-      )}
-      {/* Only when it is the fallback. Saying "silero" every time would be noise about the thing
-          working; saying nothing when it is NOT would leave somebody watching turns open on a fan
-          with no reason to suspect the detector rather than the microphone. */}
-      {on && voice.listeningWith === "energy" && (
-        <span>listening by loudness — noise may open a turn</span>
-      )}
-      {voice.trouble !== null && <ErrorNote>{voice.trouble}</ErrorNote>}
-    </div>
-  );
-}
-
-/**
- * What each phase is called on screen.
- *
- * `speaking` says "answering" rather than "speaking" so the two participants are never described
- * with the same word — with the microphone open during the answer, which of the two is talking is
- * exactly what a person needs to be able to tell at a glance.
- */
-const HANDS_FREE_PHASES: Record<ConversationPhase, string> = {
-  off: "",
-  listening: "listening",
-  hearing: "hearing you",
-  thinking: "thinking",
-  speaking: "answering",
-};
 
 /**
  * What the caret is offering, above the box rather than below it.

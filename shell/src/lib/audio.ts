@@ -116,15 +116,29 @@ export function wavBytes(pcm: Int16Array, sampleRate: number): Uint8Array {
   return new Uint8Array(buffer);
 }
 
+/**
+ * The recording as the transcriber's own audio: one channel, 16 kHz, still floating point.
+ *
+ * Split out of `encodeCapture` because this is the form anything that has to LOOK at the audio needs.
+ * Silero is defined on 512-sample frames at 16 kHz, so a speech gate placed before the encoding reads
+ * exactly these samples — and one placed before the resampling would be judging frames that mean a
+ * different amount of time on every machine.
+ */
+export function monoAt16k(
+  interleaved: Float32Array,
+  channels: number,
+  deviceRate: number,
+): Float32Array {
+  return resampleLinear(downmixToMono(interleaved, channels), deviceRate, TARGET_SAMPLE_RATE);
+}
+
 /** The whole conversion, in the order the hardware forces. */
 export function encodeCapture(
   interleaved: Float32Array,
   channels: number,
   deviceRate: number,
 ): Uint8Array {
-  const mono = downmixToMono(interleaved, channels);
-  const resampled = resampleLinear(mono, deviceRate, TARGET_SAMPLE_RATE);
-  return wavBytes(toPcm16(resampled), TARGET_SAMPLE_RATE);
+  return wavBytes(toPcm16(monoAt16k(interleaved, channels, deviceRate)), TARGET_SAMPLE_RATE);
 }
 
 /**
