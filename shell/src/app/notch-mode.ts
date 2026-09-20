@@ -78,9 +78,17 @@ export function useNotchMode(): NotchMode | undefined {
  * Asks for the notch to move to the other host. The command answers before the move is made, so the
  * mode is not taken from its answer: the Rust side's broadcast says what actually happened — to
  * every window, this one included — and a move that failed comes back as the mode that stayed.
+ *
+ * Through `Promise.resolve().then()` and not `Promise.resolve(invoke(...))`, for `useNotchMode`'s
+ * reason: the second shape calls `invoke` first, so a synchronous throw — the browser preview, a
+ * command the build does not carry — escapes past the promise entirely, and both call sites catch
+ * on the promise.
  */
 export function useSetNotchMode() {
-  return (mode: NotchMode) => Promise.resolve(invoke("notch_set_mode", { mode })).then(() => {});
+  return (mode: NotchMode) =>
+    Promise.resolve()
+      .then(() => invoke("notch_set_mode", { mode }))
+      .then(() => {});
 }
 
 /**

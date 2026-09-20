@@ -76,11 +76,29 @@ impl std::fmt::Display for QuotaError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct QuotaClient {
     http: reqwest::Client,
     base: String,
     token: String,
+}
+
+/// Describes everything except the one thing that must not be described.
+///
+/// `CouncilRuntime`'s lesson, applied to the third struct that reaches `AppState` holding a
+/// credential. The bearer here is only the daemon's key for its own sidecar rather than a provider
+/// token (design D2), but it is still the key that opens the sidecar to anything on loopback, and
+/// `#[derive(Debug)]` is one `tracing::debug!(?state.quota, …)` away from writing it into a
+/// rotating log file — by somebody printing configuration, who will not be thinking about which
+/// secret is the small one.
+impl std::fmt::Debug for QuotaClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QuotaClient")
+            .field("base", &self.base)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The ceiling on one sidecar call. Above the sidecar's own 15s fetch timeout so a vendor that
@@ -130,6 +148,21 @@ mod tests {
     fn the_base_url_is_loopback_http() {
         let client = QuotaClient::new(crate::sidecar::QUOTA_ADDR, "t".into());
         assert_eq!(client.base, "http://127.0.0.1:8796");
+    }
+
+    /// The bearer must not come back out through the one formatter everybody reaches for.
+    #[test]
+    fn printing_the_client_does_not_print_its_bearer() {
+        let client = QuotaClient::new(crate::sidecar::QUOTA_ADDR, "s3cret-bearer".into());
+
+        let printed = format!("{client:?}");
+
+        assert!(!printed.contains("s3cret-bearer"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+        assert!(
+            printed.contains("127.0.0.1:8796"),
+            "the guard must still describe what it is guarding: {printed}"
+        );
     }
 
     /// A provider this build has never heard of must arrive intact rather than take the answer down.

@@ -18,7 +18,9 @@ export interface QuotaNotchProps {
   /**
    * Which host is drawing it (design D8). `contained` is always unfolded — it lives inside a page
    * with room to spare. `global` floats over every other window, so at rest it is the rings alone
-   * and it unfolds when the pointer or the keyboard reaches it.
+   * and it unfolds when the pointer reaches it, or when focus does. Focus is the weaker of the two
+   * there, and deliberately said so: the floating window is outside the Alt+Tab order, so focus
+   * only ever arrives after a click or from assistive tech (see the move control below).
    */
   host?: NotchMode;
   /**
@@ -84,16 +86,33 @@ export function QuotaNotch({ host = "contained", onMove }: QuotaNotchProps) {
           last known
         </span>
       )}
-      {/*
-        Only unfolded: folded, the floating notch is the rings and nothing else. Closing that window
-        (Alt+F4 reaches it) docks it too, so the control is never the only way back.
-      */}
       {onMove !== undefined &&
-        unfolded &&
         (host === "contained" ? (
           <IconButton label="Keep the notch in front of every window" icon={Pin} onClick={onMove} />
         ) : (
-          <IconButton label="Put the notch back inside NucleOS" icon={PinOff} onClick={onMove} />
+          /*
+            Folded, the floating notch is the rings and nothing else — but the way back is still
+            THERE, tucked into `.sr-only` rather than left unrendered. Rendered only when unfolded,
+            it could not be reached by a keyboard at all: the wrapper's `onFocus` fires from a
+            child, and the only focusable child was this button, so focus had nowhere to land and
+            the notch never unfolded. Tucked away it is out of flow — it measures nothing, so the
+            window the Rust side fits round this drawing is the same size it was — and it is the
+            first tab stop, which unfolds the notch and brings itself into view.
+
+            What that does NOT buy, and the old comment here claimed: reaching this window from the
+            keyboard in the first place. It is built `skip_taskbar(true)` (`notch.rs`), which on
+            Windows means WS_EX_TOOLWINDOW and no place in the Alt+Tab order, and `focused(false)`,
+            so it never takes focus by itself. Focus arrives when the owner clicks the notch, or
+            through assistive tech that can move it; Alt+F4 closes the window — which docks it —
+            only once focus is already there. So an owner working from the keyboard alone cannot
+            reach this control at all, and the main window has no other: `AppShell` draws no notch
+            while the mode is `global`, by design, and the mode has no home in settings yet. That
+            gap is named here rather than implied away — closing it is a decision about where such
+            a control belongs in the app, not a line of this component.
+          */
+          <span className={unfolded ? "quota-notch-back" : "sr-only"}>
+            <IconButton label="Put the notch back inside NucleOS" icon={PinOff} onClick={onMove} />
+          </span>
         ))}
     </div>
   );

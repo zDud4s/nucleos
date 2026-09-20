@@ -1,9 +1,11 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, waitFor } from "@testing-library/react";
 
-const tauri = vi.hoisted(() => ({ invoke: vi.fn() }));
+const tauri = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn(async () => () => {}) }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: tauri.invoke }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: tauri.listen }));
 
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn() }));
 vi.mock("../data/client", async (original) => ({
@@ -24,6 +26,7 @@ beforeEach(() => {
   vi.stubGlobal("ResizeObserver", StillObserver);
   tauri.invoke.mockReset();
   tauri.invoke.mockResolvedValue(undefined);
+  tauri.listen.mockClear();
   daemon.apiFetch.mockReset();
   daemon.apiFetch.mockResolvedValue({
     providers: [
@@ -61,5 +64,44 @@ describe("NotchWindow", () => {
     await waitFor(() =>
       expect(tauri.invoke).toHaveBeenCalledWith("notch_set_mode", { mode: "contained" }),
     );
+  });
+
+  /**
+   * The floating window holds no capability of its own (`src-tauri/src/notch.rs`), which buys it
+   * the app's own commands and nothing else: every plugin command, window API and event
+   * subscription is refused there. `listen` is the one that bites, because it is mocked in this
+   * file and in `notch-mode.test.tsx` — a subscription added to this page passes CI and is dead on
+   * the owner's screen, silently, since the page catches what it cannot do. So it is asserted
+   * outright rather than left to the mock: nothing here listens, and every command it does invoke
+   * is one of the app's own.
+   */
+  const OWN_COMMANDS = ["notch_fit", "notch_set_mode", "get_daemon_token"];
+
+  it("reaches for nothing the notch window is refused", async () => {
+    const { container, findByRole } = renderWithQuery(<NotchWindow />);
+    await waitFor(() => expect(container.querySelector(".quota-notch")).not.toBeNull());
+    fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
+    fireEvent.click(await findByRole("button", { name: "Put the notch back inside NucleOS" }));
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalled());
+
+    expect(tauri.listen).not.toHaveBeenCalled();
+    for (const [command] of tauri.invoke.mock.calls) expect(OWN_COMMANDS).toContain(command);
+  });
+
+  /**
+   * The same rule where a mock cannot reach it: a plugin import anywhere in this window's own
+   * modules. `@tauri-apps/api/event` is in `notch-mode.ts` for the main window's `useNotchMode`,
+   * which this page never calls — the import is inert, the call would not be — so the assertion is
+   * about the page's own files.
+   */
+  it("imports no plugin API into the notch window's own page", () => {
+    // The same normalisation `MapCanvas.test.tsx` and `one-waiting-phrase.test.ts` do: this runner
+    // hands `import.meta.url` over as a bare path, and `new URL` then resolves it against nothing.
+    const here = import.meta.url.startsWith("file:") ? import.meta.url : `file://${import.meta.url}`;
+    for (const name of ["NotchWindow.tsx", "QuotaNotch.tsx"]) {
+      const source = readFileSync(fileURLToPath(new URL(`./${name}`, here)), "utf8");
+      expect(source, name).not.toMatch(/@tauri-apps\/plugin-/);
+      expect(source, name).not.toMatch(/@tauri-apps\/api\/(event|window|webviewWindow)/);
+    }
   });
 });
