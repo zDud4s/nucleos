@@ -91,4 +91,20 @@ describe("notch mode", () => {
     act(() => tauri.heard[0]({ payload: "global" }));
     await waitFor(() => expect(result.current.mode).toBe("global"));
   });
+
+  /**
+   * A refusal that is thrown rather than rejected still comes back as a rejected promise.
+   * `invoke` throws synchronously where the command does not exist at all — the browser preview,
+   * an older build — and `Promise.resolve(invoke(...))` calls it before there is a promise to
+   * catch on, so the throw goes straight past both call sites' `.catch(() => {})` and out to the
+   * click handler that asked.
+   */
+  it("carries a synchronous refusal into the promise its callers catch on", async () => {
+    tauri.invoke.mockImplementation((command: string) => {
+      if (command === "notch_mode") return Promise.resolve("contained");
+      throw new Error("no such command");
+    });
+    const { result } = renderHook(() => useSetNotchMode(), { wrapper });
+    await expect(result.current("global")).rejects.toThrow("no such command");
+  });
 });

@@ -91,7 +91,9 @@ describe("QuotaNotch", () => {
     await findByText(/claude: 7d 46% /);
     expect(container.querySelectorAll(".ui-ring")).toHaveLength(1);
     expect(queryByText("claude")).toBeNull();
-    expect(container.querySelector("button")).toBeNull();
+    // The way back is rendered but tucked away — see the keyboard test below. Nothing of it is on
+    // screen: `.sr-only` is out of flow, so the window is still fitted to the rings alone.
+    expect(container.querySelector("button")?.closest(".sr-only")).not.toBeNull();
 
     fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
     await findByText("claude");
@@ -100,6 +102,32 @@ describe("QuotaNotch", () => {
 
     fireEvent.pointerLeave(container.querySelector(".quota-notch")!);
     await waitFor(() => expect(queryByText("claude")).toBeNull());
+  });
+
+  /**
+   * Focus is the other way the floating notch unfolds, and the only one a pointer is not needed
+   * for. Drawn only once unfolded, the control could never be reached: the wrapper hears focus from
+   * a child, and this button was the only child that could take it. The same element stays in the
+   * tree across the unfold, so the focus that opened the notch is still on it afterwards.
+   */
+  it("keeps the way back reachable by focus while it is folded", async () => {
+    answer({ providers: [claude()] });
+    const onMove = vi.fn();
+    const { findByText, getByRole, queryByText } = renderWithQuery(
+      <QuotaNotch host="global" onMove={onMove} />,
+    );
+    await findByText(/claude: 7d 46% /);
+    const back = getByRole("button", { name: "Put the notch back inside NucleOS" });
+    expect(back.closest(".sr-only")).not.toBeNull();
+    expect(queryByText("claude")).toBeNull();
+
+    fireEvent.focusIn(back);
+    await findByText("claude");
+    expect(getByRole("button", { name: "Put the notch back inside NucleOS" })).toBe(back);
+    expect(back.closest(".sr-only")).toBeNull();
+
+    fireEvent.click(back);
+    expect(onMove).toHaveBeenCalledOnce();
   });
 
   /** Inside the app the notch is always unfolded, and its control offers the other host. */
