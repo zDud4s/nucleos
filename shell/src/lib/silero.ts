@@ -106,29 +106,53 @@ export class SpeechProbe {
 export const MODEL_URL = "/models/silero_vad.onnx";
 
 /**
- * Builds a session against onnxruntime-web, or answers `null` if it cannot.
+ * A session, or the reason there is none. Exactly one of the two fields is filled.
  *
- * `null` rather than a throw, and the caller falls back to `energyOf`. That is the same call
+ * The reason is the whole point of the shape. This used to answer `VadSession | null`, and the `null`
+ * arm was produced by a `catch` with an empty body — so when WebView2 refused to compile the runtime's
+ * WebAssembly, what reached the screen was one line of status text saying the app was listening by
+ * loudness, and what reached nobody was a thrown error naming the policy that refused it. A whole
+ * session went into rediscovering that from the outside. Degrading is still right; degrading quietly
+ * is not.
+ */
+export interface SileroLoad {
+  session: VadSession | null;
+  why: string | null;
+}
+
+/** The runtime's own type, so a caller passing a fake is the only place that has to cast. */
+type OrtWasm = typeof import("onnxruntime-web/wasm");
+
+/**
+ * Builds a session against onnxruntime-web, or says why it cannot.
+ *
+ * A reason rather than a throw, and the caller falls back to `energyOf`. That is the same call
  * `voice.rs`'s `clean_up` makes about its own model — degraded output beats no output — and here it
- * covers a specific unknown: whether WebView2 loads this runtime's wasm under Tauri's custom
- * protocol. That has not been verified on a running app, so the failure has to be survivable.
+ * covers two failures that are both real on this machine and arrive from different lines: the policy
+ * refusing to compile WebAssembly at all (from the import), and the model or the runtime's `.wasm`
+ * not being served (from `create`, as `no available backend found`).
+ *
+ * `load` exists so both of those can be tested without standing up 13 MB of runtime; it defaults to
+ * the real import, which stays type-checked against the real module.
  *
  * Single-threaded on purpose. The threaded build needs `SharedArrayBuffer`, which needs
  * cross-origin isolation headers that a custom protocol does not send — so asking for threads is
  * asking for the one configuration most likely not to exist.
  */
-export async function loadSileroSession(): Promise<VadSession | null> {
+export async function loadSileroSession(
+  load: () => Promise<OrtWasm> = () => import("onnxruntime-web/wasm"),
+): Promise<SileroLoad> {
   try {
     // `onnxruntime-web/wasm` and NOT the package root, and the difference is 13 MB of shipped app.
     // The root entry pulls the `jsep` build, which carries WebGPU and WebNN backends this never asks
     // for: measured on this repo's own `npm run build`, the root emits a 26.8 MB wasm plus 401 KB of
     // glue, and this entry emits 13.5 MB plus 72 KB. Nothing here wants a GPU — Silero on 576
     // samples is about a millisecond on one CPU core.
-    const ort = await import("onnxruntime-web/wasm");
+    const ort = await load();
     ort.env.wasm.numThreads = 1;
     const session = await ort.InferenceSession.create(MODEL_URL);
 
-    return {
+    const built: VadSession = {
       async infer(window: Float32Array, state: Float32Array) {
         const feeds = {
           input: new ort.Tensor("float32", window, [1, window.length]),
@@ -144,7 +168,10 @@ export async function loadSileroSession(): Promise<VadSession | null> {
         };
       },
     };
-  } catch {
-    return null;
+    return { session: built, why: null };
+  } catch (error) {
+    // The message and not a sentence of this file's own: what was thrown here named the Content
+    // Security Policy directive that refused it, in words that would have cost an hour less.
+    return { session: null, why: error instanceof Error ? error.message : String(error) };
   }
 }

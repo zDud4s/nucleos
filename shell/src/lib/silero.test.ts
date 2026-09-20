@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   CONTEXT_SAMPLES,
+  loadSileroSession,
   SpeechProbe,
   STATE_SIZE,
   VadSession,
@@ -139,5 +140,84 @@ describe("the Silero probe", () => {
     // The 100 real samples land at the END of the context, so the newest audio stays adjacent to the
     // frame that follows it. Padding at the front is silence; padding at the back would be a gap.
     expect(windows[1][CONTEXT_SAMPLES - 1]).toBe(99);
+  });
+});
+
+/**
+ * What happens when the runtime does not load, which on this machine was every time.
+ *
+ * The session of 2026-09-18 shipped a VAD that never ran: the app said "listening by loudness" and
+ * the reason was a `catch {}` with nothing in it. The policy refused to compile WebAssembly — a
+ * legible error, thrown, caught, and dropped — and the next session spent its first hour finding out
+ * what was already known inside this function.
+ */
+describe("loading the runtime", () => {
+  /** The real module's type, so the fakes below are the only place that casts. */
+  type OrtWasm = typeof import("onnxruntime-web/wasm");
+
+  it("says why it could not load instead of only answering null", async () => {
+    const load = await loadSileroSession(async () => {
+      throw new Error("Compiling WebAssembly violates the Content Security Policy");
+    });
+
+    expect(load.session).toBeNull();
+    expect(load.why).toContain("Content Security Policy");
+  });
+
+  /**
+   * The second failure mode, and the one a CSP fix does not cover: the runtime loads and the MODEL
+   * does not. In `tauri dev` Vite serves `index.html` for the wasm's own URL, so the failure arrives
+   * from `create` rather than from the import — a different line, the same silence before this.
+   */
+  it("says why when the runtime loads and the model does not", async () => {
+    const ort = {
+      env: { wasm: { numThreads: 0 } },
+      InferenceSession: {
+        async create() {
+          throw new Error("no available backend found");
+        },
+      },
+    } as unknown as OrtWasm;
+
+    const load = await loadSileroSession(async () => ort);
+
+    expect(load.session).toBeNull();
+    expect(load.why).toContain("no available backend found");
+  });
+
+  /** A runtime that works answers a session and no reason, so a caller cannot report both. */
+  it("answers a session and nothing to explain when it works", async () => {
+    const ort = {
+      env: { wasm: { numThreads: 0 } },
+      InferenceSession: {
+        async create() {
+          return {
+            async run() {
+              return {
+                output: { data: Float32Array.from([0.42]) },
+                stateN: { data: new Float32Array(STATE_SIZE) },
+              };
+            },
+          };
+        },
+      },
+      Tensor: class {
+        constructor(
+          readonly type: string,
+          readonly data: unknown,
+          readonly dims: unknown,
+        ) {}
+      },
+    } as unknown as OrtWasm;
+
+    const load = await loadSileroSession(async () => ort);
+
+    expect(load.why).toBeNull();
+    const probability = await load.session?.infer(
+      new Float32Array(WINDOW_SAMPLES),
+      new Float32Array(STATE_SIZE),
+    );
+    // `toBeCloseTo` and not `toBe`: the data comes back as float32, where 0.42 is 0.41999998688697815.
+    expect(probability?.probability).toBeCloseTo(0.42);
   });
 });

@@ -43,7 +43,9 @@ beforeEach(() => {
   tauri.listen.mockReset();
   tauri.listen.mockResolvedValue(() => {});
   silero.loadSileroSession.mockReset();
-  silero.loadSileroSession.mockResolvedValue(null);
+  // The load's shape, not a session: these suites drive the energy fallback, which is what a
+  // machine with no runtime gets. `why` is what the fallback now has to carry.
+  silero.loadSileroSession.mockResolvedValue({ session: null, why: "no runtime in this suite" });
 
   processor = {
     onaudioprocess: null,

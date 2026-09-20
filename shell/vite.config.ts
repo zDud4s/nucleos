@@ -30,6 +30,26 @@ export default defineConfig(async () => ({
     tailwindcss(),
   ],
 
+  optimizeDeps: {
+    /**
+     * onnxruntime-web, unbundled, because pre-bundling breaks the URL of its own `.wasm`.
+     *
+     * The runtime locates its binary with `new URL("ort-wasm-simd-threaded.wasm", import.meta.url)`.
+     * Pre-bundled, `import.meta.url` is the optimizer's output directory, so the URL becomes
+     * `/node_modules/.vite/deps/ort-wasm-simd-threaded.wasm` — and the optimizer copies the `.mjs`
+     * glue there without the binary beside it. Measured against this repo's own dev server on
+     * 2026-09-19: that URL answers 200 with `text/html`, the SPA fallback, so the runtime is handed
+     * `index.html` where it expected WebAssembly.
+     *
+     * The failure was invisible for exactly as long as `loadSileroSession` had an empty `catch`: the
+     * app fell back to an energy threshold and said it was listening by loudness. Excluded here, Vite
+     * serves the package's own file from `node_modules`, where the `.wasm` is.
+     *
+     * Development only — `vite build` emits the binary as an asset and rewrites the URL to it.
+     */
+    exclude: ["onnxruntime-web"],
+  },
+
   resolve: {
     alias: {
       // What the registries' generated code imports by. Kept in step with the
