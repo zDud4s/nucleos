@@ -1666,7 +1666,11 @@ ol.ui-well {
   inset: 0;
   display: grid;
   place-items: center;
-  color: var(--text-muted);
+  /* Full ink, not muted. A mark is identity and not a reading, so it does not compete with the
+     arcs for meaning — but at muted it lost to them for attention, which is the opposite of what
+     the mark replaced the provider's printed name to do. Neutral ink also keeps design D12: the
+     only thing here that carries a state's colour is still the arc. */
+  color: var(--text);
   pointer-events: none;
 }
 
@@ -1680,7 +1684,9 @@ ol.ui-well {
 .ui-provider-mark-initial {
   fill: currentColor;
   font-family: var(--font-mono);
-  font-size: 15px;
+  /* In the path data's own 24x24 box, so it scales with the glyph rather than with the page: at
+     `ProviderMark`'s 16px this draws at about 11. */
+  font-size: 17px;
   font-weight: 600;
 }
 

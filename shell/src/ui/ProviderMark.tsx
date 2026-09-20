@@ -4,7 +4,7 @@
  * **A mark rather than the provider's name.** The notch printed `claude` and `codex` beside their
  * rings, and at this size the word costs more room than the drawing it labels — two rings and two
  * captions, in a column that has to stay narrow enough to live on a screen edge. A mark is
- * recognised without being read, which is the whole difference at twelve pixels.
+ * recognised without being read, which is the whole difference at this size.
  *
  * **Where the artwork comes from.** simple-icons 16.32.0 (`icons/claude.svg`, `icons/openai.svg`),
  * whose icon files are released under CC0-1.0 — a public-domain dedication, so nothing is owed for
@@ -40,11 +40,14 @@ export interface ProviderMarkProps {
 /**
  * What fits inside the inner track of a ring at `Ring`'s default size, with air around it.
  *
- * Ten and not twelve, which is what the first photograph of this said: the inner track leaves
- * about fifteen pixels of clear middle, and a twelve-pixel glyph filled it to the edges — the
- * Claude mark's radiating strokes ran into the arc and read as a smudge rather than as a mark.
+ * The history is the same mistake twice, from opposite ends, and worth keeping for that reason.
+ * Twelve pixels inside a 34px ring filled its 15px middle to the edges — the Claude mark's
+ * radiating strokes ran into the arc and read as a smudge. Ten cleared the arc and was then too
+ * small to read at all: a smudge with air round it instead of a smudge without. Neither number was
+ * the problem; the hole was too small for any mark. `Ring` grew to 44 and the middle to 22 with it,
+ * and sixteen leaves three pixels of air on every side of a glyph somebody can recognise.
  */
-const SIZE = 10;
+const SIZE = 16;
 
 export function ProviderMark({ provider, size = SIZE }: ProviderMarkProps) {
   const path = MARKS[provider.trim().toLowerCase()];

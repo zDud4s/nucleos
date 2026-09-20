@@ -72,8 +72,10 @@
      slot grows leftwards from its own ring and the ring does not move — the alternative is a
      drawing that jumps sideways the moment the pointer arrives. */
   align-items: flex-end;
-  /* Tightened from `--space-3` after the first photograph: two rings with that much air between
-     them read as two separate things parked beside each other rather than as one reading. */
+  /* Folded only. Tightened from `--space-3` after the first photograph: two rings with that much
+     air between them read as two separate things parked beside each other rather than as one
+     reading. Unfolded the same distance is too little, and the rule further down says why — the
+     right gap depends on what is in the column, which is the one thing that changes here. */
   gap: var(--space-2);
   padding: var(--space-2);
   background: var(--surface-raised);
@@ -88,9 +90,10 @@
  * The width the page gives back so the folded notch stands beside it rather than on top of it.
  *
  * Measured off the drawing rather than derived from it, because the drawing's width comes from its
- * content and CSS cannot ask: two 34px rings, `--space-2` of padding either side, one border. The
- * first photograph of this design is what made it necessary — pinned over a page at 1440px wide,
- * the folded notch sat on the right-hand column of the Teams table and hid the pulse bars in it.
+ * content and CSS cannot ask: a 44px ring, `--space-2` of padding either side, one border — 61px,
+ * rounded up to a whole rem. The first photograph of this design is what made it necessary —
+ * pinned over a page at 1440px wide, the folded notch sat on the right-hand column of the Teams
+ * table and hid the pulse bars in it.
  *
  * Unfolding still covers something, and that is the right trade: a page that reflowed every time
  * the pointer crossed the notch would be worse than a panel that overlaps for as long as somebody
@@ -98,7 +101,17 @@
  * here.
  */
 .app-main-notched {
-  padding-right: 3.25rem;
+  padding-right: 4rem;
+}
+
+/*
+  Unfolded, each slot is three lines of text tall instead of one ring, and `--space-2` between two
+  of them stops reading as a gap at all — the second provider's window names sit right under the
+  first's fidelity line. The padding is deliberately NOT part of this: it is what holds the rings
+  off the edge, and changing it would slide them sideways every time the pointer arrived.
+*/
+.quota-notch[data-unfolded="true"] {
+  gap: var(--space-3);
 }
 
 /* Pinned to the middle of the window's right edge. See the header for why this is `fixed`. */
@@ -121,7 +134,7 @@
   display: flex;
   flex-direction: row-reverse;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-3);
 }
 
 /**
@@ -138,8 +151,12 @@
 .quota-notch-detail {
   display: grid;
   grid-template-columns: auto auto auto;
-  column-gap: var(--space-2);
-  row-gap: 1px;
+  /* Three mono columns at `--space-2` ran together into one stripe of text: `7d` `46%` `resets in
+     3d` read as a single word before it read as three facts. */
+  column-gap: var(--space-3);
+  /* Was 1px, which is not a gap — two lines of mono at that distance are a block, and the unfolded
+     notch read as a paragraph nobody would finish. */
+  row-gap: var(--space-1);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--text-muted);
@@ -150,8 +167,15 @@
   display: contents;
 }
 
+/*
+  The figure the unfold exists to show, so it is the one thing here drawn at full size and full ink
+  — the window beside it and the reset after it are its labels, and a percentage set in the same
+  small grey as both of them is a table with no subject.
+*/
 .quota-notch-percent {
   text-align: right;
+  font-size: var(--text-sm);
+  font-weight: 600;
   color: var(--text);
 }
 
@@ -160,9 +184,15 @@
   color: var(--text-faint);
 }
 
-/* Across all three columns, under them: it is about the reading, not about one window of it. */
+/*
+  Across all three columns, under them, and ruled off: it is about the reading, not about one
+  window of it, and without the rule it read as a third window whose name had gone missing.
+*/
 .quota-notch-fidelity {
   grid-column: 1 / -1;
+  margin-top: var(--space-1);
+  padding-top: var(--space-1);
+  border-top: 1px solid var(--border);
 }
 
 /**

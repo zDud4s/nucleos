@@ -41,11 +41,19 @@ export interface RingProps {
   mark?: ReactNode;
 }
 
-/** The default outer diameter: what fits legibly in a notch beside a second provider. */
-const SIZE = 34;
+/**
+ * The default outer diameter: what fits legibly in a notch beside a second provider.
+ *
+ * Forty-four and not thirty-four, and what the extra ten pixels buy is the hole rather than the
+ * ring. Two tracks cost a fixed `2 * STROKE + GAP` of radius whatever the diameter, so the clear
+ * middle is what a small ring runs out of first: at 34 it was 15px across, and a mark with any air
+ * round it had nowhere to be. At 44 it is 22px. `.app-main-notched` in `app.css` is measured off
+ * this number and has to follow it.
+ */
+const SIZE = 44;
 /** Track thickness, and the gap between two tracks. Both in pixels, at `SIZE`. */
-const STROKE = 3.5;
-const GAP = 2.5;
+const STROKE = 4;
+const GAP = 3;
 
 /**
  * A reading drawn as concentric arcs — the outer track the long window, the inner track the short
