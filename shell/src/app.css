@@ -39,6 +39,105 @@
 }
 
 /**
+ * The notch: how much of each assistant's usage window is gone, at the top edge of the page area.
+ *
+ * `sticky` and not `fixed`. Fixed would take it out of the grid and put it over a rail whose width
+ * this file is careful never to know; sticky keeps it inside the column the grid hands over, so it
+ * centres over the page and stays put while the page scrolls under it, with nothing here having
+ * been told how wide anything else is.
+ *
+ * `width: fit-content` with `margin-inline: auto` is what centres it: a sticky block is still a
+ * block, and a full-width one would have nothing to centre.
+ *
+ * The z-index is `1` and deliberately small. It has to sit over the page it hovers above and over
+ * nothing else — a modal, a palette or a drawer must still come out in front of it, and a notch
+ * that outranked them would be a quota reading covering the control somebody opened.
+ */
+.quota-notch {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  width: fit-content;
+  margin-inline: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-2) var(--space-4);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  /* Square at the top, round below: it hangs from the edge rather than floating free, which is the
+     whole shape of a notch. */
+  border-top: none;
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+}
+
+.quota-notch-slot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* The provider's name, in the daemon's own face. Text, so that the rings are never the only thing
+   on screen carrying the reading. */
+.quota-notch-name {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/**
+ * The wrapper round the floating notch's way back into the app, unfolded.
+ *
+ * It exists for the folded state, where it carries `.sr-only` instead and keeps the control
+ * reachable by focus without drawing it (`QuotaNotch.tsx`). Unfolded it must get out of the way
+ * completely: one element, kept across both states so focus survives the unfold, and
+ * `display: contents` is what makes the button itself the flex item again — wrapped in an inline
+ * span it would sit on a baseline instead of on the notch's centre line, and the strip would grow
+ * by the descender it never needed.
+ */
+.quota-notch-back {
+  display: contents;
+}
+
+/* Shown only when the sidecar could not be reached. The figures beside it are real and old. */
+.quota-notch-stale {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/**
+ * The floating host: the notch window's whole document (design D8).
+ *
+ * The ground is see-through, so the window is the drawing and not a box round it — which is also
+ * why the scrollbar gutter `base.css` reserves is given back: in a window this size it would be a
+ * visible stripe beside the rings. Nothing scrolls here; the Rust side fits the window to the
+ * drawing instead.
+ */
+.notch-host,
+.notch-host body {
+  background: transparent;
+  scrollbar-gutter: auto;
+  overflow: hidden;
+}
+
+/*
+ * Sized by the drawing and never by the window. `max-content` is the load-bearing word: the window
+ * is still folded-narrow at the moment the notch unfolds, and a box that took its width from the
+ * viewport would measure that old width, hand it to `notch_fit`, and grow a few pixels per round —
+ * measured in the spike, where the names landed on top of the next provider's rings.
+ */
+.notch-window {
+  width: max-content;
+}
+
+/* Hung from the top of the screen rather than from the top of a page: no stickiness and no
+   centring, because the window is already centred and exactly this wide. */
+.quota-notch-global {
+  position: static;
+  margin-inline: 0;
+}
+
+/**
  * The page, centred in whatever room the rail leaves it.
  *
  * `max-width` without `margin-inline` is a width that is never used: the page stopped growing at

@@ -256,6 +256,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         email,
         web,
         browser,
+        quota,
         voice,
         speaker,
         github,
@@ -288,6 +289,13 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             "browser_sidecar",
             sidecar_probe("browser_sidecar", crate::sidecar::BROWSER, browser_enabled),
         ),
+        // Always `true`, unlike its three neighbours, because this sidecar has no pillar switch:
+        // it is supervised beside `echo`. A provider with no credential on this machine is a
+        // reading that says `unmeasured`, not a subsystem that is off.
+        run_subsystem(
+            "quota_sidecar",
+            sidecar_probe("quota_sidecar", crate::sidecar::QUOTA, true),
+        ),
         run_subsystem("voice_transcriber", voice_probe(voice_armed, stt_command)),
         run_subsystem("voice_speaker", speaker_probe(voice_speaks, tts_command)),
         run_subsystem("github", github_probe(github_asked_for, github_binary)),
@@ -306,6 +314,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         email,
         web,
         browser,
+        quota,
         voice,
         speaker,
         github,

@@ -76,6 +76,14 @@ pub fn build_router(state: AppState) -> Router {
             get(get_autopilot_budget).post(post_autopilot_budget),
         )
         .route("/autopilot/attention", post(post_attention_heartbeat))
+        // How much of each assistant's usage limit is gone. A read and nothing more in this phase:
+        // the notch draws it, and no part of this daemon acts on it yet.
+        //
+        // Registered here BEFORE anything in the shell calls it, which is the order
+        // `map_seam::no_screen_in_this_repository_asks_for_a_route_the_daemon_does_not_serve`
+        // enforces: a screen asking for a route the daemon does not serve fails that assertion,
+        // while a route served with no caller is explicitly allowed.
+        .route("/quota", get(get_quota))
         .route("/projects", get(get_projects))
         // The fleet canvas's authority: how much fits, and who is inside it. Beside `/projects`
         // because it answers about the same set — the roster — seen through capacity rather than
@@ -3101,6 +3109,15 @@ async fn post_autopilot_kill_scoped(
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// The quota readings, live from the sidecar or — when it cannot be reached — from the table.
+///
+/// Never an error: a sidecar that is down is an answer about the sidecar, and `quota::report`
+/// carries it in the body as `source: "stored"` plus the reason. Returning a 5xx would have the
+/// shell draw nothing, which looks exactly like a quota that has not been touched.
+async fn get_quota(State(state): State<AppState>) -> Json<crate::quota::QuotaReport> {
+    Json(crate::quota::report(&state.quota, &state.pool, chrono::Utc::now()).await)
 }
 
 async fn get_autopilot_budget(
@@ -14039,6 +14056,7 @@ mod tests {
                 browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
                 github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
                 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+                quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
                 calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
@@ -14946,6 +14964,7 @@ mod tests {
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
             github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
@@ -28603,6 +28622,7 @@ mod tests {
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
             github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,

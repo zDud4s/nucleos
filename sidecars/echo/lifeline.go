@@ -10,7 +10,7 @@ import (
 
 // lifelineVar is set by the daemon on every sidecar it supervises (core/src/sidecar.rs,
 // LIFELINE_VAR). Copied, not shared: each sidecar is its own Go module with no common package, so
-// the five copies of this file (echo, email, web, telegram, browser) must stay identical.
+// the six copies of this file (echo, email, web, telegram, browser, quota) must stay identical.
 const lifelineVar = "NUCLEOS_LIFELINE"
 
 // sigpipeCaught is where an armed lifeline sends this process's SIGPIPEs, and nothing reads it. A full

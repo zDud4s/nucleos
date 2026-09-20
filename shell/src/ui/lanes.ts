@@ -119,6 +119,9 @@ const LANE_OF: Record<string, FeedLane> = {
   proposal_record_failed: "machine",
   promotion_ready: "machine",
   token_efficiency: "machine",
+  // The machine's own ceiling, like the budget: it is about what this laptop may still spend, not
+  // about any one job — the burn it reports was made by all of them at once.
+  quota_warning: "machine",
   resume_did_not_act: "machine",
   secret_stored: "machine",
   secret_forgotten: "machine",

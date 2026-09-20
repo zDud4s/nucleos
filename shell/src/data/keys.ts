@@ -38,6 +38,9 @@ export const keys = {
    */
   concurrency: ["concurrency"] as const,
 
+  /** How much of each assistant's usage window is gone — `GET /quota`. */
+  quota: ["quota"] as const,
+
   autopilot: {
     /** The prefix, for the rare caller that means *everything autopilot*. */
     all: ["autopilot"] as const,

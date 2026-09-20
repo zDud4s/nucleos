@@ -19,6 +19,7 @@ pub const TELEGRAM: &str = "telegram";
 pub const EMAIL: &str = "email";
 pub const WEB: &str = "web";
 pub const BROWSER: &str = "browser";
+pub const QUOTA: &str = "quota";
 
 /// The two values [`SidecarState::state`] takes, written once because it is serialized to the shell.
 const RUNNING: &str = "running";
@@ -483,6 +484,37 @@ pub const WEB_ADDR: &str = "127.0.0.1:8794";
 /// bind anything else. A listener off this machine would hand those sessions to whoever asked.
 pub const BROWSER_ADDR: &str = "127.0.0.1:8795";
 
+/// Where the quota sidecar answers the núcleo. 8796 follows the browser sidecar (8795).
+///
+/// A constant for the same reason the three above are: one fact shared by two processes, and a fact
+/// with two homes eventually has two values. The Go side's copy is `config.DefaultAddr` in
+/// `sidecars/quota/config/config.go`, and it too refuses to bind anything that is not loopback —
+/// this process answers with how much of the owner's usage limit is gone, which is nobody else's
+/// business, and it reaches the vendor holding the owner's own token (design D2).
+pub const QUOTA_ADDR: &str = "127.0.0.1:8796";
+
+/// The quota sidecar's environment (spec §1.4, design D2).
+///
+/// Deliberately SHORT, and the absences are the design. No credential is passed: the sidecar reads
+/// the owner's Claude token out of Claude Code's own file at the point of use and hands back a
+/// percentage, so the núcleo never holds it — which is why it is not in the Credential Manager and
+/// not a parameter here. No thresholds either: what counts as alarming is decided in `quota.rs`
+/// against settings the owner can change, and a copy out here would only change when the process
+/// restarts.
+///
+/// The TTLs are named rather than left to the sidecar's defaults because they are the floor that
+/// stops the núcleo's polling from becoming a reason to run out of quota, and a floor nobody can
+/// see is one somebody later assumes is lower.
+pub fn quota_env(daemon_url: &str, daemon_token: &str) -> Vec<(String, String)> {
+    vec![
+        ("NUCLEOS_DAEMON_URL".to_string(), daemon_url.to_string()),
+        ("NUCLEOS_DAEMON_TOKEN".to_string(), daemon_token.to_string()),
+        ("QUOTA_ADDR".to_string(), QUOTA_ADDR.to_string()),
+        ("QUOTA_SUCCESS_TTL_SECS".to_string(), "60".to_string()),
+        ("QUOTA_ERROR_TTL_SECS".to_string(), "10".to_string()),
+    ]
+}
+
 /// The browser sidecar's environment (spec §8).
 ///
 /// The site lists are deliberately ABSENT, exactly as the trust allowlist is absent from
@@ -785,6 +817,30 @@ mod tests {
         // travels separately from the IMAP one rather than being derived from it.
         assert_eq!(env["EMAIL_SMTP_HOST"], "smtp.gmail.com");
         assert_eq!(env["EMAIL_SMTP_PORT"], "465");
+    }
+
+    /// The quota sidecar is handed no secret, and that is the property worth a test rather than a
+    /// comment.
+    ///
+    /// Design D2 turns on the núcleo never taking custody of Claude Code's token: the sidecar reads
+    /// it where it lies and hands back a percentage. The cheapest way to break that is for somebody
+    /// later to "fix" a 401 by passing the token through here, which would put another application's
+    /// credential into this process's environment, its child's command line, and every crash dump
+    /// either of them produces.
+    #[test]
+    fn the_quota_sidecar_is_given_the_port_and_no_credential_of_the_providers() {
+        let env: HashMap<String, String> = quota_env("http://127.0.0.1:8791", "daemon-token")
+            .into_iter()
+            .collect();
+
+        assert_eq!(env["QUOTA_ADDR"], QUOTA_ADDR);
+        assert_eq!(env["NUCLEOS_DAEMON_TOKEN"], "daemon-token");
+        for name in env.keys() {
+            assert!(
+                !name.contains("CLAUDE") && !name.contains("CODEX") && !name.contains("OAUTH"),
+                "{name} looks like a provider credential; the quota sidecar reads those itself"
+            );
+        }
     }
 
     /// An unconfigured submission host must reach the sidecar as an ABSENCE, not as an empty string.
