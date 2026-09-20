@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { Learned } from "./Learned";
-import type { Refinement, RefinementHistory } from "../data/refinements";
+import type { Known, KnowledgeHistory } from "../data/knowledge";
 import { renderWithRouter } from "../test/harness";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -16,10 +16,13 @@ beforeEach(() => {
   daemon.apiFetch.mockReset();
 });
 
-function refinement(over: Partial<Refinement> = {}): Refinement {
+function known(over: Partial<Known> = {}): Known {
   return {
     id: 1,
-    project_id: "nucleos",
+    layer: "semantic",
+    scope_kind: "project",
+    scope_id: "nucleos",
+    source: "run",
     kind: "memory",
     title: "The suite needs Git's usr/bin on PATH",
     body: "Nine tests spawn echo as a program.",
@@ -34,14 +37,14 @@ function refinement(over: Partial<Refinement> = {}): Refinement {
   };
 }
 
-/** A daemon holding exactly these refinements, and answering the detail route from them. */
-function daemonWith(rows: Refinement[], history?: Partial<RefinementHistory>) {
+/** A daemon holding exactly this much, and answering the detail route from it. */
+function daemonWith(rows: Known[], history?: Partial<KnowledgeHistory>) {
   return (path: string) => {
-    if (path === "/refinements") return Promise.resolve(rows);
-    if (path.startsWith("/refinements/")) {
+    if (path === "/knowledge") return Promise.resolve(rows);
+    if (path.startsWith("/knowledge/")) {
       const id = Number(path.split("/")[2]);
       return Promise.resolve({
-        refinement: rows.find((row) => row.id === id) ?? rows[0],
+        known: rows.find((row) => row.id === id) ?? rows[0],
         events: [],
         replaced: [],
         replaced_by: null,
@@ -61,13 +64,13 @@ async function panelFor(headingText: string | RegExp): Promise<HTMLElement> {
 }
 
 describe("Learned", () => {
-  it("four kinds of refinement wear one tone, because a kind is not a state", async () => {
+  it("four kinds wear one tone, because a kind is not a state", async () => {
     daemon.apiFetch.mockImplementation(
       daemonWith([
-        refinement({ id: 1, kind: "prompt" }),
-        refinement({ id: 2, kind: "memory" }),
-        refinement({ id: 3, kind: "skill" }),
-        refinement({ id: 4, kind: "subagent" }),
+        known({ id: 1, kind: "prompt" }),
+        known({ id: 2, kind: "memory" }),
+        known({ id: 3, kind: "skill" }),
+        known({ id: 4, kind: "subagent" }),
       ]),
     );
 
@@ -83,9 +86,9 @@ describe("Learned", () => {
   it("keeps what is waiting apart from what is in force", async () => {
     daemon.apiFetch.mockImplementation(
       daemonWith([
-        refinement({ id: 1, status: "active", title: "already in force" }),
-        refinement({ id: 2, status: "proposed", title: "still a question", proposal_id: 9 }),
-        refinement({ id: 3, status: "reverted", title: "taken back" }),
+        known({ id: 1, status: "active", title: "already in force" }),
+        known({ id: 2, status: "proposed", title: "still a question", proposal_id: 9 }),
+        known({ id: 3, status: "reverted", title: "taken back" }),
       ]),
     );
 
@@ -105,11 +108,11 @@ describe("Learned", () => {
     expect(within(await panelFor("No longer in force")).getByText("taken back")).toBeDefined();
   });
 
-  it("sends the two answers to the proposal and the revert to the refinement", async () => {
+  it("sends the two answers to the proposal and the revert to the row", async () => {
     daemon.apiFetch.mockImplementation(
       daemonWith([
-        refinement({ id: 1, status: "active", title: "in force", proposal_id: 7 }),
-        refinement({ id: 2, status: "proposed", title: "a question", proposal_id: 9 }),
+        known({ id: 1, status: "active", title: "in force", proposal_id: 7 }),
+        known({ id: 2, status: "proposed", title: "a question", proposal_id: 9 }),
       ]),
     );
 
@@ -117,7 +120,7 @@ describe("Learned", () => {
     await screen.findByText("a question");
 
     // Yes and no go through the proposal doors — the núcleo dispatches on the
-    // proposal's kind — while a revert is aimed at the refinement, because the
+    // proposal's kind — while a revert is aimed at the row itself, because the
     // question was answered long ago and what changes now is the layer.
     // `waitFor` and not a bare assertion: react-query defers the mutation, so
     // the request has not been made in the tick the click returns in.
@@ -138,7 +141,7 @@ describe("Learned", () => {
     await new Promise((resolve) => setTimeout(resolve, 350));
     fireEvent.click(screen.getByRole("button", { name: /no longer applies/i }));
     await waitFor(() =>
-      expect(daemon.apiFetch).toHaveBeenCalledWith("/refinements/1/revert", {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/knowledge/1/revert", {
         method: "POST",
         body: "{}",
       }),
@@ -148,9 +151,9 @@ describe("Learned", () => {
   it("does not ask for a chain until somebody opens one", async () => {
     daemon.apiFetch.mockImplementation(
       daemonWith(
-        [refinement({ id: 4, status: "active", title: "current text", supersedes: 3 })],
+        [known({ id: 4, status: "active", title: "current text", supersedes: 3 })],
         {
-          replaced: [refinement({ id: 3, status: "superseded", title: "what it said before" })],
+          replaced: [known({ id: 3, status: "superseded", title: "what it said before" })],
         },
       ),
     );
@@ -160,8 +163,8 @@ describe("Learned", () => {
 
     // One request per row would make reading a list of forty cost forty-one
     // calls to answer a question nobody has asked yet.
-    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/refinements/4", expect.anything());
-    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/refinements/4");
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/knowledge/4", expect.anything());
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/knowledge/4");
 
     fireEvent.click(screen.getByRole("button", { name: /What it replaced/ }));
 
@@ -179,31 +182,31 @@ describe("Learned", () => {
     expect(screen.queryByRole("heading", { level: 2, name: "In force" })).toBeNull();
   });
 
-  it("the headline names refinements", async () => {
+  it("the headline names what is waiting", async () => {
     // "waiting on you" is the one queue's phrase, and this page counts one kind
-    // of thing: a refinement somebody proposed. Naming it is what lets a reader
+    // of thing: a note somebody proposed. Naming it is what lets a reader
     // hold Home's number and this one at the same time without adding them up.
     daemon.apiFetch.mockImplementation(
       daemonWith([
-        refinement({ id: 1, status: "active", title: "in force" }),
-        refinement({ id: 2, status: "proposed", title: "one", proposal_id: 9 }),
-        refinement({ id: 3, status: "proposed", title: "two", proposal_id: 10 }),
-        refinement({ id: 4, status: "proposed", title: "three", proposal_id: 11 }),
+        known({ id: 1, status: "active", title: "in force" }),
+        known({ id: 2, status: "proposed", title: "one", proposal_id: 9 }),
+        known({ id: 3, status: "proposed", title: "two", proposal_id: 10 }),
+        known({ id: 4, status: "proposed", title: "three", proposal_id: 11 }),
       ]),
     );
 
     await renderWithRouter(<Learned />);
 
     expect(
-      (await screen.findByText(/refinements proposed/)).textContent,
-    ).toBe("one note is in force; 3 refinements proposed");
+      (await screen.findByText(/notes proposed/)).textContent,
+    ).toBe("one note is in force; 3 notes proposed");
   });
 
-  it("says nothing proposed when every refinement is settled", async () => {
+  it("says nothing proposed when everything is settled", async () => {
     daemon.apiFetch.mockImplementation(
       daemonWith([
-        refinement({ id: 1, status: "active", title: "in force" }),
-        refinement({ id: 2, status: "reverted", title: "taken back" }),
+        known({ id: 1, status: "active", title: "in force" }),
+        known({ id: 2, status: "reverted", title: "taken back" }),
       ]),
     );
 

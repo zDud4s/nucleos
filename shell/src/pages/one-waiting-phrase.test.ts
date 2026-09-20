@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
  * One arithmetic owns the phrase "waiting on you": the Waiting page's own six
  * decision lists, shown on Home and on the rail badge. Every other surface
  * names the noun it actually counts — proposals, team actions, runs awaiting
- * approval, refinements proposed. Eight pages once said "waiting on you" about
+ * approval, notes proposed. Eight pages once said "waiting on you" about
  * eight different numbers, and a reader had no way to tell which one was the
  * queue. This test is the fence: a new page that borrows the phrase fails here
  * rather than in a screenshot nobody reads.

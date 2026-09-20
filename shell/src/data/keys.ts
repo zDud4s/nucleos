@@ -300,18 +300,18 @@ export const keys = {
 
   /**
    * What the agent has been told, and what it asked to be told — `GET
-   * /refinements`.
+   * /knowledge`.
    *
-   * Its own root and not a child of `proposals`, although a refinement waiting
+   * Its own root and not a child of `proposals`, although something waiting
    * for an answer IS a proposal: `GET /proposals` filters `kind =
    * 'action-approval'` (`core/src/proposals.rs`), so the two lists never
    * overlap, and a page invalidating one would refetch a list that cannot have
    * changed. `detail` carries the chain, which is the half the listing has no
    * room for.
    */
-  refinements: {
-    all: ["refinements"] as const,
-    detail: (id: number) => ["refinements", "detail", id] as const,
+  knowledge: {
+    all: ["knowledge"] as const,
+    detail: (id: number) => ["knowledge", "detail", id] as const,
   },
 
   /**

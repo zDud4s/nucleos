@@ -1,15 +1,15 @@
 import { useState, type ReactNode } from "react";
 import { isApiRefusal } from "../data/client";
 import {
-  useApproveRefinement,
-  useRefinementHistory,
-  useRefinements,
-  useRejectRefinement,
-  useRevertRefinement,
-  type Refinement,
-  type RefinementKind,
-  type RefinementStatus,
-} from "../data/refinements";
+  useApproveKnowledge,
+  useKnowledge,
+  useKnowledgeHistory,
+  useRejectKnowledge,
+  useRevertKnowledge,
+  type Known,
+  type KnownKind,
+  type KnownStatus,
+} from "../data/knowledge";
 import {
   Button,
   ConfirmButton,
@@ -31,8 +31,8 @@ import "./learned.css";
 /**
  * Learned — what the agent has been told, and what it asked to be told.
  *
- * The page exists because the layer behind it was, until this slice, invisible.
- * A refinement waiting for an answer is a `kind = 'refinement'` proposal, and
+ * The page exists because the store behind it was, until this slice, invisible.
+ * Something waiting for an answer is a `kind = 'refinement'` proposal, and
  * `proposals::list_pending` filters `kind = 'action-approval'` — so the Waiting
  * queue, which is the page for everything that stopped to ask you something,
  * structurally could not show one. A decision queue nobody can see is a queue
@@ -50,12 +50,12 @@ import "./learned.css";
  * would otherwise be forty-one requests to answer a question nobody asked.
  */
 export function Learned() {
-  const refinements = useRefinements();
-  const approve = useApproveRefinement();
-  const reject = useRejectRefinement();
-  const revert = useRevertRefinement();
+  const knowledge = useKnowledge();
+  const approve = useApproveKnowledge();
+  const reject = useRejectKnowledge();
+  const revert = useRevertKnowledge();
 
-  const rows = refinements.data;
+  const rows = knowledge.data;
   const waiting = rows?.filter((row) => row.status === "proposed") ?? [];
   const inForce = rows?.filter((row) => row.status === "active") ?? [];
   const over = rows?.filter((row) => OVER.has(row.status)) ?? [];
@@ -69,7 +69,7 @@ export function Learned() {
     <>
       <PageHeader title="Learned" headline={headline(rows)} />
 
-      {refinements.isError && (
+      {knowledge.isError && (
         <ErrorNote>
           the núcleo did not answer — nothing is known about what it has learned
         </ErrorNote>
@@ -97,7 +97,7 @@ export function Learned() {
             {[...waiting]
               .sort((left, right) => left.id - right.id)
               .map((row) => (
-                <RefinementRow
+                <KnownRow
                   key={row.id}
                   row={row}
                   decisions={
@@ -147,7 +147,7 @@ export function Learned() {
           </p>
           <Rows label="In force">
             {[...inForce].sort(byKindThenId).map((row) => (
-              <RefinementRow
+              <KnownRow
                 key={row.id}
                 row={row}
                 decisions={
@@ -175,7 +175,7 @@ export function Learned() {
             {[...over]
               .sort((left, right) => right.id - left.id)
               .map((row) => (
-                <RefinementRow key={row.id} row={row} />
+                <KnownRow key={row.id} row={row} />
               ))}
           </Rows>
         </Panel>
@@ -185,28 +185,28 @@ export function Learned() {
 }
 
 /** The three statuses that mean "was decided, and is not applying now". */
-const OVER: ReadonlySet<RefinementStatus> = new Set<RefinementStatus>([
+const OVER: ReadonlySet<KnownStatus> = new Set<KnownStatus>([
   "rejected",
   "reverted",
   "superseded",
 ]);
 
 /**
- * One refinement, with whatever can be done to it.
+ * One thing known, with whatever can be done to it.
  *
  * `decisions` is a slot rather than a status check inside the row: what a person
- * may do to a refinement is a property of the list it is in — you approve what
+ * may do to a row is a property of the list it is in — you approve what
  * is waiting, revert what is in force, and do nothing at all to what is over.
  */
-function RefinementRow({ row, decisions }: { row: Refinement; decisions?: ReactNode }) {
+function KnownRow({ row, decisions }: { row: Known; decisions?: ReactNode }) {
   const [open, setOpen] = useState(false);
 
   return (
     <Row className="learned-row">
       <div className="learned-head">
-        <StateBadge domain="refinement" state={row.kind} />
+        <StateBadge domain="knowledge" state={row.kind} />
         <span className="learned-scope">
-          {row.project_id ?? "this machine"}
+          {row.scope_id ?? "this machine"}
         </span>
         <span className="learned-when">
           <RelativeTime at={row.activated_at ?? row.created_at} />
@@ -240,7 +240,7 @@ function RefinementRow({ row, decisions }: { row: Refinement; decisions?: ReactN
  * row, and the point of not fetching is that nothing is asked for.
  */
 function Chain({ id }: { id: number }) {
-  const history = useRefinementHistory(id);
+  const history = useKnowledgeHistory(id);
 
   if (history.isError) {
     return (
@@ -303,13 +303,13 @@ function Chain({ id }: { id: number }) {
 }
 
 /** Kind first, then id — the order a node reads them, so the screen matches the prompt. */
-function byKindThenId(left: Refinement, right: Refinement): number {
+function byKindThenId(left: Known, right: Known): number {
   const order = KIND_ORDER[left.kind] - KIND_ORDER[right.kind];
   return order !== 0 ? order : left.id - right.id;
 }
 
 /** `refine::Kind`'s own order: an instruction changes what a node does, a fact what it believes. */
-const KIND_ORDER: Record<RefinementKind, number> = {
+const KIND_ORDER: Record<KnownKind, number> = {
   prompt: 0,
   memory: 1,
   skill: 2,
@@ -344,13 +344,13 @@ function DecisionRefusal({ error }: { error: unknown }) {
 }
 
 /**
- * One derived sentence about the layer.
+ * One derived sentence about the store.
  *
  * What is *waiting* leads, because it is the only part of this page that is a
  * task. A count of what is in force follows, because "the agent has been told
  * eleven things" is the fact a person wants before they read any of them.
  */
-function headline(rows: Refinement[] | undefined): string | undefined {
+function headline(rows: Known[] | undefined): string | undefined {
   if (rows === undefined) return undefined;
   const waiting = rows.filter((row) => row.status === "proposed").length;
   const inForce = rows.filter((row) => row.status === "active").length;
@@ -360,5 +360,9 @@ function headline(rows: Refinement[] | undefined): string | undefined {
   const held =
     inForce === 1 ? "one note is in force" : `${inForce} notes are in force`;
   if (waiting === 0) return `${held}; nothing proposed`;
-  return `${held}; ${waiting} refinement${waiting === 1 ? "" : "s"} proposed`;
+  // "note", which is the word the clause before it already uses. The store is
+  // called knowledge and the page is called Learned; neither is a word to count
+  // out loud, and "3 refinements proposed" is the old table's name surviving in
+  // the one place a person reads it.
+  return `${held}; ${waiting} note${waiting === 1 ? "" : "s"} proposed`;
 }

@@ -55,7 +55,7 @@ export type StateDomain =
   | "feed"
   | "rule"
   | "folder"
-  | "refinement";
+  | "knowledge";
 
 export interface StateReading {
   tone: BadgeTone;
@@ -251,8 +251,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * A healthy folder is the absence of a fact, so `ok` is absent rather than a map row nobody renders.
    */
   folder: { missing: { tone: "danger", label: "gone" }, unset: { tone: "off", label: "not named" } },
-  /** Refinement kinds are facts, not a severity scale, so all four use Stated Blue. */
-  refinement: { prompt: { tone: "info", label: "instruction" }, memory: { tone: "info", label: "fact" }, skill: { tone: "info", label: "how-to" }, subagent: { tone: "info", label: "delegation" } },
+  /** The four kinds are facts, not a severity scale, so all four use Stated Blue. */
+  knowledge: { prompt: { tone: "info", label: "instruction" }, memory: { tone: "info", label: "fact" }, skill: { tone: "info", label: "how-to" }, subagent: { tone: "info", label: "delegation" } },
   /**
    * Run outcomes. `concurrency.rs`'s `LIVE_RUN_STATUSES` and `runs.rs`'s
    * `TERMINAL_RUN_STATUSES` name all eight; `run_stop.rs` counts the same set.

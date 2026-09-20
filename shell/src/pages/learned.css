@@ -1,5 +1,5 @@
 /**
- * The Learned slice: the three lists of the refinement layer, the row they are
+ * The Learned slice: the three lists of the knowledge store, the row they are
  * all made of, and the chain that unfolds under one. `learned-` throughout, as
  * `waiting-` is for the decision queue and `runs-` for the run index.
  *
@@ -64,7 +64,7 @@
 }
 
 /**
- * The refinement's own text — the body of prose on this page, and the reason
+ * The row's own text — the body of prose on this page, and the reason
  * `--measure-prose` rather than `--measure`.
  *
  * It was `80ch`, which is past the point where an eye stops finding the start of
@@ -142,7 +142,7 @@
 
 /* The decisions, oldest first — proposed, active, superseded — as one line each.
    The top margin is for the one case where the only thing above them is the
-   `Quiet` line saying this refinement replaced nothing: a quiet line carries no
+   `Quiet` line saying this row replaced nothing: a quiet line carries no
    margin of its own. Against the paragraph and the list above, whose bottom
    margins are larger, it collapses and changes nothing. */
 .learned-events {

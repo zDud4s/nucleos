@@ -160,7 +160,7 @@ describe("Palette - a row that cannot act", () => {
           id: "learned",
           label: "Learned",
           match: "learned",
-          hint: "the núcleo does not write refinements yet",
+          hint: "the núcleo does not write to this store yet",
           disabled: true,
         }),
       ],
@@ -176,9 +176,9 @@ describe("Palette - a row that cannot act", () => {
     // designed, and the reason travels beside the row rather than vanishing.
     expect(row?.getAttribute("aria-disabled")).toBe("true");
     expect(row?.getAttribute("data-disabled")).toBe("true");
-    expect(row?.getAttribute("title")).toBe("the núcleo does not write refinements yet");
+    expect(row?.getAttribute("title")).toBe("the núcleo does not write to this store yet");
     expect(
-      within(palette).getByText("the núcleo does not write refinements yet").getAttribute("class"),
+      within(palette).getByText("the núcleo does not write to this store yet").getAttribute("class"),
     ).toBe("ui-palette-hint");
   });
 });
