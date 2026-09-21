@@ -892,8 +892,65 @@ pub async fn warn(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub async fn stub_sidecar(answer: serde_json::Value) -> String {
+        let app = axum::Router::new().route(
+            "/quota",
+            axum::routing::get(move || {
+                let answer = answer.clone();
+                async move { axum::Json(answer) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        address.to_string()
+    }
+
+    pub async fn arm(pool: &SqlitePool, enabled: bool, p5h: i64, p7d: i64) {
+        set_brake_policy(
+            pool,
+            BrakePolicy {
+                enabled,
+                pause_above_percent_5h: p5h,
+                pause_above_percent_7d: p7d,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    pub fn live_answer(
+        provider: &str,
+        window: &str,
+        used: f64,
+        resets_at: Option<&str>,
+        read_at: chrono::DateTime<chrono::Utc>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "providers": [{
+                "provider": provider,
+                "fidelity": "official",
+                "read_at": read_at.to_rfc3339(),
+                "severity": "normal",
+                "windows": [{
+                    "window": window,
+                    "used_fraction": used,
+                    "resets_at": resets_at,
+                    "stale": false
+                }]
+            }],
+            "cached": false
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use super::test_support::{arm, live_answer, stub_sidecar};
 
     async fn pool() -> SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -907,6 +964,35 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    async fn state_with_quota(pool: SqlitePool, quota: QuotaRuntime) -> crate::state::AppState {
+        crate::state::AppState {
+            token: crate::auth::Token("test-token".into()),
+            pool,
+            telegram_doctrine: None,
+            runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
+            run_handles: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_messages: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
+            files_root: None,
+            workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            quota: std::sync::Arc::new(quota),
+            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+        }
     }
 
     /// The reset every helper below writes, and the clock they are read under.
@@ -1771,20 +1857,6 @@ mod tests {
     /// `QuotaClient` owns a `reqwest::Client` rather than sitting behind a trait, so the cheapest
     /// honest fake is a real socket — the same shape, and for the same reason, as
     /// `browser_client.rs`'s stub.
-    async fn stub_sidecar(answer: serde_json::Value) -> String {
-        let app = axum::Router::new().route(
-            "/quota",
-            axum::routing::get(move || {
-                let answer = answer.clone();
-                async move { axum::Json(answer) }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        address.to_string()
-    }
-
     /// **The degradation is wired into `report()`**, not merely available beside it.
     ///
     /// The three cases above call `degrade_to_last_good` directly, so deleting its one call site in
@@ -1835,5 +1907,101 @@ mod tests {
             provider.detail, "the usage endpoint answered 429",
             "the reason the figure is old has to reach the shell with it"
         );
+    }
+
+    #[test]
+    fn quota_brake_never_pauses_on_an_unmeasured_stale_old_or_absent_reading() {
+        let now = chrono::Utc::now();
+        let policy = BrakePolicy { enabled: true, pause_above_percent_5h: 85, pause_above_percent_7d: 90 };
+        let cases = vec![
+            vec![Provider { provider: "claude".into(), fidelity: Fidelity::Unmeasured, read_at: now.to_rfc3339(), windows: vec![window(1.0, false)], detail: String::new(), severity: String::new() }],
+            vec![Provider { provider: "claude".into(), fidelity: Fidelity::Official, read_at: now.to_rfc3339(), windows: vec![window(1.0, true)], detail: String::new(), severity: String::new() }],
+            vec![Provider { provider: "claude".into(), fidelity: Fidelity::Official, read_at: (now - QUOTA_FRESH_FOR - chrono::Duration::seconds(1)).to_rfc3339(), windows: vec![window(1.0, false)], detail: String::new(), severity: String::new() }],
+            vec![],
+        ];
+        for providers in cases {
+            assert!(!matches!(judge(&policy, "claude", &providers, now), Verdict::Over { .. }));
+        }
+    }
+
+    #[test]
+    fn quota_brake_pauses_at_the_threshold_of_a_fresh_measured_window() {
+        let now = chrono::Utc::now();
+        let policy = BrakePolicy { enabled: true, pause_above_percent_5h: 85, pause_above_percent_7d: 90 };
+        for (window_name, threshold) in [("5h", 0.85), ("7d", 0.90)] {
+            let provider = Provider { provider: "claude".into(), fidelity: Fidelity::Official, read_at: now.to_rfc3339(), windows: vec![Window { window: window_name.into(), used_fraction: threshold, resets_at: None, stale: false, state: "ok" }], detail: String::new(), severity: String::new() };
+            let Verdict::Over { reason, .. } = judge(&policy, "claude", &[provider], now) else { panic!("fresh {window_name} at its threshold must pause") };
+            assert!(reason.contains("quota"));
+        }
+    }
+
+    #[test]
+    fn quota_brake_only_counts_the_active_runners_provider() {
+        let now = chrono::Utc::now();
+        let policy = BrakePolicy { enabled: true, pause_above_percent_5h: 85, pause_above_percent_7d: 90 };
+        let providers = vec![
+            Provider { provider: "claude".into(), fidelity: Fidelity::Official, read_at: now.to_rfc3339(), windows: vec![window(0.1, false)], detail: String::new(), severity: String::new() },
+            Provider { provider: "codex".into(), fidelity: Fidelity::Official, read_at: now.to_rfc3339(), windows: vec![window(1.0, false)], detail: String::new(), severity: String::new() },
+        ];
+        assert!(!matches!(judge(&policy, "claude", &providers, now), Verdict::Over { .. }));
+        let Verdict::Over { reason, .. } = judge(&policy, "codex", &providers, now) else { panic!("the active provider must count") };
+        assert!(reason.contains("quota"));
+    }
+
+    #[tokio::test]
+    async fn quota_brake_disabled_never_pauses_but_still_warns() {
+        let pool = pool().await;
+        arm(&pool, false, 85, 90).await;
+        let now = chrono::Utc::now();
+        let address = stub_sidecar(live_answer("claude", "5h", 1.0, None, now)).await;
+        let runtime = QuotaRuntime::new(crate::quota_client::QuotaClient::new(&address, "bearer".into()), "claude".into());
+        assert!(matches!(quota_permits_new_run(&pool, Some(&runtime), "claude", now).await, QuotaDecision::Allow));
+        assert_eq!(feed_kinds(&pool).await, vec![FEED_KIND]);
+        assert!(!feed_kinds(&pool).await.iter().any(|kind| kind == BLIND_FEED_KIND));
+    }
+
+    #[tokio::test]
+    async fn quota_brake_running_blind_says_so_once_and_names_the_quota() {
+        let pool = pool().await;
+        arm(&pool, true, 85, 90).await;
+        let now = chrono::Utc::now();
+        let address = stub_sidecar(serde_json::json!({"providers": [], "cached": false})).await;
+        let runtime = QuotaRuntime::new(crate::quota_client::QuotaClient::new(&address, "bearer".into()), "claude".into());
+        for _ in 0..2 { assert!(matches!(quota_permits_new_run(&pool, Some(&runtime), "claude", now).await, QuotaDecision::Allow)); }
+        let summaries: Vec<String> = sqlx::query_scalar("SELECT summary FROM feed WHERE kind = ?").bind(BLIND_FEED_KIND).fetch_all(&pool).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].starts_with("quota: "));
+    }
+
+    #[tokio::test]
+    async fn quota_brake_consult_fires_the_warning() {
+        let pool = pool().await;
+        arm(&pool, true, 85, 90).await;
+        let now = chrono::Utc::now();
+        let address = stub_sidecar(live_answer("claude", "5h", 0.82, None, now)).await;
+        let runtime = QuotaRuntime::new(crate::quota_client::QuotaClient::new(&address, "bearer".into()), "claude".into());
+        assert!(matches!(quota_permits_new_run(&pool, Some(&runtime), "claude", now).await, QuotaDecision::Allow));
+        assert_eq!(feed_kinds(&pool).await, vec![FEED_KIND]);
+    }
+
+    #[tokio::test]
+    async fn quota_brake_pause_carries_the_quota_source() {
+        let pool = pool().await;
+        arm(&pool, true, 85, 90).await;
+        let now = chrono::Utc::now();
+        let address = stub_sidecar(live_answer("claude", "5h", 1.0, None, now)).await;
+        let state = state_with_quota(pool, QuotaRuntime::new(crate::quota_client::QuotaClient::new(&address, "bearer".into()), "claude".into())).await;
+        let pause = permits_new_run(&state, now).await;
+        let crate::budget::BudgetDecision::Pause { reason, source, .. } = pause else { panic!("quota pause must be a pause") };
+        assert_eq!(source, PAUSE_SOURCE);
+        assert!(reason.contains("quota"));
+    }
+
+    #[tokio::test]
+    async fn quota_brake_settings_default_off_85_90_and_round_trip() {
+        let pool = pool().await;
+        assert_eq!(load_brake_policy(&pool).await.unwrap(), BrakePolicy { enabled: false, pause_above_percent_5h: 85, pause_above_percent_7d: 90 });
+        arm(&pool, true, 86, 91).await;
+        assert_eq!(load_brake_policy(&pool).await.unwrap(), BrakePolicy { enabled: true, pause_above_percent_5h: 86, pause_above_percent_7d: 91 });
     }
 }

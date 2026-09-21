@@ -31634,6 +31634,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quota_brake_route_reads_and_writes_the_three_settings() {
+        let app = build_router(test_state().await);
+        let get = app.clone().oneshot(Request::builder().uri("/autopilot/quota-brake").header("Authorization", "Bearer test-token").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let defaults: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(get.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(defaults["enabled"], false);
+        assert_eq!(defaults["pause_above_percent_5h"], 85);
+        assert_eq!(defaults["pause_above_percent_7d"], 90);
+
+        let post = app.clone().oneshot(Request::builder().method("POST").uri("/autopilot/quota-brake").header("Authorization", "Bearer test-token").header("content-type", "application/json").body(Body::from(serde_json::to_vec(&serde_json::json!({"enabled": true, "pause_above_percent_5h": 86, "pause_above_percent_7d": 91})).unwrap())).unwrap()).await.unwrap();
+        assert_eq!(post.status(), StatusCode::OK);
+
+        for (p5h, p7d) in [(0, 90), (101, 90), (85, 0), (85, 101)] {
+            let rejected = app.clone().oneshot(Request::builder().method("POST").uri("/autopilot/quota-brake").header("Authorization", "Bearer test-token").header("content-type", "application/json").body(Body::from(serde_json::to_vec(&serde_json::json!({"enabled": true, "pause_above_percent_5h": p5h, "pause_above_percent_7d": p7d})).unwrap())).unwrap()).await.unwrap();
+            assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    #[tokio::test]
     async fn autopilot_budget_get_returns_defaults() {
         let app = build_router(test_state().await);
         let response = app

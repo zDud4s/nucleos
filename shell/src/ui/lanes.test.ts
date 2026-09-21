@@ -49,6 +49,10 @@ describe("a line's gravity", () => {
     expect(readState("wait_reason", "excluded")?.tone).toBe("paused");
   });
 
+  it("quota brake wait reason is held ember", () => {
+    expect(readState("wait_reason", "quota")?.tone).toBe("paused");
+  });
+
   it("the two lines that ask something of you still do", () => {
     expect(feedGravityOf("email_urgent")).toBe("asks");
     expect(feedGravityOf("promotion_ready")).toBe("asks");
