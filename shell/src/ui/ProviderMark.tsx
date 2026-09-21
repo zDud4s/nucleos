@@ -33,21 +33,30 @@ const MARKS: Record<string, string> = {
 export interface ProviderMarkProps {
   /** The daemon's word for the provider — `claude`, `codex`. Matched case-insensitively. */
   provider: string;
-  /** Edge length in pixels. The default is what fits inside the inner track of a 34px ring. */
+  /**
+   * Edge length in pixels. The default is what fits inside the inner track of a `Ring` drawn at
+   * its own default size.
+   */
   size?: number;
 }
 
 /**
  * What fits inside the inner track of a ring at `Ring`'s default size, with air around it.
  *
- * The history is the same mistake twice, from opposite ends, and worth keeping for that reason.
- * Twelve pixels inside a 34px ring filled its 15px middle to the edges — the Claude mark's
- * radiating strokes ran into the arc and read as a smudge. Ten cleared the arc and was then too
- * small to read at all: a smudge with air round it instead of a smudge without. Neither number was
- * the problem; the hole was too small for any mark. `Ring` grew to 44 and the middle to 22 with it,
- * and sixteen leaves three pixels of air on every side of a glyph somebody can recognise.
+ * **The hole is round and a glyph's box is square, and that is the whole arithmetic.** Three
+ * attempts measured the wrong distance. Twelve pixels inside a 34px ring filled its 15px middle to
+ * the edges; ten cleared the arc and was too small to read; the hole was what had run out, so
+ * `Ring` grew to 44 and its middle to 22. Sixteen then looked right on paper — three pixels of air
+ * on every side — and was still wrong, because a square's corners are further out than its edges.
+ * Both glyphs here ink their whole 24x24 box (measured with `getBBox`: 23.98 and 23.67 wide, 24
+ * tall), so a 16px box has a half-diagonal of 11.3 against a hole of radius 11, and Claude's
+ * radiating strokes — which point at the corners — came out through the arc.
+ *
+ * What has to fit is the hole's inscribed square, `22 / sqrt(2)` = 15.5, and fourteen is that with
+ * air: 9.9 diagonally against 11, four clear pixels at the edges, and 64% of the hole covered,
+ * which is about where a mark inside a circle sits when somebody has drawn it on purpose.
  */
-const SIZE = 16;
+const SIZE = 14;
 
 export function ProviderMark({ provider, size = SIZE }: ProviderMarkProps) {
   const path = MARKS[provider.trim().toLowerCase()];

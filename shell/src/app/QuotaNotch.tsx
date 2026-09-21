@@ -49,6 +49,16 @@ export interface QuotaNotchProps {
  * the move control points. The contained host is also the recoil if the floating window misbehaves
  * (risk R1), which is why it keeps working with no Rust side at all.
  *
+ * **A folded notch must not draw an old answer like a live one.** `GET /quota` answers 200 with
+ * `source: "stored"` when the quota sidecar cannot be reached, carrying whatever figures were
+ * last recorded — so an outage arrives as numbers rather than as an error. Unfolded, the notch
+ * says "last known" in words. Folded, which is where it spends its life, it said nothing whatever,
+ * and that is the one thing this app forbids itself: stale and current may never render as one. So
+ * the whole drawing carries `data-stored` and its edge goes dashed, which is what a dash already
+ * means here — `.ui-ring-unmeasured`, `.ui-runpipe-unreached` — *this is not a live fact*. No
+ * tone, because `.ui-note-stale` settled the house style: say stale without borrowing a colour
+ * that would claim something about the quota instead of about the reading of it.
+ *
  * **It is never the only thing that says a number, and it no longer says a name.** The provider's
  * name was printed beside its rings and is now a mark inside them: at this size the word cost more
  * room than the drawing it labelled. What carries the reading instead is text that is worth more —
@@ -75,6 +85,7 @@ export function QuotaNotch({ host = "contained", onMove }: QuotaNotchProps) {
     <div
       className={`quota-notch quota-notch-${host}`}
       data-unfolded={reached}
+      data-stored={source === "stored"}
       onPointerEnter={() => setReached(true)}
       onPointerLeave={() => setReached(false)}
       onFocus={() => setReached(true)}
@@ -94,7 +105,18 @@ export function QuotaNotch({ host = "contained", onMove }: QuotaNotchProps) {
               {tracksOf(provider).map((track) => (
                 <span className="quota-notch-line" key={track.name}>
                   <span className="quota-notch-window">{track.name}</span>
-                  <span className="quota-notch-percent">
+                  {/*
+                    The dash takes a class of its own because it is not a figure. In the weight
+                    and the ink the percentages wear, an em dash reads as a value somebody
+                    measured; what it means is that nobody could.
+                  */}
+                  <span
+                    className={
+                      track.measured
+                        ? "quota-notch-percent"
+                        : "quota-notch-percent quota-notch-percent-absent"
+                    }
+                  >
                     {track.measured ? `${Math.round(track.used * 100)}%` : "—"}
                   </span>
                   <span className="quota-notch-reset">{resetPhrase(provider, track.name, now)}</span>
@@ -124,7 +146,19 @@ export function QuotaNotch({ host = "contained", onMove }: QuotaNotchProps) {
       )}
       {onMove !== undefined &&
         (host === "contained" ? (
-          <IconButton label="Keep the notch in front of every window" icon={Pin} onClick={onMove} />
+          /*
+            Drawn in both states, unlike the floating host's: this is the only way out of the page
+            and into the window that floats over everything, and that host is where the notch is
+            worth having. The wrapper is what rules it off from the rings above it — stacked in
+            the same column, at the same size, a control reads as a third provider (`app.css`).
+          */
+          <span className="quota-notch-control">
+            <IconButton
+              label="Keep the notch in front of every window"
+              icon={Pin}
+              onClick={onMove}
+            />
+          </span>
         ) : (
           /*
             Folded, the floating notch is the rings and nothing else — but the way back is still
@@ -146,7 +180,7 @@ export function QuotaNotch({ host = "contained", onMove }: QuotaNotchProps) {
             gap is named here rather than implied away — closing it is a decision about where such
             a control belongs in the app, not a line of this component.
           */
-          <span className={reached ? "quota-notch-back" : "sr-only"}>
+          <span className={reached ? "quota-notch-control" : "sr-only"}>
             <IconButton label="Put the notch back inside NucleOS" icon={PinOff} onClick={onMove} />
           </span>
         ))}
@@ -212,7 +246,12 @@ function fidelityPhrase(provider: QuotaProvider, now: number): string {
  * anybody who does not know the glyph yet.
  */
 function titleOf(provider: QuotaProvider): string {
-  const head = `${provider.provider} — ${provider.fidelity}`;
+  // The vendor's own word for how bad this is, when it sent one. `QuotaProvider.severity` is
+  // documented as shown and never acted on, and it was neither: the field arrived, nothing drew
+  // it, and the doc described a plan. Here is where it belongs — beside the fidelity, which is
+  // the other fact about the READING rather than about one window of it.
+  const said = provider.severity.trim() === "" ? "" : ` · ${provider.severity.trim()}`;
+  const head = `${provider.provider} — ${provider.fidelity}${said}`;
   if (provider.windows.length === 0) {
     return provider.detail === "" ? head : `${head}: ${provider.detail}`;
   }

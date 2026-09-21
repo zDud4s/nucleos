@@ -183,11 +183,19 @@ describe("QuotaNotch", () => {
     expect(container.querySelectorAll(".quota-notch-percent")).toHaveLength(2);
   });
 
-  /** Old figures are real and old, and the notch says which of the two it is showing. */
+  /**
+   * Old figures are real and old, and the notch says which of the two it is showing.
+   *
+   * In BOTH states, which is the half this used to miss. Unfolded it says so in words; folded it
+   * is nothing but rings, and a ring drawn from an hour-old answer looked exactly like one drawn a
+   * second ago. `data-stored` is what the dashed edge hangs off (`app.css`), and the state it has
+   * to be right in is the one nobody is hovering.
+   */
   it("says the figures are last known when the sidecar could not be reached", async () => {
     answer({ providers: [claude()], source: "stored", unreachable: "quota sidecar unreachable: refused" });
     const { container, findByText } = renderWithQuery(<QuotaNotch />);
     await findByText(/claude: 7d 46% /);
+    expect(container.querySelector(".quota-notch")!.getAttribute("data-stored")).toBe("true");
     fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
 
     const note = await findByText("last known");
@@ -268,6 +276,87 @@ describe("QuotaNotch", () => {
 
     fireEvent.click(float);
     expect(onMove).toHaveBeenCalledOnce();
+  });
+
+  /** A live reading says nothing about its source, and the edge stays solid. */
+  it("claims no staleness while the sidecar is answering", async () => {
+    const { container } = await folded();
+    expect(container.querySelector(".quota-notch")!.getAttribute("data-stored")).toBe("false");
+  });
+
+  /**
+   * An em dash is not a figure, and must not be set like one.
+   *
+   * The percentage column is the one thing in the panel drawn at full size and full ink, because
+   * it is what the unfold exists to show. A window nobody could read has no percentage, and the
+   * dash standing in for it inherited all of that weight — a bold absence, which reads as a value
+   * somebody measured.
+   */
+  it("sets an unread window apart from one with a figure", async () => {
+    answer({
+      providers: [claude(), claude({ provider: "codex", fidelity: "unmeasured", windows: [], detail: "none" })],
+    });
+    const { container, findByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/codex: 7d /);
+    fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
+
+    await findByText("46%");
+    // Four windows drawn, and the two nobody could read are the two that say so.
+    expect(container.querySelectorAll(".quota-notch-percent")).toHaveLength(4);
+    expect(container.querySelectorAll(".quota-notch-percent-absent")).toHaveLength(2);
+  });
+
+  /**
+   * `QuotaProvider.severity` is documented as shown and never acted on, and it was shown nowhere:
+   * the field arrived from the daemon and no surface drew it. The hover text is where it belongs,
+   * beside the fidelity — both are facts about the reading rather than about one window of it.
+   *
+   * A provider that sent none draws no separator. A dangling middle dot reads as a word that
+   * failed to arrive, which is a worse lie than saying nothing.
+   */
+  it("carries the vendor's own word for the severity, and nothing when it sent none", async () => {
+    answer({ providers: [claude({ severity: "warning" })] });
+    const loud = renderWithQuery(<QuotaNotch />);
+    await loud.findByText(/claude: 7d 46% /);
+    expect(loud.container.querySelector(".quota-notch-slot")!.getAttribute("title")).toContain(
+      "claude — official · warning",
+    );
+    loud.unmount();
+
+    answer({ providers: [claude({ severity: "" })] });
+    const quiet = renderWithQuery(<QuotaNotch />);
+    await quiet.findByText(/claude: 7d 46% /);
+    expect(quiet.container.querySelector(".quota-notch-slot")!.getAttribute("title")).toContain(
+      "claude — official\n",
+    );
+  });
+
+  /**
+   * The way to the other host is a control, and a control is not a reading.
+   *
+   * Stacked in the same narrow column, at the same size, with the same air round it, the pin sat
+   * under two rings looking like a provider nobody had drawn a quota for. `.quota-notch-control`
+   * is the hairline that says which of the two categories it belongs to, and both hosts wear it
+   * — the floating one only once unfolded, because folded it is `.sr-only` and must measure
+   * nothing.
+   */
+  it("rules the move control off from the rings", async () => {
+    const onMove = vi.fn();
+    answer({ providers: [claude()] });
+    const page = renderWithQuery(<QuotaNotch onMove={onMove} />);
+    const float = await page.findByRole("button", { name: "Keep the notch in front of every window" });
+    expect(float.closest(".quota-notch-control")).not.toBeNull();
+    page.unmount();
+
+    // Folded, the floating host keeps it out of the flow instead, rule and all.
+    const floating = renderWithQuery(<QuotaNotch host="global" onMove={onMove} />);
+    const back = await floating.findByRole("button", { name: "Put the notch back inside NucleOS" });
+    expect(back.closest(".quota-notch-control")).toBeNull();
+    expect(back.closest(".sr-only")).not.toBeNull();
+
+    fireEvent.focusIn(back);
+    await floating.findByText("46%");
+    expect(back.closest(".quota-notch-control")).not.toBeNull();
   });
 
   /** A notch with nowhere else to go offers nowhere else. */

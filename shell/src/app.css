@@ -91,7 +91,8 @@
  *
  * Measured off the drawing rather than derived from it, because the drawing's width comes from its
  * content and CSS cannot ask: a 44px ring, `--space-2` of padding either side, one border — 61px,
- * rounded up to a whole rem. The first photograph of this design is what made it necessary —
+ * rounded up to a whole rem, which also absorbs the three pixels of slack `Ring`'s own arithmetic
+ * leaves. The first photograph of this design is what made it necessary —
  * pinned over a page at 1440px wide, the folded notch sat on the right-hand column of the Teams
  * table and hid the pulse bars in it.
  *
@@ -114,7 +115,45 @@
   gap: var(--space-3);
 }
 
-/* Pinned to the middle of the window's right edge. See the header for why this is `fixed`. */
+/**
+ * Every figure in here is a last-known one.
+ *
+ * `source: "stored"` means the sidecar could not be reached and these numbers are whatever was
+ * recorded last. Unfolded, the notch says so in words; folded — which is the state it spends
+ * its whole life in — it said nothing at all, and drew an hour-old reading exactly as it draws
+ * a live one. That is the single thing this app forbids itself (`PRODUCT.md`: stale, refused and
+ * empty are different things and must never render as one), and a hairline is a cheap place to say
+ * it.
+ *
+ * **Dashed, and not coloured.** This app has already decided how it says stale: `.ui-note-stale`
+ * carries no tone whatever — muted italic text — and a dash is what `.ui-ring-unmeasured`
+ * and `.ui-runpipe-unreached` already mean by *this is not a live fact*. Borrowing a state tone
+ * here would say something about the quota, and the quota is not what changed; the connection to
+ * the thing that measures it is.
+ */
+.quota-notch[data-stored="true"] {
+  border-style: dashed;
+}
+
+/**
+ * Pinned to the middle of the window's right edge. See the header for why this is `fixed`.
+ *
+ * **`right: 0` is ten pixels short of the right edge, and no value here can close them.** `html`
+ * carries `scrollbar-gutter: stable` (`base.css`), so the browser reserves a strip for a scrollbar
+ * and takes it out of the box a fixed element is positioned against: measured in the engine rather
+ * than guessed, `documentElement.clientWidth` answers 1430 in a 1440px window. The notch therefore
+ * hangs off a line ten pixels inside the glass, with its square right-hand edge and a stripe of
+ * page beyond it.
+ *
+ * `calc(100% - 100vw)` was tried here and is a no-op: Chromium resolves `100vw` to that same
+ * reduced box, so the difference is zero and CSS has no way to ask how wide the gutter is. The
+ * only honest fixes are outside this rule — either a hardcoded offset, which is a guess about an
+ * engine that has changed its scrollbar width twice, or `base.css` giving the gutter up. That
+ * gutter guards the scroll-lock compensation at the end of that file and nothing else in this app
+ * scrolls the root (`.app-shell` is `overflow: hidden`, `.app-main` does the scrolling), so it may
+ * well be reservable for nothing — but deciding that is a change to every surface, not to this
+ * one. Left measured and named rather than papered over.
+ */
 .quota-notch-contained {
   position: fixed;
   right: 0;
@@ -157,10 +196,39 @@
   /* Was 1px, which is not a gap — two lines of mono at that distance are a block, and the unfolded
      notch read as a paragraph nobody would finish. */
   row-gap: var(--space-1);
+  /* Three columns of text at three sizes, and the default aligns their BOXES: every line is a grid
+     item stretched to the row's height with its own line box at the top of it, so the 13px
+     percentage sat about a pixel below the 11px label it belongs to. A row of text is read along
+     its baseline, so that is what has to line up — the kind of pixel nobody can name and
+     everybody sees. */
+  align-items: baseline;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+  /* The daemon's own figures, so the app's rule applies: mono, and tabular. Right-aligning the
+     percentage was half the job — `46%` and `100%` end at the same place — and proportional
+     digits undid the other half, because `11%` and `46%` are then different widths and the column's
+     left edge frays. `.ui-pips-count` and `.ui-limit` already say it this way. */
+  font-variant-numeric: tabular-nums;
   color: var(--text-muted);
   white-space: nowrap;
+  /* One authored moment, and it is the reveal itself: the panel arrives from under the ring it
+     belongs to, 4px, the distance being a hint about where it came from rather than a journey.
+     `--dur-quick` because somebody is mid-glance, not watching.
+
+     **Opacity and a transform, and never the geometry.** The floating host is a window the Rust
+     side fits round this drawing — `NotchWindow`'s `ResizeObserver` calls `notch_fit` with the
+     measured box — so animating a width or a height would fire an IPC resize per frame and
+     leave the window chasing its own content. A transform changes no layout box, so the window is
+     fitted once, to the final size, and what moves is only the paint. The global reduced-motion
+     guard in `base.css` clamps this to 0.01ms, which for a fade is exactly the right answer. */
+  animation: quota-notch-unfold var(--dur-quick) var(--ease);
+}
+
+@keyframes quota-notch-unfold {
+  from {
+    opacity: 0;
+    transform: translateX(4px);
+  }
 }
 
 .quota-notch-line {
@@ -175,8 +243,19 @@
 .quota-notch-percent {
   text-align: right;
   font-size: var(--text-sm);
-  font-weight: 600;
+  font-weight: var(--weight-semibold);
   color: var(--text);
+}
+
+/*
+  A window nobody could read has no figure, and an em dash is not one. Drawn in the weight and the
+  full ink of a percentage it reads as a value somebody measured — a bold absence, which is the
+  one thing an absence must not be. It is a fact about the source, so it is set like the phrase
+  beside it that explains the source.
+*/
+.quota-notch-percent-absent {
+  font-weight: var(--weight-regular);
+  color: var(--text-faint);
 }
 
 .quota-notch-reset,
@@ -196,17 +275,30 @@
 }
 
 /**
- * The wrapper round the floating notch's way back into the app, unfolded.
+ * The wrapper round the way to the other host, ruled off from the readings above it.
  *
- * It exists for the folded state, where it carries `.sr-only` instead and keeps the control
- * reachable by focus without drawing it (`QuotaNotch.tsx`). Unfolded it must get out of the way
- * completely: one element, kept across both states so focus survives the unfold, and
- * `display: contents` is what makes the button itself the flex item again — wrapped in an inline
- * span it would sit on a baseline instead of on the notch's centre line, and the strip would grow
- * by the descender it never needed.
+ * **The rule is the point.** Stacked in the same narrow column, at the same size, with the same air
+ * round it, a control reads as a third instrument: the first photograph of the contained notch has
+ * a pin glyph sitting under two rings like a provider nobody had drawn a quota for. This app admits
+ * two categories of thing on a screen, instruments and controls, and one hairline is enough to say
+ * which of them this is.
+ *
+ * **A flex row, where this used to be `display: contents`.** The wrapper was transparent to the
+ * layout so that the button, and not the span, was the flex item — an inline span would have sat
+ * on a baseline instead of on the notch's centre line and grown the strip by a descender it never
+ * needed. A flex container has no baseline to sit on either, so it keeps that property, and unlike
+ * `display: contents` it has a box to hang the rule on.
+ *
+ * In the floating host, folded, this class is swapped for `.sr-only` (`QuotaNotch.tsx`): the
+ * control stays reachable by focus without being drawn, and nothing of it — the rule included
+ * — measures anything for the window the Rust side fits round the drawing.
  */
-.quota-notch-back {
-  display: contents;
+.quota-notch-control {
+  align-self: stretch;
+  display: flex;
+  justify-content: flex-end;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border);
 }
 
 /* Shown only when the sidecar could not be reached. The figures above it are real and old. */

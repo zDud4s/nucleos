@@ -1685,7 +1685,8 @@ ol.ui-well {
   fill: currentColor;
   font-family: var(--font-mono);
   /* In the path data's own 24x24 box, so it scales with the glyph rather than with the page: at
-     `ProviderMark`'s 16px this draws at about 11. */
+     `ProviderMark`'s 14px this draws at about 10. A letter inks nothing near the corners of its
+     box, so it is not held to the inscribed-square rule the drawn marks are. */
   font-size: 17px;
   font-weight: 600;
 }
