@@ -163,6 +163,20 @@ pub enum Scope {
 }
 
 impl Scope {
+    /// Parse the two stored columns before using scope as an ordering signal.
+    fn parse(kind: &str, id: Option<&str>) -> Option<Self> {
+        match (kind, id) {
+            ("machine", None) => Some(Scope::Machine),
+            ("project", Some(id)) => Some(Scope::Project(id.to_owned())),
+            ("errand", Some(id)) => Some(Scope::Errand(id.to_owned())),
+            ("job", Some(id)) => Some(Scope::Job {
+                id: id.parse().ok()?,
+                project: None,
+            }),
+            _ => None,
+        }
+    }
+
     /// The scopes a reader in this one is entitled to, most general first.
     ///
     /// `machine` → `project` → `job` inherits downwards, and the most specific wins where they
@@ -225,6 +239,8 @@ pub struct Known {
     pub expires_after_runs: Option<i64>,
     pub last_confirmed_at: Option<String>,
     pub shown_count: i64,
+    /// Briefings whose run reached an outcome. `0` is NOT MEASURED, and it is a different thing from
+    /// `green_count == 0` with this above zero, which is measured badly.
     pub outcome_count: i64,
     pub green_count: i64,
     pub last_shown_at: Option<String>,
@@ -307,30 +323,171 @@ pub struct Brief {
     pub trace: Vec<Scored>,
 }
 
-/// The candidates in the order the selector will consider them.
+/// The midpoint of the bounded utility range: without any outcomes, there is evidence for neither
+/// success nor failure, so the neutral value must favour neither end.
+const NEUTRAL_UTILITY: f64 = 0.5;
+
+/// Score every candidate once. The tuple order below is the selection order: exactly the five
+/// signals in the design, followed only by stable vocabulary and id tie-breakers in the caller.
 #[cfg_attr(not(test), allow(dead_code))]
-fn ordered_candidates(known: &[Known]) -> Vec<&Known> {
-    let mut candidates: Vec<(f64, Layer, Kind, &Known)> = known
+fn scored_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<(&'a Known, Scored)> {
+    let utility_if_absent = median_measured_utility(known);
+
+    known
         .iter()
+        .filter(|row| Layer::parse(&row.layer).is_some())
+        .filter(|row| Kind::parse(&row.kind).is_some())
         .filter_map(|row| {
             Some((
-                row.s_fts,
+                row,
+                Scored {
+                    knowledge_id: row.id,
+                    shown: false,
+                    // FTS5 owns text ranking. Re-ranking the text here would be a second, worse
+                    // implementation of the database signal already carried by the row.
+                    s_fts: finite_or_zero(row.s_fts),
+                    s_scope: scope_specificity(row, context)?,
+                    s_structure: structural_overlap(row, context),
+                    s_recency: recency(row),
+                    // `outcome_count == 0` is absence, not failure. Give it the median measured
+                    // utility from this pass, or the named neutral midpoint when the set is empty.
+                    s_use: if row.outcome_count == 0 {
+                        utility_if_absent
+                    } else {
+                        row.green_count as f64 / row.outcome_count as f64
+                    },
+                },
+            ))
+        })
+        .collect()
+}
+
+fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+fn scope_specificity(row: &Known, context: &Context) -> Option<f64> {
+    let row_scope = Scope::parse(&row.scope_kind, row.scope_id.as_deref())?;
+    context
+        .chain
+        .iter()
+        .position(|scope| scope.columns() == row_scope.columns())
+        .map(|index| (index + 1) as f64)
+        // A recognised but out-of-chain candidate is not entitled to inherit into this context.
+        .or(Some(0.0))
+}
+
+fn structural_overlap(row: &Known, context: &Context) -> f64 {
+    let Some(points_at) = row.points_at.as_deref() else {
+        return 0.0;
+    };
+    let references = structural_references(points_at);
+    context
+        .files
+        .iter()
+        .chain(&context.communities)
+        .filter(|candidate| {
+            let candidate = normalise_reference(candidate);
+            references.iter().any(|reference| reference == &candidate)
+        })
+        .count() as f64
+}
+
+fn structural_references(raw: &str) -> Vec<String> {
+    fn collect(value: &serde_json::Value, into: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(value) => into.push(normalise_reference(value)),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect(value, into);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values() {
+                    collect(value, into);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut references = Vec::new();
+    if let Ok(value) = serde_json::from_str(raw) {
+        collect(&value, &mut references);
+    } else {
+        references.extend(
+            raw.split([',', ';', '\n'])
+                .map(normalise_reference)
+                .filter(|reference| !reference.is_empty()),
+        );
+    }
+    references.sort();
+    references.dedup();
+    references
+}
+
+fn normalise_reference(reference: &str) -> String {
+    reference
+        .trim()
+        .trim_matches(['"', '\'', '[', ']', '{', '}'])
+        .replace('\\', "/")
+}
+
+fn recency(row: &Known) -> f64 {
+    row.last_shown_at
+        .as_deref()
+        .and_then(|shown| chrono::DateTime::parse_from_rfc3339(shown).ok())
+        .map(|shown| shown.timestamp_micros() as f64)
+        .unwrap_or(0.0)
+}
+
+fn median_measured_utility(known: &[Known]) -> f64 {
+    let mut measured: Vec<f64> = known
+        .iter()
+        .filter(|row| row.outcome_count > 0)
+        .map(|row| row.green_count as f64 / row.outcome_count as f64)
+        .collect();
+    if measured.is_empty() {
+        return NEUTRAL_UTILITY;
+    }
+    measured.sort_by(f64::total_cmp);
+    let middle = measured.len() / 2;
+    if measured.len().is_multiple_of(2) {
+        // The even median is the arithmetic mean of the two middle values, not the lower middle.
+        (measured[middle - 1] + measured[middle]) / 2.0
+    } else {
+        measured[middle]
+    }
+}
+
+/// The candidates in the order the selector will consider them.
+#[cfg_attr(not(test), allow(dead_code))]
+fn ordered_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<&'a Known> {
+    let mut candidates: Vec<(Layer, Kind, &Known, Scored)> = scored_candidates(known, context)
+        .into_iter()
+        .filter_map(|(row, scored)| {
+            Some((
                 Layer::parse(&row.layer)?,
                 Kind::parse(&row.kind)?,
                 row,
+                scored,
             ))
         })
         .collect();
     candidates.sort_by(|left, right| {
         right
-            .0
-            .partial_cmp(&left.0)
-            .unwrap_or_else(|| right.0.total_cmp(&left.0))
+            .3
+            .s_fts
+            .total_cmp(&left.3.s_fts)
+            .then_with(|| right.3.s_scope.total_cmp(&left.3.s_scope))
+            .then_with(|| right.3.s_structure.total_cmp(&left.3.s_structure))
+            .then_with(|| right.3.s_recency.total_cmp(&left.3.s_recency))
+            .then_with(|| right.3.s_use.total_cmp(&left.3.s_use))
+            .then_with(|| left.0.cmp(&right.0))
             .then_with(|| left.1.cmp(&right.1))
-            .then_with(|| left.2.cmp(&right.2))
-            .then_with(|| left.3.id.cmp(&right.3.id))
+            .then_with(|| left.2.id.cmp(&right.2.id))
     });
-    candidates.into_iter().map(|(_, _, _, row)| row).collect()
+    candidates.into_iter().map(|(_, _, row, _)| row).collect()
 }
 
 /// Every column of the store, in the order the migration declares them.
@@ -1520,8 +1677,15 @@ mod tests {
             skill.clone(),
         ];
         let second = vec![skill, tied_first, prompt, tied_second, higher_score];
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
         let ids = |rows: &[Known]| {
-            ordered_candidates(rows)
+            ordered_candidates(rows, &context)
                 .into_iter()
                 .map(|row| row.id.to_string())
                 .collect::<Vec<_>>()
@@ -1532,6 +1696,87 @@ mod tests {
         let second_ids = ids(&second);
         assert_eq!(first_ids.as_bytes(), second_ids.as_bytes());
         assert_eq!(first_ids, "90,10,20,80,70");
+    }
+
+    /// A new row does not compete from the bottom as if it had failed: the selection treats absence as
+    /// absence, and what that is worth as a NUMBER is decided here and tested in a table. Without this,
+    /// whoever implements it picks a value by taste and D6's table tests that taste.
+    ///
+    /// The utility component of a row with no outcome is the MEDIAN of the candidates that have one, and a
+    /// neutral constant when none of them does.
+    #[test]
+    fn a_row_nobody_has_measured_scores_like_the_middle_of_the_ones_somebody_has() {
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let cases = [
+            ("odd", vec![(1, 5), (3, 5), (5, 5)], 0.6),
+            ("even", vec![(1, 5), (4, 5)], 0.5),
+            ("single", vec![(3, 4)], 0.75),
+            ("none", Vec::new(), NEUTRAL_UTILITY),
+        ];
+
+        for (name, measured, expected) in cases {
+            let mut rows = vec![one(100, "memory", "not measured", "new")];
+            for (offset, (green_count, outcome_count)) in measured.into_iter().enumerate() {
+                let mut row = one(offset as i64 + 1, "memory", "measured", "old");
+                row.green_count = green_count;
+                row.outcome_count = outcome_count;
+                rows.push(row);
+            }
+
+            let actual = scored_candidates(&rows, &context)
+                .into_iter()
+                .find(|(row, _)| row.id == 100)
+                .map(|(_, scored)| scored.s_use)
+                .expect("the unmeasured row is scored");
+            assert!(
+                (actual - expected).abs() < f64::EPSILON,
+                "{name}: expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    /// And the pair that expresses it has to be the one that CAN differ. `last_shown_at IS NULL` and
+    /// `shown_count == 0` are written by the same pass at the same moment, so they are the same state; the
+    /// distinction that exists is `outcome_count == 0` against `green_count == 0, outcome_count > 0`.
+    #[test]
+    fn not_measured_does_not_order_like_measured_and_failed() {
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let not_measured = one(1, "memory", "not measured", "new");
+        let mut failed = one(2, "memory", "failed", "bad");
+        failed.outcome_count = 4;
+        let mut green = one(3, "memory", "green", "good");
+        green.outcome_count = 4;
+        green.green_count = 4;
+        let rows = vec![failed, not_measured, green];
+
+        let scored = scored_candidates(&rows, &context);
+        let utility = |id| {
+            scored
+                .iter()
+                .find(|(row, _)| row.id == id)
+                .map(|(_, scored)| scored.s_use)
+                .expect("row is scored")
+        };
+        assert_ne!(utility(1), utility(2));
+        assert_eq!(
+            ordered_candidates(&rows, &context)
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 2]
+        );
     }
 
     /// A store that grows for a year would take the context the work needs, and the failure mode is
