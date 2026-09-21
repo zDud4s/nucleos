@@ -243,3 +243,51 @@
   line-height: var(--leading-snug);
   overflow-wrap: anywhere;
 }
+
+/* ------------------------------------------------------------ conversation -- */
+
+.voice-conversation-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  margin-top: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+/* The TRACK is what makes this legible, and the reason it is `--surface-sunken`: the first version
+   used `--surface-raised`, the panel's own colour, so the meter was an invisible rectangle with an
+   invisible fill inside it — and in a quiet room the fill does not move at all, correctly, because
+   Silero reports about 0.01 for silence. A person watching nothing move on nothing could only
+   conclude the microphone was broken. With a visible track and a visible bar, a still fill reads as
+   what it is: it is listening, and that is not speech yet. */
+.voice-meter {
+  position: relative;
+  width: 6rem;
+  height: 4px;
+  flex: none;
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.voice-meter-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--text-muted);
+}
+
+/* Overflows the track by a pixel at each end so the bar reads as a mark ON the scale rather than as
+   a segment of the fill. */
+.voice-meter-bar {
+  position: absolute;
+  top: -1px;
+  width: 2px;
+  height: calc(100% + 2px);
+  background: var(--border-strong);
+}

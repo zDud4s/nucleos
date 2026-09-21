@@ -5,6 +5,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { finishCapture, startCapture, type ActiveCapture } from "../lib/capture";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { useVoiceConversation, type ConversationView } from "../data/conversation";
+import { useVoiceChat } from "../data/voice-chat";
+import type { SilenceReason } from "../lib/vad";
 import {
   phaseAfter,
   postCapture,
@@ -149,9 +152,9 @@ export function Voice() {
    *
    * All three in ONE call, because `register_hotkeys` unregisters everything before it registers
    * anything — a second call naming only the conversation chord would silently drop the other two.
-   * That is also why the conversation chord is registered from this page even though the mode it
-   * toggles is driven from the chat: the registration is indivisible, and this is the page that
-   * already holds the config it comes from.
+   * The conversation chord was registered from here while the mode it toggles still lived in a
+   * chat's composer, on the grounds that the registration is indivisible. Since 2026-09-21 the mode
+   * lives on this page too, so the chord and what it does are finally in one file.
    *
    * The host is asked FIRST whether this desktop gives global hotkeys at all, and the ask lives in
    * THIS effect rather than an earlier one of its own on purpose: on Wayland the answer is a
@@ -337,12 +340,173 @@ export function Voice() {
         <DeliveryNote delivery={delivery} />
       </Panel>
 
+      <Conversation armed={config.data?.armed ?? false} />
+
       <ConfigReadout config={config} />
 
       <MemoList memos={memos} deleteMemo={deleteMemo} />
 
       <DictationList dictations={dictations} />
     </>
+  );
+}
+
+/* --------------------------------------------------------- conversation -- */
+
+/**
+ * Talking to the agent out loud: it hears a sentence, sends it as a turn, and reads the answer back.
+ *
+ * **Not the dictation above, and not the microphone in a chat's composer.** Those two turn speech
+ * into TEXT and hand it over — a dictation is pasted by the host, and the chat's microphone fills the
+ * box you were about to type in. Both leave the words in front of somebody before anything is sent,
+ * which is why they are the right shape THERE: a misheard sentence is editable, and the first sentence
+ * in a chat is the one that opens a conversation. This is the other thing, and it is here because the
+ * owner put it here on 2026-09-19: a spoken turn goes out as it was heard, and the answer comes back
+ * out loud.
+ *
+ * Which conversation it belongs to is `data/voice-chat.ts`'s whole subject — one dedicated chat,
+ * reused, because the daemon refuses a turn that names none.
+ */
+function Conversation({ armed }: { armed: boolean }) {
+  const chat = useVoiceChat();
+  const voice = useVoiceConversation(chat.chatId);
+  const [opening, setOpening] = useState(false);
+  const on = voice.phase !== "off";
+
+  async function press() {
+    if (on) {
+      voice.toggle();
+      return;
+    }
+    setOpening(true);
+    try {
+      /* The conversation first, and awaited: a turn that names no chat is refused by the daemon
+         outright, in as many words. The id reaches the hook on the render this causes — which is
+         many frames before anything can be spoken into a microphone that is not even open yet, so
+         the toggle below cannot outrun it. */
+      if ((await chat.open()) === null) return;
+      voice.toggle();
+    } finally {
+      setOpening(false);
+    }
+  }
+
+  return (
+    <Panel title="Conversation" aside={<ConversationBadge phase={voice.phase} />}>
+      {armed ? (
+        <>
+          <div className="voice-capture-buttons">
+            <Button intent={on ? "stop" : "go"} disabled={opening} onClick={() => void press()}>
+              {on ? "Stop talking" : "Start talking"}
+            </Button>
+          </div>
+          <ConversationStatus voice={voice} />
+          {chat.trouble !== null && <ErrorNote>{chat.trouble}</ErrorNote>}
+        </>
+      ) : (
+        <Quiet says="not armed — nothing here can transcribe a spoken turn" />
+      )}
+    </Panel>
+  );
+}
+
+/**
+ * What each phase is called, and its one colour.
+ *
+ * Mapped here rather than in `state-map.ts`, for the reason that file's own docstring gives: it holds
+ * the domains the núcleo writes as Rust literals, and `ConversationPhase` is this shell's state
+ * machine. {@link PhaseBadge} two screens down is the same shape for the same reason.
+ */
+function ConversationBadge({ phase }: { phase: ConversationView["phase"] }) {
+  if (phase === "off") return <Badge tone="off">off</Badge>;
+  if (phase === "listening") return <Badge tone="active">listening</Badge>;
+  if (phase === "hearing") return <Badge tone="pending">hearing you</Badge>;
+  if (phase === "thinking") return <Badge tone="info">thinking</Badge>;
+  return <Badge tone="info">answering</Badge>;
+}
+
+/**
+ * Why a listening microphone has opened no turn.
+ *
+ * `flat` deliberately states a fact and asks nothing. It used to read "the microphone hears nothing —
+ * is it muted, or the wrong one?", which is a diagnosis, and it appeared in an ordinary quiet room
+ * four seconds after switching on — measured on 2026-09-19. The cause is a measurement floor rather
+ * than a bad threshold: `energyOf` bottoms out at -50 dBFS, and a quiet room with a desk microphone
+ * sits at about that, so the number genuinely cannot tell a silent room from a dead device. A sentence
+ * that claims otherwise is wrong four times out of five; one that reports the silence is right either
+ * way, and is still the clue somebody needs when the device really is muted.
+ */
+const SILENCE_SENTENCES: Record<SilenceReason, string> = {
+  noMicrophone: "the microphone is not sending any sound",
+  flat: "silence — nothing is reaching the microphone",
+  byLoudness: "not loud enough to open a turn — speak up or come closer",
+  belowThreshold: "sound, but not speech — noise, or too far from the microphone",
+};
+
+/** What the conversation heard, what it is hearing, and anything that stopped it working. */
+function ConversationStatus({ voice }: { voice: ConversationView }) {
+  const on = voice.phase !== "off";
+  const metering =
+    voice.phase === "listening" || voice.phase === "hearing" || voice.phase === "speaking";
+
+  if (
+    !on &&
+    voice.heard === null &&
+    voice.trouble === null &&
+    voice.assembling === null &&
+    voice.ignoredEcho === 0
+  ) {
+    return null;
+  }
+
+  return (
+    <div className="voice-conversation-status">
+      {/* The level and the bar answer one question together: is it hearing me, and is that enough to
+          open a turn? The bar moves on its own — it rises while the answer plays — which is the
+          difference between "it is ignoring me" and "it is holding a higher bar for a moment". */}
+      {metering && (
+        <span
+          role="meter"
+          aria-label="microphone level"
+          aria-valuemin={0}
+          aria-valuemax={1}
+          aria-valuenow={voice.level}
+          aria-valuetext={`level ${Math.round(voice.level * 100)}%, a turn opens at ${Math.round(voice.threshold * 100)}%`}
+          className="voice-meter"
+        >
+          <span
+            aria-hidden="true"
+            className="voice-meter-fill"
+            style={{ width: `${voice.level * 100}%` }}
+          />
+          <span
+            aria-hidden="true"
+            className="voice-meter-bar"
+            style={{ left: `${voice.threshold * 100}%` }}
+          />
+        </span>
+      )}
+      {/* Shown as soon as it is heard and BEFORE the answer, because a misheard question that only
+          becomes visible once it has been answered is a question nobody got to correct. */}
+      {voice.heard !== null && <span>heard: “{voice.heard}”</span>}
+      {voice.assembling !== null && <span>hearing: “{voice.assembling}”</span>}
+      {voice.silence !== null && <span>{SILENCE_SENTENCES[voice.silence]}</span>}
+      {/* A silently dropped segment looks exactly like a failed microphone, so say when the answer was
+          heard again and deliberately not treated as a turn. */}
+      {voice.ignoredEcho > 0 && (
+        <span title="it heard its own answer through the microphone and did not treat it as a turn">
+          ignored its own voice ×{voice.ignoredEcho}
+        </span>
+      )}
+      {on && !voice.hasVoice && <span>no voice on this machine — the answer will be written</span>}
+      {voice.listeningWith === "energy" && (
+        <span>
+          listening by loudness — noise may open a turn
+          {voice.whyByLoudness === null ? "" : ` (${voice.whyByLoudness})`}
+        </span>
+      )}
+      {voice.trouble !== null && <ErrorNote>{voice.trouble}</ErrorNote>}
+    </div>
   );
 }
 
@@ -385,7 +549,10 @@ function CaptureButtons({
       <Teach title="Voice is not armed">
         <p>
           Armed means a transcriber is configured on this machine —{" "}
-          <code>armed = enabled &amp;&amp; stt_command != ""</code>. It reflects configuration, not
+          <code>armed = enabled &amp;&amp; (stt_command != "" || stt_url != "")</code>. Either engine
+          arms it, since 2026-09-20: a machine pointed at a resident whisper server is the
+          configuration that is six times faster, and naming only the command would have reported no
+          voice at all on it. It reflects configuration, not
           whether a GPU or a model is actually present: the shell is set up to try, which is not the
           same fact as a capture succeeding.
         </p>

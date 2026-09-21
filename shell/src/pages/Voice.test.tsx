@@ -4,6 +4,13 @@ import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
+/* The conversation runner, mocked: it owns a microphone, an ONNX model and an `<audio>` element, none
+   of which jsdom has. What this page decides about it — when to open a chat, what to draw from the
+   view it returns — is exactly what is left to test here. `data/conversation.test.ts` holds the runner
+   itself, against a faked audio graph. */
+const conversation = vi.hoisted(() => ({ useVoiceConversation: vi.fn(), toggle: vi.fn() }));
+vi.mock("../data/conversation", () => conversation);
+
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
 vi.mock("../data/client", async (original) => ({
   ...(await original<typeof import("../data/client")>()),
@@ -25,6 +32,10 @@ beforeEach(() => {
   daemon.probeHealth.mockReset();
   mockInvoke.mockReset();
   mockListen.mockReset();
+  conversation.toggle.mockReset();
+  conversation.useVoiceConversation.mockReset();
+  conversation.useVoiceConversation.mockImplementation(() => aConversation());
+  window.localStorage.clear();
   // Both event subscriptions resolve to a harmless no-op unlisten by default —
   // individual tests override `voice_hotkey` and friends as they need.
   mockListen.mockResolvedValue(() => {});
@@ -242,5 +253,148 @@ describe("Voice — capture outcomes", () => {
     renderWithQuery(<Voice />);
 
     expect(await screen.findByText("call the plumber")).toBeDefined();
+  });
+});
+
+/* --------------------------------------------------- the spoken conversation -- */
+
+/** A view in whatever state a test needs, defaulting to a mode nobody has switched on. */
+function aConversation(overrides: Record<string, unknown> = {}) {
+  return {
+    phase: "off",
+    heard: null,
+    trouble: null,
+    hasVoice: true,
+    listeningWith: null,
+    whyByLoudness: null,
+    level: 0,
+    threshold: 0.6,
+    assembling: null,
+    silence: null,
+    ignoredEcho: 0,
+    toggle: conversation.toggle,
+    ...overrides,
+  };
+}
+
+/** The baseline, plus the chat list the one spoken conversation is looked up in. */
+function withChats(
+  config: VoiceConfigView,
+  listed: Array<{ chat_id: string; title: string | null }>,
+  opens: string | Error = "c-voice",
+) {
+  const base = daemonBaseline(config);
+  return async (path: string, init?: RequestInit) => {
+    if (path === "/assistant/chats" && (init?.method ?? "GET") === "GET") return listed;
+    if (path === "/assistant/chats" && init?.method === "POST") {
+      if (opens instanceof Error) throw opens;
+      return { chat_id: opens };
+    }
+    if (path.startsWith("/assistant/chats/") && init?.method === "PATCH") return undefined;
+    return base(path, init);
+  };
+}
+
+/** Every call the daemon was asked for, as `METHOD /path`. */
+function called(): string[] {
+  return daemon.apiFetch.mock.calls.map(
+    (call) => `${(call[1] as RequestInit | undefined)?.method ?? "GET"} ${String(call[0])}`,
+  );
+}
+
+describe("Voice — the spoken conversation", () => {
+  it("says what is missing instead of offering a button it cannot honour", async () => {
+    daemon.apiFetch.mockImplementation(daemonBaseline(voiceConfig({ armed: false, hotkey: "", memo_hotkey: "" })));
+
+    renderWithQuery(<Voice />);
+
+    expect(await screen.findByText("not armed — nothing here can transcribe a spoken turn")).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Start talking" })).toBeNull();
+  });
+
+  /* The order is the point, not an implementation detail: the daemon refuses a turn that names no
+     chat, so opening one has to finish BEFORE the microphone does. A toggle that went first would
+     leave a live microphone whose first sentence could not be sent anywhere. */
+  it("opens the one spoken conversation before it opens the microphone", async () => {
+    daemon.apiFetch.mockImplementation(withChats(voiceConfig(), []));
+
+    renderWithQuery(<Voice />);
+    fireEvent.click(await screen.findByRole("button", { name: "Start talking" }));
+
+    await waitFor(() => expect(conversation.toggle).toHaveBeenCalledTimes(1));
+    expect(called()).toContain("POST /assistant/chats");
+    expect(window.localStorage.getItem("nucleos.voice-chat")).toBe("c-voice");
+    /* That the opening comes FIRST is proved by the test below rather than by an index here: nothing
+       in this list is the toggle, so their order cannot be read from it. A run where opening fails and
+       the microphone stays shut can only happen if the toggle waits on it. */
+  });
+
+  it("speaks into the conversation it already has, without opening another", async () => {
+    daemon.apiFetch.mockImplementation(
+      withChats(voiceConfig(), [{ chat_id: "c-voice", title: "Voice" }]),
+    );
+
+    renderWithQuery(<Voice />);
+    fireEvent.click(await screen.findByRole("button", { name: "Start talking" }));
+
+    await waitFor(() => expect(conversation.toggle).toHaveBeenCalledTimes(1));
+    expect(called()).not.toContain("POST /assistant/chats");
+  });
+
+  /* A microphone opened with nowhere to send what it hears is the failure this pillar's design keeps
+     naming: armed-looking and useless. Better to stay off and say why. */
+  it("does not open the microphone when no conversation could be opened", async () => {
+    daemon.apiFetch.mockImplementation(
+      withChats(voiceConfig(), [], new Error("the daemon is not answering")),
+    );
+
+    renderWithQuery(<Voice />);
+    fireEvent.click(await screen.findByRole("button", { name: "Start talking" }));
+
+    expect(await screen.findByText("the daemon is not answering")).toBeDefined();
+    expect(conversation.toggle).not.toHaveBeenCalled();
+  });
+
+  /* The meter and the bar are one reading: "it hears me this much, and this much would open a turn".
+     Drawn separately they would answer neither — which is why the threshold travels in the accessible
+     text too, rather than living only in a coloured pixel. */
+  it("draws the level against the bar actually in force", async () => {
+    daemon.apiFetch.mockImplementation(withChats(voiceConfig(), []));
+    conversation.useVoiceConversation.mockImplementation(() =>
+      aConversation({ phase: "speaking", level: 0.3, threshold: 0.85 }),
+    );
+
+    renderWithQuery(<Voice />);
+
+    const meter = await screen.findByRole("meter", { name: "microphone level" });
+    expect(meter.getAttribute("aria-valuenow")).toBe("0.3");
+    expect(meter.getAttribute("aria-valuetext")).toBe("level 30%, a turn opens at 85%");
+  });
+
+  /* A segment dropped in silence looks exactly like a microphone that failed. Saying it was the
+     assistant's own voice is the difference between a working guard and an apparent fault. */
+  it("says when it heard its own answer and refused to treat it as a turn", async () => {
+    daemon.apiFetch.mockImplementation(withChats(voiceConfig(), []));
+    conversation.useVoiceConversation.mockImplementation(() =>
+      aConversation({ phase: "listening", ignoredEcho: 2 }),
+    );
+
+    renderWithQuery(<Voice />);
+
+    expect(await screen.findByText("ignored its own voice ×2")).toBeDefined();
+  });
+
+  /* Not the alarmed question it used to be. `energyOf` bottoms out at -50 dBFS and an ordinary quiet
+     room sits about there, so this reason cannot tell a silent room from a dead device — and the
+     sentence must not pretend it can. */
+  it("reports silence as a fact rather than diagnosing the microphone", async () => {
+    daemon.apiFetch.mockImplementation(withChats(voiceConfig(), []));
+    conversation.useVoiceConversation.mockImplementation(() =>
+      aConversation({ phase: "listening", silence: "flat" }),
+    );
+
+    renderWithQuery(<Voice />);
+
+    expect(await screen.findByText("silence — nothing is reaching the microphone")).toBeDefined();
   });
 });
