@@ -25,6 +25,18 @@ use sqlx::{FromRow, SqlitePool};
 /// nobody notices, because a prompt does not get slower, it gets emptier of room.
 pub const RENDER_CHARS: usize = 4_000;
 
+/// One item's share of the room when it got in on its score.
+pub const PER_ITEM_CHARS: usize = 600;
+
+/// And one FLOOR item's share, which is half of it, because five floors at 600 would eat 3,000 of the
+/// ~3,400 useful characters and leave less than one whole item behind. The five signals would then
+/// decide WHICH row fills each floor and nothing else, which is the blindness this module exists to
+/// end. At 300 the floors cost ~1,500, three whole items fit in what is left, and the scoring layer
+/// decides something again.
+#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(test, expect(dead_code))]
+pub const FLOOR_ITEM_CHARS: usize = 300;
+
 /// The nature of what is known, which is what makes one store rather than four.
 ///
 /// Unknown values are not an error and not a default: [`Layer::parse`] returns `Option` and every
@@ -193,7 +205,11 @@ impl Scope {
     }
 }
 
-/// One thing the agent knows.
+/// One candidate, with everything the pure selection needs and nothing it would have to fetch.
+///
+/// `s_fts` arrives ALREADY CALCULATED, and that is what purity costs: the rank is SQLite's, computed
+/// by `brief` — the one function here that talks to a database. A pure function that had to rank text
+/// itself would be a second, worse implementation of FTS5.
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct Known {
     pub id: i64,
@@ -215,6 +231,13 @@ pub struct Known {
     pub kind: String,
     pub title: String,
     pub body: String,
+    /// SQLite's rank for this row against the context's query, normalised. `0.0` when the row
+    /// did not match at all, which on day one is every row.
+    ///
+    /// Not a column of `knowledge`: the rank belongs to a QUERY, so `#[sqlx(default)]` leaves it
+    /// zero for every reader that selects `COLUMNS`, and `brief` sets it after the fetch.
+    #[sqlx(default)]
+    pub s_fts: f64,
     pub status: String,
     pub proposal_id: Option<i64>,
     pub supersedes: Option<i64>,
@@ -222,6 +245,66 @@ pub struct Known {
     pub created_at: String,
     pub activated_at: Option<String>,
     pub ended_at: Option<String>,
+}
+
+/// The kind of node whose work is being briefed, in the order the job graph uses them.
+#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(test, expect(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    Plan,
+    Implement,
+    Review,
+    Replan,
+}
+
+/// What the work is, as far as the selection is allowed to know it.
+#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(test, expect(dead_code))]
+pub struct Context {
+    /// The scope and its chain (machine -> project -> job; an errand inherits from machine alone).
+    pub chain: Vec<Scope>,
+    /// The files the worktree touched, or the ones the item declares.
+    pub files: Vec<String>,
+    /// The communities and modules of the project map those files inhabit — the signal this project
+    /// has for free because it already builds the map.
+    pub communities: Vec<String>,
+    pub node: Option<NodeKind>,
+    /// The normalised signature of the red gate, when there is one.
+    pub gate: Option<String>,
+}
+
+/// The room, and the three numbers that decide how it is spent.
+#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(test, expect(dead_code))]
+pub struct Budget {
+    pub render_chars: usize,
+    pub per_item_chars: usize,
+    pub floor_item_chars: usize,
+}
+
+/// One candidate's TRACE and not the signal: whether it was shown and the five scores that decided
+/// why it won or lost.
+#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(test, expect(dead_code))]
+pub struct Scored {
+    pub knowledge_id: i64,
+    pub shown: bool,
+    pub s_fts: f64,
+    pub s_scope: f64,
+    pub s_structure: f64,
+    pub s_recency: f64,
+    pub s_use: f64,
+}
+
+/// What a node reads, and what it was not shown.
+#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(test, expect(dead_code))]
+pub struct Brief {
+    pub block: Option<String>,
+    /// One entry per candidate, shown or not, with the five signals — this is what `brief` writes to
+    /// `run_knowledge`, and the reason the trace can answer WHICH signal elected a row.
+    pub trace: Vec<Scored>,
 }
 
 /// Every column of the store, in the order the migration declares them.
@@ -300,7 +383,6 @@ pub fn render(known: &[Known]) -> Option<String> {
 /// By chars and not bytes: a slice through a UTF-8 boundary panics on exactly the inputs nobody
 /// writes tests with, and a body is free text somebody wrote.
 fn clip(body: &str) -> String {
-    const PER_ITEM_CHARS: usize = 600;
     if body.chars().count() <= PER_ITEM_CHARS {
         return body.to_owned();
     }
@@ -1313,6 +1395,7 @@ mod tests {
             kind: kind.into(),
             title: title.into(),
             body: body.into(),
+            s_fts: 0.0,
             status: "active".into(),
             proposal_id: Some(1),
             supersedes: None,
