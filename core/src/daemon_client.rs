@@ -639,13 +639,11 @@ impl DaemonClient {
     /// off `RUN_ID_HEADER`, which `request` above sets from the run this client was built for — so
     /// a run can name itself and has no way to name anybody else. A field here would be a field a
     /// model could fill in, and "which run taught this?" would stop being evidence.
-    ///
-    /// `project_id` is `Option` and travels as JSON `null` when absent, which the door reads as
-    /// machine-wide. Omitting the key entirely would mean the same thing to serde and something
-    /// different to a reader of the wire, so it is sent.
+    /// The declaration's project is deliberately not a parameter for the same reason: the daemon
+    /// derives it from that run, so the caller cannot name another project or widen it to the whole
+    /// machine.
     pub async fn declare_refinement(
         &self,
-        project_id: Option<&str>,
         kind: &str,
         title: &str,
         body: &str,
@@ -654,7 +652,6 @@ impl DaemonClient {
         let response = self
             .request(reqwest::Method::POST, "/knowledge")
             .json(&serde_json::json!({
-                "project_id": project_id,
                 "kind": kind,
                 "title": title,
                 "body": body,

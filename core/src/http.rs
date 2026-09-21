@@ -13691,7 +13691,7 @@ struct LeaveNoteResponse {
 }
 
 #[derive(serde::Deserialize)]
-struct ProposeKnowledgeRequest {
+pub(crate) struct ProposeKnowledgeRequest {
     project_id: Option<String>,
     kind: String,
     title: String,
@@ -13716,7 +13716,7 @@ struct ProposeKnowledgeRequest {
 /// It still goes through the proposal, rather than inserting an `active` row: the review trail is
 /// what makes the layer safe to have at all, and a second way in that skipped it would be the way
 /// everything eventually got written. The owner simply approves their own in the next call.
-async fn post_knowledge(
+pub(crate) async fn post_knowledge(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(request): Json<ProposeKnowledgeRequest>,
@@ -13734,16 +13734,36 @@ async fn post_knowledge(
             "a refinement needs both a title and a body".to_owned(),
         ));
     }
+    let origin_run_id = sending_run_id_of(&headers);
+    let project_id = match origin_run_id {
+        Some(run_id) => {
+            sqlx::query_scalar::<_, Option<String>>("SELECT project_id FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, run_id, "reading a declaration's run scope failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "the refinement's scope could not be determined".to_owned(),
+                    )
+                })?
+                .flatten()
+        }
+        // The owner-facing route already allowed a person to choose a scope. D13 removes that
+        // choice from a run, not from the person using the same write door without a run header.
+        None => request.project_id.clone(),
+    };
     let (knowledge_id, proposal_id) = crate::knowledge::propose(
         &state.pool,
         crate::knowledge::Declaration {
-            project_id: request.project_id.as_deref(),
+            project_id: project_id.as_deref(),
             // Off the header and never off the body: `RUN_ID_HEADER` is set from an environment
             // variable the run's own tools have nothing able to read or alter, so a run can name
             // itself and cannot name anybody else. Absent for the owner writing from the app, who
             // is not a run — which is why the column stays nullable rather than the door demanding
             // one.
-            origin_run_id: sending_run_id_of(&headers),
+            origin_run_id,
             kind,
             title,
             body,
