@@ -153,12 +153,17 @@
  * scrolls the root (`.app-shell` is `overflow: hidden`, `.app-main` does the scrolling), so it may
  * well be reservable for nothing — but deciding that is a change to every surface, not to this
  * one. Left measured and named rather than papered over.
+ *
+ * **Hung by the top of the folded drawing, not centred on the drawing it is.** `translateY(-50%)`
+ * re-centred the notch on every unfold, so the panel opened by moving both rings up by half of
+ * what it grew — away from the pointer that had just reached them. `--quota-notch-rest` is the
+ * folded height, measured by `QuotaNotch` before its first paint; half of it above the middle is
+ * where the folded notch is centred, and the unfolded one grows down from the same line.
  */
 .quota-notch-contained {
   position: fixed;
   right: 0;
-  top: 50%;
-  transform: translateY(-50%);
+  top: calc(50% - var(--quota-notch-rest, 0px) / 2);
 }
 
 /*
@@ -172,7 +177,11 @@
 .quota-notch-slot {
   display: flex;
   flex-direction: row-reverse;
-  align-items: center;
+  /* The ring hangs from the top of its figures rather than sitting on their middle. Centred, it
+     moved down by half of what the three lines outgrow it by every time the panel opened, and the
+     whole point of hanging the notch from its top edge is that the ring the pointer is on does not
+     move at all. */
+  align-items: flex-start;
   gap: var(--space-3);
 }
 
@@ -229,6 +238,30 @@
     opacity: 0;
     transform: translateX(4px);
   }
+}
+
+/* The way out is the way in, played back: the same 4px towards the ring, the same duration.
+   `forwards` holds the last frame, so nothing flashes back to full ink in the instant between the
+   animation ending and `QuotaNotch` taking the panel away (`FOLD_MS`, which is this duration). */
+@keyframes quota-notch-fold {
+  to {
+    opacity: 0;
+    transform: translateX(4px);
+  }
+}
+
+/* The rest of what the unfold brings — the move control and the "last known" line — arrives with
+   the figures rather than a frame before them, so the panel appears as one thing. A little after
+   them, because they are about the reading and not the reading itself. */
+.quota-notch[data-unfolded="true"] > .quota-notch-control,
+.quota-notch[data-unfolded="true"] > .quota-notch-stale {
+  animation: quota-notch-unfold var(--dur-quick) var(--ease) 40ms backwards;
+}
+
+.quota-notch[data-folding="true"] .quota-notch-detail,
+.quota-notch[data-folding="true"] > .quota-notch-control,
+.quota-notch[data-folding="true"] > .quota-notch-stale {
+  animation: quota-notch-fold var(--dur-quick) var(--ease) forwards;
 }
 
 .quota-notch-line {

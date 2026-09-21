@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { Pin, PinOff } from "lucide-react";
 import { useQuota, type QuotaProvider, type QuotaWindow } from "../data/quota";
 import { IconButton, ProviderMark, Ring, relativeText, type RingTrack } from "../ui";
@@ -13,6 +13,30 @@ import type { NotchMode } from "./notch-mode";
  * `7d`), not the vendor's.
  */
 const WINDOWS = ["7d", "5h"] as const;
+
+/**
+ * How long the panel stays open after the pointer leaves it.
+ *
+ * **Folding on the instant was the other half of the bumpy hover.** A pointer that slips a pixel
+ * past the rounded corner, or across the edge while the floating window is still being resized
+ * round the panel, reads as a leave — and a notch that folds on every leave and unfolds on every
+ * enter flickers between the two for as long as somebody is trying to read it. A quarter of a
+ * second is long enough to forgive that and short enough that a notch the pointer has really left
+ * is already going by the time anybody looks back. A pointer that returns in the meantime cancels
+ * it, so the panel never folds under somebody reading it.
+ */
+const LINGER_MS = 240;
+
+/** How long the panel takes to go: `--dur-quick`, the length of `quota-notch-fold` (`app.css`). */
+const FOLD_MS = 140;
+
+/**
+ * Folded and open are the two states; `folding` is the moment between them, when the panel is
+ * still drawn and playing its way out. The drawing only shrinks once that is done — which in the
+ * floating host is also when its window shrinks — so what the owner sees go is the panel, never a
+ * rectangle of text cut off by a window closing round it.
+ */
+type Phase = "folded" | "open" | "folding";
 
 export interface QuotaNotchProps {
   /**
@@ -45,6 +69,13 @@ export interface QuotaNotchProps {
  * false: open always, it is a wall down the right-hand side of whatever page is in front. So both
  * hosts now show the rings alone until somebody asks, and the asking is a hover or a focus.
  *
+ * **The panel opens from where the rings are, and it waits before it goes.** Both hosts hang the
+ * notch by the top of its FOLDED drawing — `--quota-notch-rest` here, `rest` in `notch_fit` for
+ * the floating window — so unfolding grows the drawing down and to the left, and the first ring
+ * stays exactly where the pointer found it. Centred on its own height, as it was, every unfold
+ * moved the rings away by half of what it grew. And leaving folds only after `LINGER_MS`, so a
+ * pointer that slips off an edge for a moment is not answered with a fold and a re-open.
+ *
  * **One component, two hosts.** Nothing about the reading changes between them — only which way
  * the move control points. The contained host is also the recoil if the floating window misbehaves
  * (risk R1), which is why it keeps working with no Rust side at all.
@@ -68,7 +99,22 @@ export interface QuotaNotchProps {
  */
 export function QuotaNotch({ host = "contained", onMove }: QuotaNotchProps) {
   const quota = useQuota();
-  const [reached, setReached] = useState(false);
+  const [phase, setPhase] = useState<Phase>("folded");
+  const timer = useRef<number | undefined>(undefined);
+  const drawing = useRef<HTMLDivElement>(null);
+  // The drawing's height folded, for the contained host to hang from (`app.css`,
+  // `.quota-notch-contained`). Measured rather than derived: it is two rings or three, a border
+  // and some padding, and a sum of tokens written out here would be one more thing to keep equal.
+  const [rest, setRest] = useState<number | undefined>(undefined);
+  const count = quota.data?.providers.length ?? 0;
+
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+
+  // Before paint, so the first frame is already hung from the right place.
+  useLayoutEffect(() => {
+    if (phase !== "folded" || drawing.current === null) return;
+    setRest(drawing.current.getBoundingClientRect().height);
+  }, [phase, count]);
 
   // Nothing until the first answer. A notch drawn empty would say "nothing is burned", which is the
   // most misleading thing this feature could claim — and it would say it at exactly the moment
@@ -80,17 +126,39 @@ export function QuotaNotch({ host = "contained", onMove }: QuotaNotchProps) {
   // notch cannot be counted against two different nows — a difference of milliseconds that shows
   // up as "resets in 1h" beside "resets in 59min".
   const now = Date.now();
+  const reached = phase !== "folded";
+
+  const unfold = () => {
+    window.clearTimeout(timer.current);
+    setPhase("open");
+  };
+  // Every step checks where it is before it moves, so a leave that arrives with the notch already
+  // folded plays nothing, and a pointer back inside before the linger is up folds nothing.
+  const fold = (linger: number) => {
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => {
+      setPhase((current) => (current === "open" ? "folding" : current));
+      timer.current = window.setTimeout(
+        () => setPhase((current) => (current === "folding" ? "folded" : current)),
+        FOLD_MS,
+      );
+    }, linger);
+  };
 
   return (
     <div
+      ref={drawing}
       className={`quota-notch quota-notch-${host}`}
       data-unfolded={reached}
+      data-folding={phase === "folding"}
       data-stored={source === "stored"}
-      onPointerEnter={() => setReached(true)}
-      onPointerLeave={() => setReached(false)}
-      onFocus={() => setReached(true)}
+      style={rest === undefined ? undefined : ({ "--quota-notch-rest": `${rest}px` } as CSSProperties)}
+      onPointerEnter={unfold}
+      onPointerLeave={() => fold(LINGER_MS)}
+      onFocus={unfold}
       onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setReached(false);
+        // Focus has nothing to slip off, so it lingers for nothing — but the panel still plays out.
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) fold(0);
       }}
     >
       {providers.map((provider) => (
@@ -144,46 +212,41 @@ export function QuotaNotch({ host = "contained", onMove }: QuotaNotchProps) {
           last known
         </span>
       )}
-      {onMove !== undefined &&
-        (host === "contained" ? (
-          /*
-            Drawn in both states, unlike the floating host's: this is the only way out of the page
-            and into the window that floats over everything, and that host is where the notch is
-            worth having. The wrapper is what rules it off from the rings above it — stacked in
-            the same column, at the same size, a control reads as a third provider (`app.css`).
-          */
-          <span className="quota-notch-control">
-            <IconButton
-              label="Keep the notch in front of every window"
-              icon={Pin}
-              onClick={onMove}
-            />
-          </span>
-        ) : (
-          /*
-            Folded, the floating notch is the rings and nothing else — but the way back is still
-            THERE, tucked into `.sr-only` rather than left unrendered. Rendered only when unfolded,
-            it could not be reached by a keyboard at all: the wrapper's `onFocus` fires from a
-            child, and the only focusable child was this button, so focus had nowhere to land and
-            the notch never unfolded. Tucked away it is out of flow — it measures nothing, so the
-            window the Rust side fits round this drawing is the same size it was — and it is the
-            first tab stop, which unfolds the notch and brings itself into view.
+      {onMove !== undefined && (
+        /*
+          Folded, the notch is the rings and nothing else, in BOTH hosts — the owner's call: a pin
+          drawn under two rings at rest was one more thing on the edge of every page, for an action
+          taken once. The contained host used to be the exception, drawn in both states as the way
+          out to the floating one, and that way is still one hover away.
 
-            What that does NOT buy, and the old comment here claimed: reaching this window from the
-            keyboard in the first place. It is built `skip_taskbar(true)` (`notch.rs`), which on
-            Windows means WS_EX_TOOLWINDOW and no place in the Alt+Tab order, and `focused(false)`,
-            so it never takes focus by itself. Focus arrives when the owner clicks the notch, or
-            through assistive tech that can move it; Alt+F4 closes the window — which docks it —
-            only once focus is already there. So an owner working from the keyboard alone cannot
-            reach this control at all, and the main window has no other: `AppShell` draws no notch
-            while the mode is `global`, by design, and the mode has no home in settings yet. That
-            gap is named here rather than implied away — closing it is a decision about where such
-            a control belongs in the app, not a line of this component.
-          */
-          <span className={reached ? "quota-notch-control" : "sr-only"}>
+          Folded, the control is still THERE, tucked into `.sr-only` rather than left unrendered.
+          Rendered only when unfolded it could not be reached by a keyboard at all: the wrapper's
+          `onFocus` fires from a child, and the only focusable child is this button, so focus would
+          have nowhere to land and the notch would never unfold. Tucked away it is out of flow — it
+          measures nothing, so neither the page nor the window the Rust side fits round this drawing
+          changes size — and it is a tab stop, which unfolds the notch and brings itself into view.
+          The wrapper, drawn, is what rules it off from the rings above it: stacked in the same
+          column, at the same size, a control reads as a third provider (`app.css`).
+
+          What that does NOT buy in the floating host: reaching its window from the keyboard in the
+          first place. It is built `skip_taskbar(true)` (`notch.rs`), which on Windows means
+          WS_EX_TOOLWINDOW and no place in the Alt+Tab order, and `focused(false)`, so it never
+          takes focus by itself. Focus arrives when the owner clicks the notch, or through assistive
+          tech that can move it; Alt+F4 closes the window — which docks it — only once focus is
+          already there. So an owner working from the keyboard alone cannot reach the way back at
+          all, and the main window has no other: `AppShell` draws no notch while the mode is
+          `global`, by design, and the mode has no home in settings yet. That gap is named here
+          rather than implied away — closing it is a decision about where such a control belongs in
+          the app, not a line of this component.
+        */
+        <span className={reached ? "quota-notch-control" : "sr-only"}>
+          {host === "contained" ? (
+            <IconButton label="Keep the notch in front of every window" icon={Pin} onClick={onMove} />
+          ) : (
             <IconButton label="Put the notch back inside NucleOS" icon={PinOff} onClick={onMove} />
-          </span>
-        ))}
+          )}
+        </span>
+      )}
     </div>
   );
 }

@@ -1711,9 +1711,23 @@ ol.ui-well {
   stroke-dasharray: 3 3;
 }
 
+/* Motion here says one thing, and it is a state: how much of the window is gone. The arc sweeps out
+   from twelve o'clock when a reading first arrives, and slides to the new figure when a later one
+   differs — a quota that climbed from 40% to 55% is seen to climb, which a redraw would hide.
+   Both animate the dash only, which is paint: the ring's box never changes, so the floating
+   notch's window is never asked to follow it. `--ui-ring-length` is the track's circumference,
+   set by `Ring`, because the empty dash has to be as long as the whole circle to hide the arc. */
 .ui-ring-arc {
   fill: none;
   stroke-linecap: round;
+  transition: stroke-dasharray var(--dur-settle) var(--ease);
+  animation: ui-ring-fill var(--dur-settle) var(--ease) backwards;
+}
+
+@keyframes ui-ring-fill {
+  from {
+    stroke-dasharray: 0 var(--ui-ring-length);
+  }
 }
 
 .ui-ring-active {

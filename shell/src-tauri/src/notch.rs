@@ -227,7 +227,7 @@ pub fn open(app: &AppHandle) -> tauri::Result<()> {
 }
 
 /// Where the notch window sits: against the right edge of the work area — the screen minus the
-/// taskbar — and centred down it. All physical pixels.
+/// taskbar — with the FOLDED notch centred down it. All physical pixels.
 ///
 /// **`x` is derived from the right edge, and that is what makes the unfold work.** The window's
 /// width follows its drawing, so when the pointer arrives and the panel opens, this is called again
@@ -235,20 +235,35 @@ pub fn open(app: &AppHandle) -> tauri::Result<()> {
 /// from does not move. Computed from the left instead, the same unfold would walk the notch off the
 /// side of the screen, which is the one direction there is no room in.
 ///
-/// Both slacks saturate. `fit_size` has already clamped the drawing to the work area, so a window
+/// **`y` is derived from the folded height, and not from the window's.** It used to centre the
+/// window it was given, so an unfold that made the drawing taller moved the window UP by half of
+/// what it grew — and the rings, which are what the pointer was on, jumped away from under it the
+/// moment it arrived. That was the "bumpy" hover the owner reported: the panel opened somewhere
+/// other than where they were looking, and it did it again on every pass. Centring on `rest` — the
+/// height the page measured while folded — keeps the top edge where the folded notch had it, so the
+/// panel opens down and to the left and the first ring stays exactly where it was. A `rest` taller
+/// than the window (a provider dropped out while unfolded) is read as the window's own height.
+///
+/// Opening downwards is bounded by the bottom of the work area: a panel that would run past it is
+/// lifted just enough to fit, which only ever happens to a notch dragged most of the way down a
+/// short screen.
+///
+/// Every slack saturates. `fit_size` has already clamped the drawing to the work area, so a window
 /// bigger than the area cannot reach here from the app — but a screen that shrinks under a window
 /// can, and a notch pinned to the top-left corner is recoverable where one placed at a negative
 /// coordinate off the edge is not.
-pub fn right_middle(
+pub fn hang(
     area_x: i32,
     area_y: i32,
     area_width: u32,
     area_height: u32,
     window_width: u32,
     window_height: u32,
+    rest_height: u32,
 ) -> (i32, i32) {
     let x = area_width.saturating_sub(window_width);
-    let y = area_height.saturating_sub(window_height) / 2;
+    let centred = area_height.saturating_sub(rest_height.min(window_height)) / 2;
+    let y = centred.min(area_height.saturating_sub(window_height));
     (area_x + x as i32, area_y + y as i32)
 }
 
@@ -312,7 +327,7 @@ fn physical(css: f64, scale: f64, area: u32) -> u32 {
 /// notch was sized for a monitor it is not on — on a two-screen desk, a notch drawn at 125% on the
 /// 100% screen. The monitor is the one the window is currently on for the same reason, and the
 /// primary is only the fallback for a window the runtime cannot place.
-fn place(window: &WebviewWindow, width: f64, height: f64) -> Result<(), String> {
+fn place(window: &WebviewWindow, asked: Asked) -> Result<(), String> {
     let monitor = window
         .current_monitor()
         .ok()
@@ -323,29 +338,45 @@ fn place(window: &WebviewWindow, width: f64, height: f64) -> Result<(), String> 
     let scale = window
         .scale_factor()
         .unwrap_or_else(|_| monitor.scale_factor());
-    let Some((width, height)) = fit_size(width, height, scale, area.size.width, area.size.height)
-    else {
+    let Some((width, height)) = fit_size(
+        asked.width,
+        asked.height,
+        scale,
+        area.size.width,
+        area.size.height,
+    ) else {
         return window.hide().map_err(|e| e.to_string());
     };
+    // The folded height goes through the same scaling as the window's. One that is not a size —
+    // an older page that sent none, a NaN — is the window's own height, which is the centring
+    // this module did before it knew the difference.
+    let rest = fit_size(
+        asked.width,
+        asked.rest,
+        scale,
+        area.size.width,
+        area.size.height,
+    )
+    .map_or(height, |(_, rest)| rest);
     let size = tauri::PhysicalSize::new(width, height);
-    let (x, y) = right_middle(
+    let (x, y) = hang(
         area.position.x,
         area.position.y,
         area.size.width,
         area.size.height,
         width,
         height,
+        rest,
     );
     let position = tauri::PhysicalPosition::new(x, y);
     // Written only when it is not already so. `Moved` is one of the events that brings us back here
-    // (see the arm in `lib.rs`), and a `set_position` that fires another `Moved` would be a loop;
-    // comparing first ends it after one round. A size or position the runtime will not report is
-    // treated as wrong, which costs a write nobody needed and never a notch left in the wrong place.
-    if !matches!(window.inner_size(), Ok(current) if current == size) {
-        window.set_size(size).map_err(|e| e.to_string())?;
-    }
-    if !matches!(window.outer_position(), Ok(current) if current == position) {
-        window.set_position(position).map_err(|e| e.to_string())?;
+    // (see the arm in `lib.rs`), and a move that fires another `Moved` would be a loop; comparing
+    // first ends it after one round. A size or position the runtime will not report is treated as
+    // wrong, which costs a write nobody needed and never a notch left in the wrong place.
+    let resized = !matches!(window.inner_size(), Ok(current) if current == size);
+    let moved = !matches!(window.outer_position(), Ok(current) if current == position);
+    if resized || moved {
+        set_bounds(window, position, size)?;
     }
     if !window.is_visible().unwrap_or(false) {
         window.show().map_err(|e| e.to_string())?;
@@ -353,38 +384,107 @@ fn place(window: &WebviewWindow, width: f64, height: f64) -> Result<(), String> 
     Ok(())
 }
 
-/// The last CSS size the page asked for.
+/// Moves and resizes the window in ONE step, where the platform has one.
+///
+/// **Two steps are two frames, and the frame between them is the one the owner sees.** Every unfold
+/// both grows the window and moves it left, and `set_size` then `set_position` drew the grown
+/// window at the OLD position first — hanging off the right edge of the screen with the rings out
+/// of sight — and only then pulled it back into place. `SetWindowPos` takes both at once, so the
+/// window goes straight from the folded box to the unfolded one. `SWP_NOACTIVATE` keeps the promise
+/// `open` made with `focused(false)`: the notch never takes focus from what the owner is typing
+/// into, and a resize is no exception. `SWP_NOZORDER` leaves always-on-top as it was.
+#[cfg(windows)]
+fn set_bounds(
+    window: &WebviewWindow,
+    position: tauri::PhysicalPosition<i32>,
+    size: tauri::PhysicalSize<u32>,
+) -> Result<(), String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+    let handle = window.hwnd().map_err(|e| e.to_string())?;
+    // SAFETY: the handle is the live window Tauri just answered for, on the thread that owns it
+    // (a synchronous command, or the window event handler — both the main thread).
+    let done = unsafe {
+        SetWindowPos(
+            handle.0,
+            std::ptr::null_mut(),
+            position.x,
+            position.y,
+            size.width as i32,
+            size.height as i32,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+    };
+    if done == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+/// Elsewhere, the two steps: size first, so a runtime that clamps a window to its screen clamps the
+/// size it is about to have rather than the one it is leaving.
+#[cfg(not(windows))]
+fn set_bounds(
+    window: &WebviewWindow,
+    position: tauri::PhysicalPosition<i32>,
+    size: tauri::PhysicalSize<u32>,
+) -> Result<(), String> {
+    window.set_size(size).map_err(|e| e.to_string())?;
+    window.set_position(position).map_err(|e| e.to_string())
+}
+
+/// What the page last asked for, in CSS pixels: the drawing's box, and how tall it is folded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Asked {
+    width: f64,
+    height: f64,
+    rest: f64,
+}
+
+/// The last box the page asked for.
 ///
 /// Kept because nothing will ask again when the screen changes under the window: a new scale
 /// factor, a new resolution or a taskbar that moved leave the element's CSS box exactly as it was,
 /// so the page's `ResizeObserver` never fires. `refit` is what spends it.
-static ASKED: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+static ASKED: Mutex<Option<Asked>> = Mutex::new(None);
 
 /// The notch window's size follows its content, in CSS pixels, and it is re-placed on every change
 /// — which is also how it unfolds when the pointer reaches it: the page grows, asks to be fitted,
-/// and `right_middle` opens it leftwards off an edge that stays where it is.
+/// and `hang` opens it leftwards and downwards from the corner the folded notch occupied.
+///
+/// `rest` is the drawing's height while folded, which is what the window is centred on (see
+/// `hang`). Optional, so a page that sends none is centred on its whole height as before.
 ///
 /// Zero in either dimension hides the window. That is what the page sends when it has nothing to
 /// draw, and a hidden window is the only honest picture of "nothing measured yet".
 ///
 /// Answers only the notch window. The main window calling it would resize itself into a strip.
 #[tauri::command]
-pub fn notch_fit(window: WebviewWindow, width: f64, height: f64) -> Result<(), String> {
+pub fn notch_fit(
+    window: WebviewWindow,
+    width: f64,
+    height: f64,
+    rest: Option<f64>,
+) -> Result<(), String> {
     may_be_fitted(window.label())?;
-    if let Ok(mut asked) = ASKED.lock() {
-        *asked = Some((width, height));
+    let asked = Asked {
+        width,
+        height,
+        rest: rest.unwrap_or(height),
+    };
+    if let Ok(mut last) = ASKED.lock() {
+        *last = Some(asked);
     }
-    place(&window, width, height)
+    place(&window, asked)
 }
 
-/// Re-applies the last size the page asked for, for a screen that changed under the window.
+/// Re-applies the last box the page asked for, for a screen that changed under the window.
 ///
 /// Silent: there is nobody to tell. This runs from a window event rather than from a call the page
 /// made, and a window left where it was is still a notch.
 pub fn refit(window: &WebviewWindow) {
     let asked = ASKED.lock().ok().and_then(|asked| *asked);
-    if let Some((width, height)) = asked {
-        let _ = place(window, width, height);
+    if let Some(asked) = asked {
+        let _ = place(window, asked);
     }
 }
 
@@ -454,12 +554,12 @@ mod tests {
     /// screen's on a second monitor or with the taskbar down one side.
     #[test]
     fn the_notch_hangs_from_the_middle_of_the_right_edge() {
-        assert_eq!(right_middle(0, 0, 1920, 1040, 200, 140), (1720, 450));
-        assert_eq!(right_middle(-1920, 40, 1920, 1000, 200, 140), (-200, 470));
+        assert_eq!(hang(0, 0, 1920, 1040, 200, 140, 140), (1720, 450));
+        assert_eq!(hang(-1920, 40, 1920, 1000, 200, 140, 140), (-200, 470));
         // Bigger than the work area in both axes: pinned to its top-left corner rather than pushed
         // off the screen. `fit_size` clamps before this is reached, so what this covers is a screen
         // that changed under a window already placed.
-        assert_eq!(right_middle(0, 0, 100, 100, 200, 140), (0, 0));
+        assert_eq!(hang(0, 0, 100, 100, 200, 140, 140), (0, 0));
     }
 
     /// The property the unfold rests on: a wider drawing opens LEFTWARDS, because `x` is measured
@@ -467,12 +567,36 @@ mod tests {
     /// because the coordinates are arithmetic and the edge is the promise.
     #[test]
     fn a_wider_notch_keeps_its_right_edge_where_it_was() {
-        let folded = right_middle(0, 0, 1920, 1040, 46, 96);
-        let unfolded = right_middle(0, 0, 1920, 1040, 240, 96);
+        let folded = hang(0, 0, 1920, 1040, 46, 96, 96);
+        let unfolded = hang(0, 0, 1920, 1040, 240, 96, 96);
         assert_eq!(folded.0 + 46, 1920);
         assert_eq!(unfolded.0 + 240, 1920);
         // And down the edge it has not moved either: the height did not change, so neither did `y`.
         assert_eq!(folded.1, unfolded.1);
+    }
+
+    /// The other half of the same promise, and the one the bumpy hover broke: a TALLER drawing
+    /// opens downwards from where the folded one's top edge was. Centred on its own height, this
+    /// unfold moved the window up by 60 pixels, and the rings the pointer was on went with it.
+    #[test]
+    fn a_taller_notch_keeps_its_top_edge_where_the_folded_one_had_it() {
+        let folded = hang(0, 0, 1920, 1040, 62, 114, 114);
+        let unfolded = hang(0, 0, 1920, 1040, 280, 234, 114);
+        assert_eq!(folded.1, 463);
+        assert_eq!(unfolded.1, folded.1);
+        // A folded height taller than the window is read as the window's: a provider that dropped
+        // out while the panel was open does not park the notch above the middle.
+        assert_eq!(hang(0, 0, 1920, 1040, 62, 114, 400), folded);
+    }
+
+    /// Opening downwards never runs past the bottom of the work area; the panel is lifted just
+    /// enough to fit, and no further.
+    #[test]
+    fn an_unfold_that_would_run_off_the_bottom_is_lifted_to_fit() {
+        // Centred on a 100px fold in a 400px area the top is at 150, and 300px of panel from there
+        // would end at 450 — so the panel is lifted to end exactly at the bottom.
+        assert_eq!(hang(0, 0, 1920, 400, 280, 300, 100), (1640, 100));
+        assert_eq!(hang(0, 20, 1920, 400, 280, 300, 100), (1640, 120));
     }
 
     /// The main window asking to be fitted would resize itself into a strip.
@@ -554,8 +678,13 @@ mod tests {
             *asked, None,
             "nothing has been measured in this test binary"
         );
-        *asked = Some((200.0, 40.0));
-        assert_eq!(*asked, Some((200.0, 40.0)));
+        let box_ = Asked {
+            width: 200.0,
+            height: 40.0,
+            rest: 40.0,
+        };
+        *asked = Some(box_);
+        assert_eq!(*asked, Some(box_));
         *asked = None;
     }
 

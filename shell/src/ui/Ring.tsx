@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { StateBadgeProps } from "./StateBadge";
 import { readState } from "./state-map";
 
@@ -131,6 +131,9 @@ export function Ring({ label, tracks, size = SIZE, mark }: RingProps) {
                 r={track.radius}
                 strokeWidth={STROKE}
                 strokeDasharray={track.dash}
+                // What the arc sweeps out from (`.ui-ring-arc`): an empty dash the length of the
+                // whole track, so the first frame draws nothing rather than a full ring.
+                style={{ "--ui-ring-length": `${track.circumference}` } as CSSProperties}
                 // Start at twelve o'clock and run clockwise. Without this an arc begins at three
                 // and reads as a dial nobody set.
                 transform={`rotate(-90 ${size / 2} ${size / 2})`}

@@ -52,7 +52,7 @@ describe("NotchWindow", () => {
   it("asks to be fitted to its drawing", async () => {
     renderWithQuery(<NotchWindow />);
     await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("notch_fit", { width: 0, height: 0 }),
+      expect(tauri.invoke).toHaveBeenCalledWith("notch_fit", { width: 0, height: 0, rest: 0 }),
     );
   });
 

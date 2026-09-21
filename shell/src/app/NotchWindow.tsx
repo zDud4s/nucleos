@@ -25,12 +25,20 @@ export function NotchWindow() {
   useEffect(() => {
     const element = frame.current;
     if (element === null) return;
+    // The drawing's height the last time it was measured folded. The Rust side centres the window
+    // on THIS rather than on the window's own height, so an unfold opens downwards from where the
+    // folded notch's top edge was instead of re-centring — which moved the rings out from under
+    // the pointer that had just reached them (`notch.rs`, `hang`).
+    let rest: number | undefined;
     const fit = () => {
       const box = element.getBoundingClientRect();
+      const height = Math.ceil(box.height);
+      const unfolded = element.querySelector(".quota-notch")?.getAttribute("data-unfolded") === "true";
+      if (!unfolded || rest === undefined) rest = height;
       // Caught and dropped: a fit that fails leaves the window where it was, which is still a
       // notch, and there is nowhere in this window to say more.
       Promise.resolve()
-        .then(() => invoke("notch_fit", { width: Math.ceil(box.width), height: Math.ceil(box.height) }))
+        .then(() => invoke("notch_fit", { width: Math.ceil(box.width), height, rest }))
         .catch(() => {});
     };
     fit();

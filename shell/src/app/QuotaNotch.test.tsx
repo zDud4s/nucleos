@@ -258,24 +258,75 @@ describe("QuotaNotch", () => {
    * argument that a page has room to spare. A column down the right-hand edge makes that argument
    * false — open always, it is a wall over whatever page is in front.
    *
-   * Its move control is the exception, drawn in both states: it is the only way to the floating
-   * host, and the floating host is where the notch is worth having.
+   * Its move control used to be the exception, drawn in both states. It no longer is — the owner
+   * asked for the pin off the folded notch — so folded it is tucked away exactly as the floating
+   * host's is: not drawn, still a tab stop, and the same element once the notch opens.
    */
-  it("folds inside the app as well, and offers to float in either state", async () => {
+  it("folds inside the app as well, and offers to float only once unfolded", async () => {
     const onMove = vi.fn();
     answer({ providers: [claude()] });
     const { container, findByRole, findByText } = renderWithQuery(<QuotaNotch onMove={onMove} />);
     const float = await findByRole("button", { name: "Keep the notch in front of every window" });
     expect(container.querySelector(".quota-notch-detail")).toBeNull();
+    expect(float.closest(".sr-only")).not.toBeNull();
 
     fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
     await findByText("46%");
     expect(await findByRole("button", { name: "Keep the notch in front of every window" })).toBe(
       float,
     );
+    expect(float.closest(".sr-only")).toBeNull();
 
     fireEvent.click(float);
     expect(onMove).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * A pointer that leaves and comes straight back is not answered with a fold and a re-open.
+   *
+   * That flicker was the bumpy hover: the floating window grows round the panel as it opens, and a
+   * pointer near an edge reads as leaving for a moment while it does. Folding on the instant turned
+   * every such moment into a fold, a shrink, an enter and a grow — the panel nobody could read.
+   */
+  it("waits before it folds, and a pointer back in time keeps it open", async () => {
+    answer({ providers: [claude()] });
+    const { container, findByText, queryByText } = renderWithQuery(
+      <QuotaNotch host="global" onMove={vi.fn()} />,
+    );
+    await findByText(/claude: 7d 46% /);
+    const notch = container.querySelector(".quota-notch")!;
+    fireEvent.pointerEnter(notch);
+    await findByText("46%");
+
+    fireEvent.pointerLeave(notch);
+    // Still open, and not yet on its way out.
+    expect(queryByText("46%")).not.toBeNull();
+    expect(notch.getAttribute("data-folding")).toBe("false");
+    fireEvent.pointerEnter(notch);
+    // Longer than the linger and the fold together: had the leave counted, the panel would be gone.
+    await new Promise((settled) => setTimeout(settled, 500));
+    expect(queryByText("46%")).not.toBeNull();
+    expect(notch.getAttribute("data-unfolded")).toBe("true");
+  });
+
+  /**
+   * The panel plays its way out before it is taken away. `data-folding` is what the exit animation
+   * hangs off (`app.css`); the figures are still in the tree while it runs, and gone after.
+   */
+  it("plays the panel out before folding it away", async () => {
+    answer({ providers: [claude()] });
+    const { container, findByText, queryByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/claude: 7d 46% /);
+    const notch = container.querySelector(".quota-notch")!;
+    fireEvent.pointerEnter(notch);
+    await findByText("46%");
+
+    fireEvent.pointerLeave(notch);
+    await waitFor(() => expect(notch.getAttribute("data-folding")).toBe("true"));
+    expect(queryByText("46%")).not.toBeNull();
+    await waitFor(() => expect(queryByText("46%")).toBeNull());
+    expect(notch.getAttribute("data-folding")).toBe("false");
+    expect(notch.getAttribute("data-unfolded")).toBe("false");
   });
 
   /** A live reading says nothing about its source, and the edge stays solid. */
@@ -337,18 +388,20 @@ describe("QuotaNotch", () => {
    * Stacked in the same narrow column, at the same size, with the same air round it, the pin sat
    * under two rings looking like a provider nobody had drawn a quota for. `.quota-notch-control`
    * is the hairline that says which of the two categories it belongs to, and both hosts wear it
-   * — the floating one only once unfolded, because folded it is `.sr-only` and must measure
-   * nothing.
+   * once unfolded — folded the control is `.sr-only` in both, and must measure nothing.
    */
   it("rules the move control off from the rings", async () => {
     const onMove = vi.fn();
     answer({ providers: [claude()] });
     const page = renderWithQuery(<QuotaNotch onMove={onMove} />);
     const float = await page.findByRole("button", { name: "Keep the notch in front of every window" });
+    expect(float.closest(".quota-notch-control")).toBeNull();
+    fireEvent.focusIn(float);
+    await page.findByText("46%");
     expect(float.closest(".quota-notch-control")).not.toBeNull();
     page.unmount();
 
-    // Folded, the floating host keeps it out of the flow instead, rule and all.
+    // Folded, both hosts keep it out of the flow instead, rule and all.
     const floating = renderWithQuery(<QuotaNotch host="global" onMove={onMove} />);
     const back = await floating.findByRole("button", { name: "Put the notch back inside NucleOS" });
     expect(back.closest(".quota-notch-control")).toBeNull();
