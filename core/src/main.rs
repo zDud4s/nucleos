@@ -79,7 +79,6 @@ mod quota;
 mod quota_client;
 mod recurrence;
 mod redact;
-mod refine;
 mod relay;
 mod repo_trigger;
 mod resolver;

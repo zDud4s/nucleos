@@ -3830,14 +3830,34 @@ async fn spawn_node(
     //
     // Best-effort, like the notes above: a layer that cannot be read is a reason to say so, never a
     // reason to refuse to start the node.
-    let learned = match crate::refine::active_for(pool, Some(job.project_id.as_str())).await {
+    let pid = job.project_id.clone();
+    let context = crate::knowledge::Context {
+        chain: vec![
+            crate::knowledge::Scope::Machine,
+            crate::knowledge::Scope::Project(pid.clone()),
+            crate::knowledge::Scope::Job {
+                id: job.id,
+                project: Some(pid.clone()),
+            },
+        ],
+        files: Vec::new(),
+        communities: Vec::new(),
+        node: None,
+        gate: None,
+    };
+    let learned = match crate::knowledge::for_scope(
+        pool,
+        &crate::knowledge::Scope::Project(job.project_id.clone()),
+    )
+    .await
+    {
         Ok(learned) => learned,
         Err(error) => {
-            tracing::warn!(job_id = job.id, %error, "could not read the refinement layer");
+            tracing::warn!(job_id = job.id, %error, "could not read project knowledge");
             Vec::new()
         }
     };
-    if let Some(block) = crate::refine::render(&learned) {
+    if let Some(block) = crate::knowledge::render(&learned, &context) {
         prompt.push_str(&block);
     }
 

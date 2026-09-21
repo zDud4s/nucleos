@@ -35,8 +35,8 @@ pub const PER_ITEM_CHARS: usize = 600;
 /// decides something again.
 pub const FLOOR_ITEM_CHARS: usize = 300;
 
-const PREAMBLE: &str = "\n\nEarlier work on this project left the notes below, and a person approved every one of \
-     them before it reached you. Your brief above is still what you were asked to do; these are \
+const PREAMBLE: &str = "\n\nEarlier work on this project left the notes below under the two named admission rules. \
+     Each item names its layer. Your brief above is still what you were asked to do; these are \
      things already known about the project you are doing it in:";
 
 /// The nature of what is known, which is what makes one store rather than four.
@@ -120,16 +120,6 @@ impl Kind {
         match self {
             Kind::Memory => Layer::Semantic,
             Kind::Prompt | Kind::Skill | Kind::Subagent => Layer::Procedural,
-        }
-    }
-
-    /// What this kind is called where a node reads it.
-    fn heading(self) -> &'static str {
-        match self {
-            Kind::Prompt => "Standing instructions",
-            Kind::Memory => "What earlier runs found out about this project",
-            Kind::Skill => "How recurring work here is done",
-            Kind::Subagent => "Delegations that have worked before",
         }
     }
 }
@@ -525,7 +515,7 @@ fn scope_heading(scope: &Scope) -> String {
 
 fn cut_notice(omitted: usize) -> String {
     format!(
-        "\n\n({omitted} further approved {} in this scope {} not shown here, to leave room for the work.)",
+        "\n\n({omitted} further admitted {} in this scope {} not shown here, to leave room for the work.)",
         if omitted == 1 { "note" } else { "notes" },
         if omitted == 1 { "is" } else { "are" }
     )
@@ -731,61 +721,42 @@ const COLUMNS: &str = "id, layer, scope_kind, scope_id, source, generator, evide
 ///
 /// Appended to the brief and never replacing it, exactly as `notes::render` is — a node handed a
 /// standing instruction instead of its task does the standing instruction.
-pub fn render(known: &[Known]) -> Option<String> {
+pub fn render(known: &[Known], context: &Context) -> Option<String> {
     // Only what a person approved. Filtered here rather than trusted from the caller's query: this
     // function is the last thing between a `proposed` row and a node's prompt, and something that
     // reaches a prompt unapproved makes the approval decorative, which is the entire mechanism.
-    let mut live: Vec<(Kind, &Known)> = known
+    // The only named exceptions are a measured consolidator observation and an evidenced working
+    // fact read inside the same job; spelling their complete shapes here keeps a third one out.
+    let visible: Vec<Known> = known
         .iter()
-        .filter(|row| row.status == "active")
-        // Both vocabularies, and neither is decoration. The store carries no CHECK constraints, so
-        // this pair is what makes an unrecognised value an INVISIBLE row rather than a counted one
-        // — a row whose layer this binary cannot name is a row it cannot honestly render.
-        .filter(|row| Layer::parse(&row.layer).is_some())
-        .filter_map(|row| Kind::parse(&row.kind).map(|kind| (kind, row)))
+        .filter(|row| match row.status.as_str() {
+            "active" if row.source == "consolidator" => {
+                row.layer == "episodic" && row.observations.is_some()
+            }
+            "active" => true,
+            "live" => {
+                row.source == "run"
+                    && row.layer == "working"
+                    && row
+                        .evidence
+                        .as_deref()
+                        .is_some_and(|evidence| !evidence.trim().is_empty())
+                    && context
+                        .chain
+                        .iter()
+                        .any(|scope| matches!(scope, Scope::Job { .. }) && same_scope(row, scope))
+            }
+            _ => false,
+        })
+        // `select` keeps its Task 2.4 active-only seam. Eligibility has been decided above, so a
+        // job-local `live` row is normalised only in this private copy before entering that seam.
+        .map(|row| {
+            let mut row = row.clone();
+            row.status = "active".into();
+            row
+        })
         .collect();
-    if live.is_empty() {
-        return None;
-    }
-    // Kind first, id second: what a node reads first is a property of the store, never of the order
-    // rows happened to come back from SQLite.
-    live.sort_by_key(|(kind, row)| (*kind, row.id));
-
-    let mut block = String::from(PREAMBLE);
-
-    let mut shown = 0usize;
-    let mut heading_written: Option<Kind> = None;
-    for (kind, row) in &live {
-        // Rendered before it is measured, so the decision to include it is made on the length of
-        // what will actually be written rather than on an estimate of it.
-        let mut piece = String::new();
-        if heading_written != Some(*kind) {
-            piece.push_str(&format!("\n\n{}:", kind.heading()));
-        }
-        piece.push_str(&format!(
-            "\n- {}: {}",
-            row.title,
-            clip(&row.body, PER_ITEM_CHARS)
-        ));
-
-        if block.len() + piece.len() > RENDER_CHARS {
-            break;
-        }
-        block.push_str(&piece);
-        heading_written = Some(*kind);
-        shown += 1;
-    }
-
-    // Said, never silent. A store trimmed without saying so reads as the whole of what is known, and
-    // a node that believes it has been told everything stops asking.
-    let omitted = live.len() - shown;
-    if omitted > 0 {
-        block.push_str(&format!(
-            "\n\n({omitted} further approved {} not shown here, to leave room for the work.)",
-            if omitted == 1 { "note is" } else { "notes are" }
-        ));
-    }
-    Some(block)
+    select(&visible, context, &Budget::default()).block
 }
 
 /// One row's share of the room.
@@ -1533,7 +1504,10 @@ mod tests {
 
         // The row exists, is `active`, is in scope, and still reaches nothing. That is the whole of
         // what "no CHECK constraints" costs and the whole of what the Rust constants buy.
-        let block = render(&read).expect("the known layer still renders");
+        // Rendering now groups by the reading context; the assertion remains about the unknown
+        // layer, so it supplies the project context without changing what it proves.
+        let block =
+            render(&read, &project_context_for("mine")).expect("the known layer still renders");
         assert!(
             !block.contains("mercury is retrograde"),
             "a row this binary cannot name reached a node's prompt: {block}"
@@ -1746,7 +1720,12 @@ mod tests {
         assert_eq!(approve(&pool, proposal_id).await.unwrap(), knowledge_id);
         let after = for_scope(&pool, &mine).await.unwrap();
         assert_eq!(after.len(), 1, "approving did not activate the lesson");
-        assert!(render(&after).is_some(), "an active lesson renders nothing");
+        // Rendering now needs the scope chain that the store read represented; approval remains
+        // the assertion under test rather than the new grouping.
+        assert!(
+            render(&after, &project_context_for("mine")).is_some(),
+            "an active lesson renders nothing"
+        );
 
         // The door derives what 0088 could not say, and derives it the way the migration does.
         assert_eq!(
@@ -1816,11 +1795,115 @@ mod tests {
         }
     }
 
+    fn project_context() -> Context {
+        project_context_for("p")
+    }
+
+    fn project_context_for(id: &str) -> Context {
+        Context {
+            chain: vec![Scope::Machine, Scope::Project(id.into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        }
+    }
+
+    fn job_context(id: i64) -> Context {
+        Context {
+            chain: vec![
+                Scope::Machine,
+                Scope::Project("p".into()),
+                Scope::Job {
+                    id,
+                    project: Some("p".into()),
+                },
+            ],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        }
+    }
+
+    /// `prompt_budget.rs`, `budget.rs` and `token_efficiency.rs` exist to measure this: a briefing that
+    /// changes at every node BREAKS THE PROMPT CACHE. So machine and project scope are written first —
+    /// they do not change between nodes of the same job — and what the task chose comes last.
+    #[test]
+    fn two_nodes_of_the_same_job_read_the_same_bytes_before_the_bytes_that_are_theirs() {
+        let mut machine = one(1, "memory", "house", "shared house fact");
+        machine.scope_kind = "machine".into();
+        machine.scope_id = None;
+        let project = one(2, "memory", "project", "shared project fact");
+        let mut left = one(3, "memory", "left", "left-node fact");
+        left.scope_kind = "job".into();
+        left.scope_id = Some("77".into());
+        left.points_at = Some("core/src/left.rs".into());
+        let mut right = one(4, "memory", "right", "right-node fact");
+        right.scope_kind = "job".into();
+        right.scope_id = Some("77".into());
+        right.points_at = Some("core/src/right.rs".into());
+        let known = [machine, project, left, right];
+        let context = |file: &str| Context {
+            chain: vec![
+                Scope::Machine,
+                Scope::Project("p".into()),
+                Scope::Job {
+                    id: 77,
+                    project: Some("p".into()),
+                },
+            ],
+            files: vec![file.into()],
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+
+        let left = render(&known, &context("core/src/left.rs")).expect("left node is briefed");
+        let right = render(&known, &context("core/src/right.rs")).expect("right node is briefed");
+        let job_heading = "\n\nKnowledge about job 77:";
+        let left_job = left
+            .find(job_heading)
+            .expect("left brief has its job group");
+        let right_job = right
+            .find(job_heading)
+            .expect("right brief has its job group");
+
+        assert_eq!(&left[..left_job], &right[..right_job]);
+        assert_ne!(&left[left_job..], &right[right_job..]);
+    }
+
+    /// The layer is an item tag and not a heading, and that is what the reader needs to see: the tag is
+    /// what distinguishes a MEASUREMENT from something a person approved.
+    #[test]
+    fn every_item_says_which_layer_it_came_from() {
+        let semantic = one(1, "memory", "fact", "approved fact");
+        let mut episodic = one(2, "memory", "measurement", "measured result");
+        episodic.layer = Layer::Episodic.as_str().into();
+        episodic.source = "consolidator".into();
+        episodic.observations = Some(3);
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+
+        let block = render(&[semantic, episodic], &context).expect("both items render");
+        assert!(block.contains("\n- [semantic] fact: approved fact"));
+        assert!(block.contains("\n- [episodic] measurement: measured result"));
+        assert!(!block.contains("\n\nSemantic:"));
+        assert!(!block.contains("\n\nEpisodic:"));
+    }
+
     /// A project that has learned nothing must cost nothing. The block is appended to every node of
     /// every job, so an empty store that still wrote a heading would tax every run for ever.
     #[test]
     fn a_project_with_nothing_learned_adds_nothing_to_the_brief() {
-        assert!(render(&[]).is_none());
+        // Scope headings are written only for present groups, so the new grouped block must still
+        // cost nothing when there is no knowledge.
+        assert!(render(&[], &project_context()).is_none());
     }
 
     /// The failure this wording exists to prevent: a node handed a standing instruction INSTEAD of
@@ -1828,12 +1911,17 @@ mod tests {
     /// test asserts the item's own brief is still there beside it.
     #[test]
     fn the_block_adds_to_the_brief_rather_than_replacing_it() {
-        let block = render(&[one(
-            1,
-            "prompt",
-            "Run fmt",
-            "Always run cargo fmt before finishing.",
-        )])
+        // Scope groups replace kind headings, but the preamble still has to preserve the node's
+        // own brief as the governing instruction.
+        let block = render(
+            &[one(
+                1,
+                "prompt",
+                "Run fmt",
+                "Always run cargo fmt before finishing.",
+            )],
+            &project_context(),
+        )
         .expect("one active row renders");
         assert!(block.contains("Run fmt"), "the title is missing: {block}");
         assert!(
@@ -1846,36 +1934,34 @@ mod tests {
         );
     }
 
-    /// Grouped, and in the order of the enum rather than the order rows happen to arrive. A node
-    /// reading an instruction after four delegation specs has already spent its attention.
+    /// Scope groups deliberately replace the old per-kind headings: stable machine and project
+    /// bytes precede the job's own bytes, whatever order the rows happened to arrive in.
     #[test]
     fn the_kinds_arrive_in_a_fixed_order_whatever_order_the_rows_do() {
-        let block = render(&[
-            one(4, "subagent", "zzz-delegation", "s"),
-            one(3, "skill", "zzz-skill", "k"),
-            one(2, "memory", "zzz-fact", "m"),
-            one(1, "prompt", "zzz-instruction", "p"),
-        ])
-        .expect("renders");
-        // Distinctive needles, because the first version of this test used "P"/"M"/"K"/"S" and "S"
-        // matched the S of "Standing instructions" — it was comparing a heading against an item and
-        // failing on a renderer that was right.
+        let mut job = one(4, "subagent", "job item", "s");
+        job.scope_kind = "job".into();
+        job.scope_id = Some("77".into());
+        let project = one(3, "skill", "project item", "k");
+        let mut machine = one(2, "memory", "machine item", "m");
+        machine.scope_kind = "machine".into();
+        machine.scope_id = None;
+        let block = render(&[job, project, machine], &job_context(77)).expect("renders");
         let at = |needle: &str| {
             block
                 .find(needle)
                 .unwrap_or_else(|| panic!("{needle} missing"))
         };
         assert!(
-            at("zzz-instruction") < at("zzz-fact"),
-            "instructions must come before facts: {block}"
+            at("machine item") < at("project item"),
+            "machine scope must come before project scope: {block}"
         );
         assert!(
-            at("zzz-fact") < at("zzz-skill"),
-            "facts must come before skills: {block}"
+            at("project item") < at("job item"),
+            "project scope must come before job scope: {block}"
         );
         assert!(
-            at("zzz-skill") < at("zzz-delegation"),
-            "skills must come before delegations: {block}"
+            !block.contains("Standing instructions:"),
+            "the removed kind heading came back: {block}"
         );
     }
 
@@ -2014,11 +2100,13 @@ mod tests {
         let many: Vec<Known> = (1..=60)
             .map(|i| one(i, "memory", &format!("fact {i}"), &"x".repeat(300)))
             .collect();
-        let block = render(&many).expect("renders");
+        // The new selector accounts for each scope heading and its own cut notice, so the old loose
+        // byte bound becomes the exact character ceiling the grouped block promises.
+        let block = render(&many, &project_context()).expect("renders");
         assert!(
-            block.len() <= RENDER_CHARS * 2,
+            block.chars().count() <= RENDER_CHARS,
             "unbounded: {} chars from {} rows",
-            block.len(),
+            block.chars().count(),
             many.len()
         );
         assert!(
@@ -2094,18 +2182,18 @@ mod tests {
         );
     }
 
-    /// Structural first: preamble (238 characters, counted), one heading per PRESENT SCOPE GROUP,
-    /// and one cut notice per group that was actually cut. Groups of scope and not of layer — a
-    /// block ordered by scope interleaves layers, so a per-layer heading has nowhere to sit.
+    /// Structural first: the current preamble, one heading per PRESENT SCOPE GROUP, and one cut
+    /// notice per group that was actually cut. Groups of scope and not of layer — a block ordered
+    /// by scope interleaves layers, so a per-layer heading has nowhere to sit.
     #[test]
     fn the_headings_and_the_notices_come_off_the_top_before_any_floor_is_reserved() {
-        let preamble = "\n\nEarlier work on this project left the notes below, and a person approved every one of \
-                        them before it reached you. Your brief above is still what you were asked to do; these are \
-                        things already known about the project you are doing it in:";
-        assert_eq!(preamble.chars().count(), 238, "the preamble changed size");
+        // The preamble no longer claims every item was approved because §4.5 names two exceptions;
+        // the structural reservation still measures those exact bytes before choosing any item.
+        let preamble = PREAMBLE;
+        assert!(preamble.contains("two named admission rules"));
         let machine_heading = "\n\nHouse-wide knowledge:";
         let project_heading = "\n\nKnowledge about project p:";
-        let notice = "\n\n(1 further approved note in this scope is not shown here, to leave room for the work.)";
+        let notice = "\n\n(1 further admitted note in this scope is not shown here, to leave room for the work.)";
         let structural_chars = [preamble, machine_heading, project_heading, notice, notice]
             .into_iter()
             .map(|part| part.chars().count())
@@ -2178,17 +2266,90 @@ mod tests {
         assert_eq!(brief.trace.iter().filter(|row| row.shown).count(), 3);
     }
 
-    /// Only what a person approved. A `proposed` row reaching a prompt would make the approval
-    /// decorative, which is the whole mechanism.
+    /// Active rows still represent approval. The only rows that may bypass it are (a) an `active`
+    /// consolidator `episodic` row with observations and (b) a `live` run `working` row with
+    /// non-empty evidence, read only inside the job that wrote it. Enumerating the surrounding
+    /// status/source/layer space makes a third exception fail here rather than reach a prompt.
     #[test]
     fn nothing_that_a_person_has_not_approved_reaches_a_node() {
-        let mut waiting = one(1, "prompt", "Not yet", "This was never approved.");
-        waiting.status = "proposed".into();
-        let mut taken_back = one(2, "prompt", "Taken back", "This was reverted.");
-        taken_back.status = "reverted".into();
+        let context = job_context(77);
+        let statuses = ["active", "proposed", "live", "rejected", "reverted"];
+        let sources = ["owner", "run", "consolidator"];
+        let layers = ["semantic", "episodic", "procedural", "working"];
+        let mut id = 0;
+
+        for status in statuses {
+            for source in sources {
+                for layer in layers {
+                    id += 1;
+                    let title = format!("{status}/{source}/{layer}");
+                    let mut row = one(id, "memory", &title, "candidate");
+                    row.status = status.into();
+                    row.source = source.into();
+                    row.layer = layer.into();
+                    row.proposal_id =
+                        (status == "active" && source != "consolidator").then_some(id);
+                    if source == "consolidator" {
+                        row.observations = Some(1);
+                    }
+                    if status == "live" {
+                        row.scope_kind = "job".into();
+                        row.scope_id = Some("77".into());
+                        row.evidence = Some("run:900001".into());
+                    }
+
+                    let measured_exception = status == "active"
+                        && source == "consolidator"
+                        && layer == "episodic"
+                        && row.observations.is_some();
+                    let working_exception = status == "live"
+                        && source == "run"
+                        && layer == "working"
+                        && row
+                            .evidence
+                            .as_deref()
+                            .is_some_and(|value| !value.is_empty());
+                    let approved = status == "active" && source != "consolidator";
+                    assert_eq!(
+                        render(std::slice::from_ref(&row), &context).is_some(),
+                        approved || measured_exception || working_exception,
+                        "the admission rule was wrong for {title}"
+                    );
+                }
+            }
+        }
+
+        let mut measurement_without_observations = one(100, "memory", "unmeasured", "body");
+        measurement_without_observations.source = "consolidator".into();
+        measurement_without_observations.layer = "episodic".into();
+        measurement_without_observations.proposal_id = None;
+        measurement_without_observations.observations = None;
+
+        let mut working_without_evidence = one(101, "memory", "unsupported", "body");
+        working_without_evidence.status = "live".into();
+        working_without_evidence.source = "run".into();
+        working_without_evidence.layer = "working".into();
+        working_without_evidence.scope_kind = "job".into();
+        working_without_evidence.scope_id = Some("77".into());
+        working_without_evidence.evidence = Some("   ".into());
+
+        let mut another_jobs_working_fact = working_without_evidence.clone();
+        another_jobs_working_fact.id = 102;
+        another_jobs_working_fact.title = "another job's".into();
+        another_jobs_working_fact.scope_id = Some("78".into());
+        another_jobs_working_fact.evidence = Some("run:900002".into());
+
         assert!(
-            render(&[waiting, taken_back]).is_none(),
-            "something nobody approved reached a node's prompt"
+            render(
+                &[
+                    measurement_without_observations,
+                    working_without_evidence,
+                    another_jobs_working_fact,
+                ],
+                &context,
+            )
+            .is_none(),
+            "an incomplete or cross-job exception reached a node's prompt"
         );
     }
 
