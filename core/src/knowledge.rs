@@ -33,9 +33,11 @@ pub const PER_ITEM_CHARS: usize = 600;
 /// decide WHICH row fills each floor and nothing else, which is the blindness this module exists to
 /// end. At 300 the floors cost ~1,500, three whole items fit in what is left, and the scoring layer
 /// decides something again.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(test, expect(dead_code))]
 pub const FLOOR_ITEM_CHARS: usize = 300;
+
+const PREAMBLE: &str = "\n\nEarlier work on this project left the notes below, and a person approved every one of \
+     them before it reached you. Your brief above is still what you were asked to do; these are \
+     things already known about the project you are doing it in:";
 
 /// The nature of what is known, which is what makes one store rather than four.
 ///
@@ -275,8 +277,6 @@ pub enum NodeKind {
 }
 
 /// What the work is, as far as the selection is allowed to know it.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(test, expect(dead_code))]
 pub struct Context {
     /// The scope and its chain (machine -> project -> job; an errand inherits from machine alone).
     pub chain: Vec<Scope>,
@@ -285,24 +285,34 @@ pub struct Context {
     /// The communities and modules of the project map those files inhabit — the signal this project
     /// has for free because it already builds the map.
     pub communities: Vec<String>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(test, expect(dead_code))]
     pub node: Option<NodeKind>,
     /// The normalised signature of the red gate, when there is one.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(test, expect(dead_code))]
     pub gate: Option<String>,
 }
 
 /// The room, and the three numbers that decide how it is spent.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(test, expect(dead_code))]
 pub struct Budget {
     pub render_chars: usize,
     pub per_item_chars: usize,
     pub floor_item_chars: usize,
 }
 
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            render_chars: RENDER_CHARS,
+            per_item_chars: PER_ITEM_CHARS,
+            floor_item_chars: FLOOR_ITEM_CHARS,
+        }
+    }
+}
+
 /// One candidate's TRACE and not the signal: whether it was shown and the five scores that decided
 /// why it won or lost.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(test, expect(dead_code))]
 pub struct Scored {
     pub knowledge_id: i64,
     pub shown: bool,
@@ -314,12 +324,12 @@ pub struct Scored {
 }
 
 /// What a node reads, and what it was not shown.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(test, expect(dead_code))]
 pub struct Brief {
+    #[cfg_attr(not(test), allow(dead_code))] // Task 2.5 reads the selected block.
     pub block: Option<String>,
     /// One entry per candidate, shown or not, with the five signals — this is what `brief` writes to
     /// `run_knowledge`, and the reason the trace can answer WHICH signal elected a row.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 2.5 persists this trace.
     pub trace: Vec<Scored>,
 }
 
@@ -329,7 +339,6 @@ const NEUTRAL_UTILITY: f64 = 0.5;
 
 /// Score every candidate once. The tuple order below is the selection order: exactly the five
 /// signals in the design, followed only by stable vocabulary and id tie-breakers in the caller.
-#[cfg_attr(not(test), allow(dead_code))]
 fn scored_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<(&'a Known, Scored)> {
     let utility_if_absent = median_measured_utility(known);
 
@@ -461,7 +470,6 @@ fn median_measured_utility(known: &[Known]) -> f64 {
 }
 
 /// The candidates in the order the selector will consider them.
-#[cfg_attr(not(test), allow(dead_code))]
 fn ordered_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<&'a Known> {
     let mut candidates: Vec<(Layer, Kind, &Known, Scored)> = scored_candidates(known, context)
         .into_iter()
@@ -488,6 +496,225 @@ fn ordered_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<&'a Know
             .then_with(|| left.2.id.cmp(&right.2.id))
     });
     candidates.into_iter().map(|(_, _, row, _)| row).collect()
+}
+
+struct Selected<'a> {
+    row: &'a Known,
+    width: usize,
+    chars: usize,
+}
+
+struct Selection<'a> {
+    items: Vec<Selected<'a>>,
+    omitted: Vec<usize>,
+}
+
+fn same_scope(row: &Known, scope: &Scope) -> bool {
+    Scope::parse(&row.scope_kind, row.scope_id.as_deref())
+        .is_some_and(|row_scope| row_scope.columns() == scope.columns())
+}
+
+fn scope_heading(scope: &Scope) -> String {
+    match scope {
+        Scope::Machine => "\n\nHouse-wide knowledge:".into(),
+        Scope::Project(id) => format!("\n\nKnowledge about project {id}:"),
+        Scope::Errand(id) => format!("\n\nKnowledge about errand {id}:"),
+        Scope::Job { id, .. } => format!("\n\nKnowledge about job {id}:"),
+    }
+}
+
+fn cut_notice(omitted: usize) -> String {
+    format!(
+        "\n\n({omitted} further approved {} in this scope {} not shown here, to leave room for the work.)",
+        if omitted == 1 { "note" } else { "notes" },
+        if omitted == 1 { "is" } else { "are" }
+    )
+}
+
+fn item_piece(row: &Known, width: usize) -> String {
+    let layer = Layer::parse(&row.layer).expect("selection only carries recognised layers");
+    format!(
+        "\n- [{}] {}: {}",
+        layer.as_str(),
+        row.title,
+        clip(&row.body, width)
+    )
+}
+
+fn char_count(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn select_pass<'a>(
+    candidates: &[&'a Known],
+    groups: &[Scope],
+    budget: &Budget,
+    initial_notices: &[bool],
+    reserve_new_notices: bool,
+) -> Selection<'a> {
+    let totals: Vec<usize> = groups
+        .iter()
+        .map(|scope| {
+            candidates
+                .iter()
+                .filter(|row| same_scope(row, scope))
+                .count()
+        })
+        .collect();
+    let mut notices = initial_notices.to_vec();
+    let mut used = char_count(PREAMBLE)
+        + groups
+            .iter()
+            .map(|scope| char_count(&scope_heading(scope)))
+            .sum::<usize>()
+        + notices
+            .iter()
+            .enumerate()
+            .filter(|(_, reserved)| **reserved)
+            .map(|(index, _)| char_count(&cut_notice(totals[index])))
+            .sum::<usize>();
+
+    let floor_counts = [
+        (Layer::Semantic, 2usize),
+        (Layer::Episodic, 1usize),
+        (Layer::Procedural, 1usize),
+        (Layer::Working, 1usize),
+    ];
+    let mut floor_ids = Vec::new();
+    let mut priority = Vec::new();
+    for (layer, count) in floor_counts {
+        for row in candidates
+            .iter()
+            .copied()
+            .filter(|row| Layer::parse(&row.layer) == Some(layer))
+            .take(count)
+        {
+            floor_ids.push(row.id);
+            priority.push((row, budget.floor_item_chars));
+        }
+    }
+    priority.extend(
+        candidates
+            .iter()
+            .copied()
+            .filter(|row| !floor_ids.contains(&row.id))
+            .map(|row| (row, budget.per_item_chars)),
+    );
+
+    let mut selected: Vec<Selected<'a>> = Vec::new();
+    for (row, width) in priority {
+        let group = groups
+            .iter()
+            .position(|scope| same_scope(row, scope))
+            .expect("candidate belongs to one present scope group");
+        let chars = char_count(&item_piece(row, width));
+        if used.saturating_add(chars) <= budget.render_chars {
+            used += chars;
+            selected.push(Selected { row, width, chars });
+            continue;
+        }
+
+        if !reserve_new_notices || notices[group] {
+            continue;
+        }
+        notices[group] = true;
+        used = used.saturating_add(char_count(&cut_notice(totals[group])));
+        while used > budget.render_chars {
+            let Some(removed) = selected.pop() else {
+                break;
+            };
+            used -= removed.chars;
+            let removed_group = groups
+                .iter()
+                .position(|scope| same_scope(removed.row, scope))
+                .expect("selected row belongs to one present scope group");
+            if !notices[removed_group] {
+                notices[removed_group] = true;
+                used = used.saturating_add(char_count(&cut_notice(totals[removed_group])));
+            }
+        }
+    }
+
+    let omitted = groups
+        .iter()
+        .enumerate()
+        .map(|(index, scope)| {
+            totals[index]
+                - selected
+                    .iter()
+                    .filter(|item| same_scope(item.row, scope))
+                    .count()
+        })
+        .collect();
+    Selection {
+        items: selected,
+        omitted,
+    }
+}
+
+/// Select a bounded briefing without doing I/O.
+///
+/// Structure owns its bytes first. Populated layers then claim their item floors, and candidates
+/// left over compete in [`ordered_candidates`] order. The first pass discovers which scope groups
+/// are cut; the second reserves those notices before choosing rows and accounts for any cut it
+/// exposes at the boundary.
+#[cfg_attr(not(test), allow(dead_code))] // Task 2.5 wires this pure seam into `render`.
+pub fn select(known: &[Known], context: &Context, budget: &Budget) -> Brief {
+    let candidates: Vec<&Known> = ordered_candidates(known, context)
+        .into_iter()
+        .filter(|row| row.status == "active")
+        .filter(|row| context.chain.iter().any(|scope| same_scope(row, scope)))
+        .collect();
+    if candidates.is_empty() {
+        return Brief {
+            block: None,
+            trace: scored_candidates(known, context)
+                .into_iter()
+                .map(|(_, scored)| scored)
+                .collect(),
+        };
+    }
+
+    let groups: Vec<Scope> = context
+        .chain
+        .iter()
+        .filter(|scope| candidates.iter().any(|row| same_scope(row, scope)))
+        .cloned()
+        .collect();
+    let first = select_pass(
+        &candidates,
+        &groups,
+        budget,
+        &vec![false; groups.len()],
+        false,
+    );
+    let reserved: Vec<bool> = first.omitted.iter().map(|omitted| *omitted > 0).collect();
+    let selected = select_pass(&candidates, &groups, budget, &reserved, true);
+    let shown: Vec<i64> = selected.items.iter().map(|item| item.row.id).collect();
+
+    let mut block = String::from(PREAMBLE);
+    for (index, scope) in groups.iter().enumerate() {
+        block.push_str(&scope_heading(scope));
+        for item in selected
+            .items
+            .iter()
+            .filter(|item| same_scope(item.row, scope))
+        {
+            block.push_str(&item_piece(item.row, item.width));
+        }
+        if selected.omitted[index] > 0 {
+            block.push_str(&cut_notice(selected.omitted[index]));
+        }
+    }
+    let block = (char_count(&block) <= budget.render_chars).then_some(block);
+    let trace = scored_candidates(known, context)
+        .into_iter()
+        .map(|(_, mut scored)| {
+            scored.shown = block.is_some() && shown.contains(&scored.knowledge_id);
+            scored
+        })
+        .collect();
+    Brief { block, trace }
 }
 
 /// Every column of the store, in the order the migration declares them.
@@ -524,11 +751,7 @@ pub fn render(known: &[Known]) -> Option<String> {
     // rows happened to come back from SQLite.
     live.sort_by_key(|(kind, row)| (*kind, row.id));
 
-    let mut block = String::from(
-        "\n\nEarlier work on this project left the notes below, and a person approved every one of \
-         them before it reached you. Your brief above is still what you were asked to do; these are \
-         things already known about the project you are doing it in:",
-    );
+    let mut block = String::from(PREAMBLE);
 
     let mut shown = 0usize;
     let mut heading_written: Option<Kind> = None;
@@ -539,7 +762,11 @@ pub fn render(known: &[Known]) -> Option<String> {
         if heading_written != Some(*kind) {
             piece.push_str(&format!("\n\n{}:", kind.heading()));
         }
-        piece.push_str(&format!("\n- {}: {}", row.title, clip(&row.body)));
+        piece.push_str(&format!(
+            "\n- {}: {}",
+            row.title,
+            clip(&row.body, PER_ITEM_CHARS)
+        ));
 
         if block.len() + piece.len() > RENDER_CHARS {
             break;
@@ -565,11 +792,11 @@ pub fn render(known: &[Known]) -> Option<String> {
 ///
 /// By chars and not bytes: a slice through a UTF-8 boundary panics on exactly the inputs nobody
 /// writes tests with, and a body is free text somebody wrote.
-fn clip(body: &str) -> String {
-    if body.chars().count() <= PER_ITEM_CHARS {
+fn clip(body: &str, width: usize) -> String {
+    if body.chars().count() <= width {
         return body.to_owned();
     }
-    let mut cut: String = body.chars().take(PER_ITEM_CHARS).collect();
+    let mut cut: String = body.chars().take(width).collect();
     cut.push('…');
     cut
 }
@@ -1654,8 +1881,8 @@ mod tests {
 
     /// D6 is this test and nothing else. Without the `id` tail, two rows of the same scope with the same
     /// files and rank 0 tie, two distributions become indistinguishable, and "deterministic" is a word.
-    /// `knowledge.rs:257-258` carries the reason in the house's own words: "what a node reads first is a
-    /// property of the store, never of the order rows happened to come back from SQLite."
+    /// `render`'s `sort_by_key` carries the reason in the house's own words: "what a node reads first
+    /// is a property of the store, never of the order rows happened to come back from SQLite."
     #[test]
     fn two_candidates_that_tie_on_every_signal_are_still_ordered_the_same_way_every_time() {
         let mut higher_score = one(90, "subagent", "higher-score", "s");
@@ -1798,6 +2025,157 @@ mod tests {
             block.contains("not shown") || block.contains("more"),
             "trimmed in silence, which is the one way this may not fail: {block}"
         );
+    }
+
+    /// The test `the_block_is_bounded_and_says_what_it_left_out` cannot write today — it only
+    /// asserts `<= RENDER_CHARS * 2`, because the cut notice is appended AFTER the loop. Two passes
+    /// make the real ceiling assertable.
+    #[test]
+    fn the_block_never_passes_the_ceiling_however_much_is_on_offer() {
+        let many: Vec<Known> = (1..=60)
+            .map(|i| one(i, "memory", &format!("fact {i}"), &"x".repeat(1_000)))
+            .collect();
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let budget = Budget {
+            render_chars: RENDER_CHARS,
+            per_item_chars: PER_ITEM_CHARS,
+            floor_item_chars: FLOOR_ITEM_CHARS,
+        };
+
+        let brief = select(&many, &context, &budget);
+        let block = brief.block.expect("some of sixty active rows render");
+        assert!(
+            block.chars().count() <= RENDER_CHARS,
+            "the block passed its ceiling: {} > {RENDER_CHARS}",
+            block.chars().count()
+        );
+        assert!(block.contains("not shown"), "the cut was silent: {block}");
+    }
+
+    /// A floor reserved for a layer with no candidate is dead budget, and two layers are born empty.
+    #[test]
+    fn a_layer_with_nothing_in_it_reserves_no_floor() {
+        let mut first = one(1, "memory", "first", &"a".repeat(301));
+        first.s_fts = 3.0;
+        let mut second = one(2, "memory", "second", &"b".repeat(301));
+        second.s_fts = 2.0;
+        let mut third = one(3, "memory", "third", "small scored remainder");
+        third.s_fts = 1.0;
+        let known = [first, second, third];
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let budget = Budget {
+            render_chars: 1_100,
+            per_item_chars: PER_ITEM_CHARS,
+            floor_item_chars: FLOOR_ITEM_CHARS,
+        };
+
+        let brief = select(&known, &context, &budget);
+        assert_eq!(
+            brief.trace.iter().filter(|row| row.shown).count(),
+            3,
+            "empty episodic, procedural, and working layers consumed room: {:?}",
+            brief
+                .trace
+                .iter()
+                .map(|row| (row.knowledge_id, row.shown))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Structural first: preamble (238 characters, counted), one heading per PRESENT SCOPE GROUP,
+    /// and one cut notice per group that was actually cut. Groups of scope and not of layer — a
+    /// block ordered by scope interleaves layers, so a per-layer heading has nowhere to sit.
+    #[test]
+    fn the_headings_and_the_notices_come_off_the_top_before_any_floor_is_reserved() {
+        let preamble = "\n\nEarlier work on this project left the notes below, and a person approved every one of \
+                        them before it reached you. Your brief above is still what you were asked to do; these are \
+                        things already known about the project you are doing it in:";
+        assert_eq!(preamble.chars().count(), 238, "the preamble changed size");
+        let machine_heading = "\n\nHouse-wide knowledge:";
+        let project_heading = "\n\nKnowledge about project p:";
+        let notice = "\n\n(1 further approved note in this scope is not shown here, to leave room for the work.)";
+        let structural_chars = [preamble, machine_heading, project_heading, notice, notice]
+            .into_iter()
+            .map(|part| part.chars().count())
+            .sum();
+
+        let mut machine = one(1, "memory", "machine item", &"m".repeat(301));
+        machine.scope_kind = "machine".into();
+        machine.scope_id = None;
+        let project = one(2, "memory", "project item", &"p".repeat(301));
+        let known = [machine, project];
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let budget = Budget {
+            render_chars: structural_chars,
+            per_item_chars: PER_ITEM_CHARS,
+            floor_item_chars: FLOOR_ITEM_CHARS,
+        };
+
+        let brief = select(&known, &context, &budget);
+        let block = brief
+            .block
+            .expect("present groups still render their structure");
+        assert_eq!(block.chars().count(), structural_chars);
+        assert!(block.contains(machine_heading));
+        assert!(block.contains(project_heading));
+        assert_eq!(block.matches(notice).count(), 2);
+        assert!(!block.contains("machine item"));
+        assert!(!block.contains("project item"));
+        assert!(brief.trace.iter().all(|row| !row.shown));
+    }
+
+    /// The two clips are different numbers and the test says which is which.
+    #[test]
+    fn a_floor_item_is_cut_at_three_hundred_and_one_that_won_on_score_at_six_hundred() {
+        let mut floor = one(1, "memory", "floor", &"f".repeat(301));
+        floor.s_fts = 3.0;
+        let mut other_floor = one(2, "memory", "other floor", "short");
+        other_floor.s_fts = 2.0;
+        let mut scored = one(3, "memory", "score", &"s".repeat(601));
+        scored.s_fts = 1.0;
+        let known = [floor, other_floor, scored];
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let budget = Budget {
+            render_chars: RENDER_CHARS,
+            per_item_chars: PER_ITEM_CHARS,
+            floor_item_chars: FLOOR_ITEM_CHARS,
+        };
+
+        let brief = select(&known, &context, &budget);
+        let block = brief.block.expect("all three rows fit");
+        assert!(
+            block.contains(&format!("{}…", "f".repeat(FLOOR_ITEM_CHARS))),
+            "the floor item was not clipped at {FLOOR_ITEM_CHARS}: {block}"
+        );
+        assert!(
+            block.contains(&format!("{}…", "s".repeat(PER_ITEM_CHARS))),
+            "the score winner was not clipped at {PER_ITEM_CHARS}: {block}"
+        );
+        assert_eq!(brief.trace.iter().filter(|row| row.shown).count(), 3);
     }
 
     /// Only what a person approved. A `proposed` row reaching a prompt would make the approval
