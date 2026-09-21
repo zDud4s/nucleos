@@ -307,6 +307,32 @@ pub struct Brief {
     pub trace: Vec<Scored>,
 }
 
+/// The candidates in the order the selector will consider them.
+#[cfg_attr(not(test), allow(dead_code))]
+fn ordered_candidates(known: &[Known]) -> Vec<&Known> {
+    let mut candidates: Vec<(f64, Layer, Kind, &Known)> = known
+        .iter()
+        .filter_map(|row| {
+            Some((
+                row.s_fts,
+                Layer::parse(&row.layer)?,
+                Kind::parse(&row.kind)?,
+                row,
+            ))
+        })
+        .collect();
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or_else(|| right.0.total_cmp(&left.0))
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.id.cmp(&right.3.id))
+    });
+    candidates.into_iter().map(|(_, _, _, row)| row).collect()
+}
+
 /// Every column of the store, in the order the migration declares them.
 ///
 /// One constant and not five copies: [`FromRow`] matches by name, so a query that forgets a column
@@ -1467,6 +1493,45 @@ mod tests {
             at("zzz-skill") < at("zzz-delegation"),
             "skills must come before delegations: {block}"
         );
+    }
+
+    /// D6 is this test and nothing else. Without the `id` tail, two rows of the same scope with the same
+    /// files and rank 0 tie, two distributions become indistinguishable, and "deterministic" is a word.
+    /// `knowledge.rs:257-258` carries the reason in the house's own words: "what a node reads first is a
+    /// property of the store, never of the order rows happened to come back from SQLite."
+    #[test]
+    fn two_candidates_that_tie_on_every_signal_are_still_ordered_the_same_way_every_time() {
+        let mut higher_score = one(90, "subagent", "higher-score", "s");
+        higher_score.layer = Layer::Working.as_str().into();
+        higher_score.s_fts = 1.0;
+
+        let tied_second = one(20, "memory", "tied-second", "m2");
+        let tied_first = one(10, "memory", "tied-first", "m1");
+        let prompt = one(80, "prompt", "prompt", "p");
+        let skill = one(70, "skill", "skill", "k");
+
+        // The tied pair shares project scope `p`, this one selection context (and therefore its files),
+        // and rank 0.0. The other rows make each earlier key observable before the id tail is asserted.
+        let first = vec![
+            higher_score.clone(),
+            tied_second.clone(),
+            prompt.clone(),
+            tied_first.clone(),
+            skill.clone(),
+        ];
+        let second = vec![skill, tied_first, prompt, tied_second, higher_score];
+        let ids = |rows: &[Known]| {
+            ordered_candidates(rows)
+                .into_iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        let first_ids = ids(&first);
+        let second_ids = ids(&second);
+        assert_eq!(first_ids.as_bytes(), second_ids.as_bytes());
+        assert_eq!(first_ids, "90,10,20,80,70");
     }
 
     /// A store that grows for a year would take the context the work needs, and the failure mode is
