@@ -1,11 +1,13 @@
 // §spec novo-frontend
 
 import { useEffect, useRef, useState } from "react";
+import { useNavigate, useSearch } from "@tanstack/react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { finishCapture, startCapture, type ActiveCapture } from "../lib/capture";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import { useVoiceConversation, type ConversationView } from "../data/conversation";
+import { useHotkeyRegistration } from "../data/hotkeys";
 import { useVoiceChat } from "../data/voice-chat";
 import type { SilenceReason } from "../lib/vad";
 import {
@@ -122,13 +124,14 @@ export function Voice() {
   const [pending, setPending] = useState(false);
   const [outcome, setOutcome] = useState<CaptureOutcome | null>(null);
   const [delivery, setDelivery] = useState<Delivery | null>(null);
-  const [hotkeyConflicts, setHotkeyConflicts] = useState<string[] | null>(null);
-  const [hotkeyRegisterFailed, setHotkeyRegisterFailed] = useState(false);
-  /** The host's own sentence when this desktop hands out no global hotkeys at all — Wayland. */
-  const [hotkeysUnavailable, setHotkeysUnavailable] = useState<string | null>(null);
+  /* Registered by the shell, not here — see `data/hotkeys.ts`. The page reads the outcome of the one
+     registration, which the shell has usually finished before anybody opens this page. */
+  const hotkeys = useHotkeyRegistration();
+  const hotkeyConflicts = hotkeys?.conflicts ?? null;
+  const hotkeyRegisterFailed = hotkeys?.failed ?? false;
+  const hotkeysUnavailable = hotkeys?.unavailable ?? null;
 
   const captureRef = useRef<ActiveRecording | null>(null);
-  const registeredHotkeysRef = useRef<string | null>(null);
 
   /** The phase this window already holds, in case the host is mid-capture from before this page mounted. */
   useEffect(() => {
@@ -145,52 +148,6 @@ export function Voice() {
       cancelled = true;
     };
   }, []);
-
-  /**
-   * Register all three hotkeys once the config that names them has answered, and again only if the
-   * chords actually change.
-   *
-   * All three in ONE call, because `register_hotkeys` unregisters everything before it registers
-   * anything — a second call naming only the conversation chord would silently drop the other two.
-   * The conversation chord was registered from here while the mode it toggles still lived in a
-   * chat's composer, on the grounds that the registration is indivisible. Since 2026-09-21 the mode
-   * lives on this page too, so the chord and what it does are finally in one file.
-   *
-   * The host is asked FIRST whether this desktop gives global hotkeys at all, and the ask lives in
-   * THIS effect rather than an earlier one of its own on purpose: on Wayland the answer is a
-   * sentence and the registration must not happen. Two effects would order themselves by render
-   * timing, so the sentence could be on screen while the chords were registered anyway — the page
-   * claiming to have hotkeys and explaining that it has none, in the same breath. Sequenced here,
-   * "there is a sentence" and "nothing was registered" are the same decision.
-   */
-  useEffect(() => {
-    const dictationHotkey = config.data?.hotkey;
-    const memoHotkey = config.data?.memo_hotkey;
-    const conversationHotkey = config.data?.conversation_hotkey;
-    if (dictationHotkey === undefined || memoHotkey === undefined) return;
-    const conversation = conversationHotkey ?? "";
-    const key = `${dictationHotkey} ${memoHotkey} ${conversation}`;
-    if (registeredHotkeysRef.current === key) return;
-    registeredHotkeysRef.current = key;
-    invoke<string | null>("voice_hotkeys_unavailable")
-      // A host that does not know the command is a host with nothing to refuse, and so is one
-      // that answers `undefined` rather than `null` — both mean "register them". Treated as the
-      // same answer because the alternative is a page that silently stops registering hotkeys
-      // the day it runs against an older shell.
-      .catch(() => null)
-      .then((answer) => {
-        const sentence = answer ?? null;
-        setHotkeysUnavailable(sentence);
-        if (sentence !== null) return;
-        return invoke<string[]>("voice_register_hotkeys", {
-          dictation: dictationHotkey,
-          memo: memoHotkey,
-          conversation,
-        })
-          .then((failed) => setHotkeyConflicts(failed))
-          .catch(() => setHotkeyRegisterFailed(true));
-      });
-  }, [config.data?.hotkey, config.data?.memo_hotkey, config.data?.conversation_hotkey]);
 
   async function beginRecording(kind: "dictation" | "memo") {
     setOutcome(null);
@@ -340,7 +297,7 @@ export function Voice() {
         <DeliveryNote delivery={delivery} />
       </Panel>
 
-      <Conversation armed={config.data?.armed ?? false} />
+      <Conversation armed={config.data?.armed} />
 
       <ConfigReadout config={config} />
 
@@ -367,17 +324,23 @@ export function Voice() {
  * Which conversation it belongs to is `data/voice-chat.ts`'s whole subject — one dedicated chat,
  * reused, because the daemon refuses a turn that names none.
  */
-function Conversation({ armed }: { armed: boolean }) {
+function Conversation({ armed }: { armed: boolean | undefined }) {
   const chat = useVoiceChat();
   const voice = useVoiceConversation(chat.chatId);
   const [opening, setOpening] = useState(false);
+  /* The same fact as `opening`, readable inside an await. A chord pressed while the button's own
+     request is in flight would otherwise open the conversation twice, and two `POST`s before either
+     has settled are two conversations. */
+  const openingRef = useRef(false);
   const on = voice.phase !== "off";
 
   async function press() {
+    if (openingRef.current) return;
     if (on) {
       voice.toggle();
       return;
     }
+    openingRef.current = true;
     setOpening(true);
     try {
       /* The conversation first, and awaited: a turn that names no chat is refused by the daemon
@@ -387,13 +350,16 @@ function Conversation({ armed }: { armed: boolean }) {
       if ((await chat.open()) === null) return;
       voice.toggle();
     } finally {
+      openingRef.current = false;
       setOpening(false);
     }
   }
 
+  useChordRequest(armed, press);
+
   return (
     <Panel title="Conversation" aside={<ConversationBadge phase={voice.phase} />}>
-      {armed ? (
+      {armed === true ? (
         <>
           <div className="voice-capture-buttons">
             <Button intent={on ? "stop" : "go"} disabled={opening} onClick={() => void press()}>
@@ -411,6 +377,43 @@ function Conversation({ armed }: { armed: boolean }) {
 }
 
 /**
+ * The `talk` stamp `app/ConversationChord.tsx` puts in the address when the conversation chord is
+ * pressed. A number or nothing: anything else a person typed there is the same as not asking.
+ */
+export function validateVoiceSearch(search: Record<string, unknown>): { talk?: number } {
+  const talk = typeof search.talk === "number" ? search.talk : Number(search.talk);
+  return Number.isFinite(talk) && search.talk !== undefined && search.talk !== "" ? { talk } : {};
+}
+
+/**
+ * Acts on the chord's stamp once, through `press` — the button's own path, so the chord opens the
+ * conversation before the microphone exactly as a click does.
+ *
+ * Waits for the configuration rather than acting on its absence: arriving from another page, the
+ * stamp lands before `armed` has answered, and treating "not answered yet" as "not armed" would
+ * swallow the one press that brought the person here. Once it has answered, an unarmed page consumes
+ * the stamp and does nothing — the panel already says why, in place of the button.
+ *
+ * The stamp is removed from the address as it is consumed, so a reload or a Back does not start a
+ * conversation nobody asked for this time. The consumed value is remembered as well, because clearing
+ * the address is itself a navigation and this effect sees the old stamp again before it lands.
+ */
+function useChordRequest(armed: boolean | undefined, press: () => Promise<void>) {
+  const navigate = useNavigate();
+  const { talk } = validateVoiceSearch(useSearch({ strict: false }) as Record<string, unknown>);
+  const pressRef = useRef(press);
+  pressRef.current = press;
+  const consumedRef = useRef<number | undefined>(undefined);
+
+  useEffect(() => {
+    if (talk === undefined || talk === consumedRef.current || armed === undefined) return;
+    consumedRef.current = talk;
+    void navigate({ to: "/voice", search: {}, replace: true });
+    if (armed) void pressRef.current();
+  }, [talk, armed, navigate]);
+}
+
+/**
  * What each phase is called, and its one colour.
  *
  * Mapped here rather than in `state-map.ts`, for the reason that file's own docstring gives: it holds
@@ -421,8 +424,7 @@ function ConversationBadge({ phase }: { phase: ConversationView["phase"] }) {
   if (phase === "off") return <Badge tone="off">off</Badge>;
   if (phase === "listening") return <Badge tone="active">listening</Badge>;
   if (phase === "hearing") return <Badge tone="pending">hearing you</Badge>;
-  if (phase === "thinking") return <Badge tone="info">thinking</Badge>;
-  return <Badge tone="info">answering</Badge>;
+  return <Badge tone="info">{phase === "thinking" ? "thinking" : "answering"}</Badge>;
 }
 
 /**

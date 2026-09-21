@@ -3,9 +3,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { energyOf, FLAT_LEVEL, FRAME_MS, FRAME_SAMPLES } from "../lib/vad";
 
-const tauri = vi.hoisted(() => ({ listen: vi.fn() }));
-vi.mock("@tauri-apps/api/event", () => tauri);
-
 const silero = vi.hoisted(() => ({ loadSileroSession: vi.fn(), probability: 0 }));
 vi.mock("../lib/silero", () => ({
   loadSileroSession: silero.loadSileroSession,
@@ -92,8 +89,6 @@ async function reachSpeaking() {
 }
 
 beforeEach(() => {
-  tauri.listen.mockReset();
-  tauri.listen.mockResolvedValue(() => {});
   silero.loadSileroSession.mockReset();
   // The load's shape, not a session: these suites drive the energy fallback, which is what a
   // machine with no runtime gets. `why` is what the fallback now has to carry.

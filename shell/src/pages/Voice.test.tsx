@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -20,8 +20,15 @@ vi.mock("../data/client", async (original) => ({
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Voice } from "./Voice";
+import { CONVERSATION_TOGGLE_EVENT, ConversationChord } from "../app/ConversationChord";
 import { phaseAfter, type Capture, type VoiceConfigView } from "../data/voice";
-import { renderWithQuery } from "../test/harness";
+import { renderWithRouter } from "../test/harness";
+
+/* Inside a router, because the page reads its address: the conversation chord arrives as a `talk`
+   stamp in it (`app/ConversationChord.tsx`). */
+function renderVoice(path = "/voice") {
+  return renderWithRouter(<Voice />, { initialPath: path });
+}
 
 const mockInvoke = vi.mocked(invoke);
 const mockListen = vi.mocked(listen);
@@ -156,7 +163,7 @@ describe("Voice — not armed", () => {
   it("teaches instead of offering capture when voice is not armed", async () => {
     daemon.apiFetch.mockImplementation(daemonBaseline(voiceConfig({ armed: false, hotkey: "", memo_hotkey: "" })));
 
-    renderWithQuery(<Voice />);
+    await renderVoice();
 
     expect(await screen.findByText("Voice is not armed")).toBeDefined();
     expect(screen.queryByRole("button", { name: "Start dictation" })).toBeNull();
@@ -173,7 +180,7 @@ describe("Voice — hotkey registration", () => {
       return undefined;
     });
 
-    renderWithQuery(<Voice />);
+    await renderVoice();
 
     expect(await screen.findByText("armed, but the hotkeys did not register — use the buttons below")).toBeDefined();
     const capture = screen.getByRole("heading", { level: 2, name: "Capture" }).closest("section");
@@ -195,7 +202,7 @@ describe("Voice — hotkey registration", () => {
       return undefined;
     });
 
-    renderWithQuery(<Voice />);
+    await renderVoice();
 
     // `textContent` and not a matcher: this suite has no jest-dom.
     await waitFor(() => {
@@ -228,7 +235,7 @@ describe("Voice — capture outcomes", () => {
       return undefined;
     });
 
-    renderWithQuery(<Voice />);
+    await renderVoice();
 
     const start = await screen.findByRole("button", { name: "Start dictation" });
     fireEvent.click(start);
@@ -250,7 +257,7 @@ describe("Voice — capture outcomes", () => {
       return undefined;
     });
 
-    renderWithQuery(<Voice />);
+    await renderVoice();
 
     expect(await screen.findByText("call the plumber")).toBeDefined();
   });
@@ -306,7 +313,7 @@ describe("Voice — the spoken conversation", () => {
   it("says what is missing instead of offering a button it cannot honour", async () => {
     daemon.apiFetch.mockImplementation(daemonBaseline(voiceConfig({ armed: false, hotkey: "", memo_hotkey: "" })));
 
-    renderWithQuery(<Voice />);
+    await renderVoice();
 
     expect(await screen.findByText("not armed — nothing here can transcribe a spoken turn")).toBeDefined();
     expect(screen.queryByRole("button", { name: "Start talking" })).toBeNull();
@@ -318,7 +325,7 @@ describe("Voice — the spoken conversation", () => {
   it("opens the one spoken conversation before it opens the microphone", async () => {
     daemon.apiFetch.mockImplementation(withChats(voiceConfig(), []));
 
-    renderWithQuery(<Voice />);
+    await renderVoice();
     fireEvent.click(await screen.findByRole("button", { name: "Start talking" }));
 
     await waitFor(() => expect(conversation.toggle).toHaveBeenCalledTimes(1));
@@ -334,7 +341,7 @@ describe("Voice — the spoken conversation", () => {
       withChats(voiceConfig(), [{ chat_id: "c-voice", title: "Voice" }]),
     );
 
-    renderWithQuery(<Voice />);
+    await renderVoice();
     fireEvent.click(await screen.findByRole("button", { name: "Start talking" }));
 
     await waitFor(() => expect(conversation.toggle).toHaveBeenCalledTimes(1));
@@ -348,7 +355,7 @@ describe("Voice — the spoken conversation", () => {
       withChats(voiceConfig(), [], new Error("the daemon is not answering")),
     );
 
-    renderWithQuery(<Voice />);
+    await renderVoice();
     fireEvent.click(await screen.findByRole("button", { name: "Start talking" }));
 
     expect(await screen.findByText("the daemon is not answering")).toBeDefined();
@@ -364,7 +371,7 @@ describe("Voice — the spoken conversation", () => {
       aConversation({ phase: "speaking", level: 0.3, threshold: 0.85 }),
     );
 
-    renderWithQuery(<Voice />);
+    await renderVoice();
 
     const meter = await screen.findByRole("meter", { name: "microphone level" });
     expect(meter.getAttribute("aria-valuenow")).toBe("0.3");
@@ -379,7 +386,7 @@ describe("Voice — the spoken conversation", () => {
       aConversation({ phase: "listening", ignoredEcho: 2 }),
     );
 
-    renderWithQuery(<Voice />);
+    await renderVoice();
 
     expect(await screen.findByText("ignored its own voice ×2")).toBeDefined();
   });
@@ -393,8 +400,66 @@ describe("Voice — the spoken conversation", () => {
       aConversation({ phase: "listening", silence: "flat" }),
     );
 
-    renderWithQuery(<Voice />);
+    await renderVoice();
 
     expect(await screen.findByText("silence — nothing is reaching the microphone")).toBeDefined();
+  });
+});
+
+describe("Voice — the conversation chord", () => {
+  /* The chord arrives as a stamp in the address, from whatever page was open. It has to take the
+     button's own path — conversation first, then the microphone — or the first press of a fresh
+     install switches the mode on with no conversation, and the daemon refuses the first turn. */
+  it("starts talking through the button's own path when the chord brought the person here", async () => {
+    daemon.apiFetch.mockImplementation(withChats(voiceConfig(), []));
+
+    const { router } = await renderVoice("/voice?talk=1700000000000");
+
+    await waitFor(() => expect(conversation.toggle).toHaveBeenCalledTimes(1));
+    expect(called()).toContain("POST /assistant/chats");
+    expect(window.localStorage.getItem("nucleos.voice-chat")).toBe("c-voice");
+    // Consumed, so a reload or a Back does not start a conversation nobody asked for this time.
+    await waitFor(() => expect(router.state.location.search).toEqual({}));
+  });
+
+  it("does nothing but clear the stamp on a page that cannot transcribe", async () => {
+    daemon.apiFetch.mockImplementation(withChats(voiceConfig({ armed: false }), []));
+
+    const { router } = await renderVoice("/voice?talk=1700000000000");
+
+    await waitFor(() => expect(router.state.location.search).toEqual({}));
+    expect(conversation.toggle).not.toHaveBeenCalled();
+    expect(called()).not.toContain("POST /assistant/chats");
+  });
+
+  /* A second press is a second stamp, and it must reach the SAME page instance: the chord pressed
+     while the conversation is on is how somebody stops it without looking for the button. */
+  it("answers a second press on the page that is already open", async () => {
+    daemon.apiFetch.mockImplementation(
+      withChats(voiceConfig(), [{ chat_id: "c-voice", title: "Voice" }]),
+    );
+
+    let chord: (() => void) | null = null;
+    mockListen.mockImplementation(async (event, handler) => {
+      if (event === CONVERSATION_TOGGLE_EVENT) chord = () => handler({} as never);
+      return () => {};
+    });
+
+    // The page and the shell's listener together, as the app mounts them.
+    const { router } = await renderWithRouter(
+      <>
+        <Voice />
+        <ConversationChord />
+      </>,
+      { initialPath: "/voice?talk=1" },
+    );
+    await waitFor(() => expect(conversation.toggle).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(router.state.location.search).toEqual({}));
+    await waitFor(() => expect(chord).not.toBeNull());
+
+    act(() => chord?.());
+
+    await waitFor(() => expect(conversation.toggle).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(router.state.location.search).toEqual({}));
   });
 });

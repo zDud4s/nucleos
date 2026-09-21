@@ -35,7 +35,7 @@ import { System } from "./pages/System";
 import { TeamRunDetail } from "./pages/TeamRunDetail";
 import { Teams } from "./pages/Teams";
 import { Bench } from "./team/Bench";
-import { Voice } from "./pages/Voice";
+import { Voice, validateVoiceSearch } from "./pages/Voice";
 import { Waiting, validateWaitingSearch } from "./pages/Waiting";
 import { Web } from "./pages/Web";
 
@@ -99,6 +99,7 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
   "/feed": validateFeedSearch,
   "/calendar": validateCalendarSearch,
   "/waiting": validateWaitingSearch,
+  "/voice": validateVoiceSearch,
 };
 
 /**

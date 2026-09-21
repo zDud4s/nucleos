@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { Outlet, useNavigate } from "@tanstack/react-router";
 import { useChats } from "../data/chats";
+import { useHotkeyRegistration } from "../data/hotkeys";
 import { untriagedCount, useMailQueue } from "../data/mail";
 import { POLL } from "../data/poll";
 import { useProjects, useSystemHealth, wantsAttention } from "../data/system";
@@ -9,6 +10,7 @@ import { unreadTotal } from "../lib/turns";
 import { PaletteProvider, usePaletteGroup, type PaletteGroup } from "../ui";
 import { AttentionHeartbeat } from "./AttentionHeartbeat";
 import { ConnectionGate } from "./ConnectionGate";
+import { ConversationChord } from "./ConversationChord";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { NotificationsDrawer } from "./NotificationsDrawer";
 import { PaletteTrigger } from "./PaletteTrigger";
@@ -92,11 +94,18 @@ function Frame() {
    * business rather than something this component should have to know.
    */
   const projects = useProjects();
+  /**
+   * The three global chords, registered here because this is the one component every page is inside.
+   * Registered from the Voice page instead, a "global" chord did not exist until somebody had opened
+   * that page since launch — see `data/hotkeys.ts`. The page reads the outcome from the same query.
+   */
+  useHotkeyRegistration();
 
   return (
     <PaletteProvider>
       <div className="app-shell">
         <AttentionHeartbeat />
+        <ConversationChord />
         <Destinations />
         <Sidebar
           badges={{

@@ -16,7 +16,6 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 
 import {
   ConversationAction,
@@ -45,9 +44,6 @@ import { useListening, type Listening } from "./listening";
 import type { LiveTurn } from "./chats";
 import { apiFetch } from "./client";
 import { fetchSpeechUnit, postSegment } from "./voice";
-
-/** The chord's event, emitted by `shell/src-tauri/src/dictation.rs`. */
-const TOGGLE_EVENT = "voice://conversation-toggle";
 
 /**
  * The three constraints that make hands-free possible at all.
@@ -598,19 +594,10 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
     },
   });
 
-  useEffect(() => {
-    let stop: (() => void) | undefined;
-    listen(TOGGLE_EVENT, () => dispatchRef.current({ type: "toggled" }))
-      .then((off) => {
-        stop = off;
-      })
-      // Swallowed rather than surfaced, and the mode keeps working without it. Subscribing needs a
-      // Tauri runtime; a test harness and a plain browser have none, and neither does a shell whose
-      // global-shortcut plugin failed to start. What is lost is the chord — the button beside Send
-      // is unaffected, and it is the button that a person who cannot see the chord will reach for.
-      .catch(() => undefined);
-    return () => stop?.();
-  }, []);
+  // The chord is not subscribed here. This hook is mounted by one page, so a listener inside it made a
+  // global chord work on that page alone — and it toggled without opening the conversation a turn
+  // needs. `app/ConversationChord.tsx` answers it from every page and routes it through the page's
+  // own button instead.
 
   // The microphone must not outlive the page. Without this, navigating away leaves a live capture
   // with nothing on screen saying so — which in a pillar built for privacy is the worst leak it has.
