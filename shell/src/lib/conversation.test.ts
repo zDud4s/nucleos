@@ -182,7 +182,10 @@ describe("the conversation mode", () => {
   });
 
   it("segmentation does not start while the answer is playing", () => {
-    // The AEC is unproven (spec §7). Speech STARTING is still barge-in; a segment must not open.
+    // Speech starting while the answer plays is barge-in, so the only way to reach `speaking` +
+    // `speechEnded` is an onset the self-guard swallowed (`selfGuardHolds` in `lib/vad.ts`);
+    // transcribing that tail would send the assistant's own first syllable to the transcriber —
+    // which is why this stays `nothing`.
     expect(onConversationEvent("speaking", { type: "speechEnded" })).toEqual({
       phase: "speaking",
       action: "nothing",

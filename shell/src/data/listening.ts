@@ -19,7 +19,10 @@
  * once.
  *
  * What it does NOT own: what a sentence is worth, what to do with one, and whether to record at all.
- * The caller starts and stops the recording and reads it whenever it likes.
+ * The caller starts and stops the recording and reads it whenever it likes. Nor does it own where the
+ * bar sits or which onsets count — `gateNow` is asked every frame and `onSignal` may refuse one, so a
+ * caller that knows something this module cannot (that the voice on the line is the assistant's own)
+ * decides, while the arithmetic of the gate stays here, once.
  */
 
 import { useCallback, useEffect, useRef } from "react";
@@ -28,7 +31,9 @@ import { durationMs } from "../lib/audio";
 import { loadSileroSession, SpeechProbe } from "../lib/silero";
 import {
   energyOf,
+  FRAME_MS,
   FRAME_SAMPLES,
+  GateConfig,
   GateState,
   IDLE_GATE,
   onFrame,
@@ -60,8 +65,35 @@ export interface ListeningHandlers {
    * letting the frame through would let the gate open a segment on the way out.
    */
   onFrame?: (recording: boolean) => boolean | void;
-  /** Somebody started or stopped talking. */
-  onSignal: (signal: "speechStarted" | "speechEnded") => void;
+  /**
+   * Which gate is in force right now, asked once per frame. Omitted, every frame uses `DEFAULT_GATE`.
+   *
+   * Per frame and not per session because the bar moves while the microphone stays open: a spoken
+   * conversation raises it for as long as the answer is playing and drops it again afterwards, many
+   * times over one session. See `gateFor`.
+   */
+  gateNow?: () => GateConfig;
+  /**
+   * The two numbers behind the decision, for a caller that has to show or diagnose them.
+   *
+   * Reported because neither can be recomputed from outside: the probability came from a model this
+   * module holds, and loudness is separate evidence about the DEVICE rather than about speech — a flat
+   * signal is a muted or wrong microphone, whatever the model says of it. With no model the two are
+   * the same number, because loudness is then what the gate judges.
+   *
+   * Not called for a frame that was dropped, which is the honest thing: nothing judged it.
+   */
+  onMeasured?: (measured: { probability: number; loudness: number; at: number }) => void;
+  /**
+   * Somebody started or stopped talking. Returning `false` REFUSES the signal and re-arms the gate.
+   *
+   * Refusing is not the same as ignoring, and the difference is the whole reason this returns
+   * anything. An onset left unhandled leaves the gate open with nothing recording, so the person who
+   * really is talking has no onset left to give and cannot open a turn until they stop. Re-arming
+   * makes a refusal cost one onset instead of the rest of the session. It exists for the self-guard,
+   * where an onset within `SELF_GUARD_MS` of an answer's first syllable is the answer itself.
+   */
+  onSignal: (signal: "speechStarted" | "speechEnded") => boolean | void;
   /** The microphone could not be opened, in words fit to show somebody. */
   onTrouble: (sentence: string) => void;
   /**
@@ -92,6 +124,13 @@ export interface Listening {
   /** Everything kept so far, and stop keeping. `null` when nothing was being kept. */
   take: () => Recorded | null;
   isRecording: () => boolean;
+  /**
+   * Whether the device is open, which is the first thing to know about silence.
+   *
+   * `diagnoseListening` looks for `noMicrophone` before anything else and nothing could produce it:
+   * the caller had no way to ask, so it passed `micOpen: true` and the reason was unreachable.
+   */
+  isOpen: () => boolean;
 }
 
 interface Live {
@@ -160,7 +199,7 @@ export function useListening(handlers: ListeningHandlers): Listening {
    *
    * Assigned once when the graph is built, so everything it reads is a ref.
    */
-  const onAudioFrame = useCallback((frame: Float32Array) => {
+  const onAudioFrame = useCallback((frame: Float32Array, at: number) => {
     // Synchronous and first, because these two are what the recording IS. Deferring them behind the
     // probe below would put the audio's order at the mercy of how fast inference happens to be.
     const recording = recordingRef.current;
@@ -170,15 +209,29 @@ export function useListening(handlers: ListeningHandlers): Listening {
     prerollRef.current.push(frame);
     if (prerollRef.current.length > PREROLL_FRAMES) prerollRef.current.shift();
 
-    const decide = (probability: number) => {
-      const { state, signal } = onFrame(gateRef.current, probability);
+    const decide = (probability: number, loudness: number) => {
+      handlersRef.current.onMeasured?.({ probability, loudness, at });
+      const { state, signal } = onFrame(
+        gateRef.current,
+        probability,
+        handlersRef.current.gateNow?.(),
+      );
       gateRef.current = state;
-      if (signal !== null) handlersRef.current.onSignal(signal);
+      if (signal === null) return;
+      // Re-armed and not merely dropped, for the reason written on `onSignal`: a refused onset that
+      // left the gate open would lock the person out until they stopped talking.
+      if (handlersRef.current.onSignal(signal) === false) gateRef.current = IDLE_GATE;
     };
+
+    // Measured for every frame that is judged, because it costs 512 multiply-adds and a logarithm at
+    // 31 Hz — less than the branch that would avoid it — and a caller asking for it later would
+    // otherwise have to be given the frame.
+    const loudness = energyOf(frame);
 
     const probe = probeRef.current;
     if (probe === null) {
-      decide(energyOf(frame));
+      // One number used twice: with no model, loudness IS the probability the gate is judging.
+      decide(loudness, loudness);
       return;
     }
 
@@ -190,7 +243,7 @@ export function useListening(handlers: ListeningHandlers): Listening {
     pendingRef.current += 1;
     chainRef.current = chainRef.current
       .then(() => probe.probability(frame))
-      .then(decide)
+      .then((probability) => decide(probability, loudness))
       // One frame that failed is one frame of silence, not a broken mode. A runtime that fails every
       // frame presents as a gate that never opens, which is what the fallback above is for.
       .catch(() => undefined)
@@ -225,8 +278,19 @@ export function useListening(handlers: ListeningHandlers): Listening {
 
         processor.onaudioprocess = (event) => {
           const buffer = event.inputBuffer.getChannelData(0);
+          // The callback fires once the buffer is FULL, so this clock dates its LAST frame and every
+          // earlier one is dated backwards from it. Stamping them all `arrived` would put the frame at
+          // the front of the buffer 256 ms later than it happened — most of `SELF_GUARD_MS` — and a
+          // guard that short lets the answer's own first syllable open a turn.
+          const arrived = performance.now();
+          const frames = Math.floor(buffer.length / FRAME_SAMPLES);
+          let index = 0;
           for (let at = 0; at + FRAME_SAMPLES <= buffer.length; at += FRAME_SAMPLES) {
-            onAudioFrame(new Float32Array(buffer.subarray(at, at + FRAME_SAMPLES)));
+            onAudioFrame(
+              new Float32Array(buffer.subarray(at, at + FRAME_SAMPLES)),
+              arrived - (frames - 1 - index) * FRAME_MS,
+            );
+            index += 1;
           }
         };
         source.connect(processor);
@@ -266,8 +330,9 @@ export function useListening(handlers: ListeningHandlers): Listening {
   }, [gather]);
 
   const isRecording = useCallback(() => recordingRef.current !== null, []);
+  const isOpen = useCallback(() => liveRef.current !== null, []);
 
-  return { open, close, record, peek, take, isRecording };
+  return { open, close, record, peek, take, isRecording, isOpen };
 }
 
 function concat(frames: Float32Array[]): Float32Array {

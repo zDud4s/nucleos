@@ -62,6 +62,54 @@ export const DEFAULT_GATE: GateConfig = {
 };
 
 /**
+ * The assistant's own voice needs a higher bar than the person's. This is a probability in `[0, 1]`,
+ * not an energy level, so multiplying a threshold has no meaningful shape. Silero measured close-mic
+ * speech at a 0.961 mean; 0.85 stays below real speech while cutting the attenuated copy an imperfect
+ * canceller leaves behind.
+ */
+export const SPEAKING_GATE: GateConfig = { ...DEFAULT_GATE, enter: 0.85 };
+
+/** Select the gate that keeps the assistant from barging in on itself. */
+export function gateFor(assistantIsSpeaking: boolean): GateConfig {
+  return assistantIsSpeaking ? SPEAKING_GATE : DEFAULT_GATE;
+}
+
+/**
+ * The attack of the first syllable is the loudest, least-cancelled part of an answer: it arrives before
+ * the canceller has adapted. Without this window, a long answer interrupts itself on its own first word,
+ * which reads as the assistant refusing to speak.
+ */
+export const SELF_GUARD_MS = 350;
+
+/** Whether a newly started unit is still inside the self-interruption guard. */
+export function selfGuardHolds(msSinceUnitStarted: number): boolean {
+  return msSinceUnitStarted < SELF_GUARD_MS;
+}
+
+/** Loudness below this is a flat microphone signal, not useful evidence for voice activity. */
+export const FLAT_LEVEL = 0.02;
+
+export type SilenceReason = "noMicrophone" | "flat" | "byLoudness" | "belowThreshold";
+
+/**
+ * Explain why listening did not open a turn. The order is fixed because each reason is a precondition
+ * of the next; reading a later one first would name a symptom instead of the cause.
+ */
+export function diagnoseListening(input: {
+  micOpen: boolean;
+  loudness: number;
+  probability: number;
+  threshold: number;
+  detector: "silero" | "energy" | null;
+}): SilenceReason | null {
+  if (!input.micOpen) return "noMicrophone";
+  if (input.loudness < FLAT_LEVEL) return "flat";
+  if (input.detector === "energy") return "byLoudness";
+  if (input.probability < input.threshold) return "belowThreshold";
+  return null;
+}
+
+/**
  * Frames of audio kept from BEFORE the gate opened, and prepended to the recording.
  *
  * Not a refinement — without it the start of every question is missing. The gate cannot declare

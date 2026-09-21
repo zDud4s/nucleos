@@ -2,23 +2,31 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_GATE,
+  diagnoseListening,
   energyOf,
+  FLAT_LEVEL,
   FRAME_MS,
+  gateFor,
   GateSignal,
   GateState,
   IDLE_GATE,
   onFrame,
+  SELF_GUARD_MS,
+  selfGuardHolds,
+  SilenceReason,
+  SPEAKING_GATE,
 } from "./vad";
 
 /** Feeds a run of probabilities and collects everything the gate decided. */
 function feed(
   probabilities: number[],
   from: GateState = IDLE_GATE,
+  config = DEFAULT_GATE,
 ): { state: GateState; signals: GateSignal[] } {
   let state = from;
   const signals: GateSignal[] = [];
   for (const p of probabilities) {
-    const next = onFrame(state, p, DEFAULT_GATE);
+    const next = onFrame(state, p, config);
     state = next.state;
     if (next.signal) signals.push(next.signal);
   }
@@ -33,6 +41,55 @@ const AMBIGUOUS = 0.45;
 const run = (value: number, frames: number) => Array<number>(frames).fill(value);
 
 describe("the speech gate", () => {
+  it("the bar is raised while the assistant is speaking", () => {
+    expect(gateFor(true)).toBe(SPEAKING_GATE);
+    expect(feed(run(0.8, SPEAKING_GATE.minSpeechFrames), IDLE_GATE, gateFor(true)).signals).toEqual([]);
+    expect(feed(run(SPEECH, SPEAKING_GATE.minSpeechFrames), IDLE_GATE, gateFor(true)).signals).toEqual([
+      "speechStarted",
+    ]);
+    expect(feed(run(0.8, DEFAULT_GATE.minSpeechFrames), IDLE_GATE, gateFor(false)).signals).toEqual([
+      "speechStarted",
+    ]);
+  });
+
+  it("an onset inside the self-guard window is not a barge-in", () => {
+    expect(selfGuardHolds(0)).toBe(true);
+    expect(selfGuardHolds(SELF_GUARD_MS - 1)).toBe(true);
+    expect(selfGuardHolds(SELF_GUARD_MS)).toBe(false);
+    expect(selfGuardHolds(400)).toBe(false);
+  });
+
+  it("the four reasons a turn is not opening, in order", () => {
+    const cases: Array<{
+      input: Parameters<typeof diagnoseListening>[0];
+      expected: SilenceReason;
+    }> = [
+      {
+        input: { micOpen: false, loudness: FLAT_LEVEL / 2, probability: 1, threshold: 0, detector: "silero" },
+        expected: "noMicrophone",
+      },
+      {
+        input: { micOpen: true, loudness: FLAT_LEVEL / 2, probability: 1, threshold: 0, detector: "silero" },
+        expected: "flat",
+      },
+      {
+        input: { micOpen: true, loudness: FLAT_LEVEL + 0.01, probability: 0, threshold: 1, detector: "energy" },
+        expected: "byLoudness",
+      },
+      {
+        input: { micOpen: true, loudness: FLAT_LEVEL + 0.01, probability: 0, threshold: 1, detector: "silero" },
+        expected: "belowThreshold",
+      },
+    ];
+
+    for (const { input, expected } of cases) {
+      expect(diagnoseListening(input)).toBe(expected);
+    }
+    expect(
+      diagnoseListening({ micOpen: true, loudness: FLAT_LEVEL + 0.01, probability: 0.9, threshold: 0.85, detector: "silero" }),
+    ).toBeNull();
+  });
+
   it("opens a turn once speech has lasted long enough, and closes it after the hangover", () => {
     const { signals, state } = feed([
       ...run(SPEECH, 10),
