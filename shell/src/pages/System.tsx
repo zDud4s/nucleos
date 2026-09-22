@@ -811,7 +811,7 @@ function BudgetPanel() {
             <ErrorNote>the quota brake was not sent — usage must be an integer from 1 to 100</ErrorNote>
           )}
           {setQuotaBrake.isError && (
-            <ErrorNote>the quota brake was not changed — the nÃºcleo refused or did not answer</ErrorNote>
+            <ErrorNote>the quota brake was not changed — the núcleo refused or did not answer</ErrorNote>
           )}
         </section>
       )}

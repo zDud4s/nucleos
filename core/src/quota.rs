@@ -12,14 +12,11 @@
 //! `web.rs`. And it holds no provider credential — see design D2, whose whole point is that the
 //! token stays inside the sidecar.
 //!
-//! The quota brake fails open: an absent, stale, or unmeasured provider reading cannot prove that a
-//! window is spent. Every consultation still reads the quota (so the live path can warn); `enabled`
-//! gates only whether the decision is allowed to pause autonomous work.
-//!
-//! **This module draws, speaks, reads, and brakes.** A measured window can warn its owner and,
-//! when the optional brake is enabled, hold autonomous work before the window is exhausted.
-//! Unknown quota state never stops work: this brake fails open because a stale or unmeasured
-//! reading cannot safely stand in for the owner's current limit.
+//! **This module draws, speaks, reads, and now brakes** (design D9, D10): the optional `enabled`
+//! setting (off by factory default) gates only the action, while every consultation still reads the
+//! quota so the phase-3 warning fires even with the brake off. The brake fails OPEN, fixed: an
+//! absent, stale, or unmeasured reading cannot prove a window spent—the opposite direction from
+//! `budget.rs`, which fails closed.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;

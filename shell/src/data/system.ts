@@ -27,7 +27,7 @@ export interface BudgetView {
   reason: string | null;
 }
 
-/** The provider's rolling usage windows that can pause autonomous work. */
+/** The quota brake's three owner settings, returned by GET/POST /autopilot/quota-brake, plus the active runner's read-only provider (only its windows count). */
 export interface QuotaBrakeView {
   enabled: boolean;
   pause_above_percent_5h: number;
