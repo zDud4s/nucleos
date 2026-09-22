@@ -75,9 +75,13 @@ pub fn build_router(state: AppState) -> Router {
             "/autopilot/budget",
             get(get_autopilot_budget).post(post_autopilot_budget),
         )
+        .route(
+            "/autopilot/quota-brake",
+            get(get_quota_brake).post(post_quota_brake),
+        )
         .route("/autopilot/attention", post(post_attention_heartbeat))
-        // How much of each assistant's usage limit is gone. A read and nothing more in this phase:
-        // the notch draws it, and no part of this daemon acts on it yet.
+        // How much of each assistant's usage limit is gone. The notch draws this read; the
+        // separate quota-brake route owns settings for acting on it.
         //
         // Registered here BEFORE anything in the shell calls it, which is the order
         // `map_seam::no_screen_in_this_repository_asks_for_a_route_the_daemon_does_not_serve`
@@ -1325,6 +1329,21 @@ struct BudgetRequest {
     hourly_limit_usd: Option<f64>,
     per_run_reserve_usd: f64,
     time_cost_per_hour_usd: f64,
+}
+
+#[derive(serde::Serialize)]
+struct QuotaBrakeResponse {
+    enabled: bool,
+    pause_above_percent_5h: i64,
+    pause_above_percent_7d: i64,
+    provider: String,
+}
+
+#[derive(Deserialize)]
+struct QuotaBrakeRequest {
+    enabled: bool,
+    pause_above_percent_5h: i64,
+    pause_above_percent_7d: i64,
 }
 
 #[derive(Deserialize)]
@@ -3142,6 +3161,46 @@ async fn post_autopilot_budget(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     budget_response(&state).await.map(Json)
+}
+
+async fn get_quota_brake(
+    State(state): State<AppState>,
+) -> Result<Json<QuotaBrakeResponse>, StatusCode> {
+    quota_brake_response(&state).await.map(Json)
+}
+
+async fn post_quota_brake(
+    State(state): State<AppState>,
+    Json(body): Json<QuotaBrakeRequest>,
+) -> Result<Json<QuotaBrakeResponse>, StatusCode> {
+    if !(1..=100).contains(&body.pause_above_percent_5h)
+        || !(1..=100).contains(&body.pause_above_percent_7d)
+    {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    crate::quota::set_brake_policy(
+        &state.pool,
+        crate::quota::BrakePolicy {
+            enabled: body.enabled,
+            pause_above_percent_5h: body.pause_above_percent_5h,
+            pause_above_percent_7d: body.pause_above_percent_7d,
+        },
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    quota_brake_response(&state).await.map(Json)
+}
+
+async fn quota_brake_response(state: &AppState) -> Result<QuotaBrakeResponse, StatusCode> {
+    let policy = crate::quota::load_brake_policy(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(QuotaBrakeResponse {
+        enabled: policy.enabled,
+        pause_above_percent_5h: policy.pause_above_percent_5h,
+        pause_above_percent_7d: policy.pause_above_percent_7d,
+        provider: state.quota.provider.clone(),
+    })
 }
 
 async fn post_attention_heartbeat(
@@ -31636,9 +31695,24 @@ mod tests {
     #[tokio::test]
     async fn quota_brake_route_reads_and_writes_the_three_settings() {
         let app = build_router(test_state().await);
-        let get = app.clone().oneshot(Request::builder().uri("/autopilot/quota-brake").header("Authorization", "Bearer test-token").body(Body::empty()).unwrap()).await.unwrap();
+        let get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/autopilot/quota-brake")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(get.status(), StatusCode::OK);
-        let defaults: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(get.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let defaults: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(get.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(defaults["enabled"], false);
         assert_eq!(defaults["pause_above_percent_5h"], 85);
         assert_eq!(defaults["pause_above_percent_7d"], 90);

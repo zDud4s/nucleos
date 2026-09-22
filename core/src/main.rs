@@ -1309,7 +1309,7 @@ async fn main() {
         quota: Arc::new(quota::QuotaRuntime::new(quota_client::QuotaClient::new(
             sidecar::QUOTA_ADDR,
             quota_sidecar_token.clone(),
-        ))),
+        ), models_config.active_runner().to_string())),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_tails: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1349,7 +1349,7 @@ async fn main() {
     // machine, and it reads the credential that CLI wrote. On a machine with no Claude Code it
     // makes no outbound call at all — it answers `unmeasured` and stops. So the switch an opt-in
     // would offer is one the owner has already thrown, in the other application, and a second one
-    // here would mean the notch ships dark with no settings page to light it until phase 4.
+    // here would mean the notch ships dark with no settings page to light it.
     if sidecars_wanted {
         tokio::spawn(sidecar::supervise(
             sidecar::QUOTA.to_string(),

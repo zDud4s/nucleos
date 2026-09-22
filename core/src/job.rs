@@ -4737,15 +4737,17 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
             crate::budget::BudgetDecision::Pause {
                 reason,
                 kind: crate::budget::PauseKind::Transient,
+                source,
             } => {
                 return Brake::Park {
-                    reason: "budget",
+                    reason: source,
                     detail: reason,
                 };
             }
             crate::budget::BudgetDecision::Pause {
                 reason,
                 kind: crate::budget::PauseKind::Window,
+                ..
             } => return Brake::Stop { detail: reason },
         }
     }

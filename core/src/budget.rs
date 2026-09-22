@@ -3,6 +3,8 @@
 use chrono::{DateTime, Datelike, Utc};
 use sqlx::SqlitePool;
 
+pub const PAUSE_SOURCE: &str = "budget";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetPeriod {
     Daily,
@@ -57,7 +59,11 @@ pub enum PauseKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetDecision {
     Allow,
-    Pause { reason: String, kind: PauseKind },
+    Pause {
+        reason: String,
+        kind: PauseKind,
+        source: &'static str,
+    },
 }
 
 /// One run's contribution to the budget, already parsed from the `runs` table.
@@ -411,6 +417,7 @@ async fn evaluate_budget(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<
                     cfg.per_run_reserve_usd
                 ),
                 kind: PauseKind::Window,
+                source: PAUSE_SOURCE,
             });
         }
     }
@@ -424,6 +431,7 @@ async fn evaluate_budget(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<
                     cfg.per_run_reserve_usd
                 ),
                 kind: PauseKind::Transient,
+                source: PAUSE_SOURCE,
             });
         }
     }
@@ -441,6 +449,7 @@ pub async fn budget_permits_new_run(pool: &SqlitePool, now: DateTime<Utc>) -> Bu
         Err(error) => BudgetDecision::Pause {
             reason: format!("budget check failed, pausing to be safe: {error}"),
             kind: PauseKind::Transient,
+            source: PAUSE_SOURCE,
         },
     }
 }

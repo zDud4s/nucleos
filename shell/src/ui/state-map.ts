@@ -167,8 +167,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     // stands for is still to come, but it comes from the job, not from the reader — the same
     // argument `job_waiting` makes below. The sequence stays open (`lanes.ts`) until it lands.
     job_review_retried: { tone: "info", label: "job review retried" },
-    // Stated Blue, not Awaiting-You Amber. `job.rs::brakes` parks a job for exactly six reasons —
-    // `kill-switch`, `budget`, `excluded`, `attention`, `slot` and `disk` (`park` writes the line) — and
+    // Stated Blue, not Awaiting-You Amber. `job.rs::brakes` parks a job for exactly seven reasons —
+    // `kill-switch`, `budget`, `quota`, `excluded`, `attention`, `slot` and `disk` (`park` writes the line) — and
     // none of them is a question put to the reader: an approval is `awaiting_approval`, a status
     // and not a park. Amber on every parked job taught the Feed to summon somebody for a slot that
     // frees itself. The verdict, where there is one, is the `wait_reason` badge beside it.
@@ -193,6 +193,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     // decides whether to spend the rest of the window, and nothing here frees itself before the
     // reset. The same argument budget makes in `wait_reason`, and this is the same kind of ceiling.
     quota_warning: { tone: "paused", label: "quota threshold crossed" },
+    quota_blind: { tone: "info", label: "quota brake ran blind" },
     // Worktrees.
     worktree_gate_failed: { tone: "danger", label: "worktree gate failed" },
     worktree_provision_failed: { tone: "danger", label: "worktree could not be made" },
@@ -425,6 +426,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    */
   wait_reason: {
     budget: { tone: "paused", label: "held by budget" },
+    quota: { tone: "paused", label: "held by quota" },
     slot: { tone: "info", label: "waiting for a slot" },
     excluded: { tone: "paused", label: "held by an exclusion" },
     disk: { tone: "paused", label: "held by a full disk" },
