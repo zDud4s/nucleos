@@ -4752,6 +4752,30 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
         }
     }
 
+    match crate::quota::quota_permits_new_run(
+        &state.pool,
+        Some(&state.quota),
+        &state.quota.provider,
+        now,
+    )
+    .await
+    {
+        crate::quota::QuotaDecision::Allow => {}
+        crate::quota::QuotaDecision::Pause { reason, resets_at }
+            if resets_at.is_some_and(|reset| {
+                DateTime::parse_from_rfc3339(&job.created_at)
+                    .map(|created| reset < created.with_timezone(&Utc) + lifetime_ceiling(job))
+                    .unwrap_or(false)
+            }) =>
+        {
+            return Brake::Park {
+                reason: crate::quota::PAUSE_SOURCE,
+                detail: reason,
+            };
+        }
+        crate::quota::QuotaDecision::Pause { reason, .. } => return Brake::Stop { detail: reason },
+    }
+
     // The job's own ceiling — under the house's for work nobody asked for, and INSTEAD of it for
     // work somebody did. Two different questions and both worth asking: a job can be stopped by
     // what it was given or by what is left in the till.
@@ -4842,6 +4866,14 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
             reason: "attention",
             detail: reason,
         },
+    }
+}
+
+fn lifetime_ceiling(job: &JobRow) -> chrono::Duration {
+    if job.commissioned_with_an_allowance() {
+        COMMISSIONED_JOB_LIFETIME
+    } else {
+        MAX_JOB_LIFETIME
     }
 }
 
@@ -5420,11 +5452,7 @@ async fn drive(state: &AppState, job: JobRow, now: DateTime<Utc>) {
     // Which ceiling is a question about who asked, exactly as the house budget below is — see
     // `COMMISSIONED_JOB_LIFETIME`. The message says the number it actually applied rather than a
     // constant, so a reader is never told four hours by a job that got twelve.
-    let ceiling = if job.commissioned_with_an_allowance() {
-        COMMISSIONED_JOB_LIFETIME
-    } else {
-        MAX_JOB_LIFETIME
-    };
+    let ceiling = lifetime_ceiling(&job);
     if let Ok(started) = DateTime::parse_from_rfc3339(&job.created_at)
         && now.signed_duration_since(started.with_timezone(&Utc)) > ceiling
     {
@@ -6073,10 +6101,7 @@ mod tests {
         test_state_with_runner(pool).await.0
     }
 
-    async fn quota_state(
-        pool: sqlx::SqlitePool,
-        resets_at: Option<&str>,
-    ) -> AppState {
+    async fn quota_state(pool: sqlx::SqlitePool, resets_at: Option<&str>) -> AppState {
         let now = Utc::now();
         let address = crate::quota::test_support::stub_sidecar(
             crate::quota::test_support::live_answer("claude", "5h", 1.0, resets_at, now),
@@ -12255,11 +12280,12 @@ mod tests {
         let job = load_job(&pool, job_id).await.unwrap();
         assert_eq!(advance(&state, &job, Utc::now()).await, Step::Stopped);
         assert_eq!(job_status(&pool, job_id).await, "waiting");
-        let reason: Option<String> = sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(reason.as_deref(), Some("quota"));
     }
 
@@ -12296,11 +12322,12 @@ mod tests {
 
         let job = load_job(&pool, job_id).await.unwrap();
         advance(&state, &job, Utc::now()).await;
-        let reason: Option<String> = sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(reason.as_deref(), Some("quota"));
     }
 

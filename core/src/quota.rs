@@ -381,7 +381,6 @@ pub async fn quota_permits_new_run(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 /// Applies the budget brake first, then the fail-open quota brake.
 pub async fn permits_new_run(
     state: &crate::state::AppState,

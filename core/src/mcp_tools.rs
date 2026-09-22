@@ -2352,9 +2352,23 @@ impl LocalToolBox {
     /// still start a run without passing here, which is the behaviour it has today and a separate
     /// decision to change — one that would affect the desktop app, where somebody is watching.
     async fn spend_is_permitted(&self) -> Result<(), String> {
-        match crate::budget::budget_permits_new_run(&self.pool, chrono::Utc::now()).await {
-            crate::budget::BudgetDecision::Allow => Ok(()),
+        let now = chrono::Utc::now();
+        match crate::budget::budget_permits_new_run(&self.pool, now).await {
             crate::budget::BudgetDecision::Pause { reason, .. } => Err(reason),
+            crate::budget::BudgetDecision::Allow => {
+                // LocalToolBox has no runtime, so this reads stored quota and never warns.
+                match crate::quota::quota_permits_new_run(
+                    &self.pool,
+                    None,
+                    crate::config::models_config_now().active_runner(),
+                    now,
+                )
+                .await
+                {
+                    crate::quota::QuotaDecision::Allow => Ok(()),
+                    crate::quota::QuotaDecision::Pause { reason, .. } => Err(reason),
+                }
+            }
         }
     }
 

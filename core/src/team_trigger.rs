@@ -468,7 +468,7 @@ pub async fn team_trigger_tick(state: &AppState, now: DateTime<Utc>) {
         return;
     }
     if let crate::budget::BudgetDecision::Pause { reason, .. } =
-        crate::budget::budget_permits_new_run(&state.pool, now).await
+        crate::quota::permits_new_run(state, now).await
     {
         tracing::info!(reason = %reason, "budget exhausted; team triggers paused this tick");
         return;

@@ -951,6 +951,7 @@ pub enum StartError {
     NotFound,
     Invalid(String),
     BudgetExhausted(String),
+    QuotaExhausted(String),
     Unavailable(String),
 }
 
@@ -960,6 +961,7 @@ impl std::fmt::Display for StartError {
             Self::NotFound => formatter.write_str("team not found"),
             Self::Invalid(message)
             | Self::BudgetExhausted(message)
+            | Self::QuotaExhausted(message)
             | Self::Unavailable(message) => formatter.write_str(message),
         }
     }
@@ -1075,10 +1077,14 @@ pub async fn start_with(
         )));
     }
 
-    match crate::budget::budget_permits_new_run(&state.pool, chrono::Utc::now()).await {
+    match crate::quota::permits_new_run(state, chrono::Utc::now()).await {
         crate::budget::BudgetDecision::Allow => {}
-        crate::budget::BudgetDecision::Pause { reason, .. } => {
-            return Err(StartError::BudgetExhausted(reason));
+        crate::budget::BudgetDecision::Pause { reason, source, .. } => {
+            return Err(if source == crate::quota::PAUSE_SOURCE {
+                StartError::QuotaExhausted(reason)
+            } else {
+                StartError::BudgetExhausted(reason)
+            });
         }
     }
 
@@ -4066,7 +4072,7 @@ pub async fn post_team_run(
         Err(error @ StartError::NotFound) => Err((StatusCode::NOT_FOUND, error.to_string())),
         Err(error @ StartError::Invalid(_)) => Err((StatusCode::BAD_REQUEST, error.to_string())),
         // 429 and not 402: the ceiling is a window that reopens, and the caller should come back.
-        Err(error @ StartError::BudgetExhausted(_)) => {
+        Err(error @ (StartError::BudgetExhausted(_) | StartError::QuotaExhausted(_))) => {
             Err((StatusCode::TOO_MANY_REQUESTS, error.to_string()))
         }
         Err(error @ StartError::Unavailable(_)) => {

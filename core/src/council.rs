@@ -972,6 +972,8 @@ pub enum StartError {
     Invalid(String),
     /// The budget says no, and names the limit and the spend.
     BudgetExhausted(String),
+    /// The active provider's measured quota says no.
+    QuotaExhausted(String),
     /// Minting or storing failed and the council would run with a key that authenticates nothing.
     Unavailable(String),
 }
@@ -989,6 +991,7 @@ impl std::fmt::Display for StartError {
             ),
             StartError::Invalid(reason) => write!(formatter, "{reason}"),
             StartError::BudgetExhausted(reason) => write!(formatter, "{reason}"),
+            StartError::QuotaExhausted(reason) => write!(formatter, "{reason}"),
             StartError::Unavailable(reason) => write!(formatter, "{reason}"),
         }
     }
@@ -1211,10 +1214,14 @@ pub async fn start(
         None => resolve_roster(state, &configured.chairman, &configured.members).await?,
     };
 
-    if let crate::budget::BudgetDecision::Pause { reason, .. } =
-        crate::budget::budget_permits_new_run(&state.pool, chrono::Utc::now()).await
+    if let crate::budget::BudgetDecision::Pause { reason, source, .. } =
+        crate::quota::permits_new_run(state, chrono::Utc::now()).await
     {
-        return Err(StartError::BudgetExhausted(reason));
+        return Err(if source == crate::quota::PAUSE_SOURCE {
+            StartError::QuotaExhausted(reason)
+        } else {
+            StartError::BudgetExhausted(reason)
+        });
     }
 
     let id = crate::auth::generate_uuid_v4();
@@ -2428,7 +2435,7 @@ pub async fn post_council(
             Err((axum::http::StatusCode::BAD_REQUEST, error.to_string()))
         }
         // 429, not 402: the ceiling is a window that reopens, and the caller should come back.
-        Err(error @ StartError::BudgetExhausted(_)) => {
+        Err(error @ (StartError::BudgetExhausted(_) | StartError::QuotaExhausted(_))) => {
             Err((axum::http::StatusCode::TOO_MANY_REQUESTS, error.to_string()))
         }
         Err(error @ StartError::Unavailable(_)) => Err((

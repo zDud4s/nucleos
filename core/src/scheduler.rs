@@ -29,6 +29,24 @@ pub fn is_catch_up(due_at: DateTime<Utc>, now: DateTime<Utc>, grace: chrono::Dur
     now.signed_duration_since(due_at) > grace
 }
 
+/// A quota hold excuses only windows that were still within their on-time grace when it began.
+pub fn lateness_origin(
+    due_at: DateTime<Utc>,
+    hold: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> DateTime<Utc> {
+    match hold {
+        // A rule still inside its on-time grace when the quota closed was delayed by the
+        // quota; one already late before it was not. A rule due after reopening was not held.
+        Some((start, end))
+            if start <= due_at + chrono::Duration::minutes(CATCH_UP_GRACE_MINUTES)
+                && due_at < end =>
+        {
+            end
+        }
+        _ => due_at,
+    }
+}
+
 fn humanize_lateness(late: chrono::Duration) -> String {
     let minutes = late.num_minutes().max(0);
     match minutes {
@@ -326,12 +344,50 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
         return;
     }
 
-    if let crate::budget::BudgetDecision::Pause { reason, .. } =
-        crate::budget::budget_permits_new_run(&state.pool, now).await
-    {
-        tracing::info!(reason = %reason, "budget exhausted; scheduler paused this tick");
-        return;
+    match crate::quota::permits_new_run(state, now).await {
+        crate::budget::BudgetDecision::Pause { reason, source, .. } => {
+            if source == crate::quota::PAUSE_SOURCE {
+                let _ = sqlx::query(
+                    "UPDATE autopilot_global
+                     SET quota_hold_started_at = ?, quota_hold_ended_at = NULL
+                     WHERE quota_hold_started_at IS NULL OR quota_hold_ended_at IS NOT NULL",
+                )
+                .bind(now.to_rfc3339())
+                .execute(&state.pool)
+                .await;
+                tracing::info!(reason = %reason, "quota exhausted; scheduler paused this tick");
+            } else {
+                tracing::info!(reason = %reason, "budget exhausted; scheduler paused this tick");
+            }
+            return;
+        }
+        crate::budget::BudgetDecision::Allow => {
+            let _ = sqlx::query(
+                "UPDATE autopilot_global SET quota_hold_ended_at = ?
+                 WHERE quota_hold_started_at IS NOT NULL AND quota_hold_ended_at IS NULL",
+            )
+            .bind(now.to_rfc3339())
+            .execute(&state.pool)
+            .await;
+        }
     }
+
+    let quota_hold: Option<(String, String)> = sqlx::query_as(
+        "SELECT quota_hold_started_at, quota_hold_ended_at FROM autopilot_global
+         WHERE quota_hold_started_at IS NOT NULL AND quota_hold_ended_at IS NOT NULL LIMIT 1",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten();
+    let quota_hold = quota_hold.and_then(|(start, end)| {
+        Some((
+            DateTime::parse_from_rfc3339(&start)
+                .ok()?
+                .with_timezone(&Utc),
+            DateTime::parse_from_rfc3339(&end).ok()?.with_timezone(&Utc),
+        ))
+    });
 
     if let crate::attention::AttentionDecision::Defer { reason, scope } =
         crate::attention::attention_permits_new_run(&state.pool, &state.run_handles, "", now).await
@@ -585,7 +641,7 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
             // A catch-up is demoted to plan-only whatever the project's mode: it carries assumptions
             // as old as the window it missed, so the most it may produce is a proposal.
             let catch_up = is_catch_up(
-                due_at,
+                lateness_origin(due_at, quota_hold),
                 now,
                 chrono::Duration::minutes(CATCH_UP_GRACE_MINUTES),
             );
@@ -2160,6 +2216,64 @@ mod tests {
         assert!(prompt.contains("plan-only"), "got: {prompt}");
         // The rule's own prompt still rides at the end, unaltered.
         assert!(prompt.ends_with("go"), "got: {prompt}");
+    }
+
+    #[test]
+    fn quota_brake_hold_does_not_excuse_a_window_missed_before_it() {
+        assert_eq!(
+            lateness_origin(
+                timestamp("2026-07-18T02:00:00Z"),
+                Some((
+                    timestamp("2026-07-18T09:00:00Z"),
+                    timestamp("2026-07-18T09:10:00Z"),
+                )),
+            ),
+            timestamp("2026-07-18T02:00:00Z"),
+        );
+        assert_eq!(
+            lateness_origin(
+                timestamp("2026-07-18T10:00:00Z"),
+                Some((
+                    timestamp("2026-07-18T10:05:00Z"),
+                    timestamp("2026-07-18T13:55:00Z"),
+                )),
+            ),
+            timestamp("2026-07-18T13:55:00Z"),
+        );
+        assert_eq!(
+            lateness_origin(
+                timestamp("2026-07-18T09:00:00Z"),
+                Some((
+                    timestamp("2026-07-18T09:15:00Z"),
+                    timestamp("2026-07-18T10:00:00Z"),
+                )),
+            ),
+            timestamp("2026-07-18T10:00:00Z"),
+        );
+        assert_eq!(
+            lateness_origin(
+                timestamp("2026-07-18T09:00:00Z"),
+                Some((
+                    timestamp("2026-07-18T09:16:00Z"),
+                    timestamp("2026-07-18T10:00:00Z"),
+                )),
+            ),
+            timestamp("2026-07-18T09:00:00Z"),
+        );
+        assert_eq!(
+            lateness_origin(
+                timestamp("2026-07-18T11:00:00Z"),
+                Some((
+                    timestamp("2026-07-18T09:00:00Z"),
+                    timestamp("2026-07-18T10:00:00Z"),
+                )),
+            ),
+            timestamp("2026-07-18T11:00:00Z"),
+        );
+        assert_eq!(
+            lateness_origin(timestamp("2026-07-18T11:00:00Z"), None),
+            timestamp("2026-07-18T11:00:00Z"),
+        );
     }
 
     #[tokio::test]

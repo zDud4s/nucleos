@@ -511,6 +511,7 @@ pub enum GateBlock {
     KillSwitch,
     ScopedKill,
     Budget(String),
+    Quota(String),
     DailyCap,
 }
 
@@ -537,10 +538,14 @@ async fn gates_permit(
     {
         return Err(GateBlock::ScopedKill);
     }
-    if let crate::budget::BudgetDecision::Pause { reason, .. } =
-        crate::budget::budget_permits_new_run(&state.pool, now).await
+    if let crate::budget::BudgetDecision::Pause { reason, source, .. } =
+        crate::quota::permits_new_run(state, now).await
     {
-        return Err(GateBlock::Budget(reason));
+        return Err(if source == crate::quota::PAUSE_SOURCE {
+            GateBlock::Quota(reason)
+        } else {
+            GateBlock::Budget(reason)
+        });
     }
     match runs_started_today(&state.pool, now).await {
         Ok(count) if count < DAILY_RUN_CAP => Ok(()),
@@ -1015,6 +1020,9 @@ async fn pass(
             GateBlock::LocalTriageDisabled(reason) => Some(format!(
                 "email triage paused: the configured local model is unavailable: {reason}"
             )),
+            GateBlock::Budget(reason) | GateBlock::Quota(reason) => {
+                Some(format!("email triage paused: {reason}"))
+            }
             _ => None,
         };
         if let Some(pause_message) = pause_message {
@@ -1915,7 +1923,10 @@ mod tests {
         ));
         seed_pending(&state.pool, 5, 1).await;
 
-        let launched = triage_now(&state, &mut LoopState::default(), now).await.run_id.is_some();
+        let launched = triage_now(&state, &mut LoopState::default(), now)
+            .await
+            .run_id
+            .is_some();
         assert!(!launched, "quota must hold triage");
         let summary: String = sqlx::query_scalar(
             "SELECT summary FROM feed WHERE kind = 'email_triage_paused' ORDER BY id DESC LIMIT 1",

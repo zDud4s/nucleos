@@ -292,7 +292,7 @@ async fn launch_once(state: &AppState) -> Option<i64> {
     // for a busy project would leave that work stranded precisely when the project is busy enough
     // for the conflict to matter.
     if let crate::budget::BudgetDecision::Pause { reason, .. } =
-        crate::budget::budget_permits_new_run(&state.pool, chrono::Utc::now()).await
+        crate::quota::permits_new_run(state, chrono::Utc::now()).await
     {
         tracing::info!(%reason, "budget exhausted; no conflict resolution started this tick");
         return None;
