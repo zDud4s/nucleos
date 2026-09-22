@@ -1900,6 +1900,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn quota_brake_hold_on_triage_leaves_a_feed_line() {
+        let mut state = triage_state().await;
+        let now = chrono::Utc::now();
+        let address = crate::quota::test_support::stub_sidecar(
+            crate::quota::test_support::live_answer("claude", "5h", 1.0, None, now),
+        )
+        .await;
+        crate::quota::test_support::arm(&state.pool, true, 85, 90).await;
+        state.quota = std::sync::Arc::new(crate::quota::QuotaRuntime::new(
+            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            "claude".into(),
+        ));
+        seed_pending(&state.pool, 5, 1).await;
+
+        let launched = triage_now(&state, &mut LoopState::default(), now).await.run_id.is_some();
+        assert!(!launched, "quota must hold triage");
+        let summary: String = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE kind = 'email_triage_paused' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(summary.contains("quota"), "{summary}");
+    }
+
     /// The control that makes the test above mean something. Same cap, same everything, and the only
     /// difference is that the seeded run cost almost nothing — so the gate has to open. If this ever
     /// fails alongside its pair passing, the pair is passing for a reason that has nothing to do with

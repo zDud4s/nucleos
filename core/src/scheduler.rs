@@ -2163,6 +2163,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quota_brake_delay_does_not_demote_a_scheduled_rule() {
+        let project = tempfile::tempdir().expect("create active project");
+        let state = test_state(None).await;
+        let now = timestamp("2026-07-18T14:00:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "active", &old).await;
+        sqlx::query(
+            "UPDATE autopilot_global
+             SET quota_hold_started_at = ?, quota_hold_ended_at = ?",
+        )
+        .bind(timestamp("2026-07-18T10:05:00Z").to_rfc3339())
+        .bind(timestamp("2026-07-18T13:55:00Z").to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        scheduler_tick(&state, now).await;
+
+        let (mode, prompt): (String, String) = sqlx::query_as("SELECT mode, prompt FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "worktree");
+        assert!(!prompt.contains("CATCH-UP"), "got: {prompt}");
+    }
+
+    #[tokio::test]
     async fn a_catch_up_over_a_moved_head_is_told_to_re_triage() {
         let container = space_free_tempdir("nucleos-scheduler-catchup-");
         let repo = container.path().join("repo");

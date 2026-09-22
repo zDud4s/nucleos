@@ -4385,6 +4385,28 @@ mod tests {
         assert_eq!(runner.seen.lock().unwrap().len(), 0);
     }
 
+    #[tokio::test]
+    async fn quota_brake_refusal_names_the_quota() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        let mut state = council_state(runner, Some(roster(2))).await;
+        let now = chrono::Utc::now();
+        let address = crate::quota::test_support::stub_sidecar(
+            crate::quota::test_support::live_answer("claude", "5h", 1.0, None, now),
+        )
+        .await;
+        crate::quota::test_support::arm(&state.pool, true, 85, 90).await;
+        state.quota = std::sync::Arc::new(crate::quota::QuotaRuntime::new(
+            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            "claude".into(),
+        ));
+
+        let error = start(&state, "why?", None).await.unwrap_err();
+        match error {
+            StartError::QuotaExhausted(reason) => assert!(reason.contains("quota"), "{reason}"),
+            other => panic!("expected a quota refusal, got {other:?}"),
+        }
+    }
+
     /// A council left `running` by a crash would sit in the list for ever at a phase nothing will
     /// advance, because the driver that would have advanced it died with the process.
     #[tokio::test]

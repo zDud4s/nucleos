@@ -4864,6 +4864,21 @@ mod tests {
         (state, root)
     }
 
+    async fn state_with_quota() -> (AppState, tempfile::TempDir) {
+        let (mut state, root) = state_with_root().await;
+        let now = chrono::Utc::now();
+        let address = crate::quota::test_support::stub_sidecar(
+            crate::quota::test_support::live_answer("claude", "5h", 1.0, None, now),
+        )
+        .await;
+        crate::quota::test_support::arm(&state.pool, true, 85, 90).await;
+        state.quota = std::sync::Arc::new(crate::quota::QuotaRuntime::new(
+            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            "claude".into(),
+        ));
+        (state, root)
+    }
+
     async fn insert_agent(state: &AppState, id: &str, engine: &str) {
         sqlx::query(
             "INSERT OR IGNORE INTO agents
@@ -7780,6 +7795,36 @@ mod tests {
         assert_eq!(run.state, "stopped");
         assert_eq!(run.outcome.as_deref(), Some("stopped"));
         assert!(run.why.unwrap().contains("ceiling"));
+    }
+
+    #[tokio::test]
+    async fn quota_brake_never_stops_a_running_team() {
+        let (state, _root) = state_with_quota().await;
+        marketing(&state).await;
+        crate::quota::test_support::arm(&state.pool, false, 85, 90).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        crate::quota::test_support::arm(&state.pool, true, 85, 90).await;
+
+        team_tick(&state, chrono::Utc::now()).await;
+
+        let run = fetch_run(&state, &id).await;
+        assert_ne!(run.state, "stopped", "quota must not stop a running team");
+    }
+
+    #[tokio::test]
+    async fn quota_brake_refuses_to_start_a_team() {
+        let (state, _root) = state_with_quota().await;
+        marketing(&state).await;
+
+        let error = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap_err();
+        match error {
+            StartError::QuotaExhausted(reason) => assert!(reason.contains("quota"), "{reason}"),
+            other => panic!("expected a quota refusal, got {other:?}"),
+        }
     }
 
     /// Four hours is a ceiling on the clock, and it ends the run `expired` — which tells the owner

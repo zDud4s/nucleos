@@ -6073,6 +6073,24 @@ mod tests {
         test_state_with_runner(pool).await.0
     }
 
+    async fn quota_state(
+        pool: sqlx::SqlitePool,
+        resets_at: Option<&str>,
+    ) -> AppState {
+        let now = Utc::now();
+        let address = crate::quota::test_support::stub_sidecar(
+            crate::quota::test_support::live_answer("claude", "5h", 1.0, resets_at, now),
+        )
+        .await;
+        crate::quota::test_support::arm(&pool, true, 85, 90).await;
+        let mut state = test_state(pool).await;
+        state.quota = std::sync::Arc::new(crate::quota::QuotaRuntime::new(
+            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            "claude".into(),
+        ));
+        state
+    }
+
     async fn test_state_with_runner(
         pool: sqlx::SqlitePool,
     ) -> (AppState, std::sync::Arc<crate::runner::FakeCommandRunner>) {
@@ -12224,6 +12242,66 @@ mod tests {
 
         assert_eq!(job_status(&pool, job_id).await, STATUS_STOPPED);
         assert!(feed_kinds(&pool).await.contains(&"job_stopped".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn quota_brake_parks_with_wait_reason_quota_when_the_reset_comes_before_end_of_life() {
+        let pool = test_pool().await;
+        let reset = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let state = quota_state(pool.clone(), Some(&reset)).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["pending"]).await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert_eq!(advance(&state, &job, Utc::now()).await, Step::Stopped);
+        assert_eq!(job_status(&pool, job_id).await, "waiting");
+        let reason: Option<String> = sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some("quota"));
+    }
+
+    #[tokio::test]
+    async fn quota_brake_stops_and_hands_back_the_partial_when_the_reset_is_after_end_of_life() {
+        for reset in [
+            Some((Utc::now() + chrono::Duration::hours(5)).to_rfc3339()),
+            None,
+        ] {
+            let pool = test_pool().await;
+            let state = quota_state(pool.clone(), reset.as_deref()).await;
+            let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+            seed_items(&pool, job_id, &["pending"]).await;
+
+            let job = load_job(&pool, job_id).await.unwrap();
+            advance(&state, &job, Utc::now()).await;
+            assert_eq!(job_status(&pool, job_id).await, STATUS_STOPPED);
+            assert!(feed_kinds(&pool).await.contains(&"job_stopped".to_owned()));
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_brake_holds_a_job_with_its_own_allowance() {
+        let pool = test_pool().await;
+        let reset = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let state = quota_state(pool.clone(), Some(&reset)).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        sqlx::query("UPDATE jobs SET budget_usd = 10.0 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_items(&pool, job_id, &["pending"]).await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+        let reason: Option<String> = sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some("quota"));
     }
 
     /// The number in that line is what the night left behind, and a retriable item is work.
