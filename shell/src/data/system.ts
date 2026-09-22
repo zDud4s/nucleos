@@ -27,6 +27,14 @@ export interface BudgetView {
   reason: string | null;
 }
 
+/** The provider's rolling usage windows that can pause autonomous work. */
+export interface QuotaBrakeView {
+  enabled: boolean;
+  pause_above_percent_5h: number;
+  pause_above_percent_7d: number;
+  provider: string;
+}
+
 export interface ProjectSummary {
   project_id: string;
   mode: AutopilotMode;
@@ -237,6 +245,34 @@ export function useSetBudget() {
     },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.autopilot.budget });
+    },
+  });
+}
+
+/** The quota brake is independent from spend budget and polls at the same cadence. */
+export function useQuotaBrake() {
+  return useQuery({
+    queryKey: keys.autopilot.quotaBrake,
+    queryFn: () => apiFetch<QuotaBrakeView>("/autopilot/quota-brake"),
+    refetchInterval: POLL.fast,
+  });
+}
+
+/** Replace all quota-brake settings after the daemon accepts them. */
+export function useSetQuotaBrake() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (change: Omit<QuotaBrakeView, "provider">) =>
+      apiFetch<QuotaBrakeView>("/autopilot/quota-brake", {
+        method: "POST",
+        body: JSON.stringify(change),
+      }),
+    retry: false,
+    onSuccess: (data) => {
+      queryClient.setQueryData<QuotaBrakeView>(keys.autopilot.quotaBrake, data);
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.quotaBrake });
     },
   });
 }
