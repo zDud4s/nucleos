@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
@@ -16,6 +16,8 @@ import {
   renderApp,
   type DaemonState,
 } from "../test/harness";
+import { ApiRefusal } from "../data/client";
+import { keys } from "../data/keys";
 import type { ProjectSummary } from "../data/system";
 import { statesOf } from "../ui/state-map";
 
@@ -73,33 +75,75 @@ describe("the roster", () => {
   });
 
   /**
-   * The card names proposals.
+   * **The headline says it once, and nothing says it again in a box.**
    *
-   * `Waiting on you` over `open proposals across the roster` made the label a promise the
-   * detail then took back. The bare phrase counts the six decision lists at `/waiting`; this
-   * number is `open_review_items` summed over the rows, so the label says that and the detail is
-   * left to say only where they are.
+   * A strip of four stat cards used to sit under the headline and repeat it figure for figure —
+   * projects, acting, failing, to review — so the largest mass on the page was a repetition, and
+   * "4 on the roster" weighed what "1 failing the gate" weighed. The column carries the headline's
+   * own words for the same number: `To review`, not `Waiting`, which the rail uses for another
+   * count.
    */
-  it("the card names proposals", async () => {
+  it("says the review count in the headline's words, with no strip of cards repeating it", async () => {
     await openRoster([
       fine("alpha", { open_review_items: 3 }),
       fine("beta", { open_review_items: 2 }),
     ]);
     await screen.findByRole("table");
 
-    const card = screen.getByRole("article", { name: "To review" });
-    expect(within(card).getByText("5")).toBeDefined();
-    expect(within(card).getByText("across the roster")).toBeDefined();
-    expect(screen.queryByRole("article", { name: "Waiting on you" })).toBeNull();
+    expect(screen.getByText("2 projects · 5 items to review")).toBeDefined();
+    expect(screen.queryByRole("article")).toBeNull();
+    expect(screen.getByRole("columnheader", { name: "To review" })).toBeDefined();
+    expect(screen.queryByRole("columnheader", { name: "Waiting" })).toBeNull();
   });
 
-  /** Zero keeps the sentence it already had: nothing has stopped to ask, not `across` nothing. */
-  it("says nothing has stopped to ask when no proposal is open", async () => {
+  /** The normal recedes: nothing waiting is not said at all, rather than said as a zero. */
+  it("says nothing about review when nothing is waiting", async () => {
     await openRoster([fine("alpha"), fine("beta")]);
     await screen.findByRole("table");
 
-    const card = screen.getByRole("article", { name: "To review" });
-    expect(within(card).getByText("nothing has stopped to ask")).toBeDefined();
+    expect(screen.getByText("2 projects")).toBeDefined();
+    expect(screen.queryByText(/to review/)).toBeNull();
+  });
+
+  /**
+   * **A stale roster says so first, and offers nothing that would act on it.**
+   *
+   * The note used to arrive under the stat strip in the faintest register the system has, so the
+   * figures were read at full weight before the sentence saying they were old. And `remove` stayed
+   * live on every row — an action on a roster nobody can vouch for, which DESIGN.md says is removed,
+   * not disabled. An open panel closes rather than hiding, so it cannot come back by itself.
+   */
+  it("leads with the stale note, dates the headline, and takes the remove controls away", async () => {
+    const state = daemonState({ projects: [fine("alpha", { open_review_items: 2 }), fine("beta")] });
+    let answering = true;
+    const fetchFake = daemonFetch(state);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (!answering && path === "/projects" && init?.method === undefined) {
+        throw new ApiRefusal(503, "unavailable", "");
+      }
+      return await fetchFake(path, init);
+    });
+    daemon.apiText.mockImplementation(daemonText(state));
+    daemon.probeHealth.mockResolvedValue(true);
+    const { queryClient } = await renderApp({ initialPath: "/projects" });
+    await screen.findByRole("table");
+
+    await openRemove("alpha");
+    answering = false;
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: keys.projects.all, exact: true });
+    });
+
+    const note = await screen.findByText(/view is stale — last good read/);
+    // Before the table in the document, which is before it in reading order.
+    const table = screen.getByRole("table");
+    expect(note.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText(/^as of \d\d:\d\d:\d\d — 2 projects · 2 items to review$/)).toBeDefined();
+
+    expect(within(table).queryByRole("button", { name: "remove" })).toBeNull();
+    expect(screen.queryByRole("group", { name: "Remove alpha from NucleOS" })).toBeNull();
+    // The rows are still here: stale is the last good read, not an empty roster.
+    expect(within(table).getByRole("rowheader", { name: "alpha" })).toBeDefined();
   });
 
   /**
@@ -136,7 +180,7 @@ describe("the roster", () => {
     await screen.findByRole("table");
     expect(screen.getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
       "Project",
-      "Waiting",
+      "To review",
       "Gate",
       "Folder",
       // The way out has no heading worth reading; the column exists for the control in it.
@@ -237,25 +281,42 @@ describe("the roster", () => {
     const brokenRow = screen.getByRole("rowheader", { name: "broken" }).closest("tr") as HTMLElement;
     const unrunRow = screen.getByRole("rowheader", { name: "unrun" }).closest("tr") as HTMLElement;
 
-    expect(within(brokenRow).getByText("failed").className).toContain("ui-badge-danger");
-    expect(within(unrunRow).getByText("errored").className).toContain("ui-badge-info");
+    expect(within(brokenRow).getByText("gate failed").className).toContain("ui-badge-danger");
+    expect(within(unrunRow).getByText("gate not measured").className).toContain("ui-badge-info");
   });
 
-  it("a gate that could not run is a fact, not a ceiling", async () => {
-    await openRoster([fine("unrun", { last_gate: "errored" })]);
+  /**
+   * The map's words and not the wire's. `errored` is exactly the word that reads as a failure, and
+   * the whole point of drawing it blue is that the code was never measured.
+   */
+  it("names a gate that could not run in the map's words, not the wire's", async () => {
+    await openRoster([fine("unrun", { last_gate: "errored", last_gate_at: "2026-09-20T14:05:00Z" })]);
     await screen.findByRole("table");
-    const cell = screen.getByText("errored");
+    const cell = screen.getByText("gate not measured");
     expect(cell.className).toContain("ui-badge-info");
-    expect(cell.textContent).toBe("errored");
+    expect(screen.queryByText("errored")).toBeNull();
+    // And the time in the tooltip is formatted, not the daemon's raw stamp.
+    expect(cell.getAttribute("title")).toMatch(/^last run 20 Sept? 2026/);
   });
 
-  it("says so plainly when the núcleo knows of no project", async () => {
+  it("says so plainly when the núcleo knows of no project, with the way to add one", async () => {
     await openRoster([]);
 
-    expect(await screen.findByText(/no project has been registered/i)).toBeTruthy();
+    const heading = await screen.findByRole("heading", { name: /no project has been registered/i });
     expect(screen.queryByRole("table")).toBeNull();
+    const teach = heading.parentElement as HTMLElement;
+    expect(within(teach).getByRole("link", { name: "Add a project…" }).getAttribute("href")).toBe(
+      "/projects/new",
+    );
   });
 });
+
+/** Past `ConfirmButton`'s dwell, so the second press is a decision and not a double-click. */
+async function pastTheDwell(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 350));
+  });
+}
 
 /** The remove control on one row, opened. */
 async function openRemove(name: string) {
@@ -298,7 +359,7 @@ describe("a project leaving the roster", () => {
    * And the number is beside the checkbox because that is what makes it a decision: "forget the
    * history too" over nothing asks a person to agree to lose an amount they cannot see.
    */
-  it("offers the record beside the checkbox, and forgets only when it is ticked", async () => {
+  it("offers the record beside the checkbox, and forgets only when it is ticked and confirmed", async () => {
     const { state } = await openRoster([fine("spent")], {
       record: {
         forgets: { runs: 312, jobs: 0, proposals: 8, decisions: 0, stamps: 40, commands: 0, feed: 0 },
@@ -308,10 +369,26 @@ describe("a project leaving the roster", () => {
     await screen.findByRole("table");
 
     const panel = await openRemove("spent");
-    expect(await panel.findByText(/312 runs, 8 proposals and 40 stamps/)).toBeTruthy();
+    expect(await panel.findByText(/312 runs, 8 proposals and 40 stamps on record/)).toBeTruthy();
+    expect(panel.getByText(/Nothing on disk is touched/)).toBeTruthy();
 
     fireEvent.click(panel.getByRole("checkbox"));
+    /*
+      The reassurance stops promising what is no longer true. The runs live in the núcleo's own
+      database, which is on a disk, and "nothing on disk is touched" above the one irreversible act
+      on this page was the sentence the critique caught.
+    */
+    expect(panel.queryByText(/Nothing on disk is touched/)).toBeNull();
+    expect(panel.getByText(/will be deleted from the núcleo and cannot be brought back/)).toBeTruthy();
+
+    // One press arms; nothing has been sent yet.
     fireEvent.click(panel.getByRole("button", { name: "remove and forget" }));
+    expect(state.removed).toEqual([]);
+
+    await pastTheDwell();
+    fireEvent.click(
+      panel.getByRole("button", { name: "delete 312 runs, 8 proposals and 40 stamps for good · spent" }),
+    );
     await waitFor(() => expect(state.removed.length).toBe(1));
     expect(state.removed[0]).toEqual({ projectId: "spent", forgetHistory: true });
   });
@@ -389,6 +466,111 @@ describe("a project leaving the roster", () => {
     await openRemove("two");
     expect(screen.queryByRole("group", { name: "Remove one from NucleOS" })).toBeNull();
     expect(screen.getByRole("group", { name: "Remove two from NucleOS" })).toBeTruthy();
+  });
+});
+
+describe("the way out of the remove panel", () => {
+  /**
+   * **The panel's one exit, and where focus goes after it.** A panel that unmounts with focus inside
+   * drops focus to the body, and somebody on a keyboard loses their place in the table — the house
+   * standard is that focus goes back to the control that opened it.
+   */
+  it("hands focus back to the toggle on cancel", async () => {
+    await openRoster([fine("one")]);
+    await screen.findByRole("table");
+
+    const panel = await openRemove("one");
+    fireEvent.click(panel.getByRole("button", { name: "cancel" }));
+
+    expect(screen.queryByRole("group", { name: "Remove one from NucleOS" })).toBeNull();
+    const row = screen.getByRole("rowheader", { name: "one" }).closest("tr") as HTMLElement;
+    expect(document.activeElement).toBe(within(row).getByRole("button", { name: "remove" }));
+  });
+
+  it("closes on Escape and hands focus back the same way", async () => {
+    await openRoster([fine("one")]);
+    await screen.findByRole("table");
+
+    const panel = await openRemove("one");
+    fireEvent.keyDown(panel.getByRole("button", { name: "cancel" }), { key: "Escape" });
+
+    expect(screen.queryByRole("group", { name: "Remove one from NucleOS" })).toBeNull();
+    const row = screen.getByRole("rowheader", { name: "one" }).closest("tr") as HTMLElement;
+    expect(document.activeElement).toBe(within(row).getByRole("button", { name: "remove" }));
+  });
+
+  /**
+   * The toggle says what pressing it does now. Left saying `remove` while open, the page had two
+   * `remove` buttons with opposite effects — one closed the panel, the other removed the project.
+   * Open, it reads `cancel`, the panel's own exit word, rather than `keep`, a second one.
+   */
+  it("names the open toggle for what it does now, and points it at the panel it opened", async () => {
+    await openRoster([fine("one")]);
+    await screen.findByRole("table");
+
+    const row = screen.getByRole("rowheader", { name: "one" }).closest("tr") as HTMLElement;
+    await openRemove("one");
+    expect(within(row).queryByRole("button", { name: "remove" })).toBeNull();
+    expect(within(row).queryByRole("button", { name: "keep" })).toBeNull();
+    const toggle = within(row).getByRole("button", { name: "cancel" });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    const panel = screen.getByRole("group", { name: "Remove one from NucleOS" });
+    expect(toggle.getAttribute("aria-controls")).toBe(panel.id);
+    // Exactly one `remove` on screen, and it is the one that removes.
+    expect(screen.getAllByRole("button", { name: "remove" })).toEqual([
+      within(panel).getByRole("button", { name: "remove" }),
+    ]);
+
+    fireEvent.click(toggle);
+    expect(screen.queryByRole("group", { name: "Remove one from NucleOS" })).toBeNull();
+    expect(within(row).getByRole("button", { name: "remove" }).getAttribute("aria-expanded")).toBe("false");
+  });
+
+  /**
+   * The app tried and could not: the error rung, announced, next to the button. It was faint 12px
+   * text with no role — the one failure on the page that read quieter than a column label.
+   */
+  it("says a dropped connection as an error, and keeps the panel open", async () => {
+    const state = daemonState({ projects: [fine("spent")] });
+    const fetchFake = daemonFetch(state);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method === "DELETE") throw new TypeError("Failed to fetch");
+      return await fetchFake(path, init);
+    });
+    daemon.apiText.mockImplementation(daemonText(state));
+    daemon.probeHealth.mockResolvedValue(true);
+    await renderApp({ initialPath: "/projects" });
+    await screen.findByRole("table");
+
+    const panel = await openRemove("spent");
+    fireEvent.click(panel.getByRole("button", { name: "remove" }));
+
+    const alert = await panel.findByRole("alert");
+    expect(alert.textContent).toBe("the núcleo did not answer — nothing was removed");
+    expect(screen.getByRole("rowheader", { name: "spent" })).toBeTruthy();
+  });
+
+  /**
+   * **A removal is answered where the row was.** It used to end in silence — the panel shut, the
+   * row went on the next poll and focus fell to the body. Now one quiet line says what left and
+   * that nothing else moved, carries the way back, and takes focus.
+   */
+  it("says the project left, keeps the way back, and puts focus on the line", async () => {
+    await openRoster([fine("spent"), fine("kept")]);
+    await screen.findByRole("table");
+
+    const panel = await openRemove("spent");
+    fireEvent.click(panel.getByRole("button", { name: "remove" }));
+
+    const line = await screen.findByText(
+      "spent left the roster — its folder is still at C:/Projects/spent, and its history is kept.",
+    );
+    const quiet = line.closest(".ui-quiet") as HTMLElement;
+    expect(quiet.getAttribute("role")).toBe("status");
+    expect(within(quiet).getByRole("link", { name: "add it back" }).getAttribute("href")).toBe(
+      "/projects/new",
+    );
+    await waitFor(() => expect(document.activeElement?.contains(quiet)).toBe(true));
   });
 });
 
