@@ -94,6 +94,7 @@ mod sessions;
 mod shadow;
 mod sidecar;
 mod speak;
+mod speed;
 mod state;
 mod storage;
 mod team;

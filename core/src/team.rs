@@ -967,12 +967,9 @@ impl std::fmt::Display for StartError {
     }
 }
 
-/// Starts a department on one request: validates, mints the key, makes the folder, writes the row.
-///
-/// Returns as soon as the row exists — everything after is the tick's. The four refusals here are
-/// the four things that cannot be discovered later without wasting money: a team with nobody in it,
-/// a director that was deleted, a local member on a machine with no local model, and a house budget
-/// that is already spent.
+/// `start_with` at `normal`, with no lineage: the shape most tests start a run in. Test-only since
+/// `post_team_run` began carrying a speed, which left no production caller.
+#[cfg(test)]
 pub async fn start(
     state: &AppState,
     team_id: &str,
@@ -984,22 +981,31 @@ pub async fn start(
         team_id,
         request,
         Lineage::default(),
+        crate::speed::Speed::Normal,
         report_to_chat_id,
     )
     .await
 }
 
-/// `start`, for a caller that knows where the run came from — and, now, where it should speak.
+/// Starts a department on one request: validates, mints the key, makes the folder, writes the row.
 ///
-/// One function and not two paths: a triggered run is an ordinary run with four columns filled in,
-/// and every refusal above applies to it unchanged. What a trigger adds — the depth, the tree
+/// Returns as soon as the row exists — everything after is the tick's. The four refusals here are
+/// the four things that cannot be discovered later without wasting money: a team with nobody in it,
+/// a director that was deleted, a local member on a machine with no local model, and a house budget
+/// that is already spent.
+///
+/// The caller says where the run came from and where it should speak. One function and not two
+/// paths: a triggered run is an ordinary run with four columns filled in, and every refusal
+/// applies to it unchanged. What a trigger adds — the depth, the tree
 /// ceiling, the live-run counts — is checked by `team_trigger::fire` BEFORE it gets here, because
 /// those are questions about whether to start at all rather than about whether this team can.
+/// `speed` is this run's, chosen by whoever started it (speed spec, section 3.4).
 pub async fn start_with(
     state: &AppState,
     team_id: &str,
     request: &str,
     lineage: Lineage,
+    speed: crate::speed::Speed,
     report_to_chat_id: Option<&str>,
 ) -> Result<String, StartError> {
     let request = request.trim();
@@ -1104,8 +1110,8 @@ pub async fn start_with(
     sqlx::query(
         "INSERT INTO team_runs (id, team_id, request, workspace, token, state, created_at,
                                 updated_at, trigger_id, parent_id, root_id, depth,
-                                report_to_chat_id)
-         VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?)",
+                                report_to_chat_id, speed)
+         VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&team.team.id)
@@ -1124,6 +1130,7 @@ pub async fn start_with(
     // NULL for nearly every run, which is what makes a department that reports nowhere behave
     // exactly as it did before this column existed.
     .bind(report_to_chat_id)
+    .bind(speed.as_str())
     .execute(&state.pool)
     .await
     .map_err(|error| StartError::Unavailable(error.to_string()))?;
@@ -2634,6 +2641,26 @@ pub async fn spend_of(pool: &sqlx::SqlitePool, team_run_id: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// How many specialists a round may have running at once: the team's value, widened by this
+/// run's speed, never past `MAX_PARALLEL_CEILING` (speed spec, section 5.1). The column is
+/// validated on the way in, but a value written around that validation is exactly what a
+/// ceiling exists for, so it is applied here, at the one place that opens the fan.
+async fn round_width(state: &AppState, run: &TeamRun) -> Result<i64, sqlx::Error> {
+    let (stored, speed): (i64, Option<String>) = sqlx::query_as(
+        "SELECT t.max_parallel, r.speed FROM teams t JOIN team_runs r ON r.team_id = t.id
+         WHERE r.id = ?",
+    )
+    .bind(&run.id)
+    .fetch_one(&state.pool)
+    .await?;
+    let speed = crate::speed::Speed::from_column(speed.as_deref());
+    let (width, degraded) = crate::speed::team_width(speed, stored);
+    if let Some(reason) = degraded {
+        tracing::info!(team_run = %run.id, reason, "the speed asked for more width than this team allows");
+    }
+    Ok(width)
+}
+
 /// A round: start what is pending, up to the team's parallelism, and replan when it is empty.
 async fn advance_round(state: &AppState, run: &TeamRun) -> Result<(), sqlx::Error> {
     let items: Vec<TeamItem> = sqlx::query_as(
@@ -2657,10 +2684,7 @@ async fn advance_round(state: &AppState, run: &TeamRun) -> Result<(), sqlx::Erro
         return launch_director(state, run, DirectorNode::Replanning).await;
     }
 
-    let parallel: i64 = sqlx::query_scalar("SELECT max_parallel FROM teams WHERE id = ?")
-        .bind(&run.team_id)
-        .fetch_one(&state.pool)
-        .await?;
+    let parallel = round_width(state, run).await?;
 
     for item in pending
         .into_iter()
@@ -4046,6 +4070,10 @@ pub struct StartRequest {
     /// belongs to THIS piece of work and is chosen by the person starting it.
     #[serde(default)]
     pub report_to_chat_id: Option<String>,
+    /// `normal | fast | thorough`. Absent is `normal`. Given per request, not configured on the
+    /// team: the team's `max_parallel` IS `normal`, and speed is a choice about this piece of work.
+    #[serde(default)]
+    pub speed: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -4060,10 +4088,21 @@ pub async fn post_team_run(
     Path(id): Path<String>,
     Json(body): Json<StartRequest>,
 ) -> Result<(StatusCode, Json<StartResponse>), (StatusCode, String)> {
-    match start(
+    let speed = match body.speed.as_deref() {
+        None => crate::speed::Speed::Normal,
+        Some(value) => crate::speed::Speed::parse(value).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("speed `{value}` is not one of normal, fast, thorough"),
+            )
+        })?,
+    };
+    match start_with(
         &state,
         &id,
         &body.request,
+        Lineage::default(),
+        speed,
         body.report_to_chat_id.as_deref(),
     )
     .await
@@ -4473,6 +4512,7 @@ pub mod test_support {
 mod tests {
     use super::*;
     use crate::auth::Scope;
+    use crate::speed::Speed;
 
     // -----------------------------------------------------------------------------------------
     // The vocabulary three readers share
@@ -5024,6 +5064,106 @@ mod tests {
                 "{rounds} rounds x {parallel} parallel should be refused"
             );
         }
+    }
+
+    /// Invariant (II) at the place that opens a round: a `max_parallel` written straight into
+    /// the column does not open 99 specialists, at any speed.
+    #[tokio::test]
+    async fn a_round_never_opens_past_the_ceiling_whatever_the_column_says() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        sqlx::query("UPDATE teams SET max_parallel = 99 WHERE id = 'marketing'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        for speed in [Speed::Normal, Speed::Fast, Speed::Thorough] {
+            let id = start_with(
+                &state,
+                "marketing",
+                "write it",
+                Lineage::default(),
+                speed,
+                None,
+            )
+            .await
+            .unwrap();
+            let run = fetch_run(&state, &id).await;
+            assert_eq!(
+                round_width(&state, &run).await.unwrap(),
+                MAX_PARALLEL_CEILING
+            );
+        }
+    }
+
+    /// Section 5.2: the team's value is `normal`, `fast` doubles it, and a serial team stays serial.
+    #[tokio::test]
+    async fn fast_widens_a_round_and_never_a_serial_team() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        for (stored, speed, expected) in [
+            (2, Speed::Normal, 2),
+            (2, Speed::Fast, 4),
+            (1, Speed::Fast, 1),
+        ] {
+            sqlx::query("UPDATE teams SET max_parallel = ? WHERE id = 'marketing'")
+                .bind(stored)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            let id = start_with(
+                &state,
+                "marketing",
+                "write it",
+                Lineage::default(),
+                speed,
+                None,
+            )
+            .await
+            .unwrap();
+            let run = fetch_run(&state, &id).await;
+            assert_eq!(
+                round_width(&state, &run).await.unwrap(),
+                expected,
+                "{stored} {speed:?}"
+            );
+        }
+    }
+
+    /// A run started before the column existed has NULL, and NULL is `normal`.
+    #[tokio::test]
+    async fn a_run_with_no_speed_is_normal() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write it", None).await.unwrap();
+        sqlx::query("UPDATE team_runs SET speed = NULL WHERE id = ?")
+            .bind(&id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let run = fetch_run(&state, &id).await;
+        assert_eq!(round_width(&state, &run).await.unwrap(), 2);
+    }
+
+    /// An unknown speed on a request is the caller's mistake, made at a keyboard, now.
+    #[tokio::test]
+    async fn an_unknown_speed_on_a_request_is_refused() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let refusal = post_team_run(
+            State(state.clone()),
+            Path("marketing".to_owned()),
+            Json(StartRequest {
+                request: "write it".to_owned(),
+                report_to_chat_id: None,
+                speed: Some("fsat".to_owned()),
+            }),
+        )
+        .await;
+        let Err((status, message)) = refusal else {
+            panic!("accepted an unknown speed")
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("fsat"));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -5713,6 +5853,7 @@ mod tests {
             "marketing",
             "write the launch post",
             Lineage::default(),
+            crate::speed::Speed::Normal,
             Some(&chat_id),
         )
         .await
@@ -5840,6 +5981,7 @@ mod tests {
             "marketing",
             "write the launch post",
             Lineage::default(),
+            crate::speed::Speed::Normal,
             Some("no-such-chat"),
         )
         .await
@@ -5915,6 +6057,7 @@ mod tests {
                 root_id: None,
                 depth: 1,
             },
+            crate::speed::Speed::Normal,
             None,
         )
         .await
