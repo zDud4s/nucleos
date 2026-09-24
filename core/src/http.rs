@@ -13715,17 +13715,20 @@ pub(crate) async fn post_knowledge(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(request): Json<ProposeKnowledgeRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), axum::response::Response> {
+    // These are the relay's named slugs for the same header, rather than sentences, for the reason
+    // on `refusal`. A model reads the body verbatim through `declare_refinement`. By owner scope,
+    // 2026-09-24, every other refusal in this handler stays prose.
     let Some(origin_run_id) = sending_run_id_of(&headers) else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "only a run can declare knowledge, and this request names none".to_owned(),
-        ));
+        return Err(refusal(StatusCode::BAD_REQUEST, "missing_run_id").into_response());
     };
-    let kind = crate::knowledge::Kind::parse(request.kind.trim()).ok_or((
-        StatusCode::BAD_REQUEST,
-        "kind must be one of prompt, memory, skill, subagent".to_owned(),
-    ))?;
+    let kind = crate::knowledge::Kind::parse(request.kind.trim()).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "kind must be one of prompt, memory, skill, subagent".to_owned(),
+        )
+            .into_response()
+    })?;
     let title = request.title.trim();
     let body = request.body.trim();
     // A refinement with no words is an empty heading in every later prompt, for ever.
@@ -13733,7 +13736,8 @@ pub(crate) async fn post_knowledge(
         return Err((
             StatusCode::BAD_REQUEST,
             "a refinement needs both a title and a body".to_owned(),
-        ));
+        )
+            .into_response());
     }
     let project_id = sqlx::query_scalar::<_, Option<String>>(
         "SELECT project_id FROM runs WHERE id = ?",
@@ -13747,11 +13751,9 @@ pub(crate) async fn post_knowledge(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the refinement's scope could not be determined".to_owned(),
         )
+            .into_response()
     })?
-    .ok_or((
-        StatusCode::BAD_REQUEST,
-        "the run this request names does not exist".to_owned(),
-    ))?;
+    .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "unknown_sender").into_response())?;
     let (knowledge_id, proposal_id) = crate::knowledge::propose(
         &state.pool,
         crate::knowledge::Declaration {
@@ -13775,10 +13777,10 @@ pub(crate) async fn post_knowledge(
     // between "that id is not there" and "that id is not yours", and the two have different fixes.
     .map_err(|error| match error {
         crate::knowledge::ProposeError::UnknownPredecessor(_) => {
-            (StatusCode::NOT_FOUND, error.to_string())
+            (StatusCode::NOT_FOUND, error.to_string()).into_response()
         }
         crate::knowledge::ProposeError::ForeignPredecessor(_) => {
-            (StatusCode::CONFLICT, error.to_string())
+            (StatusCode::CONFLICT, error.to_string()).into_response()
         }
         crate::knowledge::ProposeError::Db(error) => {
             tracing::warn!(%error, "proposing a refinement failed");
@@ -13786,6 +13788,7 @@ pub(crate) async fn post_knowledge(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "the refinement could not be written".to_owned(),
             )
+                .into_response()
         }
     })?;
     Ok((
@@ -33132,6 +33135,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["refusal"], "missing_run_id");
+        let knowledge_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let proposal_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proposals WHERE kind = 'refinement'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            knowledge_count, 0,
+            "a refused declaration writes no knowledge"
+        );
+        assert_eq!(
+            proposal_count, 0,
+            "a refused declaration writes no proposal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declaration_whose_run_header_is_not_a_run_id_is_refused_by_name() {
+        let state = test_state().await;
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/knowledge")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header(crate::daemon_client::RUN_ID_HEADER, "not-a-run")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "kind": "prompt",
+                            "title": "commit messages are English here",
+                            "body": "fixed by the owner, and it applies to every project on this \
+                                     machine",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["refusal"], "missing_run_id");
         let knowledge_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
             .fetch_one(&state.pool)
             .await
@@ -33177,6 +33228,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["refusal"], "unknown_sender");
         let knowledge_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
             .fetch_one(&state.pool)
             .await

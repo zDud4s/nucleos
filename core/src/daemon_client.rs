@@ -1743,6 +1743,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_refused_declaration_hands_the_refusal_back_to_the_model() {
+        let url = refusing_daemon(
+            axum::http::StatusCode::BAD_REQUEST,
+            r#"{"refusal":"missing_run_id"}"#,
+        )
+        .await;
+
+        let refusal = DaemonClient::new(url, "test-token".to_string())
+            .declare_refinement("memory", "t", "b", "r")
+            .await
+            .expect_err("a refused declaration must not be reported as knowledge");
+
+        assert!(refusal.contains("missing_run_id"), "said {refusal:?}");
+    }
+
     /// A daemon that answers one canned refusal to everything.
     async fn refusing_daemon(status: axum::http::StatusCode, body: &'static str) -> String {
         let app = axum::Router::new().fallback(move || async move { (status, body) });
