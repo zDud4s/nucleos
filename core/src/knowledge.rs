@@ -328,11 +328,10 @@ impl Scored {
 
 /// What a node reads, and what it was not shown.
 pub struct Brief {
-    #[cfg_attr(not(test), allow(dead_code))] // Task 2.5 reads the selected block.
     pub block: Option<String>,
     /// One entry per candidate, shown or not, with the five signals — this is what `brief` writes to
     /// `run_knowledge`, and the reason the trace can answer WHICH signal elected a row.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 2.5 persists this trace.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 3.1 persists this trace.
     pub trace: Vec<Scored>,
 }
 
@@ -703,23 +702,55 @@ fn select_pass<'a>(
     }
 }
 
+// Only what a person approved. Filtered here rather than trusted from the caller's query:
+// `select` is the last thing between a `proposed` row and a node's prompt, and something that
+// reaches a prompt unapproved makes the approval decorative, which is the entire mechanism.
+// The only named exceptions are a measured consolidator observation and an evidenced working
+// fact read inside the same job; spelling their complete shapes here keeps a third one out.
+fn admitted(row: &Known, context: &Context) -> bool {
+    match row.status.as_str() {
+        "active" if row.source == "consolidator" => {
+            row.layer == "episodic" && row.observations.is_some()
+        }
+        "active" => true,
+        "live" => {
+            row.source == "run"
+                && row.layer == "working"
+                && row
+                    .evidence
+                    .as_deref()
+                    .is_some_and(|evidence| !evidence.trim().is_empty())
+                && context
+                    .chain
+                    .iter()
+                    .any(|scope| matches!(scope, Scope::Job { .. }) && same_scope(row, scope))
+        }
+        _ => false,
+    }
+}
+
 /// Select a bounded briefing without doing I/O.
 ///
-/// Structure owns its bytes first. Populated layers then claim their item floors, and candidates
-/// left over compete in [`ordered_candidates`] order. The first pass discovers which scope groups
-/// are cut; the second reserves those notices before choosing rows and accounts for any cut it
-/// exposes at the boundary.
-#[cfg_attr(not(test), allow(dead_code))] // Task 2.5 wires this pure seam into `render`.
+/// Admission applies spec §4.5 first: approved rows plus the two named exceptions, measured
+/// consolidator observations and evidenced same-job working facts. Structure then owns its bytes
+/// first. Populated layers claim their item floors, and candidates left over compete in
+/// [`ordered_candidates`] order. The first pass discovers which scope groups are cut; the second
+/// reserves those notices before choosing rows and accounts for any cut it exposes at the
+/// boundary. The trace covers every admitted candidate.
 pub fn select(known: &[Known], context: &Context, budget: &Budget) -> Brief {
-    let candidates: Vec<&Known> = ordered_candidates(known, context)
+    let admitted: Vec<Known> = known
+        .iter()
+        .filter(|row| admitted(row, context))
+        .cloned()
+        .collect();
+    let candidates: Vec<&Known> = ordered_candidates(&admitted, context)
         .into_iter()
-        .filter(|row| row.status == "active")
         .filter(|row| context.chain.iter().any(|scope| same_scope(row, scope)))
         .collect();
     if candidates.is_empty() {
         return Brief {
             block: None,
-            trace: scored_candidates(known, context)
+            trace: scored_candidates(&admitted, context)
                 .into_iter()
                 .map(|(_, scored)| scored)
                 .collect(),
@@ -758,7 +789,7 @@ pub fn select(known: &[Known], context: &Context, budget: &Budget) -> Brief {
         }
     }
     let block = (char_count(&block) <= budget.render_chars).then_some(block);
-    let trace = scored_candidates(known, context)
+    let trace = scored_candidates(&admitted, context)
         .into_iter()
         .map(|(_, mut scored)| {
             scored.shown = block.is_some() && shown.contains(&scored.knowledge_id);
@@ -782,42 +813,9 @@ const COLUMNS: &str = "id, layer, scope_kind, scope_id, source, generator, evide
 ///
 /// Appended to the brief and never replacing it, exactly as `notes::render` is — a node handed a
 /// standing instruction instead of its task does the standing instruction.
+/// It trusts [`select`] for admission and holds no second copy of the rule.
 pub fn render(known: &[Known], context: &Context) -> Option<String> {
-    // Only what a person approved. Filtered here rather than trusted from the caller's query: this
-    // function is the last thing between a `proposed` row and a node's prompt, and something that
-    // reaches a prompt unapproved makes the approval decorative, which is the entire mechanism.
-    // The only named exceptions are a measured consolidator observation and an evidenced working
-    // fact read inside the same job; spelling their complete shapes here keeps a third one out.
-    let visible: Vec<Known> = known
-        .iter()
-        .filter(|row| match row.status.as_str() {
-            "active" if row.source == "consolidator" => {
-                row.layer == "episodic" && row.observations.is_some()
-            }
-            "active" => true,
-            "live" => {
-                row.source == "run"
-                    && row.layer == "working"
-                    && row
-                        .evidence
-                        .as_deref()
-                        .is_some_and(|evidence| !evidence.trim().is_empty())
-                    && context
-                        .chain
-                        .iter()
-                        .any(|scope| matches!(scope, Scope::Job { .. }) && same_scope(row, scope))
-            }
-            _ => false,
-        })
-        // `select` keeps its Task 2.4 active-only seam. Eligibility has been decided above, so a
-        // job-local `live` row is normalised only in this private copy before entering that seam.
-        .map(|row| {
-            let mut row = row.clone();
-            row.status = "active".into();
-            row
-        })
-        .collect();
-    select(&visible, context, &Budget::default()).block
+    select(known, context, &Budget::default()).block
 }
 
 /// One row's share of the room.
@@ -2432,7 +2430,8 @@ mod tests {
         assert_eq!(brief.trace.iter().filter(|row| row.shown).count(), 3);
     }
 
-    /// Active rows still represent approval. The only rows that may bypass it are (a) an `active`
+    /// The admission rule is asserted on `select`, the seam every caller passes through. Active
+    /// rows still represent approval. The only rows that may bypass it are (a) an `active`
     /// consolidator `episodic` row with observations and (b) a `live` run `working` row with
     /// non-empty evidence, read only inside the job that wrote it. Enumerating the surrounding
     /// status/source/layer space makes a third exception fail here rather than reach a prompt.
@@ -2477,9 +2476,19 @@ mod tests {
                             .is_some_and(|value| !value.is_empty());
                     let approved = status == "active" && source != "consolidator";
                     assert_eq!(
-                        render(std::slice::from_ref(&row), &context).is_some(),
+                        select(std::slice::from_ref(&row), &context, &Budget::default(),)
+                            .block
+                            .is_some(),
                         approved || measured_exception || working_exception,
                         "the admission rule was wrong for {title}"
+                    );
+                    assert_eq!(
+                        select(std::slice::from_ref(&row), &context, &Budget::default(),)
+                            .trace
+                            .iter()
+                            .any(|scored| scored.knowledge_id == id),
+                        approved || measured_exception || working_exception,
+                        "a row the admission rule refuses was scored as a candidate for {title}"
                     );
                 }
             }
@@ -2506,14 +2515,16 @@ mod tests {
         another_jobs_working_fact.evidence = Some("run:900002".into());
 
         assert!(
-            render(
+            select(
                 &[
                     measurement_without_observations,
                     working_without_evidence,
                     another_jobs_working_fact,
                 ],
                 &context,
+                &Budget::default(),
             )
+            .block
             .is_none(),
             "an incomplete or cross-job exception reached a node's prompt"
         );
