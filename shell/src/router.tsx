@@ -115,8 +115,8 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  * TanStack spells a parameter `$runId`; the page reads it back under that name.
  *
  * `/projects/$projectId/$view` is the second, and it carries a parameter that is
- * not an id: the mode a project is being looked at through — `state`, `code`,
- * `workflows` or `github`. It is in the location rather than in component state
+ * not an id: the mode a project is being looked at through — `state`, `map`,
+ * `code`, `workflows` or `authority` (once `github`, which still resolves). It is in the location rather than in component state
  * because a project somebody is working in should survive a reload and be linkable, and
  * it is **not** a search param because it is not a filter: there is exactly one
  * of it and it always has a value.

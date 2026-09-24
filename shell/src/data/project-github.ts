@@ -100,6 +100,15 @@ export interface ReadOutcome {
 /* ------------------------------------------------------------------ hooks -- */
 
 /**
+ * How long one answer serves every reader on the page that asked for it.
+ *
+ * Long enough that the readers one page mounts share a single subprocess, short enough that
+ * leaving the page and coming back is still a fresh question. Not a poll: nothing re-asks when it
+ * runs out; the next reader to mount does.
+ */
+const SHARED_BY_ONE_PAGE_MS = 30_000;
+
+/**
  * Which repository on GitHub this project is — `GET /projects/{id}/github-repo`.
  *
  * Not polled: a project's `origin` changes when somebody types `git remote set-url`, which is not
@@ -119,6 +128,11 @@ export function useProjectRepo(projectId: string | null) {
     // A project's `origin` does not change while somebody reads a page about it, and this spawns
     // git — the same reading `useDetect` takes about the wizard's three git commands.
     refetchOnWindowFocus: false,
+    // Several readers on one page: the Authority mode's status line, its remote and its GitHub
+    // table each ask. With `staleTime` 0 a reader that mounted a beat after the answer landed
+    // counted it stale and spawned git again. Half a minute covers one page's worth of readers;
+    // coming back to the page later asks again, as it always did.
+    staleTime: SHARED_BY_ONE_PAGE_MS,
   });
 }
 
@@ -158,5 +172,11 @@ export function useGithubListing(op: ListingRead, repo: string | null) {
     // polling this module's header says it does not do, wearing a different trigger. The one gesture
     // that asks again is the button.
     refetchOnWindowFocus: false,
+    // **And not on a second reader's mount either.** The Authority mode reads these listings from
+    // three places (its status line, the remote, the Reads group's "is GitHub answering?"), and they
+    // do not always subscribe in one commit — measured: the later reader found the first answer
+    // already stale and ran `gh` again, four invocations for two listings. The button still asks at
+    // once (`refetch` ignores `staleTime`), and the page shows when the answer it has was read.
+    staleTime: SHARED_BY_ONE_PAGE_MS,
   });
 }

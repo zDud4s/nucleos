@@ -43,6 +43,24 @@ type ModeGithubState = DaemonState & {
   declarableGitOps: DeclarableGitOp[];
 };
 
+/** The dwell `ConfirmButton` needs between arming and confirming — see `KillSwitchControl.test.tsx`. */
+async function afterDwell(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 350));
+}
+
+/**
+ * Press a widening control twice, the way a person has to.
+ *
+ * The first press only arms it — the assertion that nothing was written in between is the caller's,
+ * where it matters — and the armed control is found again by its armed name, because that is the
+ * label a person is reading when they confirm.
+ */
+async function pressTwice(scope: HTMLElement, name: string, armed: string | RegExp) {
+  fireEvent.click(within(scope).getByRole("button", { name }));
+  await afterDwell();
+  fireEvent.click(within(scope).getByRole("button", { name: armed }));
+}
+
 /** Mount the mode over a daemon holding exactly these declarations. */
 function open(overrides: Partial<ModeGithubState> = {}): ModeGithubState {
   const state = Object.assign(daemonState(overrides), {
@@ -108,7 +126,7 @@ describe("what runs on its own", () => {
     // Its name is there — omitting it would claim this daemon cannot do it at all, which is the
     // other bad answer the catalogue's `declarable` flag exists to avoid.
     expect(row.textContent).toContain("api_read");
-    expect(row.textContent).toContain("outside the compiled ceiling");
+    expect(row.textContent).toContain("not allowed by this build");
 
     // And nothing in it can be pressed, ticked or focused. Not "is disabled" — absent.
     expect(within(row).queryByRole("checkbox")).toBeNull();
@@ -120,7 +138,7 @@ describe("what runs on its own", () => {
     // The comparison that gives the assertion its teeth: an operation the ceilings DO admit gets
     // the control this one is denied, from the same list and the same renderer.
     const admitted = screen.getByRole("listitem", { name: "operation run_list" });
-    expect(within(admitted).getByRole("checkbox")).toBeDefined();
+    expect(within(admitted).getByRole("button", { name: "grant" })).toBeDefined();
   });
 
   /**
@@ -142,11 +160,11 @@ describe("what runs on its own", () => {
     const state = open({ githubOps: ["api_read"] });
 
     const row = await screen.findByRole("listitem", { name: "operation api_read" });
-    expect(row.textContent).toContain("declared here");
+    expect(row.textContent).toContain("granted here");
     expect(row.textContent).toMatch(/it does not run/i);
 
-    // Still never a checkbox: the ceilings do not admit it, so there is nothing to re-grant.
-    expect(within(row).queryByRole("checkbox")).toBeNull();
+    // Still never a grant: the ceilings do not admit it, so there is nothing to re-grant.
+    expect(within(row).queryByRole("button", { name: "grant" })).toBeNull();
 
     fireEvent.click(within(row).getByRole("button", { name: "withdraw" }));
     await waitFor(() => expect(state.githubOps).toEqual([]));
@@ -175,27 +193,117 @@ describe("what runs on its own", () => {
     await waitFor(() => expect(state.githubOps).toEqual([]));
   });
 
-  it("ticks the operations this project has declared, and only those", async () => {
+  /**
+   * The state is a word, and the human name stands beside the id.
+   *
+   * These were checkboxes whose only label was `pr_list`. The row now says what the operation
+   * does, and says in words whether runs do it without asking — a state a screen reader reads out
+   * rather than a tick it has to be told the meaning of.
+   */
+  it("says which operations run without asking, and names each in words", async () => {
     open({ githubOps: ["run_list"] });
 
     const declared = await screen.findByRole("listitem", { name: "operation run_list" });
-    expect(within(declared).getByRole<HTMLInputElement>("checkbox").checked).toBe(true);
+    expect(declared.textContent).toContain("list recent CI runs");
+    expect(declared.textContent).toContain("without asking");
+    expect(within(declared).getByRole("button", { name: "withdraw" })).toBeDefined();
 
     const not = screen.getByRole("listitem", { name: "operation pr_list" });
-    expect(within(not).getByRole<HTMLInputElement>("checkbox").checked).toBe(false);
+    expect(not.textContent).toContain("asks first");
+    expect(within(not).getByRole("button", { name: "grant" })).toBeDefined();
   });
 
-  it("grants an operation and reads the list back", async () => {
+  /**
+   * **Widening costs two presses, and the first one writes nothing.**
+   *
+   * A grant widens what every run already working in the project may do, from its next command.
+   * It used to be one tick, as light as withdrawing — the page said "this is a live control" and
+   * then treated it as a preference. The first press arms and names what is about to be widened;
+   * only the second writes. And the row, not the section, is what waits and what says it happened.
+   */
+  it("grants an operation only on the second press, and says so on the row", async () => {
     const state = open();
 
     const row = await screen.findByRole("listitem", { name: "operation pr_list" });
-    fireEvent.click(within(row).getByRole("checkbox"));
+    fireEvent.click(within(row).getByRole("button", { name: "grant" }));
+
+    // Armed, and saying what it will do, with nothing sent.
+    expect(within(row).getByRole("button", { name: "grant without asking · pr_list" })).toBeDefined();
+    expect(state.policyWrites).toEqual([]);
+
+    await afterDwell();
+    fireEvent.click(within(row).getByRole("button", { name: "grant without asking · pr_list" }));
 
     await waitFor(() => expect(state.githubOps).toEqual(["pr_list"]));
     expect(state.policyWrites[0]).toMatchObject({
       method: "POST",
       body: { op_kind: "pr_list" },
     });
+    // The receipt, on the row it is about.
+    await waitFor(() =>
+      expect(screen.getByRole("listitem", { name: "operation pr_list" }).textContent).toMatch(
+        /granted · \d\d:\d\d/,
+      ),
+    );
+  });
+
+  /** Narrowing stays one press: withdrawing is never the gesture that needs a second thought. */
+  it("withdraws an operation at the first press", async () => {
+    const state = open({ githubOps: ["run_list"] });
+
+    const row = await screen.findByRole("listitem", { name: "operation run_list" });
+    fireEvent.click(within(row).getByRole("button", { name: "withdraw" }));
+
+    await waitFor(() => expect(state.githubOps).toEqual([]));
+    expect(state.policyWrites[0]).toMatchObject({ method: "DELETE", body: { op_kind: "run_list" } });
+  });
+
+  /**
+   * A refusal lands on the row it is about.
+   *
+   * It used to arrive at the foot of the section, below every row, saying nothing about which of
+   * them had been refused — somebody who had just pressed two grants could not tell which one the
+   * núcleo turned down.
+   */
+  it("puts a refusal inside the row that earned it", async () => {
+    open({ policyRefusal: { status: 423, code: "kill_switch", detail: "" } });
+
+    const row = await screen.findByRole("listitem", { name: "operation pr_list" });
+    await pressTwice(row, "grant", "grant without asking · pr_list");
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("listitem", { name: "operation pr_list" }).querySelector(".ui-note-refusal"),
+      ).not.toBeNull(),
+    );
+    expect(screen.getByRole("listitem", { name: "operation pr_list" }).textContent).toContain(
+      "kill_switch",
+    );
+    expect(
+      screen.getByRole("listitem", { name: "operation run_list" }).querySelector(".ui-note-refusal"),
+    ).toBeNull();
+  });
+
+  /**
+   * While the stop is engaged, a grant is a request with one possible answer — so the page says
+   * so before anybody spends it, and the control cannot be armed.
+   */
+  it("says up front that the stop blocks widening, and will not arm a grant", async () => {
+    const state = open({ kill: { engaged: true } });
+
+    const note = await screen.findByText(/emergency stop is engaged/i);
+    // Narrowing still works under the stop, and the page must not suggest otherwise.
+    expect(note.textContent).toMatch(/withdrawing and refusing still work/i);
+
+    const row = await screen.findByRole("listitem", { name: "operation pr_list" });
+    await waitFor(() =>
+      expect(within(row).getByRole("button", { name: "grant" }).getAttribute("aria-disabled")).toBe(
+        "true",
+      ),
+    );
+    fireEvent.click(within(row).getByRole("button", { name: "grant" }));
+    expect(within(row).queryByRole("button", { name: /grant without asking/ })).toBeNull();
+    expect(state.policyWrites).toEqual([]);
   });
 
   /**
@@ -210,6 +318,8 @@ describe("what runs on its own", () => {
 
     const actions = await screen.findByText(/recorded and inert/i);
     expect(actions.textContent).toContain("later step");
+    // Said first, not last: "this may do nothing" is the half that matters most.
+    expect(actions.textContent).toMatch(/^Recorded and inert/);
 
     /*
       And the reads half says the same kind of true thing, which unqualified it did not.
@@ -219,20 +329,40 @@ describe("what runs on its own", () => {
       where nothing will ever consult it. "Consulted at the next decision" was unconditional and the
       núcleo makes no such promise.
     */
-    const reads = screen.getByText(/consulted at the next decision/i);
-    expect(reads.textContent).toMatch(/only while the GitHub pillar is on/i);
-    expect(reads.textContent).toContain(".ai/github.yaml");
+    const reads = screen.getByText(/Used the next time an agent types gh/i);
+    expect(reads.textContent).toMatch(/while GitHub is switched on for this machine/i);
+
+    // Where that switch lives is one press away, not a line every opening has to read past.
+    const section = screen.getByRole("region", { name: "GitHub operations without asking" });
+    fireEvent.click(within(section).getAllByRole("button", { name: "why?" })[0]);
+    expect(section.textContent).toContain(".ai/github.yaml");
+  });
+
+  /**
+   * GitHub unreachable makes every read grant moot, and the page says so before a grant is spent.
+   *
+   * The daemon has no route that says whether GitHub is switched on for this machine; the remote's
+   * own 503 is the one reading that finds out, and it covers a missing `gh` too. Either way a read
+   * granted here has nothing to run against.
+   */
+  it("warns that a read grant is moot while GitHub is not answering", async () => {
+    open({
+      githubReadRefusal: { status: 503, code: "unavailable", detail: "the github pillar is off" },
+    });
+
+    const section = await screen.findByRole("region", { name: "GitHub operations without asking" });
+    await waitFor(() => expect(section.textContent).toMatch(/GitHub is not answering on this machine/));
   });
 });
 
 describe("what the queue may do on its own", () => {
-  it("renders one checkbox for each of the six git operation kinds", async () => {
+  it("offers a grant for each of the six git operation kinds", async () => {
     open();
 
-    const section = await screen.findByRole("region", { name: "What the queue may do on its own" });
-    const boxes = await within(section).findAllByRole("checkbox");
+    const section = await screen.findByRole("region", { name: "Git operations the queue may perform" });
+    const grants = await within(section).findAllByRole("button", { name: "grant" });
 
-    expect(boxes).toHaveLength(6);
+    expect(grants).toHaveLength(6);
     expect(
       GIT_CATALOGUE.map((operation) =>
         within(section).getByRole("listitem", { name: `git operation ${operation.kind}` }),
@@ -240,17 +370,19 @@ describe("what the queue may do on its own", () => {
     ).toHaveLength(6);
   });
 
-  it("ticks with POST and unticks with DELETE", async () => {
+  it("grants with POST after a confirm, and withdraws with DELETE at once", async () => {
     const state = open({ gitOps: ["merge"] });
-    const section = await screen.findByRole("region", { name: "What the queue may do on its own" });
+    const section = await screen.findByRole("region", { name: "Git operations the queue may perform" });
     const push = await within(section).findByRole("listitem", { name: "git operation push" });
+    expect(push.textContent).toContain("push to the remote");
 
-    fireEvent.click(within(push).getByRole("checkbox"));
+    await pressTwice(push, "grant", "grant without asking · push");
     await waitFor(() => expect(state.gitOps).toEqual(["merge", "push"]));
 
     fireEvent.click(
       within(within(section).getByRole("listitem", { name: "git operation merge" })).getByRole(
-        "checkbox",
+        "button",
+        { name: "withdraw" },
       ),
     );
     await waitFor(() => expect(state.gitOps).toEqual(["push"]));
@@ -272,11 +404,11 @@ describe("what the queue may do on its own", () => {
   it("renders a declared kind absent from the catalogue as stranded and withdrawable", async () => {
     open({ gitOps: ["cherry-pick"] });
 
-    const section = await screen.findByRole("region", { name: "What the queue may do on its own" });
+    const section = await screen.findByRole("region", { name: "Git operations the queue may perform" });
     const row = await within(section).findByRole("listitem", { name: "git operation cherry-pick" });
 
     expect(row.textContent).toContain("cherry-pick");
-    expect(within(row).queryByRole("checkbox")).toBeNull();
+    expect(within(row).queryByRole("button", { name: "grant" })).toBeNull();
     expect(within(row).getByRole("button", { name: "withdraw" })).toBeDefined();
   });
 });
@@ -296,12 +428,16 @@ describe("what the worktrees may run", () => {
     const said =
       screen.getByRole("region", { name: "What the worktrees may run" }).textContent ?? "";
 
-    // `deny` wins, over an `allow` and over a compiled permission.
-    expect(said).toMatch(/deny\s*beats\s*allow/i);
+    // `deny` wins, over an `allow` and over a compiled permission — in the section's one visible
+    // sentence, in words rather than in the table's verdict names.
+    expect(said).toMatch(/A refusal here beats a permission here/i);
     expect(said).toContain("compiled into the núcleo");
-    // And the half nobody guesses: an allow widens what would have ASKED, never what refuses.
     expect(said).toMatch(/never lifts a refusal/i);
-    expect(said).toContain("rm -rf /");
+
+    // And the worked example, one press away.
+    const region = screen.getByRole("region", { name: "What the worktrees may run" });
+    fireEvent.click(within(region).getAllByRole("button", { name: "why?" })[0]);
+    expect(region.textContent).toContain("rm -rf /");
   });
 
   it("shows the folded prefix, because that is what is stored and enforced", async () => {
@@ -431,7 +567,7 @@ describe("what the worktrees may run", () => {
 
     const box = await screen.findByLabelText("Command prefix");
     fireEvent.change(box, { target: { value: "ls | sh" } });
-    fireEvent.click(screen.getByRole("button", { name: "allow it here" }));
+    await pressTwice(document.body, "allow it here", "allow without asking · ls | sh");
 
     const note = await screen.findByText(detail);
     expect(note).toBeDefined();
@@ -453,9 +589,9 @@ describe("what the worktrees may run", () => {
 
     const box = await screen.findByLabelText("Command prefix");
     fireEvent.change(box, { target: { value: "bash scripts/gates.sh" } });
-    fireEvent.click(screen.getByRole("button", { name: "allow it here" }));
+    await pressTwice(document.body, "allow it here", "allow without asking · bash scripts/gates.sh");
 
-    const note = await screen.findByRole("status");
+    const note = (await screen.findByText(/is not blocked/i)).closest(".ui-note-refusal") as HTMLElement;
     expect(note.textContent).toContain("kill_switch");
     expect(note.textContent).toMatch(/is not blocked/i);
     expect(note.textContent).toContain("narrowing");
@@ -528,7 +664,7 @@ describe("what the worktrees may run", () => {
     const write = await screen.findByRole("listitem", { name: "rule Edit writing to migrations" });
     expect(within(write).queryByRole("button", { name: /instead/ })).toBeNull();
     // Withdrawing it is still offered: a refusal a project can never remove is a different problem.
-    expect(within(write).getByRole("button", { name: "forget" })).toBeDefined();
+    expect(within(write).getByRole("button", { name: "withdraw" })).toBeDefined();
 
     // And the command rule beside it keeps the gesture, so this is about the KIND of rule and not
     // about the section having lost its controls.
@@ -661,7 +797,7 @@ describe("what the worktrees may run", () => {
 
     // And it is the owner's to remove — a row that decides nothing and cannot be withdrawn is the
     // same problem one move further on, and filtering it out of the list would be that too.
-    expect(within(stranded).getByRole("button", { name: "forget" })).toBeDefined();
+    expect(within(stranded).getByRole("button", { name: "withdraw" })).toBeDefined();
 
     // The ordinary permission beside it is untouched: this is about the KIND of row, and not about
     // the Allowed panel having learned to disclaim everything in it.
@@ -732,15 +868,26 @@ describe("where the work lands", () => {
     // A declared target IS closable, from the same list, which is what makes the absence above a
     // decision rather than an omission.
     const declared = screen.getByRole("listitem", { name: "land target release/next" });
-    expect(within(declared).getByRole("button", { name: "close" })).toBeDefined();
+    expect(within(declared).getByRole("button", { name: "withdraw" })).toBeDefined();
   });
 
-  it("opens a target and reads it back", async () => {
+  it("adds a target and reads it back", async () => {
     const state = open();
 
-    const box = await screen.findByLabelText("Another landing target");
+    const box = await screen.findByLabelText("Branch");
     fireEvent.change(box, { target: { value: "release/next" } });
-    fireEvent.click(screen.getByRole("button", { name: "open it" }));
+    fireEvent.click(screen.getByRole("button", { name: "add" }));
+
+    await waitFor(() => expect(state.landTargets).toEqual(["release/next"]));
+  });
+
+  /** A form, so Enter adds — the field was a dead end for anybody not reaching for the mouse. */
+  it("adds a target when Enter is pressed in the field", async () => {
+    const state = open();
+
+    const box = await screen.findByLabelText("Branch");
+    fireEvent.change(box, { target: { value: "release/next" } });
+    fireEvent.submit(box.closest("form") as HTMLFormElement);
 
     await waitFor(() => expect(state.landTargets).toEqual(["release/next"]));
   });
@@ -1077,7 +1224,7 @@ describe("the page as a whole", () => {
     open({ policyReadRefusal: { status: 500, code: "internal", detail: "" } });
 
     for (const label of [
-      "What runs on its own",
+      "GitHub operations without asking",
       "What the worktrees may run",
       "Where the work lands",
     ]) {
@@ -1112,7 +1259,7 @@ describe("the page as a whole", () => {
     const before = repoReads();
 
     const row = await screen.findByRole("listitem", { name: "operation pr_list" });
-    fireEvent.click(within(row).getByRole("checkbox"));
+    await pressTwice(row, "grant", "grant without asking · pr_list");
     await waitFor(() => expect(screen.getByRole("listitem", { name: "operation pr_list" })).toBeDefined());
     await new Promise((resolve) => setTimeout(resolve, 50));
 
@@ -1144,9 +1291,13 @@ describe("the page as a whole", () => {
   it("says a rule written here binds the next tool call of a run already going", async () => {
     open();
 
-    const said = (await screen.findByText(/no cache and no restart/i)).textContent ?? "";
-    expect(said).toContain("very next tool call");
-    expect(said).toContain("nucleos");
+    // One sentence on every opening, and the mechanism behind it one press away.
+    const said = await screen.findByText(/very next tool call of every run already working/i);
+    const standing = screen.getByRole("group", { name: "Standing" });
+    expect(standing.contains(said)).toBe(true);
+
+    fireEvent.click(within(standing).getByRole("button", { name: "why?" }));
+    expect(standing.textContent).toMatch(/no cache and no restart/i);
   });
 
   it("draws the five sections in the order the designs fix", async () => {
@@ -1156,11 +1307,153 @@ describe("the page as a whole", () => {
     expect(screen.getAllByRole("region").map((region) => region.getAttribute("aria-label"))).toEqual(
       [
         "The remote",
-        "What runs on its own",
-        "What the queue may do on its own",
+        "GitHub operations without asking",
+        "Git operations the queue may perform",
         "What the worktrees may run",
         "Where the work lands",
       ],
     );
+  });
+});
+
+describe("the answer at the top, and the gestures that widen", () => {
+  /**
+   * **"Is everything fine?" before "what can I do?"** — Product Principle 1, which the page failed:
+   * its first element was a warning paragraph, and nothing said how much this project may do.
+   *
+   * The counts are what is IN FORCE: a declared action is inert and a row outside the ceiling is
+   * narrowed away, so neither is counted — the line must not promise authority the núcleo does not
+   * grant.
+   */
+  it("opens on one line counting what runs here may do without asking", async () => {
+    open({
+      githubOps: ["pr_list", "pr_comment", "api_read"],
+      gitOps: ["merge", "push"],
+      shellRules: [
+        shellRule({ prefix: "npm ci", verdict: "allow" }),
+        shellRule({ prefix: "git push", verdict: "deny" }),
+        shellRule({ prefix: "migrations", tool: "Edit", verdict: "deny" }),
+      ],
+      landTargets: ["release/next"],
+    });
+
+    const standing = await screen.findByRole("group", { name: "Standing" });
+    const fact = (term: string) =>
+      within(standing).getByText(term).nextElementSibling?.textContent ?? null;
+
+    await waitFor(() => expect(fact("GitHub reads")).toBe("1"));
+    expect(fact("Git operations")).toBe("2");
+    expect(fact("Commands allowed")).toBe("1");
+    expect(fact("Refusals")).toBe("2");
+    expect(fact("Lands on")).toBe("master +1");
+  });
+
+  /** A reading nobody took is the em dash, never a nought — the app's rule for "not measured". */
+  it("draws an unanswered count as a dash, not as zero", async () => {
+    open({ policyReadRefusal: { status: 500, code: "internal", detail: "" } });
+
+    const standing = await screen.findByRole("group", { name: "Standing" });
+    await waitFor(() =>
+      expect(within(standing).getByText("Refusals").nextElementSibling?.textContent).toBe("—"),
+    );
+  });
+
+  /**
+   * A red run looked exactly like a green one, at the place on the page an exception is most likely.
+   *
+   * The listing is still `gh`'s text, byte for byte — the line is marked, never re-laid out — and
+   * the verdict is said once above it and once on the status line.
+   */
+  it("makes a CI run that did not succeed stand out, without rewriting gh's text", async () => {
+    const printed =
+      "completed\tfailure\tCI\tmaster\tpush\t9812346\t2m02s\n" +
+      "completed\tsuccess\tCI\tmaster\tpush\t9812345\t1m20s";
+    open({
+      githubListings: {
+        pr_list: readOutcome("pr_list", "#41\tthe queue lands\tfeat/land\tabout 2 hours ago"),
+        run_list: readOutcome("run_list", printed),
+      },
+    });
+
+    const section = await screen.findByRole("region", { name: "The remote" });
+    await waitFor(() => expect(section.textContent).toMatch(/1 of the 2 listed runs did not succeed/));
+
+    const pres = section.querySelectorAll("pre");
+    expect(pres[1].textContent).toBe(printed);
+    const marked = pres[1].querySelectorAll("mark");
+    expect(marked).toHaveLength(1);
+    expect(marked[0].textContent).toContain("failure");
+
+    const standing = screen.getByRole("group", { name: "Standing" });
+    expect(within(standing).getByText("CI").nextElementSibling?.textContent).toBe(
+      "1 did not succeed",
+    );
+  });
+
+  /**
+   * Asked once and never polled, so the page says WHEN — a listing three hours old shown without a
+   * time is currency the page does not have.
+   */
+  it("says when the remote was read, beside the control that asks again", async () => {
+    open();
+
+    const section = await screen.findByRole("region", { name: "The remote" });
+    await waitFor(() => expect(section.textContent).toMatch(/read \d\d:\d\d/));
+    expect(within(section).getByRole("button", { name: "ask again" })).toBeDefined();
+  });
+
+  /**
+   * Enter declares a REFUSAL, the one thing safe to do by reflex. It did nothing before, so a rule
+   * could only be declared with the mouse; and allowing is never what a keystroke does.
+   */
+  it("declares a refusal when Enter is pressed in the prefix", async () => {
+    const state = open();
+
+    const box = await screen.findByLabelText("Command prefix");
+    fireEvent.change(box, { target: { value: "git push --force" } });
+    fireEvent.submit(box.closest("form") as HTMLFormElement);
+
+    await waitFor(() => expect(state.shellRules).toHaveLength(1));
+    expect(state.shellRules[0]).toMatchObject({ prefix: "git push --force", verdict: "deny" });
+  });
+
+  /**
+   * Withdrawing a REFUSAL widens — whatever it stopped may now run or be asked about — and it takes
+   * the justification with it, so it arms and says what it loses. Withdrawing a permission narrows,
+   * and stays one press.
+   */
+  it("arms before withdrawing a refusal, and not before withdrawing a permission", async () => {
+    const state = open({
+      shellRules: [
+        shellRule({ prefix: "git push", verdict: "deny", note: "the queue pushes" }),
+        shellRule({ prefix: "npm ci", verdict: "allow" }),
+      ],
+    });
+
+    const refusal = await screen.findByRole("listitem", { name: "rule git push" });
+    fireEvent.click(within(refusal).getByRole("button", { name: "withdraw" }));
+    expect(
+      within(refusal).getByRole("button", {
+        name: "stop refusing this, and drop its justification · git push",
+      }),
+    ).toBeDefined();
+    expect(state.policyWrites).toEqual([]);
+
+    const permission = screen.getByRole("listitem", { name: "rule npm ci" });
+    fireEvent.click(within(permission).getByRole("button", { name: "withdraw" }));
+    await waitFor(() => expect(state.shellRules.map((rule) => rule.prefix)).toEqual(["git push"]));
+  });
+
+  /** Flipping a refusal to a permission widens, so it is the flip that arms; the reverse does not. */
+  it("arms before turning a refusal into a permission", async () => {
+    const state = open({ shellRules: [shellRule({ prefix: "git push", verdict: "deny" })] });
+
+    const row = await screen.findByRole("listitem", { name: "rule git push" });
+    fireEvent.click(within(row).getByRole("button", { name: "allow it instead" }));
+    expect(state.policyWrites).toEqual([]);
+
+    await afterDwell();
+    fireEvent.click(within(row).getByRole("button", { name: "allow without asking · git push" }));
+    await waitFor(() => expect(state.shellRules[0].verdict).toBe("allow"));
   });
 });

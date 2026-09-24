@@ -22,25 +22,33 @@ import { ModeGithub } from "./ModeGithub";
  *
  * Five modes and not seven tabs, because each has a genuinely different shape —
  * a dense grid of panels, a graph of the repository, three columns with a tree
- * that persists, a graph of one workflow, four sections read top to bottom.
+ * that persists, a graph of one workflow, a status line over five sections read
+ * top to bottom.
  * Seven tabs would have been seven variations on one grid, which is a second
  * sidebar wearing a disguise. The rule was never the count: a mode earns its
  * place by having a shape and a subject of its own, which is why Map and
  * Workflows can both be graphs without being the same mode — one draws the
  * project, the other draws one pipeline installed in it.
  *
- * **GitHub is the fifth, and it is held to that same rule rather than excused
- * from it.** Its subject is this project's *authority* — three tables deciding
+ * **Authority is the fifth, and it is held to that same rule rather than
+ * excused from it.** Its subject is this project's *authority* — four tables
+ * (GitHub operations, git operations, shell rules, landing targets) deciding
  * what its autonomous runs may do — which is nothing the other four are about:
  * State reads what has happened, Map reads what is in the folder, Code reads a
  * run's checkout, Workflows reads an installed bundle. And its shape is its
- * own: a column of four declarations, each with its own form, which is neither
- * a grid nor a graph. Folding it into State's Settings panel would have put a
- * live autonomy control among the preferences.
+ * own: the remote, then a column of four tables, each with its own controls,
+ * which is neither a grid nor a graph. Folding it into State's Settings panel
+ * would have put a live autonomy control among the preferences.
+ *
+ * It was called "GitHub" until 2026-09-23, after its first section. Only that
+ * section is about GitHub; the other four govern the queue, the worktrees'
+ * shell and where work lands, which a project that never touches GitHub has
+ * too. The mode and ceiling in State › Settings are the same subject and are
+ * meant to move here.
  */
 
 /** The five modes, in the order the tabs read. */
-const MODES = ["state", "map", "code", "workflows", "github"] as const;
+const MODES = ["state", "map", "code", "workflows", "authority"] as const;
 export type ProjectMode = (typeof MODES)[number];
 
 const MODE_LABEL: Record<ProjectMode, string> = {
@@ -48,15 +56,16 @@ const MODE_LABEL: Record<ProjectMode, string> = {
   map: "Map",
   code: "Code",
   workflows: "Workflows",
-  github: "GitHub",
+  authority: "Authority",
 };
 
 /**
- * The segments three of these modes used to be, still answered.
+ * The segments four of these modes used to be, still answered.
  *
  * `estado`, `mapa` and `codigo` were the design's words, and this route was the
- * one place in the app where a segment was not English. Renaming them is only
- * safe because of this map: a URL is not an identifier somebody can rename for
+ * one place in the app where a segment was not English; `github` was the
+ * Authority mode's name while its label promised only its first section.
+ * Renaming them is only safe because of this map: a URL is not an identifier somebody can rename for
  * you — it lives in a bookmark, a chat message, a browser's history, and none of
  * those are in the repository.
  *
@@ -75,10 +84,11 @@ const RENAMED: Record<string, ProjectMode> = {
   estado: "state",
   mapa: "map",
   codigo: "code",
+  github: "authority",
 };
 
 /**
- * A `$view` parameter as one of the five, or as one of the three it used to be.
+ * A `$view` parameter as one of the five, or as one of the four it used to be.
  *
  * Falls back to `state` rather than 404ing, which is the rule the inspector this
  * replaces already followed: a route parameter is a string, anybody can type
@@ -103,10 +113,10 @@ interface Holding {
  * **Two of the five are doors rather than places.** Code reads a *run's* worktree and Workflows
  * reads an installed bundle, and on most projects most of the time there is neither — so a strip
  * of equal tabs sends somebody through a click onto a page whose whole content explains why
- * it is empty, and after the third time they stop pressing either. State, Map and GitHub are never
- * in here: all three are true of a project the moment it exists, so a number beside them would be
- * measuring the project rather than saying whether the tab has anything in it. GitHub in
- * particular would be numbered *zero* on every project that has declared nothing, which is the
+ * it is empty, and after the third time they stop pressing either. State, Map and Authority are
+ * never in here: all three are true of a project the moment it exists, so a number beside them
+ * would be measuring the project rather than saying whether the tab has anything in it. Authority
+ * in particular would be numbered *zero* on every project that has declared nothing, which is the
  * project whose owner most needs to open it.
  *
  * **A number and not a mark, because a number is what was measured.** `0` here is a real answer —
@@ -116,7 +126,9 @@ interface Holding {
  * measured nought would take that distinction away at the top of every page in the workspace.
  *
  * **Nothing is hidden and nothing is disabled.** The tab keeps its route, its link and its press;
- * what changes is that it stops presenting itself as a peer while it holds nothing.
+ * what changes is that it stops presenting itself as a peer while it holds nothing — and only while
+ * it is NOT the page on screen. Dimming the current tab too took the "you are here" away from
+ * somebody who had just pressed it: an empty Code mode read as current and faded at once.
  *
  * **Unanswered is not zero.** A mode is numbered only once the query behind it has come back.
  * Numbering on `undefined` would put a nought on both tabs on every open and then take it off,
@@ -207,8 +219,8 @@ export function Workspace() {
         strip is the same object on screen as the tabs in the Bench. What it is NOT is
         Radix's `Tabs`, and that is deliberate: each mode is a URL, so a tab here has to
         be an `<a href>` that can be copied, opened in a second window, and — the case
-        `Workspace.test.tsx` pins — carry an old Portuguese segment's replacement in its
-        `href` so the address canonicalises itself on the first press. A `role="tab"`
+        `Workspace.test.tsx` pins — carry an old segment's replacement (Portuguese, or
+        `github`) in its `href` so the address canonicalises itself on the first press. A `role="tab"`
         button has none of that — Radix's `Trigger` would swap the link role and
         `aria-current` for `role="tab"` and `aria-selected`, and collapse five tab stops
         into one roving one. `pj-tabs` on the inspector is the same decision.
@@ -221,7 +233,9 @@ export function Workspace() {
       <nav aria-label="Project modes" className="ui-tab-list mb-6">
         {MODES.map((candidate) => {
           const holds = holding[candidate];
-          const quiet = holds !== undefined && holds.count === 0;
+          // Quiet is for a door somebody has not walked through. The tab they are standing in keeps
+          // full weight whatever it counts, or the strip's one "here" mark is the dimmest thing on it.
+          const quiet = holds !== undefined && holds.count === 0 && candidate !== mode;
           return (
             <Link
               key={candidate}
@@ -267,7 +281,7 @@ export function Workspace() {
         />
       ) : null}
       {mode === "workflows" ? <ModeWorkflows projectId={projectId} /> : null}
-      {mode === "github" ? <ModeGithub projectId={projectId} /> : null}
+      {mode === "authority" ? <ModeGithub projectId={projectId} /> : null}
     </>
   );
 }

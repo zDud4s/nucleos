@@ -173,13 +173,21 @@ describe("the app router", () => {
    * Asserted through the whole app rather than by mounting `Workspace`: the tab strip, the segment
    * and the page have to agree, and a component test cannot see the router that carries them.
    */
-  it("draws the GitHub mode at /projects/$projectId/github", async () => {
+  /*
+    The mode was "GitHub" until it was renamed "Authority": its subject is what the agent may do
+    without asking, and GitHub is one of five sections of that. The old segment is kept here on
+    purpose — `Workspace`'s `RENAMED` map is what lets a link somebody kept still land, and this is
+    the test that would go red if the map lost it.
+  */
+  it("draws the Authority mode at the old /projects/$projectId/github", async () => {
     const { router } = await renderApp({ initialPath: "/projects/nucleos/github" });
 
     expect(router.state.location.pathname).toBe("/projects/nucleos/github");
     // The mode's own sections, which no other mode has — and not the tab, which is on screen
     // whichever mode is open.
-    expect(await screen.findByRole("region", { name: "What runs on its own" })).toBeDefined();
+    expect(
+      await screen.findByRole("region", { name: "GitHub operations without asking" }),
+    ).toBeDefined();
     expect(screen.getByRole("region", { name: "What the worktrees may run" })).toBeDefined();
     // State is the fallback an unrecognised segment lands on, so its absence is what proves the
     // segment was recognised.
@@ -195,8 +203,8 @@ describe("the app router", () => {
     // Five and not four. Read by position rather than by name because two of the tabs carry a
     // count beside their label once the query behind them has answered.
     expect(links).toHaveLength(5);
-    expect(links[4].textContent).toContain("GitHub");
-    expect(links[4].getAttribute("href")).toBe("/projects/nucleos/github");
+    expect(links[4].textContent).toContain("Authority");
+    expect(links[4].getAttribute("href")).toBe("/projects/nucleos/authority");
   });
 
   it("opens on Home", async () => {

@@ -90,11 +90,12 @@ function panelsOf2(container: HTMLElement): string[] {
 }
 
 describe("normaliseMode", () => {
-  it("takes the four modes as themselves", () => {
+  it("takes the five modes as themselves", () => {
     expect(normaliseMode("state")).toBe("state");
     expect(normaliseMode("map")).toBe("map");
     expect(normaliseMode("code")).toBe("code");
     expect(normaliseMode("workflows")).toBe("workflows");
+    expect(normaliseMode("authority")).toBe("authority");
   });
 
   /**
@@ -111,6 +112,14 @@ describe("normaliseMode", () => {
     expect(normaliseMode("estado")).toBe("state");
     expect(normaliseMode("mapa")).toBe("map");
     expect(normaliseMode("codigo")).toBe("code");
+  });
+
+  /**
+   * `github` was the Authority mode's segment until 2026-09-23, and it is in the same window the
+   * Portuguese three are: a link somebody kept must land on the mode it always meant, not on State.
+   */
+  it("still answers the segment the Authority mode used to be", () => {
+    expect(normaliseMode("github")).toBe("authority");
   });
 
   /**
@@ -181,6 +190,35 @@ describe("the project workspace", () => {
    * time somebody clicks anything. Without the tabs emitting the new segment
    * this would be a permanent alias wearing a deprecation's clothes.
    */
+  it("answers a kept github link on Authority, and hands back the new segment", async () => {
+    await openWorkspace({ mode: "github" });
+
+    const authority = await screen.findByRole("link", { name: "Authority" });
+    expect(authority.getAttribute("aria-current")).toBe("page");
+    expect(authority.getAttribute("href")).toBe("/projects/nucleos/authority");
+    // The mode's own region, which State (the fallback) does not have.
+    expect(await screen.findByRole("region", { name: "Where the work lands" })).toBeDefined();
+  });
+
+  /**
+   * The tab you are standing in is never the dimmed one.
+   *
+   * Quiet says "nothing behind this door", which is advice about a tab somebody has not pressed. On
+   * the tab they HAVE pressed it took away the one mark that says where they are: an empty Code mode
+   * read as current and faded at once. The count still says nought; only the dimming is withheld.
+   */
+  it("does not dim the current tab when it holds nothing", async () => {
+    await openWorkspace({ mode: "code" });
+
+    const code = await screen.findByRole("link", { name: /^Code/ });
+    await waitFor(() => expect(code.textContent).toBe("Code0"));
+    expect(code.getAttribute("aria-current")).toBe("page");
+    expect(code.className).not.toContain("opacity");
+
+    // And the other empty door, not current, still recedes.
+    expect(screen.getByRole("link", { name: /^Workflows/ }).className).toContain("opacity");
+  });
+
   it("answers a kept Portuguese link, and hands back English tabs", async () => {
     await openWorkspace({ mode: "codigo" });
 
@@ -502,7 +540,9 @@ describe("the project workspace", () => {
   it("mounts the workflows mode on the library and the project's pins", async () => {
     await openWorkspace({ mode: "workflows" });
     expect(await screen.findByText(/No workflow is installed here/)).toBeTruthy();
-    expect(await screen.findByText("On this machine")).toBeTruthy();
+    // Nothing installed and an empty library: the mode offers the way to fill it rather than an
+    // empty "On this machine" section, which the Workflows mode no longer draws in that case.
+    expect(await screen.findByRole("button", { name: "Copy the library path" })).toBeTruthy();
   });
 
   /**
@@ -757,7 +797,9 @@ describe("the settings this app authors", () => {
       settingsState({ promotable: false, classes_ready: 2, classes_total: 5 }),
     );
     const active = await screen.findByRole("button", { name: "Let it act" });
-    expect(active.hasAttribute("disabled")).toBe(true);
+    // Focusable and refused rather than natively disabled: the house pattern, so the reason beside
+    // it is reachable by keyboard from the control it explains.
+    expect(active.getAttribute("aria-disabled")).toBe("true");
     expect(screen.getByText(/3 of 5 action classes are still short of the bar/)).toBeTruthy();
 
     locked.unmount();
@@ -770,9 +812,9 @@ describe("the settings this app authors", () => {
         withheld_classes_ready: 1,
       }),
     );
-    expect(
-      (await screen.findByRole("button", { name: "Let it act" })).hasAttribute("disabled"),
-    ).toBe(false);
+    const earned = await screen.findByRole("button", { name: "Let it act" });
+    expect(earned.getAttribute("aria-disabled")).not.toBe("true");
+    expect(earned.hasAttribute("disabled")).toBe(false);
   });
 
   it("an action class and its tally do not run together", async () => {
@@ -805,11 +847,14 @@ describe("the settings this app authors", () => {
     });
     await openState(state);
 
-    const chip = await screen.findByTitle(/decided, .* reviewed/);
-    const fraction = chip.querySelector("span") as HTMLElement;
-    expect(fraction.className).toContain("ml-2");
-    expect(fraction.className).not.toContain("ml-1");
-    expect(chip.getAttribute("title")).toContain("disagreed");
+    // A table now, so the class and its tally are separate cells by construction rather than by a
+    // margin somebody has to remember: the row header is the class and nothing else.
+    const id = await screen.findByRole("rowheader", { name: "read-local" });
+    expect(id.textContent).toBe("read-local");
+    const cells = Array.from((id.closest("tr") as HTMLElement).querySelectorAll("td")).map(
+      (cell) => cell.textContent,
+    );
+    expect(cells).toEqual(["46", "18", "6"]);
   });
 
   /**
