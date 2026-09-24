@@ -331,7 +331,6 @@ pub struct Brief {
     pub block: Option<String>,
     /// One entry per candidate, shown or not, with the five signals — this is what `brief` writes to
     /// `run_knowledge`, and the reason the trace can answer WHICH signal elected a row.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 3.1 persists this trace.
     pub trace: Vec<Scored>,
 }
 
@@ -814,6 +813,7 @@ const COLUMNS: &str = "id, layer, scope_kind, scope_id, source, generator, evide
 /// Appended to the brief and never replacing it, exactly as `notes::render` is — a node handed a
 /// standing instruction instead of its task does the standing instruction.
 /// It trusts [`select`] for admission and holds no second copy of the rule.
+#[cfg_attr(not(test), allow(dead_code))] // Tests only since Task 3.4; production goes through brief::of.
 pub fn render(known: &[Known], context: &Context) -> Option<String> {
     select(known, context, &Budget::default()).block
 }

@@ -88,7 +88,6 @@ async fn fts_ranks(pool: &SqlitePool, expression: &str) -> sqlx::Result<HashMap<
 }
 
 /// Fetch the context's candidates, add their query-local FTS signal, and select without writing.
-#[cfg_attr(not(test), allow(dead_code))] // Task 3.4 calls this from job::spawn_node.
 pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Result<Brief> {
     let scope = context.chain.last().unwrap_or(&Scope::Machine);
     let mut known = knowledge::for_scope(pool, scope).await?;
@@ -119,7 +118,6 @@ pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Resu
 ///
 /// The timestamp is RFC 3339 because `knowledge::recency` parses that format and treats anything
 /// else as never shown; the credit pass also copies this value into `last_shown_at`.
-#[cfg_attr(not(test), allow(dead_code))] // Task 3.4 calls this from job::spawn_node.
 pub async fn record(
     pool: &SqlitePool,
     run_id: i64,
@@ -404,7 +402,6 @@ async fn credit_item_by_id(pool: &SqlitePool, item_id: i64) -> sqlx::Result<u64>
 }
 
 /// Credit one job item once its item-level verdict is final.
-#[cfg_attr(not(test), allow(dead_code))] // Task 3.4 calls this from job.rs.
 pub(crate) async fn credit_item(pool: &SqlitePool, job_id: i64, ordinal: i64) -> sqlx::Result<u64> {
     let item_id: Option<i64> =
         sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
@@ -447,7 +444,6 @@ pub(crate) async fn credit_run(pool: &SqlitePool, run_id: i64) -> sqlx::Result<u
 ///
 /// This follows the `job_notes.delivered_at IS NULL` queue precedent: because both the verdict and
 /// trace are durable, a crash between the verdict and credit is repaired by the next sweep.
-#[cfg_attr(not(test), allow(dead_code))] // Task 3.4 calls this from job.rs.
 pub(crate) async fn sweep(pool: &SqlitePool) -> sqlx::Result<u64> {
     let item_ids: Vec<i64> = sqlx::query_scalar(
         "SELECT DISTINCT item_id

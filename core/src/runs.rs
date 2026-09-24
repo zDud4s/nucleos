@@ -1920,6 +1920,13 @@ fn spawn_run(
                         .await;
                     }
 
+                    // A handed-off run starts a chain that is still live, so sweep only after the
+                    // handoff has had the chance to link its successor. The verdict reader leaves
+                    // that chain for a later terminal pass.
+                    if terminal_write_won && let Err(error) = crate::brief::sweep(&pool).await {
+                        tracing::warn!(%error, run_id = id, "briefing credit not recorded");
+                    }
+
                     // Judged from the row the terminal write just put there, so it is gated on the
                     // same CAS: losing the race means the numbers in `runs` belong to whoever won,
                     // and reading them here would count another attempt's spending as this one's.
