@@ -2141,8 +2141,12 @@ async fn spawn_local_turn(
         // no `Turn` left to say so — so the run row would be written clean and the next turn in this
         // chat would start with a stranger's words in its history and an open latch.
         let taint = std::sync::atomic::AtomicBool::new(false);
-        let outcome =
-            tokio::time::timeout(run_timeout, assistant.answer(&history, &prompt, &taint)).await;
+        // This turn's tools speak for this row, so a declaration names the run that taught it.
+        let outcome = tokio::time::timeout(
+            run_timeout,
+            assistant.answer_as_run(id, &history, &prompt, &taint),
+        )
+        .await;
         let completed_at = chrono::Utc::now().to_rfc3339();
 
         // Marked before any status is written, whatever the ending. `hooks.rs` refuses the READ
@@ -3602,6 +3606,81 @@ mod tests {
         assert_eq!(
             answered_by(&state.pool, turn).await.as_deref(),
             Some("cloud")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_chat_turn_declares_as_its_own_run() {
+        struct DeclaresOnce;
+        #[async_trait::async_trait]
+        impl crate::local_agent::LocalChat for DeclaresOnce {
+            async fn exchange(
+                &self,
+                messages: Vec<serde_json::Value>,
+                _tools: Option<Vec<serde_json::Value>>,
+            ) -> std::io::Result<serde_json::Value> {
+                if messages.iter().any(|message| message["role"] == "tool") {
+                    return Ok(serde_json::json!({"role": "assistant", "content": "noted"}));
+                }
+                Ok(serde_json::json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {
+                        "name": "declare_refinement",
+                        "arguments": {
+                            "kind": "memory",
+                            "title": "the daemon holds nucleos-core.exe",
+                            "body": "stop it before building",
+                            "reasoning": "a later run will hit it"
+                        }
+                    }}]
+                }))
+            }
+        }
+
+        let mut state = test_state().await;
+        let door = axum::Router::new()
+            .route(
+                "/knowledge",
+                axum::routing::post(crate::http::post_knowledge),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, door).await.unwrap();
+        });
+        let toolbox = crate::mcp_tools::LocalToolBox::new(
+            format!("http://{address}"),
+            "t".into(),
+            state.pool.clone(),
+        );
+        state.assistants = Arc::new(FixedAssistants(Arc::new(
+            crate::local_agent::LocalAssistant::new(Box::new(DeclaresOnce), Box::new(toolbox)),
+        )));
+
+        let run_id = send_message(&state, "local-declares", "remember that", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, run_id).await;
+
+        type KnowledgeRow = (Option<i64>, String, Option<i64>, String, String);
+        let rows: Vec<KnowledgeRow> = sqlx::query_as(
+            "SELECT origin_run_id, scope_kind, scope_id, source, status FROM knowledge",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                Some(run_id),
+                "machine".into(),
+                None,
+                "run".into(),
+                "proposed".into()
+            )],
+            "the declaration must name the chat turn that made it"
         );
     }
 

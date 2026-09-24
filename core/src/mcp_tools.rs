@@ -2466,6 +2466,15 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             .collect()
     }
 
+    fn for_run(&self, run_id: i64) -> Option<Box<dyn crate::local_agent::ToolBox>> {
+        Some(Box::new(LocalToolBox {
+            tools: NucleosTools::for_box(self.tools.client.for_run(run_id), self.tools.errand),
+            pool: self.pool.clone(),
+            allowed: self.allowed,
+            errand: self.errand,
+        }))
+    }
+
     /// An unknown name resolves to `Acts` in `tool_effect`, so it is refused here — the fail-closed
     /// direction, and the same one the cloud path takes.
     fn permitted_after_untrusted(&self, name: &str) -> bool {

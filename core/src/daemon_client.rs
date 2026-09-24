@@ -108,6 +108,18 @@ impl DaemonClient {
         }
     }
 
+    /// The same client, speaking for one run from now on.
+    ///
+    /// The id comes from the daemon's own `runs` row, never from a model. See `RUN_ID_HEADER`.
+    pub fn for_run(&self, run_id: i64) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            token: self.token.clone(),
+            run_id: Some(run_id),
+            http: self.http.clone(),
+        }
+    }
+
     pub fn from_env() -> Result<Self, String> {
         // `NUCLEOS_DAEMON_URL` still wins: the daemon writes it into everything it launches, and
         // it is the only value that survives a client running somewhere the daemon's own
