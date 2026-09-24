@@ -190,20 +190,51 @@ export function useForgetWorkflow() {
 /**
  * The tone a standing is drawn in.
  *
- * Three tones for four standings, and the pairing is the argument. `drifted` and `missing` are both
- * amber because both are *the thing you pinned is not the thing you have* — something to look at,
- * not something broken. `ejected` is not amber: it is a deliberate choice somebody made, and
- * colouring a decision as a warning is how a page teaches people to ignore its colours.
+ * Three tones for four standings, and the pairing is the argument. `drifted` and `missing` share
+ * Awaiting You Amber because both are *the thing you pinned is not the thing you have*, and both
+ * wait on a decision only the owner can make — follow the library again or eject, fetch the bundle
+ * or stop using it. That is the one tone that asks something of you, which is exactly what they do.
+ * The comment here used to say "both are amber" over a function returning Held Ember, which is
+ * *stopped by a rule or a ceiling* — and nothing has stopped.
+ *
+ * `ejected` is Switched Off Grey: off on purpose, a deliberate choice, and colouring a decision as a
+ * warning is how a page teaches people to ignore its colours. It was Deliberating Violet, which is
+ * shadow mode — so on a project in shadow the same violet meant two unrelated things one line apart.
  */
 export function standingTone(standing: Standing): string {
   switch (standing) {
     case "referenced":
       return "active";
     case "ejected":
-      return "shadow";
+      return "off";
     default:
-      return "paused";
+      return "pending";
   }
+}
+
+/**
+ * Where the library lives, as a person types it. What the empty states point at.
+ *
+ * The daemon does not serve the absolute root, so a page with no bundle to read it off can say it
+ * but not open it — see `libraryRootOf`.
+ */
+export const LIBRARY_HINT = "~/.nucleos/workflows/";
+
+/**
+ * The library's folder on this machine, read off a bundle that lives in it.
+ *
+ * A bundle's `path` is `<root>/<name>/<version>`, absolute, so two segments up is the root the
+ * daemon walked. `null` when there is no bundle to read it from — an empty library has no answer
+ * here, and guessing the home directory from the webview would be a claim about a machine the
+ * daemon, not this page, is the authority on.
+ */
+export function libraryRootOf(bundles: Bundle[] | undefined): string | null {
+  const first = bundles?.[0];
+  if (first === undefined) return null;
+  const parts = first.path.split(/[\\/]/);
+  if (parts.length < 3) return null;
+  const separator = first.path.includes("\\") && !first.path.includes("/") ? "\\" : "/";
+  return parts.slice(0, -2).join(separator);
 }
 
 /**
@@ -218,9 +249,13 @@ export function standingTone(standing: Standing): string {
  *
  * `MODE_SENTENCES` next door exists for exactly this reason, and `Settings` states it: "two copies
  * of a sentence about restraint would eventually say two different things".
+ *
+ * Worded for the task and not for the design: it says what is true of the project and what a
+ * workflow would change, rather than arguing that the absence is "a real answer and not a gap" —
+ * which was the design document talking, and read as a shrug to somebody who came to install one.
  */
 export const NO_WORKFLOW_MEANS =
-  "This project develops however whoever is at the keyboard decides — which is a real answer and not a gap.";
+  "Nothing is broken: work here runs however whoever is at the keyboard runs it. A workflow writes the steps down — which model does what, and which check has to pass.";
 
 /**
  * What a standing means, in words, with the numbers that make it checkable.

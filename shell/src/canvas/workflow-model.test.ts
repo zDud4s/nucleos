@@ -2,7 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { graphNode } from "../test/harness";
 import type { GraphEdge } from "../data/workflow-graph";
-import { buildWorkflow, inSequence, layerOf, nodeMeaning, nodeTone, placed } from "./workflow-model";
+import { buildWorkflow, inSequence, layerOf, nodeMeaning, nodeShape, placed, SHAPES } from "./workflow-model";
 
 /**
  * The layout, without a canvas.
@@ -97,25 +97,25 @@ describe("inSequence", () => {
   });
 });
 
-describe("nodeTone", () => {
+describe("nodeShape", () => {
   /**
-   * §6.4's whole claim: the two questions anybody asks of a workflow are answered before a word is
-   * read. Violet spends tokens, amber has a verdict — so those two must never share a colour with
-   * anything, and the role must beat the kind.
+   * §6.4's two questions — where the money goes, where the pipeline stops — answered by shape, and
+   * no longer by colour: every hue this system has is a state, and a gate drawn permanently amber
+   * spent the one tone that means "this needs you" on something that never does. Five kinds, five
+   * shapes, and the role beats the kind.
    */
-  it("answers where the money goes and where the pipeline stops, without text", () => {
-    const agent = nodeTone("agent", "plain");
-    const command = nodeTone("command", "plain");
-    const gate = nodeTone("command", "gate");
-    const decision = nodeTone("decision", "plain");
-
-    expect(new Set([agent, command, gate, decision]).size).toBe(4);
-    // A gate is a role, so an agent could never be drawn as one — but the function has to say so
-    // rather than the caller remembering to.
-    expect(nodeTone("agent", "gate")).toBe(gate);
-    // A fan is told apart by its shape, not a fifth colour: its question is *how many at once*,
-    // which is neither of the two the colours answer.
-    expect(nodeTone("fan", "plain")).toBe(command);
+  it("gives every kind its own shape, and draws a gate as a gate whatever it runs", () => {
+    const shapes = [
+      nodeShape("agent", "plain"),
+      nodeShape("command", "plain"),
+      nodeShape("command", "gate"),
+      nodeShape("decision", "plain"),
+      nodeShape("fan", "plain"),
+    ];
+    expect(new Set(shapes).size).toBe(5);
+    expect(nodeShape("agent", "gate")).toBe("gate");
+    // The key lists every shape the canvas can draw, so none of them is a vocabulary without a key.
+    expect([...SHAPES].sort()).toEqual([...new Set(shapes)].sort());
   });
 
   it("says what each kind is in words, for the ones who read the label", () => {
@@ -145,6 +145,18 @@ describe("buildWorkflow", () => {
     const toRescue = model.edges.find((edge) => edge.target === "rescue");
     expect(toRescue?.data?.dimmed).toBe(true);
     expect(model.edges.find((edge) => edge.target === "land")?.data?.dimmed).toBe(false);
+  });
+
+  /**
+   * xyflow focuses its own wrapper and names it from the node object, so the name lives there — with
+   * the overlay and the run in it, because those are drawn and a screen reader must hear them too.
+   */
+  it("names each node where keyboard focus lands, with what the picture marks on it", () => {
+    const nodes = [graphNode({ id: "plan", label: "Plan", disabled: true, overridden: true })];
+    const [plan] = buildWorkflow(nodes, [], "plan").nodes;
+    expect(plan.ariaLabel).toBe(
+      "Plan, a model is asked to do this, off in this project, changed by this project, running",
+    );
   });
 
   /**

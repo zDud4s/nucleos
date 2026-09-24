@@ -238,6 +238,101 @@ describe("the workflows mode", () => {
   });
 
   /**
+   * The two clicks that throw something away are interlocks. "replace with the library's" discards
+   * an ejected copy's edits and "stop using it" takes this project's overrides with the pin; both
+   * fired on the first press.
+   */
+  it("asks twice before replacing an ejected copy", async () => {
+    const { state } = await openWorkflows({
+      workflows: [installedWorkflow({ standing: "ejected", ejected_at: "2026-02-01T00:00:00Z" })],
+    });
+    const replace = await screen.findByRole("button", { name: "replace with the library's" });
+    fireEvent.click(replace);
+    expect(state.workflowChanges).toEqual([]);
+    // The live region, not the label: both labels are always in the DOM, one of them hidden.
+    expect(await screen.findByText(/armed: replace — this copy's edits are lost/)).toBeTruthy();
+
+    // Past the 300ms dwell that stops a double-click from confirming its own arming.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    fireEvent.click(replace);
+    await waitFor(() => expect(state.workflowChanges.length).toBe(1));
+    expect(state.workflowChanges[0].verb).toBe("update");
+  });
+
+  it("asks twice before removing the pin, and says the overrides go with it", async () => {
+    const { state } = await openWorkflows({
+      workflows: [installedWorkflow({ overridden_nodes: 2 })],
+    });
+    const stop = await screen.findByRole("button", { name: "stop using it" });
+    fireEvent.click(stop);
+    expect(state.workflowChanges).toEqual([]);
+    expect(await screen.findByText(/armed: stop — 2 overrides go with the pin/)).toBeTruthy();
+
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    fireEvent.click(stop);
+    await waitFor(() => expect(state.workflowChanges).toEqual([{ verb: "forget", name: "harness" }]));
+  });
+
+  /**
+   * A failure that is not a refusal was dropped: with the núcleo gone, "use here" did nothing and
+   * said nothing. It is said now, in the error's own words.
+   */
+  it("says so when the núcleo does not answer a change", async () => {
+    const { ApiUnavailable } = await import("../data/client");
+    const state = daemonState({
+      projects: [project({ project_id: "nucleos", mode: "shadow" })],
+      library: [bundle({ version: "1.0" })],
+    });
+    const answer = daemonFetch(state);
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) =>
+      init?.method === "POST" && path.includes("/workflows")
+        ? Promise.reject(new ApiUnavailable("transport", "connection refused"))
+        : answer(path, init),
+    );
+    daemon.apiText.mockImplementation(daemonText(state));
+    daemon.probeHealth.mockResolvedValue(true);
+    await renderApp({ initialPath: "/projects/nucleos/workflows" });
+
+    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    expect(await screen.findByText(/nothing was installed: connection refused/)).toBeTruthy();
+  });
+
+  /** Escape closes the eject guard, and focus goes back to the button that opened it. */
+  it("closes the eject guard on Escape and returns focus to eject", async () => {
+    await openWorkflows({ library: [bundle()], workflows: [installedWorkflow()] });
+    fireEvent.click(await screen.findByRole("button", { name: "eject" }));
+    const guard = screen.getByRole("group", { name: "Eject or edit in the library" });
+    expect(document.activeElement).toBe(guard);
+
+    fireEvent.keyDown(guard, { key: "Escape" });
+    expect(screen.queryByRole("group", { name: "Eject or edit in the library" })).toBeNull();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "eject" })),
+    );
+  });
+
+  /**
+   * The empty state has a way out. With bundles on the machine, the folder they live in opens in
+   * the editor; with none, the path to create is there to copy — and one teach block says it,
+   * instead of two stacked empties.
+   */
+  it("offers the library folder from the empty state", async () => {
+    await openWorkflows({ library: [bundle({ path: "C:/Users/x/.nucleos/workflows/harness/1.0" })] });
+    fireEvent.click(await screen.findByRole("button", { name: "Open the library folder" }));
+    expect(opener.openUrl).toHaveBeenCalledWith("vscode://file/C:/Users/x/.nucleos/workflows");
+  });
+
+  it("says where bundles go when the library is empty, once", async () => {
+    await openWorkflows({ library: [] });
+    const copy = await screen.findByRole("button", { name: "Copy the library path" });
+    // The path is the visible label, and the control beside it is only an icon — a bare "Copy"
+    // said less to the eye than the accessible name said to a screen reader.
+    expect(screen.getByText("~/.nucleos/workflows/")).toBeTruthy();
+    expect(copy.textContent).toBe("");
+    expect(screen.queryByText("On this machine")).toBeNull();
+  });
+
+  /**
    * A pins file that does not parse is a file somebody has to fix, and the parser's words say which
    * line. An empty list here would say "this project uses no workflow", which is a claim the daemon
    * explicitly could not make.

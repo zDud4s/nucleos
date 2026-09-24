@@ -21,9 +21,6 @@ export interface ModeWorkflowsProps {
 }
 
 export function ModeWorkflows({ projectId }: ModeWorkflowsProps) {
-  return (
-    <div className="flex flex-col gap-8">
-      <Workflows projectId={projectId} />
-    </div>
-  );
+  // No wrapper: a flex column around one child spaced nothing, and `Workflows` owns its own rhythm.
+  return <Workflows projectId={projectId} />;
 }

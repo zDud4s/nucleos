@@ -91,28 +91,28 @@ export function inSequence(nodes: GraphNode[], edges: GraphEdge[]): GraphNode[] 
 }
 
 /**
- * The tone a node is drawn in, and the two questions it answers without any text being read.
+ * What a node is drawn as: one of five shapes, and never one of the seven tones.
  *
- * §6.4: *where does this spend money* and *where can this break something*. An **agent** is violet
- * because it spends tokens; a **command** is grey because it does not; a **gate** is amber because
- * it is where the pipeline stops. A **decision** is blue — it executes nothing and costs nothing,
- * and it is the one place the path forks.
+ * §6.4 asks the picture to answer *where does this spend money* and *where can this break
+ * something*. This used to answer both in colour — agents violet, gates amber, decisions blue — and
+ * every one of those hues is a STATE in this system: violet is shadow mode, amber is the only tone
+ * that asks something of you, blue is a stated fact. A graph where every gate is permanently amber
+ * teaches the eye to ignore the one colour that is meant to summon it, and a project in shadow mode
+ * had violet meaning three things on one page. DESIGN.md: chroma reports state and nothing else.
  *
- * A **fan** is grey like the command it usually contains, and is told apart by its shape rather
- * than its colour. That is deliberate: its question is *how many at once*, which is neither of the
- * two the colours answer, and a fifth colour would dilute the two that matter.
+ * So the kind is carried by shape, face and an icon, on the neutral ladder: an agent is rounded, a
+ * command is square and set in mono, a gate is a command with a heavier edge, a decision has a double
+ * edge, a fan is dashed with a stack behind it. The role beats the kind — a gate is a role, so the
+ * function says so rather than every caller remembering to.
  */
-export function nodeTone(kind: NodeKind, role: Role): string {
-  if (role === "gate") return "pending";
-  switch (kind) {
-    case "agent":
-      return "shadow";
-    case "decision":
-      return "info";
-    default:
-      return "off";
-  }
+export type NodeShape = "agent" | "command" | "gate" | "decision" | "fan";
+
+export function nodeShape(kind: NodeKind, role: Role): NodeShape {
+  return role === "gate" ? "gate" : kind;
 }
+
+/** The order the key lists shapes in: the sequence somebody usually meets them in. */
+export const SHAPES: readonly NodeShape[] = ["agent", "command", "gate", "decision", "fan"];
 
 /** What a node is, in words, for the label under it and for a screen reader. */
 export function nodeMeaning(kind: NodeKind, role: Role): string {
@@ -171,6 +171,18 @@ export function buildWorkflow(
       id: node.id,
       type: "workflowNode" as const,
       position: at[node.id] ?? { x: 0, y: 0 },
+      // On the node object and not on the card inside it: xyflow puts keyboard focus on its own
+      // wrapper (`role="group"`), and that wrapper reads `ariaLabel` from here. A name on the inner
+      // card was a name on something focus never lands on, so a screen reader tabbing through the
+      // graph heard "group" once per node and nothing else.
+      ariaLabel: [
+        `${node.label}, ${nodeMeaning(node.type, node.role)}`,
+        node.disabled ? "off in this project" : null,
+        node.overridden ? "changed by this project" : null,
+        running === node.id ? "running" : null,
+      ]
+        .filter((part) => part !== null)
+        .join(", "),
       data: { node, running: running === node.id },
     })),
     edges: edges.map((edge, index) => ({

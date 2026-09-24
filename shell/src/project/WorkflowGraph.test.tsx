@@ -2,7 +2,7 @@
 import { createElement } from "react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 
 /**
  * jsdom has no layout and no CSS transforms, and xyflow constructs a `DOMMatrixReadOnly` on mount.
@@ -206,6 +206,95 @@ describe("the workflow canvas", () => {
   });
 
   /**
+   * The keyboard path, which did not exist. Enter on a focused node goes through xyflow's internal
+   * selection and never through `onNodeClick`, so a canvas wired only to the click could be tabbed
+   * to and never opened — and every overlay control lives in the inspector it opens.
+   */
+  it("opens a node from the keyboard, moves focus into the inspector, and Escape brings it back", async () => {
+    openGraph();
+    const plan = await screen.findByLabelText(/Plan, a model is asked/);
+    plan.focus();
+    fireEvent.keyDown(plan, { key: "Enter" });
+
+    const heading = await screen.findByRole("heading", { name: "Plan" });
+    expect(document.activeElement).toBe(heading);
+    expect(screen.getByLabelText("model in this project")).toBeTruthy();
+
+    fireEvent.keyDown(heading, { key: "Escape" });
+    expect(screen.queryByLabelText("model in this project")).toBeNull();
+    expect(document.activeElement).toBe(plan);
+  });
+
+  /** Escape on a node that is not open must not open it — which is what xyflow's own handler does. */
+  it("does not open a node on Escape", async () => {
+    openGraph();
+    const plan = await screen.findByLabelText(/Plan, a model is asked/);
+    fireEvent.keyDown(plan, { key: "Escape" });
+    expect(screen.queryByLabelText("model in this project")).toBeNull();
+  });
+
+  /** A save on blur says it saved, so nobody has to reopen the node to find out whether it took. */
+  it("says when a model change has been saved", async () => {
+    openGraph();
+    fireEvent.click(await screen.findByLabelText(/Plan, a model is asked/));
+    const field = await screen.findByLabelText("model in this project");
+    fireEvent.change(field, { target: { value: "haiku" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+    expect(await screen.findByText(/Saved to/)).toBeTruthy();
+  });
+
+  /**
+   * A núcleo that went away between the blur and the answer is a failure, not a refusal, and it was
+   * dropped: the field kept a value that was never saved and nothing said so.
+   */
+  it("says so when a change could not be saved because the núcleo did not answer", async () => {
+    const { ApiUnavailable } = await import("../data/client");
+    const state = daemonState({ graph: graph() });
+    const answer = daemonFetch(state);
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) =>
+      init?.method === "POST"
+        ? Promise.reject(new ApiUnavailable("transport", "connection refused"))
+        : answer(path, init),
+    );
+    daemon.apiText.mockImplementation(daemonText(state));
+    renderWithQuery(
+      <WorkflowGraph projectId="nucleos" name="harness" originPath="C:/lib/harness/1.0" ejected={false} />,
+    );
+
+    fireEvent.click(await screen.findByLabelText(/Plan, a model is asked/));
+    const field = await screen.findByLabelText("model in this project");
+    fireEvent.change(field, { target: { value: "haiku" } });
+    fireEvent.blur(field);
+    expect(await screen.findByText(/may not have been saved: connection refused/)).toBeTruthy();
+  });
+
+  /** The instructions guard closes on Escape and hands focus back to the button that opened it. */
+  it("closes the instructions guard on Escape and returns focus to its button", async () => {
+    openGraph();
+    fireEvent.click(await screen.findByLabelText(/Plan, a model is asked/));
+    fireEvent.click(await screen.findByRole("button", { name: "edit the instructions" }));
+    const guard = screen.getByRole("group", { name: "Edit this node's instructions" });
+    expect(document.activeElement).toBe(guard);
+
+    fireEvent.keyDown(guard, { key: "Escape" });
+    expect(screen.queryByRole("group", { name: "Edit this node's instructions" })).toBeNull();
+    // One press closed one thing: the inspector is still open on the node.
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "edit the instructions" })),
+    );
+  });
+
+  /** The key names what this graph draws, and only that. */
+  it("draws a key for the shapes and marks the graph uses", async () => {
+    openGraph({ graph: graph({ edges: [{ from: "plan", to: "gate", verdict: "fail" }] }) });
+    const key = within(await screen.findByRole("list", { name: "Key" }));
+    expect(key.getByText("agent")).toBeTruthy();
+    expect(key.getByText("gate")).toBeTruthy();
+    expect(key.queryByText("fan")).toBeNull();
+    expect(key.getByText("dashed line: the fail path")).toBeTruthy();
+  });
+
+  /**
    * §6.3, and only for the edit it is actually about: changing what a node SAYS is changing the
    * bundle. Three exits, inline, and the middle one is the point — most of the time what somebody
    * wants is to improve the workflow rather than diverge from it.
@@ -240,7 +329,10 @@ describe("the workflow canvas", () => {
    */
   it("says which overrides apply to nothing", async () => {
     openGraph({ graph: graph({ orphaned: ["council"] }) });
-    expect(await screen.findByText(/overrides council, which 1.0 does not have/)).toBeTruthy();
+    expect(await screen.findByText(/Those overrides apply to\s+nothing/)).toBeTruthy();
+    // The ids are the núcleo's names, listed one by one rather than run together in a sentence.
+    const list = screen.getByRole("list", { name: "Overrides that apply to nothing" });
+    expect(within(list).getByText("council")).toBeTruthy();
   });
 
   /** A bundle with no graph is a halfway state, and a graph that will not parse is a fault. */
