@@ -1,4 +1,3 @@
-import type { ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import {
   compactTokens,
@@ -10,7 +9,7 @@ import {
 } from "../data/project-readings";
 import { useBudget, useKillSwitch, useProjects } from "../data/system";
 import { driftingWorkflows, useProjectWorkflows } from "../data/workflows";
-import { Section } from "../ui";
+import { ErrorNote, Section, StaleNote, StatCard } from "../ui";
 import { Branches } from "./Branches";
 import { Commands } from "./Commands";
 import { DeleteFolder } from "./DeleteFolder";
@@ -81,7 +80,12 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
 
   return (
     <div className="flex flex-col gap-8">
-      <Leading concern={leading} project={projectId} budgetReason={budget.data?.reason ?? null} />
+      <Leading
+        concern={leading}
+        project={projectId}
+        budgetReason={budget.data?.reason ?? null}
+        staleSince={projects.isError && projects.data !== undefined ? projects.dataUpdatedAt : null}
+      />
 
       <Section label="Readings">
         <Readings projectId={projectId} />
@@ -160,12 +164,22 @@ function Leading({
   concern,
   project,
   budgetReason,
+  staleSince,
 }: {
   concern: LeadingConcern;
   project: string;
   budgetReason: string | null;
+  /**
+   * When the roster last answered, if its latest poll failed.
+   *
+   * The top of the page is drawn from the roster, and "Nothing waiting on you" from a roster that
+   * stopped answering five minutes ago is a claim about now made from a reading of then. The
+   * sentence stays — blanking it would be the louder lie — and the note under it says how old it is.
+   */
+  staleSince: number | null;
 }) {
   const tone = toneFor(concern.kind);
+  const stale = staleSince === null ? null : <StaleNote dataUpdatedAt={staleSince} />;
 
   return (
     <section aria-label="Leading" aria-live="polite" className="min-h-16">
@@ -178,9 +192,12 @@ function Leading({
           calm line that turned a month's average into a claim about right now would be reassuring
           about something it did not check.
         */
-        <p className="font-display text-lg leading-snug text-text-muted">
-          Nothing waiting on you in {project}.
-        </p>
+        <>
+          <p className="font-display text-lg leading-snug text-text-muted">
+            Nothing waiting on you in {project}.
+          </p>
+          {stale}
+        </>
       ) : (
         <div
           role="status"
@@ -209,6 +226,7 @@ function Leading({
           {concern.kind === "budget-paused" && budgetReason !== null ? (
             <p className="mt-2 text-sm text-text-muted">{budgetReason}</p>
           ) : null}
+          {stale}
         </div>
       )}
     </section>
@@ -216,44 +234,54 @@ function Leading({
 }
 
 /**
- * Four readings, at two sizes.
+ * Four readings, in one row, gate first.
  *
- * One principal and three supporting, never four identical cards: equal cards are a grid you scan
- * and forget, and the point of this row is that one number is the one worth knowing.
+ * This used to be one principal and three supporting, and the principal was token efficiency — a
+ * full-width 128k at the top of the page, when the question the page answers first is *is
+ * everything all right?* and a median token count has no verdict in it. The one reading here that
+ * does is the gate, so it leads the row, and when it has failures its clause is the page's one red
+ * line in this section. The other three are context, and they sit beside it at the same size: a
+ * token median does not deserve three times the room of a failing gate.
  *
  * Every one of them can be absent, and absent is drawn as an em dash with a reason under it. A
  * project too new to have a month behind it is the ordinary case, not the edge one.
+ *
+ * **Refused, stale and absent are three different things here**, and principle 4 is that they never
+ * render as one. A read that failed says so once, for the row, rather than four em dashes that
+ * would claim four measurements came back empty; a read that failed after a good one keeps the
+ * numbers and dates them; and a row that answered says when, because it is read once when the mode
+ * opens and not polled, so "now" is exactly what it cannot claim.
  */
 function Readings({ projectId }: { projectId: string }) {
   const readings = useProjectReadings(projectId);
   const data = readings.data;
 
+  if (readings.isError && data === undefined) {
+    return <ErrorNote>The núcleo did not answer for this project&rsquo;s readings.</ErrorNote>;
+  }
+
   return (
-    <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-      <EfficiencyReading data={data} />
-      <CostReading data={data} />
-      <GateReading data={data} />
-      <DeliveredReading data={data} />
+    <div className="flex flex-col gap-2">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <GateReading data={data} />
+        <DeliveredReading data={data} />
+        <CostReading data={data} />
+        <EfficiencyReading data={data} />
+      </div>
+      {data === undefined ? null : readings.isError ? (
+        <StaleNote dataUpdatedAt={readings.dataUpdatedAt} />
+      ) : (
+        <p className="text-xs text-text-faint">
+          Last {data.window_days} days, read at {clockOf(readings.dataUpdatedAt)}.
+        </p>
+      )}
     </div>
   );
 }
 
-/** The frame every reading shares, so that four of them cannot drift into four layouts. */
-function Card({
-  label,
-  span = false,
-  children,
-}: {
-  label: string;
-  span?: boolean;
-  children: ReactNode;
-}) {
-  return (
-    <div className={`rounded-lg border border-border bg-surface p-4 ${span ? "md:col-span-3" : ""}`}>
-      <p className="text-xs uppercase tracking-wide text-text-faint">{label}</p>
-      {children}
-    </div>
-  );
+/** Local wall-clock, 24-hour — the same reading `StaleNote` gives, so the two lines agree. */
+function clockOf(at: number): string {
+  return new Date(at).toTimeString().slice(0, 5);
 }
 
 /**
@@ -261,14 +289,10 @@ function Card({
  *
  * A reading nobody took and a reading that came back zero are opposite facts, and the whole point
  * of the never-collapse contract is that the second must not be able to impersonate the first.
+ * `StatCard` draws the dash for an `undefined` value, so this is only the card with its reason.
  */
-function Absent({ why, big = false }: { why: string; big?: boolean }) {
-  return (
-    <>
-      <p className={`mt-1 font-display ${big ? "text-3xl" : "text-xl"} text-text-faint`}>—</p>
-      <p className="mt-1 text-xs text-text-faint">{why}</p>
-    </>
-  );
+function Absent({ label, why }: { label: string; why: string }) {
+  return <StatCard label={label} value={undefined} detail={why} />;
 }
 
 const TREND_TEXT = {
@@ -279,72 +303,55 @@ const TREND_TEXT = {
 } as const;
 
 function EfficiencyReading({ data }: { data: ProjectReadings | undefined }) {
-  if (data === undefined) {
-    return (
-      <Card label="Token efficiency" span>
-        <Absent why="reading…" big />
-      </Card>
-    );
-  }
+  const label = "Token efficiency";
+  if (data === undefined) return <Absent label={label} why="reading…" />;
 
   const { efficiency } = data;
   if (efficiency.median_total_tokens === null) {
     return (
-      <Card label="Token efficiency" span>
-        <Absent
-          big
-          why={
-            efficiency.unmeasured_runs > 0
-              ? `${efficiency.unmeasured_runs} runs in the last ${data.window_days} days, none reporting usage`
-              : `nothing finished in the last ${data.window_days} days`
-          }
-        />
-      </Card>
+      <Absent
+        label={label}
+        why={
+          efficiency.unmeasured_runs > 0
+            ? `${efficiency.unmeasured_runs} runs in the last ${data.window_days} days, none reporting usage`
+            : `nothing finished in the last ${data.window_days} days`
+        }
+      />
     );
   }
 
   const trend = efficiencyTrend(efficiency);
   return (
-    <Card label="Token efficiency" span>
-      <p className="mt-1 font-display text-3xl font-bold tabular-nums text-text">
-        {compactTokens(efficiency.median_total_tokens)}
-      </p>
-      <p className="text-xs text-text-faint">median per session</p>
-      <p className="mt-1 text-xs text-text-muted">
-        {efficiency.measured_runs} measured
-        {/*
-          Said out loud whenever there are any. Silence about the runs that reported nothing would
-          let the median look as though it covered everything.
-        */}
-        {efficiency.unmeasured_runs > 0 ? `, ${efficiency.unmeasured_runs} reporting no usage` : ""}
-        {trend === "unknown" ? "" : ` · ${TREND_TEXT[trend]}`}
-      </p>
-    </Card>
+    <StatCard
+      label={label}
+      value={compactTokens(efficiency.median_total_tokens)}
+      detail="median per session"
+      bar={
+        <p className="ui-stat-detail">
+          {efficiency.measured_runs} measured
+          {/*
+            Said out loud whenever there are any. Silence about the runs that reported nothing would
+            let the median look as though it covered everything.
+          */}
+          {efficiency.unmeasured_runs > 0 ? `, ${efficiency.unmeasured_runs} reporting no usage` : ""}
+          {trend === "unknown" ? "" : ` · ${TREND_TEXT[trend]}`}
+        </p>
+      }
+    />
   );
 }
 
 function CostReading({ data }: { data: ProjectReadings | undefined }) {
-  if (data === undefined) {
-    return (
-      <Card label="Cost">
-        <Absent why="reading…" />
-      </Card>
-    );
-  }
+  if (data === undefined) return <Absent label="Cost" why="reading…" />;
   if (data.cost.runs === 0) {
-    return (
-      <Card label="Cost">
-        <Absent why={`nothing started in the last ${data.window_days} days`} />
-      </Card>
-    );
+    return <Absent label="Cost" why={`nothing started in the last ${data.window_days} days`} />;
   }
   return (
-    <Card label="Cost">
-      <p className="mt-1 font-display text-xl font-bold tabular-nums text-text">${data.cost.usd.toFixed(2)}</p>
-      <p className="mt-1 text-xs text-text-muted">
-        over {data.cost.runs} {data.cost.runs === 1 ? "run" : "runs"}, {data.window_days} days
-      </p>
-    </Card>
+    <StatCard
+      label="Cost"
+      value={`$${data.cost.usd.toFixed(2)}`}
+      detail={`over ${data.cost.runs} ${data.cost.runs === 1 ? "run" : "runs"}, ${data.window_days} days`}
+    />
   );
 }
 
@@ -357,79 +364,85 @@ function CostReading({ data }: { data: ProjectReadings | undefined }) {
  * silent cushion.
  */
 function GateReading({ data }: { data: ProjectReadings | undefined }) {
-  if (data === undefined) {
-    return (
-      <Card label="Gate">
-        <Absent why="reading…" />
-      </Card>
-    );
-  }
+  if (data === undefined) return <Absent label="Gate" why="reading…" />;
 
   const share = gateShare(data.gate);
   if (share.judged === 0) {
     return (
-      <Card label="Gate">
-        <Absent
-          why={
-            data.gate.no_gate > 0
-              ? `${data.gate.no_gate} runs, no gate command configured`
-              : `nothing judged in the last ${data.window_days} days`
-          }
-        />
-      </Card>
+      <Absent
+        label="Gate"
+        why={
+          data.gate.no_gate > 0
+            ? `${data.gate.no_gate} runs, no gate command configured`
+            : `nothing judged in the last ${data.window_days} days`
+        }
+      />
     );
   }
 
+  const { passed, failed, errored, no_gate } = data.gate;
   return (
-    <Card label="Gate">
-      <p className="mt-1 font-display text-xl font-bold tabular-nums text-text">
-        {Math.round(share.passed * 100)}%
-      </p>
-      <p className="text-xs text-text-faint">of {share.judged} judged</p>
-      <div className="mt-2 flex h-1.5 overflow-hidden rounded-pill bg-surface-sunken">
-        <span style={{ width: `${share.passed * 100}%` }} className="bg-tone-active-fg" />
-        <span style={{ width: `${share.failed * 100}%` }} className="bg-tone-danger-fg" />
-        {/*
-          A third colour, not a second. A gate that could not run is not a gate that said no, and
-          the two sharing a red would tell somebody their tests broke when the measurement did.
-        */}
-        <span style={{ width: `${share.errored * 100}%` }} className="bg-tone-paused-fg" />
-      </div>
-      <p className="mt-1 text-xs text-text-muted">
-        {data.gate.failed > 0 ? `${data.gate.failed} failed` : "none failed"}
-        {data.gate.errored > 0 ? ` · ${data.gate.errored} could not run` : ""}
-        {data.gate.no_gate > 0 ? ` · ${data.gate.no_gate} ungated` : ""}
-      </p>
-    </Card>
+    <StatCard
+      label="Gate"
+      value={`${Math.round(share.passed * 100)}%`}
+      detail={`of ${share.judged} judged`}
+      bar={
+        <>
+          {/*
+            A gauge, and so an image with words: the three widths are the whole of what it says,
+            and a screen reader given three unlabelled spans is given nothing.
+          */}
+          <div
+            role="img"
+            aria-label={`${passed} passed, ${failed} failed, ${errored} could not run, of ${share.judged} judged`}
+            className="mt-1 flex h-1.5 overflow-hidden rounded-pill bg-surface-sunken shadow-[inset_0_0_0_1px_var(--border)]"
+          >
+            <span style={{ width: `${share.passed * 100}%` }} className="bg-tone-active-fg" />
+            <span style={{ width: `${share.failed * 100}%` }} className="bg-tone-danger-fg" />
+            {/*
+              A third colour, not a second. A gate that could not run is not a gate that said no, and
+              the two sharing a red would tell somebody their tests broke when the measurement did.
+            */}
+            <span style={{ width: `${share.errored * 100}%` }} className="bg-tone-paused-fg" />
+          </div>
+          {/*
+            The verdict, in words, and red when something failed — the one wrong fact in this row,
+            carried by the clause and not by the figure (see `StatCard`: one device per wrong fact).
+
+            `ui-wrong` on a span inside, not on the paragraph: `.ui-stat-detail` comes later in
+            `ui.css` at the same specificity, so on one element its grey won and the failure
+            rendered as quietly as "none failed".
+          */}
+          <p className="ui-stat-detail">
+            <span className={failed > 0 ? "ui-wrong" : undefined}>
+              {failed > 0 ? `${failed} failed` : "none failed"}
+              {errored > 0 ? ` · ${errored} could not run` : ""}
+              {no_gate > 0 ? ` · ${no_gate} ungated` : ""}
+            </span>
+          </p>
+        </>
+      }
+    />
   );
 }
 
 function DeliveredReading({ data }: { data: ProjectReadings | undefined }) {
-  if (data === undefined) {
-    return (
-      <Card label="Delivered">
-        <Absent why="reading…" />
-      </Card>
-    );
-  }
+  if (data === undefined) return <Absent label="Delivered" why="reading…" />;
   if (data.delivered.landed === 0) {
-    return (
-      <Card label="Delivered">
-        <Absent why={`nothing landed in the last ${data.window_days} days`} />
-      </Card>
-    );
+    return <Absent label="Delivered" why={`nothing landed in the last ${data.window_days} days`} />;
   }
   return (
-    <Card label="Delivered">
-      <p className="mt-1 font-display text-xl font-bold tabular-nums text-text">
-        {data.delivered.landed}
-      </p>
-      <p className="text-xs text-text-faint">landed</p>
-      <p className="mt-1 text-xs text-text-muted">
-        {data.delivered.median_minutes === null
-          ? "none of them had a run to time from"
-          : `${humanMinutes(data.delivered.median_minutes)} median, over ${data.delivered.timed} of ${data.delivered.landed}`}
-      </p>
-    </Card>
+    <StatCard
+      label="Delivered"
+      value={data.delivered.landed}
+      detail="landed"
+      bar={
+        <p className="ui-stat-detail">
+          {data.delivered.median_minutes === null
+            ? "none of them had a run to time from"
+            : `${humanMinutes(data.delivered.median_minutes)} median, over ${data.delivered.timed} of ${data.delivered.landed}`}
+        </p>
+      }
+    />
   );
 }

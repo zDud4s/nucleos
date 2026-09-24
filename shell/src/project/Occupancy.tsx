@@ -1,6 +1,6 @@
 import { Link } from "@tanstack/react-router";
 import { useConcurrency } from "../data/fleet";
-import { Quiet } from "../ui";
+import { ErrorNote, Quiet, StaleNote } from "../ui";
 
 /**
  * How full this project is, as slots rather than as a number.
@@ -28,9 +28,24 @@ export function Occupancy({ projectId }: OccupancyProps) {
   const answered = concurrency.data !== undefined;
   const here = concurrency.data?.projects.find((row) => row.project_id === projectId);
 
+  /*
+    Refused and still reading are two different facts. Before this, a read that failed kept saying
+    "Reading capacity…" for ever — a promise of an answer that was not coming.
+  */
   if (!answered) {
-    return <p className="text-sm text-text-faint">Reading capacity…</p>;
+    return concurrency.isError ? (
+      <ErrorNote>The núcleo did not say which worktree slots are in use.</ErrorNote>
+    ) : (
+      <p className="text-sm text-text-faint">Reading capacity…</p>
+    );
   }
+
+  /*
+    A poll that failed after one that worked keeps the last good boxes on screen and says how old
+    they are. This panel polls fast, so a slot drawn as taken can be free by now — the note is what
+    stops the picture passing for the present.
+  */
+  const stale = concurrency.isError ? <StaleNote dataUpdatedAt={concurrency.dataUpdatedAt} /> : null;
 
   /**
    * A project with no row in the readout holds nothing — but that is only true
@@ -66,7 +81,7 @@ export function Occupancy({ projectId }: OccupancyProps) {
       zero is worth reading once and is not worth a line of every visit, so it moves behind the
       question rather than being deleted.
     */
-    if (slots.length === 0) {
+    if (slots.length === 0 && stale === null) {
       return (
         <Quiet says="no ceiling · nothing in flight">
           A ceiling is this app&rsquo;s main brake, and nothing here bounds how many worktrees may
@@ -80,17 +95,21 @@ export function Occupancy({ projectId }: OccupancyProps) {
     return (
       <div className="flex flex-col gap-2">
         <p className="text-sm text-text-muted">
-          No ceiling set — {slots.length} {slots.length === 1 ? "worktree" : "worktrees"} in use.
+          No worktree ceiling set — {slots.length} {slots.length === 1 ? "worktree" : "worktrees"}{" "}
+          in use.
         </p>
-        <div className="flex flex-wrap gap-2">
-          {slots.map((slot) => (
-            <Slot
-              key={`${slot.owner_kind}-${slot.owner_id}`}
-              taken={slot}
-              projectId={projectId}
-            />
-          ))}
-        </div>
+        {slots.length === 0 ? null : (
+          <ul aria-label="Worktree slots" className="m-0 flex list-none flex-wrap gap-2 p-0">
+            {slots.map((slot) => (
+              <Slot
+                key={`${slot.owner_kind}-${slot.owner_id}`}
+                taken={slot}
+                projectId={projectId}
+              />
+            ))}
+          </ul>
+        )}
+        {stale}
       </div>
     );
   }
@@ -99,7 +118,16 @@ export function Occupancy({ projectId }: OccupancyProps) {
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex flex-wrap gap-2">
+      {/*
+        The count in words, above the boxes. The boxes say "full" before anything is read; this
+        says WHICH ceiling they are. The Settings block further down has a ceiling too — on
+        proposals waiting on a person, not on worktrees — and two unlabelled fours on one page
+        were two numbers a reader had to guess apart.
+      */}
+      <p className="text-xs text-text-muted">
+        {Math.min(slots.length, limit)} of {limit} worktree {limit === 1 ? "slot" : "slots"} in use
+      </p>
+      <ul aria-label="Worktree slots" className="m-0 flex list-none flex-wrap gap-2 p-0">
         {Array.from({ length: boxes }, (_, index) => {
           const taken = slots[index];
           return taken === undefined ? (
@@ -112,7 +140,7 @@ export function Occupancy({ projectId }: OccupancyProps) {
             />
           );
         })}
-      </div>
+      </ul>
       {/*
         Over the ceiling is a real state, not an impossible one: the limit can be
         lowered under work already running. Saying it plainly beats drawing a
@@ -124,18 +152,21 @@ export function Occupancy({ projectId }: OccupancyProps) {
           already running.
         </p>
       ) : null}
+      {stale}
     </div>
   );
 }
 
+/*
+  List items, and no `aria-label` on any of them. A label on a generic `div` is ignored by several
+  screen readers, so "Free slot" was often not said at all; the visible word is the name, and the
+  list around the boxes is what says how many there are.
+*/
 function Free() {
   return (
-    <div
-      className="grid h-16 w-40 place-items-center rounded-md border border-dashed border-border text-xs text-text-faint"
-      aria-label="Free slot"
-    >
+    <li className="grid h-16 w-40 place-items-center rounded-md border border-dashed border-border text-xs text-text-faint">
       free
-    </div>
+    </li>
   );
 }
 
@@ -166,23 +197,22 @@ function Slot({
 
   if (taken.owner_kind !== "run") {
     return (
-      <div
-        className="flex h-16 w-40 flex-col justify-between rounded-md border border-border bg-surface p-2"
-        aria-label={`${taken.owner_kind} ${taken.owner_id}`}
-      >
+      <li className="flex h-16 w-40 flex-col justify-between rounded-md border border-border bg-surface p-2">
         {body}
-      </div>
+      </li>
     );
   }
 
   return (
-    <Link
-      to={`/projects/${projectId}/code`}
-      search={{ run: taken.owner_id }}
-      className="flex h-16 w-40 flex-col justify-between rounded-md border border-border bg-surface p-2 hover:border-border-strong"
-      aria-label={`Review run ${taken.owner_id}`}
-    >
-      {body}
-    </Link>
+    <li className="flex">
+      <Link
+        to={`/projects/${projectId}/code`}
+        search={{ run: taken.owner_id }}
+        className="flex h-16 w-40 flex-col justify-between rounded-md border border-border bg-surface p-2 hover:border-border-strong"
+        aria-label={`Review run ${taken.owner_id}`}
+      >
+        {body}
+      </Link>
+    </li>
   );
 }

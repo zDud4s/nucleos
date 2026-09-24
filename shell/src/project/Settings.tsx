@@ -16,7 +16,7 @@ import {
   promotionConfirmLabel,
   promotionConsequence,
 } from "../lib/mode";
-import { ErrorNote, Inset, ModeSwitch, Quiet } from "../ui";
+import { ErrorNote, Inset, ModeSwitch, Quiet, StaleNote } from "../ui";
 
 /**
  * The settings this app is the author of — the ones that live in the database.
@@ -47,18 +47,53 @@ export function Settings({ projectId }: SettingsProps) {
   const project = projects.data?.find((row) => row.project_id === projectId);
 
   if (project === undefined) {
-    return <p className="text-sm text-text-faint">Reading settings…</p>;
+    // A roster that refused is not a roster still being read, and must not keep saying it is.
+    return projects.isError && projects.data === undefined ? (
+      <ErrorNote>The núcleo did not answer, so this project&rsquo;s settings are unknown.</ErrorNote>
+    ) : (
+      <p className="text-sm text-text-faint">Reading settings…</p>
+    );
   }
 
+  /*
+    The roster polls, and a poll that failed after a good one leaves these controls drawn from the
+    last answer. The mode switch still sends an absolute value, so it stays; the ceiling's stepper
+    sends the number on screen plus or minus one, and that number may be old — so it goes, and the
+    note says why, which is the app's rule for an action that would act on stale data.
+  */
+  const stale = projects.isError;
+
+  /*
+    Two blocks side by side and the evidence under both, `items-start` so neither box is stretched
+    to the other's height. The Mode block used to fill the height of a column holding two others,
+    and stood 40% empty — the most important control on the page, drawn as the emptiest box.
+  */
   return (
-    <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-      <ModeChoice project={project} />
-      <div className="flex flex-col gap-3">
-        <Ceiling project={project} />
-        <Classes projectId={projectId} project={project} />
+    <div className="flex flex-col gap-3">
+      {stale ? <StaleNote dataUpdatedAt={projects.dataUpdatedAt} /> : null}
+      <div className="grid grid-cols-1 items-start gap-3 lg:grid-cols-2">
+        <ModeChoice project={project} />
+        <Ceiling project={project} stale={stale} />
+        <div className="lg:col-span-2">
+          <Classes projectId={projectId} project={project} />
+        </div>
       </div>
     </div>
   );
+}
+
+/**
+ * A daemon sentence, as a sentence.
+ *
+ * `lib/mode.ts` writes its strings lower-case and unpunctuated because the Autopilot page splices
+ * them into lines of its own. Here each one stands alone as a paragraph, and a paragraph that
+ * starts in lower case and stops without a full stop reads as a fragment somebody cut off.
+ */
+function sentence(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed === "") return trimmed;
+  const capital = trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+  return /[.!?…]$/.test(capital) ? capital : `${capital}.`;
 }
 
 /**
@@ -72,14 +107,23 @@ export function Settings({ projectId }: SettingsProps) {
  */
 function Block({
   label,
+  id,
   children,
 }: {
   label: string;
+  /** For a control inside that wants the heading as its name. */
+  id?: string;
   children: React.ReactNode;
 }) {
+  /*
+    An `h3`, under the section's `h2`. These were paragraphs, so the one control on the page that
+    decides whether a project acts on its own could not be reached by walking the headings.
+  */
   return (
     <Inset>
-      <p className="text-xs uppercase tracking-wide text-text-faint">{label}</p>
+      <h3 id={id} className="text-xs font-normal uppercase tracking-wide text-text-faint">
+        {label}
+      </h3>
       {children}
     </Inset>
   );
@@ -113,6 +157,14 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
   const [armed, setArmed] = useState(false);
   /** The id the armed switch points at, so the sentence is read as the button's description. */
   const consequenceId = useId();
+  /**
+   * The id of the blocker sentence, for a "Let it act" that is locked.
+   *
+   * The switch keeps a locked segment focusable here (`focusableWhenInert`), and a control you
+   * can land on but not press owes the reason it cannot be pressed. That reason is the blocker
+   * paragraph below; the consequence sentence is for an offer that can be taken.
+   */
+  const blockerId = useId();
 
   function change(mode: AutopilotMode) {
     setMode.mutate({
@@ -127,14 +179,20 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
 
   return (
     <Block label="Mode">
+      {/*
+        `focusableWhenInert`: pressing a segment makes it the setting, which makes it inert — and
+        a native `disabled` would drop the focus that pressed it to `<body>`. The same holds while
+        the write is in flight, when all three are inert at once.
+      */}
       <ModeSwitch
         value={project.mode}
         actAllowed={project.promotable}
         actArmedLabel={promotionConfirmLabel(project)}
         actConsequence={promotionConsequence(project)}
         onArmedChange={setArmed}
-        actDescribedBy={consequenceId}
+        actDescribedBy={project.promotable ? consequenceId : blockerId}
         busy={setMode.isPending}
+        focusableWhenInert
         onChoose={change}
       />
 
@@ -147,7 +205,7 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
         {promotionConsequence(project)}
       </p>
 
-      <p className="text-xs text-text-muted">{MODE_MEANING[project.mode]}.</p>
+      <p className="text-xs text-text-muted">{sentence(MODE_MEANING[project.mode])}</p>
 
       {/*
         The gate, stated whether or not it is open — and only while it is still a gate. A project
@@ -155,8 +213,8 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
         about something that is not happening.
       */}
       {project.mode !== "active" ? (
-        <p className={project.promotable ? "text-xs text-text-muted" : "text-xs text-text-faint"}>
-          {project.promotable ? PROMOTION_EARNED : blocker}
+        <p id={blockerId} className="text-xs text-text-muted">
+          {sentence(project.promotable ? PROMOTION_EARNED : blocker)}
         </p>
       ) : null}
 
@@ -180,60 +238,82 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
  * this page's arithmetic — `queue_is_full` compares `open >= limit`, and a second implementation of
  * that comparison would eventually disagree with the one that actually defers work.
  */
-function Ceiling({ project }: { project: ProjectSummary }) {
+function Ceiling({ project, stale }: { project: ProjectSummary; stale: boolean }) {
   const setLimit = useSetWipLimit();
   const limit = project.wip_limit;
   const open = project.open_review_items;
+  const headingId = useId();
+  const readingId = useId();
+  const busy = setLimit.isPending;
+  const refused = setLimit.isError && isApiRefusal(setLimit.error) ? setLimit.error : null;
 
   function set(next: number | null) {
     setLimit.mutate({ projectId: project.project_id, limit: next });
   }
 
+  /*
+    `null` is the brake OFF and is not a ceiling of zero: the daemon compares
+    `open >= limit`, so zero would mean "never start anything again" — the opposite end of
+    the same axis.
+
+    The word "off" and deliberately NOT an em dash. The dash is this page's mark for a
+    reading nobody took, and it is on the screen four times already; a brake somebody chose
+    to switch off is the opposite of an absent measurement, and one glyph meaning both
+    would be the collapse the rest of the page is built to avoid.
+  */
+  const figure = (
+    <span className="min-w-16 text-center font-display text-xl font-bold tabular-nums text-text">
+      {limit === null ? "off" : limit}
+    </span>
+  );
+
   return (
-    <Block label="Open-proposal ceiling">
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          aria-label="Lower the ceiling"
-          disabled={limit === null || limit <= 0 || setLimit.isPending}
-          onClick={() => set(limit === null ? null : limit - 1)}
-          className="h-8 w-8 rounded-md border border-border text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
-        >
-          −
-        </button>
-        <span className="min-w-16 text-center font-display text-xl font-bold tabular-nums text-text">
-          {/*
-            `null` is the brake OFF and is not a ceiling of zero: the daemon compares
-            `open >= limit`, so zero would mean "never start anything again" — the opposite end of
-            the same axis.
-
-            The word "off" and deliberately NOT an em dash. The dash is this page's mark for a
-            reading nobody took, and it is on the screen four times already; a brake somebody chose
-            to switch off is the opposite of an absent measurement, and one glyph meaning both
-            would be the collapse the rest of the page is built to avoid.
-          */}
-          {limit === null ? "off" : limit}
-        </span>
-        <button
-          type="button"
-          aria-label="Raise the ceiling"
-          disabled={setLimit.isPending}
-          onClick={() => set(limit === null ? 1 : limit + 1)}
-          className="h-8 w-8 rounded-md border border-border text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
-        >
-          +
-        </button>
-        <button
-          type="button"
-          disabled={limit === null || setLimit.isPending}
-          onClick={() => set(null)}
-          className="rounded-md border border-border px-2 py-1 text-xs text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
-        >
-          no ceiling
-        </button>
-      </div>
-
+    <Block label="Open-proposal ceiling" id={headingId}>
+      {/* What the number bounds, said once where it is set. The worktree slots above are a
+          different ceiling, and a reader meeting two unexplained fours has to guess which is which. */}
       <p className="text-xs text-text-muted">
+        How many proposals may wait on you before new work here is held.
+      </p>
+
+      {stale ? (
+        figure
+      ) : (
+        <div
+          role="group"
+          aria-labelledby={headingId}
+          aria-busy={busy}
+          className="flex flex-wrap items-center gap-2"
+        >
+          <Step
+            label="Lower the ceiling"
+            inert={limit === null || limit <= 0 || busy}
+            describedBy={readingId}
+            onPress={() => set(limit === null ? null : limit - 1)}
+          >
+            −
+          </Step>
+          {figure}
+          <Step
+            label="Raise the ceiling"
+            inert={busy}
+            describedBy={readingId}
+            onPress={() => set(limit === null ? 1 : limit + 1)}
+          >
+            +
+          </Step>
+          <Step inert={limit === null || busy} describedBy={readingId} onPress={() => set(null)}>
+            no ceiling
+          </Step>
+        </div>
+      )}
+
+      {/*
+        Polite and live, because this is what a press on the stepper changes and the stepper
+        itself says nothing: "Raise the ceiling" is the same label before and after. It is also
+        each step's description, so a step that cannot be pressed — lower at zero, "no ceiling"
+        when there is none — is read beside the reason.
+      */}
+      <p id={readingId} aria-live="polite" className="text-xs text-text-muted">
         {limit === null
           ? `no ceiling — ${open} ${open === 1 ? "proposal" : "proposals"} waiting on you`
           : `${open} of ${limit} taken`}
@@ -243,7 +323,54 @@ function Ceiling({ project }: { project: ProjectSummary }) {
           The brake is holding new work here until something is reviewed.
         </p>
       ) : null}
+
+      {/* A failed write used to say nothing, so the number on screen was the only answer — and it
+          was the old number, looking like a change that had not landed yet. */}
+      {setLimit.isError ? (
+        <ErrorNote>
+          {refused === null
+            ? "The ceiling was not changed — the núcleo did not answer."
+            : `The ceiling was not changed — ${refused.detail}`}
+        </ErrorNote>
+      ) : null}
     </Block>
+  );
+}
+
+/**
+ * One step of the ceiling, inert in the house way: `aria-disabled` and a press that does nothing.
+ *
+ * Native `disabled` was what these used, and the press that lowers the ceiling to zero is the
+ * press that disables "lower" — so the focus that made the change fell to `<body>` as it landed,
+ * and "no ceiling" did the same to itself. Kept focusable, a step says it cannot be pressed and is
+ * described by the reading beside it, which is the reason.
+ */
+function Step({
+  label,
+  inert,
+  describedBy,
+  onPress,
+  children,
+}: {
+  label?: string;
+  inert: boolean;
+  describedBy: string;
+  onPress: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      aria-disabled={inert ? "true" : undefined}
+      aria-describedby={describedBy}
+      onClick={() => {
+        if (!inert) onPress();
+      }}
+      className={`${label === undefined ? "px-2 py-1 text-xs" : "h-8 w-8"} rounded-md border border-border text-text-muted hover:border-border-strong aria-disabled:cursor-not-allowed aria-disabled:opacity-(--opacity-disabled) aria-disabled:hover:border-border`}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -266,7 +393,11 @@ function Classes({ projectId, project }: { projectId: string; project: ProjectSu
   return (
     <Block label="Action classes">
       {scoreboard.data === undefined ? (
-        <p className="text-xs text-text-faint">Reading…</p>
+        scoreboard.isError ? (
+          <ErrorNote>The núcleo did not say what the classifier has been judged on here.</ErrorNote>
+        ) : (
+          <p className="text-xs text-text-faint">Reading…</p>
+        )
       ) : rows.length === 0 ? (
         /*
           Nothing recorded is not "zero of zero clear". A project that has never run in shadow has
@@ -275,33 +406,72 @@ function Classes({ projectId, project }: { projectId: string; project: ProjectSu
         <Quiet says="Nothing recorded in shadow yet — there is no measurement here, which is not the same as a bad one." />
       ) : (
         <>
-          <div className="flex flex-wrap gap-1.5">
-            {rows.map((row) => (
-              <Chip key={row.action_class} row={row} />
-            ))}
-          </div>
+          {/*
+            One verdict, and it comes first: the daemon's count, which is the one that gates the
+            third mode. The table under it is the volume of evidence, not a second verdict.
+
+            It used to be the other way round — a row of pills reading `read-local 18/46` above a
+            sentence saying all five cleared the bar. A fraction at 39% beside "clears the bar"
+            reads as a contradiction, on the panel where somebody decides whether to let go of
+            the wheel; the fraction was reviewed-of-decided, and it said so only on hover.
+          */}
+          <p className="text-sm text-text">
+            {project.classes_ready} of {project.classes_total}{" "}
+            {project.classes_total === 1 ? "class clears" : "classes clear"} the bar.
+          </p>
+          <table className="w-full max-w-xl border-collapse text-xs">
+            <caption className="sr-only">Shadow decisions by action class</caption>
+            <thead>
+              <tr className="text-text-faint">
+                <th scope="col" className="pb-1 text-left font-normal uppercase tracking-wide">
+                  Class
+                </th>
+                <th scope="col" className="pb-1 text-right font-normal uppercase tracking-wide">
+                  Decided
+                </th>
+                <th scope="col" className="pb-1 text-right font-normal uppercase tracking-wide">
+                  Reviewed
+                </th>
+                <th scope="col" className="pb-1 text-right font-normal uppercase tracking-wide">
+                  Disagreed
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <ClassRow key={row.action_class} row={row} />
+              ))}
+            </tbody>
+          </table>
           <p className="text-xs text-text-muted">
-            {project.classes_ready} of {project.classes_total} clearing the bar, by the núcleo's own
-            count — which deduplicates repeats of the same command and so is lower than these
-            tallies.
+            The bar counts each distinct command once; this table counts every decision, so its
+            numbers run higher than the bar&rsquo;s.
           </p>
         </>
       )}
+      {scoreboard.isError && scoreboard.data !== undefined ? (
+        <StaleNote dataUpdatedAt={scoreboard.dataUpdatedAt} />
+      ) : null}
     </Block>
   );
 }
 
-function Chip({ row }: { row: ClassTally }) {
+/**
+ * One class and its three tallies, each in a column that says what it counts.
+ *
+ * The class name is the daemon's identifier and so is set in mono (the Three Faces Rule), and the
+ * numbers are the daemon's too, tabular so a column stays a column when a poll moves a digit. No
+ * pill: that is the badge shape, and these are facts rather than states.
+ */
+function ClassRow({ row }: { row: ClassTally }) {
   return (
-    <span
-      className="rounded-pill border border-border bg-surface-sunken px-2 py-0.5 text-xs text-text-muted"
-      title={`${row.total} decided, ${row.reviewed} reviewed, ${row.disagree} disagreed`}
-    >
-      {row.action_class}
-      {/* The fraction needs a real gap from the hyphenated class name. */}
-      <span className="ml-2 text-text-faint">
-        {row.reviewed}/{row.total}
-      </span>
-    </span>
+    <tr className="border-t border-border">
+      <th scope="row" className="py-1 pr-3 text-left font-mono font-normal text-text">
+        {row.action_class}
+      </th>
+      <td className="py-1 text-right font-mono tabular-nums text-text-muted">{row.total}</td>
+      <td className="py-1 text-right font-mono tabular-nums text-text-muted">{row.reviewed}</td>
+      <td className="py-1 text-right font-mono tabular-nums text-text-muted">{row.disagree}</td>
+    </tr>
   );
 }

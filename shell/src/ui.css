@@ -407,6 +407,20 @@
 
 /* ---------------------------------------------------------------- button -- */
 
+/*
+  A button that is a toggle, while it is the setting.
+
+  One rung up the neutral ladder and a stronger edge — the same answer `.ui-switch-seg` gives
+  inside the mode track, so "this is how it is set now" looks the same wherever it is said, and
+  never arrives as a hue. `aria-pressed` is the selector on purpose: the mark cannot appear
+  without the semantics that make it legible to a screen reader.
+*/
+.ui-button[aria-pressed="true"] {
+  border-color: var(--text-faint);
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
 .ui-button {
   display: inline-flex;
   align-items: center;
@@ -2115,11 +2129,37 @@ ol.ui-well {
   color: var(--text);
 }
 
-/* The setting now. A rung on the ladder, never a hue — Contrast-Not-Hue. */
+/*
+  The setting now. A rung on the ladder, never a hue — Contrast-Not-Hue — and a mark that is
+  not a colour at all.
+
+  The rung alone was not enough, and it failed where it mattered most. `project/Settings.tsx`
+  puts the mode switch inside an `Inset`, which is `--surface-raised` — the same rung the pressed
+  segment painted — so "Watch in shadow" differed from its neighbours by text colour only, while
+  the green offer beside it read as the selected one. In light, Working and Raised are both white,
+  so on any panel the rung was invisible there too.
+
+  So the mark is the one the tabs already use for "this is the current one": a 2px rule in
+  `--text` along the bottom (`.ui-tab[data-state="active"]`). Inset, so the segment does not grow
+  when it becomes the setting, and a shape rather than a hue, so it survives any ground and anyone
+  who cannot separate the tones. No weight change either: segments are `nowrap`, and a bolder label
+  would widen the one somebody just pressed.
+*/
 .ui-switch-seg[aria-pressed="true"] {
   background: var(--surface-raised);
+  box-shadow: inset 0 -2px 0 var(--text);
   color: var(--text);
   cursor: default;
+}
+
+/*
+  Inside an inset the rung has to go the other way. The inset IS Raised, so a pressed segment one
+  rung up would be the same colour as the box around it; one rung down — a well — is the step that
+  shows. Scoped to the inset rather than applied everywhere, because on a page ground (Feed, Fleet,
+  Runs) the lift still reads and Sunken beside Deep Ground would be the weaker of the two.
+*/
+.ui-panel-inset .ui-switch-seg[aria-pressed="true"] {
+  background: var(--surface-sunken);
 }
 
 .ui-switch-seg[aria-disabled="true"]:not([aria-pressed="true"]),
@@ -2168,6 +2208,30 @@ ol.ui-well {
 */
 .ui-switch-seg-wrap > .ui-confirm-armed > .ui-button {
   box-shadow: inset 0 0 0 2px var(--text);
+}
+
+/*
+  An offer, not the setting: outline until armed.
+
+  `.ui-button-approve` is a filled tone, and inside a track whose current segment is marked by a
+  change of ground, a filled segment reads as the current one — on the State page "Let it act"
+  looked selected while the project was in shadow. At rest it keeps the tone's text and edge (the
+  edge inset, because the track clips and the segment has no border of its own) and drops the
+  fill; the fill comes back once armed, where it belongs to the moment of deciding. A locked offer
+  is excluded here and stays with `.ui-button-approve:disabled` below, which takes the tone away
+  altogether.
+*/
+.ui-switch-seg-wrap
+  > .ui-confirm:not(.ui-confirm-armed)
+  > .ui-button-approve:not(:disabled):not([aria-disabled="true"]) {
+  background: none;
+  box-shadow: inset 0 0 0 1px var(--tone-active-border);
+}
+
+.ui-switch-seg-wrap
+  > .ui-confirm:not(.ui-confirm-armed)
+  > .ui-button-approve:not(:disabled):not([aria-disabled="true"]):hover {
+  box-shadow: inset 0 0 0 1px var(--tone-active-fg);
 }
 
 /*

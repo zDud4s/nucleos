@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 
 import { isApiRefusal } from "../data/client";
 import { useDeleteProjectFolder, useProjectFolder } from "../data/projects";
@@ -38,21 +38,60 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
   const folder = useProjectFolder(projectId, open);
   const deletion = useDeleteProjectFolder();
 
+  /*
+    Where focus goes when the control opens and when it closes.
+
+    Both gestures unmount the element that had focus: "delete this folder…" is replaced by the
+    panel, and "cancel" takes the panel away. Left alone, focus fell to `<body>` in the middle of
+    the one irreversible thing this app does, and a keyboard user had to find their place again
+    from the top of the page. So opening hands focus to the warning — the reading comes first, and
+    it is the first thing a screen reader should say — and closing hands it back to the button that
+    opened it, which is the standard the project switcher already keeps.
+
+    `settle` says which of the two just happened. Neither fires on first paint: a page that
+    stole focus into its last section on arrival would be the opposite bug.
+  */
+  const warning = useRef<HTMLParagraphElement>(null);
+  const trigger = useRef<HTMLParagraphElement>(null);
+  const [settle, setSettle] = useState<"opened" | "closed" | null>(null);
+
+  useEffect(() => {
+    if (settle === "opened") warning.current?.focus();
+    if (settle === "closed") trigger.current?.querySelector("button")?.focus();
+    if (settle !== null) setSettle(null);
+  }, [settle]);
+
+  function show() {
+    setOpen(true);
+    setSettle("opened");
+  }
+
   function close() {
     setOpen(false);
     setTyped("");
     setForget(false);
     deletion.reset();
+    setSettle("closed");
+  }
+
+  /*
+    Escape stands the panel down, as it does every disclosure in this app — except while the
+    request is in flight, when closing would hide the answer to something already sent.
+  */
+  function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "Escape" || deletion.isPending) return;
+    event.preventDefault();
+    close();
   }
 
   if (!open) {
     return (
-      <p className="flex flex-wrap items-baseline gap-3 text-sm text-text-muted">
+      <p ref={trigger} className="flex flex-wrap items-baseline gap-3 text-sm text-text-muted">
         <span>
           Removing this project from NucleOS leaves its folder alone. Deleting the folder is a
           separate thing, and it is permanent.
         </span>
-        <Button variant="quiet" onClick={() => setOpen(true)}>
+        <Button variant="quiet" onClick={show}>
           delete this folder…
         </Button>
       </p>
@@ -70,9 +109,20 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
     <div
       role="group"
       aria-label={`Delete ${projectId}'s folder`}
+      onKeyDown={onKeyDown}
       className="flex flex-col gap-3 rounded-md border border-tone-danger-border bg-surface-sunken p-3"
     >
-      <p className="max-w-prose text-sm text-text">
+      {/* `tabIndex={-1}`: a target for the focus the opening hands over, not a tab stop. The
+          global ring's 2px offset sat flush on the glyphs of a block of prose, so this one
+          stands further off — same colour and width, only the offset, as the house overrides do.
+          Inline, because the ring in `base.css` is unlayered on purpose and beats any utility;
+          inline still wins over it, and changes nothing but the distance. */}
+      <p
+        ref={warning}
+        tabIndex={-1}
+        style={{ outlineOffset: "4px" }}
+        className="max-w-prose text-sm text-text"
+      >
         This deletes <code className="font-mono text-xs">{named}</code> and everything in it,
         permanently, and takes the project off the roster. Nothing here can undo it.
       </p>

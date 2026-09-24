@@ -27,7 +27,12 @@ describe("the armed ring", () => {
     // the focus ring off it, and neither paints anything. A third ring would be a variant
     // answering "is this live?" in its own colour again, which is how 51 of 53 sites came to
     // have one at 1.7:1 and 1.2:1.
-    const armed = ui.split("}").filter((chunk) => chunk.includes("ui-confirm-armed"));
+    //
+    // A rule that names the class only to EXCLUDE it — `:not(.ui-confirm-armed)`, the at-rest
+    // outline of an offer inside a mode switch — styles the unarmed state and is not counted.
+    const armed = ui
+      .split("}")
+      .filter((chunk) => chunk.replace(/:not\(\.ui-confirm-armed\)/g, "").includes("ui-confirm-armed"));
     expect(armed).toHaveLength(4);
 
     const rings = armed.filter((chunk) => chunk.includes("box-shadow"));

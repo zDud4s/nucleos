@@ -266,4 +266,37 @@ describe("deleting a project's folder", () => {
     await openDelete();
     await waitFor(() => expect(asked()).toBe(true));
   });
+
+  /**
+   * **Focus is handed over, and handed back.**
+   *
+   * Opening replaces the button that had focus and cancelling removes the panel that had it, so
+   * both used to drop focus to `<body>` in the middle of the one irreversible thing this app does.
+   * Opening lands on the warning, which is the first thing to read; closing lands back on the
+   * button that opened it; and Escape closes, like every other disclosure here.
+   */
+  it("moves focus to the warning on opening and back to the trigger on cancel", async () => {
+    await openEstado();
+    const panel = await openDelete();
+
+    await waitFor(() =>
+      expect(document.activeElement?.textContent).toMatch(/^This deletes .* Nothing here can undo it\.$/),
+    );
+
+    fireEvent.click(panel.getByRole("button", { name: "cancel" }));
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "delete this folder…" })),
+    );
+  });
+
+  it("closes on Escape and hands focus back", async () => {
+    await openEstado();
+    const panel = await openDelete();
+
+    fireEvent.keyDown(panel.getByLabelText("Type nucleos to confirm"), { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByRole("group", { name: "Delete nucleos's folder" })).toBeNull(),
+    );
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "delete this folder…" }));
+  });
 });
