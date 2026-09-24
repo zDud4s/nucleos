@@ -862,8 +862,8 @@ impl NucleosTools {
     }
 
     #[tool(
-        description = "Record something worth telling every later run on this project — a fact it \
-                       would otherwise rediscover, a standing instruction, how a recurring job is \
+        description = "Record something worth telling later runs — a fact they would otherwise \
+                       rediscover, a standing instruction, how a recurring job is \
                        done here. This does NOT take effect: it is written down as a proposal and \
                        waits for a person, and only once they approve it does it start reaching \
                        any brief. Say it in the words a run with none of your context would need, \
