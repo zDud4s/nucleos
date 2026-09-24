@@ -138,7 +138,10 @@ describe("MapCanvas", () => {
     // The word appears twice — once explaining the diagonal, once as the count. That is the point:
     // the reader is told what the mark means and then how many of them there are.
     expect(screen.getAllByText(/backwards/).length).toBeGreaterThan(1);
-    expect(screen.getByText(/forwards/)).toBeTruthy();
+    // One word for each direction, the same in the count and in the legend: "forwards" and
+    // "backwards", where the legend used to say "goes down" beside a count saying "forwards".
+    expect(screen.getAllByText(/point forwards/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/A mark above the diagonal points forwards/)).toBeTruthy();
   });
 
   it("opens a community when its name is clicked, and comes back", () => {
@@ -264,7 +267,14 @@ describe("a matrix too small to be read whole", () => {
     // and points at the ways out.
     expect(screen.getByText(/At this size only the shape reads/)).toBeTruthy();
     expect(screen.getByText(/8px/)).toBeTruthy();
-    expect(screen.getByText(/Stand closer, go full screen, or open a community/)).toBeTruthy();
+    expect(screen.getByText(/Point at a mark to read it, or stand closer/)).toBeTruthy();
+
+    // And it does what it says: the marks are drawn without the digits nobody could read, and
+    // the name of whatever is under the pointer is said above the window at a size that reads.
+    const cells = [...document.querySelectorAll("td")];
+    expect(cells.every((cell) => cell.textContent === "")).toBe(true);
+    fireEvent.mouseOver(cells.find((cell) => cell.className.endsWith(" bg-text"))!);
+    expect(screen.getByText(/ · 2 files$/)).toBeTruthy();
 
     // And the old half untouched: this is not a refusal, the table is still on the page,
     // and the shape is still there to be read. Refusing the whole picture to protect the
@@ -277,17 +287,25 @@ describe("a matrix too small to be read whole", () => {
     // Two communities open at 100%, where nothing is lost and a warning would be noise.
     draw(twoGroups.modules, twoGroups.imports);
     expect(screen.queryByText(/At this size only the shape reads/)).toBeNull();
+    // And the numbers are drawn, because here they can be read.
+    const marked = [...document.querySelectorAll("td")].filter((cell) => cell.title !== "");
+    expect(marked.some((cell) => cell.textContent === "1")).toBe(true);
   });
 });
 
 /* ---------------------------------------------- along the structure -- */
 
 describe("what a community touches", () => {
-  it("the drawing is an image with a name", () => {
+  it("the drawing is a named group whose boxes are doors the keyboard can reach", () => {
     draw(twoGroups.modules, twoGroups.imports);
     openFirstCommunity();
 
-    expect(screen.getByRole("img", { name: /file|neighbour|declaration/ })).toBeTruthy();
+    // A group and not an image: `img` makes its children presentational, and these boxes open files.
+    const drawing = screen.getByRole("group", { name: /file|neighbour|declaration/ });
+    const door = within(drawing).getAllByRole("button")[0];
+    expect(door.getAttribute("tabindex")).toBe("0");
+    fireEvent.keyDown(door, { key: "Enter" });
+    expect(daemon.apiFetch).toHaveBeenCalled();
   });
 
   it("names both directions, and never one number over the pair", () => {
@@ -410,6 +428,21 @@ describe("how far out the drawing stands", () => {
     expect(screen.getByText("full screen")).toBeTruthy();
   });
 
+  it("is a modal dialog that takes focus and hands it back to the button that opened it", () => {
+    // It was a `fixed inset-0` div: Tab walked out into the page behind it, and closing it left
+    // focus nowhere. The project switcher's standard is the one to meet.
+    draw(wideProject.modules, wideProject.imports);
+    const opener = screen.getByText("full screen");
+    opener.focus();
+    fireEvent.click(opener);
+    const dialog = screen.getByRole("dialog", { name: /full screen/ });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(document.activeElement).toBe(dialog);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement?.textContent).toBe("full screen");
+  });
+
   it("keeps the rail and the trail in full screen, which is where there is most room for them", () => {
     // The first version overlaid the picture alone. Growing the window then cost
     // you every way of going anywhere, which is the opposite of what more room
@@ -441,6 +474,24 @@ describe("every drawing under the matrix", () => {
     draw(wideProject.modules, wideProject.imports);
     const rail = screen.getByRole("complementary", { name: "Every community" });
     expect(within(rail).getAllByRole("button").length).toBe(60);
+  });
+
+  it("is one tab stop, walked with the arrows", () => {
+    // Sixty buttons each taking a Tab put the whole rail between the doors and the zoom.
+    draw(wideProject.modules, wideProject.imports);
+    const rail = screen.getByRole("complementary", { name: "Every community" });
+    const doors = within(rail).getAllByRole("button");
+    expect(doors.filter((door) => door.tabIndex === 0)).toHaveLength(1);
+    doors[0].focus();
+    fireEvent.keyDown(doors[0], { key: "ArrowDown" });
+    expect(document.activeElement).toBe(doors[1]);
+    fireEvent.keyDown(doors[1], { key: "End" });
+    expect(document.activeElement).toBe(doors[doors.length - 1]);
+    expect(doors[doors.length - 1].tabIndex).toBe(0);
+    expect(doors[0].tabIndex).toBe(-1);
+    // And the matrix's own headers are out of the Tab order: the rail is the keyboard's way in.
+    const headers = within(screen.getByRole("table")).getAllByRole("button");
+    expect(headers.every((header) => header.tabIndex === -1)).toBe(true);
   });
 
   it("opens a community from the list without touching the matrix", () => {

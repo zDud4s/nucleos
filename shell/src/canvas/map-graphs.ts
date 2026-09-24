@@ -20,6 +20,7 @@
 import type { MapImport, MapModule } from "../data/project-map";
 import { communities, feedback, seriate } from "./communities";
 import { type Layout, type Link, layout } from "./layered";
+import { topFolder } from "./map-sides";
 
 /** Above this many boxes a layered drawing stops being read and starts being scanned. */
 export const MAX_BOXES = 44;
@@ -122,6 +123,14 @@ function linksBetween(imports: MapImport[], known: Set<string>): Link[] {
  * Where two groups would take the same name the later one is numbered, because a duplicate label on
  * two different rows is worse than an ugly one.
  *
+ * **In a project with more than one side, the name carries its side: `core·transcription`.** The
+ * rows used to read `transcription`, `transcription (2)`, `transcription (3)`, with nothing saying
+ * which were the núcleo's and which the shell's — the one distinction the header above the map has
+ * just taught. A `(2)` had to be opened to learn which side it was on, on every row. The side is
+ * the top folder of the file the group is named after, the same `topFolder` the sides are counted
+ * by, so the prefix and the box above can never disagree. A single-side project gets no prefix: a
+ * word repeated on every row says nothing.
+ *
  * **A file nothing imports and that imports nothing is not a box.** `main.rs` is only `mod`
  * declarations and `logging.rs` stands alone; both would sit in the matrix as a row and a column of
  * pure silence. They come back in {@link CommunityMatrix.alone} so a surface can list them, because
@@ -166,12 +175,14 @@ export function buildCommunities(modules: MapModule[], imports: MapImport[]): Co
     return best;
   };
 
+  const sided = new Set(names.map(topFolder)).size > 1;
   const titles = new Map<string, string>();
   const taken = new Map<string, number>();
   for (const [where, group] of [...members].sort((a, b) => b[1].length - a[1].length)) {
     // The file's name and not its path: a matrix row is a label, and `core/src/map_join.rs` sitting
     // sideways down a column is not one.
-    const wanted = moduleName(pull(group));
+    const named = pull(group);
+    const wanted = sided ? `${topFolder(named)}·${moduleName(named)}` : moduleName(named);
     const seen = (taken.get(wanted) ?? 0) + 1;
     taken.set(wanted, seen);
     titles.set(where, seen === 1 ? wanted : `${wanted} (${seen})`);

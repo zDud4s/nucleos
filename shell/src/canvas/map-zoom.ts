@@ -93,12 +93,28 @@ export function zoomLabel(zoom: number): string {
  * table at full size first — which is the flash of an unreadable picture this
  * exists to avoid.
  *
- * `19` is the cell, from the table's own `h-[19px] w-[19px]`. `6.1` is the
- * advance of the 10px monospace the row labels are set in, and the constant is
- * the padding around them.
+ * **An estimate that runs short is a scrollbar at `fit`**, and that is how
+ * this was found: it used `6.1`px a character for labels actually set at 12px
+ * (`text-xs`), counted the title without the file count printed after it, and
+ * left out the cells' collapsed borders. The margin that hid it went the day
+ * titles grew a side prefix (`shell·council`), and the matrix opened at `fit`
+ * with a horizontal scrollbar. So every term is now the drawing's own:
+ *
+ * - `CELL`: the `w-[19px]` cell plus its share of the collapsed 1px border.
+ * - `LABEL_ADVANCE`: 0.6em of the 12px monospace, rounded up — a monospace
+ *   advance is a fact of the face, and rounding up is the side of the error
+ *   that costs a step of zoom rather than a scrollbar.
+ * - `longestLabel` is the whole row header in characters — title, space and
+ *   count — which the caller measures, because only it knows what it prints.
+ * - `FRAME`: the table's `m-3` either side, the header's `px-1`, and a margin.
  */
-export function matrixWidth(columns: number, longestTitle: number): number {
-  return columns * 19 + longestTitle * 6.1 + 34;
+const CELL = 20;
+/** The advance of one character of the 12px monospace the labels are set in. */
+export const LABEL_ADVANCE = 7.5;
+const FRAME = 24 + 8 + 12;
+
+export function matrixWidth(columns: number, longestLabel: number): number {
+  return columns * CELL + longestLabel * LABEL_ADVANCE + FRAME;
 }
 
 /**

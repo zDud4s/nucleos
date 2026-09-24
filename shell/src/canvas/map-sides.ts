@@ -81,6 +81,15 @@ export interface Sides {
   /** Imports whose two ends land in different sides. Zero, and see this module's header for why. */
   crossing: number;
   /**
+   * The crossing imports themselves, `from → to`.
+   *
+   * **A count that must be zero and is not is a bug report, and a bug report without the lines is
+   * half of one.** The panel drew *17 imports cross between sides* in red and named none of them,
+   * so whoever read it could neither check it nor fix it. The count stays for the sentence; these
+   * are what the sentence is about.
+   */
+  crossings: MapImport[];
+  /**
    * Imports with an end in no side at all.
    *
    * Cannot happen while the núcleo only emits edges between modules it listed, which is exactly
@@ -88,6 +97,8 @@ export interface Sides {
    * that is worth finding here rather than in a drawing that quietly lost a line.
    */
   loose: number;
+  /** The loose imports themselves, for the same reason {@link Sides.crossings} exists. */
+  strays: MapImport[];
 }
 
 /**
@@ -149,17 +160,17 @@ export function buildSides(
     sides.set(key, side);
   }
 
-  let crossing = 0;
-  let loose = 0;
+  const crossings: MapImport[] = [];
+  const strays: MapImport[] = [];
   for (const line of imports) {
     const from = of.get(line.from);
     const to = of.get(line.to);
     if (from === undefined || to === undefined) {
-      loose += 1;
+      strays.push(line);
       continue;
     }
     if (from === to) sides.get(from)!.imports += 1;
-    else crossing += 1;
+    else crossings.push(line);
   }
 
   const citing = new Map<string, ForeignFile[]>();
@@ -186,8 +197,10 @@ export function buildSides(
   return {
     sides: [...sides.values()].sort(bySize),
     unread: quiet.sort(bySize),
-    crossing,
-    loose,
+    crossing: crossings.length,
+    crossings,
+    loose: strays.length,
+    strays,
   };
 }
 

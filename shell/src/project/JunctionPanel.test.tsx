@@ -185,6 +185,45 @@ describe("the nodes that do not match", () => {
   });
 
   /**
+   * The contradiction the critique photographed: the sides above said "nothing here cites a
+   * section" (from `cites`) while this pile, empty, said every module names one (from `unclaimed`).
+   * `unclaimed` is by definition the modules with empty `cites`, so the two can be checked against
+   * each other — and a disagreement must read as a fault in the reading, never as a reassurance.
+   */
+  it("refuses to reassure when its empty pile disagrees with the modules' own citations", () => {
+    const uncited = { reader: "rust" as const, declares: false, cites: [], spec: null, tested: false };
+    renderWithQuery(
+      <JunctionPanel
+        junction={junction({ unclaimed: [] })}
+        projectId="alpha"
+        modules={[{ ...uncited, path: "core/src/a.rs" }, { ...uncited, path: "core/src/b.rs" }]}
+      />,
+    );
+    expect(screen.getByText(/yet 2 modules name no section at all/)).toBeTruthy();
+    expect(screen.queryByText(/Every module this reader could read/)).toBeNull();
+  });
+
+  it("says every module names a section only when the modules agree", () => {
+    renderWithQuery(
+      <JunctionPanel
+        junction={junction({ unclaimed: [] })}
+        projectId="alpha"
+        modules={[
+          {
+            path: "core/src/a.rs",
+            reader: "rust",
+            declares: true,
+            cites: [{ section: "3", named: null }],
+            spec: null,
+            tested: false,
+          },
+        ]}
+      />,
+    );
+    expect(screen.getByText(/Every module this reader could read names a spec section/)).toBeTruthy();
+  });
+
+  /**
    * **A silent truncation is the same defect this feature exists to cure.** The list is capped
    * because a hundred paths is the thousand-line plan again; the number that is not on screen is
    * therefore said out loud, and the total stays where it was.
@@ -243,7 +282,8 @@ describe("the nodes that do not match", () => {
   it("says which derived states it cannot draw, and why", () => {
     open({ decisions: [anchored()] });
 
-    expect(screen.getByText(/they belong to the triage panel below/)).toBeTruthy();
+    // Behind a door now, and the sentence says which rather than pointing "below" at nothing.
+    expect(screen.getByText(/they are behind the Triage door/)).toBeTruthy();
     expect(screen.getByText(/needs a citation that names its own document/)).toBeTruthy();
   });
 

@@ -155,8 +155,12 @@ describe("the number on a door", () => {
     expect(junction.textContent).not.toContain("0");
     expect(screen.getByRole("button", { name: /^Stamps/ }).textContent).toContain("—");
     expect(screen.getByRole("button", { name: /^Triage/ }).textContent).toContain("—");
-    // And it says why, rather than leaving a dash to be guessed at.
+    // And it says why, rather than leaving a dash to be guessed at — on hover, and to a screen
+    // reader, which would otherwise announce "em dash" and nothing else.
     expect(junction.getAttribute("title")).toMatch(/No decision has been approved/);
+    expect(junction.textContent).toContain("not measured");
+    const why = document.getElementById(junction.getAttribute("aria-describedby") ?? "");
+    expect(why?.textContent).toMatch(/No decision has been approved/);
   });
 
   it("is the count once there is a layer to count over", async () => {
@@ -194,6 +198,67 @@ describe("the number on a door", () => {
     await waitFor(() =>
       expect(screen.getByRole("button", { name: /^Specs/ }).textContent).toContain("3"),
     );
+  });
+});
+
+/**
+ * Principle 1: every screen answers "is everything fine?" before anything else. The map used to
+ * lead with its size — `245` at display size — and bury the exceptions in three paragraphs.
+ */
+describe("the answer before the detail", () => {
+  it("leads with a verdict, then says how big the reading is and when it was taken", async () => {
+    open(dayOne());
+    expect(await screen.findByText("Nothing this reading checks came back wrong")).toBeTruthy();
+    // Principle 4: never claim currency you do not have. The map is not polled, so it says when
+    // the tree was read, and reading it again is one press.
+    const read = document.querySelector("time");
+    expect(read?.textContent).toBe("just now");
+    // A phrase in the sentence, not a value the daemon wrote: never the mono face.
+    expect(read?.className ?? "").not.toMatch(/mono|ui-reading/);
+    const before = daemon.apiFetch.mock.calls.filter(([path]) => String(path).endsWith("/map")).length;
+    fireEvent.click(screen.getByRole("button", { name: "read again" }));
+    await waitFor(() =>
+      expect(
+        daemon.apiFetch.mock.calls.filter(([path]) => String(path).endsWith("/map")).length,
+      ).toBe(before + 1),
+    );
+  });
+
+  it("counts what points backwards and takes the reader to the drawing that shows it", async () => {
+    open(
+      dayOne({
+        modules: ["a1", "a2", "b1", "b2"].map((name) => ({
+          path: `core/src/${name}.rs`,
+          reader: "rust" as const,
+          declares: false,
+          cites: [],
+          spec: null,
+          tested: false,
+        })),
+        imports: [
+          { from: "core/src/a1.rs", to: "core/src/a2.rs" },
+          { from: "core/src/b1.rs", to: "core/src/b2.rs" },
+          { from: "core/src/a1.rs", to: "core/src/b1.rs" },
+          { from: "core/src/b2.rs", to: "core/src/a2.rs" },
+        ],
+      }),
+    );
+    await screen.findByText(/this reader could read/);
+    fireEvent.click(screen.getByRole("button", { name: /^Junction/ }));
+    expect(screen.queryByRole("table")).toBeNull();
+    const show = screen.queryByRole("button", { name: "show them" });
+    // Two communities joined both ways: one of the two threads has to point backwards, whatever
+    // the order.
+    expect(show).toBeTruthy();
+    fireEvent.click(show!);
+    expect(screen.getByRole("table")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Picture/ }).getAttribute("aria-current")).toBe("true");
+  });
+
+  it("offers to read a map again when it could not be read", async () => {
+    open(new Error("no such folder"));
+    expect(await screen.findByText(/could not read this project/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "read it again" })).toBeTruthy();
   });
 });
 

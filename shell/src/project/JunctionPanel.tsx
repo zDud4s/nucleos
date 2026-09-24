@@ -1,5 +1,5 @@
 // §spec mapa-do-projeto
-import type { Anchored, Junction } from "../data/project-map";
+import type { Anchored, Junction, MapModule } from "../data/project-map";
 import { OrphanCheck } from "./OrphanCheck";
 import { Inset, SectionTitle } from "../ui";
 
@@ -47,6 +47,17 @@ export interface JunctionPanelProps {
    * answer to which project is on screen.
    */
   projectId: string;
+  /**
+   * The modules the junction was joined over, when the caller has them.
+   *
+   * Only to check one sentence. The sides above this panel say "nothing here cites a section"
+   * from `cites`, and this panel's empty pile said "every module names some section" from
+   * `unclaimed` — two derivations of one fact, and on one screen they contradicted each other.
+   * `unclaimed` is by definition the modules whose `cites` is empty, so with the modules in hand
+   * the two can be compared, and a disagreement is said as the fault in the reading it is rather
+   * than printed as a reassurance.
+   */
+  modules?: MapModule[];
 }
 
 /**
@@ -67,7 +78,7 @@ function plural(count: number, one: string, many: string): string {
   return count === 1 ? one : many;
 }
 
-export function JunctionPanel({ junction, projectId }: JunctionPanelProps) {
+export function JunctionPanel({ junction, projectId, modules }: JunctionPanelProps) {
   const { decisions, unclaimed, counts } = junction;
 
   /*
@@ -112,7 +123,10 @@ export function JunctionPanel({ junction, projectId }: JunctionPanelProps) {
       {lostTheComment.length > 0 ? <LostTheComment rows={lostTheComment} /> : null}
       {unnumbered.length > 0 ? <Unnumbered rows={unnumbered} /> : null}
 
-      <Unclaimed paths={unclaimed} />
+      <Unclaimed
+        paths={unclaimed}
+        uncited={modules?.filter((module) => module.cites.length === 0).length ?? null}
+      />
 
       {counts.decisions === 0 ? null : (
         <Plausible total={counts.ambiguous} unattributed={unattributed} abroad={abroad} />
@@ -145,8 +159,8 @@ function NoIntention() {
       </p>
       <p className="max-w-prose text-sm text-text-muted">
         The structure is derived from the code and is always true. The layer that says whether it
-        matches what you decided is made one line at a time: extract a spec below, then answer the
-        lines it proposes. Nothing enters this map without that answer.
+        matches what you decided is made one line at a time: extract a spec behind the Specs door,
+        then answer the lines it proposes. Nothing enters this map without that answer.
       </p>
     </div>
   );
@@ -188,8 +202,7 @@ function Silent({ rows, projectId }: { rows: Anchored[]; projectId: string }) {
         </span>
       </p>
       <p className="max-w-prose text-xs text-text-muted">
-        §5.1 calls this declared, with no code. It is the one answer here the map is certain
-        about: a section no file names anywhere is claimed under no document, whichever document
+        Declared, with no code. It is the one answer here the map is certain about: a section no file names anywhere is claimed under no document, whichever document
         each bare § was meant to point at.
       </p>
       <ul aria-label="Decisions nothing names" className="flex flex-col gap-2">
@@ -232,7 +245,7 @@ function LostTheComment({ rows }: { rows: Anchored[] }) {
         written down and no comment naming them any more.
       </p>
       <p className="max-w-prose text-xs text-text-muted">
-        The `§` that anchored each of these is gone from the code. The files are still here
+        The § that anchored each of these is gone from the code. The files are still here
         because somebody wrote them down, which is the only reason these rows are not sitting
         above looking like decisions nobody ever implemented. Whether the comment went on
         purpose is for you to say — nothing here read a line of code.
@@ -288,12 +301,24 @@ function Unnumbered({ rows }: { rows: Anchored[] }) {
  * alone and owes nothing to the intention layer. Hiding a real measurement behind a missing one
  * would be the blank screen §11 refuses.
  */
-function Unclaimed({ paths }: { paths: string[] }) {
+function Unclaimed({ paths, uncited }: { paths: string[]; uncited: number | null }) {
   if (paths.length === 0) {
+    if (uncited !== null && uncited > 0) {
+      return (
+        <p className="max-w-prose text-sm text-text-muted">
+          <span className="ui-wrong">
+            The junction lists no module nobody asked for, yet {uncited}{" "}
+            {plural(uncited, "module names", "modules name")} no section at all.
+          </span>{" "}
+          Both are read off the same answer and must agree, so this is a fault in the reading and
+          not a fact about your code — report it.
+        </p>
+      );
+    }
     return (
       <p className="max-w-prose text-sm text-text-muted">
-        Every module this reader could read names some section, so nothing is sitting in the code
-        nobody asked for pile.
+        Every module this reader could read names a spec section, so none of them is code nobody
+        asked for.
       </p>
     );
   }
@@ -309,9 +334,8 @@ function Unclaimed({ paths }: { paths: string[] }) {
         </span>
       </p>
       <p className="max-w-prose text-xs text-text-muted">
-        They name no spec section at all, and neither does whatever tests them. §5.1 calls this
-        code nobody asked for, and it is the pile that fills up inside a plan nobody read to the
-        end.
+        They name no spec section at all, and neither does whatever tests them: code nobody asked
+        for, the pile that fills up inside a plan nobody read to the end.
       </p>
       <ul aria-label="Modules nobody asked for" className="flex flex-col gap-1">
         {shown.map((path) => (
@@ -430,15 +454,16 @@ function Missing({ declared, decisions }: { declared: number; decisions: number 
         What this panel cannot see
       </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
-        §5.1 names four derived states and this panel draws two of them. The other two — waiting on
-        you, and silenced — both mean a triager looked at a node and formed an opinion about it, and
-        they belong to the triage panel below. Nothing on this panel says whether anybody looked.
+        The map derives four states for a decision and this panel draws two of them. The other two
+        — waiting on you, and silenced — both mean a triager looked at a node and formed an opinion
+        about it, and they are behind the Triage door. Nothing on this panel says whether anybody
+        looked.
       </p>
       {decisions === 0 ? null : declared === 0 ? (
         <p className="max-w-prose text-xs text-text-muted">
           No decision here is confirmed either. That state needs a citation that names its own
-          document, the shape §8 asks for, and nothing this map read carries one yet — so every
-          join above is a guess, while every decision with no code is sound.
+          document, and nothing this map read carries one yet — so every join above is a guess,
+          while every decision with no code is sound.
         </p>
       ) : (
         <p className="max-w-prose text-xs text-text-muted">

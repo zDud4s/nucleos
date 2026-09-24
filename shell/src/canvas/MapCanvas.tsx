@@ -1,5 +1,13 @@
 // §spec mapa-do-projeto
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as KeyEvent,
+  type ReactNode,
+  type SyntheticEvent,
+} from "react";
 import type {
   Anchored,
   FileItems,
@@ -19,10 +27,19 @@ import {
   neighbourCount,
   sliceAround,
   trafficFor,
+  type CommunityMatrix,
 } from "./map-graphs";
 import { buildFileItems, fileFacts } from "./map-items";
 import { claimedFiles, claimsFor, isSettled, standingLabel } from "./map-claims";
-import { ASSUMED_ROOM, fitZoom, matrixWidth, unreadableAt, zoomBy, zoomLabel } from "./map-zoom";
+import {
+  ASSUMED_ROOM,
+  LABEL_ADVANCE,
+  fitZoom,
+  matrixWidth,
+  unreadableAt,
+  zoomBy,
+  zoomLabel,
+} from "./map-zoom";
 
 /**
  * How this project is built, as three nested pictures under one header.
@@ -78,6 +95,15 @@ export interface MapCanvasProps {
    */
   junction: Junction;
   standings: Record<string, Standing>;
+  /**
+   * The communities, when the caller has already built them.
+   *
+   * The mode's own header counts the dependencies that point backwards, and that number has to be
+   * the one this matrix draws below its diagonal — built twice from the same answer it would
+   * agree, but only by luck of a deterministic sort, and it would cost the seriation twice per
+   * open. Optional so the canvas still stands on its own.
+   */
+  matrix?: CommunityMatrix;
 }
 
 export function MapCanvas({
@@ -86,6 +112,7 @@ export function MapCanvas({
   imports,
   junction,
   standings,
+  matrix: given,
 }: MapCanvasProps) {
   const [open, setOpen] = useState<string | null>(null);
   const [openFile, setOpenFile] = useState<string | null>(null);
@@ -97,7 +124,10 @@ export function MapCanvas({
    * picture you cannot navigate.
    */
   const [full, setFull] = useState(false);
-  const matrix = useMemo(() => buildCommunities(modules, imports), [modules, imports]);
+  const matrix = useMemo(
+    () => given ?? buildCommunities(modules, imports),
+    [given, modules, imports],
+  );
   const inside = useMemo(
     () => (open === null ? null : buildCommunity(matrix.members.get(open) ?? [], imports)),
     [open, matrix, imports],
@@ -106,7 +136,7 @@ export function MapCanvas({
 
   if (matrix.order.length === 0) {
     return (
-      <p className="text-sm text-text-faint">Nothing here imports anything else.</p>
+      <p className="text-sm text-text-muted">Nothing here imports anything else.</p>
     );
   }
 
@@ -170,7 +200,7 @@ export function MapCanvas({
             attached to them, which the rail has no room for and which is about
             the junction rather than about navigation.
           */}
-          <ol className="flex list-none flex-col gap-0.5">
+          <ol className="m-0 flex list-none flex-col gap-0.5 p-0">
             {members.map((path) => (
               <li key={path}>
                 <button
@@ -241,20 +271,77 @@ function Shell({
   onTop: () => void;
   children: ReactNode;
 }) {
+  const surface = useRef<HTMLDivElement>(null);
+  /** Where the page begins, so full screen covers the page and never the sidebar. */
+  const [left, setLeft] = useState(0);
+
+  /*
+    Full screen is a modal dialog, and it was a `fixed inset-0` div: nothing moved focus into it,
+    Tab walked straight out into the page hidden behind it, closing it dropped focus on the body,
+    and it covered the sidebar — the Kill switch included, which DESIGN.md keeps "always within
+    reach". So it takes focus on the way in, keeps Tab inside, hands focus back to whatever opened
+    it on the way out (the same promise the project switcher keeps), and starts where the page
+    starts rather than at the window's edge.
+
+    The left edge is read off `.app-main` rather than hard-coded, because the sidebar folds and
+    its width is the shell's business, not this canvas's. With no such element — a test, a
+    preview — it is the window's edge, which is what it always was.
+  */
   useEffect(() => {
     if (!full) return;
-    const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onFull(false);
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const main = document.querySelector(".app-main");
+    const place = () => setLeft(main === null ? 0 : Math.max(0, main.getBoundingClientRect().left));
+    place();
+    window.addEventListener("resize", place);
+    surface.current?.focus();
+
+    const key = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onFull(false);
+        return;
+      }
+      const box = surface.current;
+      if (event.key !== "Tab" || box === null) return;
+      const stops = [
+        ...box.querySelectorAll<HTMLElement>(
+          'button:not([disabled]):not([tabindex="-1"]), summary, [tabindex="0"]',
+        ),
+      ];
+      if (stops.length === 0) return;
+      const first = stops[0];
+      const last = stops[stops.length - 1];
+      const at = document.activeElement;
+      if (!box.contains(at)) {
+        event.preventDefault();
+        first.focus();
+      } else if (event.shiftKey && (at === first || at === box)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && at === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
-    window.addEventListener("keydown", escape);
-    return () => window.removeEventListener("keydown", escape);
+    window.addEventListener("keydown", key);
+    return () => {
+      window.removeEventListener("keydown", key);
+      window.removeEventListener("resize", place);
+      if (opener !== null && opener.isConnected) opener.focus();
+    };
   }, [full, onFull]);
 
   return (
     <div
+      ref={surface}
+      role={full ? "dialog" : undefined}
+      aria-modal={full ? true : undefined}
+      aria-label={full ? "The project map, full screen" : undefined}
+      tabIndex={full ? -1 : undefined}
+      style={full ? { left } : undefined}
       className={
         full
-          ? "fixed inset-0 z-50 flex flex-col gap-3 overflow-auto bg-bg p-4"
+          ? "fixed inset-y-0 right-0 z-50 flex flex-col gap-3 overflow-auto bg-bg p-4 outline-none"
           : "flex flex-col gap-4"
       }
     >
@@ -351,9 +438,50 @@ function Rail({
   const listed = [...matrix.members].sort((a, b) => b[1].length - a[1].length);
   const inside = open === null ? [] : (matrix.members.get(open) ?? []);
   const row = "flex w-full items-baseline justify-between gap-2 rounded-sm px-2 py-0.5 text-left font-mono text-[11px]";
+
+  /*
+    One tab stop for the whole rail, and the arrows walk it — the project switcher's idiom.
+
+    Sixty-four buttons each taking a Tab meant crossing the entire rail to reach the zoom beside
+    it, and with the matrix's 128 headers on top that was some two hundred stops between the doors
+    and the drawing. The stop is the item you are on (the open file, else the open community, else
+    the first); an arrow moves it, and Tab leaves the rail in one press from wherever it is.
+  */
+  const keyOfFile = (path: string) => `f:${path}`;
+  const keyOfCommunity = (title: string) => `c:${title}`;
+  const keys = [...inside.map(keyOfFile), ...listed.map(([title]) => keyOfCommunity(title))];
+  const home =
+    openFile !== null && inside.includes(openFile)
+      ? keyOfFile(openFile)
+      : open !== null
+        ? keyOfCommunity(open)
+        : keys[0];
+  const [moved, setMoved] = useState<string | null>(null);
+  const stop = moved !== null && keys.includes(moved) ? moved : home;
+  const walk = (event: KeyEvent<HTMLElement>) => {
+    const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("button[data-rail]")];
+    const at = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    if (at === -1) return;
+    const next =
+      event.key === "ArrowDown"
+        ? Math.min(buttons.length - 1, at + 1)
+        : event.key === "ArrowUp"
+          ? Math.max(0, at - 1)
+          : event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? buttons.length - 1
+              : null;
+    if (next === null) return;
+    event.preventDefault();
+    buttons[next].focus();
+    setMoved(buttons[next].dataset.rail ?? null);
+  };
+
   return (
     <aside
       aria-label="Every community"
+      onKeyDown={walk}
       className={
         (full ? "h-full " : "max-h-[560px] ") +
         "w-56 shrink-0 overflow-y-auto rounded-lg border border-border bg-surface-sunken p-2"
@@ -372,11 +500,13 @@ function Rail({
           <h3 className="px-2 pb-1 font-display text-xs font-medium uppercase tracking-wider text-text-faint">
             {open}
           </h3>
-          <ul className="flex list-none flex-col">
+          <ul className="m-0 flex list-none flex-col p-0">
             {inside.map((path) => (
               <li key={path}>
                 <button
                   type="button"
+                  data-rail={keyOfFile(path)}
+                  tabIndex={stop === keyOfFile(path) ? 0 : -1}
                   aria-current={path === openFile ? "true" : undefined}
                   onClick={() => onFile(path)}
                   title={path}
@@ -401,11 +531,13 @@ function Rail({
       >
         Communities
       </h3>
-      <ul className="flex list-none flex-col">
+      <ul className="m-0 flex list-none flex-col p-0">
         {listed.map(([title, files]) => (
           <li key={title}>
             <button
               type="button"
+              data-rail={keyOfCommunity(title)}
+              tabIndex={stop === keyOfCommunity(title) ? 0 : -1}
               aria-current={title === open ? "true" : undefined}
               onClick={() => onCommunity(title)}
               className={
@@ -442,6 +574,20 @@ function Rail({
  * is a real and interesting answer, and an empty row where chips normally sit
  * reads as a surface that failed to load.
  */
+/**
+ * The one chip this canvas draws: a neighbour to go to, or a file to stand around.
+ *
+ * It was two recipes that had drifted by one class each, next to a third (the zoom) and a fourth
+ * (the doors above the map) — four ways of drawing a pressable thing on one screen, each read
+ * afresh. The zoom and the doors are now the shared switch track; what is left is a wrapping row of
+ * names, which a track cannot hold, and it is one recipe. The chosen one takes `--text` on its edge
+ * and its ink: the ink and not the hue, and a mark that does not depend on a fill.
+ */
+const CHIP =
+  "rounded-pill border border-border px-2 py-0.5 font-mono text-[11px] text-text-muted hover:border-border-strong hover:text-text";
+const CHIP_CHOSEN =
+  "rounded-pill border border-text bg-surface-raised px-2 py-0.5 font-mono text-[11px] text-text";
+
 function Traffic({
   matrix,
   title,
@@ -452,8 +598,6 @@ function Traffic({
   onOpen: (title: string) => void;
 }) {
   const { uses, usedBy } = trafficFor(matrix, title);
-  const chip =
-    "rounded-pill border border-border px-2 py-0.5 font-mono text-[11px] text-text-muted hover:border-border-strong hover:text-text";
   const row = (label: string, traffic: ReturnType<typeof trafficFor>["uses"]) => (
     <div className="flex flex-wrap items-baseline gap-1">
       <span className="w-16 text-xs uppercase tracking-wide text-text-faint">{label}</span>
@@ -461,7 +605,7 @@ function Traffic({
         <span className="text-xs text-text-faint">nothing</span>
       ) : (
         traffic.map((one) => (
-          <button key={one.title} type="button" onClick={() => onOpen(one.title)} className={chip}>
+          <button key={one.title} type="button" onClick={() => onOpen(one.title)} className={CHIP}>
             {one.title} <span className="text-text-faint">{one.weight}</span>
           </button>
         ))
@@ -547,11 +691,7 @@ function Around({
             aria-pressed={one.path === at}
             title={one.path}
             onClick={() => setCentre(one.path)}
-            className={
-              one.path === at
-                ? "rounded-pill border border-text bg-surface-raised px-2 py-0.5 font-mono text-[11px] text-text"
-                : "rounded-pill border border-border px-2 py-0.5 font-mono text-[11px] text-text-muted hover:border-border-strong hover:text-text"
-            }
+            className={one.path === at ? CHIP_CHOSEN : CHIP}
           >
             {moduleName(one.path)} <span className="text-text-faint">{one.near}</span>
           </button>
@@ -586,11 +726,15 @@ function Around({
  */
 function TooSmall({ reasons }: { reasons: string[] }) {
   if (reasons.length === 0) return null;
+  /*
+    It used to say the numbers could not be read and then draw them anyway, at 6px — a texture
+    that looked like data. Now the marks are drawn without their digits, and the one reading the
+    size took away is given back one mark at a time, in the readout under this line.
+  */
   return (
     <p className="max-w-prose text-xs text-text-muted">
-      <span className="text-text">At this size only the shape reads</span> — which side of the
-      diagonal the marks fall on, and how much is below it. The detail does not:{" "}
-      {reasons.join("; ")}. Stand closer, go full screen, or open a community to read it.
+      <span className="text-text">At this size only the shape reads</span>, so the marks carry no
+      numbers ({reasons.join("; ")}). Point at a mark to read it, or stand closer.
     </p>
   );
 }
@@ -600,7 +744,7 @@ function Refused({ reasons }: { reasons: string[] }) {
   return (
     <div className="rounded-lg border border-border bg-surface-sunken px-4 py-3">
       <p className="text-sm text-text">This one does not draw, and pretending otherwise would help nobody.</p>
-      <ul className="mt-1 list-disc pl-5 text-xs text-text-muted">
+      <ul className="mb-0 mt-1 list-disc pl-5 text-xs text-text-muted">
         {reasons.map((reason) => (
           <li key={reason}>{reason}</li>
         ))}
@@ -638,7 +782,7 @@ function FileLevel({
   return (
     <div className="flex flex-col gap-2">
       {found.isError ? (
-        <p className="text-sm text-text-faint">
+        <p className="text-sm text-text-muted">
           The núcleo could not read this file — it may have moved since the map was walked.
         </p>
       ) : found.data === undefined ? (
@@ -675,16 +819,16 @@ function Claims({
 }) {
   if (claims.length === 0) {
     return (
-      <p className="max-w-prose text-xs text-text-faint">
-        No approved decision names this file. That is §5.1&rsquo;s pile &mdash; code nobody asked
-        for &mdash; and it is a fact about what has been declared, not a verdict about the code.
+      <p className="max-w-prose text-xs text-text-muted">
+        No approved decision names this file, which puts it with the code nobody asked for &mdash;
+        a fact about what has been declared, not a verdict about the code.
       </p>
     );
   }
   return (
     <div className="flex flex-col gap-1">
       <SectionTitle>Decisions that claim this file</SectionTitle>
-      <ul className="flex flex-col gap-1">
+      <ul className="m-0 flex list-none flex-col gap-1 p-0">
         {claims.map((claim) => {
           const standing = standings[String(claim.decision_id)];
           return (
@@ -738,7 +882,7 @@ function FileDrawing({
 
   if (found.reader === null) {
     return (
-      <p className="text-sm text-text-faint">
+      <p className="text-sm text-text-muted">
         Nothing here reads this language yet, so this file has no declarations to draw. It is not
         missing from the map — the level above counts it, and says the same thing about it.
       </p>
@@ -747,7 +891,7 @@ function FileDrawing({
 
   if (found.items.length === 0) {
     return (
-      <p className="text-sm text-text-faint">
+      <p className="text-sm text-text-muted">
         This file declares nothing of its own. It is imports, or a list of modules, or both.
       </p>
     );
@@ -815,7 +959,7 @@ function FileDrawing({
       {found.missed.length > 0 ? (
         <p className="text-xs text-text-faint">Not drawn: {found.missed.join("; ")}.</p>
       ) : null}
-      <ol className="flex flex-col gap-0.5">
+      <ol className="m-0 flex list-none flex-col gap-0.5 p-0">
         {found.items.map((item) => (
           <li key={item.id} className="font-mono text-[11px] text-text-muted">
             <span className="text-text-faint">{item.line}</span> {item.id}
@@ -853,21 +997,46 @@ function Matrix({
 }) {
   const total = matrix.back + matrix.forward;
   const share = total === 0 ? 0 : Math.round((100 * matrix.back) / total);
+  /*
+    What the pointer (or focus) is on, said at a size that reads.
+
+    Opened at the fit, a 64-community matrix sets every label at 6px, and a rotated column header
+    has to be matched to its row by eye across sixty columns. So whatever is under the pointer is
+    named once, above the window, in the type the rest of the page is set in — the one place the
+    name of a mark can be read whatever the zoom is. Delegated from the table rather than bound on
+    4,096 cells.
+  */
+  const [pointed, setPointed] = useState<string | null>(null);
+  const point = (event: SyntheticEvent) => {
+    const target = (event.target as HTMLElement).closest<HTMLElement>("[data-say]");
+    setPointed(target?.dataset.say ?? null);
+  };
+  const files = (title: string) => {
+    const count = matrix.members.get(title)?.length ?? 0;
+    return `${count} file${count === 1 ? "" : "s"}`;
+  };
+  /*
+    The longest row header as printed — title, a space, the file count — and the longest title
+    alone, which is how tall the rotated column headers have to be. Both feed the geometry: the
+    first the width `fit` is computed from, the second the header row, which was a fixed `h-28`
+    that a side-prefixed title outgrew and wrapped into a second, wider column.
+  */
+  const longestRow = matrix.order.reduce(
+    (longest, title) =>
+      Math.max(longest, title.length + 1 + String(matrix.members.get(title)?.length ?? 0).length),
+    0,
+  );
+  const longestTitle = matrix.order.reduce((longest, title) => Math.max(longest, title.length), 0);
+
   return (
     <div className="flex flex-col gap-3">
-      <p className="max-w-prose text-sm text-text-muted">
-        {matrix.files} files joined by {matrix.deps} dependencies — {(matrix.deps / matrix.files).toFixed(1)}{" "}
-        each. No arrangement of boxes and arrows survives that, so this is a matrix: each row uses
-        the columns marked in it. The files were grouped into {matrix.order.length} communities found
-        from the imports themselves. <span className="text-text">A mark above the diagonal is a
-        dependency that goes down. A heavier mark below it points backwards</span> — and no reordering removes it.
-      </p>
       <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-text-muted">
         <span>
-          <span className="font-display text-sm text-text">{matrix.forward}</span> forwards
+          <span className="font-display text-sm text-text">{matrix.forward}</span> point forwards
         </span>
         <span>
-          <span className="font-display text-sm text-text">{matrix.back}</span> backwards · {share}%
+          <span className="font-display text-sm text-text">{matrix.back}</span> point backwards ·{" "}
+          {share}%
         </span>
         {matrix.alone.length > 0 ? (
           <span title={matrix.alone.join("\n")}>
@@ -876,97 +1045,159 @@ function Matrix({
           </span>
         ) : null}
       </div>
+      {/*
+        The legend, one click away. It was a paragraph above the drawing on every open, read once
+        and skipped two hundred times after; the key a reader needs while looking — which side of
+        the diagonal is which — is also in the table's caption, where a screen reader meets it.
+      */}
+      <details className="max-w-prose text-xs text-text-muted">
+        <summary className="cursor-pointer text-text-muted hover:text-text">
+          How to read this matrix
+        </summary>
+        <p className="mb-0 mt-1">
+          {matrix.files} files joined by {matrix.deps} dependencies —{" "}
+          {(matrix.deps / matrix.files).toFixed(1)} each. No arrangement of boxes and arrows
+          survives that, so this is a matrix: each row uses the columns marked in it. The files were
+          grouped into {matrix.order.length} communities found from the imports themselves, and
+          ordered so as little as possible points backwards.{" "}
+          <span className="text-text">
+            A mark above the diagonal points forwards. A heavier mark below it points backwards
+          </span>{" "}
+          — and no reordering removes it.
+        </p>
+      </details>
       <Stage
         full={full}
         onFull={onFull}
         title={`${matrix.order.length} communities, every one of them a drawing of its own`}
-        natural={matrixWidth(
-          matrix.order.length,
-          matrix.order.reduce((longest, title) => Math.max(longest, title.length), 0),
+        natural={matrixWidth(matrix.order.length, longestRow)}
+        note={(zoom) => (
+          <>
+            <TooSmall reasons={unreadableAt(zoom)} />
+            <p className="m-0 h-4 truncate font-mono text-xs text-text-muted">
+              {pointed ?? "Point at a mark or a name to read it here."}
+            </p>
+          </>
         )}
-        note={(zoom) => <TooSmall reasons={unreadableAt(zoom)} />}
       >
-        <table className="m-3 border-collapse font-mono text-xs">
-          <thead>
-            <tr>
-              <th />
-              {matrix.order.map((title) => (
-                <th key={title} className="h-28 align-bottom pb-1">
-                  <button
-                    type="button"
-                    onClick={() => onOpen(title)}
-                    className="[writing-mode:vertical-rl] rotate-180 text-text-muted hover:text-text"
-                  >
-                    {title}
-                  </button>
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {matrix.order.map((row, i) => (
-              <tr key={row}>
-                <th className="whitespace-nowrap px-1 text-right font-normal">
-                  <button
-                    type="button"
-                    onClick={() => onOpen(row)}
-                    className="text-text-muted hover:text-text"
-                  >
-                    {row}{" "}
-                    <span className="text-text-faint">{matrix.members.get(row)?.length}</span>
-                  </button>
-                </th>
-                {matrix.order.map((column, j) => {
-                  const weight = matrix.cells.get(cellKey(row, column));
-                  /*
-                    The two marks this whole matrix exists to be counted by, and neither used to be
-                    drawable: forwards wore the brand colour hand-diluted, and backwards a bare
-                    `danger` name this app has never declared, so the utility compiled to nothing
-                    and every dependency pointing backwards shipped as an empty cell. Both are
-                    fills of `--text` at two weights — never a state tone, because red means
-                    destroyed and a back edge is coupling, not damage. That rule stands; what
-                    follows is what it cost to keep it.
-
-                    THE DIAGONAL IS THE RULE, and the weights are the second reading rather than
-                    the only one. Two weights of one hue cannot carry this distinction on their
-                    own: `/15` against `/35` measured 1.93:1 in dark and 1.63:1 in light, against
-                    the 3:1 a graphical object needs to be told apart, and no pair of opacities on
-                    one hue reaches 3:1 in the light theme at all — `/15` against `/55` is the best
-                    available and stops at 2.95:1. The way out was not a second hue, which would
-                    have bought the number and spent the rule above. It was to stop asking colour
-                    to do it alone: a solid, unbroken staircase down the diagonal turns "above or
-                    below" into a question about POSITION against a visible boundary, which needs
-                    no contrast between the two fills, survives both themes, and survives a reader
-                    who cannot separate them by tone at all. The weights then only have to rank
-                    two things the eye has already placed, and at `/15` against `/55` they measure
-                    3.51:1 in dark and 2.95:1 in light.
-
-                    Full strength and not `surface-sunken`, which is what the diagonal wore while
-                    it was scenery: at the 50% this opens at, a near-background staircase was the
-                    faintest thing on a picture whose whole geometry hangs off it.
-                  */
-                  const tone =
-                    i === j
-                      ? "bg-text"
-                      : weight === undefined
-                        ? ""
-                        : j > i
-                          ? "bg-text/15"
-                          : "bg-text/55";
-                  return (
-                    <td
-                      key={column}
-                      title={weight === undefined ? undefined : `${row} uses ${column} — ${weight}`}
-                      className={`h-[19px] w-[19px] border border-border text-center ${tone}`}
+        {(zoom) => {
+          // Below the size a digit reads at, the digits go and the marks stay: the shape is the
+          // reading that survives, and a 6px numeral is a texture that looks like data.
+          const bare = unreadableAt(zoom).length > 0;
+          return (
+            <table
+              className="m-3 border-collapse font-mono text-xs"
+              onMouseOver={point}
+              onFocus={point}
+              onMouseLeave={() => setPointed(null)}
+            >
+              <caption className="sr-only">
+                Dependencies between {matrix.order.length} communities. Each row uses the columns
+                marked in it; a mark above the diagonal points forwards and one below it points
+                backwards. The list of every community beside this table opens each one.
+              </caption>
+              <thead>
+                <tr>
+                  <th />
+                  {matrix.order.map((title) => (
+                    <th
+                      key={title}
+                      className="p-0 pb-1 align-bottom"
+                      style={{ height: Math.ceil(longestTitle * LABEL_ADVANCE) + 8 }}
                     >
-                      {weight ?? ""}
-                    </td>
-                  );
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
+                      {/*
+                        Out of the Tab order: 128 headers were 128 stops between the doors and the
+                        zoom. The rail lists every community as one stop walked with the arrows,
+                        and that is the keyboard's way in; these stay for the pointer.
+                      */}
+                      <button
+                        type="button"
+                        tabIndex={-1}
+                        data-say={`${title} · ${files(title)}`}
+                        onClick={() => onOpen(title)}
+                        className="rotate-180 whitespace-nowrap p-0 leading-none text-text-muted [writing-mode:vertical-rl] hover:text-text"
+                      >
+                        {title}
+                      </button>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {matrix.order.map((row, i) => (
+                  <tr key={row}>
+                    <th className="whitespace-nowrap px-1 text-right font-normal">
+                      <button
+                        type="button"
+                        tabIndex={-1}
+                        data-say={`${row} · ${files(row)}`}
+                        onClick={() => onOpen(row)}
+                        className="whitespace-nowrap p-0 text-text-muted hover:text-text"
+                      >
+                        {row}{" "}
+                        <span className="text-text-faint">{matrix.members.get(row)?.length}</span>
+                      </button>
+                    </th>
+                    {matrix.order.map((column, j) => {
+                      const weight = matrix.cells.get(cellKey(row, column));
+                      /*
+                        The two marks this whole matrix exists to be counted by, and neither used to be
+                        drawable: forwards wore the brand colour hand-diluted, and backwards a bare
+                        `danger` name this app has never declared, so the utility compiled to nothing
+                        and every dependency pointing backwards shipped as an empty cell. Both are
+                        fills of `--text` at two weights — never a state tone, because red means
+                        destroyed and a back edge is coupling, not damage. That rule stands; what
+                        follows is what it cost to keep it.
+
+                        THE DIAGONAL IS THE RULE, and the weights are the second reading rather than
+                        the only one. Two weights of one hue cannot carry this distinction on their
+                        own: `/15` against `/35` measured 1.93:1 in dark and 1.63:1 in light, against
+                        the 3:1 a graphical object needs to be told apart, and no pair of opacities on
+                        one hue reaches 3:1 in the light theme at all — `/15` against `/55` is the best
+                        available and stops at 2.95:1. The way out was not a second hue, which would
+                        have bought the number and spent the rule above. It was to stop asking colour
+                        to do it alone: a solid, unbroken staircase down the diagonal turns "above or
+                        below" into a question about POSITION against a visible boundary, which needs
+                        no contrast between the two fills, survives both themes, and survives a reader
+                        who cannot separate them by tone at all. The weights then only have to rank
+                        two things the eye has already placed, and at `/15` against `/55` they measure
+                        3.51:1 in dark and 2.95:1 in light.
+
+                        Full strength and not `surface-sunken`, which is what the diagonal wore while
+                        it was scenery: at the 50% this opens at, a near-background staircase was the
+                        faintest thing on a picture whose whole geometry hangs off it.
+                      */
+                      const tone =
+                        i === j
+                          ? "bg-text"
+                          : weight === undefined
+                            ? ""
+                            : j > i
+                              ? "bg-text/15"
+                              : "bg-text/55";
+                      const say =
+                        i === j
+                          ? `${row} · ${files(row)}`
+                          : weight === undefined
+                            ? `${row} does not use ${column}`
+                            : `${row} uses ${column} — ${weight}, pointing ${j > i ? "forwards" : "backwards"}`;
+                      return (
+                        <td
+                          key={column}
+                          data-say={say}
+                          title={weight === undefined ? undefined : `${row} uses ${column} — ${weight}`}
+                          className={`h-[19px] w-[19px] border border-border text-center ${tone}`}
+                        >
+                          {bare ? "" : (weight ?? "")}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          );
+        }}
       </Stage>
     </div>
   );
@@ -1025,7 +1256,13 @@ function Stage({
   /** Whether the whole map surface has the window. Owned by `Shell`, not here. */
   full: boolean;
   onFull: (full: boolean) => void;
-  children: ReactNode;
+  /**
+   * The drawing, or a function of the zoom it is shown at.
+   *
+   * A function for the matrix, which drops its digits below the size a digit reads at; a node
+   * drawing is the same picture at every zoom and passes plain children.
+   */
+  children: ReactNode | ((zoom: number) => ReactNode);
 }) {
   const box = useRef<HTMLDivElement>(null);
   const [room, setRoom] = useState(ASSUMED_ROOM);
@@ -1046,13 +1283,19 @@ function Stage({
 
   const fit = fitZoom(natural, room);
   const at = chosen ?? fit;
-  const step = "rounded-pill border border-border px-2 py-0.5 text-xs text-text-muted enabled:hover:text-text disabled:opacity-40";
+  /*
+    The shared switch track, and it was four loose pills. The doors above the map are the same
+    track now, so a pressable thing on this screen looks one way. Smaller type than the doors,
+    because this is an instrument's control and not a place to go.
+  */
+  const step = "ui-switch-seg px-2! py-0.5! text-xs!";
 
   return (
     <div className={full ? "flex min-h-0 flex-1 flex-col gap-2" : "flex flex-col gap-2"}>
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs text-text-muted">{title}</span>
-        <span className="ml-auto flex items-center gap-1">
+        <span className="ml-auto flex items-center gap-2">
+          <span className="ui-switch" role="group" aria-label="Zoom">
           <button
             type="button"
             aria-label="Further out"
@@ -1064,7 +1307,9 @@ function Stage({
           </button>
           {/* The number is a readout and not a control: there is nothing to press
               here, and a button that does nothing is worse than a word. */}
-          <span className="w-10 text-center font-mono text-xs text-text-muted">{zoomLabel(at)}</span>
+          <span className="w-12 self-center text-center font-mono text-xs text-text-muted">
+            {zoomLabel(at)}
+          </span>
           <button
             type="button"
             aria-label="Closer in"
@@ -1074,12 +1319,26 @@ function Stage({
           >
             +
           </button>
-          <button type="button" onClick={() => setChosen(null)} className={step}>
+          {/* Disabled when the drawing is already at the fit, like `−` and `+` at their ends. */}
+          <button
+            type="button"
+            disabled={chosen === null}
+            onClick={() => setChosen(null)}
+            className={step}
+          >
             fit
           </button>
-          <button type="button" onClick={() => onFull(!full)} className={step}>
-            {full ? "close" : "full screen"}
-          </button>
+          </span>
+          {/* A track of one, so it wears the same edge as the zoom beside it. */}
+          <span className="ui-switch">
+            <button
+              type="button"
+              onClick={() => onFull(!full)}
+              className={step}
+            >
+              {full ? "close" : "full screen"}
+            </button>
+          </span>
         </span>
       </div>
       {note?.(at)}
@@ -1100,7 +1359,7 @@ function Stage({
           "w-full overflow-auto rounded-lg border border-border bg-surface"
         }
       >
-        <div style={{ zoom: at }}>{children}</div>
+        <div style={{ zoom: at }}>{typeof children === "function" ? children(at) : children}</div>
       </div>
     </div>
   );
@@ -1139,8 +1398,10 @@ function Graph({
   return (
     <Stage title={title} natural={drawn.width + PAD * 2} full={full} onFull={onFull}>
       <svg
-        // This is a picture; “Every community” is its text alternative, and its name lets a reader decide to skip it.
-        role="img"
+        // A picture when nothing in it can be pressed; “Every community” is its text alternative,
+        // and its name lets a reader decide to skip it. A group when its boxes are doors, because
+        // `img` makes everything inside it presentational and the doors would vanish with it.
+        role={onOpen === undefined ? "img" : "group"}
         aria-label={title}
         width={drawn.width + PAD * 2}
         height={drawn.height + PAD * 2}
@@ -1172,7 +1433,29 @@ function Graph({
               key={node.id}
               transform={`translate(${node.x - node.width / 2},${node.y - NODE_H / 2})`}
               onClick={onOpen === undefined ? undefined : () => onOpen(node.id)}
-              className={onOpen === undefined ? undefined : "cursor-pointer"}
+              /*
+                A door the keyboard can reach. It was a `<g onClick>` and nothing else, so the
+                layered picture — the best moment of this mode — could only be entered with a
+                pointer. The ring is drawn on the box, because an outline on an SVG group is not
+                drawn by every engine.
+              */
+              role={onOpen === undefined ? undefined : "button"}
+              tabIndex={onOpen === undefined ? undefined : 0}
+              aria-label={onOpen === undefined ? undefined : `Open ${node.id}`}
+              onKeyDown={
+                onOpen === undefined
+                  ? undefined
+                  : (event) => {
+                      if (event.key !== "Enter" && event.key !== " ") return;
+                      event.preventDefault();
+                      onOpen(node.id);
+                    }
+              }
+              className={
+                onOpen === undefined
+                  ? undefined
+                  : "cursor-pointer outline-none [&:focus-visible>rect]:stroke-focus-ring [&:focus-visible>rect]:[stroke-width:2]"
+              }
             >
               <title>{node.id}</title>
               <rect

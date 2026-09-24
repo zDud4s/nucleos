@@ -28,6 +28,24 @@ const twoGroups = (() => {
   return { modules: names.map(mod), imports };
 })();
 
+describe("what a community is called", () => {
+  it("carries its side when the project has more than one", () => {
+    // `transcription`, `transcription (2)`: nothing said which was the core's and which the
+    // shell's, so every numbered row had to be opened to find out.
+    const modules = ["core/src/job.rs", "core/src/run.rs", "shell/src/job.ts", "shell/src/run.ts"].map(mod);
+    const matrix = buildCommunities(modules, [
+      link("core/src/run.rs", "core/src/job.rs"),
+      link("shell/src/run.ts", "shell/src/job.ts"),
+    ]);
+    expect([...matrix.order].sort()).toEqual(["core·job", "shell·job"]);
+  });
+
+  it("carries no side in a project that has only one", () => {
+    const matrix = buildCommunities(twoGroups.modules, twoGroups.imports);
+    expect(matrix.order.every((title) => !title.includes("·"))).toBe(true);
+  });
+});
+
 describe("what a community touches", () => {
   it("keeps the two directions apart, because they are opposite facts", () => {
     const matrix = buildCommunities(twoGroups.modules, twoGroups.imports);

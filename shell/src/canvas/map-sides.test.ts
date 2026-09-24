@@ -127,6 +127,8 @@ describe("buildSides", () => {
     );
     expect(sides.crossing).toBe(1);
     expect(sides.sides.every((side) => side.imports === 0)).toBe(true);
+    // And the import itself, so the red line that counts it can also name it.
+    expect(sides.crossings).toEqual([{ from: "core/src/a.rs", to: "shell/src/x.ts" }]);
   });
 
   it("counts an edge whose end is no module at all, instead of dropping it", () => {
@@ -139,6 +141,7 @@ describe("buildSides", () => {
       [],
     );
     expect(sides.loose).toBe(1);
+    expect(sides.strays).toEqual([{ from: "core/src/a.rs", to: "gone.rs" }]);
     expect(sides.crossing).toBe(0);
   });
 

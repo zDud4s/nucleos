@@ -1,6 +1,6 @@
 // §spec mapa-do-projeto
 import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 
 import { Boundary } from "./Boundary";
 import type { ForeignFile, MapImport, MapModule, Seam } from "../data/project-map";
@@ -72,6 +72,9 @@ describe("the sides of the product", () => {
     // The number can only be zero: no Rust file imports a TypeScript module and the núcleo resolves
     // imports inside one folder. Drawn without the sentence it reads as a clean bill of health.
     draw([mod("core/src/a.rs"), mod("shell/src/x.ts")], []);
+    // The line says it; the reasoning is one click away rather than on every open.
+    expect(screen.getByText(/These sides share no source/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "why?" }));
     expect(screen.getByText(/No import crosses between them, and none could/)).toBeTruthy();
     expect(screen.getByText(/it does not say they are independent/)).toBeTruthy();
   });
@@ -109,8 +112,8 @@ describe("the boundary between the two sides", () => {
     draw([mod("core/src/a.rs"), mod("shell/src/x.ts")], [], {
       seam: { served: ["/things", "/quiet"], calls: 1, matched: 1, uncalled: ["/quiet"] },
     });
-    expect(screen.getByText(/What passes between them is HTTP/)).toBeTruthy();
-    expect(screen.getByText("2")).toBeTruthy();
+    expect(screen.getByText(/What passes between them is HTTP: 2 routes/)).toBeTruthy();
+    // The verified answer stays on the line, visible, rather than behind the disclosure.
     expect(screen.getByText(/Nothing asks for a route that does not exist/)).toBeTruthy();
   });
 
@@ -137,11 +140,12 @@ describe("the boundary between the two sides", () => {
       { seam: { served: ["/things"], calls: 1, matched: 0, unmatched: [{ path: "/thingz", file: "shell/src/data/things.ts", line: 12 }] } },
     );
 
-    const wrong = container.querySelector(".ui-wrong") as HTMLElement | null;
-    expect(wrong?.className).toContain("ui-wrong");
-    expect(wrong?.textContent).toContain("cross between sides");
-    expect((container.querySelector(".bg-tone-danger-bg") as HTMLElement | null)?.className).toContain(
-      "bg-tone-danger-bg",
+    const wrong = [...container.querySelectorAll(".ui-wrong")].map((one) => one.textContent);
+    // The verdict counts them, and each is a row of its own in the colour that means look.
+    expect(wrong[0]).toBe("2 findings on this reading");
+    expect(wrong.some((text) => /cross(es)? between sides/.test(text ?? ""))).toBe(true);
+    expect(wrong.some((text) => text?.includes("ask for a route this daemon does not serve"))).toBe(
+      true,
     );
   });
 
@@ -157,8 +161,58 @@ describe("the boundary between the two sides", () => {
         uncalled: ["/b"],
       },
     });
+    fireEvent.click(screen.getByRole("button", { name: "why?" }));
     expect(screen.getByText(/hand the path in from elsewhere/)).toBeTruthy();
+    // As a list and not a tooltip: a hover is not something a keyboard can do.
+    expect(screen.getByText("shell/src/data/runs.ts:210")).toBeTruthy();
     expect(screen.getByText(/not a list of dead code/)).toBeTruthy();
+  });
+});
+
+describe("an alarm with its proof", () => {
+  /**
+   * "17 imports cross between sides" was drawn in red and named none of them: a bug report without
+   * a stack trace, to a reader who is also the person who fixes it. The count must come with the
+   * lines it counts.
+   */
+  it("lists every import that crosses, from and to", () => {
+    draw(
+      [mod("core/src/a.rs"), mod("shell/src/x.ts"), mod("shell/src/y.ts")],
+      [link("core/src/a.rs", "shell/src/x.ts"), link("shell/src/y.ts", "shell/src/x.ts")],
+    );
+    const list = screen.getByRole("list", { name: "Imports that cross between sides" });
+    expect(within(list).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+      "core/src/a.rs → shell/src/x.ts",
+    ]);
+    expect(screen.getByText(/report it with this list/)).toBeTruthy();
+  });
+
+  it("leads with a verdict that counts only what must be zero and is not", () => {
+    // A blind spot is a limit on the answer, not a finding: counting it would cry wolf on every
+    // open of a project that has Go in it.
+    draw([mod("core/src/a.rs")], [], { unread: ["sidecars/echo/main.go"] });
+    expect(screen.getByText("Nothing this reading checks came back wrong")).toBeTruthy();
+    // Two: the Go folder, and a daemon side this reading found no route on.
+    expect(screen.getByText(/2 limits on what it could see/)).toBeTruthy();
+  });
+
+  it("offers the drawing that shows what points backwards, and counts it with the matrix's number", () => {
+    let opened = 0;
+    render(
+      <Boundary
+        modules={[mod("core/src/a.rs")]}
+        imports={[]}
+        unread={[]}
+        foreign={[]}
+        seam={quietSeam}
+        direction={{ forward: 3, back: 1 }}
+        onMatrix={() => (opened += 1)}
+      />,
+    );
+    expect(screen.getByText(/dependencies between communities point backwards/)).toBeTruthy();
+    expect(screen.getByText("25%")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "show them" }));
+    expect(opened).toBe(1);
   });
 });
 

@@ -1,16 +1,16 @@
 // §spec mapa-do-projeto
-import { useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { useProjectMap, useProjectSpecs, type ProjectMap } from "../data/project-map";
 import { Boundary } from "../canvas/Boundary";
 import { MapCanvas } from "../canvas/MapCanvas";
 import { declaredCoverage } from "../canvas/map-model";
-import { drawableLinks } from "../canvas/map-graphs";
+import { buildCommunities, drawableLinks, type CommunityMatrix } from "../canvas/map-graphs";
 import { StampsPanel } from "./StampsPanel";
 import { ExtractSpec } from "./ExtractSpec";
 import { JunctionPanel } from "./JunctionPanel";
 import { DecisionsWaiting } from "./DecisionsWaiting";
 import { TriagePanel } from "./TriagePanel";
-import { ErrorNote } from "../ui";
+import { Button, ErrorNote, StaleNote, relativeText } from "../ui";
 
 /**
  * "What is in here, what did nobody ask for, and what did this project actually decide?"
@@ -82,24 +82,42 @@ export function ModeMap({ projectId }: ModeMapProps) {
   */
   const specs = useProjectSpecs(projectId);
   const [view, setView] = useState<MapView>("picture");
+  /*
+    Built once, here, for two readers: the header's row counting what points backwards and the
+    matrix that draws it below its diagonal. One build is one number — and the seriation is the
+    dearest thing this mode computes, so it is not paid twice per open either.
+  */
+  const matrix = useMemo(
+    () => (map.data === undefined ? null : buildCommunities(map.data.modules, map.data.imports)),
+    [map.data],
+  );
+  const readAgain = () => void map.refetch();
 
   return (
     <div className="flex flex-col gap-6">
       {/*
-        The headline and the seam, above every door. Absent until there is an answer to draw them
+        The verdict and the seam, above every door. Absent until there is an answer to draw them
         from — a header of dashes over a map still loading is a measurement nobody took.
       */}
       {map.data === undefined ? null : (
-        <>
-          <Headline data={map.data} />
-          <Boundary
-            modules={map.data.modules}
-            imports={map.data.imports}
-            unread={map.data.unread}
-            foreign={map.data.foreign}
-            seam={map.data.seam}
-          />
-        </>
+        <Boundary
+          modules={map.data.modules}
+          imports={map.data.imports}
+          unread={map.data.unread}
+          foreign={map.data.foreign}
+          seam={map.data.seam}
+          direction={matrix ?? undefined}
+          onMatrix={() => setView("picture")}
+          meta={
+            <Reading
+              data={map.data}
+              updatedAt={map.dataUpdatedAt}
+              reading={map.isFetching}
+              failed={map.isError}
+              onRead={readAgain}
+            />
+          }
+        />
       )}
 
       <Views view={view} onView={setView} data={map.data} specs={specs.data?.length ?? null} />
@@ -116,19 +134,24 @@ export function ModeMap({ projectId }: ModeMapProps) {
         </div>
       ) : map.isError ? (
         <ErrorNote>
-          The núcleo could not read this project&rsquo;s map — its folder may have moved.
+          The núcleo could not read this project&rsquo;s map — its folder may have moved.{" "}
+          <Button variant="quiet" onClick={readAgain} disabled={map.isFetching}>
+            {map.isFetching ? "reading…" : "read it again"}
+          </Button>
         </ErrorNote>
-      ) : map.data === undefined ? (
+      ) : map.data === undefined || matrix === null ? (
         <p className="text-sm text-text-faint">Reading the project&rsquo;s tree…</p>
       ) : (
-        <Derived projectId={projectId} view={view} data={map.data} />
+        <Derived projectId={projectId} view={view} data={map.data} matrix={matrix} />
       )}
 
-      <p className="max-w-prose text-sm text-text-muted">
-        Structure, intention, the join between them, your verdict on each line, and what a model
-        thought was worth your eyes. The evidence layer is a slice that does not exist yet — nothing
-        here reads a test, or a gate, or asks whether the code that claims a decision actually does
-        what it says.
+      {/*
+        One line, and it was four sentences at the foot of every door: every visit ended on an
+        absence. The absence is still said — a map that implies a layer it has not got is the
+        false confidence this mode exists to cure — but once, and quietly.
+      */}
+      <p className="m-0 text-xs text-text-faint">
+        Not on this map yet: evidence — nothing here reads a test or a gate.
       </p>
     </div>
   );
@@ -141,11 +164,17 @@ export function ModeMap({ projectId }: ModeMapProps) {
  * a grid of zeros on a project with no approved decision — *"a row of `0`s reads as a measurement,
  * and here nothing has been measured"* — and a chip reading `Junction 0` is that same claim in
  * less space and with more authority. So until one decision is approved, those three doors carry
- * an em dash: this app's own mark for a reading nobody took, with the reason on hover and the
- * whole sentence behind the door.
+ * an em dash: this app's own mark for a reading nobody took, with the reason on hover, read out as
+ * the button's description, and the whole sentence behind the door.
  *
  * The specs door is not like them. A count of documents on disk is a real measurement whatever
  * else this project has or has not got, so it says the number even when the number is nought.
+ *
+ * **The shared switch track, and the door you are behind is marked three ways at once**: the
+ * raised rung, the top ink, and `.ui-current`'s 2px rule on the leading edge. It was the rule
+ * alone, inside a chip that already had a border, and "Picture" and "Junction" could barely be
+ * told apart; a rung alone vanishes in the light theme, where `--surface` and `--surface-raised`
+ * are the same white. The rule survives both themes and the ink carries the rest.
  */
 function Views({
   view,
@@ -159,6 +188,7 @@ function Views({
   /** How many documents there are to read, or `null` while that listing is unanswered. */
   specs: number | null;
 }) {
+  const said = useId();
   const approved = data?.junction.counts.decisions ?? 0;
   /* Nothing has been read against the code yet, so nothing counted over it is a measurement. */
   const layered = data !== undefined && approved > 0;
@@ -196,32 +226,38 @@ function Views({
   };
 
   return (
-    <nav aria-label="Views of this map" className="flex flex-wrap gap-2">
+    <nav aria-label="Views of this map" className="ui-switch">
       {VIEWS.map((candidate) => {
         const { of, means } = counts[candidate];
+        const current = candidate === view;
         return (
           <button
             key={candidate}
             type="button"
             onClick={() => onView(candidate)}
-            aria-current={candidate === view ? "true" : undefined}
+            aria-current={current ? "true" : undefined}
+            aria-describedby={`${said}-${candidate}`}
             title={means}
-            /*
-              The door you are behind is `.ui-current` — a 2px rule on the leading edge — and
-              nothing else. It was the brand colour over a raised fill, which is the one thing the
-              cyan may never mark; and a fill cannot mark anything in the light theme, where
-              `--surface` and `--surface-raised` are the same white.
-            */
             className={
-              candidate === view
-                ? "ui-current inline-flex items-baseline gap-2 rounded-md border border-border px-3 py-1.5 text-xs text-text"
-                : "inline-flex items-baseline gap-2 rounded-md border border-border px-3 py-1.5 text-xs text-text-muted hover:text-text"
+              current
+                ? "ui-switch-seg ui-current inline-flex items-baseline gap-2 bg-surface-raised! text-text!"
+                : "ui-switch-seg inline-flex items-baseline gap-2"
             }
           >
             {VIEW_LABEL[candidate]}
-            {candidate === "picture" ? null : (
-              <span className="font-mono text-text-faint">{of === null ? "—" : of}</span>
+            {candidate === "picture" ? null : of === null ? (
+              <>
+                <span aria-hidden="true" className="font-mono text-text-faint">
+                  —
+                </span>
+                <span className="sr-only">not measured</span>
+              </>
+            ) : (
+              <span className="font-mono text-text-faint">{of}</span>
             )}
+            <span id={`${said}-${candidate}`} hidden>
+              {means}
+            </span>
           </button>
         );
       })}
@@ -230,59 +266,76 @@ function Views({
 }
 
 /**
- * The map's own headline: the size of what this reader could read, and how much of it said so.
+ * The line under the verdict: the size of what this reader could read, and when it read it.
  *
- * **It reports what this half alone knows, and nothing else.** It used to report
- * `modules.filter(m => !m.declares).length` under the words "declaring nothing they implement",
- * which is the same concept as `junction.counts.unclaimed` — and the two disagreed. `declares` is
- * `source.contains('§')`, the file's own gesture at a section, bare `§` included; `unclaimed` is
- * an empty `cites`, and a TypeScript module's `cites` folds in its sibling test's, the way a Rust
- * module has always got its `#[cfg(test)]` citations for free. Four modules of this repository are
- * `declares: false` with a non-empty `cites` — their tests name what they prove, so they are not
- * code nobody asked for. Two numbers meaning almost the same thing and disagreeing by four, on one
- * screen, is precisely the confusion this mode exists to remove, so the junction is the single
- * owner of that count and this reports the size of what it could read.
+ * **The size used to be the page's hero** — `245` at display size, the largest thing on the
+ * screen — and it answers nothing: a project's size is not whether it is fine. It is metadata,
+ * and it sits where metadata sits.
+ *
+ * **When the tree was read is the half that was missing.** The map is read on open and never
+ * polled (walking a thousand files every few seconds is the wrong trade), so a map left open over
+ * lunch is a lunch-old map with nothing saying so. Principle 4 of this product is *never claim
+ * currency you do not have*: the time is printed, and reading it again is one press.
+ *
+ * It reports what this half alone knows. It once reported `modules.filter(m => !m.declares)`
+ * under the words "declaring nothing they implement", which is the junction's `unclaimed` by
+ * another derivation — and the two disagreed by four on one screen. The junction owns that count.
  */
-function Headline({ data }: { data: ProjectMap }) {
-  const { modules, imports, unread, foreign } = data;
+function Reading({
+  data,
+  updatedAt,
+  reading,
+  failed,
+  onRead,
+}: {
+  data: ProjectMap;
+  /** react-query's `dataUpdatedAt`: when the tree was last read successfully. */
+  updatedAt: number;
+  reading: boolean;
+  failed: boolean;
+  onRead: () => void;
+}) {
+  const { modules, imports, foreign } = data;
   // Counted rather than taken from `imports.length`: this is the number of links the map would
   // actually draw, which drops any edge with an end it cannot find.
   const links = drawableLinks(modules, imports);
-  // **§8 on screen, because until now it was legible only to the parser.** A bare `§7` names a
-  // section of *some* document; the header says which. Every confirmation this mode draws below
-  // rests on that, so a reader has to be able to ask how much of the project has said it — a
-  // green over an undeclared file is a guess wearing the same colour as a fact.
-  //
-  // Counted over the files that name a section and not over `modules.length`, and the two must
-  // not be confused: a file with no `§` has nothing to declare, and the denominator on the line
-  // above is a different question with a different answer.
+  // §8 on screen: a bare `§7` names a section of *some* document, and the header says which.
+  // Counted over the files that name a section and not over `modules.length` — a file with no `§`
+  // has nothing to declare.
   const declared = declaredCoverage(modules, foreign);
 
   return (
-    <div>
-      <p className="mt-1 font-display text-3xl font-bold tabular-nums text-text">
-        {modules.length}
-      </p>
-      <p className="mt-1 text-xs uppercase tracking-wide text-text-faint">
-        module{modules.length === 1 ? "" : "s"} this reader could read
-      </p>
-      {declared.citing > 0 ? (
-        <>
-          <p className="mt-2 font-display text-3xl font-bold tabular-nums text-text">
-            {declared.saying}
-          </p>
-          <p className="mt-1 text-xs uppercase tracking-wide text-text-faint">
-            of {declared.citing} file{declared.citing === 1 ? "" : "s"} naming a section say which
-            document it belongs to
-          </p>
-        </>
-      ) : null}
-      <p className="mt-1 text-xs text-text-muted">
-        joined by {links} link{links === 1 ? "" : "s"}
-        {unread.length > 0
-          ? ` · ${unread.length} file${unread.length === 1 ? "" : "s"} in a language it cannot read yet`
+    <div className="flex flex-col gap-1">
+      {/*
+        One line of prose, and set as prose: no flex gap between its pieces (which put a wide gap
+        before each "·"), and the time as words rather than `RelativeTime`'s mono, which is the
+        face for a value the daemon wrote. "just now" is a phrase this line says, not an id.
+        The exact time stays on hover and in `dateTime`.
+      */}
+      <p className="m-0 text-xs text-text-muted">
+        <span className="font-mono tabular-nums text-text">{modules.length}</span> module
+        {modules.length === 1 ? "" : "s"} this reader could read · {links} link
+        {links === 1 ? "" : "s"}
+        {declared.citing > 0
+          ? ` · ${declared.saying} of ${declared.citing} files naming a section say which document`
           : ""}
+        {updatedAt > 0 ? (
+          <>
+            {" · read "}
+            <time
+              dateTime={new Date(updatedAt).toISOString()}
+              title={new Date(updatedAt).toLocaleString()}
+            >
+              {relativeText(updatedAt, Date.now())}
+            </time>
+          </>
+        ) : null}
+        {" · "}
+        <Button variant="quiet" onClick={onRead} disabled={reading}>
+          {reading ? "reading…" : "read again"}
+        </Button>
       </p>
+      {failed ? <StaleNote dataUpdatedAt={updatedAt} /> : null}
     </div>
   );
 }
@@ -302,10 +355,12 @@ function Derived({
   projectId,
   view,
   data,
+  matrix,
 }: {
   projectId: string;
   view: MapView;
   data: ProjectMap;
+  matrix: CommunityMatrix;
 }) {
   const {
     modules,
@@ -334,12 +389,15 @@ function Derived({
         imports={imports}
         junction={junction}
         standings={standings}
+        matrix={matrix}
       />
     );
   }
 
   if (view === "junction") {
-    return <JunctionPanel junction={junction} projectId={projectId} />;
+    // The modules ride along so the panel can check its own "nobody asked for" pile against the
+    // citations the sides above are counted from: two derivations of one fact, on one screen.
+    return <JunctionPanel junction={junction} projectId={projectId} modules={modules} />;
   }
 
   if (view === "stamps") {
