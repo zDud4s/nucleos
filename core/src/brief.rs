@@ -14,6 +14,20 @@ use crate::knowledge::{self, Brief, Budget, Context, Scope, Scored};
 /// Bounded work on the briefing hot path, as `knowledge::MAX_READ` bounds the candidate fetch.
 const MAX_QUERY_TERMS: usize = 64;
 
+/// Briefing traces keep the same 90-day window as `feed::DEFAULT_RETENTION_DAYS` and
+/// `council::DEFAULT_COUNCIL_RETENTION_DAYS`, not the transcript's 30 days. The risk in spec
+/// section 13.6 is not the volume of one run: the consolidator grows the store by itself, so
+/// candidates times runs grows quadratically.
+pub const DEFAULT_KNOWLEDGE_TRACE_RETENTION_DAYS: i64 = 90;
+
+/// The trace window, overridable independently from the other hourly retention sweeps.
+pub(crate) fn retention_days() -> i64 {
+    std::env::var("NUCLEOS_KNOWLEDGE_TRACE_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_KNOWLEDGE_TRACE_RETENTION_DAYS)
+}
+
 /// Build an OR expression because an implicit FTS5 AND over a whole node prompt usually matches
 /// no row and would leave the FTS signal at zero for every candidate.
 fn match_expression(query: &str) -> Option<String> {
@@ -138,6 +152,29 @@ pub async fn record(
     }
     tx.commit().await?;
     Ok(inserted)
+}
+
+/// Delete briefing explanations past their window without touching learned signal.
+///
+/// Migration 0143 makes `run_knowledge` the trace, not the signal: counters and recency live on
+/// the knowledge row. [`record`] writes `at` as RFC 3339, so computing the cutoff in Rust makes
+/// the TEXT comparison exact rather than mixing SQLite's space-separated datetime format with
+/// RFC 3339's `T` separator.
+pub async fn prune(
+    pool: &SqlitePool,
+    retain_days: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<u64> {
+    if retain_days <= 0 {
+        return Ok(0);
+    }
+
+    let cutoff = (now - chrono::Duration::days(retain_days)).to_rfc3339();
+    Ok(sqlx::query("DELETE FROM run_knowledge WHERE at < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?
+        .rows_affected())
 }
 
 /// What the work that received a briefing ultimately proved.
@@ -457,7 +494,7 @@ mod tests {
     use sqlx::{Row, SqlitePool};
 
     use super::{
-        Verdict, credit_item, credit_run, item_verdict, match_expression, normalise_fts, of,
+        Verdict, credit_item, credit_run, item_verdict, match_expression, normalise_fts, of, prune,
         record, run_verdict, sweep,
     };
     use crate::job::ItemState;
@@ -596,6 +633,77 @@ mod tests {
             node: None,
             gate: None,
         }
+    }
+
+    /// The briefing trace has its own 90-day window: the same as the feed and council sweeps in
+    /// the hourly loop, not the transcript's 30 days. What expires is the explanation of a
+    /// briefing. Pruning touches no signal because the counters and `last_shown_at` live on the
+    /// knowledge row. `prune_transcripts` is the precedent for the shape and the counter-example
+    /// for the mechanism: it empties columns and deletes no rows. The row itself is NOT deleted,
+    /// and that is the whole design.
+    #[tokio::test]
+    async fn pruning_the_trace_loses_the_explanation_and_no_signal() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let now = chrono::Utc::now();
+        let old_at = (now - chrono::Duration::days(91)).to_rfc3339();
+        let recent_at = (now - chrono::Duration::days(1)).to_rfc3339();
+        let last_shown_at = (now - chrono::Duration::days(2)).to_rfc3339();
+        let measured = seed(&pool, "machine", None, "measured").await?;
+        let untouched = seed(&pool, "machine", None, "untouched").await?;
+        let run_id = seed_run(&pool, "completed", Some(0), Some("passed"), None).await?;
+
+        sqlx::query(
+            "UPDATE knowledge
+                SET shown_count = 3, outcome_count = 2, green_count = 1, last_shown_at = ?
+              WHERE id = ?",
+        )
+        .bind(&last_shown_at)
+        .bind(measured)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO run_knowledge
+               (run_id, knowledge_id, shown, s_fts, s_scope, s_structure, s_recency, s_use, at,
+                credited_at)
+             VALUES (?, ?, 1, 0.0, 0.0, 0.0, 0.0, 0.0, ?, NULL)",
+        )
+        .bind(run_id)
+        .bind(measured)
+        .bind(&old_at)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO run_knowledge
+               (run_id, knowledge_id, shown, s_fts, s_scope, s_structure, s_recency, s_use, at,
+                credited_at)
+             VALUES (?, ?, 0, 0.0, 0.0, 0.0, 0.0, 0.0, ?, ?)",
+        )
+        .bind(run_id)
+        .bind(untouched)
+        .bind(&recent_at)
+        .bind(&recent_at)
+        .execute(&pool)
+        .await?;
+
+        let before = counters(&pool, measured).await?;
+        assert_eq!(prune(&pool, 90, now).await?, 1);
+        let remaining: Vec<(i64, String)> =
+            sqlx::query_as("SELECT knowledge_id, at FROM run_knowledge")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(remaining, vec![(untouched, recent_at)]);
+        assert_eq!(counters(&pool, measured).await?, before);
+        let knowledge_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(knowledge_rows, 2);
+
+        assert_eq!(prune(&pool, 0, now).await?, 0);
+        let trace_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_knowledge")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(trace_rows, 1);
+        Ok(())
     }
 
     #[test]
