@@ -87,7 +87,10 @@
 
   --text: #e7eaf0;
   --text-muted: #98a1b2;
-  --text-faint: #6a7484;
+  /* 4.67:1 on --surface-raised, the darkest ground it lands on; 5.14 on --surface, 5.54 on
+     --bg. #6a7484 before it measured 3.45, 3.80 and 4.09 — below AA on every ground, and it
+     carries column headers, crumbs and refusal lines, not decoration. */
+  --text-faint: #808a9a;
 
   /* The one brand colour. Not a state; never used to mean anything. */
   --accent: #4fd1e0;
@@ -246,7 +249,9 @@
 
     --text: #12151b;
     --text-muted: #545d6c;
-    --text-faint: #79828f;
+    /* 4.56:1 on --surface-sunken, 4.90 on --bg, 5.29 on --surface. #79828f before it
+       measured 3.35, 3.60 and 3.89. */
+    --text-faint: #646c7a;
 
     /* Link text on every light ground: 5.26:1 on --surface, 4.87:1 on --bg and 4.53:1 on
        --surface-sunken. #0b8493 before it measured 4.43, 4.10 and 3.82, so a link in the page
