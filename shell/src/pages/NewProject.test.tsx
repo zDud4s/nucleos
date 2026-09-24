@@ -1,6 +1,6 @@
 // §spec workspace-de-projeto
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
@@ -9,24 +9,26 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
+import { ApiRefusal } from "../data/client";
 import {
   bundle,
   daemonFetch,
   daemonState,
   daemonText,
   detected,
+  project,
   renderApp,
   type DaemonState,
 } from "../test/harness";
 import { suggestedId } from "../data/detect";
 
 /** Open the wizard over a daemon holding these facts, and point it at a folder. */
-async function openWizard(overrides: Partial<DaemonState> = {}) {
+async function openWizard(overrides: Partial<DaemonState> = {}, initialPath = "/projects/new") {
   const state = daemonState(overrides);
   daemon.apiFetch.mockImplementation(daemonFetch(state));
   daemon.apiText.mockImplementation(daemonText(state));
   daemon.probeHealth.mockResolvedValue(true);
-  const rendered = await renderApp({ initialPath: "/projects/new" });
+  const rendered = await renderApp({ initialPath });
   return { state, rendered };
 }
 
@@ -56,7 +58,7 @@ describe("adding a project", () => {
   });
 
   /**
-   * **§9's second step, and the reason it exists.** This repository's way of working is a folder,
+   * §9's second step, and the reason it exists. This repository's way of working is a folder,
    * and the app has to recognise it rather than ask for it to be described again.
    *
    * Adopting copies nothing, so the sentence has to say what it does give up — updates — because a
@@ -75,7 +77,8 @@ describe("adding a project", () => {
     });
     await look();
 
-    expect(await screen.findByText(".ai")).toBeTruthy();
+    // By its radio: the path is also in the receipt of what adding will write.
+    expect(await screen.findByRole("radio", { name: /\.ai/ })).toBeTruthy();
     expect(screen.getByText("42 files")).toBeTruthy();
     expect(screen.getByText(/receives no updates/)).toBeTruthy();
     expect(screen.getByText(/not copied, not rewritten/)).toBeTruthy();
@@ -107,7 +110,9 @@ describe("adding a project", () => {
     await look("C:/Projects/nucleos");
 
     fireEvent.click(await screen.findByRole("checkbox", { name: /gate/ }));
-    fireEvent.change(screen.getByLabelText("WIP ceiling"), { target: { value: "3" } });
+    // The same name and the same control as the Settings block this number is found under next.
+    const ceiling = screen.getByRole("group", { name: "Open-proposal ceiling" });
+    fireEvent.click(within(ceiling).getByRole("button", { name: "Raise the ceiling" }));
     fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
 
     await waitFor(() => expect(state.projects.length).toBeGreaterThan(0));
@@ -142,10 +147,11 @@ describe("adding a project", () => {
     // Twice on the page and deliberately: once in the banner explaining what would go wrong, and
     // once beside the button that is disabled because of it.
     expect((await screen.findAllByText(/already registered as/)).length).toBe(2);
-    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty(
-      "disabled",
-      true,
-    );
+    const add = screen.getByRole("button", { name: "add it, in shadow" });
+    expect(add).toHaveProperty("disabled", true);
+    // The reason is the button's description, not a span a screen reader never reaches.
+    const reason = document.getElementById(add.getAttribute("aria-describedby") ?? "");
+    expect(reason?.textContent).toBe("already registered as nucleos");
   });
 
   /**
@@ -166,7 +172,7 @@ describe("adding a project", () => {
       library: [bundle()],
     });
     await look();
-    await screen.findByText(".ai");
+    await screen.findByRole("radio", { name: /\.ai/ });
     expect(screen.queryByLabelText("Workflow")).toBeNull();
   });
 
@@ -184,18 +190,25 @@ describe("adding a project", () => {
     );
   });
 
-  /** Three refusals, three sentences: they send somebody to three different places. */
+  /**
+   * Three refusals, three sentences: they send somebody to three different places. A refusal is
+   * the daemon answering, so it is a status and not an alert.
+   */
   it("says which of the three reasons a folder could not be read", async () => {
     await openWizard({ detected: null });
     await look("C:/nowhere");
-    expect(await screen.findByText(/nothing at that path/)).toBeTruthy();
+    const note = (await screen.findByText(/nothing at that path/)).closest("p");
+    expect(note?.getAttribute("role")).toBe("status");
+    expect(within(note as HTMLElement).getByText("no_such_folder")).toBeTruthy();
   });
 
   /**
-   * A failure part-way through stops and says so. Carrying on would leave a project registered,
-   * half-configured, with nothing on screen saying which half.
+   * A failure part-way through stops and says so — and says what already landed. Carrying on would
+   * leave a project registered, half-configured, with nothing on screen saying which half; and a
+   * button left inviting a second press would repeat the registration. So the receipt marks the
+   * line that stopped, the button goes, and the way on is the project's own page.
    */
-  it("stops at the first refusal instead of leaving a project half-configured", async () => {
+  it("stops at the first refusal, says what was already written, and does not invite a retry", async () => {
     const { state } = await openWizard({
       detected: detected({
         harnesses: [{ path: ".ai", what: "a pipeline", files: 3 }],
@@ -208,9 +221,163 @@ describe("adding a project", () => {
     fireEvent.click(await screen.findByRole("checkbox", { name: /gate/ }));
     fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
 
-    expect(await screen.findByText(/the stop is engaged/)).toBeTruthy();
+    expect(await screen.findByText(/Registered as/)).toBeTruthy();
+    expect(screen.getByText(/Registered as/).textContent).toBe(
+      "Registered as thing in shadow, and stopped at adopting .ai. Nothing after it was tried.",
+    );
+    expect(screen.getByText(/kill switch is engaged/)).toBeTruthy();
+    expect(screen.getByText("kill_switch")).toBeTruthy();
+    expect(screen.getAllByText("done").length).toBe(1);
+    expect(screen.getByText("stopped here")).toBeTruthy();
+    expect(screen.getAllByText("not tried").length).toBe(2);
+
     // The project row was written — that step succeeded — and nothing after the refusal ran.
     expect(state.projects.length).toBe(1);
     expect(state.declared).toEqual([]);
+
+    // No second press on offer: it would register again and re-send what landed.
+    expect(screen.queryByRole("button", { name: "add it, in shadow" })).toBeNull();
+    expect(
+      screen.getByRole("link", { name: "Finish setting up thing on its page" }).getAttribute("href"),
+    ).toBe("/projects/thing/state");
+  });
+
+  /** A refusal on the very first write left nothing behind, so pressing again is a retry. */
+  it("keeps the button when the registration itself was refused", async () => {
+    const { state } = await openWizard({ detected: detected() });
+    await look();
+    await screen.findByRole("button", { name: "add it, in shadow" });
+    const answers = daemonFetch(state);
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/autopilot/state" && init?.method === "POST") {
+        return Promise.reject(new ApiRefusal(422, "unprocessable", ""));
+      }
+      return answers(path, init);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
+
+    expect(await screen.findByText(/did not say which prerequisite is missing/)).toBeTruthy();
+    expect(screen.queryByText(/Registered as/)).toBeNull();
+    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty("disabled", false);
+  });
+
+  /**
+   * The stop refuses the workflow and nothing else of the four, so it is said before the first
+   * write — not found out after the project row already exists — and the way round it is offered.
+   */
+  it("warns about an engaged kill switch before anything is written, and can leave the workflow out", async () => {
+    const { state } = await openWizard({
+      kill: { engaged: true },
+      detected: detected({ harnesses: [{ path: ".ai", what: "a pipeline", files: 3 }] }),
+    });
+    await look();
+
+    expect(await screen.findByText(/while it is the núcleo refuses to record a workflow/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty("disabled", true);
+    expect(screen.getByText("the kill switch would refuse the workflow")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "leave the workflow for later" }));
+    expect(screen.getByRole("radio", { name: /adopt none of them/ })).toHaveProperty("checked", true);
+    fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
+
+    await waitFor(() => expect(state.projects.length).toBe(1));
+    expect(state.adopted).toEqual([]);
+  });
+
+  /**
+   * The id goes into every URL the project has. Its shape is the one `suggestedId` produces, it is
+   * checked here rather than by a refusal at the bottom of the page, and the nearest good one is
+   * offered. The visible label is the accessible name, so "click project id" finds it.
+   */
+  it("refuses an id out of shape before anything is sent, and offers the nearest one", async () => {
+    const { state } = await openWizard({ detected: detected() });
+    await look();
+
+    const id = (await screen.findByLabelText("Project id")) as HTMLInputElement;
+    fireEvent.change(id, { target: { value: "My Project" } });
+    expect(id.getAttribute("aria-invalid")).toBe("true");
+    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty("disabled", true);
+    expect(screen.getByText(/not an id yet/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "use my-project" }));
+    expect(id.value).toBe("my-project");
+    fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
+    await waitFor(() => expect(state.projects[0]?.project_id).toBe("my-project"));
+  });
+
+  /**
+   * Registering is an upsert, so an id another project has would not be refused — it would re-point
+   * that project at this folder. The one mistake here nothing downstream catches.
+   */
+  it("will not reuse the id of a project that already exists", async () => {
+    await openWizard({ projects: [project({ project_id: "thing" })], detected: detected() });
+    await look();
+
+    expect(await screen.findByText(/would move that project here/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty("disabled", true);
+  });
+
+  /** "No ceiling" is a real answer on the project's page, so it is one here too — sent as null. */
+  it("can add a project with no open-proposal ceiling", async () => {
+    const { state } = await openWizard({ detected: detected() });
+    await look();
+
+    fireEvent.click(await screen.findByRole("button", { name: "no ceiling" }));
+    expect(screen.getByText("off")).toBeTruthy();
+    expect(screen.getByText("no open-proposal ceiling")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
+    await waitFor(() => expect(state.projects[0]).toMatchObject({ wip_limit: null }));
+  });
+
+  /** The receipt, read before signing: the writes, in the order they will be made. */
+  it("lists what adding will write before the button is pressed", async () => {
+    await openWizard({
+      detected: detected({
+        harnesses: [{ path: ".ai", what: "a pipeline", files: 3 }],
+        commands: [{ name: "gate", command: "cargo test", source: "Makefile" }],
+      }),
+    });
+    await look();
+    fireEvent.click(await screen.findByRole("checkbox", { name: /gate/ }));
+
+    const receipt = screen.getByText("Adding it will:").nextElementSibling as HTMLElement;
+    expect(within(receipt).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+      "register thing at C:/Projects/thing, in shadow",
+      "adopt .ai as its way of working",
+      "declare gate, not as a gate",
+      "an open-proposal ceiling of 2",
+    ]);
+  });
+
+  /** Steps two and three arrive below the focus; focus goes to them, so they are heard. */
+  it("moves focus to what was found", async () => {
+    await openWizard({ detected: detected() });
+    await look();
+    const heading = await screen.findByRole("heading", { name: "2 of 3. What is already there" });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+  });
+
+  /** Edited after it was read, the folder above is not the one steps two and three describe. */
+  it("holds the button when the path is edited after it was read", async () => {
+    await openWizard({ detected: detected() });
+    await look();
+    await screen.findByRole("button", { name: "add it, in shadow" });
+
+    fireEvent.change(screen.getByLabelText("Folder"), { target: { value: "C:/Projects/other" } });
+    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty("disabled", true);
+    expect(screen.getByText(/edited after it was read/)).toBeTruthy();
+  });
+
+  /** A page that sends somebody here with a folder in mind hands it over, and it is read at once. */
+  it("takes the folder from ?path= and reads it", async () => {
+    await openWizard(
+      { detected: detected({ root: "C:/Projects/back" }) },
+      "/projects/new?path=C%3A%2FProjects%2Fback",
+    );
+
+    expect(((await screen.findByLabelText("Folder")) as HTMLInputElement).value).toBe(
+      "C:/Projects/back",
+    );
+    expect(await screen.findByDisplayValue("back")).toBeTruthy();
   });
 });
