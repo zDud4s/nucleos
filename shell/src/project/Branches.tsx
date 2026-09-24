@@ -6,7 +6,7 @@ import {
   type BranchRow,
   type BranchStanding,
 } from "../data/project-git";
-import { ErrorNote, Quiet, RelativeTime, Row, Rows } from "../ui";
+import { ErrorNote, Quiet, RelativeTime, Row, Rows, StaleNote } from "../ui";
 
 /**
  * Where the work is, and how far it is from landing.
@@ -38,7 +38,12 @@ export function Branches({ projectId }: BranchesProps) {
   const branches = useProjectBranches(projectId);
   const recent = useProjectLog(projectId, "", 5);
 
-  if (branches.isError) {
+  /*
+    Only a read that never worked is an error. One that failed after a good read keeps the branches
+    on screen with their age beside them — blanking a panel during a daemon restart destroys more
+    than it protects, and "its folder may have moved" is the wrong sentence for a poll that missed.
+  */
+  if (branches.isError && branches.data === undefined) {
     return (
       <ErrorNote>
         The núcleo could not read this project&rsquo;s branches — its folder may have moved.
@@ -53,6 +58,7 @@ export function Branches({ projectId }: BranchesProps) {
 
   return (
     <div className="flex flex-col gap-4">
+      {branches.isError ? <StaleNote dataUpdatedAt={branches.dataUpdatedAt} /> : null}
       {integration === null ? (
         /*
           A detached root is an ordinary state — somebody checked out a sha to look at something —
@@ -134,7 +140,7 @@ function Line({ row, integration }: { row: BranchRow; integration: string | null
         The numbers, and only when there are numbers to give. An unmeasured branch shows the word
         and no digits: a `0/0` beside "unknown" would be two answers to one question.
       */}
-      <span className="shrink-0 text-xs text-text-faint">
+      <span className="shrink-0 text-xs tabular-nums text-text-faint">
         {standing === "unmeasured" || standing === "integration"
           ? STANDING_TEXT[standing]
           : `${STANDING_TEXT[standing]}${row.ahead > 0 ? ` +${row.ahead}` : ""}${

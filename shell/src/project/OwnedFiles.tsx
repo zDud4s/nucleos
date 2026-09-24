@@ -2,7 +2,7 @@ import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useProjectOwnership, useWriteProjectFile, type Claim } from "../data/project-config";
 import { useProjectCat } from "../data/projects";
-import { ErrorNote, Inset, Quiet } from "../ui";
+import { ErrorNote, Inset, Quiet, StaleNote } from "../ui";
 
 /**
  * The files this app is the legitimate author of, and the editor for them.
@@ -37,8 +37,15 @@ export function OwnedFiles({ projectId }: OwnedFilesProps) {
   const ownership = useProjectOwnership(projectId);
 
   if (ownership.data === undefined) {
-    return <p className="text-sm text-text-faint">Reading the write boundary…</p>;
+    // Refused is its own answer, not a read that is taking a while.
+    return ownership.isError ? (
+      <ErrorNote>The núcleo did not say which files this app may write here.</ErrorNote>
+    ) : (
+      <p className="text-sm text-text-faint">Reading the write boundary…</p>
+    );
   }
+
+  const stale = ownership.isError ? <StaleNote dataUpdatedAt={ownership.dataUpdatedAt} /> : null;
 
   /*
     Nothing claimed is a whole section saying so, and it used to say so twice: once that the app
@@ -47,16 +54,20 @@ export function OwnedFiles({ projectId }: OwnedFilesProps) {
   */
   if (ownership.data.length === 0) {
     return (
-      <Quiet says="none">
-        Every file in this project belongs to the repository, so all of it is read here and edited
-        where code is edited. Which files the app may write is answered by the núcleo rather than
-        decided by this page, so an empty list is a fence rather than a gap.
-      </Quiet>
+      <>
+        <Quiet says="none">
+          Every file in this project belongs to the repository, so all of it is read here and edited
+          where code is edited. Which files the app may write is answered by the núcleo rather than
+          decided by this page, so an empty list is a fence rather than a gap.
+        </Quiet>
+        {stale}
+      </>
     );
   }
 
   return (
     <div className="flex flex-col gap-3">
+      {stale}
       {ownership.data.map((claim) => (
         <OwnedFile key={claim.path} projectId={projectId} claim={claim} />
       ))}

@@ -10,7 +10,16 @@ import {
   useRunProjectCommand,
   type ProjectCommand,
 } from "../data/project-commands";
-import { Button, ErrorNote, Inset, Quiet, SHORTCUT_HINT, usePaletteGroup, usePaletteOpen } from "../ui";
+import {
+  Button,
+  ErrorNote,
+  Inset,
+  Quiet,
+  SHORTCUT_HINT,
+  StaleNote,
+  usePaletteGroup,
+  usePaletteOpen,
+} from "../ui";
 
 /**
  * What this project can be asked to do to itself.
@@ -63,8 +72,19 @@ export function Commands({ projectId }: CommandsProps) {
   });
 
   if (commands.data === undefined) {
-    return <p className="text-sm text-text-faint">Reading this project's commands…</p>;
+    // A read that failed is not a read still coming, and must not keep saying it is.
+    return commands.isError ? (
+      <ErrorNote>The núcleo did not say which commands this project declares.</ErrorNote>
+    ) : (
+      <p className="text-sm text-text-faint">Reading this project's commands…</p>
+    );
   }
+
+  /*
+    The last good list, dated. A gate's verdict is the one thing on this bar somebody reads as
+    "is it green now", and a verdict from before the connection dropped must not pass for that.
+  */
+  const stale = commands.isError ? <StaleNote dataUpdatedAt={commands.dataUpdatedAt} /> : null;
 
   const gates = rows.filter((row) => row.is_gate);
   const refused = run.isError && isApiRefusal(run.error) ? run.error : null;
@@ -89,12 +109,14 @@ export function Commands({ projectId }: CommandsProps) {
           project — declaration rather than detection, so a list nobody agreed to cannot appear on
           its own.
         </Quiet>
+        {stale}
       </>
     );
   }
 
   return (
     <div className="flex flex-col gap-2">
+      {stale}
       {rows.length === 0 ? null : (
         <>
           <div className="flex flex-wrap items-center gap-2">
