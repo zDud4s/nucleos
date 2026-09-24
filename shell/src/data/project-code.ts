@@ -1,4 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
+import { useCallback } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiFetch, apiText } from "./client";
 import { keys } from "./keys";
 
@@ -129,6 +130,41 @@ export function useRunWorktree(projectId: string | null, run: number | null) {
     enabled: projectId !== null && projectId !== "" && run !== null,
     retry: false,
   });
+}
+
+/**
+ * The cache entries that hold one run's reads, as prefixes.
+ *
+ * Built from `keys` rather than spelled out, so a key that grows a segment moves this with it. The
+ * diff, the file and the blame are cut before their path: a refresh is about the run, and every
+ * file somebody opened in it is as old as the list it was picked from.
+ */
+export function runReadPrefixes(projectId: string, run: number): (readonly unknown[])[] {
+  return [
+    keys.projects.changed(projectId, run),
+    keys.projects.worktree(projectId, run),
+    keys.projects.runDiff(projectId, run, "").slice(0, -1),
+    keys.projects.runFile(projectId, run, "").slice(0, -1),
+    keys.projects.runBlame(projectId, run, "").slice(0, -1),
+  ];
+}
+
+/**
+ * Read this run again, now — the one way these reads are ever repeated.
+ *
+ * The answer to "never polled" above is not "never fresh": a run keeps writing files after the
+ * page opened, and a review that could only be refreshed by leaving and coming back would sit
+ * saying "changed nothing yet" long after that stopped being true. So it is read when the page
+ * opens and again when somebody asks, which is the inspector's policy too.
+ */
+export function useRefreshRunReads(projectId: string, run: number | null): () => Promise<void> {
+  const queryClient = useQueryClient();
+  return useCallback(async () => {
+    if (run === null) return;
+    await Promise.all(
+      runReadPrefixes(projectId, run).map((queryKey) => queryClient.invalidateQueries({ queryKey })),
+    );
+  }, [projectId, queryClient, run]);
 }
 
 /**
