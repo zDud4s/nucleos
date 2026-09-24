@@ -2,7 +2,6 @@ import { useMemo } from "react";
 import { Outlet, useNavigate } from "@tanstack/react-router";
 import { useChats } from "../data/chats";
 import { useHotkeyRegistration } from "../data/hotkeys";
-import { untriagedCount, useMailQueue } from "../data/mail";
 import { POLL } from "../data/poll";
 import { useProjects, useSystemHealth, wantsAttention } from "../data/system";
 import { useWaitingCount } from "../data/waiting";
@@ -11,6 +10,7 @@ import { PaletteProvider, usePaletteGroup, type PaletteGroup } from "../ui";
 import { AttentionHeartbeat } from "./AttentionHeartbeat";
 import { ConnectionGate } from "./ConnectionGate";
 import { ConversationChord } from "./ConversationChord";
+import { DictationProvider } from "./Dictation";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { NotificationsDrawer } from "./NotificationsDrawer";
 import { PaletteTrigger } from "./PaletteTrigger";
@@ -74,12 +74,6 @@ function Frame() {
    */
   const chats = useChats();
   /**
-   * Untriaged mail. `undefined` until the queue has answered once, same rule
-   * as the two above — a zero drawn before the first answer would be a claim
-   * nobody has measured, not an honest "nothing waiting".
-   */
-  const mail = useMailQueue();
-  /**
    * The roster, for the sidebar's project group.
    *
    * Already polled — this is the same query the roster page and the pending
@@ -103,6 +97,11 @@ function Frame() {
 
   return (
     <PaletteProvider>
+      {/*
+        Around everything, because the dictation chords are answered on every page and the Voice page
+        draws what they did — see `Dictation.tsx`.
+      */}
+      <DictationProvider>
       <div className="app-shell">
         <AttentionHeartbeat />
         <ConversationChord />
@@ -111,7 +110,6 @@ function Frame() {
           badges={{
             proposals: waiting,
             chats: chats.data === undefined ? undefined : unreadTotal(chats.data),
-            mail: mail.data === undefined ? undefined : untriagedCount(mail.data),
           }}
           projects={projects.data?.map((project) => ({
             id: project.project_id,
@@ -184,6 +182,7 @@ function Frame() {
           </div>
         </main>
       </div>
+      </DictationProvider>
     </PaletteProvider>
   );
 }

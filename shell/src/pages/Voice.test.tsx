@@ -21,13 +21,20 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Voice } from "./Voice";
 import { CONVERSATION_TOGGLE_EVENT, ConversationChord } from "../app/ConversationChord";
+import { DictationProvider } from "../app/Dictation";
 import { phaseAfter, type Capture, type VoiceConfigView } from "../data/voice";
 import { renderWithRouter } from "../test/harness";
 
 /* Inside a router, because the page reads its address: the conversation chord arrives as a `talk`
-   stamp in it (`app/ConversationChord.tsx`). */
+   stamp in it (`app/ConversationChord.tsx`). And under the shell's dictation, which is where the
+   capture it draws lives (`app/Dictation.tsx`). */
 function renderVoice(path = "/voice") {
-  return renderWithRouter(<Voice />, { initialPath: path });
+  return renderWithRouter(
+    <DictationProvider>
+      <Voice />
+    </DictationProvider>,
+    { initialPath: path },
+  );
 }
 
 const mockInvoke = vi.mocked(invoke);
@@ -447,10 +454,10 @@ describe("Voice — the conversation chord", () => {
 
     // The page and the shell's listener together, as the app mounts them.
     const { router } = await renderWithRouter(
-      <>
+      <DictationProvider>
         <Voice />
         <ConversationChord />
-      </>,
+      </DictationProvider>,
       { initialPath: "/voice?talk=1" },
     );
     await waitFor(() => expect(conversation.toggle).toHaveBeenCalledTimes(1));

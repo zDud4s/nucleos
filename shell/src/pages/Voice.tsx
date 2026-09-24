@@ -2,23 +2,18 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { finishCapture, startCapture, type ActiveCapture } from "../lib/capture";
+import { useDictation, type CaptureOutcome, type Delivery } from "../app/Dictation";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import { useVoiceConversation, type ConversationView } from "../data/conversation";
 import { useHotkeyRegistration } from "../data/hotkeys";
 import { useVoiceChat } from "../data/voice-chat";
 import type { SilenceReason } from "../lib/vad";
 import {
-  phaseAfter,
-  postCapture,
   useDeleteMemo,
   useDictations,
   useMemos,
   useVoiceConfig,
   type Capture,
-  type CaptureResult,
   type VoiceConfigView,
   type VoicePhase,
 } from "../data/voice";
@@ -52,22 +47,10 @@ import "./voice.css";
  * "nothing was heard", not success** — {@link CaptureOutcomeNote} names it
  * explicitly rather than rendering the silence of a successful mutation.
  *
- * **The split this page holds to throughout**: the WEBVIEW owns the
- * microphone and the POST — `beginRecording` / `endRecordingAndCapture`
- * below, using `lib/audio.ts`'s pure conversions — and the HOST owns the
- * tray icon and the paste, which is why a finished dictation's text crosses
- * back out through `invoke("voice_paste", …)` rather than being typed by the
- * webview itself. Audio bytes cannot cross that boundary the other
- * direction either: Tauri IPC serialises arguments as JSON, so recording
- * happens here and only the already-encoded bytes ever leave via `fetch`.
- *
- * Two Tauri surfaces meet here. `voice://start` / `voice://stop` are the
- * REAL system hotkey, fired by the host whether or not this window has
- * focus — this page merely reacts. `invoke("voice_hotkey", { memo })` is
- * this page's own capture buttons standing in for that same hotkey while the
- * window IS focused; its resolved phase decides locally whether to start
- * recording or to stop and post, via {@link phaseAfter}, the one place that
- * decision is made.
+ * **The capture itself is not this page's**: the microphone, the POST and the
+ * paste live in `app/Dictation.tsx`, mounted by the shell on every page, because
+ * the chords that drive them are global and a dictation is pasted into whatever
+ * application has focus. This page draws that state and presses the same controls.
  */
 
 /** One derived sentence for the page header. */
@@ -98,178 +81,19 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
   return { [refusal.code]: detail };
 }
 
-/* ------------------------------------------------------------ recording -- */
-
-/** What one in-progress recording is holding, kept in a ref rather than state — none of it should cause a render. */
-/** The open microphone, plus the one thing this page needs to remember about it: which list it is for. */
-type ActiveRecording = ActiveCapture & { kind: "dictation" | "memo" };
-
-/** What a finished attempt at a capture came back as — read once, shown once, replaced by the next attempt. */
-type CaptureOutcome =
-  | { kind: "silent" }
-  | { kind: "done"; result: CaptureResult }
-  | { kind: "refused"; error: unknown }
-  | { kind: "mic-error" };
-
-type Delivery = { pasted: boolean; held: string | null };
-
 export function Voice() {
   const config = useVoiceConfig();
   const memos = useMemos();
   const dictations = useDictations();
   const deleteMemo = useDeleteMemo();
 
-  const [phase, setPhase] = useState<VoicePhase>("idle");
-  const [activeKind, setActiveKind] = useState<"dictation" | "memo" | null>(null);
-  const [pending, setPending] = useState(false);
-  const [outcome, setOutcome] = useState<CaptureOutcome | null>(null);
-  const [delivery, setDelivery] = useState<Delivery | null>(null);
+  const { phase, activeKind, pending, outcome, delivery, press, abandon } = useDictation();
   /* Registered by the shell, not here — see `data/hotkeys.ts`. The page reads the outcome of the one
      registration, which the shell has usually finished before anybody opens this page. */
   const hotkeys = useHotkeyRegistration();
   const hotkeyConflicts = hotkeys?.conflicts ?? null;
   const hotkeyRegisterFailed = hotkeys?.failed ?? false;
   const hotkeysUnavailable = hotkeys?.unavailable ?? null;
-
-  const captureRef = useRef<ActiveRecording | null>(null);
-
-  /** The phase this window already holds, in case the host is mid-capture from before this page mounted. */
-  useEffect(() => {
-    let cancelled = false;
-    invoke<VoicePhase>("voice_phase")
-      .then((initial) => {
-        if (!cancelled) setPhase(initial);
-      })
-      .catch(() => {
-        // No reading is not a reason to invent one — the button state below
-        // already defaults to idle, which is the safe assumption.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  async function beginRecording(kind: "dictation" | "memo") {
-    setOutcome(null);
-    setDelivery(null);
-    try {
-      captureRef.current = { ...(await startCapture()), kind };
-      setActiveKind(kind);
-      setPhase(phaseAfter({ type: "start", kind }));
-    } catch {
-      setOutcome({ kind: "mic-error" });
-    }
-  }
-
-  async function endRecordingAndCapture() {
-    const active = captureRef.current;
-    if (active === null) return;
-    captureRef.current = null;
-    setPhase(phaseAfter({ type: "stop" }));
-
-    const { bytes, ms } = await finishCapture(active);
-
-    try {
-      const result = await postCapture(bytes, active.kind, ms);
-      if (result === undefined) {
-        // The one route in this shell where a success-family status is a
-        // negative answer — see `data/voice.ts`'s header.
-        setOutcome({ kind: "silent" });
-      } else {
-        setOutcome({ kind: "done", result });
-        if (active.kind === "dictation") {
-          await deliverPaste(result.text);
-        }
-      }
-      setPhase(phaseAfter({ type: "capture-done" }));
-    } catch (error) {
-      setOutcome({ kind: "refused", error });
-      setPhase(phaseAfter({ type: "capture-error" }));
-    } finally {
-      setActiveKind(null);
-    }
-  }
-
-  /** The host owns the paste — this only hands the finished text across and reads back whether it landed. */
-  async function deliverPaste(text: string) {
-    try {
-      const result = await invoke<Delivery>("voice_paste", { text });
-      setDelivery(result);
-    } catch {
-      // The host did not answer at all — distinct from `held`, which is the
-      // host answering with a named reason. Neither is one of the sentences
-      // the host sends verbatim, so this is not shown as one.
-      setDelivery(null);
-    }
-  }
-
-  async function handleAbandon() {
-    const active = captureRef.current;
-    captureRef.current = null;
-    if (active !== null) {
-      active.processor.disconnect();
-      active.source.disconnect();
-      active.sink.disconnect();
-      for (const track of active.stream.getTracks()) track.stop();
-      await active.context.close();
-    }
-    try {
-      await invoke("voice_abandon");
-    } catch {
-      // Best-effort — the host may already have nothing to abandon either.
-    }
-    setOutcome(null);
-    setDelivery(null);
-    setActiveKind(null);
-    setPhase(phaseAfter({ type: "abandon" }));
-  }
-
-  /** The page's own capture buttons, standing in for the hotkey while this window has focus. */
-  async function handleHotkeyPress(memo: boolean) {
-    if (pending) return;
-    setPending(true);
-    try {
-      const result = await invoke<"recording" | "transcribing" | "busy">("voice_hotkey", { memo });
-      if (result === "recording") {
-        await beginRecording(memo ? "memo" : "dictation");
-      } else if (result === "transcribing") {
-        await endRecordingAndCapture();
-      } else {
-        setPhase(phaseAfter({ type: "hotkey", phase: "busy" }));
-      }
-    } catch (error) {
-      setOutcome({ kind: "refused", error });
-    } finally {
-      setPending(false);
-    }
-  }
-
-  /** The real hotkey — fired by the host whether or not this window is focused. */
-  useEffect(() => {
-    let unlistenStart: (() => void) | undefined;
-    let unlistenStop: (() => void) | undefined;
-
-    void listen<"dictation" | "memo">("voice://start", (event) => {
-      setActiveKind(event.payload);
-      void beginRecording(event.payload);
-    }).then((fn) => {
-      unlistenStart = fn;
-    });
-
-    void listen("voice://stop", () => {
-      void endRecordingAndCapture();
-    }).then((fn) => {
-      unlistenStop = fn;
-    });
-
-    return () => {
-      unlistenStart?.();
-      unlistenStop?.();
-    };
-    // Registered once: both handlers close only over refs and setState
-    // setters, which are stable across renders.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   return (
     <>
@@ -290,8 +114,8 @@ export function Voice() {
           armed={config.data?.armed ?? false}
           activeKind={activeKind}
           pending={pending}
-          onPress={handleHotkeyPress}
-          onAbandon={handleAbandon}
+          onPress={press}
+          onAbandon={abandon}
         />
         <CaptureOutcomeNote outcome={outcome} />
         <DeliveryNote delivery={delivery} />
