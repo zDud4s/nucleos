@@ -1400,7 +1400,7 @@ impl Outcome {
 /// is a verdict about the code and is worth another attempt; a gate that would not run measured
 /// nothing, so there is nothing to attempt again, and buying past it with a retry would mean
 /// building on work nothing has looked at.
-fn item_state_from(status: &str, gate_attempts: i64, gate_retries: i64) -> ItemState {
+pub(crate) fn item_state_from(status: &str, gate_attempts: i64, gate_retries: i64) -> ItemState {
     match status {
         "running" => ItemState::Running,
         "implemented" => ItemState::Implemented,
