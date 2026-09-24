@@ -204,7 +204,7 @@ pub(crate) fn run_verdict(
     })
 }
 
-/// Map an item state to a verdict without restating which red gates remain retriable.
+/// Map an item state and its stored gate/run evidence to a final verdict.
 pub(crate) fn item_verdict(
     state: crate::job::ItemState,
     gate_status: Option<&str>,
@@ -221,10 +221,17 @@ pub(crate) fn item_verdict(
         ItemState::Passed if gate_status == Some("passed") => Some(Verdict::Green),
         ItemState::Passed | ItemState::Failed => Some(run_without_gate()),
         ItemState::GateFailed => Some(Verdict::NotGreen),
+        // Owner decision: credit must not depend on which side of a replan the sweep runs.
+        // Replans supersede only gate_failed/failed items, so NULL keeps the prior run verdict.
+        ItemState::Superseded => Some(match gate_status {
+            Some("passed") => Verdict::Green,
+            Some("failed") => Verdict::NotGreen,
+            Some(_) => Verdict::NoOutcome,
+            None => run_without_gate(),
+        }),
         ItemState::GateErrored
         | ItemState::Cancelled
         | ItemState::Skipped
-        | ItemState::Superseded
         | ItemState::Orphaned => Some(Verdict::NoOutcome),
         ItemState::Pending
         | ItemState::Running
@@ -996,6 +1003,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_superseded_item_is_credited_as_its_stored_verdict_says_whichever_side_of_the_replan_it_is_swept()
+    -> sqlx::Result<()> {
+        for (item_status, gate_status, gate_attempts, (run_status, exit_code)) in [
+            ("gate_failed", Some("failed"), 1, ("failed", Some(1))),
+            ("failed", None, 0, ("failed", Some(1))),
+        ] {
+            for superseded_first in [false, true] {
+                let pool = test_pool().await;
+                let job_id = seed_job(&pool, "running", 0).await?;
+                let run_id = seed_run(&pool, run_status, exit_code, None, Some(job_id)).await?;
+                let item_id = seed_item(
+                    &pool,
+                    job_id,
+                    item_status,
+                    gate_status,
+                    gate_attempts,
+                    Some(run_id),
+                )
+                .await?;
+                let knowledge_id = seed(&pool, "machine", None, item_status).await?;
+                record(&pool, run_id, Some(item_id), &[scored(knowledge_id, true)]).await?;
+
+                if superseded_first {
+                    sqlx::query("UPDATE job_items SET status = 'superseded' WHERE id = ?")
+                        .bind(item_id)
+                        .execute(&pool)
+                        .await?;
+                }
+
+                sweep(&pool).await?;
+                let credited = counters(&pool, knowledge_id).await?;
+                assert_eq!((credited.0, credited.1, credited.2), (1, 1, 0));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_standalone_run_is_credited_by_the_end_of_its_chain() -> sqlx::Result<()> {
         let pool = test_pool().await;
         let handoff_knowledge = seed(&pool, "machine", None, "handoff").await?;
@@ -1113,6 +1158,27 @@ mod tests {
         );
         assert_eq!(
             item_verdict(ItemState::GateFailed, Some("failed"), false, None),
+            Some(Verdict::NotGreen)
+        );
+        assert_eq!(
+            item_verdict(ItemState::Superseded, Some("passed"), false, None),
+            Some(Verdict::Green)
+        );
+        assert_eq!(
+            item_verdict(ItemState::Superseded, Some("failed"), false, None),
+            Some(Verdict::NotGreen)
+        );
+        assert_eq!(
+            item_verdict(ItemState::Superseded, Some("errored"), false, None),
+            Some(Verdict::NoOutcome)
+        );
+        assert_eq!(
+            item_verdict(
+                ItemState::Superseded,
+                None,
+                false,
+                Some(("failed", Some(1)))
+            ),
             Some(Verdict::NotGreen)
         );
         for state in [
