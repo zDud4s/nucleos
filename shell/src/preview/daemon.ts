@@ -15,7 +15,7 @@ import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary, Propos
 import type { VoiceConfigView } from "../data/voice";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
-import type { EmailDetail } from "../data/mail";
+import type { EmailConfigView, EmailDetail, QueuedEmail } from "../data/mail";
 import type { VcsRequestSummary } from "../data/waiting";
 import type { QuotaReport } from "../data/quota";
 
@@ -1796,9 +1796,44 @@ const EMAIL_DETAIL = {
   model_class: "action",
   priority_rule: null,
   body_text: "Hi team,\n\nCould you confirm the delivery date from today's planning session?\n\nThanks,\nMira",
-  has_attachments: 0,
-  attachments: [],
+  has_attachments: 1,
+  sender_verdict: "pin",
+  attachments: [
+    { position: 0, filename: "planning-2026-09-15.pdf", mime_type: "application/pdf", size_bytes: 482_113 },
+    { position: 1, filename: "delivery-dates.xlsx", mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", size_bytes: 18_944 },
+  ],
 } satisfies EmailDetail;
+
+/**
+ * The inbound queue, drawn to carry every fact a row can state at once: each of the five
+ * classes, a message triage has not reached (`null`, which must NOT read as `noise`), both
+ * sender verdicts, an attachment, a subject long enough to wrap, and one with no subject at
+ * all. A queue of five tidy rows photographs none of the ways a row goes wrong.
+ */
+const MAIL_QUEUE = [
+  { id: 1, from_addr: "mira.chen@example.com", from_name: "Mira Chen", subject: "Tuesday planning notes", received_at: ago(18 * MINUTE), triage_class: "action", triage_summary: "The team needs a reply with the agreed delivery date.", triaged_at: ago(14 * MINUTE), has_attachments: 1, sender_verdict: "pin" },
+  { id: 2, from_addr: "accounts@contabilidade.pt", from_name: "Contabilidade Silva", subject: "Q3 reconciliation — still blocked on the missing invoices, second request", received_at: ago(2 * HOUR), triage_class: "urgent", triage_summary: "The accountant cannot close Q3 until invoices 2291 and 2304 are sent; this is the second time they have asked.", triaged_at: ago(2 * HOUR - 4 * MINUTE), has_attachments: 0, sender_verdict: null },
+  { id: 3, from_addr: "noreply@github.com", from_name: "GitHub", subject: "[nucleos] Dependabot opened 3 pull requests", received_at: ago(3 * HOUR), triage_class: null, triage_summary: null, triaged_at: null, has_attachments: 0, sender_verdict: null },
+  { id: 4, from_addr: "newsletter@rustweekly.dev", from_name: null, subject: "This Week in Rust 612", received_at: ago(5 * HOUR), triage_class: "noise", triage_summary: null, triaged_at: ago(5 * HOUR - 3 * MINUTE), has_attachments: 0, sender_verdict: "mute" },
+  { id: 5, from_addr: "joao.pereira@example.pt", from_name: "João Pereira", subject: null, received_at: ago(9 * HOUR), triage_class: "info", triage_summary: "Confirms the office is closed on Friday for the holiday.", triaged_at: ago(9 * HOUR - 2 * MINUTE), has_attachments: 0, sender_verdict: null },
+  { id: 6, from_addr: "scanner@office.local", from_name: "Office scanner", subject: "Scanned document 0042", received_at: ago(DAY + 2 * HOUR), triage_class: "failed", triage_summary: null, triaged_at: ago(DAY + HOUR), has_attachments: 1, sender_verdict: null },
+  { id: 7, from_addr: "support@hosting.example", from_name: "Hosting Support", subject: "Scheduled maintenance on 28 September", received_at: ago(2 * DAY), triage_class: "info", triage_summary: "Twenty minutes of downtime on the 28th from 02:00 UTC; nothing to do.", triaged_at: ago(2 * DAY - 5 * MINUTE), has_attachments: 0, sender_verdict: null },
+] satisfies QueuedEmail[];
+
+/** Enabled and armed, with nothing stopping local triage — the ordinary state, and the one read most. */
+const EMAIL_CONFIG = {
+  enabled: true,
+  armed: true,
+  host: "imap.example.com",
+  username: "dudas",
+  mailbox: "INBOX",
+  sent_mailbox: "Sent",
+  poll_interval_secs: 300,
+  notify_classes: ["urgent"],
+  digest_hour_utc: 7,
+  retain_bodies_days: 30,
+  local_triage_disabled: null,
+} satisfies EmailConfigView;
 
 /**
  * Every supervised sidecar, and the second half of `/health/readout`'s story above.
@@ -1971,6 +2006,21 @@ export function answer(path: string, init?: RequestInit): unknown {
   }
   if (/^\/runs\/\d+$/.test(path) && init?.method === undefined) return RUN_DETAIL;
   if (/^\/email\/\d+$/.test(path) && init?.method === undefined) return EMAIL_DETAIL;
+  if (path === "/email/queue" || path.startsWith("/email/queue?")) {
+    const q = splitQuery(path)[1].get("q")?.toLowerCase();
+    if (q === undefined) return MAIL_QUEUE;
+    return MAIL_QUEUE.filter((row) =>
+      [row.from_name, row.from_addr, row.subject, row.triage_summary].some((text) => text?.toLowerCase().includes(q)),
+    );
+  }
+  if (path === "/config/email") {
+    // The one fixture that answers differently by URL: a disarmed pillar is a state the queue
+    // itself cannot show — mail keeps arriving either way — so the shot that proves the header
+    // says it needs the page asked for under `?disarmed`.
+    const disarmed = typeof location !== "undefined" && location.search.includes("disarmed");
+    return disarmed ? { ...EMAIL_CONFIG, armed: false } : EMAIL_CONFIG;
+  }
+  if (path.startsWith("/email/cursor?")) return { uidvalidity: 1_694_512_331, last_uid: 48_213 };
 
   if (path === "/projects") return PROJECTS;
 

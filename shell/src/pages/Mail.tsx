@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { Link } from "@tanstack/react-router";
+import { Paperclip } from "lucide-react";
 import { isApiRefusal } from "../data/client";
 import {
+  awaitingYouCount,
   MAIL_QUEUE_LIMIT,
   untriagedCount,
   useEmailConfig,
@@ -53,14 +55,52 @@ import "./mail.css";
  * what keeps the badge from saying the same thing for both.
  */
 
-/** One derived sentence about the queue. */
-function headline(rows: QueuedEmail[] | undefined): string | undefined {
+/**
+ * One derived sentence about the queue — and, before it, about whether anything
+ * is reading the queue at all.
+ *
+ * The order is the answer to "is everything fine?", which is the question this
+ * page is opened with far more often than "what is in it": a pillar that is not
+ * enabled, not armed, or whose local triage is stopped makes the count beside
+ * the point, and all three used to be legible only in the dim configuration
+ * panel at the very bottom of the page. The counts are what is left when none
+ * of that is wrong, and they lead with the reader's own share of the queue —
+ * `urgent` and `action` — rather than with the daemon's backlog.
+ *
+ * `stale` is not decoration either. When the queue query has failed and rows
+ * from an earlier answer are still on screen, this sentence is the page's
+ * largest claim about the present, and it must not make one: it says "last
+ * known" and hands the rest to {@link StaleNote}.
+ */
+function headline(
+  rows: QueuedEmail[] | undefined,
+  config: EmailConfigView | undefined,
+  stale: boolean,
+): string | undefined {
+  if (config !== undefined && !config.enabled) return "mail is not enabled — nothing is fetched";
+  if (config !== undefined && !config.armed) {
+    return "triage is not armed — mail arrives, nothing reads it";
+  }
+  const stopped = config === undefined ? null : config.local_triage_disabled;
+  if (typeof stopped === "string" && stopped !== "") return `local triage is stopped: ${stopped}`;
+
   if (rows === undefined) return undefined;
+  const said = queueSentence(rows);
+  return stale ? `last known: ${said}` : said;
+}
+
+function queueSentence(rows: QueuedEmail[]): string {
   if (rows.length === 0) return "the inbound queue is empty";
+  const yours = awaitingYouCount(rows);
   const untriaged = untriagedCount(rows);
-  if (untriaged === 0) return `${rows.length} in the queue, all of it triaged`;
-  const noun = untriaged === 1 ? "message" : "messages";
-  return `${rows.length} in the queue; ${untriaged} ${noun} not triaged yet`;
+  const parts = [`${rows.length} in the queue`];
+  if (yours > 0) parts.push(`${yours} for you`);
+  if (untriaged > 0) parts.push(`${untriaged} not triaged yet`);
+  // "needs you" and not the Waiting page's own phrase: that one names a single arithmetic —
+  // its six decision lists — and `one-waiting-phrase.test.ts` is the fence that keeps a second
+  // page from borrowing it for a different number. This one counts urgent and action mail.
+  if (parts.length === 1) parts.push("nothing needs you");
+  return parts.join("; ");
 }
 
 export function Mail() {
@@ -75,7 +115,7 @@ export function Mail() {
 
   return (
     <>
-      <PageHeader title="Mail" headline={headline(rows)} />
+      <PageHeader title="Mail" headline={headline(rows, config.data, stale)} />
 
       {/* Mail opens on what arrived; configuration is filled in once, not read first. */}
       <Panel title="Queue" aside={<UntriagedCount rows={rows} />}>
@@ -87,11 +127,11 @@ export function Mail() {
 
       <TriagePanel />
 
-      <CursorPanel mailbox={mailbox} cursor={cursor.data} loading={cursor.data === undefined && !cursor.isError} />
-
       <SkippedAbsence />
 
-      <ConfigPanel config={config} />
+      {/* The cursor was a panel of its own around one line; it is a fact about the
+          mailbox the configuration already names, so it stands in that list. */}
+      <ConfigPanel config={config} cursor={cursor.data} cursorLoading={cursor.data === undefined && !cursor.isError} />
     </>
   );
 }
@@ -134,15 +174,17 @@ function TriagePanel() {
 
   return (
     <Panel title="Triage">
-      <p className="mail-note">
-        Ask for one triage batch, now. Whether it ran is answered below — including the times it
-        did not, and why, which the daemon always sends as a sentence rather than a failure.
-      </p>
-      <Button intent="go" disabled={triage.isPending} onClick={() => triage.mutate()}>
-        Run triage now
-      </Button>
-      {triage.data !== undefined && <TriageOutcomeNote outcome={triage.data} />}
-      {triage.isError && <TriageRequestError error={triage.error} />}
+      <div className="mail-stack">
+        <p className="mail-note">
+          Ask for one triage batch, now. Whether it ran is answered below — including the times it
+          did not, and why, which the daemon always sends as a sentence rather than a failure.
+        </p>
+        <Button intent="go" disabled={triage.isPending} onClick={() => triage.mutate()}>
+          Run triage now
+        </Button>
+        {triage.data !== undefined && <TriageOutcomeNote outcome={triage.data} />}
+        {triage.isError && <TriageRequestError error={triage.error} />}
+      </div>
     </Panel>
   );
 }
@@ -193,7 +235,9 @@ function MailSearchBar({ q, onSearch }: { q: string | undefined; onSearch: (q: s
         onSearch(text === "" ? undefined : text);
       }}
     >
-      <Field label="Search">
+      {/* The label is still the control's; it is not drawn because the placeholder and the
+          button beside it already say "search" twice, and a third time cost the panel a row. */}
+      <Field label="Search" labelHidden>
         <input
           name="q"
           defaultValue={q ?? ""}
@@ -238,7 +282,7 @@ function QueueList({ rows, filtered }: { rows: QueuedEmail[] | undefined; filter
   // carries for all four lists that had grown it byte for byte.
   return (
     <>
-      <Rows label="Mail queue">
+      <Rows label="Mail queue" className="mail-list">
         {rows.map((row) => (
           <MailRow key={row.id} row={row} />
         ))}
@@ -257,29 +301,57 @@ function MailRow({ row }: { row: QueuedEmail }) {
     <Row>
       <div className="mail-row-head">
         {/* NULL and "noise" are two different facts and must read as two
-            different badges — see this file's header. */}
-        <span className="mail-row-badges">
+            different badges — see this file's header. The badge is the row's ONE
+            coloured mark: the sender verdict and the attachment are a word and a
+            glyph beside the facts they qualify, never chips stacked on the class. */}
+        <span className="mail-row-class">
           <StateBadge domain="email_class" state={row.triage_class} />
-          {/* `has_attachments` is an i64 0/1 over the wire, not a boolean. */}
-          {row.has_attachments === 1 && <span className="mail-attachment">attachment</span>}
-          {row.sender_verdict !== null && (
-            <span className={`mail-verdict mail-verdict-${row.sender_verdict}`}>{row.sender_verdict}</span>
-          )}
         </span>
-        <span className="mail-row-from">{row.from_name ?? row.from_addr}</span>
+        <span className="mail-row-from">
+          <span className="mail-row-name">{row.from_name ?? row.from_addr}</span>
+          {row.sender_verdict !== null && <SenderMark verdict={row.sender_verdict} />}
+        </span>
         <Link to={`/mail/${row.id}`} className="mail-row-subject">
           {row.subject ?? "(no subject)"}
         </Link>
-        <RelativeTime at={row.received_at} />
+        <span className="mail-row-meta">
+          {/* `has_attachments` is an i64 0/1 over the wire, not a boolean. */}
+          {row.has_attachments === 1 && (
+            <Paperclip className="mail-row-clip" size={14} strokeWidth={1.75} role="img" aria-label="has attachments">
+              <title>has attachments</title>
+            </Paperclip>
+          )}
+          <RelativeTime at={row.received_at} />
+        </span>
         {row.triage_summary !== null && <p className="mail-row-summary">{row.triage_summary}</p>}
       </div>
     </Row>
   );
 }
 
+/**
+ * A standing decision about the sender, as the word it means rather than the
+ * verb that set it. This was a chip, and `pin` wore Acting Green — the tone that
+ * says "executing right now", which a sender preference never is. A condition
+ * that is not one of the seven tones gets words (DESIGN.md, the Seven Tones
+ * Rule). An unfamiliar value is shown as the daemon sent it, in the mono face.
+ */
+function SenderMark({ verdict }: { verdict: string }) {
+  const said = verdict === "pin" ? "pinned" : verdict === "mute" ? "muted" : undefined;
+  return <span className="mail-row-verdict">{said ?? <code>{verdict}</code>}</span>;
+}
+
 /* -------------------------------------------------------------- configuration -- */
 
-function ConfigPanel({ config }: { config: { data: EmailConfigView | undefined; isError: boolean; error: unknown } }) {
+function ConfigPanel({
+  config,
+  cursor,
+  cursorLoading,
+}: {
+  config: { data: EmailConfigView | undefined; isError: boolean; error: unknown };
+  cursor: MailCursor | undefined;
+  cursorLoading: boolean;
+}) {
   const data = config.data;
   return (
     <Panel title="Configuration" variant="dim">
@@ -289,14 +361,20 @@ function ConfigPanel({ config }: { config: { data: EmailConfigView | undefined; 
         <dl className="mail-config">
           <div className="mail-config-fact">
             <dt>account</dt>
-            <dd>
-              {configAccount(data)}
-            </dd>
+            <dd className="mail-config-data">{configAccount(data)}</dd>
           </div>
           <div className="mail-config-fact">
             <dt>mailbox</dt>
-            <dd>{configMailbox(data)}</dd>
+            <dd className="mail-config-data">{configMailbox(data)}</dd>
           </div>
+          {data.mailbox && (
+            <div className="mail-config-fact">
+              <dt>sync cursor</dt>
+              <dd>
+                <CursorFact mailbox={data.mailbox} cursor={cursor} loading={cursorLoading} />
+              </dd>
+            </div>
+          )}
           <div className="mail-config-fact">
             <dt>state</dt>
             <dd>{configState(data)}</dd>
@@ -346,28 +424,19 @@ function ConfigError({ error }: { error: unknown }) {
 
 /* -------------------------------------------------------------- sync cursor -- */
 
-function CursorPanel({
-  mailbox,
-  cursor,
-  loading,
-}: {
-  mailbox: string | undefined;
-  cursor: MailCursor | undefined;
-  loading: boolean;
-}) {
-  if (mailbox === undefined) return null;
+/**
+ * Where the fetcher has read up to in the named mailbox. `null` is the daemon
+ * saying no cursor row exists — never synced — and is not the same as still
+ * loading, which is `undefined` while the query has not answered.
+ */
+function CursorFact({ mailbox, cursor, loading }: { mailbox: string; cursor: MailCursor | undefined; loading: boolean }) {
+  if (loading) return <span className="mail-loading">reading the cursor…</span>;
+  if (cursor === null) return <>no cursor recorded yet for {mailbox} — it has not been synced.</>;
+  if (cursor === undefined) return <>unknown — the cursor could not be read</>;
   return (
-    <Panel title="Sync cursor" variant="dim">
-      {loading && <p className="mail-loading">reading the cursor…</p>}
-      {!loading && cursor === null && (
-        <p className="mail-note">no cursor recorded yet for {mailbox} — it has not been synced.</p>
-      )}
-      {!loading && cursor !== null && cursor !== undefined && (
-        <p className="mail-note">
-          {mailbox}: UID validity {cursor.uidvalidity}, last UID {cursor.last_uid}
-        </p>
-      )}
-    </Panel>
+    <span className="mail-config-data">
+      UID validity {cursor.uidvalidity} · last UID {cursor.last_uid}
+    </span>
   );
 }
 

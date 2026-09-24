@@ -118,7 +118,6 @@ function spokenName(
 const BADGE_NOUN: Record<NavBadge, string> = {
   proposals: "waiting",
   chats: "unread",
-  mail: "untriaged",
 };
 // The count is `open_review_items` — proposals and shadow decisions both — so the noun is items.
 const PROJECT_BADGE_NOUN = "items to review";

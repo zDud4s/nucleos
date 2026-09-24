@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { Link, useParams } from "@tanstack/react-router";
+import { useParams } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   useDownloadAttachment,
@@ -17,9 +17,11 @@ import {
 import {
   Button,
   ConfirmButton,
+  Crumb,
   ErrorNote,
   PageHeader,
   Panel,
+  readState,
   RefusalNote,
   RelativeTime,
   Row,
@@ -56,11 +58,11 @@ export function MailDetail() {
 function UnknownEmail({ raw }: { raw: string | undefined }) {
   return (
     <>
+      <Crumb to="/mail">Mail</Crumb>
       <PageHeader title="Message" />
       <ErrorNote>
         <code>{raw ?? "(nothing)"}</code> is not a message id — messages are numbered.
       </ErrorNote>
-      <Link to="/mail">Back to the queue</Link>
     </>
   );
 }
@@ -72,15 +74,18 @@ function KnownEmail({ id }: { id: number }) {
   if (detail === undefined) {
     return (
       <>
+        <Crumb to="/mail">Mail</Crumb>
         <PageHeader title={`Message ${id}`} />
         {email.isError ? <DetailError error={email.error} /> : <p className="mail-loading">reading message {id}…</p>}
-        <Link to="/mail">Back to the queue</Link>
       </>
     );
   }
 
   return (
     <>
+      {/* The way back, once and at the top — it was the last line of the page, under
+          the reply form, reachable only by scrolling past everything read here. */}
+      <Crumb to="/mail">Mail</Crumb>
       <PageHeader title={detail.subject ?? "(no subject)"} headline={headline(detail)} />
 
       <FactsPanel email={detail} />
@@ -88,17 +93,25 @@ function KnownEmail({ id }: { id: number }) {
       {detail.has_attachments === 1 && <AttachmentsPanel emailId={id} attachments={detail.attachments} />}
       <SenderVerdict email={detail} />
       <ReplyForm to={detail.from_addr} subject={detail.subject} />
-
-      <Link to="/mail">Back to the queue</Link>
     </>
   );
 }
 
-/** One derived sentence about who this is from and where triage got to. */
+/**
+ * One derived sentence about who this is from and where triage got to.
+ *
+ * In the badge's own words, from the same map: this said "triaged as action"
+ * directly above a badge reading "needs a reply, not today", which is one fact
+ * under two names on one screen. A class the map does not know is quoted raw.
+ */
 function headline(email: EmailDetail): string {
   const from = email.from_name ?? email.from_addr;
-  const state = typeof email.triage_class !== "string" ? "not triaged yet" : `triaged as ${email.triage_class}`;
-  return `from ${from} — ${state}`;
+  return `from ${from} — ${classWords(email.triage_class)}`;
+}
+
+function classWords(triageClass: string | null): string {
+  if (typeof triageClass !== "string") return "not triaged yet";
+  return readState("email_class", triageClass)?.label ?? `triaged as ${triageClass}`;
 }
 
 function DetailError({ error }: { error: unknown }) {
@@ -143,7 +156,15 @@ function FactsPanel({ email }: { email: EmailDetail }) {
         <Fact label="Triage">
           <StateBadge domain="email_class" state={email.triage_class} />
         </Fact>
-        {email.model_class !== null && <Fact label="Model said">{email.model_class}</Fact>}
+        {/* Only when the two disagree. Said whenever it was present, it printed the badge's
+            own words a second time directly beside the badge — one fact under two names. What
+            is worth reading is the disagreement, and the rule that settled it. */}
+        {email.model_class !== null && email.model_class !== email.triage_class && (
+          <Fact label="Model said">
+            {classWords(email.model_class)}
+            <span className="mail-detail-address"> {email.model_class}</span>
+          </Fact>
+        )}
         {email.priority_rule !== null && <Fact label="Overridden by">{email.priority_rule}</Fact>}
       </dl>
 
@@ -222,7 +243,7 @@ function AttachmentsPanel({ emailId, attachments }: { emailId: number; attachmen
         ) : undefined
       }
     >
-      <Rows label="Attachments" className="mail-detail-attachments">
+      <Rows label="Attachments">
         {attachments.map((attachment) => (
           <AttachmentRow key={attachment.position} emailId={emailId} attachment={attachment} />
         ))}
@@ -255,7 +276,11 @@ function AttachmentRow({ emailId, attachment }: { emailId: number; attachment: E
     <Row className="mail-detail-attachment">
       <span className="mail-detail-attachment-name">{senderName}</span>
       <span className="mail-detail-attachment-meta">
-        {attachment.mime_type ?? "unknown type"} · {formatBytes(attachment.size_bytes)}
+        <span className="mail-detail-attachment-type" title={attachment.mime_type ?? undefined}>
+          {attachment.mime_type ?? "unknown type"}
+        </span>
+        <span aria-hidden="true">·</span>
+        <span>{formatBytes(attachment.size_bytes)}</span>
       </span>
       <Button
         disabled={download.isPending}
@@ -312,37 +337,99 @@ function formatBytes(size: number): string {
  */
 function SenderVerdict({ email }: { email: EmailDetail }) {
   const verdict = useSenderVerdict();
+  const standing = email.sender_verdict;
 
   return (
     <Panel title="This sender" variant="dim">
-      <p className="mail-note">
-        A standing decision about <strong>{email.from_addr}</strong> — pin them to keep seeing their mail
-        in full, or mute them to stop it being surfaced. This is separate from the triage class above,
-        which is about this one message.
-      </p>
-      <div className="mail-detail-verdict-actions">
+      <p className="mail-note">{standingSentence(email.from_addr, standing)}</p>
+      <div className="mail-detail-verdict-actions" role="group" aria-label="Standing decision about this sender">
+        {/* `aria-pressed` and a rung of the neutral ladder, never a tone: pinning a sender is a
+            preference, and Acting Green — which this button wore — is the colour of something
+            executing right now. The same reasoning took the chip off the queue row. */}
         <Button
-          variant="approve"
+          aria-pressed={standing === "pin"}
           disabled={verdict.isPending}
           onClick={() => verdict.mutate({ address: email.from_addr, verdict: "pin" })}
         >
           Pin
         </Button>
-        <Button disabled={verdict.isPending} onClick={() => verdict.mutate({ address: email.from_addr, verdict: "mute" })}>
-          Mute
-        </Button>
-        <Button disabled={verdict.isPending} onClick={() => verdict.mutate({ address: email.from_addr, verdict: null })}>
-          Clear
-        </Button>
+        {/* The one action here with a consequence you would not see: muted mail stops being
+            surfaced, and nothing on this page would ever say so again. It asks twice, naming
+            who it is about. Pin and Clear are both one press — either is undone by the other. */}
+        <span className="mail-detail-verdict-mute" data-set={standing === "mute" ? "true" : undefined}>
+          <ConfirmButton
+            label="Mute"
+            confirmLabel="Mute them now"
+            /* The address goes to the ear, not into the label: `subject` is a short row
+               identifier — `#101`, a run id — and it is composed into the armed label AS
+               TEXT, so an e-mail address there reserves the width of the whole address on a
+               button that reads "Mute". The panel's own sentence already names the sender for
+               the eye. */
+            sayAs={`Mute ${email.from_addr} — their mail stops being surfaced`}
+            variant="ghost"
+            disabled={verdict.isPending || standing === "mute"}
+            onConfirm={() => verdict.mutate({ address: email.from_addr, verdict: "mute" })}
+          />
+        </span>
+        {standing !== null && (
+          <Button
+            disabled={verdict.isPending}
+            onClick={() => verdict.mutate({ address: email.from_addr, verdict: null })}
+          >
+            Clear
+          </Button>
+        )}
       </div>
       {verdict.isSuccess && (
         <p className="mail-outcome" role="status">
-          recorded
+          {verdictRecorded(verdict.variables?.verdict)}
         </p>
       )}
       {verdict.isError && <VerdictError error={verdict.error} />}
     </Panel>
   );
+}
+
+/**
+ * What is standing now, in words — the fact the three buttons act on.
+ *
+ * The page could not say this at all before: `EmailDetail` carried no verdict,
+ * so a sender the queue had just shown as "pinned" opened onto three buttons
+ * with nothing marked, and the only way to know what you were about to undo was
+ * to remember the row you came from.
+ */
+function standingSentence(address: string, verdict: string | null): ReactNode {
+  if (verdict === "pin") {
+    return (
+      <>
+        <code>{address}</code> is pinned — their mail keeps being surfaced in full. This is separate
+        from the triage class above, which is about this one message.
+      </>
+    );
+  }
+  if (verdict === "mute") {
+    return (
+      <>
+        <code>{address}</code> is muted — their mail stops being surfaced. This is separate from the
+        triage class above, which is about this one message.
+      </>
+    );
+  }
+  return (
+    <>
+      No standing decision about <code>{address}</code> — pin them to keep seeing their mail in full,
+      or mute them to stop it being surfaced. This is separate from the triage class above, which is
+      about this one message.
+    </>
+  );
+}
+
+/** What the press just recorded — "recorded" alone did not say which of three buttons it was. */
+function verdictRecorded(verdict: "pin" | "mute" | null | undefined): string {
+  if (verdict === "pin") return "recorded — this sender is pinned";
+  if (verdict === "mute") return "recorded — this sender is muted";
+  if (verdict === null) return "recorded — no standing decision about this sender";
+  return "recorded";
 }
 
 function VerdictError({ error }: { error: unknown }) {
@@ -376,7 +463,10 @@ function ReplyForm({ to, subject }: { to: string; subject: string | null }) {
         There is no pre-flight check here — the form is always open. If the daemon has nowhere to send
         this from, that refusal arrives after Send is pressed, named below, not before.
       </p>
-      <form className="mail-detail-reply" onSubmit={(event) => event.preventDefault()}>
+      <form className="mail-detail-reply mail-stack" onSubmit={(event) => event.preventDefault()}>
+        {/* To and Subject are fixed by the message being answered. They stay
+            inputs, for their names, but are drawn as the facts they are — a
+            bordered box reads as a place to type. */}
         <label className="mail-detail-reply-field">
           <span>To</span>
           <input value={to} readOnly aria-label="Reply recipient" />

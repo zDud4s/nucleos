@@ -1704,6 +1704,10 @@ struct EmailDetail {
     /// mistake for an empty message.
     body_text: Option<String>,
     has_attachments: i64,
+    /// The standing human decision about this sender — `pin`, `mute`, or none — the same field the
+    /// queue row carries. The message page is where that decision is changed, and a control that
+    /// cannot show which way it is set can only be pressed blind.
+    sender_verdict: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -1718,9 +1722,10 @@ async fn get_email(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<EmailDetailResponse>, StatusCode> {
-    let message: EmailDetail = sqlx::query_as(
+    let mut message: EmailDetail = sqlx::query_as(
         "SELECT id, from_addr, from_name, subject, received_at, triage_class, triage_summary,
-                triaged_at, model_class, priority_rule, body_text, has_attachments
+                triaged_at, model_class, priority_rule, body_text, has_attachments,
+                NULL AS sender_verdict
            FROM emails WHERE id = ?",
     )
     .bind(id)
@@ -1728,6 +1733,20 @@ async fn get_email(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Matched through `contacts::normalize_address`, for the reason `get_email_queue` gives: one
+    // definition of "the same sender", applied in Rust, rather than a second one written in SQL.
+    message.sender_verdict = sqlx::query_scalar(
+        "SELECT overrides.verdict
+           FROM contact_overrides AS overrides
+           JOIN contact_addresses AS addresses
+             ON addresses.contact_id = overrides.contact_id
+          WHERE addresses.address = ?",
+    )
+    .bind(crate::contacts::normalize_address(&message.from_addr))
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let attachments: Vec<EmailAttachment> = sqlx::query_as(
         "SELECT position, filename, mime_type, size_bytes
@@ -16568,6 +16587,40 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(message["model_class"], "urgent");
         assert_eq!(message["priority_rule"], "first-contact");
+    }
+
+    /// The message page is where a sender is pinned or muted, so it has to be able to say which
+    /// way that sender is set now — matched through the same address normalisation the queue uses,
+    /// display name and casing included, and `null` when no one has decided.
+    #[tokio::test]
+    async fn opening_a_message_says_how_its_sender_is_set() {
+        let state = test_state().await;
+        let id = sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, body_text,
+                                 received_at, ingested_at)
+             VALUES ('<verdict@x>', 'INBOX', 1, 78, 'Maria <MARIA@example.com>', 'body',
+                     '2026-07-30T10:00:00+00:00', '2026-07-30T10:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        seen_from(&state, "maria@example.com").await;
+
+        let (_, before) = get_email_detail(state.clone(), id).await;
+        assert!(before["sender_verdict"].is_null());
+
+        assert_eq!(
+            set_sender_verdict(
+                state.clone(),
+                serde_json::json!({ "address": "maria@example.com", "verdict": "mute" }),
+            )
+            .await,
+            StatusCode::NO_CONTENT,
+        );
+        let (status, after) = get_email_detail(state, id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(after["sender_verdict"], "mute");
     }
 
     /// `/email/queue` must keep winning over `/email/{id}`, or listing the mailbox starts trying to

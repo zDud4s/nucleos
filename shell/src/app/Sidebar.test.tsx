@@ -198,11 +198,14 @@ describe("Sidebar", () => {
     expect(screen.getByRole("link", { name: "Waiting, 7 waiting" })).toBeDefined();
   });
 
-  it("names chat and mail badges by their own arithmetic", async () => {
-    await renderWithRouter(<Sidebar badges={{ chats: 2, mail: 3 }} />);
+  it("names the chat badge by its own arithmetic, and gives Mail none", async () => {
+    await renderWithRouter(<Sidebar badges={{ chats: 2 }} />);
 
     expect(screen.getByRole("link", { name: "Chats, 2 unread" })).toBeDefined();
-    expect(screen.getByRole("link", { name: "Mail, 3 untriaged" })).toBeDefined();
+    // Mail carries no badge at all — see the comment on its row in `nav.ts`. Untriaged is the
+    // daemon's backlog, and an Awaiting You count that nothing can clear teaches a reader to
+    // ignore the tone everywhere it does mean them.
+    expect(screen.getByRole("link", { name: "Mail" })).toBeDefined();
   });
 
   it("renders no badge at all for a count the shell has no source for", async () => {

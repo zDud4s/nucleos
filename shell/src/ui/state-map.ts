@@ -60,6 +60,16 @@ export type StateDomain =
 export interface StateReading {
   tone: BadgeTone;
   label: string;
+  /**
+   * Nothing has decided this yet — the badge is drawn dashed and unfilled.
+   *
+   * A verdict that has not been reached is not a verdict, and giving it a solid
+   * badge in any of the seven tones says the opposite. Dashed is what this
+   * system already uses for "provisional or empty" (DESIGN.md, Shapes), and it
+   * is what separates `email_class: null` from `noise`: both are quiet, but one
+   * was read and dismissed and the other has not been read at all.
+   */
+  provisional?: true;
 }
 
 /**
@@ -742,7 +752,7 @@ const ABSENT: Partial<Record<StateDomain, StateReading>> = {
    * that second fact is `noise`, a real class, and the two must not share a
    * badge.
    */
-  email_class: { tone: "info", label: "not triaged yet" },
+  email_class: { tone: "off", label: "not triaged yet", provisional: true },
 };
 
 /**

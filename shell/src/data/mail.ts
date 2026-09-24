@@ -179,6 +179,18 @@ export function untriagedCount(rows: QueuedEmail[]): number {
   return rows.filter((row) => row.triage_class === null).length;
 }
 
+/**
+ * How many rows in a queue reading are the reader's own to answer.
+ *
+ * `urgent` and `action` are the two classes triage assigns when a person has to
+ * do something; everything else is the machine reporting. Kept beside
+ * {@link untriagedCount} because the difference between the two is the whole
+ * point: one counts the owner's backlog, the other counts the daemon's.
+ */
+export function awaitingYouCount(rows: QueuedEmail[]): number {
+  return rows.filter((row) => row.triage_class === "urgent" || row.triage_class === "action").length;
+}
+
 /* ---------------------------------------------------------------- detail -- */
 
 /**
@@ -228,6 +240,14 @@ export interface EmailDetail {
   body_text: string | null;
   has_attachments: number;
   attachments: EmailAttachment[];
+  /**
+   * `"pin"` | `"mute"` | `null` — the standing decision about this sender, the
+   * same field {@link QueuedEmail} carries and matched by the same address
+   * normalisation (`core/src/http.rs`'s `get_email`). The message page is where
+   * that decision is changed, and a control that cannot say which way it is set
+   * can only be pressed blind.
+   */
+  sender_verdict: string | null;
 }
 
 /** One message, in full. No `keepPreviousData`: a stale detail under the wrong id is worse than a loading state. */

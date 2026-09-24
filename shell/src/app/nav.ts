@@ -61,7 +61,7 @@ export type NavGroupId = "operate" | "projects" | "work" | "pillars";
  * between them, and it is what lets a badge be declared here in the slice that
  * builds the nav and filled in by the slice that builds the pillar.
  */
-export type NavBadge = "proposals" | "chats" | "mail";
+export type NavBadge = "proposals" | "chats";
 
 export interface NavItem {
   /** Stable id — used for badge lookup, disabled sets, and test selectors. */
@@ -201,7 +201,16 @@ export const NAV: NavGroup[] = [
     id: "pillars",
     label: "Pillars",
     items: [
-      { id: "mail", label: "Mail", path: "/mail", icon: Mail, badge: "mail" },
+      /*
+        No badge, decided 2026-09-22. It counted untriaged mail in the Awaiting You tone, and
+        untriaged is the daemon's backlog rather than anything asked of the reader — amber that
+        means "the machine has not got there yet" teaches a person to ignore amber everywhere
+        else. What genuinely asks for the reader arrives where it can be cleared: an urgent
+        message raises `email_urgent` on the feed and in Notifications, and triage falling behind
+        raises `email_triage_stalled`. A queue row has no "answered" state, so any count taken
+        from it would stand until retention pruned the message — a summons nobody can satisfy.
+      */
+      { id: "mail", label: "Mail", path: "/mail", icon: Mail },
       { id: "contacts", label: "Contacts", path: "/contacts", icon: Contact },
       { id: "calendar", label: "Calendar", path: "/calendar", icon: Calendar },
       { id: "voice", label: "Voice", path: "/voice", icon: Mic },

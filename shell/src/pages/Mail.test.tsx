@@ -120,6 +120,68 @@ describe("Mail — panel order", () => {
   });
 });
 
+/* ------------------------------------------------ the headline's answer -- */
+
+/**
+ * The page's largest sentence is read before anything else on it, and what it
+ * is FOR is the five-second "is everything fine?". It used to be a row count,
+ * which answers a question nobody opens this page with while the two facts that
+ * decide whether the count means anything — is the pillar armed, is this
+ * reading current — sat at the bottom of the page and inside a panel.
+ */
+describe("Mail — the headline", () => {
+  it("names a disarmed pillar instead of counting the queue under it", async () => {
+    const world = mailWorld({
+      queue: [queuedEmail({ id: 1, triage_class: "urgent" })],
+      config: emailConfig({ armed: false }),
+    });
+    daemon.apiFetch.mockImplementation(mailFetch(world));
+
+    await renderMail();
+
+    expect(await screen.findByText("triage is not armed — mail arrives, nothing reads it")).toBeDefined();
+  });
+
+  it("leads with the reader's own share of the queue, not the daemon's backlog", async () => {
+    const world = mailWorld({
+      queue: [
+        queuedEmail({ id: 1, triage_class: "urgent" }),
+        queuedEmail({ id: 2, triage_class: "action" }),
+        queuedEmail({ id: 3, triage_class: null }),
+        queuedEmail({ id: 4, triage_class: "noise" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(mailFetch(world));
+
+    await renderMail();
+
+    expect(await screen.findByText("4 in the queue; 2 for you; 1 not triaged yet")).toBeDefined();
+  });
+
+  it("says a reading is last known rather than restating it as the present", async () => {
+    const world = mailWorld({ queue: [queuedEmail({ id: 1, triage_class: "noise" })] });
+    let answered = false;
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      const route = path.split("?")[0];
+      if (route === "/email/queue") {
+        if (answered) throw new Error("the núcleo did not answer");
+        answered = true;
+        return world.queue;
+      }
+      return mailFetch(world)(path, init);
+    });
+
+    const { queryClient } = await renderMail();
+    expect(await screen.findByText("1 in the queue; nothing needs you")).toBeDefined();
+
+    // The same rows, now known to be old: the sentence must stop claiming they are the present.
+    await queryClient.refetchQueries({ queryKey: keys.mail.all });
+    await waitFor(() => {
+      expect(screen.getByText("last known: 1 in the queue; nothing needs you")).toBeDefined();
+    });
+  });
+});
+
 /* -------------------------------------------------- an untriaged message -- */
 
 describe("Mail — an untriaged message", () => {
@@ -142,9 +204,16 @@ describe("Mail — an untriaged message", () => {
     // from `noise`, which is triage having read it and found nothing. The
     // two must not read as the same badge.
     const badge = within(card).getByText(/not triaged/i);
-    expect(badge.className).toContain("ui-badge-info");
     expect(badge.textContent?.toLowerCase()).not.toContain("noise");
     expect(badge.textContent?.toLowerCase()).not.toContain("clean");
+    // And it is not a verdict: dashed and unfilled, because nothing has decided
+    // yet. It used to be the info tone, which is also `info`'s own tone — the
+    // class triage assigns when it HAS read a message and found it worth having
+    // seen — so the one row nobody had read wore the same blue as one that was.
+    expect(badge.className).toContain("ui-state-awaited");
+    const noise = within(screen.getByText("newsletter").closest("li") as HTMLElement).getByText("noise");
+    expect(noise.className).not.toContain("ui-state-awaited");
+    expect(badge.className).not.toBe(noise.className);
   });
 });
 

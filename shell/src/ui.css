@@ -393,6 +393,19 @@
 }
 
 /**
+ * A verdict nothing has reached yet: dashed, and unfilled.
+ *
+ * `email_class: null` is the worked example — triage has not read the message. It is not one of
+ * the seven tones, because it is not a state anything decided; dashed is what this system uses
+ * for "provisional or empty" (DESIGN.md, Shapes), and it is what keeps "not triaged yet" from
+ * reading as a quiet verdict beside `noise`, which was read and dismissed.
+ */
+.ui-badge.ui-state-awaited {
+  border-style: dashed;
+  background: none;
+}
+
+/**
  * A state this shell has no reading for, shown as itself.
  *
  * Dashed, monospaced, and lower-case: it is a literal off the wire rather than

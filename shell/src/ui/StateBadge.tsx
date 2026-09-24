@@ -24,7 +24,11 @@ export interface StateBadgeProps {
 export function StateBadge({ domain, state }: StateBadgeProps) {
   const reading = readState(domain, state);
   if (reading !== null) {
-    return <Badge tone={reading.tone}>{reading.label}</Badge>;
+    return (
+      <Badge tone={reading.tone} className={reading.provisional === true ? "ui-state-awaited" : undefined}>
+        {reading.label}
+      </Badge>
+    );
   }
 
   const literal = state === null || state === undefined ? "" : state.trim();

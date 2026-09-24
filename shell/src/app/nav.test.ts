@@ -114,13 +114,16 @@ describe("the nav table", () => {
     expect(NAV_ITEMS[NAV_ITEMS.length - 1]).toBe(SYSTEM_ITEM);
   });
 
-  it("carries the three badges on the three items the design badges", () => {
+  it("carries a badge on the two items whose count somebody can clear", () => {
     const badged = NAV_ITEMS.filter((item) => item.badge !== undefined);
     expect(badged.map((item) => [item.id, item.badge])).toEqual([
       ["waiting", "proposals"],
       ["chats", "chats"],
-      ["mail", "mail"],
     ]);
+    // Mail lost its badge on 2026-09-22 and the reason is on its row in `nav.ts`: it counted
+    // untriaged mail, which is the daemon's backlog rather than anything asked of the reader,
+    // and a queue row has no "answered" state — so nothing anyone did could clear it.
+    expect(NAV_ITEMS.find((item) => item.id === "mail")?.badge).toBeUndefined();
   });
 
   it("keeps Teams in the sidebar with nothing left holding it back", () => {

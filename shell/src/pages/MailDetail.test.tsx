@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import {
   Outlet,
@@ -55,6 +55,7 @@ function emailDetail(overrides: Partial<EmailDetail> = {}): EmailDetail {
     priority_rule: null,
     body_text: "Here are the numbers.",
     has_attachments: 0,
+    sender_verdict: null,
     attachments: [],
     ...overrides,
   };
@@ -120,6 +121,85 @@ describe("MailDetail — a pruned body", () => {
     // requeueable by every other signal on the page.
     expect(await screen.findByText(/requeuing is not offered/)).toBeDefined();
     expect(screen.queryByRole("button", { name: "Requeue for triage" })).toBeNull();
+  });
+});
+
+/* --------------------------------------------------------- the sender -- */
+
+describe("MailDetail — the standing decision about a sender", () => {
+  it("says which way the sender is set, and marks the button that is the setting", async () => {
+    const detail = emailDetail({ sender_verdict: "pin" });
+    daemon.apiFetch.mockImplementation(async (path: string) => (path === "/email/42" ? detail : undefined));
+
+    await renderMailDetail("/mail/42");
+
+    // The page could not say this at all before: `EmailDetail` carried no verdict, so a sender
+    // the queue had just shown as pinned opened onto three buttons with nothing marked.
+    expect(await screen.findByText(/is pinned — their mail keeps being surfaced/)).toBeDefined();
+    expect(screen.getByRole("button", { name: "Pin" }).getAttribute("aria-pressed")).toBe("true");
+    // Clear is the way back out, and exists only when there is something to clear.
+    expect(screen.getByRole("button", { name: "Clear" })).toBeDefined();
+  });
+
+  it("offers no way back out when nothing has been decided", async () => {
+    const detail = emailDetail({ sender_verdict: null });
+    daemon.apiFetch.mockImplementation(async (path: string) => (path === "/email/42" ? detail : undefined));
+
+    await renderMailDetail("/mail/42");
+
+    expect(await screen.findByText(/No standing decision about/)).toBeDefined();
+    expect(screen.getByRole("button", { name: "Pin" }).getAttribute("aria-pressed")).toBe("false");
+    expect(screen.queryByRole("button", { name: "Clear" })).toBeNull();
+  });
+
+  it("asks twice before muting, because muted mail stops being surfaced silently", async () => {
+    const detail = emailDetail({ sender_verdict: null });
+    const posted: unknown[] = [];
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/contacts/verdict" && init?.method === "POST") {
+        posted.push(JSON.parse(String(init.body)));
+        return undefined;
+      }
+      return path === "/email/42" ? detail : undefined;
+    });
+
+    await renderMailDetail("/mail/42");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Mute" }));
+    // One press arms it and sends nothing — the consequence is named on the armed label.
+    expect(posted).toHaveLength(0);
+    const armed = await screen.findByRole("button", { name: /Mute them now/ });
+    await afterDwell();
+    fireEvent.click(armed);
+
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).toEqual({ address: "ana@example.com", verdict: "mute" });
+    // And the outcome names what was recorded, rather than the bare word "recorded".
+    expect(await screen.findByText("recorded — this sender is muted")).toBeDefined();
+  });
+});
+
+/* ------------------------------------------------------- what triage said -- */
+
+describe("MailDetail — the model's own class", () => {
+  it("shows it only when it disagrees with the class that was stored", async () => {
+    const agreeing = emailDetail({ triage_class: "action", model_class: "action" });
+    daemon.apiFetch.mockImplementation(async (path: string) => (path === "/email/42" ? agreeing : undefined));
+
+    const { unmount } = await renderMailDetail("/mail/42");
+    // The badge above already says "needs a reply, not today"; printing the model's identical
+    // answer beside it is one fact under two names.
+    expect(await screen.findByText("Triage")).toBeDefined();
+    expect(screen.queryByText("Model said")).toBeNull();
+    unmount();
+
+    const disagreeing = emailDetail({ triage_class: "action", model_class: "urgent", priority_rule: "first-contact" });
+    daemon.apiFetch.mockImplementation(async (path: string) => (path === "/email/42" ? disagreeing : undefined));
+
+    await renderMailDetail("/mail/42");
+
+    expect(await screen.findByText("Model said")).toBeDefined();
+    expect(screen.getByText("Overridden by")).toBeDefined();
   });
 });
 

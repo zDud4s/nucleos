@@ -33,6 +33,27 @@
   color: var(--text-muted);
 }
 
+/* A note stands beside the thing it explains, so it takes the note measure:
+   run across a 78rem panel, the triage and reply notes were one line of 200
+   characters sitting directly on the button under them. */
+.mail-note {
+  max-width: var(--measure);
+}
+
+/* Prose, then its control, then what the control answered — one column with
+   one gap, rather than each child bringing (or forgetting) a margin of its
+   own. The forgetting is what put "Run triage now" flush against its note. */
+.mail-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.mail-stack > * {
+  margin: 0;
+}
+
 .mail-loading {
   color: var(--text-faint);
   font-style: italic;
@@ -104,59 +125,61 @@
 /* The column and the row itself are `Rows`/`Row`; only the arrangement inside
    a row is this page's. The argument for a hairline-ruled list over a column
    of cards now lives on the component, where all four lists that had grown it
-   can read it. */
-.mail-row-head {
-  display: grid;
-  grid-template-columns: 6rem minmax(8rem, 11rem) minmax(0, 1fr) auto;
-  align-items: center;
-  gap: var(--space-2);
+   can read it.
+
+   The class track is sized to the longest reading `email_class` has — "needs a
+   reply, not today" — because it was 6rem, and four of the six labels ran
+   straight over the sender beside them. A container, not a window, decides the
+   fold: the list is what runs out of room, and at 800px it had a quarter of
+   the width the four tracks need. */
+.mail-list {
+  container: mail-list / inline-size;
 }
 
-.mail-row-badges {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-1);
+.mail-row-head {
+  display: grid;
+  grid-template-columns: 10.5rem minmax(8rem, 12rem) minmax(0, 1fr) auto;
+  align-items: baseline;
+  column-gap: var(--space-3);
+  row-gap: var(--space-1);
+}
+
+.mail-row-class {
+  align-self: center;
+  white-space: nowrap;
 }
 
 .mail-row-from {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
   color: var(--text);
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
+  white-space: nowrap;
 }
 
-.mail-verdict {
-  padding: 0 var(--space-2);
-  border-radius: var(--radius-sm);
+/* The name gives way before the verdict does: "pin…" is not a word. */
+.mail-row-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The sender verdict, as a word after the name — quiet, because it qualifies the
+   sender rather than stating anything about this message, but MUTED and not
+   faint: faint (#6a7484 on #14171d) measures 3.8:1, and at 11px that is below
+   the 4.5:1 this project takes as a floor. Measured by the detector in the
+   rendered page, not guessed. */
+.mail-row-verdict {
+  flex: none;
+  margin-left: var(--space-2);
+  color: var(--text-muted);
   font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
+  font-weight: var(--weight-regular);
 }
 
-/* A pin is a standing decision to keep seeing this sender in full; a mute is
-   the opposite. Warm and quiet, in the same vocabulary as the state tones,
-   without claiming either one is a `StateBadge` domain of its own. */
-.mail-verdict-pin {
-  background: var(--tone-active-bg);
-  color: var(--tone-active-fg);
-}
-
-.mail-verdict-mute {
-  background: var(--tone-off-bg);
-  color: var(--tone-off-fg);
-}
-
-.mail-attachment {
-  padding: 0 var(--space-2);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  color: var(--text-faint);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-}
-
-/* A link to `/mail/$emailId` — block and undecorated so it reads as the row's
+/* A link to `/mail/$emailId` — undecorated at rest so it reads as the row's
    subject line first and a link second, the same posture `.runs-row-name`
    takes for a run's excerpt. */
 .mail-row-subject {
@@ -172,14 +195,46 @@
   text-decoration: underline;
 }
 
+.mail-row-meta {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  white-space: nowrap;
+}
+
+.mail-row-clip {
+  flex: none;
+  color: var(--text-faint);
+}
+
 .mail-row-summary {
-  grid-column: 3;
+  grid-column: 3 / -1;
   margin: 0;
   padding-left: var(--space-3);
   border-left: 2px solid var(--border-strong);
   color: var(--text-muted);
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
+}
+
+/* Folded: class, sender and time on the first line, the subject under them,
+   then its summary — three lines that each hold a whole thing, rather than
+   four tracks each holding a word. */
+@container mail-list (max-width: 44rem) {
+  .mail-row-head {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .mail-row-subject,
+  .mail-row-summary {
+    grid-column: 1 / -1;
+  }
+
+  .mail-row-meta {
+    grid-column: 3;
+    grid-row: 1;
+  }
 }
 
 /* -------------------------------------------------------------- ceiling -- */
@@ -202,6 +257,7 @@
 
 .mail-config-fact {
   display: flex;
+  align-items: baseline;
   gap: var(--space-2);
   font-size: var(--text-sm);
 }
@@ -213,6 +269,14 @@
 .mail-config-fact dd {
   margin: 0;
   color: var(--text);
+}
+
+/* The account, the mailbox and the cursor are values the daemon holds, not
+   sentences — the mono face says so (DESIGN.md, the Three Faces Rule). */
+.mail-config-data {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ======================================================= message detail == */
@@ -261,15 +325,18 @@
  * thing overridden: a message is prose somebody reads, so it takes the body face
  * at reading size and leading, held to the prose measure, rather than the mono
  * face `pre` gives stdout.
+ *
+ * And it is not a well. The sunken box with its own border sat inside the panel
+ * as a card inside a card around the one thing on this page somebody came to
+ * read; the panel is already the boundary, so the prose stands in it directly.
  */
 .mail-detail-body {
   max-width: var(--measure-prose);
   max-height: none;
   margin: 0;
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
+  padding: 0;
+  border: 0;
+  background: none;
   color: var(--text);
   font-family: var(--font-body);
   font-size: var(--text-base);
@@ -277,10 +344,6 @@
 }
 
 /* --------------------------------------------------------- attachments -- */
-
-.mail-detail-attachments {
-  margin-top: var(--space-3);
-}
 
 .mail-detail-attachment {
   display: grid;
@@ -296,10 +359,25 @@
   overflow-wrap: anywhere;
 }
 
+/* A MIME type can be seventy characters of `vnd.openxmlformats…`, and it pushed
+   both buttons of its row to the far edge. It truncates, keeps its whole value
+   in `title`, and the size after it never does. Muted rather than faint, for the
+   contrast reason given on `.mail-row-verdict`. */
 .mail-detail-attachment-meta {
-  color: var(--text-faint);
+  display: flex;
+  gap: var(--space-1);
+  min-width: 0;
+  max-width: 18rem;
+  color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.mail-detail-attachment-type {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .mail-detail-attachment > .mail-outcome,
@@ -316,12 +394,30 @@
   margin-top: var(--space-3);
 }
 
+/* The span exists to carry the mark below, and is inline-flex so it is the width of the
+   interlock inside it rather than a stretched flex item. */
+.mail-detail-verdict-mute {
+  display: inline-flex;
+}
+
+/* The mute segment marks itself while set: `ConfirmButton` deliberately carries no
+   `aria-pressed` (a control that is armed is not a control that is the setting), so the
+   wrapper says it instead — one rung up the ladder, the same mark `.ui-button[aria-pressed]`
+   makes on the two plain buttons beside it. */
+.mail-detail-verdict-mute[data-set="true"] .ui-button {
+  border-color: var(--text-faint);
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
 /* ---------------------------------------------------------------- reply -- */
 
 .mail-detail-reply {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.mail-detail-reply > label {
+  align-self: stretch;
 }
 
 /* The search bar is a `Field` from `../ui`; the reply form still labels its own
@@ -354,6 +450,14 @@
 .mail-detail-reply-field textarea {
   resize: vertical;
   line-height: var(--leading-snug);
+}
+
+/* Fixed by the message being answered: drawn as the facts they are, with no
+   box, so the one box left on the form is the one that takes typing. */
+.mail-detail-reply-field input:read-only {
+  padding-inline: 0;
+  border-color: transparent;
+  background: none;
 }
 
 .mail-detail-reply-field input:focus-visible,

@@ -544,6 +544,19 @@ const SHOTS_TO_TAKE = [
      (`AppShell.tsx`) rather than floating, and needs none of the options above — `contained` is
      always unfolded, so any page path already shows it. */
   ["63-notch-contained", { path: "/teams" }],
+  /* Mail, both halves. The queue carries all five classes plus an untriaged row, both sender
+     verdicts, attachments, a wrapping subject and a missing one (`daemon.ts`'s `MAIL_QUEUE`);
+     the narrow shot is the 800px degraded case the row grid has to survive. */
+  ["70-mail", { path: "/mail" }],
+  ["71-mail-light", { path: "/mail", theme: "light" }],
+  ["72-mail-narrow", { path: "/mail", viewport: { width: 800, height: 600 } }],
+  ["73-mail-detail", { path: "/mail/1" }],
+  ["74-mail-detail-light", { path: "/mail/1", theme: "light" }],
+  ["75-mail-detail-narrow", { path: "/mail/1", viewport: { width: 800, height: 600 } }],
+  /* The pillar disarmed. The queue looks the same as a healthy one by construction — mail keeps
+     arriving and retention keeps pruning — so the header is the only thing that can say it, and
+     this is the shot that proves it does. `?disarmed` is read by `preview/daemon.ts`. */
+  ["76-mail-disarmed", { path: "/mail?disarmed=1" }],
 ];
 
 const wanted = SHOTS_TO_TAKE.filter(([name]) => ONLY === undefined || name.includes(ONLY));
