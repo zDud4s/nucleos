@@ -155,7 +155,7 @@ async fn governance_permits_repo_trigger(
         });
     }
     if let crate::budget::BudgetDecision::Pause { reason, .. } =
-        crate::budget::budget_permits_new_run(&state.pool, now).await
+        crate::quota::permits_new_run(state, now).await
     {
         return Err(GateRefusal {
             reason,

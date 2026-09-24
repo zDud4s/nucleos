@@ -52,6 +52,7 @@ export const keys = {
      */
     scopedKills: ["autopilot", "scoped-kills"] as const,
     budget: ["autopilot", "budget"] as const,
+    quotaBrake: ["autopilot", "quota-brake"] as const,
     scoreboard: (projectId: string) => ["autopilot", "scoreboard", projectId] as const,
     shadowDecisions: ["autopilot", "shadow-decisions"] as const,
   },

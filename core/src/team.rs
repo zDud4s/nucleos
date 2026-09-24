@@ -951,6 +951,7 @@ pub enum StartError {
     NotFound,
     Invalid(String),
     BudgetExhausted(String),
+    QuotaExhausted(String),
     Unavailable(String),
 }
 
@@ -960,6 +961,7 @@ impl std::fmt::Display for StartError {
             Self::NotFound => formatter.write_str("team not found"),
             Self::Invalid(message)
             | Self::BudgetExhausted(message)
+            | Self::QuotaExhausted(message)
             | Self::Unavailable(message) => formatter.write_str(message),
         }
     }
@@ -1075,10 +1077,14 @@ pub async fn start_with(
         )));
     }
 
-    match crate::budget::budget_permits_new_run(&state.pool, chrono::Utc::now()).await {
+    match crate::quota::permits_new_run(state, chrono::Utc::now()).await {
         crate::budget::BudgetDecision::Allow => {}
-        crate::budget::BudgetDecision::Pause { reason, .. } => {
-            return Err(StartError::BudgetExhausted(reason));
+        crate::budget::BudgetDecision::Pause { reason, source, .. } => {
+            return Err(if source == crate::quota::PAUSE_SOURCE {
+                StartError::QuotaExhausted(reason)
+            } else {
+                StartError::BudgetExhausted(reason)
+            });
         }
     }
 
@@ -4066,7 +4072,7 @@ pub async fn post_team_run(
         Err(error @ StartError::NotFound) => Err((StatusCode::NOT_FOUND, error.to_string())),
         Err(error @ StartError::Invalid(_)) => Err((StatusCode::BAD_REQUEST, error.to_string())),
         // 429 and not 402: the ceiling is a window that reopens, and the caller should come back.
-        Err(error @ StartError::BudgetExhausted(_)) => {
+        Err(error @ (StartError::BudgetExhausted(_) | StartError::QuotaExhausted(_))) => {
             Err((StatusCode::TOO_MANY_REQUESTS, error.to_string()))
         }
         Err(error @ StartError::Unavailable(_)) => {
@@ -4861,6 +4867,21 @@ mod tests {
     async fn state_with_root() -> (AppState, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(std::fs::canonicalize(root.path()).unwrap()).await;
+        (state, root)
+    }
+
+    async fn state_with_quota() -> (AppState, tempfile::TempDir) {
+        let (mut state, root) = state_with_root().await;
+        let now = chrono::Utc::now();
+        let address = crate::quota::test_support::stub_sidecar(
+            crate::quota::test_support::live_answer("claude", "5h", 1.0, None, now),
+        )
+        .await;
+        crate::quota::test_support::arm(&state.pool, true, 85, 90).await;
+        state.quota = std::sync::Arc::new(crate::quota::QuotaRuntime::new(
+            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            "claude".into(),
+        ));
         (state, root)
     }
 
@@ -7780,6 +7801,36 @@ mod tests {
         assert_eq!(run.state, "stopped");
         assert_eq!(run.outcome.as_deref(), Some("stopped"));
         assert!(run.why.unwrap().contains("ceiling"));
+    }
+
+    #[tokio::test]
+    async fn quota_brake_never_stops_a_running_team() {
+        let (state, _root) = state_with_quota().await;
+        marketing(&state).await;
+        crate::quota::test_support::arm(&state.pool, false, 85, 90).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        crate::quota::test_support::arm(&state.pool, true, 85, 90).await;
+
+        team_tick(&state, chrono::Utc::now()).await;
+
+        let run = fetch_run(&state, &id).await;
+        assert_ne!(run.state, "stopped", "quota must not stop a running team");
+    }
+
+    #[tokio::test]
+    async fn quota_brake_refuses_to_start_a_team() {
+        let (state, _root) = state_with_quota().await;
+        marketing(&state).await;
+
+        let error = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap_err();
+        match error {
+            StartError::QuotaExhausted(reason) => assert!(reason.contains("quota"), "{reason}"),
+            other => panic!("expected a quota refusal, got {other:?}"),
+        }
     }
 
     /// Four hours is a ceiling on the clock, and it ends the run `expired` — which tells the owner

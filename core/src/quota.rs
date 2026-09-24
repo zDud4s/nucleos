@@ -12,14 +12,20 @@
 //! `web.rs`. And it holds no provider credential — see design D2, whose whole point is that the
 //! token stays inside the sidecar.
 //!
-//! **This module draws and it speaks; it does not act.** Phase 3 added the warning (D11) — a feed
-//! line when a measured window crosses one of the owner's thresholds — and the brake is still
-//! phase 4's. The order is the point: a threshold gets to interrupt the owner long before it gets
-//! to stop their work, so the numbers can be watched being wrong at the cost of a ping rather than
-//! at the cost of a night's autonomous work.
+//! **This module draws, speaks, reads, and now brakes** (design D9, D10): the optional `enabled`
+//! setting (off by factory default) gates only the action, while every consultation still reads the
+//! quota so the phase-3 warning fires even with the brake off. The brake fails OPEN, fixed: an
+//! absent, stale, or unmeasured reading cannot prove a window spent—the opposite direction from
+//! `budget.rs`, which fails closed.
 
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use sqlx::SqlitePool;
+
+/// Source tag carried by a pause originating from the quota brake.
+pub const PAUSE_SOURCE: &str = "quota";
+/// Longest acceptable age for a measured quota reading.
+pub const QUOTA_FRESH_FOR: Duration = Duration::minutes(10);
 
 /// The vocabulary of the `quota` state domain, named once in the language the shell paints from.
 ///
@@ -41,18 +47,14 @@ const UNMEASURED: &str = QUOTA_STATES[4];
 
 /// Where a window stops being comfortable.
 ///
-/// Constants in phase 1 and settings in phase 4 (the `QuotaPolicy` migration), in that order and not
-/// the other way round: a threshold the owner can move is only worth building once somebody has
-/// watched the fixed one for a while and can say what it should have been.
+/// Warning thresholds stay fixed: the independently configurable brake settings live in
+/// [`BrakePolicy`].
 const WARN_AT: f64 = 0.75;
 const EXHAUSTED_AT: f64 = 0.95;
 
 /// Where the owner gets told, in per cent (`warn_at_percent`, design D9's default).
 ///
-/// A constant here, and a row of the `QuotaPolicy` table in phase 4 — the order the module doc
-/// above already committed to, and the order D9 itself implies by making this a setting of a policy
-/// whose migration belongs to the brake. A settings page for a threshold nobody has yet watched
-/// fire is a page built before its question is known.
+/// The warning uses a fixed threshold; braking has separate owner-configurable thresholds.
 ///
 /// Separate from [`WARN_AT`] and [`EXHAUSTED_AT`] on purpose, and this is the one thing about this
 /// pair worth reading twice: those two colour a ring that somebody is looking at, so they may be
@@ -70,6 +72,8 @@ const WARN_AT_PERCENT: [i64; 2] = [80, 100];
 /// `const NAME: &str = "…"` beside the `append` that uses it, and a kind whose spelling lives in
 /// another module lands in that test's `unresolved` list instead of being checked at all.
 const FEED_KIND: &str = "quota_warning";
+/// Feed kind emitted once when an enabled brake must run blind.
+pub const BLIND_FEED_KIND: &str = "quota_blind";
 
 /// How much the number is worth, and therefore what a later phase may do with it (design D3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -116,8 +120,8 @@ pub struct Window {
     pub resets_at: Option<String>,
     pub stale: bool,
     /// One of [`QUOTA_STATES`]. Computed HERE and sent to the shell rather than recomputed there,
-    /// because the thresholds become the owner's settings in phase 4 and a copy of them in
-    /// TypeScript would be a second policy that changes on a different schedule.
+    /// because the brake's owner settings live in the database and a copy in TypeScript would be a
+    /// second policy that changes on a different schedule.
     pub state: &'static str,
 }
 
@@ -163,20 +167,21 @@ pub struct QuotaReport {
     pub unreachable: Option<String>,
 }
 
-/// The quota pillar's runtime: the client for the sidecar, and nothing else.
+/// The quota pillar's runtime: its sidecar client and the active runner's provider.
 ///
-/// No thresholds and no provider list. The thresholds are constants above until phase 4 puts them in
-/// the database, and the provider list is whatever the sidecar answers — a runtime copy would be a
-/// second list that only changes when the daemon restarts.
+/// The provider list remains whatever the sidecar answers; a runtime copy would be a second list
+/// that only changes when the daemon restarts.
 #[derive(Debug, Clone)]
 pub struct QuotaRuntime {
     pub client: Option<crate::quota_client::QuotaClient>,
+    pub provider: String,
 }
 
 impl QuotaRuntime {
-    pub fn new(client: crate::quota_client::QuotaClient) -> Self {
+    pub fn new(client: crate::quota_client::QuotaClient, provider: String) -> Self {
         Self {
             client: Some(client),
+            provider,
         }
     }
 
@@ -188,7 +193,211 @@ impl QuotaRuntime {
     /// one, so left ungated this is dead code in the daemon.
     #[cfg(test)]
     pub fn disabled() -> Self {
-        Self { client: None }
+        Self {
+            client: None,
+            provider: "claude".into(),
+        }
+    }
+}
+
+/// Owner-configurable quota-brake settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrakePolicy {
+    pub enabled: bool,
+    pub pause_above_percent_5h: i64,
+    pub pause_above_percent_7d: i64,
+}
+
+/// Loads the singleton quota-brake policy.
+pub async fn load_brake_policy(pool: &SqlitePool) -> sqlx::Result<BrakePolicy> {
+    let row: (i64, i64, i64) = sqlx::query_as("SELECT quota_brake_enabled, quota_pause_above_percent_5h, quota_pause_above_percent_7d FROM autopilot_global LIMIT 1").fetch_one(pool).await?;
+    Ok(BrakePolicy {
+        enabled: row.0 != 0,
+        pause_above_percent_5h: row.1,
+        pause_above_percent_7d: row.2,
+    })
+}
+
+/// Replaces the singleton quota-brake policy.
+pub async fn set_brake_policy(pool: &SqlitePool, policy: BrakePolicy) -> sqlx::Result<()> {
+    sqlx::query("UPDATE autopilot_global SET quota_brake_enabled = ?, quota_pause_above_percent_5h = ?, quota_pause_above_percent_7d = ?")
+        .bind(i64::from(policy.enabled)).bind(policy.pause_above_percent_5h).bind(policy.pause_above_percent_7d).execute(pool).await?;
+    Ok(())
+}
+
+/// Pure outcome of judging one provider's quota windows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Clear,
+    Blind(String),
+    Over {
+        reason: String,
+        resets_at: Option<DateTime<Utc>>,
+    },
+}
+/// Result returned to a prospective autonomous run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuotaDecision {
+    Allow,
+    Pause {
+        reason: String,
+        resets_at: Option<DateTime<Utc>>,
+    },
+}
+
+/// Judges the active provider's fresh, measured quota windows against the policy.
+pub fn judge(
+    policy: &BrakePolicy,
+    provider: &str,
+    providers: &[Provider],
+    now: DateTime<Utc>,
+) -> Verdict {
+    let Some(reading) = providers.iter().find(|item| item.provider == provider) else {
+        return Verdict::Blind(format!("quota: no reading for active provider {provider}"));
+    };
+    let read_at = DateTime::parse_from_rfc3339(&reading.read_at)
+        .ok()
+        .map(|at| at.with_timezone(&Utc));
+    let mut blind = reading.fidelity == Fidelity::Unmeasured
+        || read_at.is_none_or(|at| now.signed_duration_since(at) > QUOTA_FRESH_FOR);
+    if blind {
+        return Verdict::Blind(format!(
+            "quota: active provider {provider} has no fresh measured reading"
+        ));
+    }
+    let mut overs = Vec::new();
+    for window in &reading.windows {
+        let threshold = match window.window.as_str() {
+            "5h" => policy.pause_above_percent_5h,
+            "7d" => policy.pause_above_percent_7d,
+            _ => continue,
+        };
+        // `Window::stale` is computed from the reading clock on both the live and stored paths.
+        // Trust that carried fact here so this pure decision does not reinterpret a fixture's
+        // already-judged reading against a different caller clock.
+        if window.stale {
+            blind = true;
+            continue;
+        }
+        if window.used_fraction * 100.0 >= threshold as f64 {
+            let reset = window
+                .resets_at
+                .as_deref()
+                .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                .map(|at| at.with_timezone(&Utc));
+            overs.push((
+                reset,
+                format!(
+                    "quota: {provider}'s {} window is at or above {threshold}%",
+                    window.window
+                ),
+            ));
+        }
+    }
+    if !overs.is_empty() {
+        let reason = overs[0].1.clone();
+        let resets_at = if overs.iter().any(|(reset, _)| reset.is_none()) {
+            None
+        } else {
+            overs.into_iter().filter_map(|(reset, _)| reset).max()
+        };
+        return Verdict::Over { reason, resets_at };
+    }
+    if blind {
+        Verdict::Blind(format!(
+            "quota: active provider {provider} has no fresh measured reading"
+        ))
+    } else {
+        Verdict::Clear
+    }
+}
+
+async fn clear_blind_marker(pool: &SqlitePool) -> sqlx::Result<()> {
+    sqlx::query("UPDATE autopilot_global SET quota_blind_announced_at = NULL WHERE quota_blind_announced_at IS NOT NULL").execute(pool).await?;
+    Ok(())
+}
+async fn announce_blind_once(
+    pool: &SqlitePool,
+    summary: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    let changed = sqlx::query("UPDATE autopilot_global SET quota_blind_announced_at = ? WHERE quota_blind_announced_at IS NULL").bind(now.to_rfc3339()).execute(&mut *tx).await?.rows_affected();
+    if changed == 1 {
+        crate::feed::append_on(&mut tx, None, BLIND_FEED_KIND, summary, None, None).await?;
+    }
+    tx.commit().await
+}
+
+/// Reads the quota and, when enabled, decides whether it permits a new autonomous run.
+pub async fn quota_permits_new_run(
+    pool: &SqlitePool,
+    runtime: Option<&QuotaRuntime>,
+    provider: &str,
+    now: DateTime<Utc>,
+) -> QuotaDecision {
+    let providers = match runtime {
+        Some(runtime) => report(runtime, pool, now).await.providers,
+        None => match stored(pool, now).await {
+            Ok(readings) => readings,
+            Err(error) => {
+                tracing::warn!(%error, "quota brake could not read stored quota");
+                return QuotaDecision::Allow;
+            }
+        },
+    };
+    let policy = match load_brake_policy(pool).await {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(%error, "quota brake policy could not be read");
+            return QuotaDecision::Allow;
+        }
+    };
+    if !policy.enabled {
+        return QuotaDecision::Allow;
+    }
+    match judge(&policy, provider, &providers, now) {
+        Verdict::Clear => {
+            if let Err(error) = clear_blind_marker(pool).await {
+                tracing::warn!(%error, "quota blind marker could not be cleared");
+            }
+            QuotaDecision::Allow
+        }
+        Verdict::Over { reason, resets_at } => {
+            if let Err(error) = clear_blind_marker(pool).await {
+                tracing::warn!(%error, "quota blind marker could not be cleared");
+            }
+            QuotaDecision::Pause { reason, resets_at }
+        }
+        Verdict::Blind(summary) => {
+            if let Err(error) = announce_blind_once(pool, &summary, now).await {
+                tracing::warn!(%error, "quota blind announcement could not be written");
+            }
+            QuotaDecision::Allow
+        }
+    }
+}
+
+/// Applies the budget brake first, then the fail-open quota brake.
+pub async fn permits_new_run(
+    state: &crate::state::AppState,
+    now: DateTime<Utc>,
+) -> crate::budget::BudgetDecision {
+    let budget = crate::budget::budget_permits_new_run(&state.pool, now).await;
+    if !matches!(budget, crate::budget::BudgetDecision::Allow) {
+        return budget;
+    }
+    match quota_permits_new_run(&state.pool, Some(&state.quota), &state.quota.provider, now).await {
+        QuotaDecision::Allow => crate::budget::BudgetDecision::Allow,
+        QuotaDecision::Pause { reason, resets_at } => crate::budget::BudgetDecision::Pause {
+            reason,
+            kind: if resets_at.is_some() {
+                crate::budget::PauseKind::Transient
+            } else {
+                crate::budget::PauseKind::Window
+            },
+            source: PAUSE_SOURCE,
+        },
     }
 }
 
@@ -333,7 +542,7 @@ fn is_credential_failure(detail: &str) -> bool {
 /// The sidecar's `detail` travels with the stored windows, so the reason the figure is old stays
 /// on screen beside it.
 ///
-/// **Note for phase 4's brake.** A degraded provider keeps the fidelity it was stored with —
+/// **Note for the brake.** A degraded provider keeps the fidelity it was stored with —
 /// usually [`Fidelity::Official`] — and the ONLY mark that it is not a current reading is
 /// `stale: true` on each window. So a brake that gates on a minimum fidelity alone would act on a
 /// figure that is hours old at full fidelity, which is precisely what D3's "only trusts what is
@@ -412,7 +621,7 @@ async fn stored_report(
 /// `stale` is a function of the clock, not a property frozen into a reading. A window recorded at
 /// 0.97 with a 16:40 reset, whose sidecar then died at 16:00, still says 0.97 at 18:00, and
 /// serving the flag it was stored with would keep calling a period that has ended `exhausted`.
-/// Phase 4's brake reads this table, so that is not a cosmetic lie.
+/// The brake reads this table, so that is not a cosmetic lie.
 ///
 /// The boundary is `<=`: a window whose reset is exactly `now` has reopened and is therefore stale
 /// here, the stricter of the two readings — chosen because this side re-derives the flag and a
@@ -802,7 +1011,7 @@ async fn claim_the_right_to_warn(
 /// (design D3/D9/G4). Unmeasured carries no number; outdated carries one about a period that has
 /// ended. Both are the same mistake seen twice: a warning is an interruption, and interrupting
 /// somebody with a figure that was never true costs more than the warning was worth. The brake in
-/// phase 4 reads the same two guards for a heavier reason.
+/// the brake reads the same two guards for a heavier reason.
 pub async fn warn(
     pool: &SqlitePool,
     providers: &[Provider],
@@ -892,7 +1101,64 @@ pub async fn warn(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub async fn stub_sidecar(answer: serde_json::Value) -> String {
+        let app = axum::Router::new().route(
+            "/quota",
+            axum::routing::get(move || {
+                let answer = answer.clone();
+                async move { axum::Json(answer) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        address.to_string()
+    }
+
+    pub async fn arm(pool: &SqlitePool, enabled: bool, p5h: i64, p7d: i64) {
+        set_brake_policy(
+            pool,
+            BrakePolicy {
+                enabled,
+                pause_above_percent_5h: p5h,
+                pause_above_percent_7d: p7d,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    pub fn live_answer(
+        provider: &str,
+        window: &str,
+        used: f64,
+        resets_at: Option<&str>,
+        read_at: chrono::DateTime<chrono::Utc>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "providers": [{
+                "provider": provider,
+                "fidelity": "official",
+                "read_at": read_at.to_rfc3339(),
+                "severity": "normal",
+                "windows": [{
+                    "window": window,
+                    "used_fraction": used,
+                    "resets_at": resets_at,
+                    "stale": false
+                }]
+            }],
+            "cached": false
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{arm, live_answer, stub_sidecar};
     use super::*;
 
     async fn pool() -> SqlitePool {
@@ -907,6 +1173,39 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    async fn state_with_quota(pool: SqlitePool, quota: QuotaRuntime) -> crate::state::AppState {
+        crate::state::AppState {
+            token: crate::auth::Token("test-token".into()),
+            pool,
+            telegram_doctrine: None,
+            runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
+            run_handles: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            run_messages: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            run_tails: Default::default(),
+            files_root: None,
+            workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            quota: std::sync::Arc::new(quota),
+            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+        }
     }
 
     /// The reset every helper below writes, and the clock they are read under.
@@ -1771,20 +2070,6 @@ mod tests {
     /// `QuotaClient` owns a `reqwest::Client` rather than sitting behind a trait, so the cheapest
     /// honest fake is a real socket — the same shape, and for the same reason, as
     /// `browser_client.rs`'s stub.
-    async fn stub_sidecar(answer: serde_json::Value) -> String {
-        let app = axum::Router::new().route(
-            "/quota",
-            axum::routing::get(move || {
-                let answer = answer.clone();
-                async move { axum::Json(answer) }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        address.to_string()
-    }
-
     /// **The degradation is wired into `report()`**, not merely available beside it.
     ///
     /// The three cases above call `degrade_to_last_good` directly, so deleting its one call site in
@@ -1809,10 +2094,10 @@ mod tests {
             "cached": false,
         }))
         .await;
-        let runtime = QuotaRuntime::new(crate::quota_client::QuotaClient::new(
-            &address,
-            "bearer".into(),
-        ));
+        let runtime = QuotaRuntime::new(
+            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            "claude".into(),
+        );
 
         let report = report(&runtime, &pool, at(BEFORE_RESET)).await;
 
@@ -1834,6 +2119,224 @@ mod tests {
         assert_eq!(
             provider.detail, "the usage endpoint answered 429",
             "the reason the figure is old has to reach the shell with it"
+        );
+    }
+
+    #[test]
+    fn quota_brake_never_pauses_on_an_unmeasured_stale_old_or_absent_reading() {
+        let now = chrono::Utc::now();
+        let policy = BrakePolicy {
+            enabled: true,
+            pause_above_percent_5h: 85,
+            pause_above_percent_7d: 90,
+        };
+        let cases = vec![
+            vec![Provider {
+                provider: "claude".into(),
+                fidelity: Fidelity::Unmeasured,
+                read_at: now.to_rfc3339(),
+                windows: vec![window(1.0, false)],
+                detail: String::new(),
+                severity: String::new(),
+            }],
+            vec![Provider {
+                provider: "claude".into(),
+                fidelity: Fidelity::Official,
+                read_at: now.to_rfc3339(),
+                windows: vec![window(1.0, true)],
+                detail: String::new(),
+                severity: String::new(),
+            }],
+            vec![Provider {
+                provider: "claude".into(),
+                fidelity: Fidelity::Official,
+                read_at: (now - QUOTA_FRESH_FOR - chrono::Duration::seconds(1)).to_rfc3339(),
+                windows: vec![window(1.0, false)],
+                detail: String::new(),
+                severity: String::new(),
+            }],
+            vec![],
+        ];
+        for providers in cases {
+            assert!(!matches!(
+                judge(&policy, "claude", &providers, now),
+                Verdict::Over { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn quota_brake_pauses_at_the_threshold_of_a_fresh_measured_window() {
+        let now = chrono::Utc::now();
+        let policy = BrakePolicy {
+            enabled: true,
+            pause_above_percent_5h: 85,
+            pause_above_percent_7d: 90,
+        };
+        for (window_name, threshold) in [("5h", 0.85), ("7d", 0.90)] {
+            let provider = Provider {
+                provider: "claude".into(),
+                fidelity: Fidelity::Official,
+                read_at: now.to_rfc3339(),
+                windows: vec![Window {
+                    window: window_name.into(),
+                    used_fraction: threshold,
+                    resets_at: None,
+                    stale: false,
+                    state: "ok",
+                }],
+                detail: String::new(),
+                severity: String::new(),
+            };
+            let Verdict::Over { reason, .. } = judge(&policy, "claude", &[provider], now) else {
+                panic!("fresh {window_name} at its threshold must pause")
+            };
+            assert!(reason.contains("quota"));
+        }
+    }
+
+    #[test]
+    fn quota_brake_only_counts_the_active_runners_provider() {
+        let now = chrono::Utc::now();
+        let policy = BrakePolicy {
+            enabled: true,
+            pause_above_percent_5h: 85,
+            pause_above_percent_7d: 90,
+        };
+        let providers = vec![
+            Provider {
+                provider: "claude".into(),
+                fidelity: Fidelity::Official,
+                read_at: now.to_rfc3339(),
+                windows: vec![window(0.1, false)],
+                detail: String::new(),
+                severity: String::new(),
+            },
+            Provider {
+                provider: "codex".into(),
+                fidelity: Fidelity::Official,
+                read_at: now.to_rfc3339(),
+                windows: vec![window(1.0, false)],
+                detail: String::new(),
+                severity: String::new(),
+            },
+        ];
+        assert!(!matches!(
+            judge(&policy, "claude", &providers, now),
+            Verdict::Over { .. }
+        ));
+        let Verdict::Over { reason, .. } = judge(&policy, "codex", &providers, now) else {
+            panic!("the active provider must count")
+        };
+        assert!(reason.contains("quota"));
+    }
+
+    #[tokio::test]
+    async fn quota_brake_disabled_never_pauses_but_still_warns() {
+        let pool = pool().await;
+        arm(&pool, false, 85, 90).await;
+        let now = chrono::Utc::now();
+        let address = stub_sidecar(live_answer("claude", "5h", 1.0, None, now)).await;
+        let runtime = QuotaRuntime::new(
+            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            "claude".into(),
+        );
+        assert!(matches!(
+            quota_permits_new_run(&pool, Some(&runtime), "claude", now).await,
+            QuotaDecision::Allow
+        ));
+        assert_eq!(feed_kinds(&pool).await, vec![FEED_KIND]);
+        assert!(
+            !feed_kinds(&pool)
+                .await
+                .iter()
+                .any(|kind| kind == BLIND_FEED_KIND)
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_brake_running_blind_says_so_once_and_names_the_quota() {
+        let pool = pool().await;
+        arm(&pool, true, 85, 90).await;
+        let now = chrono::Utc::now();
+        let address = stub_sidecar(serde_json::json!({"providers": [], "cached": false})).await;
+        let runtime = QuotaRuntime::new(
+            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            "claude".into(),
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                quota_permits_new_run(&pool, Some(&runtime), "claude", now).await,
+                QuotaDecision::Allow
+            ));
+        }
+        let summaries: Vec<String> = sqlx::query_scalar("SELECT summary FROM feed WHERE kind = ?")
+            .bind(BLIND_FEED_KIND)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].starts_with("quota: "));
+    }
+
+    #[tokio::test]
+    async fn quota_brake_consult_fires_the_warning() {
+        let pool = pool().await;
+        arm(&pool, true, 85, 90).await;
+        let now = chrono::Utc::now();
+        let address = stub_sidecar(live_answer("claude", "5h", 0.82, None, now)).await;
+        let runtime = QuotaRuntime::new(
+            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            "claude".into(),
+        );
+        assert!(matches!(
+            quota_permits_new_run(&pool, Some(&runtime), "claude", now).await,
+            QuotaDecision::Allow
+        ));
+        assert_eq!(feed_kinds(&pool).await, vec![FEED_KIND]);
+    }
+
+    #[tokio::test]
+    async fn quota_brake_pause_carries_the_quota_source() {
+        let pool = pool().await;
+        arm(&pool, true, 85, 90).await;
+        let now = chrono::Utc::now();
+        let address = stub_sidecar(live_answer("claude", "5h", 1.0, None, now)).await;
+        let state = state_with_quota(
+            pool,
+            QuotaRuntime::new(
+                crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+                "claude".into(),
+            ),
+        )
+        .await;
+        let pause = permits_new_run(&state, now).await;
+        let crate::budget::BudgetDecision::Pause { reason, source, .. } = pause else {
+            panic!("quota pause must be a pause")
+        };
+        assert_eq!(source, PAUSE_SOURCE);
+        assert!(reason.contains("quota"));
+    }
+
+    #[tokio::test]
+    async fn quota_brake_settings_default_off_85_90_and_round_trip() {
+        let pool = pool().await;
+        assert_eq!(
+            load_brake_policy(&pool).await.unwrap(),
+            BrakePolicy {
+                enabled: false,
+                pause_above_percent_5h: 85,
+                pause_above_percent_7d: 90
+            }
+        );
+        arm(&pool, true, 86, 91).await;
+        assert_eq!(
+            load_brake_policy(&pool).await.unwrap(),
+            BrakePolicy {
+                enabled: true,
+                pause_above_percent_5h: 86,
+                pause_above_percent_7d: 91
+            }
         );
     }
 }

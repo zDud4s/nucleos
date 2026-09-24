@@ -17,9 +17,11 @@ import {
   useMintToken,
   usePiiTally,
   useProjects,
+  useQuotaBrake,
   useRevokeToken,
   useRestartSidecar,
   useSetBudget,
+  useSetQuotaBrake,
   useSidecars,
   useStageRestore,
   useSystemHealth,
@@ -35,6 +37,7 @@ import {
   type EmailConfig,
   type HealthReadout,
   type PiiTallyRow,
+  type QuotaBrakeView,
   type SidecarState,
   type SubsystemReadout,
   type VoiceConfig,
@@ -509,6 +512,20 @@ function formFromBudget(budget: BudgetView): BudgetFormState {
   };
 }
 
+interface QuotaBrakeFormState {
+  enabled: boolean;
+  fiveHour: string;
+  sevenDay: string;
+}
+
+function formFromQuotaBrake(quotaBrake: QuotaBrakeView): QuotaBrakeFormState {
+  return {
+    enabled: quotaBrake.enabled,
+    fiveHour: String(quotaBrake.pause_above_percent_5h),
+    sevenDay: String(quotaBrake.pause_above_percent_7d),
+  };
+}
+
 type CeilingResult = { ok: true; value: number | null } | { ok: false };
 
 /**
@@ -530,6 +547,11 @@ function parseAmount(raw: string): number {
   return Number.isFinite(value) ? value : 0;
 }
 
+function parseQuotaPercent(raw: string): number | null {
+  const value = Number(raw.trim());
+  return Number.isInteger(value) && value >= 1 && value <= 100 ? value : null;
+}
+
 /**
  * The budget, editable.
  *
@@ -542,14 +564,24 @@ function parseAmount(raw: string): number {
 function BudgetPanel() {
   const budget = useBudget();
   const setBudget = useSetBudget();
+  const quotaBrake = useQuotaBrake();
+  const setQuotaBrake = useSetQuotaBrake();
   const [form, setForm] = useState<BudgetFormState | null>(null);
   const [badCeilings, setBadCeilings] = useState<string[]>([]);
+  const [quotaBrakeForm, setQuotaBrakeForm] = useState<QuotaBrakeFormState | null>(null);
+  const [badQuotaBrake, setBadQuotaBrake] = useState(false);
 
   useEffect(() => {
     if (budget.data !== undefined && form === null) {
       setForm(formFromBudget(budget.data));
     }
   }, [budget.data, form]);
+
+  useEffect(() => {
+    if (quotaBrake.data !== undefined && quotaBrakeForm === null) {
+      setQuotaBrakeForm(formFromQuotaBrake(quotaBrake.data));
+    }
+  }, [quotaBrake.data, quotaBrakeForm]);
 
   return (
     <Panel title="Budget">
@@ -711,6 +743,77 @@ function BudgetPanel() {
             </ErrorNote>
           )}
         </div>
+      )}
+      {quotaBrakeForm !== null && quotaBrake.data !== undefined && (
+        <section className="sy-budget-form">
+          <h3>Quota brake</h3>
+          <div className="sy-field">
+            <label>
+              <input
+                type="checkbox"
+                checked={quotaBrakeForm.enabled}
+                onChange={(event) =>
+                  setQuotaBrakeForm({ ...quotaBrakeForm, enabled: event.target.checked })
+                }
+              />
+              Enable quota brake
+            </label>
+          </div>
+          <div className="sy-field">
+            <label htmlFor="sy-quota-brake-five-hour">Pause above 5h usage (%)</label>
+            <input
+              id="sy-quota-brake-five-hour"
+              className="sy-field-input"
+              type="text"
+              inputMode="numeric"
+              value={quotaBrakeForm.fiveHour}
+              onChange={(event) => {
+                setQuotaBrakeForm({ ...quotaBrakeForm, fiveHour: event.target.value });
+                setBadQuotaBrake(false);
+              }}
+            />
+          </div>
+          <div className="sy-field">
+            <label htmlFor="sy-quota-brake-seven-day">Pause above 7d usage (%)</label>
+            <input
+              id="sy-quota-brake-seven-day"
+              className="sy-field-input"
+              type="text"
+              inputMode="numeric"
+              value={quotaBrakeForm.sevenDay}
+              onChange={(event) => {
+                setQuotaBrakeForm({ ...quotaBrakeForm, sevenDay: event.target.value });
+                setBadQuotaBrake(false);
+              }}
+            />
+            <p className="sy-field-hint">only {quotaBrake.data.provider}'s windows count</p>
+          </div>
+          <ConfirmButton
+            label="Save quota brake"
+            confirmLabel="Save these three quota brake settings to the daemon"
+            variant="ghost"
+            onConfirm={() => {
+              const fiveHour = parseQuotaPercent(quotaBrakeForm.fiveHour);
+              const sevenDay = parseQuotaPercent(quotaBrakeForm.sevenDay);
+              if (fiveHour === null || sevenDay === null) {
+                setBadQuotaBrake(true);
+                return;
+              }
+              setBadQuotaBrake(false);
+              setQuotaBrake.mutate({
+                enabled: quotaBrakeForm.enabled,
+                pause_above_percent_5h: fiveHour,
+                pause_above_percent_7d: sevenDay,
+              });
+            }}
+          />
+          {badQuotaBrake && (
+            <ErrorNote>the quota brake was not sent — usage must be an integer from 1 to 100</ErrorNote>
+          )}
+          {setQuotaBrake.isError && (
+            <ErrorNote>the quota brake was not changed — the núcleo refused or did not answer</ErrorNote>
+          )}
+        </section>
       )}
     </Panel>
   );

@@ -100,12 +100,20 @@ const DEFAULT_CALENDAR_CONFIG: CalendarConfig = {
   working_weekdays: ["mon", "tue", "wed", "thu", "fri"],
 };
 
+interface QuotaBrakeView {
+  enabled: boolean;
+  pause_above_percent_5h: number;
+  pause_above_percent_7d: number;
+  provider: string;
+}
+
 interface SystemWorld {
   readout: HealthReadout;
   sidecars: SidecarState[];
   projects: ProjectSummary[];
   kills: ScopedKill[];
   budget: BudgetView;
+  quotaBrake: QuotaBrakeView;
   backups: BackupInfo[];
   pii: PiiTallyRow[];
   tokens: ApiTokenSummary[];
@@ -157,6 +165,12 @@ function systemWorld(overrides: Partial<SystemWorld> = {}): SystemWorld {
     projects: [],
     kills: [],
     budget: daemonState().budget,
+    quotaBrake: {
+      enabled: false,
+      pause_above_percent_5h: 85,
+      pause_above_percent_7d: 90,
+      provider: "claude",
+    },
     backups: [],
     pii: [],
     tokens: [],
@@ -210,6 +224,11 @@ function systemFetch(
         const change = JSON.parse(init.body) as Record<string, unknown>;
         world.budget = { ...world.budget, ...change } as BudgetView;
         return world.budget;
+      }
+      if (path === "/autopilot/quota-brake" && typeof init.body === "string") {
+        const change = JSON.parse(init.body) as Omit<QuotaBrakeView, "provider">;
+        world.quotaBrake = { ...change, provider: world.quotaBrake.provider };
+        return world.quotaBrake;
       }
       if (path === "/config/machine" && typeof init.body === "string") {
         const write = JSON.parse(init.body) as { path: string; contents: string };
@@ -321,6 +340,8 @@ function systemFetch(
         return world.kills;
       case "/autopilot/budget":
         return world.budget;
+      case "/autopilot/quota-brake":
+        return world.quotaBrake;
       case "/backups":
         return world.backups;
       case "/pii/observations":
@@ -818,6 +839,62 @@ describe("System - budget", () => {
       ([path, init]) => path === "/autopilot/budget" && (init as RequestInit | undefined)?.method === "POST",
     );
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe("System - quota brake", () => {
+  it("quota brake fields show the daemon's values and save all three", async () => {
+    const world = systemWorld({
+      quotaBrake: {
+        enabled: false,
+        pause_above_percent_5h: 85,
+        pause_above_percent_7d: 90,
+        provider: "claude",
+      },
+    });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystem();
+
+    const quotaBrake = await screen.findByRole("heading", { level: 3, name: "Quota brake" });
+    const block = quotaBrake.closest("section");
+    if (block === null) throw new Error("no quota brake block");
+    const enabled = within(block).getByRole("checkbox", { name: "Enable quota brake" }) as HTMLInputElement;
+    const fiveHour = within(block).getByLabelText("Pause above 5h usage (%)") as HTMLInputElement;
+    const sevenDay = within(block).getByLabelText("Pause above 7d usage (%)") as HTMLInputElement;
+    expect(enabled.checked).toBe(false);
+    expect(fiveHour.value).toBe("85");
+    expect(sevenDay.value).toBe("90");
+    expect(within(block).getByText("only claude's windows count")).toBeDefined();
+
+    fireEvent.click(enabled);
+    fireEvent.change(fiveHour, { target: { value: "80" } });
+    fireEvent.change(sevenDay, { target: { value: "95" } });
+    fireEvent.click(within(block).getByRole("button", { name: "Save quota brake" }));
+    await afterDwell();
+    fireEvent.click(within(block).getByRole("button", { name: "Save these three quota brake settings to the daemon" }));
+
+    const quotaBrakePosts = () =>
+      daemon.apiFetch.mock.calls.filter(
+        ([path, init]) =>
+          path === "/autopilot/quota-brake" && (init as RequestInit | undefined)?.method === "POST",
+      );
+    await waitFor(() => {
+      expect(quotaBrakePosts()).toHaveLength(1);
+    });
+    expect(JSON.parse((quotaBrakePosts()[0][1] as RequestInit).body as string)).toEqual({
+      enabled: true,
+      pause_above_percent_5h: 80,
+      pause_above_percent_7d: 95,
+    });
+
+    fireEvent.change(fiveHour, { target: { value: "0" } });
+    fireEvent.click(within(block).getByRole("button", { name: "Save quota brake" }));
+    await afterDwell();
+    fireEvent.click(within(block).getByRole("button", { name: "Save these three quota brake settings to the daemon" }));
+
+    expect(await within(block).findByRole("alert")).toBeDefined();
+    expect(quotaBrakePosts()).toHaveLength(1);
   });
 });
 

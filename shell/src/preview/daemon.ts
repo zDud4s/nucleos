@@ -11,7 +11,7 @@ import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
 import type { FeedEntry, FeedSeen, FeedTimeline, PendingNotification } from "../data/feed";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
-import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary, Proposal, SidecarState } from "../data/system";
+import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary, Proposal, QuotaBrakeView, SidecarState } from "../data/system";
 import type { VoiceConfigView } from "../data/voice";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
@@ -2401,6 +2401,17 @@ export function answer(path: string, init?: RequestInit): unknown {
       paused: false,
       reason: null,
     } satisfies BudgetView;
+  }
+  if (path === "/autopilot/quota-brake") {
+    if (init?.method === "POST" && typeof init.body === "string") {
+      return { ...JSON.parse(init.body), provider: "claude" } satisfies QuotaBrakeView;
+    }
+    return {
+      enabled: false,
+      pause_above_percent_5h: 85,
+      pause_above_percent_7d: 90,
+      provider: "claude",
+    } satisfies QuotaBrakeView;
   }
 
   const next = /^\/team-triggers\/(\d+)\/next$/.exec(path);
