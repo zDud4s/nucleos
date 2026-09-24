@@ -311,6 +311,19 @@ pub struct Scored {
     pub s_structure: f64,
     pub s_recency: f64,
     pub s_use: f64,
+    /// The weighted sum of the five signals above — the one number the order uses, carried so the
+    /// trace can say why a row won or lost.
+    pub score: f64,
+}
+
+impl Scored {
+    fn weighted(&self) -> f64 {
+        self.s_fts * W_FTS
+            + self.s_structure * W_STRUCTURE
+            + self.s_use * W_USE
+            + self.s_scope * W_SCOPE
+            + self.s_recency * W_RECENCY
+    }
 }
 
 /// What a node reads, and what it was not shown.
@@ -327,36 +340,54 @@ pub struct Brief {
 /// success nor failure, so the neutral value must favour neither end.
 const NEUTRAL_UTILITY: f64 = 0.5;
 
-/// Score every candidate once. The tuple order below is the selection order: exactly the five
-/// signals in the design, followed only by stable vocabulary and id tie-breakers in the caller.
+/// The midpoint of the bounded recency range: without a show timestamp, there is evidence for
+/// neither end, so the neutral value must favour neither end.
+const NEUTRAL_RECENCY: f64 = 0.5;
+
+/// Confirmed by owner 2026-09-23. The text match against this very work is the most direct evidence of relevance, but it is 0.0 for every row on day one, so it cannot be the whole score.
+const W_FTS: f64 = 0.35;
+/// Confirmed by owner 2026-09-23. Files and map communities overlap: the signal this project has for free because it already builds the map (spec §5.1).
+const W_STRUCTURE: f64 = 0.20;
+/// Confirmed by owner 2026-09-23. Measured outcomes. Kept at least W_RECENCY so a recently shown failure cannot outrank a row nobody has measured (spec §5.4).
+const W_USE: f64 = 0.20;
+/// Confirmed by owner 2026-09-23. The chain already decides entitlement; specificity only tips a contradiction towards the most specific scope (spec §3.4).
+const W_SCOPE: f64 = 0.15;
+/// Confirmed by owner 2026-09-23. Decay (spec §8.1) measures less than it seems — run-less contexts leave no trace to refresh it (D15) — so it weighs least.
+const W_RECENCY: f64 = 0.10;
+
+/// Score every candidate once. Each signal and their one weighted score are on the unit scale; the
+/// caller follows that score only with stable vocabulary and id tie-breakers.
 fn scored_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<(&'a Known, Scored)> {
     let utility_if_absent = median_measured_utility(known);
+    let recencies = normalised_recencies(known);
 
     known
         .iter()
-        .filter(|row| Layer::parse(&row.layer).is_some())
-        .filter(|row| Kind::parse(&row.kind).is_some())
-        .filter_map(|row| {
-            Some((
-                row,
-                Scored {
-                    knowledge_id: row.id,
-                    shown: false,
-                    // FTS5 owns text ranking. Re-ranking the text here would be a second, worse
-                    // implementation of the database signal already carried by the row.
-                    s_fts: finite_or_zero(row.s_fts),
-                    s_scope: scope_specificity(row, context)?,
-                    s_structure: structural_overlap(row, context),
-                    s_recency: recency(row),
-                    // `outcome_count == 0` is absence, not failure. Give it the median measured
-                    // utility from this pass, or the named neutral midpoint when the set is empty.
-                    s_use: if row.outcome_count == 0 {
-                        utility_if_absent
-                    } else {
-                        row.green_count as f64 / row.outcome_count as f64
-                    },
+        .enumerate()
+        .filter(|(_, row)| Layer::parse(&row.layer).is_some())
+        .filter(|(_, row)| Kind::parse(&row.kind).is_some())
+        .filter_map(|(index, row)| {
+            let mut scored = Scored {
+                knowledge_id: row.id,
+                shown: false,
+                // Nothing writes `s_fts` today: it is `#[sqlx(default)]`, so every production row
+                // is 0.0 and only tests set it. Task 3.1 will min-max normalise it per pass; until
+                // then and after, this clamp keeps out-of-contract input from outweighing the rest.
+                s_fts: finite_or_zero(row.s_fts).clamp(0.0, 1.0),
+                s_scope: scope_specificity(row, context)?,
+                s_structure: structural_overlap(row, context),
+                s_recency: recencies[index],
+                // `outcome_count == 0` is absence, not failure. Give it the median measured
+                // utility from this pass, or the named neutral midpoint when the set is empty.
+                s_use: if row.outcome_count == 0 {
+                    utility_if_absent
+                } else {
+                    row.green_count as f64 / row.outcome_count as f64
                 },
-            ))
+                score: 0.0,
+            };
+            scored.score = scored.weighted();
+            Some((row, scored))
         })
         .collect()
 }
@@ -371,12 +402,16 @@ fn scope_specificity(row: &Known, context: &Context) -> Option<f64> {
         .chain
         .iter()
         .position(|scope| scope.columns() == row_scope.columns())
-        .map(|index| (index + 1) as f64)
+        .map(|index| (index + 1) as f64 / context.chain.len() as f64)
         // A recognised but out-of-chain candidate is not entitled to inherit into this context.
         .or(Some(0.0))
 }
 
 fn structural_overlap(row: &Known, context: &Context) -> f64 {
+    let possible = context.files.len() + context.communities.len();
+    if possible == 0 {
+        return 0.0;
+    }
     let Some(points_at) = row.points_at.as_deref() else {
         return 0.0;
     };
@@ -390,6 +425,7 @@ fn structural_overlap(row: &Known, context: &Context) -> f64 {
             references.iter().any(|reference| reference == &candidate)
         })
         .count() as f64
+        / possible as f64
 }
 
 fn structural_references(raw: &str) -> Vec<String> {
@@ -432,34 +468,63 @@ fn normalise_reference(reference: &str) -> String {
         .replace('\\', "/")
 }
 
-fn recency(row: &Known) -> f64 {
-    row.last_shown_at
-        .as_deref()
-        .and_then(|shown| chrono::DateTime::parse_from_rfc3339(shown).ok())
-        .map(|shown| shown.timestamp_micros() as f64)
-        .unwrap_or(0.0)
+fn normalised_recencies(known: &[Known]) -> Vec<f64> {
+    let timestamps: Vec<Option<f64>> = known
+        .iter()
+        .map(|row| {
+            row.last_shown_at
+                .as_deref()
+                .and_then(|shown| chrono::DateTime::parse_from_rfc3339(shown).ok())
+                .map(|shown| shown.timestamp_micros() as f64)
+        })
+        .collect();
+    let shown: Vec<f64> = timestamps.iter().flatten().copied().collect();
+    let Some(min) = shown.iter().copied().min_by(f64::total_cmp) else {
+        return vec![NEUTRAL_RECENCY; known.len()];
+    };
+    let max = shown
+        .iter()
+        .copied()
+        .max_by(f64::total_cmp)
+        .expect("a minimum means there is also a maximum");
+    let normalise = |timestamp: f64| {
+        if max == min {
+            NEUTRAL_RECENCY
+        } else {
+            (timestamp - min) / (max - min)
+        }
+    };
+    let absent = median(shown.into_iter().map(normalise).collect()).unwrap_or(NEUTRAL_RECENCY);
+    timestamps
+        .into_iter()
+        .map(|timestamp| timestamp.map(&normalise).unwrap_or(absent))
+        .collect()
 }
 
 fn median_measured_utility(known: &[Known]) -> f64 {
-    let mut measured: Vec<f64> = known
+    let measured: Vec<f64> = known
         .iter()
         .filter(|row| row.outcome_count > 0)
         .map(|row| row.green_count as f64 / row.outcome_count as f64)
         .collect();
-    if measured.is_empty() {
-        return NEUTRAL_UTILITY;
-    }
-    measured.sort_by(f64::total_cmp);
-    let middle = measured.len() / 2;
-    if measured.len().is_multiple_of(2) {
-        // The even median is the arithmetic mean of the two middle values, not the lower middle.
-        (measured[middle - 1] + measured[middle]) / 2.0
-    } else {
-        measured[middle]
-    }
+    median(measured).unwrap_or(NEUTRAL_UTILITY)
 }
 
-/// The candidates in the order the selector will consider them.
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len().is_multiple_of(2) {
+        // The even median is the arithmetic mean of the two middle values, not the lower middle.
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    })
+}
+
+/// The candidates in `(score desc, layer, kind, id asc)` order for the selector to consider.
 fn ordered_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<&'a Known> {
     let mut candidates: Vec<(Layer, Kind, &Known, Scored)> = scored_candidates(known, context)
         .into_iter()
@@ -475,12 +540,8 @@ fn ordered_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<&'a Know
     candidates.sort_by(|left, right| {
         right
             .3
-            .s_fts
-            .total_cmp(&left.3.s_fts)
-            .then_with(|| right.3.s_scope.total_cmp(&left.3.s_scope))
-            .then_with(|| right.3.s_structure.total_cmp(&left.3.s_structure))
-            .then_with(|| right.3.s_recency.total_cmp(&left.3.s_recency))
-            .then_with(|| right.3.s_use.total_cmp(&left.3.s_use))
+            .score
+            .total_cmp(&left.3.score)
             .then_with(|| left.0.cmp(&right.0))
             .then_with(|| left.1.cmp(&right.1))
             .then_with(|| left.2.id.cmp(&right.2.id))
@@ -2011,6 +2072,107 @@ mod tests {
         assert_eq!(first_ids, "90,10,20,80,70");
     }
 
+    #[test]
+    fn the_order_is_score_then_layer_then_kind_then_id() {
+        let mut highest_score = one(50, "subagent", "highest score", "working");
+        highest_score.layer = Layer::Working.as_str().into();
+        highest_score.s_fts = 0.5;
+        let memory = one(40, "memory", "memory", "semantic");
+        let prompt = one(30, "prompt", "prompt", "procedural");
+        let later_skill = one(20, "skill", "later skill", "procedural");
+        let earlier_skill = one(10, "skill", "earlier skill", "procedural");
+        let rows = vec![highest_score, memory, prompt, later_skill, earlier_skill];
+        let ids = |rows: &[Known]| {
+            ordered_candidates(rows, &project_context())
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(&rows), vec![50, 40, 30, 10, 20]);
+        let reversed = rows.into_iter().rev().collect::<Vec<_>>();
+        assert_eq!(ids(&reversed), vec![50, 40, 30, 10, 20]);
+    }
+
+    #[test]
+    fn every_signal_and_the_score_are_on_the_unit_scale() {
+        let context = Context {
+            chain: vec![
+                Scope::Machine,
+                Scope::Project("p".into()),
+                Scope::Job {
+                    id: 77,
+                    project: Some("p".into()),
+                },
+            ],
+            files: vec!["a.rs".into(), "b.rs".into()],
+            communities: vec!["core".into()],
+            node: None,
+            gate: None,
+        };
+        let mut r1 = one(1, "memory", "best", "job");
+        r1.scope_kind = "job".into();
+        r1.scope_id = Some("77".into());
+        r1.points_at = Some(r#"["a.rs","b.rs","core"]"#.into());
+        r1.s_fts = 7.0;
+        r1.shown_count = 4;
+        r1.outcome_count = 4;
+        r1.green_count = 3;
+        r1.last_shown_at = Some("2026-09-21T00:00:00+00:00".into());
+        let mut r2 = one(2, "memory", "failed", "machine");
+        r2.scope_kind = "machine".into();
+        r2.scope_id = None;
+        r2.s_fts = -2.0;
+        r2.shown_count = 2;
+        r2.outcome_count = 2;
+        r2.last_shown_at = Some("2026-09-01T00:00:00+00:00".into());
+        let mut r3 = one(3, "memory", "unknown", "project");
+        r3.s_fts = f64::NAN;
+        let rows = vec![r1, r2, r3];
+
+        let scored = scored_candidates(&rows, &context);
+        for (row, candidate) in &scored {
+            for (name, value) in [
+                ("s_fts", candidate.s_fts),
+                ("s_scope", candidate.s_scope),
+                ("s_structure", candidate.s_structure),
+                ("s_recency", candidate.s_recency),
+                ("s_use", candidate.s_use),
+                ("score", candidate.score),
+            ] {
+                assert!(
+                    (0.0..=1.0).contains(&value),
+                    "row {} has {name} outside the unit scale: {value}",
+                    row.id
+                );
+            }
+        }
+        let fts = |id| {
+            scored
+                .iter()
+                .find(|(row, _)| row.id == id)
+                .map(|(_, candidate)| candidate.s_fts)
+                .expect("row is scored")
+        };
+        assert_eq!(fts(1), 1.0);
+        assert_eq!(fts(2), 0.0);
+        assert_eq!(fts(3), 0.0);
+        assert_eq!(ordered_candidates(&rows, &context)[0].id, 1);
+
+        let expected = scored
+            .iter()
+            .find(|(row, _)| row.id == 1)
+            .map(|(_, candidate)| candidate.score)
+            .expect("row 1 is scored");
+        let traced = select(&rows, &context, &Budget::default())
+            .trace
+            .into_iter()
+            .find(|candidate| candidate.knowledge_id == 1)
+            .map(|candidate| candidate.score)
+            .expect("row 1 reaches the trace");
+        assert_eq!(traced, expected);
+    }
+
     /// A new row does not compete from the bottom as if it had failed: the selection treats absence as
     /// absence, and what that is worth as a NUMBER is decided here and tested in a table. Without this,
     /// whoever implements it picks a value by taste and D6's table tests that taste.
@@ -2054,9 +2216,9 @@ mod tests {
         }
     }
 
-    /// And the pair that expresses it has to be the one that CAN differ. `last_shown_at IS NULL` and
-    /// `shown_count == 0` are written by the same pass at the same moment, so they are the same state; the
-    /// distinction that exists is `outcome_count == 0` against `green_count == 0, outcome_count > 0`.
+    /// This is the realistic fixture: every signal except utility is equal, because the pass that
+    /// records an outcome also records the show at the same instant. The never-shown row's recency
+    /// is absence, not zero, so it must not order like an old measured failure.
     #[test]
     fn not_measured_does_not_order_like_measured_and_failed() {
         let context = Context {
@@ -2068,10 +2230,14 @@ mod tests {
         };
         let not_measured = one(1, "memory", "not measured", "new");
         let mut failed = one(2, "memory", "failed", "bad");
+        failed.shown_count = 4;
         failed.outcome_count = 4;
+        failed.last_shown_at = Some("2026-09-20T00:00:00+00:00".into());
         let mut green = one(3, "memory", "green", "good");
+        green.shown_count = 4;
         green.outcome_count = 4;
         green.green_count = 4;
+        green.last_shown_at = Some("2026-09-20T00:00:00+00:00".into());
         let rows = vec![failed, not_measured, green];
 
         let scored = scored_candidates(&rows, &context);
@@ -2150,11 +2316,11 @@ mod tests {
     #[test]
     fn a_layer_with_nothing_in_it_reserves_no_floor() {
         let mut first = one(1, "memory", "first", &"a".repeat(301));
-        first.s_fts = 3.0;
+        first.s_fts = 0.9;
         let mut second = one(2, "memory", "second", &"b".repeat(301));
-        second.s_fts = 2.0;
+        second.s_fts = 0.6;
         let mut third = one(3, "memory", "third", "small scored remainder");
-        third.s_fts = 1.0;
+        third.s_fts = 0.3;
         let known = [first, second, third];
         let context = Context {
             chain: vec![Scope::Machine, Scope::Project("p".into())],
@@ -2234,11 +2400,11 @@ mod tests {
     #[test]
     fn a_floor_item_is_cut_at_three_hundred_and_one_that_won_on_score_at_six_hundred() {
         let mut floor = one(1, "memory", "floor", &"f".repeat(301));
-        floor.s_fts = 3.0;
+        floor.s_fts = 0.9;
         let mut other_floor = one(2, "memory", "other floor", "short");
-        other_floor.s_fts = 2.0;
+        other_floor.s_fts = 0.6;
         let mut scored = one(3, "memory", "score", &"s".repeat(601));
-        scored.s_fts = 1.0;
+        scored.s_fts = 0.3;
         let known = [floor, other_floor, scored];
         let context = Context {
             chain: vec![Scope::Machine, Scope::Project("p".into())],
