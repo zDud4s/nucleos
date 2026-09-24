@@ -1,5 +1,6 @@
 /**
- * The Projects slice: the read-only inspector, `pj-` throughout — as `waiting-`
+ * The Projects slice: the inspector and the "On its own" view it hosts for now
+ * (`project/OnItsOwn.tsx`, which imports this sheet itself), `pj-` throughout — as `waiting-`
  * is for the queue, `ap-` for the cockpit and `fleet-` for the fleet.
  *
  * The rule this file lives under: **no class appears in `Projects.tsx` that is
@@ -108,7 +109,6 @@
  * the size belongs here beside the face rather than being assumed from it.
  */
 .pj-crumb,
-.pj-file-path,
 .pj-file-nums,
 .pj-file-text,
 .pj-match-path,
@@ -119,17 +119,23 @@
 .pj-branch-name,
 .pj-branch-seen,
 .pj-row-where,
-.pj-problem,
+.pj-verbatim,
 .pj-rules-error-detail {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
 }
 
+/* The one crumb a person wrote. "the project root" is a phrase, not a path the
+   núcleo sent, and in the mono face it claimed an origin it does not have. */
+.pj-crumb-root {
+  font-family: var(--font-body);
+}
+
 /* Faint is the rung for metadata standing beside content, and every one of
    these is exactly that: the path of the file open beside the listing, its line
    numbers, the line a hit is on, the commit a trigger has already seen, and the
-   folder a rule runs in. */
-.pj-file-path,
+   folder a rule runs in. (The open file's path was here too, as a caption; it is
+   the panel's title now.) */
 .pj-file-nums,
 .pj-match-line,
 .pj-branch-seen,
@@ -161,8 +167,10 @@
 .pj-absence {
   margin: 0;
   padding: var(--space-3);
-  border-left: 3px solid var(--tone-info-border);
-  border-radius: var(--radius-sm);
+  /* A hairline, not the 3px left rule: that rule belongs to the refusal note
+     alone, and this is not one. */
+  border: var(--hairline) solid var(--tone-info-border);
+  border-radius: var(--radius-md);
   background: var(--tone-info-bg);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
@@ -195,13 +203,17 @@
   list-style: none;
 }
 
+/* A note on the ladder: a hairline box in its tone's full triple, 6px like every
+   note. It wore a 3px coloured left stripe over a filled box — the one mark the
+   system keeps for the refusal note, and a named anti-reference everywhere else. */
 .pj-concern {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: var(--space-3);
+  gap: var(--space-1) var(--space-3);
   padding: var(--space-2) var(--space-3);
-  border-left: 3px solid var(--border-strong);
-  border-radius: var(--radius-sm);
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-md);
   background: var(--surface);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
@@ -217,46 +229,49 @@
   text-align: center;
 }
 
+/* The sentence and the mark take the tone's foreground from the row. */
 .pj-concern-said {
-  flex: 1 1 auto;
+  flex: 1 1 20rem;
   min-width: 0;
-  color: var(--text);
 }
 
+/* The way to the fix, named by what you do there. The row's tone, underlined:
+   on a tinted box the accent would be a second colour arguing with the first. */
 .pj-concern-where {
   flex: none;
   font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
   white-space: nowrap;
+}
+
+.pj-concern-where:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }
 
 /* Happening now, and it will not clear itself. */
 .pj-concern-stopped {
-  border-left-color: var(--tone-danger-fg);
-  background: var(--tone-danger-bg);
-}
-
-.pj-concern-stopped .pj-concern-mark {
   color: var(--tone-danger-fg);
+  background: var(--tone-danger-bg);
+  border-color: var(--tone-danger-border);
 }
 
 /* Working as designed, and holding something back until you act. */
 .pj-concern-held {
-  border-left-color: var(--tone-paused-fg);
-  background: var(--tone-paused-bg);
-}
-
-.pj-concern-held .pj-concern-mark {
   color: var(--tone-paused-fg);
+  background: var(--tone-paused-bg);
+  border-color: var(--tone-paused-border);
 }
 
 /* A setup nobody finished. Not a fault, and not drawn as one. */
 .pj-concern-unfinished {
-  border-left-color: var(--tone-info-border);
-  background: var(--tone-info-bg);
-}
-
-.pj-concern-unfinished .pj-concern-mark {
   color: var(--tone-info-fg);
+  background: var(--tone-info-bg);
+  border-color: var(--tone-info-border);
 }
 
 /* ================================================================== tabs == */
@@ -313,6 +328,17 @@
 .pj-tab-active {
   color: var(--text);
   border-bottom-color: var(--text);
+}
+
+/* A view there is nothing for — no folder is recorded — still on the row, so
+   what is missing leaves a trace, at the disabled opacity every control uses. */
+.pj-tab-off {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+.pj-tab-off:hover {
+  color: var(--text-muted);
 }
 
 /**
@@ -455,11 +481,6 @@
   color: var(--text-muted);
 }
 
-.pj-file-path {
-  margin: 0 0 var(--space-2);
-  word-break: break-all;
-}
-
 /**
  * A file's contents, with its lines numbered.
  *
@@ -480,6 +501,10 @@
  * reader knows the primitive was tried rather than missed.
  */
 .pj-file-body {
+  /* Positioned, and set at the text's size, so the line mark below can be
+     placed in the same `em` the lines are measured in. */
+  position: relative;
+  font-size: var(--text-sm);
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   gap: var(--space-3);
@@ -507,6 +532,21 @@
 .pj-file-nums {
   text-align: right;
   user-select: none;
+}
+
+/*
+  The line a search hit pointed at: one band behind both columns, at the line's
+  offset, in the stated tone — it is a fact ("this is the line you asked for"),
+  not a verdict. A span per line would have cost a node per line of the file.
+*/
+.pj-file-mark {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 1.45em;
+  background: var(--tone-info-bg);
+  border-block: var(--hairline) solid var(--tone-info-border);
+  pointer-events: none;
 }
 
 .pj-file-text {
@@ -611,10 +651,28 @@
 }
 
 .pj-match {
+  display: block;
+}
+
+/* A hit is a way into the file at its line, so the whole row is the link — as
+   a row, on the neutral ladder, never as an underlined accent run of code. */
+.pj-match-link {
   display: flex;
   align-items: baseline;
   gap: var(--space-3);
-  padding: 1px 0 1px var(--space-3);
+  padding: 1px var(--space-2) 1px var(--space-3);
+  border-radius: var(--radius-sm);
+  color: inherit;
+  text-decoration: none;
+}
+
+.pj-match-link:hover {
+  background: var(--surface-raised);
+}
+
+.pj-match-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
 }
 
 .pj-match-line {
@@ -731,12 +789,27 @@
   text-transform: uppercase;
 }
 
+/* Primary text, not Acting Green: a file that is there is a fact, and green in
+   this system means "it is really executing, right now". */
 .pj-source-present {
-  color: var(--tone-active-fg);
+  color: var(--text);
 }
 
 .pj-source-unreadable {
   color: var(--tone-danger-fg);
+}
+
+.pj-source-edit {
+  font-size: var(--text-xs);
+}
+
+/* When the rules were read and a way to read them again, at the far end of the
+   line every reading below it comes from. */
+.pj-source-read {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin-left: auto;
 }
 
 /**
@@ -914,26 +987,13 @@
   color: var(--text);
 }
 
-/**
- * Why a rule will never fire.
- *
- * The loudest thing on this page, and it earns it: an unparseable cron or an
- * unknown timezone makes the tick skip the rule 2,880 times a day and log at
- * debug, so the rule silently does nothing and the file looks fine. This is
- * where that stops being invisible. Shared with the gate's contradiction, which
- * is the same class of fact: a rule that cannot do what it says it does.
- */
-.pj-problem {
-  margin: 0;
-  padding: var(--space-2) var(--space-3);
-  border-left: 3px solid var(--tone-danger-fg);
-  border-radius: var(--radius-sm);
-  background: var(--tone-danger-bg);
-  line-height: var(--leading-normal);
-  color: var(--tone-danger-fg);
-}
+/*
+  Why a rule will never fire, and the gate's contradiction, are `ErrorNote`s now
+  — the ladder's full Wrong Red box. They were `.pj-problem`, the same fill with
+  a 3px left stripe on it, which the system reserves for the refusal note.
 
-/* Under the rule it belongs to, indented past the mark so the pair reads as one. */
+  Under the rule it belongs to, so the pair reads as one.
+*/
 .pj-problem-cell {
   padding-top: 0 !important;
 }
@@ -970,4 +1030,127 @@
   border-radius: var(--radius-sm);
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* ============================================================ freshness == */
+
+/**
+ * When a reading was taken: "read 14:02".
+ *
+ * A clock time, faint and tabular, beside the control that would take it again.
+ * Nothing here polls, so the time is the only honest answer to "is this now?".
+ */
+.pj-read {
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* A panel corner holding more than one thing — a time and a count, a time and a
+   button. */
+.pj-aside {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-3);
+}
+
+/* =========================================================== disclosure == */
+
+/**
+ * A panel's reasoning: one line up front, the rest behind "why?".
+ *
+ * The same shape as `Quiet`'s disclosure and the same muted rung as `.pj-note`,
+ * because it is the panel's own voice; `Quiet` itself means "nothing here",
+ * which these panels are not.
+ */
+.pj-why {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.pj-why-lead {
+  margin: 0;
+}
+
+.pj-why-ask {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 2px;
+}
+
+.pj-why-ask:hover {
+  color: var(--text);
+  text-decoration-color: currentColor;
+}
+
+.pj-why-rest > p {
+  margin: var(--space-2) 0 0;
+}
+
+/* ============================================================ the fixes == */
+
+/* The way to where a finding is put right, on a line of its own under the
+   block that reports it. */
+.pj-fix {
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+/* Under a note that is not in a flex column of its own — the refusal a failed
+   read produces sits straight in a panel body, and without this the link was
+   glued to the note's bottom edge. The gap a note's own column would give it. */
+.pj-fix-under {
+  margin-top: var(--space-2);
+}
+
+/* The same, inline at the end of a sentence — inside an error box it takes the
+   box's own colour, underlined, rather than a second hue. */
+.pj-fix-link {
+  font-weight: var(--weight-medium);
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+/* The daemon's own words or a key from its file, inside a sentence a person
+   wrote. The face is the claim about origin; the colour is the box's. */
+.pj-verbatim {
+  color: inherit;
+}
+
+/* ============================================================== changes == */
+
+/**
+ * What a write just did, and how to take it back.
+ *
+ * The container is always in the document because it is the live region: a
+ * region inserted together with its text is one most screen readers never read.
+ * Empty, it takes no space.
+ */
+.pj-changed:empty {
+  display: none;
+}
+
+.pj-changed-said {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+/* A consequence worth reading before the button is pressed — a ceiling of zero —
+   in the ember of "held", because that is exactly what it will do. */
+.pj-warn {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--tone-paused-fg);
 }

@@ -319,6 +319,23 @@ async function judgeChooser(): Promise<HTMLSelectElement> {
   return chooser;
 }
 
+/** Every write the judge control has sent, in order. */
+function judgeWrites(): RequestInit[] {
+  return daemon.apiFetch.mock.calls
+    .filter((call) => String(call[0]) === "/projects/alpha/judge")
+    .map((call) => call[1] as RequestInit);
+}
+
+/**
+ * Past `ConfirmButton`'s dwell, on the real clock.
+ *
+ * A second press inside the first 300 ms is ignored by design — a double-click is one gesture —
+ * so a test that confirms has to wait it out, exactly as a person does.
+ */
+async function pastTheDwell(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 350));
+}
+
 describe("Projects - who answers for a conversation on Auto", () => {
   // Three states and not two, and the middle one is the whole reason: "nobody has chosen" must
   // follow the default wherever it moves, and "somebody chose nobody" must survive it. A control
@@ -369,13 +386,41 @@ describe("Projects - who answers for a conversation on Auto", () => {
     expect(offered).not.toContain("sonnet");
   });
 
+  /* The menu is a draft. It used to write on `change` — and on Windows, Tab onto a closed select
+     and one ↓ fires `change` without opening the list, so looking at the options handed approval
+     to a different model. Moving it now writes nothing until somebody says "Use this judge". */
+  it("writes nothing when the menu moves, only when the change is asked for", async () => {
+    answerWith(projectsWorld({ rules: rules({ judge: { state: "default" } }) }));
+    await renderProjects("/projects/alpha/rules");
+
+    const chooser = await judgeChooser();
+    expect(screen.queryByRole("button", { name: "Use this judge" })).toBeNull();
+
+    fireEvent.change(chooser, { target: { value: "qwen3" } });
+    expect(chooser.value).toBe("qwen3");
+    expect(await screen.findByRole("button", { name: "Use this judge" })).toBeDefined();
+    await pastTheDwell();
+    expect(judgeWrites()).toHaveLength(0);
+
+    // And putting the draft back takes the button away again: it appears only on a difference.
+    fireEvent.click(screen.getByRole("button", { name: "Keep the current one" }));
+    expect(chooser.value).toBe("default");
+    expect(screen.queryByRole("button", { name: "Use this judge" })).toBeNull();
+    expect(judgeWrites()).toHaveLength(0);
+  });
+
   // The brain travels out of the row that named the model, never out of a second control — which
-  // is the disagreement the daemon now refuses at the door.
-  it("sends the route beside the model it came from", async () => {
+  // is the disagreement the daemon now refuses at the door. A hosted model WIDENS who answers, so
+  // it takes the interlock: the first press arms, and only the second writes.
+  it("sends the route beside the model it came from, and only after the interlock", async () => {
     answerWith(projectsWorld({ rules: rules({ judge: { state: "default" } }) }));
     await renderProjects("/projects/alpha/rules");
 
     fireEvent.change(await judgeChooser(), { target: { value: "kimi-k2" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Use this judge" }));
+    await pastTheDwell();
+    expect(judgeWrites()).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: /Let Kimi K2 \(openrouter\) answer for you/ }));
 
     await waitFor(() => {
       const sent = daemon.apiFetch.mock.calls.find(
@@ -391,11 +436,13 @@ describe("Projects - who answers for a conversation on Auto", () => {
 
   // Two doors on the daemon and one control over them: naming nobody is a POST, withdrawing the
   // choice is a DELETE, and the difference is not null-versus-missing on one route.
-  it("switches the judge off through the write", async () => {
+  // Taking authority away is never the dangerous direction, so switching the judge off is one press.
+  it("switches the judge off through the write, in one press", async () => {
     answerWith(projectsWorld({ rules: rules({ judge: { state: "default" } }) }));
     await renderProjects("/projects/alpha/rules");
 
     fireEvent.change(await judgeChooser(), { target: { value: "off" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Use this judge" }));
 
     await waitFor(() => {
       const sent = daemon.apiFetch.mock.calls.find(
@@ -409,11 +456,15 @@ describe("Projects - who answers for a conversation on Auto", () => {
     });
   });
 
+  // From nobody to anybody widens it, the default included — so this one is armed first.
   it("puts it back on the default through the delete", async () => {
     answerWith(projectsWorld({ rules: rules({ judge: { state: "off" } }) }));
     await renderProjects("/projects/alpha/rules");
 
     fireEvent.change(await judgeChooser(), { target: { value: "default" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Use this judge" }));
+    await pastTheDwell();
+    fireEvent.click(screen.getByRole("button", { name: /answer for you/ }));
 
     await waitFor(() => {
       const sent = daemon.apiFetch.mock.calls.find(
@@ -652,8 +703,71 @@ describe("Projects - the concerns strip", () => {
     */
     expect(within(strip).queryByText(/gate_before_publish/)).toBeNull();
 
-    // And each leads to the view that answers it, rather than being a dead end.
-    expect(within(strip).getAllByRole("link", { name: "On its own" }).length).toBeGreaterThan(0);
+    /*
+      And each leads to where it is FIXED, named by what you do there. Every row
+      used to link to "On its own" — the tab that shows the finding, not the
+      place that ends it. The file is edited in the workspace; a held brake is
+      released by reviewing what is waiting.
+    */
+    const edit = within(strip).getByRole("link", { name: "Edit .ai/autopilot.yaml" });
+    expect(edit.getAttribute("href")).toBe("/projects/alpha/state");
+    expect(
+      within(strip).getByRole("link", { name: "Review what is waiting" }).getAttribute("href"),
+    ).toBe("/waiting");
+    expect(within(strip).queryByRole("link", { name: "On its own" })).toBeNull();
+
+    // The weight is spoken, not only drawn: the glyph is hidden from a screen reader.
+    expect(within(strip).getAllByText(/^Stopped:/).length).toBe(2);
+    expect(within(strip).getByText(/^Held:/)).toBeDefined();
+  });
+
+  /* On the view that shows a finding at length, the strip does not say it again. Dropping only the
+     link left the same fact twice, a hundred and fifty pixels apart. */
+  it("leaves a finding to the view that already shows it in full", async () => {
+    answerWith(
+      projectsWorld({
+        rules: rules({
+          rules_file: "unreadable",
+          rules_error: "unknown field `schedule` at line 3 column 1",
+          wip_limit: 2,
+          open_review_items: 2,
+          queue_full: true,
+        }),
+      }),
+    );
+
+    await renderProjects("/projects/alpha/rules");
+
+    // The block below says it, and carries the way to the editor itself.
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByRole("link", { name: /Edit .ai\/autopilot.yaml/ })).toBeDefined();
+    expect(screen.queryByRole("region", { name: "What is wrong here" })).toBeNull();
+  });
+
+  /* "No folder" is fixed on Autopilot, and the strip says so — it used to link to "On its own",
+     which cannot record a folder. Search and Diff would both open on the same refusal, so they are
+     on the row as text with the reason, not as links. */
+  it("sends a project with no folder to the page that records one", async () => {
+    answerWith(
+      projectsWorld({
+        projects: [project({ project_id: "alpha", mode: "off", project_root: null })],
+        rules: rules({ project_root: null }),
+      }),
+    );
+
+    await renderProjects("/projects/alpha/rules");
+
+    const strip = await screen.findByRole("region", { name: "What is wrong here" });
+    const fix = within(strip).getByRole("link", { name: "Record a folder on Autopilot" });
+    expect(fix.getAttribute("href")).toBe("/autopilot");
+    expect(within(strip).getByText(/^Unfinished:/)).toBeDefined();
+
+    const tabs = screen.getByRole("navigation", { name: "Project views" });
+    await waitFor(() => expect(within(tabs).queryByRole("link", { name: /Search/ })).toBeNull());
+    const search = within(tabs).getByText(/^Search/);
+    expect(search.getAttribute("aria-disabled")).toBe("true");
+    expect(search.textContent).toMatch(/no folder is recorded/);
+    expect(within(tabs).getByRole("link", { name: "Browse" })).toBeDefined();
   });
 
   /* Nothing at all when nothing is wrong. An "all clear" row would be a
@@ -850,5 +964,141 @@ describe("Projects - the route", () => {
     expect(within(await screen.findByRole("navigation", { name: "Folder path" })).getByText("/ src"))
       .toBeDefined();
     expect(router.state.location.pathname).toBe("/projects/alpha/inspect/browse");
+  });
+});
+
+/* ---------------------------------------- what a write did, and when a read was -- */
+
+describe("Projects - a change says what it replaced", () => {
+  /* The judge's state sentence used to change silently after a refetch, which a screen reader never
+     heard and which left no trace of what had been there. Now the change is said in a live region,
+     with the judge it replaced, and one press puts it back. */
+  it("says which judge a change replaced, and undoes it", async () => {
+    answerWith(projectsWorld({ rules: rules({ judge: { state: "default" } }) }));
+    await renderProjects("/projects/alpha/rules");
+
+    fireEvent.change(await judgeChooser(), { target: { value: "off" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Use this judge" }));
+
+    const said = await screen.findByText(/Changed from the default \(the local brain\)/);
+    expect(said.closest("[role='status']")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    // The default is put back through its own door, the DELETE.
+    await waitFor(() => {
+      expect(judgeWrites().map((init) => init.method)).toEqual(["POST", "DELETE"]);
+    });
+    expect(await screen.findByText(/Put back: the default \(the local brain\) answers again/))
+      .toBeDefined();
+  });
+
+  /* A ceiling of zero is "never start anything again". It was accepted in silence, behind the
+     green button; now the page says what it will do, and setting it takes the interlock. */
+  it("does not set a ceiling of zero on one press, and says what zero means", async () => {
+    answerWith(projectsWorld({ rules: rules({ wip_limit: 3 }) }));
+    await renderProjects("/projects/alpha/rules");
+
+    const field = (await screen.findByLabelText("Ceiling")) as HTMLInputElement;
+    fireEvent.change(field, { target: { value: "0" } });
+    expect(screen.getByText(/starts nothing new on its own until you raise it/)).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Set the ceiling" }));
+    await pastTheDwell();
+    const sent = () =>
+      daemon.apiFetch.mock.calls.filter(([path]) => String(path) === "/projects/alpha/wip-limit");
+    expect(sent()).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: /Set 0 — nothing new starts here/ }));
+    await waitFor(() => expect(sent()).toHaveLength(1));
+    expect(JSON.parse(String((sent()[0][1] as RequestInit).body))).toEqual({ limit: 0 });
+    expect(await screen.findByText(/Ceiling set to 0 — it was 3/)).toBeDefined();
+  });
+
+  /* Neither button is `approve`: that is the one affirmative fill in the system, and a search or a
+     number field wearing it teaches that green means "click here". */
+  it("keeps the affirmative fill off a read and a number field", async () => {
+    answerWith(projectsWorld({ rules: rules({ wip_limit: 3 }) }));
+    await renderProjects("/projects/alpha/rules");
+
+    const set = await screen.findByRole("button", { name: "Set the ceiling" });
+    expect(set.className).not.toContain("approve");
+  });
+
+  /* The rules are read on open and on focus, never on a timer — so the page says when, gives a way
+     to ask again, and when asking again fails it labels what is left as the last good read and
+     withdraws the two controls that would act beside it. */
+  it("says when the rules were read, and says so again when a re-read fails", async () => {
+    const world = projectsWorld({ rules: rules({ judge: { state: "default" } }) });
+    answerWith(world);
+    await renderProjects("/projects/alpha/rules");
+
+    await waitFor(() =>
+      expect(document.querySelector(".pj-source-read time")?.textContent).toMatch(/^\d\d:\d\d$/),
+    );
+    await judgeChooser();
+
+    const served = daemon.apiFetch.getMockImplementation()!;
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path.endsWith("/rules") ? Promise.reject(new Error("no daemon")) : served(path, init),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    expect(await screen.findByText(/view is stale — last good read/)).toBeDefined();
+    // The reading stays; the controls that would act beside it go.
+    expect(screen.getByText(/Nobody has chosen otherwise/)).toBeDefined();
+    expect(screen.queryByLabelText("Who answers")).toBeNull();
+    expect(screen.queryByLabelText("Ceiling")).toBeNull();
+  });
+});
+
+describe("Projects - a search hit is a way to the line", () => {
+  /* A hit used to be text under a link that carried the file alone: the listing beside it went
+     back to the project root, and line 612 was a number to remember and scroll for. */
+  it("links each hit to its file, in its folder, at its line", async () => {
+    answerWith(
+      projectsWorld({
+        matches: [{ path: "core/src/vcs.rs", line: 612, text: "rules.gate_before_publish" }],
+      }),
+    );
+
+    await renderProjects("/projects/alpha/search?q=before_publish");
+
+    const found = await screen.findByRole("list", { name: "Matches" });
+    const hit = within(found).getByRole("link", { name: /open core\/src\/vcs.rs at this line/ });
+    const href = hit.getAttribute("href") ?? "";
+    expect(href).toContain("/projects/alpha/inspect/browse");
+    expect(href).toContain("path=core%2Fsrc");
+    expect(href).toContain("file=core%2Fsrc%2Fvcs.rs");
+    expect(href).toContain("line=612");
+
+    const group = within(found).getByRole("link", { name: "core/src/vcs.rs" });
+    expect(group.getAttribute("href")).toContain("path=core%2Fsrc");
+  });
+
+  it("opens the file titled by its path, marked at the line it was sent to", async () => {
+    answerWith(
+      projectsWorld({
+        entries: [{ name: "vcs.rs", is_dir: false }],
+        file: "fn one() {}\nfn two() {}\nfn three() {}",
+      }),
+    );
+
+    await renderProjects("/projects/alpha/browse?path=core%2Fsrc&file=core%2Fsrc%2Fvcs.rs&line=2");
+
+    // The path is the panel's heading now, not a faint caption under "File".
+    expect(await screen.findByRole("heading", { level: 2, name: "core/src/vcs.rs" })).toBeDefined();
+    await screen.findByText(/fn three/);
+    expect(screen.getByText("line 2")).toBeDefined();
+    const mark = document.querySelector(".pj-file-mark");
+    expect(mark?.getAttribute("data-line")).toBe("2");
+  });
+
+  it("marks nothing for a line the file does not have", async () => {
+    answerWith(projectsWorld({ entries: [], file: "one line" }));
+
+    await renderProjects("/projects/alpha/browse?file=a.rs&line=900");
+
+    await screen.findByText("one line");
+    expect(document.querySelector(".pj-file-mark")).toBeNull();
   });
 });

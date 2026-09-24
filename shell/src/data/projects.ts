@@ -23,7 +23,9 @@ import { whereWaiting } from "./roster";
  * `diff` gets an explicit refresh instead, which is the honest shape: the tree
  * changes when the person changes it.
  *
- * The one write on this page is the WIP ceiling.
+ * Two writes live here, and neither is a file: the WIP ceiling and the judge, both rows in the
+ * núcleo's database. "The one write is the WIP ceiling" was true until the judge arrived beside it,
+ * and a sentence that outlives its truth is read as a promise.
  */
 
 /* ----------------------------------------------------------------- shapes -- */
@@ -515,6 +517,17 @@ export function scheduleCapped(schedule: ScheduleView): boolean {
   return schedule.daily_cap > 0 && schedule.fires_today >= schedule.daily_cap;
 }
 
+/**
+ * The folder a path sits in. The root is the empty path.
+ *
+ * What a grep hit links to beside the file it names: the listing next to an opened file is its
+ * folder, and a link that carried only the file left the listing on the project root.
+ */
+export function parentPath(path: string): string {
+  const segments = pathSegments(path);
+  return segments.slice(0, -1).join("/");
+}
+
 /** A path's parts, for the breadcrumb trail. The root is the empty path. */
 export function pathSegments(path: string): string[] {
   return path.split("/").filter((part) => part !== "");
@@ -678,14 +691,46 @@ export type ConcernKind =
  */
 export type ConcernWeight = "stopped" | "held" | "unfinished";
 
+/**
+ * Where a finding is put right, named by what you do there.
+ *
+ * A route and a verb rather than the name of a tab. The strip used to link every finding to "On its
+ * own" — including "no folder has been recorded", which that view cannot fix: the folder is named
+ * on the Autopilot page, and the concern's own sentence was the only place that said so, as text.
+ * A diagnosis that does not lead to the fix leaves the person who has to make it holding both.
+ */
+export interface ConcernFix {
+  /** A route that exists in `router.tsx` today. Never one this file wishes existed. */
+  to: string;
+  /** What the person will do there, as a verb phrase. */
+  label: string;
+}
+
 export interface Concern {
   kind: ConcernKind;
   weight: ConcernWeight;
   /** What is wrong and what it costs, in one sentence. */
   said: string;
-  /** The view that answers it, so a finding leads somewhere. */
+  /**
+   * The inspector view that shows the finding at length. The strip drops the finding on that view
+   * — the block below already says it, with its own way to the fix — rather than printing it twice.
+   */
   view: ProjectView;
+  /** Where it is fixed. */
+  fix: ConcernFix;
 }
+
+/**
+ * Where a project's `.ai/autopilot.yaml` is edited: the workspace's State mode, whose "Files the app
+ * owns" section holds the raw editor. The State mode and not the inspector, because the inspector
+ * reads the tree and that editor is the file's legitimate author (`project/OwnedFiles.tsx`).
+ */
+export function rulesEditorPath(projectId: string): string {
+  return `/projects/${projectId}/state`;
+}
+
+/** Where a project's folder is recorded — the Autopilot page, which names it when a mode is set. */
+export const FOLDER_FIX_PATH = "/autopilot";
 
 /**
  * Everything wrong with this project, worst first.
@@ -713,6 +758,7 @@ export function concernsOf(rules: ProjectRules, rootExists: boolean | null | und
       weight: "stopped",
       said: "The rules file will not parse — nothing runs here at all.",
       view: "rules",
+      fix: { to: rulesEditorPath(rules.project_id), label: "Edit .ai/autopilot.yaml" },
     });
   }
 
@@ -725,6 +771,7 @@ export function concernsOf(rules: ProjectRules, rootExists: boolean | null | und
       weight: "stopped",
       said: "Merges need a gate and none is set — every merge is refused.",
       view: "rules",
+      fix: { to: rulesEditorPath(rules.project_id), label: "Set a gate in .ai/autopilot.yaml" },
     });
   }
 
@@ -734,19 +781,27 @@ export function concernsOf(rules: ProjectRules, rootExists: boolean | null | und
       weight: "stopped",
       said: "The recorded folder is not on this disk — nothing here can be read.",
       view: "browse",
+      fix: { to: FOLDER_FIX_PATH, label: "Record the folder again on Autopilot" },
     });
   }
 
+  /* `stopped`, not `held`. The rule's own badge says `never fires` in Wrong Red, and the strip said
+     the same fact in ember with a `!` — two weights for one finding. It is the stopped kind by this
+     file's own definition: happening now, and it will not clear itself. */
   const inert = autonomyOf(rules).filter((rule) => rule.state === "never-fires").length;
   if (inert > 0) {
     found.push({
       kind: "rules-inert",
-      weight: "held",
+      weight: "stopped",
       said:
         inert === 1
           ? "One rule is armed and can never fire."
           : `${inert} rules are armed and can never fire.`,
       view: "rules",
+      fix: {
+        to: rulesEditorPath(rules.project_id),
+        label: inert === 1 ? "Fix the rule in .ai/autopilot.yaml" : "Fix the rules in .ai/autopilot.yaml",
+      },
     });
   }
 
@@ -756,6 +811,7 @@ export function concernsOf(rules: ProjectRules, rootExists: boolean | null | und
       weight: "held",
       said: "The ceiling is holding new work back until something is reviewed.",
       view: "rules",
+      fix: { to: "/waiting", label: "Review what is waiting" },
     });
   }
 
@@ -764,7 +820,9 @@ export function concernsOf(rules: ProjectRules, rootExists: boolean | null | und
       kind: "folder-unset",
       weight: "unfinished",
       said: "No folder has been recorded, so there is nothing to look inside.",
-      view: "rules",
+      // `browse` and not `rules`: the browse view is the one whose refusal says this at length.
+      view: "browse",
+      fix: { to: FOLDER_FIX_PATH, label: "Record a folder on Autopilot" },
     });
   }
 

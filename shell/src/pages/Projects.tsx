@@ -1,16 +1,17 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
   DIFF_LINE_CAP,
+  FOLDER_FIX_PATH,
   VIEWS,
-  autonomyOf,
   concernsOf,
   diffLines,
   groupMatches,
   headlineFor,
   joinPath,
   normaliseView,
+  parentPath,
   pathSegments,
   pathUpTo,
   useProjectCat,
@@ -18,41 +19,35 @@ import {
   useProjectGrep,
   useProjectLs,
   useProjectRules,
-  useClearJudge,
-  useSetJudge,
-  useSetWipLimit,
-  type AutonomyRule,
   type Concern,
   type ConcernWeight,
   type InspectEntry,
   type ProjectRules,
   type ProjectView,
 } from "../data/projects";
-import { useAssistantModels, type ModelChoice } from "../data/chats";
 import { useProjects } from "../data/system";
+import { OnItsOwn, ReadAt, Why } from "../project/OnItsOwn";
 import {
-  StateBadge,
   Button,
   Count,
   Crumb,
   ErrorNote,
-  Meter,
   PageHeader,
   Panel,
   Quiet,
   RefusalNote,
-  RelativeTime,
-  Teach,
+  StaleNote,
 } from "../ui";
 import "./projects.css";
 
 /**
- * Projects — the read-only inspector, and the one brake that is a write.
+ * Projects — the inspector: a project's tree, read-only, and for now the
+ * "On its own" view, which is not.
  *
  * The page exists because two facts about a project were only readable by
  * leaving the app: what it will do on its own (`.ai/autopilot.yaml`, on disk)
  * and what its tree currently looks like. Both are shown here, and this page
- * edits neither.
+ * edits neither FILE.
  *
  * **The rule that used to justify that, and what is left of it.** The sentence
  * was: a shell that offered to write the rules file would be a second author of
@@ -78,9 +73,14 @@ import "./projects.css";
  * because a form would have to re-serialise the YAML and re-serialising deletes
  * the comment somebody left explaining why a schedule is switched off.
  *
- * **The single write on this page is the WIP ceiling**, because it is the one of
- * these facts that lives in the database rather than in a file, and until now
- * could only be changed with `sqlite3`.
+ * **It is not read-only, whatever this header used to say.** The "On its own"
+ * view makes two writes, both to the núcleo's
+ * database and neither to a file: the WIP ceiling and the judge that answers for
+ * a conversation on Auto. Both are safety controls, and both now live in
+ * `project/OnItsOwn.tsx` — lifted out whole so they can move to the project
+ * workspace, where a person goes to change how a project behaves. Until they do,
+ * this page mounts that component for its `rules` view. Browse, Search and Diff
+ * are the part that reads and only reads.
  *
  * The four views are in the route (`/projects/$projectId/inspect/$view`) so a
  * folder somebody is looking at survives a reload and can be linked to. An
@@ -131,6 +131,13 @@ interface InspectSearch {
   q?: string;
   /** The subtree the search was run under. Absent is the whole project. */
   under?: string;
+  /**
+   * The line a search hit points at, in the open file. `unknown` because it is
+   * read straight off the location and `lineOf` decides what it means — until
+   * `router.tsx` validates it, the real route strips it and a hit opens the file
+   * at the top, which is what it did before this param existed.
+   */
+  line?: unknown;
 }
 
 /**
@@ -217,13 +224,19 @@ export function Projects() {
       </Crumb>
 
       <Concerns
-        projectId={projectId}
         rules={rules.data}
         rootExists={project?.root_exists}
         here={view}
       />
 
-      <ViewTabs projectId={projectId} view={view} />
+      <ViewTabs
+        projectId={projectId}
+        view={view}
+        /* Only once the roster has answered: a project not yet read is not a
+           project without a folder, and greying out two tabs on a guess would
+           be the page claiming something it does not know. */
+        noFolder={project !== undefined && project.project_root === null}
+      />
       {/* Keyed on the project so a query somebody is halfway through typing
           resets when the subject changes. The folder and the open file live in
           the location now and change with it; this key is for the drafts that
@@ -232,7 +245,6 @@ export function Projects() {
         key={projectId}
         projectId={projectId}
         projectRoot={project?.project_root ?? null}
-        rules={rules}
         view={view}
       />
     </>
@@ -263,55 +275,63 @@ const WEIGHT_MARK: Record<ConcernWeight, string> = {
  * lands, could not learn from this page that the project in front of them was
  * doing nothing at all.
  *
- * The link is dropped on the view that already answers the finding: a link to
- * where you are standing is furniture.
+ * **Each finding leads to where it is fixed, named by what you do there.** It
+ * used to link to the inspector tab that showed it — "On its own" on every row,
+ * including "no folder has been recorded", which that tab cannot fix — so the
+ * person who has to make the fix got a diagnosis and a link back to it.
+ *
+ * **On the view that shows a finding at length, the row is not drawn at all.**
+ * Dropping only its link left the same fact twice, a hundred and fifty pixels
+ * apart; the block below says it in full and carries its own way to the fix.
+ *
+ * The weight is spoken as well as drawn. The glyph is `aria-hidden`, so a screen
+ * reader heard every row as the same kind of sentence; "Stopped:" and "Held:"
+ * are the difference between a fault and a brake doing its job.
  */
 function Concerns({
-  projectId,
   rules,
   rootExists,
   here,
 }: {
-  projectId: string;
   rules: ProjectRules | undefined;
   rootExists: boolean | null | undefined;
   here: ProjectView;
 }) {
   if (rules === undefined) return null;
-  const found = concernsOf(rules, rootExists);
+  const found = concernsOf(rules, rootExists).filter((concern) => concern.view !== here);
   if (found.length === 0) return null;
 
   return (
     <section className="pj-concerns" aria-label="What is wrong here">
       <ul className="pj-concern-list">
         {found.map((concern) => (
-          <ConcernRow key={concern.kind} concern={concern} projectId={projectId} here={here} />
+          <ConcernRow key={concern.kind} concern={concern} />
         ))}
       </ul>
     </section>
   );
 }
 
-function ConcernRow({
-  concern,
-  projectId,
-  here,
-}: {
-  concern: Concern;
-  projectId: string;
-  here: ProjectView;
-}) {
+/** What a screen reader hears in place of the glyph. */
+const WEIGHT_SAID: Record<ConcernWeight, string> = {
+  stopped: "Stopped:",
+  held: "Held:",
+  unfinished: "Unfinished:",
+};
+
+function ConcernRow({ concern }: { concern: Concern }) {
   return (
     <li className={`pj-concern pj-concern-${concern.weight}`}>
       <span className="pj-concern-mark" aria-hidden="true">
         {WEIGHT_MARK[concern.weight]}
       </span>
-      <span className="pj-concern-said">{concern.said}</span>
-      {concern.view === here ? null : (
-        <Link className="pj-concern-where" to={inspectPath(projectId, concern.view)}>
-          {VIEW_LABEL[concern.view]}
-        </Link>
-      )}
+      <span className="pj-concern-said">
+        <span className="sr-only">{WEIGHT_SAID[concern.weight]} </span>
+        {concern.said}
+      </span>
+      <Link className="pj-concern-where" to={concern.fix.to}>
+        {concern.fix.label}
+      </Link>
     </li>
   );
 }
@@ -323,11 +343,25 @@ function ConcernRow({
  *
  * Browse, Search and Diff are three ways of reading the tree and are superseded
  * by the Código mode the day it grows them. "On its own" answers a different
- * question, is superseded by nothing that exists, and holds the only control on
- * the page. Drawn as four equal tabs, the durable one was the last of four and
- * had the most generic name on the screen.
+ * question, is superseded by nothing that exists, and holds the page's two
+ * controls — which is why it is leaving for the project workspace. Drawn as four
+ * equal tabs, the durable one was the last of four and had the most generic name
+ * on the screen.
+ *
+ * **Search and Diff are not links when there is no folder.** Both would open on
+ * the same refusal the browse view already gives, which is a click spent learning
+ * something the page knew. They stay on the row — a tab that vanishes leaves no
+ * trace of what is missing — as text, with the reason on it.
  */
-function ViewTabs({ projectId, view }: { projectId: string; view: ProjectView }) {
+function ViewTabs({
+  projectId,
+  view,
+  noFolder,
+}: {
+  projectId: string;
+  view: ProjectView;
+  noFolder: boolean;
+}) {
   return (
     <nav className="pj-tabs" aria-label="Project views">
       {VIEWS.map((candidate) => {
@@ -335,6 +369,19 @@ function ViewTabs({ projectId, view }: { projectId: string; view: ProjectView })
         if (candidate === view) classes.push("pj-tab-active");
         /* The divider, on the one view that is not one of the three. */
         if (candidate === "rules") classes.push("pj-tab-apart");
+        if (noFolder && candidate !== view && (candidate === "search" || candidate === "diff")) {
+          return (
+            <span
+              key={candidate}
+              className="pj-tab pj-tab-off"
+              aria-disabled="true"
+              title="No folder is recorded for this project, so there is nothing to read"
+            >
+              {VIEW_LABEL[candidate]}
+              <span className="sr-only">, unavailable: no folder is recorded</span>
+            </span>
+          );
+        }
         return (
           <Link
             key={candidate}
@@ -353,12 +400,10 @@ function ViewTabs({ projectId, view }: { projectId: string; view: ProjectView })
 function ProjectViews({
   projectId,
   projectRoot,
-  rules,
   view,
 }: {
   projectId: string;
   projectRoot: string | null;
-  rules: ReturnType<typeof useProjectRules>;
   view: ProjectView;
 }) {
   return (
@@ -366,7 +411,9 @@ function ProjectViews({
       {view === "browse" && <BrowsePanel projectId={projectId} projectRoot={projectRoot} />}
       {view === "search" && <GrepPanel projectId={projectId} projectRoot={projectRoot} />}
       {view === "diff" && <DiffPanel projectId={projectId} projectRoot={projectRoot} />}
-      {view === "rules" && <RulesView projectId={projectId} rules={rules} />}
+      {/* Its own component now, reading the rules itself; it moves to the
+          project workspace, and this line becomes a link to it. */}
+      {view === "rules" && <OnItsOwn projectId={projectId} />}
     </div>
   );
 }
@@ -401,6 +448,11 @@ function ProjectViews({
  * route answering 404 under a name of its own would slip past a hardcoded key
  * and take the generic sentence instead. The branch has already decided this is
  * the 404; the key only says "whatever this one was called".
+ *
+ * **And the 404 carries the way to the fix.** Both of its causes that are not a
+ * typo are put right on the Autopilot page, where a folder is recorded — which
+ * the sentence used to say as plain text, leaving the person to go and find it.
+ * `RefusalNote` takes a sentence and not a link, so the link sits under it.
  */
 function InspectAbsence({
   error,
@@ -419,7 +471,16 @@ function InspectAbsence({
       projectRoot === null
         ? "This project has no folder recorded, so there is nothing to look inside. A folder is named when the project is put into shadow or acting, on the Autopilot page."
         : `Not found — and the núcleo answers the same way for two different things: that path is not there, or the folder recorded for this project (${projectRoot}) is gone from the disk. Check the folder before hunting for the file.`;
-    return <RefusalNote refusal={error} sentences={{ [error.code]: said }} />;
+    return (
+      <>
+        <RefusalNote refusal={error} sentences={{ [error.code]: said }} />
+        <p className="pj-fix pj-fix-under">
+          <Link to={FOLDER_FIX_PATH}>
+            {projectRoot === null ? "Record a folder on Autopilot" : "Check the folder on Autopilot"}
+          </Link>
+        </p>
+      </>
+    );
   }
   return (
     <RefusalNote
@@ -466,9 +527,22 @@ function BrowsePanel({ projectId, projectRoot }: { projectId: string; projectRoo
 
   return (
     <div className={openFile === null ? "pj-browse" : "pj-browse pj-browse-split"}>
-      <Panel title="Folder" aside={<Count n={listing.data?.length} />}>
+      <Panel
+        title="Folder"
+        aside={
+          <span className="pj-aside">
+            <ReadAt at={listing.dataUpdatedAt} />
+            <Count n={listing.data?.length} />
+          </span>
+        }
+      >
         <Breadcrumbs path={path} onGo={(next) => go({ path: next || undefined }, false)} />
-        {listing.isError && (
+        {/* A failed re-read over a listing already on screen is a stale listing,
+            not an absent folder: the last good one stays, labelled with its age. */}
+        {listing.isError && listing.data !== undefined && (
+          <StaleNote dataUpdatedAt={listing.dataUpdatedAt} />
+        )}
+        {listing.isError && listing.data === undefined && (
           <InspectAbsence error={listing.error} projectRoot={projectRoot} what="that folder" />
         )}
         {!listing.isError && listing.data === undefined && (
@@ -514,11 +588,23 @@ function BrowsePanel({ projectId, projectRoot }: { projectId: string; projectRoo
           projectId={projectId}
           projectRoot={projectRoot}
           path={openFile}
+          line={lineOf(search.line)}
           onClose={() => go({ path: path || undefined }, true)}
         />
       )}
     </div>
   );
+}
+
+/**
+ * A `line` search param as a line number, or nothing.
+ *
+ * Read defensively because it is a claim in a URL: anything that is not a
+ * positive whole number is the same as not asking.
+ */
+function lineOf(raw: unknown): number | null {
+  const line = typeof raw === "number" ? raw : Number(raw);
+  return Number.isInteger(line) && line > 0 ? line : null;
 }
 
 function compareEntries(a: InspectEntry, b: InspectEntry): number {
@@ -539,13 +625,16 @@ function Breadcrumbs({ path, onGo }: { path: string; onGo: (path: string) => voi
   const segments = pathSegments(path);
   return (
     <nav className="pj-crumbs" aria-label="Folder path">
+      {/* "the project root" is a phrase somebody wrote, not a name the núcleo
+          sent, so it is in the body face; the segments after it are real path
+          names and keep the mono one. The face is a claim about origin. */}
       {path === "" ? (
-        <span className="pj-crumb pj-crumb-here" aria-current="location">
+        <span className="pj-crumb pj-crumb-root pj-crumb-here" aria-current="location">
           the project root
         </span>
       ) : (
         <Button variant="link" onClick={() => onGo("")}>
-          <span className="pj-crumb">the project root</span>
+          <span className="pj-crumb pj-crumb-root">the project root</span>
         </Button>
       )}
       {segments.map((segment, index) =>
@@ -580,46 +669,86 @@ function Breadcrumbs({ path, onGo }: { path: string; onGo: (path: string) => voi
  * text nodes in a column of their own, so that stays true — and they are here
  * because the search beside this view answers in line numbers, and a hit at
  * line 612 was previously unfindable in the file it named.
+ *
+ * Titled by its path. It was titled "File" with the path on a faint second
+ * line — a heading that named the kind of thing and a caption that named the
+ * thing, which is the wrong way round for the one fact the panel is about.
+ *
+ * A `line` from a search hit is scrolled to and marked, so "612" is somewhere
+ * the page takes you rather than a number you carry in your head and scroll for.
  */
 function FileView({
   projectId,
   projectRoot,
   path,
+  line,
   onClose,
 }: {
   projectId: string;
   projectRoot: string | null;
   path: string;
+  line: number | null;
   onClose: () => void;
 }) {
   const file = useProjectCat(projectId, path);
 
   return (
     <Panel
-      title="File"
+      title={path}
       aside={
-        <Button variant="ghost" onClick={onClose}>
-          Close
-        </Button>
+        <span className="pj-aside">
+          {line !== null && <span className="pj-read">line {line}</span>}
+          <ReadAt at={file.dataUpdatedAt} />
+          <Button variant="ghost" onClick={onClose}>
+            Close
+          </Button>
+        </span>
       }
     >
-      <p className="pj-file-path">{path}</p>
-      {file.isError && (
+      {file.isError && file.data !== undefined && <StaleNote dataUpdatedAt={file.dataUpdatedAt} />}
+      {file.isError && file.data === undefined && (
         <InspectAbsence error={file.error} projectRoot={projectRoot} what="that file" />
       )}
       {!file.isError && file.data === undefined && <p className="pj-loading">reading the file…</p>}
       {file.data !== undefined && file.data === "" && (
         <Quiet says="that file is empty — a real answer, not a failed read." />
       )}
-      {file.data !== undefined && file.data !== "" && <FileBody text={file.data} />}
+      {file.data !== undefined && file.data !== "" && <FileBody text={file.data} line={line} />}
     </Panel>
   );
 }
 
-function FileBody({ text }: { text: string }) {
+/**
+ * The text, with its numbers, and one line marked when a search hit asked for it.
+ *
+ * The mark is one band laid behind both columns at the line's offset, not a
+ * span per line: the file is two `pre`s so its numbers cannot be copied with it,
+ * and splitting it into a node per line to style one of them would cost a page
+ * element per line of somebody's lock file. The band is `aria-hidden`; what a
+ * screen reader gets is the "line 612" beside the panel's title.
+ */
+function FileBody({ text, line }: { text: string; line: number | null }) {
   const lines = text.split("\n");
+  const target = line !== null && line <= lines.length ? line : null;
+  const mark = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    // `?.` on the method because jsdom has no `scrollIntoView`, and a missing
+    // method there is not a reason to throw in a test.
+    if (target !== null) mark.current?.scrollIntoView?.({ block: "center" });
+  }, [target, text]);
+
   return (
     <div className="pj-file-body">
+      {target !== null && (
+        <span
+          ref={mark}
+          className="pj-file-mark"
+          aria-hidden="true"
+          data-line={target}
+          style={{ top: `calc(var(--space-3) + ${String(target - 1)} * 1.45em)` }}
+        />
+      )}
       <pre className="pj-file-nums" aria-hidden="true">
         <code>{lines.map((_, index) => String(index + 1)).join("\n")}</code>
       </pre>
@@ -656,11 +785,21 @@ function GrepPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
   const groups = groupMatches(matches.data ?? []);
 
   return (
-    <Panel title="Search" aside={<Count n={matches.data?.length} />}>
-      <p className="pj-note">
-        Plain text, over the files under the folder you name. The núcleo does the walking, so this
-        reaches files no editor has open — and it reads, only ever reads.
-      </p>
+    <Panel
+      title="Search"
+      aside={
+        <span className="pj-aside">
+          {asked !== null && <ReadAt at={matches.dataUpdatedAt} />}
+          <Count n={matches.data?.length} />
+        </span>
+      }
+    >
+      <Why lead="Plain text, over the files under the folder you name.">
+        <p>
+          The núcleo does the walking, so this reaches files no editor has open — and it reads, only
+          ever reads.
+        </p>
+      </Why>
       <form
         className="pj-form"
         onSubmit={(event) => {
@@ -696,13 +835,18 @@ function GrepPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
         />
         {/* A real submit, so Enter in either field searches. `Button` defaults to
             `type="button"` precisely so that inline controls do not submit the
-            forms they sit in; this is the one here that should. */}
-        <Button variant="approve" type="submit" disabled={draftQ.trim() === ""}>
+            forms they sit in; this is the one here that should. `ghost`, because
+            a search is a read: `approve` is the one affirmative fill in the
+            system, and a green search button teaches that green means "click". */}
+        <Button variant="ghost" type="submit" disabled={draftQ.trim() === ""}>
           Search
         </Button>
       </form>
 
-      {asked !== null && matches.isError && (
+      {asked !== null && matches.isError && matches.data !== undefined && (
+        <StaleNote dataUpdatedAt={matches.dataUpdatedAt} />
+      )}
+      {asked !== null && matches.isError && matches.data === undefined && (
         <InspectAbsence error={matches.error} projectRoot={projectRoot} what="that search" />
       )}
       {asked !== null && !matches.isError && matches.data === undefined && (
@@ -719,19 +863,35 @@ function GrepPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
                 The path once, as a heading, and each hit a link into the file.
                 A flat list repeated the path on every row — forty times for a
                 common word, and it is the longest thing on the row.
+
+                Both carry the file's folder as `path`, so the listing beside
+                the opened file is the folder it is in rather than the project
+                root — the link used to carry the file alone. A hit also carries
+                its line, which the file view scrolls to and marks.
               */}
               <Link
                 className="pj-match-path"
                 to={inspectPath(projectId, "browse")}
-                search={{ file: group.path }}
+                search={{ path: parentPath(group.path) || undefined, file: group.path }}
               >
                 {group.path}
               </Link>
               <ul className="pj-match-lines">
                 {group.matches.map((match) => (
                   <li className="pj-match" key={`${match.path}:${String(match.line)}`}>
-                    <span className="pj-match-line">{match.line}</span>
-                    <code className="pj-match-text">{match.text}</code>
+                    <Link
+                      className="pj-match-link"
+                      to={inspectPath(projectId, "browse")}
+                      search={{
+                        path: parentPath(match.path) || undefined,
+                        file: match.path,
+                        line: match.line,
+                      }}
+                    >
+                      <span className="pj-match-line">{match.line}</span>
+                      <code className="pj-match-text">{match.text}</code>
+                      <span className="sr-only">, open {match.path} at this line</span>
+                    </Link>
                   </li>
                 ))}
               </ul>
@@ -752,17 +912,25 @@ function DiffPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
     <Panel
       title="Uncommitted changes"
       aside={
-        <Button variant="ghost" disabled={diff.isFetching} onClick={() => void diff.refetch()}>
-          {diff.isFetching ? "Reading…" : "Refresh"}
-        </Button>
+        /* The time beside the button, because "read once" was the whole promise
+           and the panel never said WHEN once was. */
+        <span className="pj-aside">
+          <ReadAt at={diff.dataUpdatedAt} />
+          <Button variant="ghost" disabled={diff.isFetching} onClick={() => void diff.refetch()}>
+            {diff.isFetching ? "Reading…" : "Refresh"}
+          </Button>
+        </span>
       }
     >
-      <p className="pj-note">
-        What is in the working tree and not yet in a commit. Read once when you open this and again
-        when you ask — a tree changes because a person or a job changed it, not on a timer, so
-        polling it would be a git call every three seconds for an answer nobody is watching.
-      </p>
-      {diff.isError && (
+      <Why lead="What is in the working tree and not yet in a commit.">
+        <p>
+          Read once when you open this and again when you ask — a tree changes because a person or a
+          job changed it, not on a timer, so polling it would be a git call every three seconds for
+          an answer nobody is watching.
+        </p>
+      </Why>
+      {diff.isError && diff.data !== undefined && <StaleNote dataUpdatedAt={diff.dataUpdatedAt} />}
+      {diff.isError && diff.data === undefined && (
         <InspectAbsence error={diff.error} projectRoot={projectRoot} what="the diff" />
       )}
       {!diff.isError && diff.data === undefined && <p className="pj-loading">reading the tree…</p>}
@@ -810,636 +978,5 @@ function DiffBody({ diff }: { diff: string }) {
         ))}
       </code>
     </pre>
-  );
-}
-
-/* ------------------------------------------------------------ on its own -- */
-
-function RulesView({
-  projectId,
-  rules,
-}: {
-  projectId: string;
-  rules: ReturnType<typeof useProjectRules>;
-}) {
-  if (rules.isError) {
-    return (
-      <Panel title="On its own">
-        {isApiRefusal(rules.error) ? (
-          <RefusalNote refusal={rules.error} />
-        ) : (
-          <ErrorNote>
-            the núcleo did not answer — nothing is known about this project&apos;s rules
-          </ErrorNote>
-        )}
-      </Panel>
-    );
-  }
-  if (rules.data === undefined) {
-    return (
-      <Panel title="On its own">
-        <p className="pj-loading">reading the rules…</p>
-      </Panel>
-    );
-  }
-
-  return (
-    <>
-      <RulesFileState rules={rules.data} />
-      <Autonomy rules={rules.data} />
-      <GatePanel command={rules.data.gate_command} beforePublish={rules.data.gate_before_publish} />
-      <JudgePanel projectId={projectId} rules={rules.data} />
-      <WipPanel projectId={projectId} rules={rules.data} />
-    </>
-  );
-}
-
-/**
- * What state the rules file is in, and why that is information rather than a
- * fault.
- *
- * `absent` is ordinary: `.ai/autopilot.yaml` is gitignored, so a fresh clone and
- * every worktree legitimately has none, and a project with no file simply does
- * nothing on its own.
- *
- * `unreadable` is the row that has to be loud. `config.rs` parses with
- * `deny_unknown_fields` precisely so a typo is an error rather than a silently
- * empty ruleset — but that error used to reach only a log line, so writing
- * `schedule:` for `schedules:` stopped all autonomy for the project and looked
- * exactly like nothing happening. The daemon's own message is the whole content
- * of that finding, so it is shown verbatim and first.
- *
- * **Not a `Panel` and not a `Badge`.** It was a whole bordered section spending
- * a hundred and forty pixels to say a path and one word, with that word in the
- * same filled pill a rule's state uses — so a file's condition and a schedule's
- * condition were the same shape. A file reads as a file: its name, its state
- * beside it, and where it is.
- */
-function RulesFileState({ rules }: { rules: ProjectRules }) {
-  return (
-    <div className="pj-source">
-      <p className="pj-source-line">
-        <code className="pj-source-name">.ai/autopilot.yaml</code>
-        <span className={`pj-source-state pj-source-${rules.rules_file}`}>{rules.rules_file}</span>
-        <span className="pj-meta">
-          {rules.project_root === null ? "no folder recorded" : `in ${rules.project_root}`}
-        </span>
-      </p>
-      {rules.rules_file === "unreadable" && (
-        <div className="pj-rules-error" role="alert">
-          <p className="pj-rules-error-title">
-            The núcleo could not read this project&apos;s rules, so it is doing nothing on its own.
-          </p>
-          <pre className="pj-rules-error-detail">
-            <code>{rules.rules_error ?? "the núcleo reported no detail"}</code>
-          </pre>
-          <p className="pj-note">
-            The file is parsed strictly on purpose: an unknown key is an error rather than a silently
-            empty ruleset. Until it parses, nothing this project might run is known — not because
-            there is nothing, but because none of it could be loaded.
-          </p>
-        </div>
-      )}
-      {rules.rules_file === "absent" && (
-        <p className="pj-note">
-          There is no .ai/autopilot.yaml under this folder. That is an ordinary state and not a fault
-          — the file is gitignored, so a fresh clone has none — and it means this project starts
-          nothing by itself.
-        </p>
-      )}
-    </div>
-  );
-}
-
-/** A clock or a commit, as a mark and a word. Never colour alone, like every mark in this app. */
-const CLOCK_MARK: Record<AutonomyRule["clock"], string> = { cron: "◷", commit: "◆" };
-const CLOCK_SAID: Record<AutonomyRule["clock"], string> = {
-  cron: "on a clock",
-  commit: "on a commit",
-};
-
-/**
- * The one place a filled badge is used on this page, and it means the state of
- * a rule.
- *
- * `unseen` is `pending` and not `active`: a trigger with no commit to compare
- * against fires nothing, by design, and drawing it in the same green as a rule
- * that will run tonight is how "armed" came to mean two different things.
- */
-
-/**
- * Everything that starts work here without you, as one table.
- *
- * Two panels became one for the reason the Teams console became a table: a
- * project with two schedules and one trigger read as two half-empty lists
- * rather than as *three things run here on their own*, and a card whose blocks
- * appear only sometimes starts the next row at a different height every time. A
- * table cannot have that defect, because the columns line up by being columns.
- *
- * **Not drawn at all when the file will not parse.** The two lists it replaces
- * printed "nothing is scheduled" and "no commit starts anything here" directly
- * under an alert that had just said every rule below was absent because none
- * could be loaded — four hundred pixels spent saying something the page had
- * disclaimed one paragraph earlier.
- */
-function Autonomy({ rules }: { rules: ProjectRules }) {
-  if (rules.rules_file === "unreadable") return null;
-
-  const running = autonomyOf(rules);
-  if (running.length === 0) {
-    return (
-      <Panel title="On its own">
-        <Teach title="Nothing starts work here by itself">
-          <p>
-            No schedule and no repo trigger, so this project only ever does what somebody asks it to.
-            Both are written in <code>.ai/autopilot.yaml</code> under the project&rsquo;s folder — a
-            schedule runs on a clock, a repo trigger runs when a branch gets a commit — and the file
-            is edited in the project workspace, as text, so the comments in it survive.
-          </p>
-        </Teach>
-      </Panel>
-    );
-  }
-
-  return (
-    <Panel title="What starts work here without you" aside={<Count n={running.length} />}>
-      <div className="pj-table-scroller">
-        <table className="pj-table">
-          <caption className="sr-only">
-            Every rule that can start work in this project with nobody asking, what makes it go, and
-            when it last did.
-          </caption>
-          <thead>
-            <tr>
-              <th scope="col">Rule</th>
-              <th scope="col">What makes it go</th>
-              <th scope="col">State</th>
-              <th scope="col" className="pj-col-num">
-                Next
-              </th>
-              <th scope="col" className="pj-col-num">
-                Last
-              </th>
-              <th scope="col" className="pj-col-num">
-                Today
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {running.map((rule) => (
-              <RuleRows key={`${rule.clock}:${rule.name}`} rule={rule} />
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </Panel>
-  );
-}
-
-function RuleRows({ rule }: { rule: AutonomyRule }) {
-  return (
-    <>
-      <tr className={rule.problem === null ? undefined : "pj-row-problem"}>
-        <th scope="row" className="pj-row-name">
-          <span className="pj-row-title">
-            <span className="pj-row-kind" aria-hidden="true">
-              {CLOCK_MARK[rule.clock]}
-            </span>
-            {rule.name}
-            <span className="sr-only">, {CLOCK_SAID[rule.clock]}</span>
-          </span>
-          {/* Always drawn, whatever its length, and clamped to one line. A field
-              that appears on some rows and not others starts the next column at
-              two different heights — the defect the Teams cards had. */}
-          <span className="pj-row-asks">{rule.prompt}</span>
-          {rule.cwd !== null && <span className="pj-row-where">in {rule.cwd}</span>}
-        </th>
-        <td>
-          <Trigger rule={rule} />
-        </td>
-        <td>
-          <StateBadge domain="rule" state={rule.state} />
-        </td>
-        <td className="pj-col-num">
-          <Moment
-            at={rule.next}
-            absent={
-              rule.clock === "commit" || rule.state === "never-fires" ? "—" : "not scheduled"
-            }
-          />
-        </td>
-        <td className="pj-col-num">
-          <Moment at={rule.last} absent={rule.clock === "commit" ? "—" : "never"} />
-        </td>
-        <td className="pj-col-num">
-          <Today today={rule.today} />
-        </td>
-      </tr>
-      {/*
-        First-class and spanning, not a tooltip: an unparseable cron or an
-        unknown timezone makes the tick skip this rule 2,880 times a day and log
-        at debug, which is how a rule silently never runs.
-      */}
-      {rule.problem !== null && (
-        <tr>
-          <td className="pj-problem-cell" colSpan={6}>
-            <p className="pj-problem" role="alert">
-              {rule.problem}
-            </p>
-          </td>
-        </tr>
-      )}
-    </>
-  );
-}
-
-/**
- * What makes a rule go, drawn as what it is.
- *
- * A cron expression is a literal and gets a box; a branch is a name and does
- * not. They used to share one chip, so `0 3 * * *` and `main` — a schedule and
- * a git ref, which have nothing in common — wore identical clothes.
- */
-function Trigger({ rule }: { rule: AutonomyRule }) {
-  if (rule.clock === "commit") {
-    return (
-      <span className="pj-branch">
-        <span className="pj-branch-what">
-          a commit on <span className="pj-branch-name">{rule.when}</span>
-        </span>
-        {rule.sha !== null && (
-          <span className="pj-branch-seen">last saw {rule.sha.slice(0, 12)}</span>
-        )}
-      </span>
-    );
-  }
-  return (
-    <span className="pj-when">
-      <code className="pj-cron">{rule.when}</code>
-      {/* `null` is UTC — the scheduler's own default, not an unset field. */}
-      <span className="pj-meta">{rule.zone}</span>
-    </span>
-  );
-}
-
-/** A time, or the word that says why there is not one. */
-function Moment({ at, absent }: { at: string | null; absent: string }) {
-  if (at === null) return <span className="pj-figure pj-figure-none">{absent}</span>;
-  return (
-    <span className="pj-figure">
-      <RelativeTime at={at} />
-    </span>
-  );
-}
-
-/**
- * Today's allowance, and a mark when it is spent.
- *
- * `6 / 6` and `5 / 6` are one glyph apart and are not the same news — the same
- * reason the Teams table marks a ratio at its ceiling.
- */
-function Today({ today }: { today: AutonomyRule["today"] }) {
-  if (today === null) return <span className="pj-figure pj-figure-none">—</span>;
-  const full = today.cap > 0 && today.fired >= today.cap;
-  return (
-    <span className={full ? "pj-figure pj-figure-full" : "pj-figure"}>
-      {today.fired}
-      <span className="pj-figure-of"> / {today.cap}</span>
-      {full && <span className="sr-only"> — today&apos;s allowance is spent</span>}
-    </span>
-  );
-}
-
-/**
- * What measures this project's work, and when.
- *
- * **Out of `variant="dim"`.** `dim` means "present but not the thing you came
- * for", and this panel carries the most consequential sentence on the page: a
- * queue set to wait for a gate that does not exist refuses every merge, over a
- * key in a gitignored file. That state was drawn in muted body text — quieter
- * than the paragraph above it — while the panel's own comment called it the
- * worst of the three. It is an alert now, which is what the comment always said.
- */
-function GatePanel({ command, beforePublish }: { command: string | null; beforePublish: boolean }) {
-  const configured = command !== null && command.trim() !== "";
-  const contradiction = beforePublish && !configured;
-
-  return (
-    <Panel title="Gate">
-      {configured ? (
-        <code className="pj-gate">{command}</code>
-      ) : (
-        /* The one absence on this page with a reason worth keeping but not worth
-           reading twice. `Quiet` puts the fact on the line and the consequence one
-           click behind it — the sentence is kept rather than cut, because "no gate
-           is configured" alone reads as a field that failed to load rather than as
-           a project nobody has gated. */
-        <Quiet says="No gate is configured, so nothing measures this project’s work.">
-          <p>
-            That is why a job item can read <em>passed</em> with no gate status: there was nothing
-            to pass.
-          </p>
-        </Quiet>
-      )}
-      {/* The second moment the same command can run, and the one nothing else on this
-          page would reveal. A landing that takes twenty minutes has a reason, and the
-          reason is a key in a gitignored file — so this is where it stops being
-          invisible. */}
-      {contradiction ? (
-        <p className="pj-problem" role="alert">
-          gate_before_publish is on and no gate command is set, so the queue refuses every merge.
-        </p>
-      ) : (
-        <p className="pj-note">
-          {beforePublish
-            ? "Merges wait for it. The queue runs it on the merged result and publishes only if it passes; nothing is reverted, because nothing is published first."
-            : "Merges do not wait for it: the queue publishes without measuring the tree the two branches make together."}
-        </p>
-      )}
-    </Panel>
-  );
-}
-
-/**
- * Who answers for a conversation on `auto`.
- *
- * A project-level answer to a per-conversation question, and that is deliberate: the rung belongs
- * to the chat window, but WHO may say yes on your behalf belongs to the codebase being worked in.
- * A judge you trust on a scratch repository is not one you want on the thing that pays the rent.
- *
- * **Three states, and the middle one is the reason this is not a checkbox.** The default is the
- * local brain — every project has it without anybody deciding anything, and it should follow the
- * default wherever the default moves. Switched off is somebody having decided the opposite ON
- * PURPOSE, and it has to survive a change to what the default is. A two-state control would fuse
- * them and quietly re-enable a judge somebody had turned off.
- *
- * **One control and not a picker beside two buttons.** Every state this panel can reach is a
- * different answer to one question, so they belong on one list; two buttons plus a menu would let
- * somebody name a model and switch the judge off in the same gesture, and leave the panel to
- * decide which of the two they meant.
- *
- * The menu is the daemon's own — `GET /assistant/models`, the same read the chat window's picker
- * draws — narrowed to the two routes that can judge. `cloud` is absent because it answers through
- * the CLI, and a CLI launched to answer a hook would re-enter that hook; the daemon refuses it
- * either way, and this is the half that stops anybody having to find that out.
- *
- * **A model that declares no tool calling is not marked here, unlike in the chat picker.** A judge
- * is shown a request and a call and answers with one word; it is handed no tools and would have
- * nowhere to use them. `installed` is the mark that matters instead: a local model this machine has
- * not pulled cannot answer anything, so it is listed — seeing it is how somebody learns it can be
- * had — and not selectable.
- */
-function JudgePanel({ projectId, rules }: { projectId: string; rules: ProjectRules }) {
-  const name = useSetJudge();
-  const clear = useClearJudge();
-  const models = useAssistantModels();
-  const busy = name.isPending || clear.isPending;
-
-  const judge = rules.judge;
-  /* Narrowed by a predicate rather than a bare filter, so the route travels to `JudgeChange` as
-     the two words that type accepts. `Brain` has a third — the one this list exists to leave out. */
-  const judges = (models.data?.choices ?? []).filter(
-    (choice): choice is ModelChoice & { brain: "local" | "openrouter" } =>
-      choice.brain === "local" || choice.brain === "openrouter",
-  );
-
-  /* What the control is showing now. The two states that name no model are their own values; a
-     named judge is shown by its model. */
-  const current =
-    judge.state === "default"
-      ? "default"
-      : judge.state === "off"
-        ? "off"
-        : (judge.model ?? `${judge.brain}:configured`);
-
-  /* A state this menu cannot name gets a row of its own rather than being silently redrawn as
-     something else — a select whose value is absent from its options shows the FIRST option, which
-     here would be a panel claiming the default while the daemon holds a judge. Two ways to reach
-     one: a brain named with no model (the daemon takes it; this control never sends it), and a
-     model that was on the menu when it was chosen and is not on it now — Ollama stopped, a hosted
-     key withdrawn, a name removed from the file. */
-  const orphan =
-    judge.state === "named" && !judges.some((choice) => choice.id === current)
-      ? judge.model === null
-        ? `The ${judge.brain} brain, on its configured model`
-        : /* "Not on the menu" is a claim about the menu, so it waits for one. Until this query
-             answers — and if it never does, because the daemon went away — every model is missing
-             from an empty list, and saying so about a perfectly good one would be a lie the panel
-             tells for as long as the daemon is unreachable. */
-          models.data !== undefined
-          ? `${judge.model} — not on the menu now`
-          : judge.model
-      : null;
-
-  function move(value: string) {
-    if (value === "default") {
-      clear.mutate(projectId);
-      return;
-    }
-    if (value === "off") {
-      name.mutate({ projectId, brain: null, model: null });
-      return;
-    }
-    const choice = judges.find((row) => row.id === value);
-    /* The brain travels WITH the model, out of the row that named both. Sending the model alone
-       and letting the daemon infer would be a second place that mapping lives; sending a brain the
-       person picked separately is how the two come to disagree, which the daemon now refuses. */
-    if (choice) name.mutate({ projectId, brain: choice.brain, model: choice.id });
-  }
-
-  return (
-    <Panel title="Judge">
-      <p className="pj-note">
-        A conversation on <strong>Auto</strong> stops and asks about anything its rules do not
-        recognise. A judge is what answers those in your place — a model, given the command and
-        nothing else, inside the same window you would have had to answer in.
-      </p>
-
-      <p className="pj-wip-state">
-        {judge.state === "default" ? (
-          <>
-            The <strong>local</strong> brain answers, on whatever model it is configured with.
-            Nobody has chosen otherwise for this project.
-          </>
-        ) : judge.state === "off" ? (
-          <>
-            <strong>Nobody</strong> answers but you. Every question a conversation on Auto raises
-            here waits for a person.
-          </>
-        ) : (
-          <>
-            The <strong>{judge.brain}</strong> brain answers
-            {judge.model === null ? (
-              <>, on its configured model.</>
-            ) : (
-              <>
-                , on <code className="pj-gate">{judge.model}</code>.
-              </>
-            )}
-          </>
-        )}
-      </p>
-
-      <div className="pj-form">
-        <label className="pj-field-label" htmlFor="pj-judge">
-          Who answers
-        </label>
-        <select
-          id="pj-judge"
-          className="pj-field-input pj-field-select"
-          value={current}
-          disabled={busy}
-          onChange={(event) => move(event.target.value)}
-        >
-          {orphan !== null && <option value={current}>{orphan}</option>}
-          <option value="default">The default — the local brain, on its configured model</option>
-          <option value="off">Nobody but me</option>
-          {(["local", "openrouter"] as const).map((route) => {
-            const rows = judges.filter((choice) => choice.brain === route);
-            if (rows.length === 0) return null;
-            return (
-              <optgroup key={route} label={route === "local" ? "Local" : "OpenRouter"}>
-                {rows.map((choice) => (
-                  <option key={choice.id} value={choice.id} disabled={choice.installed === false}>
-                    {choice.label}
-                    {choice.installed === false ? " — not downloaded" : ""}
-                  </option>
-                ))}
-              </optgroup>
-            );
-          })}
-        </select>
-      </div>
-
-      {/* The daemon's own sentence, not one written here. It knows which model and which route,
-          and the two refusals somebody actually meets — a hosted model with no key stored, a local
-          one this machine cannot serve — are facts about this machine that no copy in the window
-          could keep current. */}
-      {name.isError &&
-        (isApiRefusal(name.error) ? (
-          <RefusalNote refusal={name.error} />
-        ) : (
-          <ErrorNote>the núcleo did not answer — the judge is unchanged</ErrorNote>
-        ))}
-      {clear.isError && !isApiRefusal(clear.error) && (
-        <ErrorNote>the núcleo did not answer — the judge is unchanged</ErrorNote>
-      )}
-    </Panel>
-  );
-}
-
-/* ------------------------------------------------------------- the one write -- */
-
-/**
- * The WIP ceiling — the only thing this page writes.
- *
- * `null` is the brake **off** and is never drawn as `0`: the daemon compares
- * `open >= limit`, so a ceiling of zero would mean *never start anything again*
- * while reading like a number somebody chose. The two are one keystroke apart in
- * a form and opposite in effect, so the form keeps them apart — a number field
- * for a ceiling, a separate control for turning the brake off.
- *
- * Plain buttons rather than the two-click interlock: a ceiling is a number that
- * can be typed again in five seconds, and `ConfirmButton` exists for what cannot
- * be undone. Spending the interlock here would spend it everywhere.
- *
- * The reading above the form is a `Meter` and no longer a sentence. It is a
- * count against a ceiling with a state of full, which is the exact thing that
- * primitive draws — including the one distinction this panel exists to defend:
- * `ceiling: null` is a dashed rail reading "no ceiling", which cannot be
- * mistaken for either an empty bar or a full one.
- */
-function WipPanel({ projectId, rules }: { projectId: string; rules: ProjectRules }) {
-  const setLimit = useSetWipLimit();
-  const [draft, setDraft] = useState(rules.wip_limit === null ? "" : String(rules.wip_limit));
-  const parsed = Number.parseInt(draft.trim(), 10);
-  const valid = Number.isSafeInteger(parsed) && parsed >= 0;
-
-  return (
-    <Panel title="Work-in-progress ceiling">
-      <p className="pj-note">
-        How much unreviewed work this project may be holding before it stops starting more. The brake
-        is self-clearing — it releases the moment you review something — so this is the answer to
-        &ldquo;how much unanswered work am I willing to have open&rdquo;, not a quota.
-      </p>
-
-      {/* Open work occupies the ceiling; a full queue asks the reader to review it. */}
-      <Meter
-        label="open and unreviewed"
-        value={rules.open_review_items}
-        ceiling={rules.wip_limit}
-        tone={rules.queue_full ? "pending" : "active"}
-      />
-
-      <p className="pj-wip-state">
-        {rules.wip_limit === null ? (
-          <>
-            The brake is <strong>off</strong>: no ceiling at all, which is not the same as a ceiling
-            of zero.
-          </>
-        ) : rules.queue_full ? (
-          <>It is currently holding new autonomous work back.</>
-        ) : (
-          <>Nothing is being held back by it.</>
-        )}
-      </p>
-
-      <div className="pj-form">
-        <label className="pj-field-label" htmlFor="pj-wip">
-          Ceiling
-        </label>
-        <input
-          id="pj-wip"
-          className="pj-field-input pj-field-number"
-          type="number"
-          min={0}
-          step={1}
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-        />
-        <div className="pj-actions">
-          <Button
-            variant="approve"
-            disabled={!valid || setLimit.isPending}
-            onClick={() => setLimit.mutate({ projectId, limit: parsed })}
-          >
-            Set the ceiling
-          </Button>
-          <Button
-            variant="ghost"
-            disabled={rules.wip_limit === null || setLimit.isPending}
-            onClick={() => {
-              setDraft("");
-              setLimit.mutate({ projectId, limit: null });
-            }}
-          >
-            Remove the ceiling
-          </Button>
-        </div>
-      </div>
-
-      {draft.trim() !== "" && !valid && (
-        <p className="pj-note">
-          A ceiling is a whole number, zero or more. The núcleo refuses a negative one outright — it
-          would read like a number somebody chose and mean &ldquo;never start anything again&rdquo;.
-        </p>
-      )}
-      {setLimit.isError && <WipError error={setLimit.error} />}
-    </Panel>
-  );
-}
-
-function WipError({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — the ceiling is unchanged</ErrorNote>;
-  }
-  return (
-    <RefusalNote
-      refusal={error}
-      sentences={{
-        not_found: "the núcleo has no row for this project, so there is no ceiling to set on it",
-        bad_request: "a ceiling cannot be negative",
-      }}
-    />
   );
 }
