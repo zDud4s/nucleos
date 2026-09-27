@@ -236,7 +236,19 @@ pub const LIVE_LIST_LIMIT: i64 = 200;
 /// same reason the worktree sweep does: before those, a dead owner's row still reads live, and this
 /// pass would leave its slot held forever.
 pub async fn reconcile_orphaned_slots(pool: &SqlitePool) -> sqlx::Result<u64> {
-    let swept = sqlx::query(ORPHANED_SLOTS_SQL).execute(pool).await?;
+    reconcile_orphaned_slots_at(pool, chrono::Utc::now()).await
+}
+
+/// [`reconcile_orphaned_slots`] at a given instant — the one clock the wave arm reads, taken as an
+/// argument so a lease can be tested at its edge rather than by sleeping past it.
+pub async fn reconcile_orphaned_slots_at(
+    pool: &SqlitePool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<u64> {
+    let swept = sqlx::query(ORPHANED_SLOTS_SQL)
+        .bind(crate::wave::cutoff(now))
+        .execute(pool)
+        .await?;
     Ok(swept.rows_affected())
 }
 
@@ -247,8 +259,8 @@ pub async fn reconcile_orphaned_slots(pool: &SqlitePool) -> sqlx::Result<u64> {
 ///
 /// An owner kind this does not know is left alone on purpose. Deleting it would free a slot that
 /// something may still be working in, and over-concurrency is the one failure this table exists to
-/// prevent; a leaked slot is visible in `project_slots` and costs a lower ceiling. Adding a third
-/// owner kind means teaching this pass, and `Owner` being an enum is what makes that a compile-time
+/// prevent; a leaked slot is visible in `project_slots` and costs a lower ceiling. Adding an owner
+/// kind means teaching this pass, and `Owner` being an enum is what makes that a compile-time
 /// conversation rather than a silent one.
 ///
 /// **The item arm takes TWO conditions, and the pair is the whole of it.** An item's own status is
@@ -256,6 +268,11 @@ pub async fn reconcile_orphaned_slots(pool: &SqlitePool) -> sqlx::Result<u64> {
 /// parallelism would be worth nothing — and its job's status is what frees it in the end. Neither
 /// alone is enough: item liveness alone would hold a slot forever for an item that ran out of gate
 /// retries, and job liveness alone would hold every item's slot until the last one landed.
+///
+/// **The wave arm judges a lease, not a status.** A wave's controller is a session the daemon has
+/// no row of liveness for, so a worker's slot lives while its wave is unreleased and renewed within
+/// `wave::LEASE_SECONDS` — the one `?` in this text, bound by `reconcile_orphaned_slots_at` from a
+/// cutoff computed in Rust, because SQLite's own `datetime('now')` does not sort against RFC 3339.
 ///
 /// `gate_failed` is spared deliberately, and it is the one status here that may be either thing. A
 /// red gate with a retry left is an item that WILL run again, and telling that from an item that is
@@ -280,14 +297,20 @@ const ORPHANED_SLOTS_SQL: &str = "DELETE FROM project_slots
                               AND job_items.status IN ('pending','running','implemented','merging',
                                                        'conflicted','reverted','gate_failed')
                               AND jobs.status IN ('planning','implementing','gating','reviewing',
-                                                  'awaiting_approval','waiting')))";
+                                                  'awaiting_approval','waiting')))
+        OR (owner_kind = 'wave'
+            AND NOT EXISTS (SELECT 1 FROM wave_workers
+                            JOIN waves ON waves.id = wave_workers.wave_id
+                            WHERE wave_workers.id = project_slots.owner_id
+                              AND waves.released_at IS NULL
+                              AND waves.renewed_at >= ?))";
 
 /// One taken slot, with its owner.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct HeldSlot {
     pub project_id: String,
     pub slot: i64,
-    /// `'run'`, `'job'` or `'item'`. A `String` and not `Owner`, because this leaves over JSON and
+    /// `'run'`, `'job'`, `'item'` or `'wave'`. A `String` and not `Owner`, because this leaves over JSON and
     /// the consumer is an interface that only wants to know which tab to link to.
     pub owner_kind: String,
     pub owner_id: i64,
@@ -833,7 +856,8 @@ mod tests {
             LIVE_RUN_STATUSES.len()
                 + crate::job::LIVE_STATUSES.len() * 2
                 + crate::job::LIVE_ITEM_STATUSES.len()
-                + 3,
+                // The four owner kinds: 'run', 'job', 'item' and 'wave'.
+                + 4,
             "the sweep spares a status nothing drives, or names an owner kind it cannot judge"
         );
     }
@@ -978,5 +1002,108 @@ mod tests {
 
         assert_eq!(readout.house.limit, UNREADABLE_CEILING);
         assert_eq!(readout.projects[0].limit, UNREADABLE_CEILING);
+    }
+
+    /// A wave owns slots and never a daemon worktree: its units are checked out by the controller,
+    /// by git directly (perfil-de-velocidade spec §4.2), and the `worktrees` CHECK refusing `'wave'`
+    /// is that rule held by the schema rather than by every caller's memory.
+    ///
+    /// The same row goes in first as an item, so a refusal for some other reason — a column this
+    /// test forgot — cannot pass for the one being asserted.
+    #[tokio::test]
+    async fn a_wave_owns_slots_and_never_a_daemon_worktree() {
+        let pool = test_pool().await;
+        assert_eq!(Owner::Wave(7).kind(), "wave");
+
+        let insert = |kind: &'static str| {
+            sqlx::query(
+                "INSERT INTO worktrees
+                     (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+                 VALUES (?, 7, 'project-a', 'C:/somewhere', 'C:/somewhere/x-7', 'nucleos/x-7',
+                         '2026-09-24T00:00:00Z')",
+            )
+            .bind(kind)
+        };
+        insert("item")
+            .execute(&pool)
+            .await
+            .expect("the row is well formed");
+        assert!(
+            insert("wave").execute(&pool).await.is_err(),
+            "the worktrees CHECK must refuse a wave"
+        );
+    }
+
+    /// A wave's worker, written by hand: the lease row, then the worker that holds the slot.
+    async fn seed_wave_worker(
+        pool: &SqlitePool,
+        renewed_at: chrono::DateTime<chrono::Utc>,
+        released: bool,
+    ) -> i64 {
+        let at = crate::wave::stamp(renewed_at);
+        let wave_id =
+            sqlx::query("INSERT INTO waves (created_at, renewed_at, released_at) VALUES (?, ?, ?)")
+                .bind(&at)
+                .bind(&at)
+                .bind(released.then(|| at.clone()))
+                .execute(pool)
+                .await
+                .unwrap()
+                .last_insert_rowid();
+        sqlx::query("INSERT INTO wave_workers (wave_id) VALUES (?)")
+            .bind(wave_id)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid()
+    }
+
+    /// A wave's slot lives exactly as long as its lease, and not a sweep longer.
+    ///
+    /// This is the orphan collection of spec §4.6. A controller is a session the daemon cannot sweep
+    /// by id, so without this arm a controller that died mid-wave would hold its slots forever —
+    /// "worse than not having asked for a slot at all", in the spec's words — and a slot held that
+    /// way is silent: it lowers a project's ceiling with no error anywhere.
+    #[tokio::test]
+    async fn a_waves_slot_lives_as_long_as_its_lease() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let seconds = chrono::Duration::seconds;
+        let lease = crate::wave::LEASE_SECONDS;
+
+        // (renewed this long ago, released, survives the sweep)
+        let cases = [
+            (seconds(0), false, true),
+            (seconds(lease), false, true),
+            (seconds(lease + 1), false, false),
+            (seconds(0), true, false),
+        ];
+        for (ago, released, survives) in cases {
+            let pool = test_pool().await;
+            set_limits(&pool, 5, 9).await;
+            let worker = seed_wave_worker(&pool, now - ago, released).await;
+            claim(&pool, "project-a", Owner::Wave(worker))
+                .await
+                .unwrap();
+
+            reconcile_orphaned_slots_at(&pool, now).await.unwrap();
+
+            assert_eq!(
+                slot_of(&pool, Owner::Wave(worker)).await.unwrap().is_some(),
+                survives,
+                "renewed {ago} ago, released: {released}"
+            );
+        }
+    }
+
+    /// A worker the daemon has no row for is swept, like a run that no longer exists: nothing can
+    /// renew a lease that is not there.
+    #[tokio::test]
+    async fn a_wave_slot_with_no_worker_row_is_swept() {
+        let pool = test_pool().await;
+        claim(&pool, "project-a", Owner::Wave(9_999)).await.unwrap();
+
+        assert_eq!(reconcile_orphaned_slots(&pool).await.unwrap(), 1);
     }
 }

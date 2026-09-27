@@ -38,9 +38,10 @@ export interface HeldSlot {
   /**
    * A worktree run holds a slot too — counting jobs alone would over-report the
    * room left — and so does one item of a job a team directs, which gets a
-   * checkout of its own and pays for it under the same house rule.
+   * checkout of its own and pays for it under the same house rule. And so does
+   * each worker of a controller's wave, whose `owner_id` is `wave_workers.id`.
    */
-  owner_kind: "run" | "job" | "item";
+  owner_kind: "run" | "job" | "item" | "wave";
   owner_id: number;
   claimed_at: string;
   /**
@@ -291,9 +292,16 @@ export interface SlotOwner {
  * destructive gesture aimed by a number that means something else, which is the
  * defect `ownerKey` exists to prevent, arriving through the door nobody was
  * watching.
+ *
+ * Nor for a wave. Its workers are a controller's processes, which the daemon
+ * cannot stop, and `owner_id` is a `wave_workers.id` — the same wrong-number
+ * gesture. A whitelist and not an exclusion, so the next kind of owner is not
+ * cancellable until somebody gives it a route.
  */
 export function cancellableOwner(slot: HeldSlot): SlotOwner | null {
-  return slot.owner_kind === "item" ? null : { kind: slot.owner_kind, id: slot.owner_id };
+  return slot.owner_kind === "run" || slot.owner_kind === "job"
+    ? { kind: slot.owner_kind, id: slot.owner_id }
+    : null;
 }
 
 /**

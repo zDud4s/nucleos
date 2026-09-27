@@ -108,6 +108,7 @@ mod triage;
 mod trust;
 mod vcs;
 mod voice;
+mod wave;
 mod web;
 mod web_client;
 mod webhook;

@@ -105,6 +105,9 @@ export function slotDetail(
     if (found !== undefined) return { kind: "item", job: found, ordinal, status };
     return jobs.length >= limit ? { kind: "unknown" } : { kind: "orphaned" };
   }
+  // A wave's worker is a controller's process and `owner_id` is `wave_workers.id`:
+  // among the runs it would take the description of whichever shares its number.
+  if (slot.owner_kind === "wave") return { kind: "unknown" };
   if (runs === undefined) return { kind: "unknown" };
   const found = runs.find((run) => run.id === slot.owner_id);
   if (found !== undefined) return { kind: "run", run: found };
