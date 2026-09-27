@@ -264,11 +264,17 @@ describe("adding a project", () => {
   /**
    * The stop refuses the workflow and nothing else of the four, so it is said before the first
    * write — not found out after the project row already exists — and the way round it is offered.
+   *
+   * Onboarding, inside the register step, is refused too — it now consults the same switch, like
+   * every other governance write — but that refusal is caught rather than fatal: the project still
+   * registers, and the page says onboarding is waiting rather than sending the person to their
+   * new project's page as if nothing had been skipped.
    */
   it("warns about an engaged kill switch before anything is written, and can leave the workflow out", async () => {
     const { state } = await openWizard({
       kill: { engaged: true },
       detected: detected({ harnesses: [{ path: ".ai", what: "a pipeline", files: 3 }] }),
+      onboardRefusal: { status: 423, code: "kill_switch", detail: "the stop is engaged" },
     });
     await look();
 
@@ -282,6 +288,14 @@ describe("adding a project", () => {
 
     await waitFor(() => expect(state.projects.length).toBe(1));
     expect(state.adopted).toEqual([]);
+    // Onboarding was skipped, not landed — the marker was never written.
+    expect(state.onboarded).toEqual([]);
+    expect(
+      await screen.findByText(/onboarding.*is waiting until it is released/),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("link", { name: "Go to thing" }).getAttribute("href"),
+    ).toBe("/projects/thing/state");
   });
 
   /**

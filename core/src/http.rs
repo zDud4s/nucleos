@@ -6721,19 +6721,33 @@ fn refusal_with_detail(
 /// refuse to allow; here it is allowed because a project being brought in has no folder on record
 /// yet, and naming one is what `GET /projects/detect` already lets this same key do.
 ///
-/// **No kill-switch check, unlike `POST /write`.** Onboarding starts nothing, and it is the
-/// prerequisite of registering a project, which the stop has never refused; the wizard adds
-/// projects while the stop is engaged, and this must not be what makes it fail.
+/// **Kill-switch checked first, like `POST /write` and `POST /config/machine`.** Onboarding writes
+/// `gate_command` into the project's `autopilot.yaml` and installs an executable classifier hook —
+/// the same shape of governance write those two routes already refuse the stop for — so a stop
+/// engaged here must refuse before either lands. The shell's new-project wizard used to lean on
+/// this route succeeding while the stop was engaged, because registering a project runs onboarding
+/// as its first step; it now catches this refusal there, registers the project anyway, and leaves
+/// onboarding for the project's own Settings once the stop is released (see `NewProject.tsx`).
 ///
-/// Refusals, all `{refusal, detail?}`: the root's (`no_project_root`, `not_absolute`,
-/// `no_such_folder`, `not_a_folder`), the state directory's (`no_machine_root`, `bad_project_id`),
-/// then `invalid_gate` and `rules_unreadable` (422, with the reason) before anything is written,
-/// and `hook_unwritable` (409, with the reason) for a `.claude/settings.json` this cannot parse.
+/// Refusals, all `{refusal, detail?}`: `kill_switch` (423) first, then the root's
+/// (`no_project_root`, `not_absolute`, `no_such_folder`, `not_a_folder`), the state directory's
+/// (`no_machine_root`, `bad_project_id`), then `invalid_gate` and `rules_unreadable` (422, with the
+/// reason) before anything is written, and `hook_unwritable` (409, with the reason) for a
+/// `.claude/settings.json` this cannot parse.
 async fn post_project_onboard(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<OnboardRequest>,
 ) -> Result<Json<OnboardingView>, (StatusCode, Json<serde_json::Value>)> {
+    // Unreadable reads as engaged, the rule `assistant.rs` already pins: a stop nobody can ask
+    // about is not a stop anybody may assume is off.
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
     project_state_dir(&state, &id)?;
     let machine_root = machine_config_root(&state)?;
     let root = onboarding_root(&state, &id, body.project_root).await?;
@@ -17606,6 +17620,54 @@ mod tests {
         assert!(
             !folder.path().join(".claude").exists(),
             "no hook was installed"
+        );
+    }
+
+    /// The stop refuses onboarding before either of its two writes, the same way it refuses
+    /// `POST /write` and `POST /config/machine`: 423, `kill_switch`, and nothing written.
+    #[tokio::test]
+    async fn the_kill_switch_stops_onboarding() {
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().to_string_lossy().into_owned();
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/kill",
+            Some(serde_json::json!({ "engaged": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/onboard",
+            Some(serde_json::json!({ "project_root": root, "gate_command": "npm run test" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
+
+        assert!(
+            crate::project_state::file(Some(home.path()), "alpha", crate::onboarding::MARKER_FILE)
+                .is_none_or(|path| !path.exists()),
+            "no marker for a project the stop never let onboarding reach"
+        );
+        assert!(
+            crate::project_state::file(
+                Some(home.path()),
+                "alpha",
+                crate::project_state::AUTOPILOT_FILE
+            )
+            .is_none_or(|path| !path.exists()),
+            "no gate command for a project the stop never let onboarding reach"
+        );
+        assert!(
+            !folder.path().join(".claude").exists(),
+            "no classifier hook installed either"
         );
     }
 
