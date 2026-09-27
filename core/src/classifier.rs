@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 14;
+pub const CLASSIFIER_VERSION: u32 = 15;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -1865,6 +1865,14 @@ const HOME_SPELLINGS: &[&str] = &["~/", "$home/", "${home}/", "%userprofile%/", 
 /// copies `<working directory>/.ai/<file>` into `~/.nucleos/` for any file the latter lacks, so a
 /// run that could write `.ai/github.yaml` in the daemon's own checkout would, on a machine that
 /// never had one, be writing the owner's GitHub policy one restart later.
+///
+/// **Each project's own state, by name, however it is rooted.** `autopilot.yaml` (the gate
+/// command, and so what *green* means) and `workflows.yaml` live in `~/.nucleos/projects/<id>/`
+/// (`project_state.rs`). The home spelling is covered by the first answer above; the absolute one
+/// is matched here as `.nucleos/projects/<any id>/<file>`, which a job worktree
+/// (`.nucleos/worktrees/...`) never is. The old `.ai/workflows.yaml` is guarded for the reason the
+/// old settings files are: startup copies it into a project's state directory when that has none.
+/// (`.ai/autopilot.yaml` was always in [`SELF_GOVERNING_FILES`].)
 fn names_machine_settings(raw: &str) -> bool {
     let folded = fold_for_match(&raw.replace('\\', "/"));
     let under_home_settings = HOME_SPELLINGS.iter().any(|home| {
@@ -1878,6 +1886,25 @@ fn names_machine_settings(raw: &str) -> bool {
             path_has_suffix(&normalized, &format!(".nucleos/{}", setting.path))
                 || path_has_suffix(&normalized, &format!(".ai/{}", setting.path))
         })
+        || names_project_state(&normalized)
+}
+
+/// PURE: whether an already-normalised, case-folded path is one project's state file — under
+/// `.nucleos/projects/<id>/` — or the old `.ai/workflows.yaml` it is migrated from. See
+/// [`names_machine_settings`].
+fn names_project_state(normalized: &str) -> bool {
+    let parts: Vec<&str> = normalized.split('/').collect();
+    let in_state_dir = crate::project_state::FILES.iter().any(|file| {
+        matches!(
+            parts.as_slice(),
+            [.., ".nucleos", "projects", id, name] if !id.is_empty() && name == file
+        )
+    });
+    in_state_dir
+        || path_has_suffix(
+            normalized,
+            &format!(".ai/{}", crate::project_state::PINS_FILE),
+        )
 }
 
 /// PURE: whether any word of one shell command names this machine's settings. See
@@ -4735,7 +4762,11 @@ mod tests {
     /// write through. 14 followed this machine's settings to `~/.nucleos/`: a write to any of the
     /// nine files there or in their old `.ai/`, or to anything under a home-spelled `.nucleos/`,
     /// is a `self-governing-file`, and no project `allow` or workspace confinement widens a shell
-    /// command that names one — a tightening only.
+    /// command that names one — a tightening only. 15 followed each project's own state there too:
+    /// `autopilot.yaml` and `workflows.yaml` under any `.nucleos/projects/<id>/`, however that
+    /// directory is rooted, and the old `.ai/workflows.yaml` a startup migration still copies from,
+    /// are `self-governing-file` — a tightening only. (A home-spelled path was already refused by
+    /// 14; what 15 adds is the absolute spelling and the legacy pins file.)
     /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
@@ -4750,7 +4781,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 14);
+        assert_eq!(CLASSIFIER_VERSION, 15);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
@@ -4836,6 +4867,59 @@ mod tests {
     /// is matched against a path glued onto the workspace, so before `names_machine_settings` they
     /// landed "inside" it and were allowed. The absolute form is refused one step earlier, as a
     /// write outside the workspace, and with no workspace at all it still asks.
+    /// A project's rules and pins moved to `~/.nucleos/projects/<id>/`, and an agent may no more
+    /// write them there than it could in the project's `.ai/`. Home-spelled, absolute, and in the
+    /// shell — plus the old `.ai/workflows.yaml`, which startup still migrates from.
+    #[test]
+    fn writing_a_projects_state_in_its_new_home_asks_for_approval() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for tool in ["Edit", "Write"] {
+            for path in [
+                "~/.nucleos/projects/alpha/autopilot.yaml",
+                r"~\.nucleos\projects\alpha\workflows.yaml",
+                "$HOME/.nucleos/projects/my project/autopilot.yaml",
+                ".ai/workflows.yaml",
+                ".ai/autopilot.yaml",
+            ] {
+                assert_classification(
+                    classify(tool, &json!({ "file_path": path }), cwd),
+                    "pending_approval",
+                    "self-governing-file",
+                );
+            }
+            // Absolute: outside the workspace is refused outright, and with no workspace at all it
+            // is still the owner's file by name rather than an ordinary `no-workspace` write.
+            let absolute = r"C:\Users\someone\.nucleos\projects\alpha\autopilot.yaml";
+            assert_eq!(
+                classify(tool, &json!({ "file_path": absolute }), cwd)
+                    .decision
+                    .decision,
+                "deny",
+                "{tool}"
+            );
+            assert_classification(
+                classify(tool, &json!({ "file_path": absolute }), None),
+                "pending_approval",
+                "self-governing-file",
+            );
+        }
+        for command in [
+            "echo 'gate_command: true' > ~/.nucleos/projects/alpha/autopilot.yaml",
+            "cp evil.yaml C:/Users/someone/.nucleos/projects/alpha/autopilot.yaml",
+            "cp evil.yaml .ai/workflows.yaml",
+        ] {
+            let asked = classify("Bash", &json!({ "command": command }), cwd);
+            assert_eq!(asked.decision.decision, "pending_approval", "{command}");
+        }
+        // A file of the same name that is not in a project's state directory stays ordinary.
+        assert_eq!(
+            classify("Write", &json!({ "file_path": "docs/autopilot.yaml" }), cwd)
+                .decision
+                .decision,
+            "allow"
+        );
+    }
+
     #[test]
     fn writing_this_machines_settings_in_home_asks_for_approval() {
         let cwd = Some(Path::new(r"C:\work\repo"));

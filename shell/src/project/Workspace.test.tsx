@@ -670,7 +670,7 @@ describe("what the app may author", () => {
     nothing.unmount();
 
     await openState(ownedState());
-    expect(await screen.findByText(".ai/autopilot.yaml")).toBeTruthy();
+    expect(await screen.findByText("~/.nucleos/projects/alpha/autopilot.yaml")).toBeTruthy();
     expect(screen.getByRole("button", { name: "edit" })).toBeTruthy();
   });
 
@@ -683,13 +683,13 @@ describe("what the app may author", () => {
     await openState(state);
 
     fireEvent.click(await screen.findByRole("button", { name: "edit" }));
-    const box = await screen.findByLabelText(".ai/autopilot.yaml");
+    const box = await screen.findByLabelText("~/.nucleos/projects/alpha/autopilot.yaml");
     fireEvent.change(box, { target: { value: "gate_command: cargo clippy\n" } });
     fireEvent.click(screen.getByRole("button", { name: "save" }));
 
     await waitFor(() => expect(state.writes.length).toBe(1));
     expect(state.writes[0]).toEqual({
-      path: ".ai/autopilot.yaml",
+      path: "autopilot.yaml",
       contents: "gate_command: cargo clippy\n",
     });
   });
@@ -714,7 +714,7 @@ describe("what the app may author", () => {
     await openState(state);
 
     fireEvent.click(await screen.findByRole("button", { name: "edit" }));
-    const box = await screen.findByLabelText(".ai/autopilot.yaml");
+    const box = await screen.findByLabelText("~/.nucleos/projects/alpha/autopilot.yaml");
     fireEvent.change(box, { target: { value: "gate_commmand: cargo test\n" } });
     fireEvent.click(screen.getByRole("button", { name: "save" }));
 
@@ -733,7 +733,7 @@ describe("what the app may author", () => {
     await openState(state);
 
     fireEvent.click(await screen.findByRole("button", { name: "edit" }));
-    fireEvent.change(await screen.findByLabelText(".ai/autopilot.yaml"), {
+    fireEvent.change(await screen.findByLabelText("~/.nucleos/projects/alpha/autopilot.yaml"), {
       target: { value: "gate_command: x\n" },
     });
     fireEvent.click(screen.getByRole("button", { name: "save" }));
@@ -751,7 +751,7 @@ describe("what the app may author", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "edit" }));
     expect(await screen.findByText(/no such file yet/)).toBeTruthy();
-    expect((await screen.findByLabelText(".ai/autopilot.yaml") as HTMLTextAreaElement).value).toBe("");
+    expect((await screen.findByLabelText("~/.nucleos/projects/alpha/autopilot.yaml") as HTMLTextAreaElement).value).toBe("");
   });
 });
 

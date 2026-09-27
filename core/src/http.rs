@@ -221,6 +221,7 @@ pub fn build_router(state: AppState) -> Router {
         // unintelligible without the first: `POST /write` refuses everything the table does not
         // name, so a client that cannot read the table can only discover the fence by hitting it.
         .route("/projects/{id}/ownership", get(get_project_ownership))
+        .route("/projects/{id}/owned", get(get_project_owned))
         .route("/projects/{id}/write", post(post_project_write))
         // What this project can be asked to do to itself. The literal `commands` ahead of nothing
         // ambiguous; the run route is a third segment under a command's own id, because running one
@@ -638,7 +639,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/errands/{id}/notebook", get(read_errand_notebook))
         // What makes an errand STANDING work rather than a topic somebody has to keep typing into.
-        // A project keeps its schedule in `.ai/autopilot.yaml` inside its repository; an errand has
+        // A project keeps its schedule in `~/.nucleos/projects/<id>/autopilot.yaml`; an errand has
         // no repository, so the rules live in the database and this is the only door to them.
         //
         // The rule id is scoped under the errand id on purpose. Both come out of the path, so
@@ -3445,8 +3446,15 @@ struct RepoTriggerView {
 struct ProjectRules {
     project_id: String,
     project_root: Option<String>,
-    /// `present`, `absent`, or `unreadable` — the three states `.ai/autopilot.yaml` can be in.
+    /// `present`, `absent`, or `unreadable` — the three states the project's `autopilot.yaml` can
+    /// be in.
     rules_file: &'static str,
+    /// Where that file is, as a person is shown it: `~/.nucleos/projects/<id>/autopilot.yaml`.
+    ///
+    /// Served rather than spelled by the page, because the page used to carry `.ai/autopilot.yaml`
+    /// as a literal and was wrong the day the file moved. The daemon is the one that knows where it
+    /// reads from.
+    rules_path: String,
     /// Why the file could not be read, when it could not be.
     ///
     /// `config.rs` uses `deny_unknown_fields` precisely so a typo is an error rather than a silently
@@ -3478,7 +3486,7 @@ struct ProjectRules {
 
 /// What a project does on its own.
 ///
-/// The rules live in `.ai/autopilot.yaml` under the project root and were readable only by opening
+/// The rules live in `~/.nucleos/projects/<id>/autopilot.yaml` and were readable only by opening
 /// the file; the WIP ceiling lives in the database and was readable only through the roster's
 /// summary. Both decide whether autonomous work happens at all, so they answer one question and are
 /// served together.
@@ -3494,18 +3502,20 @@ async fn get_project_rules(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .flatten();
 
-    let (rules_file, rules_error, loaded) = match project_root.as_deref() {
-        // A project with no root has no file to read, which is not a failure — it is what an `off`
-        // project looks like, and reporting it as unreadable would name a fault where there is none.
-        None => ("absent", None, crate::config::AutopilotRules::default()),
-        Some(root) => match crate::config::load_schedule_rules(std::path::Path::new(root)) {
+    // Read whether or not the project has a root. The file is keyed by the project's id, so an
+    // `off` project — which has no root on record — can still have rules waiting for the day it is
+    // switched back on, and saying `absent` about a file that is there would be the wrong fact.
+    let machine_root = state.machine_config_root.clone();
+    let rules_id = id.clone();
+    let (rules_file, rules_error, loaded) = tokio::task::spawn_blocking(move || {
+        match crate::config::load_schedule_rules(machine_root.as_deref(), &rules_id) {
             Ok(rules) => {
-                let path = std::path::Path::new(root)
-                    .join(".ai")
-                    .join("autopilot.yaml");
-                let present = tokio::task::spawn_blocking(move || path.exists())
-                    .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let present = crate::project_state::file(
+                    machine_root.as_deref(),
+                    &rules_id,
+                    crate::project_state::AUTOPILOT_FILE,
+                )
+                .is_some_and(|path| path.exists());
                 (if present { "present" } else { "absent" }, None, rules)
             }
             Err(error) => (
@@ -3513,8 +3523,11 @@ async fn get_project_rules(
                 Some(error.to_string()),
                 crate::config::AutopilotRules::default(),
             ),
-        },
-    };
+        }
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rules_path = crate::project_state::display_path(&id, crate::project_state::AUTOPILOT_FILE);
 
     let state_rows: Vec<RuleRunState> = sqlx::query_as(
         "SELECT rule_name, last_fired_at, last_head_sha, fires_date, fires_today
@@ -3602,6 +3615,7 @@ async fn get_project_rules(
         project_id: id,
         project_root,
         rules_file,
+        rules_path,
         rules_error,
         gate_command: loaded.gate_command.clone(),
         gate_before_publish: loaded.gate_before_publish,
@@ -6238,7 +6252,13 @@ async fn get_project_worktree(
 /// tomorrow there is a workflow called `core`.
 #[derive(serde::Serialize)]
 struct ClaimView {
+    /// The row's identity: what `POST /write` and `GET /owned` are sent back. Relative to `home`.
     path: String,
+    /// `state` for a file in `~/.nucleos/projects/<id>/`, `project` for one in the project's folder.
+    home: &'static str,
+    /// What a person is shown — `~/.nucleos/projects/<id>/autopilot.yaml` for a state file. Served
+    /// rather than composed by the page, so the page never carries a location of its own.
+    display: String,
     owner: String,
     what: String,
     writable: bool,
@@ -6259,18 +6279,106 @@ async fn get_project_ownership(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<ClaimView>>, StatusCode> {
     let root = resolve_project_root(&state, &id).await?;
-    let claims = claims_for_project(root, state.workflow_library.clone()).await?;
+    let claims = claims_for_project(&state, &id, root).await?;
     Ok(Json(
         claims
             .into_iter()
             .map(|claim| ClaimView {
                 writable: claim.validate.is_some(),
+                home: match claim.home {
+                    crate::ownership::Home::State => "state",
+                    crate::ownership::Home::Project => "project",
+                },
+                display: claim.display(&id),
                 path: claim.path.into_owned(),
                 owner: claim.owner.into_owned(),
                 what: claim.what.into_owned(),
             })
             .collect(),
     ))
+}
+
+/// This project's state directory, `~/.nucleos/projects/<id>/`, or the refusal saying why there is
+/// none.
+///
+/// Two refusals, and they are different facts: `no_machine_root` is this machine having no home
+/// directory — the same name `/config/machine` refuses with — and `bad_project_id` is an id that
+/// cannot name a directory without meaning another one (`project_state::valid_id`).
+fn project_state_dir(
+    state: &AppState,
+    id: &str,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    let root = machine_config_root(state)?;
+    crate::project_state::dir(&root, id)
+        .ok_or_else(|| refusal(StatusCode::UNPROCESSABLE_ENTITY, "bad_project_id"))
+}
+
+/// Where a claimed file actually is, for the read route and the write route alike.
+///
+/// A state row is joined onto the state directory, a project row onto the project root — and in
+/// both cases it is the REGISTRY's string that is joined, never the caller's, for the reason
+/// `post_project_write` gives.
+fn claim_home(
+    state: &AppState,
+    id: &str,
+    root: &std::path::Path,
+    claim: &crate::ownership::Claim,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    match claim.home {
+        crate::ownership::Home::State => project_state_dir(state, id),
+        crate::ownership::Home::Project => Ok(root.to_path_buf()),
+    }
+}
+
+/// The text of one file this app declares itself the author of, from wherever the registry says it
+/// lives.
+///
+/// **Its own route because `cat` cannot serve it any more.** `cat` reads inside the project's
+/// folder, and the núcleo's own two files moved out of it, to `~/.nucleos/projects/<id>/`. The page
+/// asks for a claim by its identity and this answers from the claim's home — so neither the page nor
+/// the caller ever names a directory.
+///
+/// 404 with `absent` for a claimed file that does not exist yet: that is the ordinary state of a
+/// project nobody has given rules, and the editor offers to create it. 403 `not_ours` for anything
+/// the table does not name, exactly as the write route refuses it.
+///
+/// In no table in `auth.rs`, and so Admin's by default-deny: the rules file carries `gate_command`
+/// and `GET /projects/{id}/rules`, which serves the same facts, has always been Admin's. When the
+/// file lived in the project a read-only key could `cat` it; the move is where that stops, and it is
+/// the right place for it to stop.
+async fn get_project_owned(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ReadQuery>,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+    let claims = claims_for_project(&state, &id, root.clone())
+        .await
+        .map_err(|status| refusal(status, "internal"))?;
+    let rel = query.path.unwrap_or_default();
+    let crate::ownership::Owner::Declared(claim) = crate::ownership::owner_of(&claims, &rel) else {
+        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
+    };
+    let home = claim_home(&state, &id, &root, claim)?;
+    let path = claim.path.clone().into_owned();
+    tokio::task::spawn_blocking(move || {
+        let target = inspect::safe_join(&home, &path)
+            .map_err(|error| refusal(inspect_status(error), "unreadable"))?;
+        match std::fs::read_to_string(&target) {
+            Ok(text) => Ok(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(refusal(StatusCode::NOT_FOUND, "absent"))
+            }
+            Err(error) => {
+                tracing::warn!(%error, "reading a claimed file failed");
+                Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+            }
+        }
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
 }
 
 /// The fence in force in one project, read off the disk on the thread pool.
@@ -6282,12 +6390,22 @@ async fn get_project_ownership(
 /// A machine with no home directory has no library, which is an empty shelf and not a failure: the
 /// núcleo's own rows still stand, so the write boundary never disappears because a path lookup came
 /// back empty.
+///
+/// The same is true of a project with no state directory: no pins file means nothing is installed,
+/// and the fence is the núcleo's rows alone.
 async fn claims_for_project(
+    state: &AppState,
+    id: &str,
     root: PathBuf,
-    library: Option<PathBuf>,
 ) -> Result<Vec<crate::ownership::Claim>, StatusCode> {
+    let library = state.workflow_library.clone();
+    let pins = crate::project_state::file(
+        state.machine_config_root.as_deref(),
+        id,
+        crate::project_state::PINS_FILE,
+    );
     tokio::task::spawn_blocking(move || match library {
-        Some(library) => crate::ownership::claims_for(&root, &library),
+        Some(library) => crate::ownership::claims_for(&root, pins.as_deref(), &library),
         None => crate::ownership::CLAIMS.to_vec(),
     })
     .await
@@ -6296,7 +6414,7 @@ async fn claims_for_project(
 
 #[derive(Deserialize)]
 struct WriteRequest {
-    /// Relative to the project root, forward slashes. Only ever compared — never joined; see below.
+    /// A claim's identity, forward slashes. Only ever compared — never joined; see below.
     path: String,
     contents: String,
 }
@@ -6324,8 +6442,10 @@ struct WriteRequest {
 ///    installed workflow declares: the fence names it, and the app still may not write it, because
 ///    it has no parser for it. One code for both would tell somebody the file is nobody's when it
 ///    has an author standing right there, and the exit for the two is different.
-/// 4. **400/404, unwritable.** The claimed path that nonetheless does not land inside the project,
-///    which after (3) means one thing: a directory link or junction under `.ai/`.
+/// 4. **400/404, unwritable.** The claimed path that nonetheless does not land inside its home,
+///    which after (3) means one thing: a directory link or junction on the way to it. (Beside it,
+///    `no_machine_root` and `bad_project_id` when the project has no state directory to write
+///    into at all — see [`project_state_dir`].)
 /// 5. **422, invalid, WITH the parser's words.** The one refusal carrying a detail, because the raw
 ///    hatch is unusable without it — "unprocessable entity" sends somebody to an editor, which is
 ///    the surface the hatch exists to replace.
@@ -6333,10 +6453,13 @@ struct WriteRequest {
 /// **The file written is the one the registry names, never the string the caller sent.** The two
 /// normalise to the same file by the time (3) passes, and joining the caller's spelling anyway
 /// would make every future change to `normalise` a security question instead of a tidiness one.
+/// It is joined onto the claim's HOME: the núcleo's own rows land in
+/// `~/.nucleos/projects/<id>/`, not in the project — see `project_state.rs`.
 ///
 /// This route is in no table in `auth.rs`, so `permits` — which is default-deny — leaves it to
-/// Control and Admin. That is not an omission: `.ai/autopilot.yaml` carries `gate_command`, and a
-/// run able to rewrite it could decide what green means for every gate it will ever face.
+/// Control and Admin. That is not an omission: the project's `autopilot.yaml` carries
+/// `gate_command`, and a run able to rewrite it could decide what green means for every gate it
+/// will ever face.
 async fn post_project_write(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -6358,7 +6481,7 @@ async fn post_project_write(
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
 
-    let claims = claims_for_project(root.clone(), state.workflow_library.clone())
+    let claims = claims_for_project(&state, &id, root.clone())
         .await
         .map_err(|status| refusal(status, "internal"))?;
     let crate::ownership::Owner::Declared(claim) = crate::ownership::owner_of(&claims, &body.path)
@@ -6379,7 +6502,22 @@ async fn post_project_write(
     };
 
     let path = claim.path.clone().into_owned();
-    let target = inspect::safe_write_target(&root, &path)
+    let display = claim.display(&id);
+    let home = claim_home(&state, &id, &root, claim)?;
+    // A state directory is created by the first file anybody writes into it, and
+    // `safe_write_target` canonicalises its root before it will answer — the same order
+    // `post_machine_config` takes, and created only once the path is known to be a row.
+    if matches!(claim.home, crate::ownership::Home::State) {
+        std::fs::create_dir_all(&home).map_err(|error| {
+            tracing::warn!(
+                %error,
+                project_id = %id,
+                "could not create this project's state directory"
+            );
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+    }
+    let target = inspect::safe_write_target(&home, &path)
         .map_err(|error| refusal(inspect_status(error), "unwritable"))?;
 
     if let Err(detail) = validate(&body.contents) {
@@ -6405,7 +6543,7 @@ async fn post_project_write(
         &state.pool,
         Some(&id),
         "config_written",
-        &format!("{path} written from the app"),
+        &format!("{display} written from the app"),
         None,
         None,
     )
@@ -6425,7 +6563,7 @@ async fn post_project_write(
 /// Write through a temporary file in the same directory, then rename over the target.
 ///
 /// A plain truncate-and-write leaves the rules file half-written if anything goes wrong mid-write,
-/// and a half-written `.ai/autopilot.yaml` is not a smaller file — it is an *unreadable* one, which
+/// and a half-written `autopilot.yaml` is not a smaller file — it is an *unreadable* one, which
 /// `gate.rs` reports as `gate errored` on every completed run from then on. Rename is atomic on both
 /// platforms and replaces an existing file on both, so the file is either wholly the old one or
 /// wholly the new one.
@@ -6793,7 +6931,8 @@ fn within_length(
 /// One declared shell rule, whole.
 ///
 /// A `View` and not a fourth `ProjectRules`. There are already two: the struct above, which answers
-/// `GET /projects/{id}/rules` about `.ai/autopilot.yaml`, and `hooks::ProjectRules`, which is an
+/// `GET /projects/{id}/rules` about the project's `autopilot.yaml`, and `hooks::ProjectRules`, which
+/// is an
 /// enum about whether the table could be read at all. A third spelling of that name would tell a
 /// reader nothing about which of the three they are holding.
 ///
@@ -7836,16 +7975,23 @@ async fn get_project_workflows(
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
     let library = library_or_refusal(&state)?;
-    tokio::task::spawn_blocking(move || crate::workflows::installed(&root, &library))
+    let pins = pins_file(&state, &id)?;
+    let shown = crate::project_state::display_path(&id, crate::project_state::PINS_FILE);
+    tokio::task::spawn_blocking(move || crate::workflows::installed(&root, &pins, &library))
         .await
         .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
         .map(Json)
         // The parser's own words, the same as `POST /write`'s `invalid`: a pins file that will not
         // load is a file somebody has to fix, and "unprocessable entity" does not say which line.
+        // Prefixed with where the file is, because that is no longer the project's folder and the
+        // page should not have to know where the daemon keeps it.
         .map_err(|detail| {
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({ "refusal": "unreadable_pins", "detail": detail })),
+                Json(serde_json::json!({
+                    "refusal": "unreadable_pins",
+                    "detail": format!("{shown}: {detail}"),
+                })),
             )
         })
 }
@@ -7909,17 +8055,26 @@ fn bundle_or_refusal(
         .ok_or(crate::workflows::Refused::NoSuchBundle)
 }
 
-/// Every route below writes into the project's own folder, so every one of them asks the same two
-/// questions first, in the same order, for the reasons `POST /write` sets out at length.
+/// This project's pins file, `~/.nucleos/projects/<id>/workflows.yaml`, or the refusal
+/// [`project_state_dir`] gives for a project with no state directory.
+fn pins_file(state: &AppState, id: &str) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    Ok(project_state_dir(state, id)?.join(crate::project_state::PINS_FILE))
+}
+
+/// Every route below writes this project's pins, so every one of them asks the same two questions
+/// first, in the same order, for the reasons `POST /write` sets out at length.
 ///
-/// **The kill switch first.** These write `.ai/workflows.yaml`, and one of them copies a whole
-/// bundle into `.ai/workflows/` — bytes in the project's folder, which §7.5 says must go the way an
-/// agent's write goes. That is the line `POST /commands` sits on the other side of: that one writes
-/// a database row and touches nothing on disk.
+/// **The kill switch first.** These write the project's `workflows.yaml`, and one of them copies a
+/// whole bundle into `.ai/workflows/` — bytes in the project's folder, which §7.5 says must go the
+/// way an agent's write goes. That is the line `POST /commands` sits on the other side of: that one
+/// writes a database row and touches nothing on disk.
+///
+/// Answers the project root (where an ejected copy goes), the pins file (in the project's state
+/// directory, never in the project) and the library.
 async fn workflow_write_root(
     state: &AppState,
     id: &str,
-) -> Result<(PathBuf, PathBuf), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(PathBuf, PathBuf, PathBuf), (StatusCode, Json<serde_json::Value>)> {
     let halted = crate::autopilot::kill_switch_engaged(&state.pool)
         .await
         .unwrap_or(true)
@@ -7932,7 +8087,7 @@ async fn workflow_write_root(
     let root = resolve_project_root(state, id)
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
-    Ok((root, library_or_refusal(state)?))
+    Ok((root, pins_file(state, id)?, library_or_refusal(state)?))
 }
 
 /// Pin a bundle to this project.
@@ -7945,12 +8100,12 @@ async fn post_project_workflow(
     Path(id): Path<String>,
     Json(body): Json<InstallRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (root, library) = workflow_write_root(&state, &id).await?;
+    let (_, pins, library) = workflow_write_root(&state, &id).await?;
     let project_id = id.clone();
 
     let installed = tokio::task::spawn_blocking(move || {
         let bundle = bundle_or_refusal(&library, &body.name, Some(&body.version))?;
-        crate::workflows::install(&root, &bundle)?;
+        crate::workflows::install(&pins, &bundle)?;
         Ok::<_, crate::workflows::Refused>(bundle)
     })
     .await
@@ -7974,10 +8129,10 @@ async fn delete_project_workflow(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (root, _) = workflow_write_root(&state, &id).await?;
+    let (_, pins, _) = workflow_write_root(&state, &id).await?;
     let removed = name.clone();
 
-    tokio::task::spawn_blocking(move || crate::workflows::uninstall(&root, &name))
+    tokio::task::spawn_blocking(move || crate::workflows::uninstall(&pins, &name))
         .await
         .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
         .map_err(workflow_refusal)?;
@@ -7995,7 +8150,7 @@ async fn post_project_workflow_eject(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (root, library) = workflow_write_root(&state, &id).await?;
+    let (root, pins, library) = workflow_write_root(&state, &id).await?;
     let now = chrono::Utc::now();
     let ejected = name.clone();
 
@@ -8003,14 +8158,14 @@ async fn post_project_workflow_eject(
         // The pinned version and not the newest: ejecting is taking a copy of what this project
         // uses, and quietly taking a copy of something else would be an upgrade nobody asked for
         // performed at the one moment updates stop arriving.
-        let pinned = crate::workflows::read_pins(&root)
+        let pinned = crate::workflows::read_pins(&pins)
             .map_err(crate::workflows::Refused::Io)?
             .workflows
             .into_iter()
             .find(|pin| pin.name == name)
             .ok_or(crate::workflows::Refused::NotInstalled)?;
         let bundle = bundle_or_refusal(&library, &name, Some(&pinned.version))?;
-        crate::workflows::eject(&root, &bundle, now)
+        crate::workflows::eject(&root, &pins, &bundle, now)
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
@@ -8043,13 +8198,13 @@ async fn post_project_workflow_update(
     Path((id, name)): Path<(String, String)>,
     Json(body): Json<UpdateRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (root, library) = workflow_write_root(&state, &id).await?;
+    let (root, pins, library) = workflow_write_root(&state, &id).await?;
     let now = chrono::Utc::now();
     let project_id = id.clone();
 
     let bundle = tokio::task::spawn_blocking(move || {
         let bundle = bundle_or_refusal(&library, &name, body.version.as_deref())?;
-        crate::workflows::update(&root, &bundle, now)?;
+        crate::workflows::update(&root, &pins, &bundle, now)?;
         Ok::<_, crate::workflows::Refused>(bundle)
     })
     .await
@@ -8089,9 +8244,10 @@ async fn get_project_workflow_diff(
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
     let library = library_or_refusal(&state)?;
+    let pins = pins_file(&state, &id)?;
 
     tokio::task::spawn_blocking(move || {
-        let pinned = crate::workflows::read_pins(&root)
+        let pinned = crate::workflows::read_pins(&pins)
             .map_err(crate::workflows::Refused::Io)?
             .workflows
             .into_iter()
@@ -8156,9 +8312,10 @@ async fn get_project_workflow_graph(
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
     let library = library_or_refusal(&state)?;
+    let pins = pins_file(&state, &id)?;
 
     tokio::task::spawn_blocking(move || {
-        let pinned = crate::workflows::read_pins(&root)
+        let pinned = crate::workflows::read_pins(&pins)
             .map_err(crate::workflows::Refused::Io)?
             .workflows
             .into_iter()
@@ -8216,8 +8373,8 @@ struct OverlayRequest {
 
 /// Change what this project overrides on one node — or clear it back to inherited.
 ///
-/// **A write, so the stop applies.** It puts bytes in `.ai/workflows.yaml`, which is the project's
-/// own folder, and §7.5 says that goes the way an agent's write goes.
+/// **A write, so the stop applies.** It puts bytes in the project's `workflows.yaml`, which the app
+/// holds on the project's behalf, and §7.5 says that goes the way an agent's write goes.
 ///
 /// A body in which everything is absent clears the row, because an override that overrides nothing
 /// is not an override. That makes "go back to what the bundle says" the same request with an empty
@@ -8227,7 +8384,7 @@ async fn post_project_workflow_node(
     Path((id, name, node)): Path<(String, String, String)>,
     Json(body): Json<OverlayRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (root, _) = workflow_write_root(&state, &id).await?;
+    let (_, pins, _) = workflow_write_root(&state, &id).await?;
     let said = format!("{name}/{node} overridden in this project");
 
     let overlay = crate::workflows::NodeOverlay {
@@ -8241,7 +8398,7 @@ async fn post_project_workflow_node(
     };
 
     tokio::task::spawn_blocking(move || {
-        crate::workflows::set_overlay(&root, &name, &node, Some(overlay))
+        crate::workflows::set_overlay(&pins, &name, &node, Some(overlay))
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
@@ -8362,12 +8519,12 @@ async fn post_project_workflow_adopt(
     Path(id): Path<String>,
     Json(body): Json<AdoptRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (root, _) = workflow_write_root(&state, &id).await?;
+    let (root, pins, _) = workflow_write_root(&state, &id).await?;
     let now = chrono::Utc::now();
     let said = format!("{} adopted as this project's workflow", body.path);
 
     tokio::task::spawn_blocking(move || {
-        crate::workflows::adopt(&root, &body.name, &body.path, now)
+        crate::workflows::adopt(&root, &pins, &body.name, &body.path, now)
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
@@ -13694,7 +13851,8 @@ async fn create_job(
                 rule_name: None,
                 prompt: &request.prompt,
                 // The daemon's ceiling, never a number the caller chose — which is why the request
-                // has no field for it. `.ai/autopilot.yaml` may only lower the fan-out, and an HTTP
+                // has no field for it. The project's `autopilot.yaml` may only lower the fan-out,
+                // and an HTTP
                 // body filled in by a model is reviewed even less than that file is.
                 max_items: crate::config::MAX_ITEMS_CEILING as i64,
                 // These two DO come from the caller, unlike `max_items`, and the asymmetry is the
@@ -16851,11 +17009,27 @@ mod tests {
         assert_eq!(attempts, 0);
     }
 
-    /// Registers a project with a root on disk, and writes `.ai/autopilot.yaml` under it.
+    /// Points `state` at a temporary directory standing in for `~/.nucleos`, so project state can be
+    /// written and read without a real home. The directory lives as long as the returned guard.
+    fn with_project_home(state: &mut AppState) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(home.path().to_path_buf());
+        home
+    }
+
+    /// Registers a project with a root on disk and, when `state` has a stand-in home, writes its
+    /// rules where the daemon reads them: `<home>/projects/<id>/autopilot.yaml`. Without one the
+    /// project simply has no rules, which is all most callers here need.
     async fn project_with_rules(state: &AppState, id: &str, yaml: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
-        std::fs::write(dir.path().join(".ai").join("autopilot.yaml"), yaml).unwrap();
+        if let Some(home) = state.machine_config_root.as_deref() {
+            crate::project_state::write_for_test(
+                home,
+                id,
+                crate::project_state::AUTOPILOT_FILE,
+                yaml,
+            );
+        }
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
         )
@@ -16891,7 +17065,8 @@ mod tests {
     /// is the failure this endpoint exists to make visible.
     #[tokio::test]
     async fn a_schedule_that_can_never_fire_says_why_instead_of_going_quiet() {
-        let state = test_state().await;
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
         let _dir = project_with_rules(
             &state,
             "alpha",
@@ -16913,6 +17088,11 @@ mod tests {
         let (status, body) = read_rules(state, "alpha").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["rules_file"], "present");
+        assert_eq!(
+            body["rules_path"],
+            "~/.nucleos/projects/alpha/autopilot.yaml"
+        );
+        drop(home);
 
         let schedules = body["schedules"].as_array().unwrap();
         assert!(
@@ -16940,7 +17120,8 @@ mod tests {
     /// run for that project and looked exactly like having no rules.
     #[tokio::test]
     async fn a_misspelt_key_is_reported_rather_than_read_as_no_rules_at_all() {
-        let state = test_state().await;
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
         let _dir = project_with_rules(
             &state,
             "alpha",
@@ -16949,6 +17130,7 @@ mod tests {
         .await;
 
         let (_, body) = read_rules(state, "alpha").await;
+        drop(home);
         assert_eq!(body["rules_file"], "unreadable");
         assert!(body["rules_error"].as_str().unwrap().contains("schedule"));
         assert_eq!(body["schedules"].as_array().unwrap().len(), 0);
@@ -17066,13 +17248,14 @@ mod tests {
     /// and a text editor does not.
     #[tokio::test]
     async fn a_rules_file_written_from_the_app_is_the_one_the_daemon_then_reads() {
-        let state = test_state().await;
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
         let (status, _) = write_file(
             state.clone(),
             "alpha",
-            ".ai/autopilot.yaml",
+            "autopilot.yaml",
             "gate_command: cargo clippy\nschedules:\n  - name: nightly\n    cron: '0 3 * * *'\n    prompt: sweep\n",
         )
         .await;
@@ -17094,7 +17277,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(kind, "config_written");
-        assert!(summary.contains(".ai/autopilot.yaml"), "got: {summary}");
+        assert_eq!(
+            summary,
+            "~/.nucleos/projects/alpha/autopilot.yaml written from the app"
+        );
+        // And the project's own folder was not touched: the rules are not its files any more.
+        assert!(!_dir.path().join(".ai").exists());
+        assert!(
+            home.path()
+                .join("projects")
+                .join("alpha")
+                .join("autopilot.yaml")
+                .is_file()
+        );
     }
 
     /// Everything the registry does not name is refused, and the refusal is named so the page can
@@ -17105,7 +17300,8 @@ mod tests {
     /// touched at all.
     #[tokio::test]
     async fn a_file_the_app_does_not_own_is_refused_before_anything_is_touched() {
-        let state = test_state().await;
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
         let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
         for path in [
@@ -17117,6 +17313,8 @@ mod tests {
             ".ai/models.yaml",
             // This machine's settings, which are not any project's however the URL is spelled.
             "~/.nucleos/github.yaml",
+            // Where the rules used to be. That file is no longer read, so it is not the app's.
+            ".ai/autopilot.yaml",
             "../escape.yaml",
             ".ai/../../escape.yaml",
         ] {
@@ -17130,6 +17328,14 @@ mod tests {
         assert!(!dir.path().join("README.md").exists());
         assert!(!dir.path().join(".ai").join("models.yaml").exists());
         assert!(!dir.path().parent().unwrap().join("escape.yaml").exists());
+        assert!(!dir.path().join(".ai").join("autopilot.yaml").exists());
+        // The only file in the stand-in home is the one `project_with_rules` wrote.
+        assert_eq!(
+            std::fs::read_dir(home.path().join("projects").join("alpha"))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     /// YAML the daemon could not read is refused **and the file that was there survives**.
@@ -17143,9 +17349,14 @@ mod tests {
     /// somebody to a text editor — which is the surface the hatch exists to replace.
     #[tokio::test]
     async fn yaml_the_daemon_could_not_read_is_refused_and_the_old_file_survives() {
-        let state = test_state().await;
-        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
-        let file = dir.path().join(".ai").join("autopilot.yaml");
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let file = home
+            .path()
+            .join("projects")
+            .join("alpha")
+            .join("autopilot.yaml");
 
         for (contents, expected_in_detail) in [
             ("schedules: [\n", "line"),
@@ -17154,7 +17365,7 @@ mod tests {
             ("gate_commmand: cargo test\n", "gate_commmand"),
         ] {
             let (status, body) =
-                write_file(state.clone(), "alpha", ".ai/autopilot.yaml", contents).await;
+                write_file(state.clone(), "alpha", "autopilot.yaml", contents).await;
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{contents}");
             assert_eq!(body["refusal"], "invalid");
             let detail = body["detail"].as_str().unwrap();
@@ -17178,9 +17389,14 @@ mod tests {
     /// this route already has in its path.
     #[tokio::test]
     async fn the_emergency_stop_holds_a_write_from_the_app() {
-        let state = test_state().await;
-        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
-        let file = dir.path().join(".ai").join("autopilot.yaml");
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let file = home
+            .path()
+            .join("projects")
+            .join("alpha")
+            .join("autopilot.yaml");
 
         crate::autopilot::set_kill_switch(&state.pool, true)
             .await
@@ -17188,7 +17404,7 @@ mod tests {
         let (status, body) = write_file(
             state.clone(),
             "alpha",
-            ".ai/autopilot.yaml",
+            "autopilot.yaml",
             "gate_command: x\n",
         )
         .await;
@@ -17204,7 +17420,7 @@ mod tests {
         let (status, body) = write_file(
             state.clone(),
             "alpha",
-            ".ai/autopilot.yaml",
+            "autopilot.yaml",
             "gate_command: x\n",
         )
         .await;
@@ -17222,8 +17438,7 @@ mod tests {
         crate::autopilot::set_scoped_kill(&state.pool, "project", "alpha", false)
             .await
             .unwrap();
-        let (status, _) =
-            write_file(state, "alpha", ".ai/autopilot.yaml", "gate_command: x\n").await;
+        let (status, _) = write_file(state, "alpha", "autopilot.yaml", "gate_command: x\n").await;
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
@@ -17241,7 +17456,7 @@ mod tests {
         let (status, body) = write_file(
             state.clone(),
             "rootless",
-            ".ai/autopilot.yaml",
+            "autopilot.yaml",
             "gate_command: x\n",
         )
         .await;
@@ -17268,7 +17483,8 @@ mod tests {
     /// mistake announces itself.
     #[tokio::test]
     async fn the_write_boundary_is_served_so_the_page_can_draw_it() {
-        let state = test_state().await;
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
         let response = build_router(state)
@@ -17288,7 +17504,12 @@ mod tests {
         let claims: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let claims = claims.as_array().unwrap();
         assert_eq!(claims.len(), 2);
-        assert_eq!(claims[0]["path"], ".ai/autopilot.yaml");
+        assert_eq!(claims[0]["path"], "autopilot.yaml");
+        assert_eq!(claims[0]["home"], "state");
+        assert_eq!(
+            claims[0]["display"],
+            "~/.nucleos/projects/alpha/autopilot.yaml"
+        );
         assert_eq!(claims[0]["owner"], "core");
         assert_eq!(claims[0]["writable"], true);
         assert!(
@@ -17297,8 +17518,75 @@ mod tests {
         );
         // The second row arrived with the module that parses it, which is the membership rule the
         // registry runs on: a claim and a parser come together or not at all.
-        assert_eq!(claims[1]["path"], ".ai/workflows.yaml");
+        assert_eq!(claims[1]["path"], "workflows.yaml");
+        assert_eq!(
+            claims[1]["display"],
+            "~/.nucleos/projects/alpha/workflows.yaml"
+        );
         assert_eq!(claims[1]["writable"], true);
+        drop(home);
+    }
+
+    /// The editor reads a claimed file from where the registry says it lives — the project's state
+    /// directory for the núcleo's own rows — and a file not there yet is `absent`, not an error.
+    #[tokio::test]
+    async fn a_claimed_file_is_read_from_its_home_and_absent_is_its_own_answer() {
+        let mut state = test_state().await;
+        let _home = with_project_home(&mut state);
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (status, text) = owned_text(state.clone(), "alpha", "autopilot.yaml").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text, "gate_command: cargo test\n");
+
+        let (status, text) = owned_text(state.clone(), "alpha", "workflows.yaml").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(text.contains("absent"), "{text}");
+
+        // Not in the table is refused, as the write route refuses it — `cat` is the door for the
+        // repository's own files.
+        let (status, text) = owned_text(state, "alpha", "README.md").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(text.contains("not_ours"), "{text}");
+    }
+
+    /// A project id that would name some other directory has no state directory, and the write
+    /// route says so by name instead of writing somewhere it did not mean.
+    #[tokio::test]
+    async fn an_id_that_cannot_name_a_directory_is_refused_by_name() {
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
+        let dir = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('a:b', 'shadow', ?)",
+        )
+        .bind(dir.path().to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (status, body) = write_file(state, "a:b", "autopilot.yaml", "gate_command: x\n").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["refusal"], "bad_project_id");
+        assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
+    }
+
+    async fn owned_text(state: AppState, id: &str, path: &str) -> (StatusCode, String) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/projects/{id}/owned?path={path}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
     /// The map of a project, derived from the tree on the spot.
@@ -20433,6 +20721,7 @@ mod tests {
         let mut state = test_state().await;
         let (_lib, library) = library_with(&[("harness", "1.0", "description: the .ai harness\n")]);
         state.workflow_library = Some(library.clone());
+        let _home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
         let (status, shelf) = workflow_call(state.clone(), "GET", "/workflows/library", None).await;
@@ -20763,7 +21052,10 @@ mod tests {
         let (state, temp) = state_with_machine_root().await;
         for path in [
             ".ai/project.yaml",
-            ".ai/autopilot.yaml",
+            // A project's rules, by the name the project door knows them and by where they sit
+            // under this same root. Neither is this machine's; the project door writes them.
+            "autopilot.yaml",
+            "projects/alpha/autopilot.yaml",
             "../voice.yaml",
             // The spelling every row had before the files moved to `~/.nucleos/`. A caller still
             // sending it would be writing a file the daemon no longer reads.
@@ -20852,6 +21144,7 @@ mod tests {
             "description: the .ai harness\nowns:\n  - .ai/models.yaml\n",
         )]);
         state.workflow_library = Some(library);
+        let _home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
         workflow_call(
@@ -20890,9 +21183,7 @@ mod tests {
             state,
             "POST",
             "/projects/alpha/write",
-            Some(
-                serde_json::json!({ "path": ".ai/workflows.yaml", "contents": "workflows: []\n" }),
-            ),
+            Some(serde_json::json!({ "path": "workflows.yaml", "contents": "workflows: []\n" })),
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
@@ -20908,6 +21199,7 @@ mod tests {
         let mut state = test_state().await;
         let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
         state.workflow_library = Some(library);
+        let _home = with_project_home(&mut state);
         let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
         workflow_call(
@@ -20958,6 +21250,7 @@ mod tests {
         let mut state = test_state().await;
         let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
         state.workflow_library = Some(library);
+        let _home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
         workflow_call(
             state.clone(),
@@ -20983,6 +21276,7 @@ mod tests {
         let mut state = test_state().await;
         let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
         state.workflow_library = Some(library);
+        let _home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
         crate::autopilot::set_kill_switch(&state.pool, true)
             .await
@@ -21039,6 +21333,7 @@ mod tests {
         let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
         std::fs::write(library.join("harness/1.0/graph.yaml"), TWO_NODE_GRAPH).unwrap();
         state.workflow_library = Some(library);
+        let _home = with_project_home(&mut state);
         let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
         workflow_call(
@@ -21097,6 +21392,7 @@ mod tests {
         let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
         std::fs::write(library.join("harness/1.0/graph.yaml"), TWO_NODE_GRAPH).unwrap();
         state.workflow_library = Some(library);
+        let _home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
         workflow_call(
@@ -21158,6 +21454,7 @@ mod tests {
         let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
         std::fs::remove_file(library.join("harness/1.0/graph.yaml")).unwrap();
         state.workflow_library = Some(library.clone());
+        let _home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
         workflow_call(
             state.clone(),
@@ -21393,7 +21690,11 @@ mod tests {
         let mut state = test_state().await;
         let (_lib, library) = library_with(&[]);
         state.workflow_library = Some(library);
+        let _home = with_project_home(&mut state);
         let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        // The folder this project already has. Nothing of the app's lives in it any more, so the
+        // test makes it rather than finding it made.
+        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
         std::fs::write(dir.path().join(".ai/workflow.md"), "the pipeline").unwrap();
 
         let (status, _) = workflow_call(
@@ -29563,7 +29864,7 @@ mod tests {
     ///
     /// `max_rounds` and `budget_usd` are how long and how much, which are the caller's to say —
     /// under the daemon's ceiling and under the house budget. `max_items` is fan-out per round and
-    /// has no field at all: `.ai/autopilot.yaml` may lower it and nobody may raise it.
+    /// has no field at all: the project's `autopilot.yaml` may lower it and nobody may raise it.
     ///
     /// The ceiling is asserted on the STORED row rather than on behaviour, because that is where it
     /// is applied: a number cut on the way in is a promise the row itself keeps, where one cut at
@@ -32321,7 +32622,8 @@ mod tests {
     /// A cron nobody can read is the caller's mistake, said to the caller.
     ///
     /// `400` and not `500`, and the reason travels in the body. This is the one advantage an
-    /// errand's rules have over a project's: `.ai/autopilot.yaml` is read long after whoever wrote
+    /// errand's rules have over a project's: the project's `autopilot.yaml` is read long after
+    /// whoever wrote
     /// it walked away, so `scheduler.rs` arms the broken rule and announces it once to the feed. A
     /// rule arriving over a route can be refused to somebody's face, and a refusal that does not
     /// quote the word that was wrong cannot be acted on from a phone.

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiFetch } from "./client";
+import { apiFetch, apiText } from "./client";
 import { keys } from "./keys";
 
 /**
@@ -17,8 +17,22 @@ import { keys } from "./keys";
 
 /** One file the app declares itself the author of. */
 export interface Claim {
-  /** Relative to the project root, forward slashes. Sent back verbatim when writing. */
+  /**
+   * The row's identity, forward slashes, relative to its `home`. Sent back verbatim when reading
+   * and writing — never shown: a person is shown `display`.
+   */
   path: string;
+  /**
+   * `state` for the núcleo's own files, which live in `~/.nucleos/projects/<id>/` and not in the
+   * project; `project` for a file in the project's folder. Optional: the shell can be newer than
+   * the daemon.
+   */
+  home?: "state" | "project";
+  /**
+   * The file as a person is shown it — `~/.nucleos/projects/<id>/autopilot.yaml`. Served, so the
+   * page never carries a location of its own. Optional for the same reason as `home`.
+   */
+  display?: string;
   /** A stable wire value (`core` today, a workflow's name later). The page writes its own words. */
   owner: string;
   /** What editing it changes, in the daemon's sentence. */
@@ -47,6 +61,26 @@ export function useProjectOwnership(projectId: string | null) {
 }
 
 /**
+ * The text of one file the app owns, from wherever the daemon keeps it.
+ *
+ * Its own route and not `cat`, because `cat` reads inside the project's folder and the núcleo's own
+ * files are not there any more. A 404 is a file not written yet, which the editor treats as a state
+ * and not an error. Under `keys.projects.all`, so the write below invalidates it with everything
+ * else.
+ */
+export function useProjectOwnedFile(projectId: string | null, path: string, enabled = true) {
+  return useQuery({
+    queryKey: keys.projects.owned(projectId ?? "", path),
+    queryFn: () =>
+      apiText(
+        `/projects/${encodeURIComponent(projectId ?? "")}/owned?path=${encodeURIComponent(path)}`,
+      ),
+    enabled: enabled && projectId !== null && path !== "",
+    retry: false,
+  });
+}
+
+/**
  * Write one file the app owns.
  *
  * **No optimistic write, and no `retry`.** Both for the same reason the mode change has neither:
@@ -56,8 +90,8 @@ export function useProjectOwnership(projectId: string | null) {
  * `unwritable`, `invalid` — and `invalid` arrives with the parser's own words in `detail`, which is
  * what makes the raw editor usable at all.
  *
- * The invalidation reaches the file's own read: `keys.projects.cat` is
- * `["projects", id, "cat", path]`, under `keys.projects.all`. `rules` lives under the same prefix
+ * The invalidation reaches the file's own read: `keys.projects.owned` is
+ * `["projects", id, "owned", path]`, under `keys.projects.all`. `rules` lives under the same prefix
  * and is the other reader that must not go stale — it is the panel showing what the daemon now
  * thinks this project does on its own, which is precisely what just changed.
  */

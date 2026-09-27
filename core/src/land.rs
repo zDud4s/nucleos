@@ -1113,18 +1113,21 @@ mod tests {
     async fn a_red_gate_fails_the_landing_and_starts_no_agent() {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
-        let (_container, repo) = repo_parked_off_target("nucleos-land-gate-", "chore/other");
+        let (container, repo) = repo_parked_off_target("nucleos-land-gate-", "chore/other");
         assert!(git_in(&repo, &["checkout", "-q", "master"]));
         let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
-        std::fs::create_dir_all(
-            repo.join(crate::config::AUTOPILOT_RULES_PATH)
-                .parent()
-                .unwrap(),
+        // Where the queue reads `alpha`'s rules: a temporary stand-in for `~/.nucleos`.
+        let machine_root = container.path().join("nucleos-home");
+        let rules = crate::project_state::file(
+            Some(&machine_root),
+            "alpha",
+            crate::project_state::AUTOPILOT_FILE,
         )
         .unwrap();
+        std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
         std::fs::write(
-            repo.join(crate::config::AUTOPILOT_RULES_PATH),
+            &rules,
             "gate_before_publish: true\ngate_command: git rev-parse --verify nao-existe\n",
         )
         .unwrap();
@@ -1135,9 +1138,11 @@ mod tests {
             .await
             .expect("a red gate is discovered at execution, not at submission");
 
-        assert!(
-            crate::vcs::drain_once(&pool, "alpha", &crate::git_exec::GitExecutor::default()).await
-        );
+        let executor = crate::git_exec::GitExecutor {
+            machine_root: Some(machine_root),
+            ..crate::git_exec::GitExecutor::default()
+        };
+        assert!(crate::vcs::drain_once(&pool, "alpha", &executor).await);
 
         assert_eq!(
             sqlx::query_scalar::<_, String>("SELECT status FROM vcs_requests WHERE id = ?")

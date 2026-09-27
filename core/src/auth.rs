@@ -2318,8 +2318,8 @@ mod tests {
 
     /// Writing a project's own rules is the owner's, and nobody else's.
     ///
-    /// The file behind this route is `.ai/autopilot.yaml`, and it carries `gate_command` — the
-    /// command whose exit code decides what *green* means for every run in the project. A key that
+    /// The file behind this route is the project's `autopilot.yaml`, and it carries `gate_command` —
+    /// the command whose exit code decides what *green* means for every run in the project. A key that
     /// could rewrite it could set the gate to `true` and pass every gate it will ever face, which
     /// makes this the one write on the project surface where the blast radius is the whole quality
     /// bar rather than one file.
@@ -2359,6 +2359,20 @@ mod tests {
             &Method::GET,
             "/projects/7/ownership"
         ));
+
+        // Reading the claimed file's TEXT is not the fence, it is the rules — `gate_command`
+        // included — and `GET /projects/{id}/rules`, which serves the same facts, has always been
+        // Admin's. So `owned` is in no table either.
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits(&scope, &Method::GET, "/projects/7/owned"),
+                "{scope:?} must not read a project's rules file"
+            );
+        }
     }
 
     /// A project's commands are the owner's, to read and to run.

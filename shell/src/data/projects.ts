@@ -10,7 +10,7 @@ import { whereWaiting } from "./roster";
  * Two kinds of hook, with opposite cadences, and the split is the whole file.
  *
  * **The rules are read on open and not polled.** `get_project_rules` loads
- * `.ai/autopilot.yaml` off the disk and stats it on every call; putting that on
+ * the project's `autopilot.yaml` off the disk and stats it on every call; putting that on
  * a three-second timer would be a file read per tick for a document somebody
  * edits once a week. The *live* numbers a rules panel needs — `open_review_items`,
  * `wip_limit`, `queue_full` — are already on the roster row from
@@ -66,15 +66,24 @@ export interface RepoTriggerView {
 export interface ProjectRules {
   project_id: string;
   project_root: string | null;
-  /** The three states `.ai/autopilot.yaml` can be in. `absent` is ordinary; the file is gitignored. */
+  /**
+   * The three states the project's `autopilot.yaml` can be in. `absent` is ordinary: the file
+   * exists once somebody writes rules for the project.
+   */
   rules_file: "present" | "absent" | "unreadable";
+  /**
+   * Where that file is, as a person is shown it: `~/.nucleos/projects/<id>/autopilot.yaml`. Served
+   * by the daemon so the page never carries a location of its own. Optional: the shell can be newer
+   * than the daemon, and `rulesFileName` falls back to the bare name.
+   */
+  rules_path?: string;
   /** Why the file could not be read. Non-null exactly when `rules_file` is `unreadable`. */
   rules_error: string | null;
   gate_command: string | null;
   /**
    * Whether the VCS queue runs that command on a merge before publishing it.
-   * Read here rather than derived: the rule lives in `.ai/autopilot.yaml`, and a
-   * second copy of it in the window is a copy that will eventually disagree.
+   * Read here rather than derived: the rule lives in the project's `autopilot.yaml`,
+   * and a second copy of it in the window is a copy that will eventually disagree.
    */
   gate_before_publish: boolean;
   /** Who answers an approval a conversation on `auto` would otherwise put to a person. */
@@ -721,7 +730,15 @@ export interface Concern {
 }
 
 /**
- * Where a project's `.ai/autopilot.yaml` is edited: the workspace's State mode, whose "Files the app
+ * The rules file as the page names it: the daemon's `~`-spelled path when it sent one, and the bare
+ * file name from a daemon too old to.
+ */
+export function rulesFileName(rules: ProjectRules): string {
+  return rules.rules_path ?? "autopilot.yaml";
+}
+
+/**
+ * Where a project's `autopilot.yaml` is edited: the workspace's State mode, whose "Files the app
  * owns" section holds the raw editor. The State mode and not the inspector, because the inspector
  * reads the tree and that editor is the file's legitimate author (`project/OwnedFiles.tsx`).
  */
@@ -758,11 +775,11 @@ export function concernsOf(rules: ProjectRules, rootExists: boolean | null | und
       weight: "stopped",
       said: "The rules file will not parse — nothing runs here at all.",
       view: "rules",
-      fix: { to: rulesEditorPath(rules.project_id), label: "Edit .ai/autopilot.yaml" },
+      fix: { to: rulesEditorPath(rules.project_id), label: "Edit autopilot.yaml" },
     });
   }
 
-  // The queue refuses every merge while this holds, over a key in a gitignored
+  // The queue refuses every merge while this holds, over a key in an unreviewed
   // file. A refusal nobody can explain is the worst of the gate's three states.
   const gated = rules.gate_command !== null && rules.gate_command.trim() !== "";
   if (rules.gate_before_publish && !gated) {
@@ -771,7 +788,7 @@ export function concernsOf(rules: ProjectRules, rootExists: boolean | null | und
       weight: "stopped",
       said: "Merges need a gate and none is set — every merge is refused.",
       view: "rules",
-      fix: { to: rulesEditorPath(rules.project_id), label: "Set a gate in .ai/autopilot.yaml" },
+      fix: { to: rulesEditorPath(rules.project_id), label: "Set a gate in autopilot.yaml" },
     });
   }
 
@@ -800,7 +817,7 @@ export function concernsOf(rules: ProjectRules, rootExists: boolean | null | und
       view: "rules",
       fix: {
         to: rulesEditorPath(rules.project_id),
-        label: inert === 1 ? "Fix the rule in .ai/autopilot.yaml" : "Fix the rules in .ai/autopilot.yaml",
+        label: inert === 1 ? "Fix the rule in autopilot.yaml" : "Fix the rules in autopilot.yaml",
       },
     });
   }

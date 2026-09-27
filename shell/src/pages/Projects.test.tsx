@@ -709,7 +709,7 @@ describe("Projects - the concerns strip", () => {
       place that ends it. The file is edited in the workspace; a held brake is
       released by reviewing what is waiting.
     */
-    const edit = within(strip).getByRole("link", { name: "Edit .ai/autopilot.yaml" });
+    const edit = within(strip).getByRole("link", { name: "Edit autopilot.yaml" });
     expect(edit.getAttribute("href")).toBe("/projects/alpha/state");
     expect(
       within(strip).getByRole("link", { name: "Review what is waiting" }).getAttribute("href"),
@@ -740,7 +740,7 @@ describe("Projects - the concerns strip", () => {
 
     // The block below says it, and carries the way to the editor itself.
     const alert = await screen.findByRole("alert");
-    expect(within(alert).getByRole("link", { name: /Edit .ai\/autopilot.yaml/ })).toBeDefined();
+    expect(within(alert).getByRole("link", { name: /Edit autopilot\.yaml/ })).toBeDefined();
     expect(screen.queryByRole("region", { name: "What is wrong here" })).toBeNull();
   });
 

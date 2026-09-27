@@ -14,9 +14,19 @@
 //!
 //! **The rule for membership: the núcleo owns a file if the núcleo PARSES it.** A claim and a
 //! validator arrive together or not at all — a claim without a parser is permission to write bytes
-//! nobody checks, which is exactly what the registry exists to prevent. The one claim below is
-//! asserted against [`crate::config::AUTOPILOT_RULES_PATH`] rather than written out again, so a
+//! nobody checks, which is exactly what the registry exists to prevent. The núcleo's claims below
+//! are asserted against [`crate::project_state`]'s file names rather than written out again, so a
 //! claim cannot come to name a file no loader reads.
+//!
+//! # Two homes: the project's state directory, and the project
+//!
+//! The núcleo's own two files no longer live in the project. They are
+//! `~/.nucleos/projects/<id>/autopilot.yaml` and `.../workflows.yaml` — see `project_state.rs` for
+//! why neither the project's `.ai/` nor a folder inside the project could hold them. A workflow's
+//! claims are still files IN the project, relative to its root. So every row says which of the two
+//! it is relative to ([`Home`]), and the write door resolves a row against that home and nothing
+//! else: a core row's `path` is a bare file name joined onto the state directory, never onto the
+//! project root.
 //!
 //! # The table has two rows, and the spec asked for eight
 //!
@@ -38,9 +48,9 @@
 //! root. What this module must never do is claim one of them, and a test in that module asserts
 //! the two registries stay disjoint.
 //!
-//! So: `.ai/autopilot.yaml`, and `.ai/workflows.yaml` beside it once there was a module that parses
-//! that one too. That is not a thin registry, it is an accurate one, and the first row is the
-//! load-bearing one — see below.
+//! So: the project's `autopilot.yaml`, and its `workflows.yaml` beside it once there was a module
+//! that parses that one too. That is not a thin registry, it is an accurate one, and the first row
+//! is the load-bearing one — see below.
 //!
 //! # A third answer: files a WORKFLOW authors
 //!
@@ -61,8 +71,10 @@
 //!
 //! # The one claimed file is the most dangerous file in the project
 //!
-//! `.ai/autopilot.yaml` carries `gate_command`. Whoever writes it decides what *green* means, so an
-//! agent able to rewrite it could make every gate it will ever face pass. The write route is
+//! The rules file carries `gate_command`. Whoever writes it decides what *green* means, so an agent
+//! able to rewrite it could make every gate it will ever face pass. Moving it out of the project did
+//! not change that; `classifier.rs` refuses an agent's write to it in its new home as it did in the
+//! old one. The write route is
 //! therefore Admin's, by appearing in no table in `auth.rs` — `permits` is default-deny — and there
 //! is a test in that module pinning it, because default-deny protects a route nobody thought about
 //! and would stop protecting this one the moment somebody added it to a list "for consistency".
@@ -82,10 +94,13 @@ pub type Validator = fn(&str) -> Result<(), String>;
 /// is the shape that would have grown two `owner_of`s that disagreed.
 #[derive(Clone)]
 pub struct Claim {
-    /// Relative to the project root, forward slashes. Compared against a caller's path only after
-    /// [`normalise`], which is what decides that `./​.ai/autopilot.yaml` is the same file and that
-    /// `.ai/../.ai/autopilot.yaml` is not a question this module answers.
+    /// Relative to [`Claim::home`], forward slashes. Compared against a caller's path only after
+    /// [`normalise`], which is what decides that `./autopilot.yaml` is the same file and that
+    /// `x/../autopilot.yaml` is not a question this module answers. It is the row's identity on
+    /// the wire; a person is shown [`Claim::display`] instead.
     pub path: std::borrow::Cow<'static, str>,
+    /// Which directory `path` is relative to. See the module header.
+    pub home: Home,
     /// Who declares it, as a stable wire value — `core`, or a workflow's name. The page renders its
     /// own words for this; a label meant for a person would be a label somebody translates and a
     /// client then compares against.
@@ -100,6 +115,26 @@ pub struct Claim {
     /// the núcleo's to write, and the write route refuses it by asking this question rather than by
     /// keeping a second list of exceptions somewhere else.
     pub validate: Option<Validator>,
+}
+
+/// Which directory a claim's `path` is relative to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Home {
+    /// The project's state directory, `~/.nucleos/projects/<id>/`. The núcleo's own rows.
+    State,
+    /// The project's root. A workflow's rows.
+    Project,
+}
+
+impl Claim {
+    /// The row as a person is shown it: `~/.nucleos/projects/<id>/autopilot.yaml` for a state
+    /// file, the path relative to the project root for a project file.
+    pub fn display(&self, project_id: &str) -> String {
+        match self.home {
+            Home::State => crate::project_state::display_path(project_id, &self.path),
+            Home::Project => self.path.clone().into_owned(),
+        }
+    }
 }
 
 /// The answer to *who may write this file*.
@@ -129,7 +164,8 @@ fn validate_autopilot(contents: &str) -> Result<(), String> {
 /// The núcleo's own claims. See the module header for why there are two and not eight.
 pub static CLAIMS: &[Claim] = &[
     Claim {
-        path: std::borrow::Cow::Borrowed(crate::config::AUTOPILOT_RULES_PATH),
+        path: std::borrow::Cow::Borrowed(crate::project_state::AUTOPILOT_FILE),
+        home: Home::State,
         owner: std::borrow::Cow::Borrowed("core"),
         what: std::borrow::Cow::Borrowed(
             "what this project does on its own: its schedules, its repository triggers, and the gate command that decides what green means",
@@ -137,7 +173,8 @@ pub static CLAIMS: &[Claim] = &[
         validate: Some(validate_autopilot),
     },
     Claim {
-        path: std::borrow::Cow::Borrowed(crate::workflows::PINS_PATH),
+        path: std::borrow::Cow::Borrowed(crate::project_state::PINS_FILE),
+        home: Home::State,
         owner: std::borrow::Cow::Borrowed("core"),
         what: std::borrow::Cow::Borrowed(
             "which workflows this project uses, which version of each, and what it overrides on their nodes",
@@ -156,12 +193,23 @@ pub static CLAIMS: &[Claim] = &[
 /// the exit for those files is their author, not a text box in this app.
 ///
 /// A path a workflow declares that the núcleo already claims is dropped, and the núcleo keeps it.
-/// The alternative is a bundle that can quietly take `.ai/autopilot.yaml` out of the app's hands by
-/// naming it — and the file that decides what *green* means is the last one that should change
-/// owner because somebody wrote a line in a manifest.
-pub fn claims_for(project_root: &std::path::Path, library_root: &std::path::Path) -> Vec<Claim> {
+/// The two homes differ, so a workflow naming `autopilot.yaml` means a file at the project's root
+/// and not the rules file — but one identity on the wire must answer one question, and the row
+/// that decides what *green* means is the last one that should become ambiguous because somebody
+/// wrote a line in a manifest.
+///
+/// `pins_file` is the project's `workflows.yaml` in its state directory; `None` (no home directory,
+/// or an id that cannot name one) means nothing is installed, and the núcleo's rows still stand.
+pub fn claims_for(
+    project_root: &std::path::Path,
+    pins_file: Option<&std::path::Path>,
+    library_root: &std::path::Path,
+) -> Vec<Claim> {
     let mut claims: Vec<Claim> = CLAIMS.to_vec();
-    let Ok(installed) = crate::workflows::installed(project_root, library_root) else {
+    let Some(pins_file) = pins_file else {
+        return claims;
+    };
+    let Ok(installed) = crate::workflows::installed(project_root, pins_file, library_root) else {
         return claims;
     };
     for workflow in installed {
@@ -174,6 +222,7 @@ pub fn claims_for(project_root: &std::path::Path, library_root: &std::path::Path
             }
             claims.push(Claim {
                 path: std::borrow::Cow::Owned(path),
+                home: Home::Project,
                 owner: std::borrow::Cow::Owned(workflow.name.clone()),
                 what: std::borrow::Cow::Owned(format!(
                     "the {} workflow's, declared in its bundle",
@@ -189,7 +238,7 @@ pub fn claims_for(project_root: &std::path::Path, library_root: &std::path::Path
 /// One relative path, in the one spelling this module compares.
 ///
 /// Deliberately NOT `std::path::Path`. `Path` means different things on the two platforms, and the
-/// difference is not cosmetic here: on Windows `.ai\autopilot.yaml` is the claimed file, and on
+/// difference is not cosmetic here: on Windows `.ai\models.yaml` names a file in `.ai/`, and on
 /// Linux it is a file whose NAME contains a backslash, sitting in the project root. A registry that
 /// used `Path` would grant the claim on both and write two different files.
 ///
@@ -256,8 +305,10 @@ mod tests {
     #[test]
     fn every_claim_names_a_file_the_nucleo_actually_parses() {
         assert_eq!(CLAIMS.len(), 2, "see the module header before adding a row");
-        assert_eq!(CLAIMS[0].path, crate::config::AUTOPILOT_RULES_PATH);
-        assert_eq!(CLAIMS[1].path, crate::workflows::PINS_PATH);
+        assert_eq!(CLAIMS[0].path, crate::project_state::AUTOPILOT_FILE);
+        assert_eq!(CLAIMS[1].path, crate::project_state::PINS_FILE);
+        // Both are the project's STATE, never a file in the project: see the module header.
+        assert!(CLAIMS.iter().all(|claim| claim.home == Home::State));
         // A `static` row with no parser would be write access to bytes nobody checks. The `None`
         // exists for the rows that come from a workflow, and those are never in here.
         assert!(CLAIMS.iter().all(|claim| claim.validate.is_some()));
@@ -284,6 +335,10 @@ mod tests {
             ".ai/github.yaml",
             "email.yaml",
             "nucleos-models.yaml",
+            // And the project's own rules and pins where they used to live. Those files are no
+            // longer read, so there is nothing for the app to author there.
+            ".ai/autopilot.yaml",
+            ".ai/workflows.yaml",
         ] {
             assert!(
                 matches!(owner_of(CLAIMS, path), Owner::Repository),
@@ -296,10 +351,14 @@ mod tests {
     /// command, so writing it is deciding what green means.
     #[test]
     fn the_rules_file_is_declared_and_carries_its_own_validator() {
-        let Owner::Declared(claim) = owner_of(CLAIMS, ".ai/autopilot.yaml") else {
+        let Owner::Declared(claim) = owner_of(CLAIMS, "autopilot.yaml") else {
             panic!("the rules file must be declared");
         };
         assert_eq!(claim.owner, "core");
+        assert_eq!(
+            claim.display("alpha"),
+            "~/.nucleos/projects/alpha/autopilot.yaml"
+        );
         assert!(claim.what.contains("gate command"));
         assert!((claim.validate.unwrap())("gate_command: cargo test\n").is_ok());
     }
@@ -313,11 +372,11 @@ mod tests {
     #[test]
     fn a_traversal_cannot_reach_a_claimed_file() {
         for path in [
-            ".ai/../.ai/autopilot.yaml",
-            "../nucleos/.ai/autopilot.yaml",
-            ".ai/./../.ai/autopilot.yaml",
+            "x/../autopilot.yaml",
+            "../projects/alpha/autopilot.yaml",
+            "./../autopilot.yaml",
             "..",
-            "../.ai/autopilot.yaml",
+            "../autopilot.yaml",
         ] {
             assert!(
                 matches!(owner_of(CLAIMS, path), Owner::Repository),
@@ -329,18 +388,14 @@ mod tests {
     /// A backslash is refused rather than translated, and the test says which platform each answer
     /// would have been wrong on.
     ///
-    /// On Windows `.ai\autopilot.yaml` IS the claimed file. On Linux it is a file whose name
-    /// contains a backslash, in the project root. Granting the claim would write the rules file on
+    /// On Windows `.\autopilot.yaml` IS the claimed file. On Linux it is a file whose name
+    /// contains a backslash. Granting the claim would write the rules file on
     /// one platform and create a junk file on the other, from the identical request — and the
     /// validator would pass in both cases, because the CONTENT is fine. Nothing downstream could
     /// catch it.
     #[test]
     fn a_backslash_names_two_different_files_and_so_names_none() {
-        for path in [
-            ".ai\\autopilot.yaml",
-            ".ai/autopilot.yaml\\",
-            "\\.ai\\autopilot.yaml",
-        ] {
+        for path in [".\\autopilot.yaml", "autopilot.yaml\\", "\\autopilot.yaml"] {
             assert!(
                 matches!(owner_of(CLAIMS, path), Owner::Repository),
                 "{path}"
@@ -353,10 +408,10 @@ mod tests {
     #[test]
     fn a_dot_segment_or_a_doubled_slash_does_not_change_the_answer() {
         for path in [
-            "./.ai/autopilot.yaml",
-            ".ai//autopilot.yaml",
-            ".ai/./autopilot.yaml",
-            "  .ai/autopilot.yaml  ",
+            "./autopilot.yaml",
+            ".//autopilot.yaml",
+            "././autopilot.yaml",
+            "  autopilot.yaml  ",
         ] {
             assert!(
                 matches!(owner_of(CLAIMS, path), Owner::Declared(_)),
@@ -373,8 +428,8 @@ mod tests {
             "/etc/passwd",
             "/",
             "C:/Windows/System32/drivers/etc/hosts",
-            "c:/projects/nucleos/.ai/autopilot.yaml",
-            "//server/share/.ai/autopilot.yaml",
+            "c:/users/me/.nucleos/projects/alpha/autopilot.yaml",
+            "//server/share/autopilot.yaml",
         ] {
             assert!(
                 matches!(owner_of(CLAIMS, path), Owner::Repository),
@@ -468,20 +523,26 @@ mod tests {
         let bundle = crate::workflows::read_bundle(&bundle_dir, "harness", "1.0")
             .unwrap()
             .unwrap();
-        crate::workflows::install(&project, &bundle).unwrap();
+        let pins = temp
+            .path()
+            .join("state")
+            .join(crate::project_state::PINS_FILE);
+        crate::workflows::install(&pins, &bundle).unwrap();
 
-        let claims = claims_for(&project, &library);
+        let claims = claims_for(&project, Some(&pins), &library);
         let Owner::Declared(claim) = owner_of(&claims, ".ai/models.yaml") else {
             panic!("an installed workflow's file must be in the fence");
         };
         assert_eq!(claim.owner, "harness");
+        assert_eq!(claim.home, Home::Project);
+        assert_eq!(claim.display("alpha"), ".ai/models.yaml");
         assert!(
             claim.validate.is_none(),
             "the app does not parse it, so it does not write it"
         );
 
         // And the núcleo's own row is still writable beside it, so the page shows two kinds.
-        let Owner::Declared(rules) = owner_of(&claims, ".ai/autopilot.yaml") else {
+        let Owner::Declared(rules) = owner_of(&claims, "autopilot.yaml") else {
             panic!("the rules file must still be declared");
         };
         assert!(rules.validate.is_some());
@@ -489,9 +550,9 @@ mod tests {
 
     /// A bundle cannot take the file that decides what green means.
     ///
-    /// `.ai/autopilot.yaml` carries `gate_command`. A manifest naming it would move it out of the
-    /// app's hands and into a row with no validator — write access with the check removed — which
-    /// is the one substitution this merge must not perform.
+    /// The rules file carries `gate_command`. A manifest naming the same identity would make the
+    /// row ambiguous, and a row with no validator in its place would be write access with the check
+    /// removed — which is the one substitution this merge must not perform.
     #[test]
     fn a_workflow_cannot_claim_a_file_the_nucleo_already_parses() {
         let temp = tempfile::tempdir().unwrap();
@@ -502,19 +563,24 @@ mod tests {
         std::fs::create_dir_all(&bundle_dir).unwrap();
         std::fs::write(
             bundle_dir.join(crate::workflows::MANIFEST),
-            "owns:\n  - .ai/autopilot.yaml\n  - ../outside.yaml\n",
+            "owns:\n  - autopilot.yaml\n  - ../outside.yaml\n",
         )
         .unwrap();
         let bundle = crate::workflows::read_bundle(&bundle_dir, "greedy", "1.0")
             .unwrap()
             .unwrap();
-        crate::workflows::install(&project, &bundle).unwrap();
+        let pins = temp
+            .path()
+            .join("state")
+            .join(crate::project_state::PINS_FILE);
+        crate::workflows::install(&pins, &bundle).unwrap();
 
-        let claims = claims_for(&project, &library);
-        let Owner::Declared(rules) = owner_of(&claims, ".ai/autopilot.yaml") else {
+        let claims = claims_for(&project, Some(&pins), &library);
+        let Owner::Declared(rules) = owner_of(&claims, "autopilot.yaml") else {
             panic!("the rules file must still be declared");
         };
         assert_eq!(rules.owner, "core");
+        assert_eq!(rules.home, Home::State);
         assert!(rules.validate.is_some());
         // The traversal never becomes a row at all — `normalise` refuses it before it is stored,
         // so the fence cannot be made to describe a file outside the project.
@@ -528,8 +594,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let claims = claims_for(&project, &temp.path().join("no-library-here"));
+        let pins = temp
+            .path()
+            .join("state")
+            .join(crate::project_state::PINS_FILE);
+        let claims = claims_for(&project, Some(&pins), &temp.path().join("no-library-here"));
         assert_eq!(claims.len(), CLAIMS.len());
+        assert_eq!(
+            claims_for(&project, None, &temp.path().join("no-library-here")).len(),
+            CLAIMS.len(),
+            "no state directory is nothing installed, never an empty fence"
+        );
     }
 
     /// Malformed YAML comes back with the parser's words rather than a bare "invalid", because the

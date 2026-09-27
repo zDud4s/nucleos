@@ -73,6 +73,7 @@ mod project_exit;
 mod project_map;
 mod project_policy;
 mod project_readings;
+mod project_state;
 mod prompt_budget;
 mod proposals;
 mod quota;
@@ -214,6 +215,66 @@ async fn migrate_machine_settings(pool: &sqlx::SqlitePool, root: &std::path::Pat
         if let Err(error) = feed::append(pool, None, "config_migrated", &summary, None, None).await
         {
             tracing::warn!(%error, file, "a settings file was copied but the feed line was lost");
+        }
+    }
+}
+
+/// Copies each rostered project's state files from its old `<project root>/.ai/` into
+/// `~/.nucleos/projects/<project_id>/`, and puts a line in that project's feed for each one.
+///
+/// The copying is [`project_state::migrate_legacy`]'s, and so is every rule about when it does and
+/// does not happen; this only reads the roster and tells somebody, for the reason
+/// [`migrate_machine_settings`] gives. The roster is every project with a root on record — a
+/// project in `off` has none, and its old files are copied the next time it is given one and the
+/// daemon starts.
+///
+/// An unreadable roster copies nothing and says so: those projects behave as projects with no rules
+/// file until the next start, which is the state an absent file has always meant.
+async fn migrate_project_state(pool: &sqlx::SqlitePool, root: &std::path::Path) {
+    let roster: Vec<(String, String)> = match sqlx::query_as(
+        "SELECT project_id, project_root FROM autopilot_state WHERE project_root IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(roster) => roster,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the project roster, so no project's .ai/ state was copied");
+            return;
+        }
+    };
+    let roster: Vec<(String, std::path::PathBuf)> = roster
+        .into_iter()
+        .map(|(id, project_root)| (id, std::path::PathBuf::from(project_root)))
+        .collect();
+    let root = root.to_path_buf();
+    let copied =
+        match tokio::task::spawn_blocking(move || project_state::migrate_legacy(&root, &roster))
+            .await
+        {
+            Ok(copied) => copied,
+            Err(error) => {
+                tracing::warn!(%error, "copying project state from .ai/ did not finish");
+                return;
+            }
+        };
+    for (project_id, file) in copied {
+        let summary = format!(
+            "{} copied from .ai/{file} in this project's folder; the old file was left where it \
+             was and is no longer read",
+            project_state::display_path(&project_id, file)
+        );
+        if let Err(error) = feed::append(
+            pool,
+            Some(&project_id),
+            "config_migrated",
+            &summary,
+            None,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(%error, %project_id, file, "a project state file was copied but the feed line was lost");
         }
     }
 }
@@ -829,7 +890,10 @@ async fn main() {
     // each pillar starts on its defaults.
     let machine_config_root = machine_config::root();
     match &machine_config_root {
-        Some(root) => migrate_machine_settings(&pool, root).await,
+        Some(root) => {
+            migrate_machine_settings(&pool, root).await;
+            migrate_project_state(&pool, root).await;
+        }
         None => tracing::warn!(
             "no home directory, so {} cannot be read; every pillar starts on its defaults",
             machine_config::ROOT_DISPLAY
@@ -1555,7 +1619,10 @@ async fn main() {
     tokio::spawn(runs::run_retention_loop(state.clone()));
     tokio::spawn(vcs::run_queue_worker(
         state.pool.clone(),
-        std::sync::Arc::new(git_exec::GitExecutor::default()),
+        std::sync::Arc::new(git_exec::GitExecutor {
+            machine_root: machine_config_root.clone(),
+            ..git_exec::GitExecutor::default()
+        }),
     ));
     // Its own loop and not a step inside the queue worker's, for the reason `resolver.rs` opens
     // with: the worker holds a pool and a repository lock, and starting an agent needs an

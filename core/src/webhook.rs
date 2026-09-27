@@ -113,8 +113,9 @@ pub(crate) async fn deliver(
         return Err(DeliveryError::Unconfigured);
     };
 
-    let rules = crate::config::load_schedule_rules(std::path::Path::new(&project_root))
-        .map_err(DeliveryError::Config)?;
+    let rules =
+        crate::config::load_schedule_rules(state.machine_config_root.as_deref(), &project_id)
+            .map_err(DeliveryError::Config)?;
     let triggers = rules
         .repo_triggers
         .into_iter()
@@ -178,7 +179,10 @@ mod tests {
     use crate::runner::FakeCommandRunner;
     use std::sync::Arc;
 
-    async fn test_state() -> AppState {
+    /// A state whose `machine_config_root` is a temporary directory standing in for `~/.nucleos`,
+    /// returned beside it so the directory lives exactly as long as the test that holds it.
+    async fn test_state() -> (AppState, tempfile::TempDir) {
+        let home = tempfile::tempdir().expect("create a stand-in home");
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(
@@ -189,7 +193,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        AppState {
+        let state = AppState {
             token: Token("test-token".into()),
             pool,
             telegram_doctrine: None,
@@ -202,7 +206,7 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
-            machine_config_root: None,
+            machine_config_root: Some(home.path().to_path_buf()),
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: Arc::new(crate::state::EmailRuntime::default()),
             voice: Arc::new(crate::voice::VoiceRuntime::default()),
@@ -214,17 +218,21 @@ mod tests {
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
-        }
+        };
+        (state, home)
     }
 
     async fn configured_project(state: &AppState) -> tempfile::TempDir {
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(project.path().join(".ai")).unwrap();
-        std::fs::write(
-            project.path().join(".ai").join("autopilot.yaml"),
+        crate::project_state::write_for_test(
+            state
+                .machine_config_root
+                .as_deref()
+                .expect("the test state has a stand-in home"),
+            "configured",
+            crate::project_state::AUTOPILOT_FILE,
             "repo_triggers:\n  - name: pushed-main\n    branch: main\n    prompt: \"review the push\"\n",
-        )
-        .unwrap();
+        );
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root)
              VALUES ('configured', 'shadow', ?)",
@@ -260,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn configured_project_and_branch_fire_once_and_replay_is_deduplicated() {
-        let state = test_state().await;
+        let (state, _home) = test_state().await;
         let _project = configured_project(&state).await;
 
         assert!(matches!(
@@ -282,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_without_sender_id_uses_project_branch_and_sha_for_deduplication() {
-        let state = test_state().await;
+        let (state, _home) = test_state().await;
         let _project = configured_project(&state).await;
         let mut first = delivery("unused");
         first.delivery_id = None;
@@ -302,7 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn unconfigured_project_or_branch_is_refused() {
-        let state = test_state().await;
+        let (state, _home) = test_state().await;
         let _project = configured_project(&state).await;
 
         let mut unknown_project = delivery("project");
@@ -323,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_switch_stops_a_delivery_before_it_fires() {
-        let state = test_state().await;
+        let (state, _home) = test_state().await;
         let _project = configured_project(&state).await;
         crate::autopilot::set_kill_switch(&state.pool, true)
             .await
@@ -338,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn attention_brake_stops_a_delivery_before_it_fires() {
-        let state = test_state().await;
+        let (state, _home) = test_state().await;
         let _project = configured_project(&state).await;
         crate::attention::record_heartbeat(
             &state.pool,

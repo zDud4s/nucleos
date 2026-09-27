@@ -1886,7 +1886,8 @@ pub async fn resume(pool: &SqlitePool, job_id: i64) -> sqlx::Result<()> {
 
 /// What a caller asks for when it starts a job.
 ///
-/// The shape is copied onto the row rather than re-read per node: `.ai/autopilot.yaml` can be
+/// The shape is copied onto the row rather than re-read per node: the project's `autopilot.yaml` can
+/// be
 /// edited mid-flight, and a job that changed shape between its own nodes would gate some items and
 /// not others with nothing recording why.
 pub struct NewJob<'a> {
@@ -4200,7 +4201,10 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
             .await;
     }
 
-    let command = match crate::config::load_schedule_rules(Path::new(&job.project_root)) {
+    let command = match crate::config::load_schedule_rules(
+        state.machine_config_root.as_deref(),
+        &job.project_id,
+    ) {
         Ok(rules) => rules.gate_command,
         // Unreadable is not the same as absent, and this is the distinction §7 of the design says
         // is the easiest to get wrong: a configuration nobody can read means the measurement did
@@ -4830,25 +4834,27 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
     // a job admitted at 03:00 could otherwise keep starting nodes at 08:00 with the owner at the
     // keyboard. The item in flight is never killed — its gate has already run or is about to — so
     // this only ever refuses to start the NEXT one.
-    // Switched off per project in `.ai/autopilot.yaml`, and read HERE rather than once at
+    // Switched off per project in the project's `autopilot.yaml`, and read HERE rather than once at
     // admission for the same reason decision 10 gives about the check itself: a job admitted under
     // one setting must not go on starting nodes under it after the owner changed their mind.
     //
     // A rules file that cannot be read leaves the brake ON. That is the direction every other arm
     // of this chain fails in, and the asymmetry is the argument: being wrong this way costs a job
     // that waits, and being wrong the other way starts a node in a worktree somebody is using.
-    let brake_applies =
-        match crate::config::load_schedule_rules(std::path::Path::new(&job.project_root)) {
-            Ok(rules) => rules.attention_brake(),
-            Err(error) => {
-                tracing::warn!(
-                    job_id = job.id,
-                    %error,
-                    "could not read this project's autopilot rules; keeping the attention brake on"
-                );
-                true
-            }
-        };
+    let brake_applies = match crate::config::load_schedule_rules(
+        state.machine_config_root.as_deref(),
+        &job.project_id,
+    ) {
+        Ok(rules) => rules.attention_brake(),
+        Err(error) => {
+            tracing::warn!(
+                job_id = job.id,
+                %error,
+                "could not read this project's autopilot rules; keeping the attention brake on"
+            );
+            true
+        }
+    };
     if !brake_applies {
         return Brake::Go;
     }
@@ -9657,13 +9663,27 @@ mod tests {
         for args in [vec!["add", "-A"], vec!["commit", "-m", "seed"]] {
             assert!(git_ok(&repo, &args));
         }
-        std::fs::create_dir_all(repo.join(".ai")).expect("create .ai");
-        std::fs::write(
-            repo.join(".ai").join("autopilot.yaml"),
-            format!("gate_command: {gate}\nschedules: []\n"),
-        )
-        .expect("write the project's gate configuration");
+        // The gate, where a job reads it: the project's state directory under a stand-in home
+        // that lives in the same container (see `with_home`). Written for both ids these walks use,
+        // since the rules are keyed by the project and not by the folder.
+        for project_id in ["nucleos", "project-a"] {
+            crate::project_state::write_for_test(
+                &container.path().join(WALK_HOME),
+                project_id,
+                crate::project_state::AUTOPILOT_FILE,
+                &format!("gate_command: {gate}\nschedules: []\n"),
+            );
+        }
         (container, repo)
+    }
+
+    /// The stand-in for `~/.nucleos` inside a [`walkable_repo`]'s container.
+    const WALK_HOME: &str = "nucleos-home";
+
+    /// `state`, reading project state from the stand-in home [`walkable_repo`] wrote the gate into.
+    fn with_home(mut state: AppState, container: &tempfile::TempDir) -> AppState {
+        state.machine_config_root = Some(container.path().join(WALK_HOME));
+        state
     }
 
     fn git_ok(repo: &std::path::Path, args: &[&str]) -> bool {
@@ -9764,6 +9784,7 @@ mod tests {
 
         // The green one lands first, and is kept.
         let state = test_state(pool.clone()).await;
+        let state = with_home(state, &_container);
         assert_eq!(
             merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 1).await,
             Step::Continued
@@ -9810,6 +9831,7 @@ mod tests {
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
+        let state = with_home(state, &_container);
 
         let started = start(
             &state,
@@ -10175,6 +10197,7 @@ mod tests {
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let (state, runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
         *runner.writes.lock().unwrap() = three_scripted_agents();
 
         let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, 2, 0).await;
@@ -10255,6 +10278,7 @@ mod tests {
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let (state, runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
         *runner.writes.lock().unwrap() = three_scripted_agents();
 
         let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, 2, 0).await;
@@ -10340,6 +10364,7 @@ mod tests {
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let (state, runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
         *runner.writes.lock().unwrap() = three_scripted_agents();
 
         let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, 2, 0).await;
@@ -10423,6 +10448,7 @@ mod tests {
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let (state, runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
         *runner.writes.lock().unwrap() = agents;
 
         let job_id =
@@ -10719,6 +10745,7 @@ mod tests {
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let (state, runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
         *runner.writes.lock().unwrap() = three_agents_over_one_registry();
 
         let job_id =
@@ -10878,6 +10905,7 @@ mod tests {
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let (state, runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
 
         let job_id = start_job_for(
             &state,
@@ -10961,6 +10989,7 @@ mod tests {
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let (state, runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
 
         let job_id = start_job_for(
             &state,
@@ -12426,12 +12455,16 @@ mod tests {
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
         let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        std::fs::create_dir_all(worktree.path().join(".ai")).unwrap();
-        std::fs::write(
-            worktree.path().join(".ai").join("autopilot.yaml"),
+        crate::project_state::write_for_test(
+            worktree.path(),
+            "project-a",
+            crate::project_state::AUTOPILOT_FILE,
             "attention_brake: false\n",
-        )
-        .unwrap();
+        );
+        let state = AppState {
+            machine_config_root: Some(worktree.path().to_path_buf()),
+            ..state
+        };
         sqlx::query("UPDATE jobs SET project_root = ? WHERE id = ?")
             .bind(worktree.path().to_string_lossy().into_owned())
             .bind(job_id)
@@ -12647,7 +12680,8 @@ mod tests {
     /// through `NewJob` and reads the row back, which is the only shape that can.
     ///
     /// Copied rather than re-read, for the reason `0042_jobs.sql` already gives about `max_items`,
-    /// `gate_each` and `review`: `.ai/autopilot.yaml` can be edited mid-flight, and a job that
+    /// `gate_each` and `review`: the project's `autopilot.yaml` can be edited mid-flight, and a job
+    /// that
     /// changed shape between its own nodes would gate some items and not others with nothing
     /// recording why. A budget re-read at each step has that failure with a worse symptom — one item
     /// retried because the file said 2 this morning, and the item beside it dropped because it says
@@ -12791,6 +12825,7 @@ mod tests {
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let (state, _runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
 
         seed_agent(&pool, "ana", "migrations", "careful").await;
         seed_crew(&pool, "crew", "ana", &[]).await;
@@ -12892,6 +12927,7 @@ mod tests {
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let (state, _runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
 
         let job_id = seed_job_in(
             &pool,
@@ -13026,12 +13062,16 @@ mod tests {
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
         let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        std::fs::create_dir_all(worktree.path().join(".ai")).unwrap();
-        std::fs::write(
-            worktree.path().join(".ai").join("autopilot.yaml"),
+        crate::project_state::write_for_test(
+            worktree.path(),
+            "project-a",
+            crate::project_state::AUTOPILOT_FILE,
             "gate_command: definitely-not-a-real-binary\n",
-        )
-        .unwrap();
+        );
+        let state = AppState {
+            machine_config_root: Some(worktree.path().to_path_buf()),
+            ..state
+        };
         sqlx::query("UPDATE jobs SET gate_each = 0, project_root = ? WHERE id = ?")
             .bind(worktree.path().to_string_lossy().into_owned())
             .bind(job_id)
@@ -13748,6 +13788,7 @@ mod tests {
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let (state, _runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
 
         let job_id = seed_job_in(
             &pool,

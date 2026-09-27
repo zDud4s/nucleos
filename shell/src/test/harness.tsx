@@ -173,7 +173,7 @@ export interface DaemonState {
   /** What every workflow-changing route refuses with, or `null` to accept. */
   workflowRefusal: { status: number; code: string; detail: string } | null;
   /**
-   * A `.ai/workflows.yaml` the daemon cannot parse.
+   * A pins file (`~/.nucleos/projects/<id>/workflows.yaml`) the daemon cannot parse.
    *
    * Its own field rather than a variant of `workflows`, because it is a different answer with a
    * different sentence: an empty list says *this project uses no workflow*, and that is precisely
@@ -349,7 +349,9 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     text: { diff: "", cat: "" },
     ownership: [
       {
-        path: ".ai/autopilot.yaml",
+        path: "autopilot.yaml",
+        home: "state",
+        display: "~/.nucleos/projects/alpha/autopilot.yaml",
         owner: "core",
         what: "what this project does on its own, and the gate command that decides what green means",
       },
@@ -1150,7 +1152,9 @@ export interface HarnessOptions {
 export function daemonText(state: DaemonState): (path: string) => Promise<string> {
   return async (path) => {
     if (path.includes("/diff")) return state.text.diff;
-    if (path.includes("/cat")) {
+    // `owned` is the claimed files' own read, and it answers exactly as `cat` does — including the
+    // 404 for a file not written yet — so the two share the one text a test sets.
+    if (path.includes("/cat") || path.includes("/owned")) {
       // `null` is a file that is not there — a 404, and a different fact from an empty file. A
       // project with no rules file yet is the ordinary case, and the editor says a different
       // sentence for it.

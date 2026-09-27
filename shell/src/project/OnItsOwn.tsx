@@ -4,6 +4,7 @@ import { isApiRefusal } from "../data/client";
 import {
   autonomyOf,
   rulesEditorPath,
+  rulesFileName,
   useClearJudge,
   useProjectRules,
   useSetJudge,
@@ -46,7 +47,8 @@ import "../pages/projects.css";
  * needs no prop threading.
  *
  * **It writes, and says so.** Two of the panels below change the núcleo's database: the judge and
- * the ceiling. Neither changes a file — `.ai/autopilot.yaml` is edited as raw text in the workspace
+ * the ceiling. Neither changes a file — the project's `autopilot.yaml`, which lives in
+ * `~/.nucleos/projects/<id>/` and not in the project, is edited as raw text in the workspace
  * (`project/OwnedFiles.tsx`), because a form here would re-serialise the YAML and delete the
  * comments somebody left in it. This component links to that editor rather than growing a second
  * one.
@@ -180,9 +182,12 @@ export function Why({ lead, children }: { lead: ReactNode; children: ReactNode }
  * What state the rules file is in, and why that is information rather than a
  * fault.
  *
- * `absent` is ordinary: `.ai/autopilot.yaml` is gitignored, so a fresh clone and
- * every worktree legitimately has none, and a project with no file simply does
- * nothing on its own.
+ * `absent` is ordinary: the file lives in `~/.nucleos/projects/<id>/`, which a
+ * project gets only once somebody writes rules for it, and a project with no file
+ * simply does nothing on its own.
+ *
+ * **Where the file is comes from the daemon** (`rules_path`), because the page
+ * carried `.ai/autopilot.yaml` as a literal and was wrong the day the file moved.
  *
  * `unreadable` is the row that has to be loud. `config.rs` parses with
  * `deny_unknown_fields` precisely so a typo is an error rather than a silently
@@ -211,13 +216,14 @@ function RulesFileState({
   onRefresh: () => void;
 }) {
   const editable = rules.project_root !== null;
+  const file = rulesFileName(rules);
   return (
     <div className="pj-source">
       <p className="pj-source-line">
-        <code className="pj-source-name">.ai/autopilot.yaml</code>
+        <code className="pj-source-name">{file}</code>
         <span className={`pj-source-state pj-source-${rules.rules_file}`}>{rules.rules_file}</span>
         <span className="pj-meta">
-          {rules.project_root === null ? "no folder recorded" : `in ${rules.project_root}`}
+          {rules.project_root === null ? "no folder recorded" : `for ${rules.project_root}`}
         </span>
         {/* Once here rather than on every finding below: the unparseable file, the missing gate
             and the rule that never fires are all put right in the same file, in the same editor. */}
@@ -248,16 +254,16 @@ function RulesFileState({
           </p>
           {editable && (
             <p className="pj-fix">
-              <Link to={rulesEditorPath(projectId)}>Edit .ai/autopilot.yaml in the workspace</Link>
+              <Link to={rulesEditorPath(projectId)}>Edit {file} in the workspace</Link>
             </p>
           )}
         </div>
       )}
       {rules.rules_file === "absent" && (
         <p className="pj-note">
-          There is no .ai/autopilot.yaml under this folder. That is an ordinary state and not a fault
-          — the file is gitignored, so a fresh clone has none — and it means this project starts
-          nothing by itself.
+          There is no {file} yet. That is an ordinary state and not a fault — it lives with this
+          machine&rsquo;s settings rather than in the project, and exists once somebody writes rules
+          — and it means this project starts nothing by itself.
         </p>
       )}
     </div>
@@ -309,9 +315,9 @@ function Autonomy({ projectId, rules }: { projectId: string; rules: ProjectRules
         >
           <p>
             No schedule and no repo trigger, so this project only ever does what somebody asks it to.
-            Both are written in <code>.ai/autopilot.yaml</code> under the project&rsquo;s folder — a
-            schedule runs on a clock, a repo trigger runs when a branch gets a commit — and the file
-            is edited in the project workspace, as text, so the comments in it survive.
+            Both are written in <code>{rulesFileName(rules)}</code> — a schedule runs on a clock, a
+            repo trigger runs when a branch gets a commit — and the file is edited in the project
+            workspace, as text, so the comments in it survive.
           </p>
         </Quiet>
       </Panel>
@@ -482,7 +488,7 @@ function Today({ today }: { today: AutonomyRule["today"] }) {
  * **Out of `variant="dim"`.** `dim` means "present but not the thing you came
  * for", and this panel carries the most consequential sentence on the page: a
  * queue set to wait for a gate that does not exist refuses every merge, over a
- * key in a gitignored file. It is an `ErrorNote` — the ladder's full red box —
+ * key in an unreviewed file. It is an `ErrorNote` — the ladder's full red box —
  * with the key in the mono face because it is a key, the sentence around it in
  * the body face because a person wrote it, and the way to the editor inside it.
  */
@@ -517,7 +523,7 @@ function GatePanel({
       )}
       {/* The second moment the same command can run, and the one nothing else on this
           page would reveal. A landing that takes twenty minutes has a reason, and the
-          reason is a key in a gitignored file — so this is where it stops being
+          reason is a key in an unreviewed file — so this is where it stops being
           invisible. */}
       {contradiction ? (
         <ErrorNote>

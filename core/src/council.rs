@@ -1017,7 +1017,8 @@ pub struct RosterOverride {
 ///
 /// The accepted cost: a roster naming a deleted agent is discovered only when somebody asks a
 /// question. That refusal happens before the budget check and before any row is written, so it
-/// costs the owner one clear error and nothing else. It is the same cost `.ai/autopilot.yaml`
+/// costs the owner one clear error and nothing else. It is the same cost a project's
+/// `autopilot.yaml`
 /// already pays by naming a project root that has since moved.
 async fn resolve_roster(
     state: &crate::state::AppState,

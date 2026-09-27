@@ -66,10 +66,15 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Where a project records which workflows it uses. Relative to the project root, forward slashes.
-pub const PINS_PATH: &str = ".ai/workflows.yaml";
-
 /// Where an ejected bundle's copy lands, per §6.1. One directory per workflow name.
+///
+/// Relative to the PROJECT root, and it stays there. The pins file moved out of the project into
+/// `~/.nucleos/projects/<id>/workflows.yaml` (see `project_state.rs`), because a pin is this app's
+/// record of what a project uses. An ejected copy is the opposite kind of thing: the project's own
+/// files, which is what ejecting means, and they belong under the project's version control.
+///
+/// Every function below that reads or writes pins therefore takes the pins FILE as its own
+/// argument, and only the ones that also touch a copy take the project root beside it.
 pub const EJECTED_DIR: &str = ".ai/workflows";
 
 /// The one file in a bundle this module parses. Everything else is bytes to be hashed.
@@ -85,8 +90,11 @@ const MAX_FILES: usize = 4_000;
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The library on this machine, or `None` when there is no home directory to hang it off.
+///
+/// Under [`crate::machine_config::root`], the same `~/.nucleos` every other file this app keeps for
+/// a person lives in, so there is one answer to "where is it" and not two spellings of it.
 pub fn library_root() -> Option<PathBuf> {
-    crate::commands::home().map(|home| home.join(".nucleos").join("workflows"))
+    crate::machine_config::root().map(|root| root.join("workflows"))
 }
 
 /* ------------------------------------------------------------------ names -- */
@@ -364,7 +372,7 @@ pub struct NodeOverlay {
     pub command: Option<String>,
 }
 
-/// One workflow this project uses, as `.ai/workflows.yaml` records it.
+/// One workflow this project uses, as its `workflows.yaml` records it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pin {
     pub name: String,
@@ -429,7 +437,7 @@ pub fn parse_pins(contents: &str) -> Result<Pins, String> {
 /// Serialise the pins back, with a line saying who writes the file.
 ///
 /// **Re-serialising destroys comments, and here that is correct** — which is the opposite of the
-/// call `OwnedFiles` makes about `.ai/autopilot.yaml`. That file is a person's, and commenting
+/// call `OwnedFiles` makes about `autopilot.yaml`. That file is a person's, and commenting
 /// `gate_command:` out is how a gate is switched off, so the app edits it as raw text. This file is
 /// the app's own bookkeeping: every field in it is written by an install, an eject or an update.
 /// The header says so, so that somebody who types a comment into it learns where it went.
@@ -447,10 +455,10 @@ pub fn validate_pins(contents: &str) -> Result<(), String> {
     parse_pins(contents).map(|_| ())
 }
 
-/// Read a project's pins. A project with no file pins nothing.
-pub fn read_pins(project_root: &Path) -> Result<Pins, String> {
-    let path = project_root.join(PINS_PATH);
-    match std::fs::read_to_string(&path) {
+/// Read a project's pins from `pins`, the file — `~/.nucleos/projects/<id>/workflows.yaml` in
+/// production. A project with no file pins nothing.
+pub fn read_pins(pins: &Path) -> Result<Pins, String> {
+    match std::fs::read_to_string(pins) {
         Ok(text) => parse_pins(&text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Pins::default()),
         Err(error) => Err(error.to_string()),
@@ -531,8 +539,15 @@ pub fn copy_path(project_root: &Path, pin: &Pin) -> Option<PathBuf> {
 }
 
 /// Every workflow this project pins, measured against the library as it is right now.
-pub fn installed(project_root: &Path, library_root: &Path) -> Result<Vec<Installed>, String> {
-    let pins = read_pins(project_root)?;
+///
+/// `pins_file` says what the project uses; `project_root` is where an ejected or adopted copy is
+/// looked for.
+pub fn installed(
+    project_root: &Path,
+    pins_file: &Path,
+    library_root: &Path,
+) -> Result<Vec<Installed>, String> {
+    let pins = read_pins(pins_file)?;
     let shelf = library(library_root).map_err(|error| error.to_string())?;
 
     let mut out = Vec::new();
@@ -692,8 +707,7 @@ impl std::fmt::Display for Refused {
     }
 }
 
-fn save_pins(project_root: &Path, pins: &Pins) -> Result<(), Refused> {
-    let path = project_root.join(PINS_PATH);
+fn save_pins(path: &Path, pins: &Pins) -> Result<(), Refused> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| Refused::Io(error.to_string()))?;
     }
@@ -701,7 +715,7 @@ fn save_pins(project_root: &Path, pins: &Pins) -> Result<(), Refused> {
     // pins file is not a smaller one, it is a project whose workflows all became `missing`.
     let temp = path.with_extension("nucleos-tmp");
     std::fs::write(&temp, render_pins(pins)).map_err(|error| Refused::Io(error.to_string()))?;
-    std::fs::rename(&temp, &path).map_err(|error| Refused::Io(error.to_string()))
+    std::fs::rename(&temp, path).map_err(|error| Refused::Io(error.to_string()))
 }
 
 /// Pin a bundle, replacing any pin of the same name.
@@ -710,11 +724,11 @@ fn save_pins(project_root: &Path, pins: &Pins) -> Result<(), Refused> {
 /// already configured is the ordinary upgrade, and dropping their node overrides on the floor for
 /// it would be a silent loss with nowhere to look it up. A node the new version does not have keeps
 /// its row and stops applying, which the canvas can say out loud.
-pub fn install(project_root: &Path, bundle: &Bundle) -> Result<(), Refused> {
+pub fn install(pins_file: &Path, bundle: &Bundle) -> Result<(), Refused> {
     if !valid_name(&bundle.name) || !valid_name(&bundle.version) {
         return Err(Refused::BadName);
     }
-    let mut pins = read_pins(project_root).map_err(Refused::Io)?;
+    let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
     let existing = pins
         .workflows
         .iter()
@@ -743,7 +757,7 @@ pub fn install(project_root: &Path, bundle: &Bundle) -> Result<(), Refused> {
         None => pins.workflows.push(pin),
     }
     pins.workflows.sort_by(|a, b| a.name.cmp(&b.name));
-    save_pins(project_root, &pins)
+    save_pins(pins_file, &pins)
 }
 
 /// Stop using a workflow. Removes the pin; never removes an ejected copy.
@@ -751,14 +765,14 @@ pub fn install(project_root: &Path, bundle: &Bundle) -> Result<(), Refused> {
 /// Deleting `.ai/workflows/<name>/` here would be this app deleting somebody's files as a side
 /// effect of a list operation. The copy is theirs — that is what ejecting means — and it is under
 /// version control where they put it.
-pub fn uninstall(project_root: &Path, name: &str) -> Result<(), Refused> {
-    let mut pins = read_pins(project_root).map_err(Refused::Io)?;
+pub fn uninstall(pins_file: &Path, name: &str) -> Result<(), Refused> {
+    let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
     let before = pins.workflows.len();
     pins.workflows.retain(|pin| pin.name != name);
     if pins.workflows.len() == before {
         return Err(Refused::NotInstalled);
     }
-    save_pins(project_root, &pins)
+    save_pins(pins_file, &pins)
 }
 
 /// Copy the library's bundle into the project and record when it stopped receiving updates.
@@ -768,6 +782,7 @@ pub fn uninstall(project_root: &Path, name: &str) -> Result<(), Refused> {
 /// the thing that happens by accident.
 pub fn eject(
     project_root: &Path,
+    pins_file: &Path,
     bundle: &Bundle,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Refused> {
@@ -777,7 +792,7 @@ pub fn eject(
     }
     // The pin is looked up before anything is copied. A project that does not use this workflow
     // must not end up with its files in `.ai/workflows/` and nothing recording why they are there.
-    let mut pins = read_pins(project_root).map_err(Refused::Io)?;
+    let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
     let Some(index) = pins
         .workflows
         .iter()
@@ -798,7 +813,7 @@ pub fn eject(
     pins.workflows[index].version = bundle.version.clone();
     pins.workflows[index].origin = bundle.origin.clone();
     pins.workflows[index].hash = bundle.hash.clone();
-    save_pins(project_root, &pins)
+    save_pins(pins_file, &pins)
 }
 
 /// Record a folder this project already has as its workflow, copying nothing.
@@ -816,6 +831,7 @@ pub fn eject(
 /// is a pin to.
 pub fn adopt(
     project_root: &Path,
+    pins_file: &Path,
     name: &str,
     rel: &str,
     now: chrono::DateTime<chrono::Utc>,
@@ -829,7 +845,7 @@ pub fn adopt(
     }
     let hash = digest_of(&file_hashes(&folder).map_err(|error| Refused::Io(error.to_string()))?);
 
-    let mut pins = read_pins(project_root).map_err(Refused::Io)?;
+    let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
     let pin = Pin {
         name: name.to_string(),
         // Versionless is not a version this app invents. `0` says plainly that nothing has ever
@@ -846,7 +862,7 @@ pub fn adopt(
         None => pins.workflows.push(pin),
     }
     pins.workflows.sort_by(|a, b| a.name.cmp(&b.name));
-    save_pins(project_root, &pins)
+    save_pins(pins_file, &pins)
 }
 
 /// Take the origin's current bytes: re-stamp the pin, and for an ejected workflow, re-copy.
@@ -857,10 +873,11 @@ pub fn adopt(
 /// one.
 pub fn update(
     project_root: &Path,
+    pins_file: &Path,
     bundle: &Bundle,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Refused> {
-    let mut pins = read_pins(project_root).map_err(Refused::Io)?;
+    let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
     let Some(index) = pins
         .workflows
         .iter()
@@ -890,7 +907,7 @@ pub fn update(
     pins.workflows[index].version = bundle.version.clone();
     pins.workflows[index].origin = bundle.origin.clone();
     pins.workflows[index].hash = bundle.hash.clone();
-    save_pins(project_root, &pins)
+    save_pins(pins_file, &pins)
 }
 
 /// Longest a node id may be in an overlay row.
@@ -911,7 +928,7 @@ pub const MAX_NODE_ID: usize = 120;
 /// would be a third state meaning the same thing, so it is normalised away: an override that
 /// overrides nothing is not an override.
 pub fn set_overlay(
-    project_root: &Path,
+    pins_file: &Path,
     name: &str,
     node: &str,
     overlay: Option<NodeOverlay>,
@@ -920,7 +937,7 @@ pub fn set_overlay(
     if node.is_empty() || node.len() > MAX_NODE_ID {
         return Err(Refused::BadName);
     }
-    let mut pins = read_pins(project_root).map_err(Refused::Io)?;
+    let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
     let Some(pin) = pins.workflows.iter_mut().find(|pin| pin.name == name) else {
         return Err(Refused::NotInstalled);
     };
@@ -933,7 +950,7 @@ pub fn set_overlay(
             pin.nodes.remove(node);
         }
     }
-    save_pins(project_root, &pins)
+    save_pins(pins_file, &pins)
 }
 
 /// Copy a directory tree, files and directories only.
@@ -967,6 +984,39 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339("2026-08-23T10:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc)
+    }
+
+    /// Where a test project's pins live: a sibling of the project, standing in for
+    /// `~/.nucleos/projects/<id>/`, and deliberately OUTSIDE the project folder.
+    fn pins_of(project: &Path) -> PathBuf {
+        project
+            .parent()
+            .expect("a test project sits in a temporary directory")
+            .join("state")
+            .join(crate::project_state::PINS_FILE)
+    }
+
+    /// A pin is this app's record, not the project's file: installing writes nothing into the
+    /// project, and the old `.ai/workflows.yaml` is never created there again.
+    #[test]
+    fn installing_writes_the_pin_outside_the_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let root = shelf(
+            &temp.path().join("lib"),
+            "harness",
+            "1.0",
+            &[("g.yaml", "a")],
+        );
+
+        install(&pins_of(&project), &bundle_at(&root, "harness", "1.0")).unwrap();
+
+        assert!(pins_of(&project).is_file());
+        assert!(
+            std::fs::read_dir(&project).unwrap().next().is_none(),
+            "installing must leave the project folder untouched"
+        );
     }
 
     /// Put a bundle in a library. Returns the library root.
@@ -1102,8 +1152,8 @@ mod tests {
         );
         let bundle = bundle_at(&root, "harness", "1.0");
 
-        install(&project, &bundle).unwrap();
-        let pins = read_pins(&project).unwrap();
+        install(&pins_of(&project), &bundle).unwrap();
+        let pins = read_pins(&pins_of(&project)).unwrap();
         assert_eq!(pins.workflows.len(), 1);
         assert_eq!(pins.workflows[0].origin, "library:harness@1.0");
         assert_eq!(pins.workflows[0].hash, bundle.hash);
@@ -1120,15 +1170,15 @@ mod tests {
             "1.0",
             &[("g.yaml", "a")],
         );
-        install(&project, &bundle_at(&root, "harness", "1.0")).unwrap();
+        install(&pins_of(&project), &bundle_at(&root, "harness", "1.0")).unwrap();
 
         assert_eq!(
-            installed(&project, &root).unwrap()[0].standing,
+            installed(&project, &pins_of(&project), &root).unwrap()[0].standing,
             Standing::Referenced
         );
 
         std::fs::write(root.join("harness/1.0/g.yaml"), "b").unwrap();
-        let after = installed(&project, &root).unwrap();
+        let after = installed(&project, &pins_of(&project), &root).unwrap();
         assert_eq!(after[0].standing, Standing::Drifted);
         // Both hashes are served, so the page states a difference somebody can check rather than
         // asserting one.
@@ -1142,10 +1192,10 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let lib = temp.path().join("lib");
         shelf(&lib, "harness", "1.0", &[("g.yaml", "a")]);
-        install(&project, &bundle_at(&lib, "harness", "1.0")).unwrap();
+        install(&pins_of(&project), &bundle_at(&lib, "harness", "1.0")).unwrap();
         shelf(&lib, "harness", "1.1", &[("g.yaml", "b")]);
 
-        let rows = installed(&project, &lib).unwrap();
+        let rows = installed(&project, &pins_of(&project), &lib).unwrap();
         assert_eq!(rows[0].standing, Standing::Referenced);
         assert_eq!(rows[0].update_available.as_deref(), Some("1.1"));
     }
@@ -1161,12 +1211,12 @@ mod tests {
             "1.0",
             &[("g.yaml", "a")],
         );
-        install(&project, &bundle_at(&lib, "harness", "1.0")).unwrap();
+        install(&pins_of(&project), &bundle_at(&lib, "harness", "1.0")).unwrap();
 
         // The new machine: the pin travelled with the repository, the bundle did not.
         let empty = temp.path().join("other-machine");
         std::fs::create_dir_all(&empty).unwrap();
-        let rows = installed(&project, &empty).unwrap();
+        let rows = installed(&project, &pins_of(&project), &empty).unwrap();
         assert_eq!(rows[0].standing, Standing::Missing);
         assert_eq!(rows[0].origin, "library:harness@1.0");
         assert!(rows[0].origin_hash.is_none());
@@ -1184,15 +1234,15 @@ mod tests {
             &[("skills/plan.md", "plan")],
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
-        install(&project, &bundle).unwrap();
-        eject(&project, &bundle, now()).unwrap();
+        install(&pins_of(&project), &bundle).unwrap();
+        eject(&project, &pins_of(&project), &bundle, now()).unwrap();
 
         assert!(
             project
                 .join(".ai/workflows/harness/skills/plan.md")
                 .is_file()
         );
-        let rows = installed(&project, &lib).unwrap();
+        let rows = installed(&project, &pins_of(&project), &lib).unwrap();
         assert_eq!(rows[0].standing, Standing::Ejected);
         assert_eq!(
             rows[0].ejected_at.as_deref(),
@@ -1212,12 +1262,12 @@ mod tests {
             &[("g.yaml", "a")],
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
-        install(&project, &bundle).unwrap();
-        eject(&project, &bundle, now()).unwrap();
+        install(&pins_of(&project), &bundle).unwrap();
+        eject(&project, &pins_of(&project), &bundle, now()).unwrap();
 
         std::fs::write(project.join(".ai/workflows/harness/g.yaml"), "mine").unwrap();
         assert_eq!(
-            eject(&project, &bundle, now()),
+            eject(&project, &pins_of(&project), &bundle, now()),
             Err(Refused::AlreadyEjected)
         );
         assert_eq!(
@@ -1238,13 +1288,13 @@ mod tests {
             &[("g.yaml", "a")],
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
-        install(&project, &bundle).unwrap();
-        eject(&project, &bundle, now()).unwrap();
+        install(&pins_of(&project), &bundle).unwrap();
+        eject(&project, &pins_of(&project), &bundle, now()).unwrap();
         std::fs::remove_dir_all(project.join(".ai/workflows/harness")).unwrap();
 
         // The field still says it was ejected; the disk decides, and the disk says there is no copy.
         assert_eq!(
-            installed(&project, &lib).unwrap()[0].standing,
+            installed(&project, &pins_of(&project), &lib).unwrap()[0].standing,
             Standing::Referenced
         );
     }
@@ -1261,8 +1311,8 @@ mod tests {
             &[("a.md", "one"), ("b.md", "two")],
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
-        install(&project, &bundle).unwrap();
-        eject(&project, &bundle, now()).unwrap();
+        install(&pins_of(&project), &bundle).unwrap();
+        eject(&project, &pins_of(&project), &bundle, now()).unwrap();
 
         let mine_dir = project.join(".ai/workflows/harness");
         std::fs::write(mine_dir.join("a.md"), "one, changed").unwrap();
@@ -1300,9 +1350,9 @@ mod tests {
         let lib = temp.path().join("lib");
         shelf(&lib, "harness", "1.0", &[("g.yaml", "a")]);
         shelf(&lib, "harness", "1.1", &[("g.yaml", "b")]);
-        install(&project, &bundle_at(&lib, "harness", "1.0")).unwrap();
+        install(&pins_of(&project), &bundle_at(&lib, "harness", "1.0")).unwrap();
 
-        let mut pins = read_pins(&project).unwrap();
+        let mut pins = read_pins(&pins_of(&project)).unwrap();
         pins.workflows[0].nodes.insert(
             "review".into(),
             NodeOverlay {
@@ -1310,10 +1360,10 @@ mod tests {
                 ..NodeOverlay::default()
             },
         );
-        save_pins(&project, &pins).unwrap();
+        save_pins(&pins_of(&project), &pins).unwrap();
 
-        install(&project, &bundle_at(&lib, "harness", "1.1")).unwrap();
-        let after = read_pins(&project).unwrap();
+        install(&pins_of(&project), &bundle_at(&lib, "harness", "1.1")).unwrap();
+        let after = read_pins(&pins_of(&project)).unwrap();
         assert_eq!(after.workflows.len(), 1);
         assert_eq!(after.workflows[0].version, "1.1");
         assert_eq!(after.workflows[0].nodes["review"].disabled, Some(true));
@@ -1327,19 +1377,25 @@ mod tests {
         let lib = temp.path().join("lib");
         shelf(&lib, "harness", "1.0", &[("g.yaml", "a")]);
         let old = bundle_at(&lib, "harness", "1.0");
-        install(&project, &old).unwrap();
-        eject(&project, &old, now()).unwrap();
+        install(&pins_of(&project), &old).unwrap();
+        eject(&project, &pins_of(&project), &old, now()).unwrap();
         std::fs::write(project.join(".ai/workflows/harness/g.yaml"), "mine").unwrap();
 
         shelf(&lib, "harness", "1.1", &[("g.yaml", "b")]);
         let later = now() + chrono::Duration::days(30);
-        update(&project, &bundle_at(&lib, "harness", "1.1"), later).unwrap();
+        update(
+            &project,
+            &pins_of(&project),
+            &bundle_at(&lib, "harness", "1.1"),
+            later,
+        )
+        .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(project.join(".ai/workflows/harness/g.yaml")).unwrap(),
             "b"
         );
-        let rows = installed(&project, &lib).unwrap();
+        let rows = installed(&project, &pins_of(&project), &lib).unwrap();
         assert_eq!(rows[0].version, "1.1");
         assert_eq!(rows[0].standing, Standing::Ejected);
         assert_eq!(
@@ -1361,10 +1417,10 @@ mod tests {
             "1.0",
             &[("g.yaml", "a")],
         );
-        install(&project, &bundle_at(&lib, "harness", "1.0")).unwrap();
+        install(&pins_of(&project), &bundle_at(&lib, "harness", "1.0")).unwrap();
 
         set_overlay(
-            &project,
+            &pins_of(&project),
             "harness",
             "plan",
             Some(NodeOverlay {
@@ -1373,14 +1429,17 @@ mod tests {
             }),
         )
         .unwrap();
-        let rows = installed(&project, &lib).unwrap();
+        let rows = installed(&project, &pins_of(&project), &lib).unwrap();
         assert_eq!(rows[0].overridden_nodes, 1);
         // Still referenced: overriding is not ejecting, and a project that had to take a copy to
         // change a model would take one every time.
         assert_eq!(rows[0].standing, Standing::Referenced);
 
-        set_overlay(&project, "harness", "plan", None).unwrap();
-        assert_eq!(installed(&project, &lib).unwrap()[0].overridden_nodes, 0);
+        set_overlay(&pins_of(&project), "harness", "plan", None).unwrap();
+        assert_eq!(
+            installed(&project, &pins_of(&project), &lib).unwrap()[0].overridden_nodes,
+            0
+        );
     }
 
     /// An override that overrides nothing is not an override, and does not become a row that would
@@ -1396,12 +1455,22 @@ mod tests {
             "1.0",
             &[("g.yaml", "a")],
         );
-        install(&project, &bundle_at(&lib, "harness", "1.0")).unwrap();
+        install(&pins_of(&project), &bundle_at(&lib, "harness", "1.0")).unwrap();
 
-        set_overlay(&project, "harness", "plan", Some(NodeOverlay::default())).unwrap();
-        assert!(read_pins(&project).unwrap().workflows[0].nodes.is_empty());
+        set_overlay(
+            &pins_of(&project),
+            "harness",
+            "plan",
+            Some(NodeOverlay::default()),
+        )
+        .unwrap();
+        assert!(
+            read_pins(&pins_of(&project)).unwrap().workflows[0]
+                .nodes
+                .is_empty()
+        );
         assert_eq!(
-            set_overlay(&project, "harness", "  ", None),
+            set_overlay(&pins_of(&project), "harness", "  ", None),
             Err(Refused::BadName)
         );
     }
@@ -1419,11 +1488,11 @@ mod tests {
         std::fs::write(project.join(".ai/scripts/select_tests.py"), "print()").unwrap();
         let before = std::fs::read_dir(project.join(".ai")).unwrap().count();
 
-        adopt(&project, "harness", ".ai", now()).unwrap();
+        adopt(&project, &pins_of(&project), "harness", ".ai", now()).unwrap();
 
         let empty = temp.path().join("no-library");
         std::fs::create_dir_all(&empty).unwrap();
-        let rows = installed(&project, &empty).unwrap();
+        let rows = installed(&project, &pins_of(&project), &empty).unwrap();
         assert_eq!(rows.len(), 1);
         // Ejected from birth, and honest about having no origin in any library.
         assert_eq!(rows[0].standing, Standing::Ejected);
@@ -1431,19 +1500,22 @@ mod tests {
         assert!(rows[0].origin_hash.is_none());
         assert!(rows[0].local_hash.is_some());
 
-        // Nothing was written into the folder — only `.ai/workflows.yaml`, which is the app's own.
+        // Nothing was written into the folder: the pin lives in the project's state directory, not
+        // beside the folder it adopted.
         assert!(!project.join(".ai/bundle.yaml").exists());
         assert_eq!(
             std::fs::read_to_string(project.join(".ai/workflow.md")).unwrap(),
             "the pipeline"
         );
-        // Two entries before, two after: `workflow.md` and `scripts/`. The pins file the app DOES
-        // write is `.ai/workflows.yaml`, which makes it three — so this is asserted against the
-        // count taken before, not against a literal that would have hidden exactly that.
+        // Two entries before, two after: `workflow.md` and `scripts/`. The pins file used to be
+        // written here as `.ai/workflows.yaml`, which made it three; it is outside the project now,
+        // so the count is unchanged — asserted against the count taken before, not against a
+        // literal that would have hidden exactly that.
         assert_eq!(
             std::fs::read_dir(project.join(".ai")).unwrap().count(),
-            before + 1
+            before
         );
+        assert!(pins_of(&project).is_file());
     }
 
     /// An adopted folder is not something this app replaces. The branch that would have deleted it
@@ -1454,7 +1526,7 @@ mod tests {
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".ai")).unwrap();
         std::fs::write(project.join(".ai/workflow.md"), "the pipeline").unwrap();
-        adopt(&project, "harness", ".ai", now()).unwrap();
+        adopt(&project, &pins_of(&project), "harness", ".ai", now()).unwrap();
 
         let lib = shelf(
             &temp.path().join("lib"),
@@ -1463,8 +1535,14 @@ mod tests {
             &[("g.yaml", "a")],
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
-        assert_eq!(update(&project, &bundle, now()), Err(Refused::Adopted));
-        assert_eq!(eject(&project, &bundle, now()), Err(Refused::Adopted));
+        assert_eq!(
+            update(&project, &pins_of(&project), &bundle, now()),
+            Err(Refused::Adopted)
+        );
+        assert_eq!(
+            eject(&project, &pins_of(&project), &bundle, now()),
+            Err(Refused::Adopted)
+        );
         assert_eq!(
             std::fs::read_to_string(project.join(".ai/workflow.md")).unwrap(),
             "the pipeline"
@@ -1479,7 +1557,13 @@ mod tests {
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         assert_eq!(
-            adopt(&project, "harness", "../elsewhere", now()),
+            adopt(
+                &project,
+                &pins_of(&project),
+                "harness",
+                "../elsewhere",
+                now()
+            ),
             Err(Refused::BadName)
         );
 
@@ -1507,13 +1591,16 @@ mod tests {
             &[("g.yaml", "a")],
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
-        install(&project, &bundle).unwrap();
-        eject(&project, &bundle, now()).unwrap();
+        install(&pins_of(&project), &bundle).unwrap();
+        eject(&project, &pins_of(&project), &bundle, now()).unwrap();
 
-        uninstall(&project, "harness").unwrap();
-        assert!(read_pins(&project).unwrap().workflows.is_empty());
+        uninstall(&pins_of(&project), "harness").unwrap();
+        assert!(read_pins(&pins_of(&project)).unwrap().workflows.is_empty());
         assert!(project.join(".ai/workflows/harness/g.yaml").is_file());
-        assert_eq!(uninstall(&project, "harness"), Err(Refused::NotInstalled));
+        assert_eq!(
+            uninstall(&pins_of(&project), "harness"),
+            Err(Refused::NotInstalled)
+        );
     }
 
     #[test]
@@ -1529,7 +1616,12 @@ mod tests {
         );
 
         assert_eq!(
-            eject(&project, &bundle_at(&lib, "harness", "1.0"), now()),
+            eject(
+                &project,
+                &pins_of(&project),
+                &bundle_at(&lib, "harness", "1.0"),
+                now()
+            ),
             Err(Refused::NotInstalled)
         );
         assert!(!project.join(".ai/workflows/harness").exists());

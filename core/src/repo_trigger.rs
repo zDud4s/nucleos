@@ -74,7 +74,8 @@ pub async fn current_branch_sha(repo: &Path, git_ref: &str, fetch: bool) -> Opti
             .output()
             .await;
     }
-    // A branch name comes from `.ai/autopilot.yaml`, so it is configuration rather than a constant,
+    // A branch name comes from the project's `autopilot.yaml`, so it is configuration rather than a
+    // constant,
     // and `rev-parse` reads a leading `-` as an option: a value like `--git-dir=...` changed what
     // the command did. No shell is involved, so this was argument injection rather than command
     // injection — still not the config file's decision to make. Rejecting the shape is simpler and
@@ -298,7 +299,10 @@ pub(crate) async fn poll_tick(state: &crate::state::AppState, now: chrono::DateT
             continue;
         }
 
-        let triggers = match crate::config::load_schedule_rules(Path::new(&project_root)) {
+        let triggers = match crate::config::load_schedule_rules(
+            state.machine_config_root.as_deref(),
+            &project_id,
+        ) {
             Ok(rules) => rules.repo_triggers,
             Err(error) => {
                 tracing::warn!(
@@ -562,7 +566,10 @@ mod tests {
             .with_timezone(&chrono::Utc)
     }
 
-    async fn test_state() -> crate::state::AppState {
+    /// A state whose `machine_config_root` is a temporary directory standing in for `~/.nucleos`,
+    /// returned beside it so the directory lives exactly as long as the test that holds it.
+    async fn test_state() -> (crate::state::AppState, tempfile::TempDir) {
+        let home = tempfile::tempdir().expect("create a stand-in home");
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -575,7 +582,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        crate::state::AppState {
+        let state = crate::state::AppState {
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,
@@ -588,7 +595,7 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
-            machine_config_root: None,
+            machine_config_root: Some(home.path().to_path_buf()),
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
@@ -600,17 +607,21 @@ mod tests {
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
-        }
+        };
+        (state, home)
     }
 
     async fn seed_due_repo_project(state: &crate::state::AppState, project_id: &str, repo: &Path) {
         let branch = git_stdout(repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
-        std::fs::create_dir_all(repo.join(".ai")).unwrap();
-        std::fs::write(
-            repo.join(".ai").join("autopilot.yaml"),
-            format!("repo_triggers:\n  - name: t1\n    branch: {branch}\n    prompt: \"go\"\n"),
-        )
-        .unwrap();
+        crate::project_state::write_for_test(
+            state
+                .machine_config_root
+                .as_deref()
+                .expect("the test state has a stand-in home"),
+            project_id,
+            crate::project_state::AUTOPILOT_FILE,
+            &format!("repo_triggers:\n  - name: t1\n    branch: {branch}\n    prompt: \"go\"\n"),
+        );
 
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root)
@@ -635,7 +646,7 @@ mod tests {
     async fn a_project_heartbeat_only_stops_that_projects_repo_trigger() {
         let repo_a = init_repo();
         let repo_b = init_repo();
-        let state = test_state().await;
+        let (state, _home) = test_state().await;
         seed_due_repo_project(&state, "project-a", repo_a.path()).await;
         seed_due_repo_project(&state, "project-b", repo_b.path()).await;
         let now = ts("2026-07-20T10:00:00Z");
@@ -661,7 +672,7 @@ mod tests {
     async fn a_global_heartbeat_stops_all_repo_triggers() {
         let repo_a = init_repo();
         let repo_b = init_repo();
-        let state = test_state().await;
+        let (state, _home) = test_state().await;
         seed_due_repo_project(&state, "project-a", repo_a.path()).await;
         seed_due_repo_project(&state, "project-b", repo_b.path()).await;
         let now = ts("2026-07-20T10:00:00Z");
@@ -685,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn no_heartbeat_leaves_repo_trigger_firing_unchanged() {
         let repo = init_repo();
-        let state = test_state().await;
+        let (state, _home) = test_state().await;
         seed_due_repo_project(&state, "project", repo.path()).await;
 
         poll_tick(&state, ts("2026-07-20T10:00:00Z")).await;
@@ -701,14 +712,16 @@ mod tests {
     async fn poll_arms_first_then_fires_on_a_new_commit() {
         let repo = init_repo();
         let branch = git_stdout(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
-        std::fs::create_dir_all(repo.path().join(".ai")).unwrap();
-        std::fs::write(
-            repo.path().join(".ai").join("autopilot.yaml"),
-            format!("repo_triggers:\n  - name: t1\n    branch: {branch}\n    prompt: \"go\"\n"),
-        )
-        .unwrap();
-
-        let state = test_state().await;
+        let (state, _home) = test_state().await;
+        crate::project_state::write_for_test(
+            state
+                .machine_config_root
+                .as_deref()
+                .expect("the test state has a stand-in home"),
+            "proj",
+            crate::project_state::AUTOPILOT_FILE,
+            &format!("repo_triggers:\n  - name: t1\n    branch: {branch}\n    prompt: \"go\"\n"),
+        );
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('proj', 'shadow', ?)",
         )

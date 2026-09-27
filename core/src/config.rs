@@ -1857,17 +1857,19 @@ pub struct ScheduleRule {
 
 /// The ceiling the daemon puts on a rule's fan-out, whatever the file asks for.
 ///
-/// `.ai/` is gitignored and travels with nobody, so `autopilot.yaml` is per-developer configuration
-/// that no review ever sees. A number in it therefore cannot be the only thing standing between one
-/// trigger and an unbounded number of runs — the file may lower the fan-out, never raise it.
+/// A project's `autopilot.yaml` lives in `~/.nucleos/projects/<id>/` and travels with nobody, so
+/// it is per-developer configuration that no review ever sees. A number in it therefore cannot be
+/// the only thing standing between one trigger and an unbounded number of runs — the file may
+/// lower the fan-out, never raise it.
 pub const MAX_ITEMS_CEILING: usize = 5;
 
 /// The ceiling the daemon puts on how many EXTRA implement runs one red gate may buy.
 ///
 /// The same argument `MAX_ITEMS_CEILING` makes, against the same file. A retry is a whole run, and
-/// `.ai/autopilot.yaml` is per-developer configuration no review ever sees — a number in it cannot
-/// be the only thing standing between one red gate and an unbounded number of re-implements. It may
-/// lower the budget; it may not raise it past what the daemon is willing to spend on one item.
+/// the project's `autopilot.yaml` is per-developer configuration no review ever sees — a number in
+/// it cannot be the only thing standing between one red gate and an unbounded number of
+/// re-implements. It may lower the budget; it may not raise it past what the daemon is willing to
+/// spend on one item.
 ///
 /// Three rather than five, and lower than the fan-out ceiling on purpose: past the third attempt the
 /// evidence is that the item cannot be made to pass, and every further run is taken from the items
@@ -1971,7 +1973,7 @@ pub struct GraphConfig {
     ///
     /// `None` — the key absent — means what every `graph:` rule has always meant: only the house
     /// limit governs this job. That is the behaviour of every rule already sitting in somebody's
-    /// gitignored `.ai/autopilot.yaml`, and it must stay theirs, so there is no default number here.
+    /// `autopilot.yaml`, and it must stay theirs, so there is no default number here.
     ///
     /// A PUBLIC field, unlike `max_items` and `gate_retries`. Those two are private behind an
     /// accessor because the accessor applies a CEILING against a per-developer file no review sees.
@@ -2014,8 +2016,8 @@ impl GraphConfig {
     ///
     /// Private field plus this accessor for the same reason `max_items` has one, and it is worth
     /// saying twice because the failure is silent: a caller that read `gate_retries` straight off
-    /// the struct would honour whatever `.ai/autopilot.yaml` asked for, and the ceiling above would
-    /// be decorative — present in the code, absent from every job that actually runs.
+    /// the struct would honour whatever the project's `autopilot.yaml` asked for, and the ceiling
+    /// above would be decorative — present in the code, absent from every job that actually runs.
     pub fn gate_retries(&self) -> usize {
         self.gate_retries.min(MAX_GATE_RETRIES_CEILING)
     }
@@ -2045,7 +2047,7 @@ pub struct AutopilotRules {
     /// before this key existed. `deny_unknown_fields` above means a misspelling is a startup error,
     /// rather than a silently ignored line.
     ///
-    /// Turning this on records the breach in `.ai/local/ledgers/intents.jsonl` for an operator to
+    /// Turning this on records the breach as a line in the project's feed for an operator to
     /// review; it does not enqueue a job, start a run, or touch the approval queue. The
     /// `schedules` and `repo_triggers` lists stay empty because the file's own doctrine is
     /// "Creating this file must not start anything"; this key does not overrule that doctrine.
@@ -2101,21 +2103,37 @@ impl AutopilotRules {
     }
 }
 
-/// Where a project keeps its rules, relative to its root, in forward slashes.
+/// A project's rules, from `~/.nucleos/projects/<project_id>/autopilot.yaml`.
 ///
-/// Named once because two things have to agree about it and they live in different modules: this
-/// loader, and `ownership.rs`, which declares the file writable by the app. A registry that granted
-/// write to a path the loader never reads would be permission to write bytes nobody parses, which
-/// is the one thing that registry exists to prevent — so the claim is asserted against this const
-/// rather than against a second literal.
-pub const AUTOPILOT_RULES_PATH: &str = ".ai/autopilot.yaml";
+/// Keyed by the project's id and not by a folder, which is the whole of `project_state.rs`'s
+/// argument: the same file is found from the main checkout and from every worktree the daemon opens
+/// of it, and it does not move when the project's folder does. `machine_root` is
+/// `AppState::machine_config_root` in production and a temporary directory in a test.
+///
+/// No root, or an id that cannot name a directory, reads as a project with no file — the ordinary
+/// state, answered with `AutopilotRules::default()`. The file is named once, as
+/// [`crate::project_state::AUTOPILOT_FILE`], because two things have to agree about it: this loader
+/// and `ownership.rs`, which declares it writable by the app.
+pub fn load_schedule_rules(
+    machine_root: Option<&Path>,
+    project_id: &str,
+) -> std::io::Result<AutopilotRules> {
+    match crate::project_state::file(
+        machine_root,
+        project_id,
+        crate::project_state::AUTOPILOT_FILE,
+    ) {
+        Some(path) => load_schedule_rules_from(&path),
+        None => Ok(AutopilotRules::default()),
+    }
+}
 
-pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRules> {
-    let path = project_root.join(AUTOPILOT_RULES_PATH);
+/// The same rules, from one file. Absent is `AutopilotRules::default()`.
+pub fn load_schedule_rules_from(path: &Path) -> std::io::Result<AutopilotRules> {
     if !path.exists() {
         return Ok(AutopilotRules::default());
     }
-    parse_schedule_rules(&std::fs::read_to_string(&path)?)
+    parse_schedule_rules(&std::fs::read_to_string(path)?)
 }
 
 /// The same rules, from text that is not on disk yet.
@@ -2150,7 +2168,7 @@ pub fn parse_schedule_rules(contents: &str) -> std::io::Result<AutopilotRules> {
 /// caller has to look, and a hand-built `GraphConfig` in a test is not silently held to a rule that
 /// only the file-reading path enforces.
 ///
-/// Refused rather than clamped, both times, because `.ai/autopilot.yaml` is gitignored per-developer
+/// Refused rather than clamped, both times, because the project's `autopilot.yaml` is per-developer
 /// configuration no review ever sees. A number quietly corrected there is a number nobody learns was
 /// wrong: the file would keep reading as though it had asked for something, and the job would behave
 /// as though it had asked for something else.
@@ -2971,9 +2989,13 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
 
     fn rules_from(yaml: &str) -> std::io::Result<AutopilotRules> {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
-        std::fs::write(dir.path().join(".ai").join("autopilot.yaml"), yaml).unwrap();
-        load_schedule_rules(dir.path())
+        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
+        std::fs::write(
+            dir.path().join("projects").join("p").join("autopilot.yaml"),
+            yaml,
+        )
+        .unwrap();
+        load_schedule_rules(Some(dir.path()), "p")
     }
 
     #[test]
@@ -3045,7 +3067,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
 
     /// The same argument `max_items` is guarded by, against the same file.
     ///
-    /// `.ai/autopilot.yaml` is gitignored per-developer configuration no review ever sees, and a
+    /// a project's `autopilot.yaml` is per-developer configuration no review ever sees, and a
     /// retry is a whole run: a number in that file cannot be the only thing standing between one red
     /// gate and an unbounded number of re-implements. It may lower the budget; it may not raise it
     /// past what the daemon is willing to spend on one item.
@@ -3099,7 +3121,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
 
     /// Absent means absent, and never zero. A rule that says nothing about money keeps exactly
     /// today's behaviour — only the house limit governs — and every `graph:` rule already sitting in
-    /// somebody's gitignored `.ai/autopilot.yaml` says nothing about money. Defaulting this to a
+    /// somebody's `autopilot.yaml` says nothing about money. Defaulting this to a
     /// number would put a ceiling on all of them overnight, and the first evidence would be a job
     /// stopping for a limit nobody set.
     ///
@@ -3119,9 +3141,9 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     ///
     /// Both halves matter and the second more. `#[serde(deny_unknown_fields)]` means the key had to
     /// be declared before any file could carry it, so the first half is the whole of "the nightly
-    /// job can be run by a team". And every rule already sitting in somebody's gitignored
-    /// `.ai/autopilot.yaml` omits it, so the second half is the promise that none of those nights
-    /// changes shape because this landed.
+    /// job can be run by a team". And every rule already sitting in somebody's `autopilot.yaml`
+    /// omits it, so the second half is the promise that none of those nights changes shape because
+    /// this landed.
     ///
     /// Nothing here checks that the team exists, and nothing here can: this is a file and the
     /// catalogue is a table. `job::start` reads it when the job is made, which is the only moment
@@ -3154,8 +3176,8 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     /// allowance is not a number anyone meant to write.
     ///
     /// Clamping it silently to zero would be the worse of the two failures: the job would stop at
-    /// its first node while `.ai/autopilot.yaml` still read as though it had asked for something,
-    /// and the file is gitignored per-developer configuration that no review ever sees.
+    /// its first node while the project's `autopilot.yaml` still read as though it had asked for
+    /// something, and the file is per-developer configuration that no review ever sees.
     #[test]
     fn a_negative_budget_is_malformed_rather_than_clamped() {
         let error = rules_from(
@@ -3858,7 +3880,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     fn schedule_rules_missing_file_returns_default() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            load_schedule_rules(dir.path()).unwrap(),
+            load_schedule_rules(Some(dir.path()), "p").unwrap(),
             AutopilotRules::default()
         );
     }
@@ -3869,7 +3891,11 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     #[test]
     fn a_project_that_configured_nothing_keeps_the_attention_brake() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_schedule_rules(dir.path()).unwrap().attention_brake());
+        assert!(
+            load_schedule_rules(Some(dir.path()), "p")
+                .unwrap()
+                .attention_brake()
+        );
         assert!(AutopilotRules::default().attention_brake());
     }
 
@@ -3890,24 +3916,32 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     #[test]
     fn the_attention_brake_is_switched_off_by_name_and_back_on_by_name() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
-        let path = dir.path().join(".ai").join("autopilot.yaml");
+        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
+        let path = dir.path().join("projects").join("p").join("autopilot.yaml");
 
         std::fs::write(&path, "attention_brake: false\n").unwrap();
-        assert!(!load_schedule_rules(dir.path()).unwrap().attention_brake());
+        assert!(
+            !load_schedule_rules(Some(dir.path()), "p")
+                .unwrap()
+                .attention_brake()
+        );
 
         // Spelled out rather than left to the test above: "absent" and "present and true" are
         // different inputs that must reach the same answer, and only one of them is the default.
         std::fs::write(&path, "attention_brake: true\n").unwrap();
-        assert!(load_schedule_rules(dir.path()).unwrap().attention_brake());
+        assert!(
+            load_schedule_rules(Some(dir.path()), "p")
+                .unwrap()
+                .attention_brake()
+        );
     }
 
     #[test]
     fn schedule_rules_parses_two_entries() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
         std::fs::write(
-            dir.path().join(".ai").join("autopilot.yaml"),
+            dir.path().join("projects").join("p").join("autopilot.yaml"),
             "schedules:\n\
              \x20\x20- name: nightly-build\n\
              \x20\x20\x20\x20cron: \"0 2 * * *\"\n\
@@ -3919,7 +3953,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         )
         .unwrap();
 
-        let rules = load_schedule_rules(dir.path()).unwrap();
+        let rules = load_schedule_rules(Some(dir.path()), "p").unwrap();
         assert_eq!(rules.schedules.len(), 2);
 
         assert_eq!(rules.schedules[0].name, "nightly-build");
@@ -3935,9 +3969,9 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     #[test]
     fn schedule_rules_entry_without_cwd_is_none() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
         std::fs::write(
-            dir.path().join(".ai").join("autopilot.yaml"),
+            dir.path().join("projects").join("p").join("autopilot.yaml"),
             "schedules:\n\
              \x20\x20- name: morning-report\n\
              \x20\x20\x20\x20cron: \"0 8 * * *\"\n\
@@ -3945,7 +3979,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         )
         .unwrap();
 
-        let rules = load_schedule_rules(dir.path()).unwrap();
+        let rules = load_schedule_rules(Some(dir.path()), "p").unwrap();
         assert_eq!(rules.schedules[0].cwd, None);
     }
 
@@ -3957,10 +3991,14 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     fn schedule_rules_with_no_yaml_document_is_not_a_gate_rather_than_an_error() {
         for contents in ["", "   \n\n", "# just a comment\n# and another\n"] {
             let dir = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
-            std::fs::write(dir.path().join(".ai").join("autopilot.yaml"), contents).unwrap();
+            std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
+            std::fs::write(
+                dir.path().join("projects").join("p").join("autopilot.yaml"),
+                contents,
+            )
+            .unwrap();
 
-            let rules = load_schedule_rules(dir.path())
+            let rules = load_schedule_rules(Some(dir.path()), "p")
                 .unwrap_or_else(|e| panic!("{contents:?} must not be an error, got {e}"));
             assert_eq!(rules.gate_command, None);
             assert!(
@@ -3975,22 +4013,22 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     #[test]
     fn schedule_rules_malformed_yaml_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
         std::fs::write(
-            dir.path().join(".ai").join("autopilot.yaml"),
+            dir.path().join("projects").join("p").join("autopilot.yaml"),
             "schedules: [not, valid, for this struct",
         )
         .unwrap();
 
-        assert!(load_schedule_rules(dir.path()).is_err());
+        assert!(load_schedule_rules(Some(dir.path()), "p").is_err());
     }
 
     #[test]
     fn repo_triggers_parse_and_default_empty() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
         std::fs::write(
-            dir.path().join(".ai").join("autopilot.yaml"),
+            dir.path().join("projects").join("p").join("autopilot.yaml"),
             "repo_triggers:\n\
              \x20\x20- name: review-main\n\
              \x20\x20\x20\x20branch: main\n\
@@ -3998,7 +4036,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         )
         .unwrap();
 
-        let rules = load_schedule_rules(dir.path()).unwrap();
+        let rules = load_schedule_rules(Some(dir.path()), "p").unwrap();
         assert!(rules.schedules.is_empty());
         assert_eq!(rules.repo_triggers.len(), 1);
         assert_eq!(rules.repo_triggers[0].name, "review-main");

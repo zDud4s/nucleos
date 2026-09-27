@@ -1912,16 +1912,22 @@ async fn worktree_holding(
 
 /// The `VcsExecutor` the daemon actually runs.
 ///
-/// The whole type is a deadline: everything else it needs comes from the claimed request, which is
-/// the only thing that knows which repository and which operation.
+/// A deadline, and where project state lives: everything else it needs comes from the claimed
+/// request, which is the only thing that knows which repository and which operation.
 pub struct GitExecutor {
     pub timeout: Duration,
+    /// `AppState::machine_config_root`, so the queue reads a project's `autopilot.yaml` from the
+    /// same `~/.nucleos/projects/<id>/` every other reader does. `None` — what `Default` gives —
+    /// reads every project as having no rules file, which is how a test that never configures one
+    /// stays out of the real home directory.
+    pub machine_root: Option<std::path::PathBuf>,
 }
 
 impl Default for GitExecutor {
     fn default() -> Self {
         Self {
             timeout: OPERATION_TIMEOUT,
+            machine_root: None,
         }
     }
 }
@@ -2002,6 +2008,8 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                         // is a pure path function, and the second would `merge --abort`, `reset
                         // --hard` and `clean` the very checkout being measured.
                         let measured = match gate_the_merge(
+                            self.machine_root.as_deref(),
+                            &request.project_id,
                             project_root,
                             &integration_worktree(project_root),
                             crate::state::DEFAULT_GATE_TIMEOUT,
@@ -2097,6 +2105,8 @@ impl crate::vcs::VcsExecutor for GitExecutor {
 /// queue cannot resolve; a red suite is owned by whoever wrote the branch, and it is fixed where
 /// every other red suite is fixed — in their own worktree, on their own branch.
 async fn gate_the_merge(
+    machine_root: Option<&Path>,
+    project_id: &str,
     project_root: &Path,
     integration: &Path,
     timeout: Duration,
@@ -2107,13 +2117,14 @@ async fn gate_the_merge(
         output_tail: String::new(),
     };
 
-    let rules = match crate::config::load_schedule_rules(project_root) {
+    let rules_path =
+        crate::project_state::display_path(project_id, crate::project_state::AUTOPILOT_FILE);
+    let rules = match crate::config::load_schedule_rules(machine_root, project_id) {
         Ok(rules) => rules,
         Err(error) => {
             return Err(refuse(format!(
-                "{} could not be read, so whether this repository wants its merges measured is \
-                 unknown and nothing was published: {error}",
-                crate::config::AUTOPILOT_RULES_PATH
+                "{rules_path} could not be read, so whether this repository wants its merges \
+                 measured is unknown and nothing was published: {error}"
             )));
         }
     };
@@ -2122,9 +2133,8 @@ async fn gate_the_merge(
     }
     let Some(command) = rules.gate_command else {
         return Err(refuse(format!(
-            "{} asks for merges to be gated and names no gate_command, so there is nothing to \
-             measure this merge with and nothing was published",
-            crate::config::AUTOPILOT_RULES_PATH
+            "{rules_path} asks for merges to be gated and names no gate_command, so there is \
+             nothing to measure this merge with and nothing was published"
         )));
     };
 
@@ -3108,16 +3118,16 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn um_merge_que_o_gate_recusa_nao_e_publicado() {
         let _lock = crate::worktree::test_env_lock();
-        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-red-");
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-red-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         write_autopilot_rules(
-            &repo,
+            container.path(),
             "gate_before_publish: true\ngate_command: git rev-parse --verify nao-existe\n",
         );
         let before = sha_of(&repo, "master");
 
-        match land_ordinarily(&repo).await {
+        match land_ordinarily(&repo, container.path()).await {
             Outcome::Failed {
                 reason,
                 output_tail,
@@ -3144,17 +3154,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn um_merge_que_o_gate_aceita_e_publicado() {
         let _lock = crate::worktree::test_env_lock();
-        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-green-");
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-green-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         // `git --version` is the gate that always agrees, and it needs no shell to run.
         write_autopilot_rules(
-            &repo,
+            container.path(),
             "gate_before_publish: true\ngate_command: git --version\n",
         );
         let before = sha_of(&repo, "master");
 
-        let published = match land_ordinarily(&repo).await {
+        let published = match land_ordinarily(&repo, container.path()).await {
             Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
             other => panic!("a green gate must let the merge through, got {other:?}"),
         };
@@ -3172,13 +3182,16 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn sem_a_chave_o_gate_nem_sequer_corre() {
         let _lock = crate::worktree::test_env_lock();
-        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-off-");
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-off-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
-        write_autopilot_rules(&repo, "gate_command: git rev-parse --verify nao-existe\n");
+        write_autopilot_rules(
+            container.path(),
+            "gate_command: git rev-parse --verify nao-existe\n",
+        );
         let before = sha_of(&repo, "master");
 
-        match land_ordinarily(&repo).await {
+        match land_ordinarily(&repo, container.path()).await {
             Outcome::Succeeded { .. } => {}
             other => panic!("an ungated merge must land untouched, got {other:?}"),
         }
@@ -3193,13 +3206,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn pedir_medida_sem_gate_command_e_recusado() {
         let _lock = crate::worktree::test_env_lock();
-        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-nocmd-");
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-nocmd-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
-        write_autopilot_rules(&repo, "gate_before_publish: true\n");
+        write_autopilot_rules(container.path(), "gate_before_publish: true\n");
         let before = sha_of(&repo, "master");
 
-        match land_ordinarily(&repo).await {
+        match land_ordinarily(&repo, container.path()).await {
             Outcome::Failed { reason, .. } => assert!(
                 reason.contains("gate_command"),
                 "the refusal must name the key that is missing: {reason}"
@@ -3209,30 +3222,40 @@ pub(crate) mod tests {
         assert_eq!(sha_of(&repo, "master"), before, "master moved");
     }
 
-    /// An ordinary landing of `feat/x` into `master`, through the real executor.
-    fn write_autopilot_rules(repo: &Path, contents: &str) {
-        let path = repo.join(crate::config::AUTOPILOT_RULES_PATH);
+    /// Writes project `alpha`'s rules where the queue reads them: `<machine_root>/projects/alpha/`,
+    /// with `machine_root` a temporary directory standing in for `~/.nucleos`.
+    fn write_autopilot_rules(machine_root: &Path, contents: &str) {
+        let path = crate::project_state::file(
+            Some(machine_root),
+            "alpha",
+            crate::project_state::AUTOPILOT_FILE,
+        )
+        .expect("alpha names a directory");
         std::fs::create_dir_all(path.parent().expect("the rules file sits in a folder"))
             .expect("create the rules folder");
         std::fs::write(path, contents).expect("write the rules");
     }
 
-    async fn land_ordinarily(repo: &Path) -> Outcome {
+    /// An ordinary landing of `feat/x` into `master`, through the real executor.
+    async fn land_ordinarily(repo: &Path, machine_root: &Path) -> Outcome {
         use crate::vcs::VcsExecutor;
-        GitExecutor::default()
-            .execute(&crate::vcs::ClaimedRequest {
-                id: 1,
-                op: crate::vcs::Op::Merge {
-                    source: "feat/x".into(),
-                    target: "master".into(),
-                },
-                project_id: "alpha".to_owned(),
-                project_root: repo.to_string_lossy().into_owned(),
-                from_resolution: false,
-                run_id: None,
-                integration_branch: None,
-            })
-            .await
+        GitExecutor {
+            machine_root: Some(machine_root.to_path_buf()),
+            ..GitExecutor::default()
+        }
+        .execute(&crate::vcs::ClaimedRequest {
+            id: 1,
+            op: crate::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            project_id: "alpha".to_owned(),
+            project_root: repo.to_string_lossy().into_owned(),
+            from_resolution: false,
+            run_id: None,
+            integration_branch: None,
+        })
+        .await
     }
 
     /// Spec §7, first row. A conflict is not a problem this module solves — and the point of

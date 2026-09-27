@@ -294,7 +294,8 @@ async fn start_job(
             project_root,
             rule_name: Some(&rule.name),
             prompt: &rule.prompt,
-            // The daemon's ceiling, not the file's number. `.ai/autopilot.yaml` is per-developer
+            // The daemon's ceiling, not the file's number. The project's `autopilot.yaml` is
+            // per-developer
             // and gitignored, so nobody reviews what it asks for; it may lower the fan-out and
             // never raise it.
             max_items: graph.max_items() as i64,
@@ -306,10 +307,10 @@ async fn start_job(
             head_sha,
             // A scheduled job asks for neither, which keeps it at one round under the house limit —
             // exactly what a `graph:` rule did before rounds existed. Rounds are opt-in per request,
-            // not something a rule already in somebody's `.ai/autopilot.yaml` acquires overnight.
+            // not something a rule already in somebody's `autopilot.yaml` acquires overnight.
             max_rounds: None,
             // The file's number, and here that is safe where `max_rounds` above is not. Both would
-            // come from the same gitignored, unreviewed, per-developer `.ai/autopilot.yaml`; the
+            // come from the same unreviewed, per-developer `autopilot.yaml`; the
             // difference is direction. A budget runs UNDER the house limit rather than instead of
             // it, so the only thing this key can do is tighten what the job may spend — there is no
             // value it could hold that buys the job more than the daemon already allows. Rounds
@@ -449,18 +450,19 @@ pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
             continue;
         }
 
-        let rules = match config::load_schedule_rules(Path::new(&project_root)) {
-            Ok(rules) => rules.schedules,
-            Err(error) => {
-                tracing::warn!(
-                    project_id = %project_id,
-                    project_root = %project_root,
-                    %error,
-                    "failed to load project schedule rules"
-                );
-                continue;
-            }
-        };
+        let rules =
+            match config::load_schedule_rules(state.machine_config_root.as_deref(), &project_id) {
+                Ok(rules) => rules.schedules,
+                Err(error) => {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        project_root = %project_root,
+                        %error,
+                        "failed to load project schedule rules"
+                    );
+                    continue;
+                }
+            };
 
         let rows: Vec<RuleState> = match sqlx::query_as(
             "SELECT rule_name, last_fired_at, last_head_sha, fires_date, fires_today
@@ -1375,7 +1377,10 @@ mod tests {
     const ACTIVE_TEST_CHILD_ENV: &str = "NUCLEOS_SCHEDULER_ACTIVE_TEST_CHILD";
     const ACTIVE_TEST_REPO_ENV: &str = "NUCLEOS_SCHEDULER_ACTIVE_TEST_REPO";
 
-    async fn test_state(delay: Option<Duration>) -> AppState {
+    /// A state whose `machine_config_root` is a temporary directory standing in for `~/.nucleos`,
+    /// returned beside it so the directory lives exactly as long as the test that holds it.
+    async fn test_state(delay: Option<Duration>) -> (AppState, tempfile::TempDir) {
+        let home = tempfile::tempdir().expect("create a stand-in home");
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(
@@ -1387,7 +1392,7 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
-        AppState {
+        let state = AppState {
             token: Token("test-token".into()),
             pool,
             telegram_doctrine: None,
@@ -1403,7 +1408,7 @@ mod tests {
             run_tails: Default::default(),
             files_root: None,
             workflow_library: None,
-            machine_config_root: None,
+            machine_config_root: Some(home.path().to_path_buf()),
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
@@ -1415,7 +1420,8 @@ mod tests {
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: DEFAULT_RUN_TIMEOUT,
-        }
+        };
+        (state, home)
     }
 
     fn space_free_tempdir(prefix: &str) -> tempfile::TempDir {
@@ -1468,34 +1474,46 @@ mod tests {
         );
     }
 
-    fn write_schedule(project_root: &FsPath) {
-        let ai_dir = project_root.join(".ai");
-        std::fs::create_dir_all(&ai_dir).expect("create .ai directory");
-        std::fs::write(
-            ai_dir.join("autopilot.yaml"),
+    /// Writes `project_id`'s rules where the scheduler reads them: its directory under the state's
+    /// stand-in home.
+    fn write_rules(state: &AppState, project_id: &str, contents: &str) {
+        crate::project_state::write_for_test(
+            state
+                .machine_config_root
+                .as_deref()
+                .expect("the test state has a stand-in home"),
+            project_id,
+            crate::project_state::AUTOPILOT_FILE,
+            contents,
+        );
+    }
+
+    fn write_schedule(state: &AppState, project_id: &str) {
+        write_rules(
+            state,
+            project_id,
             "schedules:\n  - name: r1\n    cron: \"* * * * *\"\n    prompt: \"go\"\n",
-        )
-        .expect("write autopilot schedule");
+        );
     }
 
     /// The same rule with a `graph:` block on it, so a test can compare like with like.
-    fn write_graph_schedule(project_root: &FsPath) {
-        std::fs::write(
-            project_root.join(".ai").join("autopilot.yaml"),
+    fn write_graph_schedule(state: &AppState) {
+        write_rules(
+            state,
+            "proj",
             "schedules:\n  - name: r1\n    cron: \"* * * * *\"\n    prompt: \"go\"\n    graph:\n      max_items: 3\n",
-        )
-        .expect("write autopilot schedule with a graph block");
+        );
     }
 
     /// The same graph rule again, this time naming a ceiling of its own. The number is deliberately
     /// nothing any default or house limit would produce, so a row carrying it can only have got it
     /// from this file.
-    fn write_budgeted_graph_schedule(project_root: &FsPath) {
-        std::fs::write(
-            project_root.join(".ai").join("autopilot.yaml"),
+    fn write_budgeted_graph_schedule(state: &AppState) {
+        write_rules(
+            state,
+            "proj",
             "schedules:\n  - name: r1\n    cron: \"* * * * *\"\n    prompt: \"go\"\n    graph:\n      max_items: 3\n      budget_usd: 2.5\n      team: crew\n",
-        )
-        .expect("write autopilot schedule with a budgeted, directed graph block");
+        );
     }
 
     /// A team the schedule above can name. `foreign_keys` is on, so the agent comes first.
@@ -1546,11 +1564,11 @@ mod tests {
     #[tokio::test]
     async fn a_graph_rule_in_shadow_still_fires_one_ordinary_run() {
         let project = tempfile::tempdir().expect("create shadow project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "shadow", &old).await;
-        write_graph_schedule(project.path());
+        write_graph_schedule(&state);
 
         scheduler_tick(&state, now).await;
 
@@ -1568,12 +1586,12 @@ mod tests {
     #[tokio::test]
     async fn a_catch_up_never_starts_a_job() {
         let project = tempfile::tempdir().expect("create active project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         // Due at 10:01; the daemon only came back four hours later.
         let now = timestamp("2026-07-18T14:00:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "active", &old).await;
-        write_graph_schedule(project.path());
+        write_graph_schedule(&state);
 
         scheduler_tick(&state, now).await;
 
@@ -1592,11 +1610,11 @@ mod tests {
     #[tokio::test]
     async fn a_project_with_no_slot_free_keeps_its_window() {
         let project = tempfile::tempdir().expect("create active project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "active", &old).await;
-        write_graph_schedule(project.path());
+        write_graph_schedule(&state);
         // A ceiling of one, which is what this used to get from `one_live_job_per_project`. The
         // seeded job then has to hold the slot as well as the row: `insert_job` alone claims
         // nothing, because claiming is `start`'s job and this is seeding, not starting.
@@ -1669,11 +1687,11 @@ mod tests {
         let repo = PathBuf::from(
             std::env::var_os(ACTIVE_TEST_REPO_ENV).expect("active test repository is set"),
         );
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, &repo, "active", &old).await;
-        write_graph_schedule(&repo);
+        write_graph_schedule(&state);
 
         scheduler_tick(&state, now).await;
 
@@ -1742,12 +1760,12 @@ mod tests {
         let repo = PathBuf::from(
             std::env::var_os(ACTIVE_TEST_REPO_ENV).expect("active test repository is set"),
         );
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, &repo, "active", &old).await;
         seed_team(&state, "crew").await;
-        write_budgeted_graph_schedule(&repo);
+        write_budgeted_graph_schedule(&state);
 
         scheduler_tick(&state, now).await;
 
@@ -1796,7 +1814,7 @@ mod tests {
         mode: &str,
         last_fired_at: &str,
     ) {
-        write_schedule(project_root);
+        write_schedule(state, project_id);
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, ?, ?)",
         )
@@ -1824,7 +1842,7 @@ mod tests {
     /// restart looks like: no loop state survives between the calls.
     #[tokio::test]
     async fn the_daily_cap_survives_a_daemon_restart() {
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let container = space_free_tempdir("nucleos-scheduler-cap-");
         let repo = container.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -1875,15 +1893,15 @@ mod tests {
     /// wrong, not how you find out. Said once, to the feed, when the rule is first seen.
     #[tokio::test]
     async fn an_unreadable_cron_is_reported_once_where_a_person_looks() {
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let container = space_free_tempdir("nucleos-scheduler-badcron-");
         let repo = container.path().join("repo");
-        std::fs::create_dir_all(repo.join(".ai")).unwrap();
-        std::fs::write(
-            repo.join(".ai").join("autopilot.yaml"),
+        std::fs::create_dir_all(&repo).unwrap();
+        write_rules(
+            &state,
+            "proj",
             "schedules:\n  - name: r1\n    cron: \"not a cron\"\n    prompt: \"go\"\n",
-        )
-        .unwrap();
+        );
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root)
              VALUES ('proj', 'shadow', ?)",
@@ -2131,7 +2149,7 @@ mod tests {
         let repo = PathBuf::from(
             std::env::var_os(ACTIVE_TEST_REPO_ENV).expect("active test repository is set"),
         );
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, &repo, "active", &old).await;
@@ -2198,7 +2216,7 @@ mod tests {
     #[tokio::test]
     async fn a_missed_window_is_demoted_to_a_plan_only_catch_up_on_an_active_project() {
         let project = tempfile::tempdir().expect("create active project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         // The window came due at 10:01; the daemon only ran again four hours later.
         let now = timestamp("2026-07-18T14:00:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
@@ -2279,7 +2297,7 @@ mod tests {
     #[tokio::test]
     async fn quota_brake_delay_does_not_demote_a_scheduled_rule() {
         let project = tempfile::tempdir().expect("create active project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T14:00:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "active", &old).await;
@@ -2308,7 +2326,7 @@ mod tests {
         let container = space_free_tempdir("nucleos-scheduler-catchup-");
         let repo = container.path().join("repo");
         initialize_repo(&repo);
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T14:00:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, &repo, "shadow", &old).await;
@@ -2344,7 +2362,7 @@ mod tests {
     #[tokio::test]
     async fn a_punctual_window_carries_no_catch_up_preamble() {
         let project = tempfile::tempdir().expect("create shadow project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         // Due at 10:01, served at 10:10 — late, but well inside the grace.
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
@@ -2362,7 +2380,7 @@ mod tests {
     #[tokio::test]
     async fn tick_fires_a_shadow_run_for_a_shadow_project() {
         let project = tempfile::tempdir().expect("create shadow project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "shadow", &old).await;
@@ -2384,7 +2402,7 @@ mod tests {
     #[tokio::test]
     async fn tick_defers_when_no_slot_is_free() {
         let project = tempfile::tempdir().expect("create active project");
-        let state = test_state(Some(Duration::from_millis(100))).await;
+        let (state, _home) = test_state(Some(Duration::from_millis(100))).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "active", &old).await;
@@ -2426,7 +2444,7 @@ mod tests {
     #[tokio::test]
     async fn tick_rearms_a_malformed_timestamp() {
         let project = tempfile::tempdir().expect("create shadow project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         seed_project(&state, project.path(), "shadow", "not-a-date").await;
 
@@ -2449,7 +2467,7 @@ mod tests {
     #[tokio::test]
     async fn tick_does_nothing_when_kill_switch_engaged() {
         let project = tempfile::tempdir().expect("create active project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "active", &old).await;
@@ -2471,7 +2489,7 @@ mod tests {
         let projects = tempfile::tempdir().expect("create project roots");
         let project_a = projects.path().join("project-a");
         let project_b = projects.path().join("project-b");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_named_project(&state, "project-a", &project_a, "shadow", &old).await;
@@ -2497,7 +2515,7 @@ mod tests {
     #[tokio::test]
     async fn a_global_heartbeat_stops_all_scheduled_rules() {
         let projects = tempfile::tempdir().expect("create project roots");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_named_project(
@@ -2536,7 +2554,7 @@ mod tests {
     #[tokio::test]
     async fn no_heartbeat_leaves_scheduled_firing_unchanged() {
         let project = tempfile::tempdir().expect("create shadow project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-18T10:10:00Z");
         let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "shadow", &old).await;
@@ -2553,7 +2571,7 @@ mod tests {
     #[tokio::test]
     async fn tick_does_nothing_when_over_budget() {
         let project = tempfile::tempdir().expect("create shadow project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-20T10:10:00Z");
         let old = timestamp("2026-07-20T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "shadow", &old).await;
@@ -2594,7 +2612,7 @@ mod tests {
     #[tokio::test]
     async fn tick_skips_a_project_when_its_kill_is_engaged() {
         let project = tempfile::tempdir().expect("create shadow project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-20T10:10:00Z");
         let old = timestamp("2026-07-20T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "shadow", &old).await;
@@ -2614,7 +2632,7 @@ mod tests {
     #[tokio::test]
     async fn tick_still_fires_when_a_different_project_is_killed() {
         let project = tempfile::tempdir().expect("create shadow project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-20T10:10:00Z");
         let old = timestamp("2026-07-20T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "shadow", &old).await;
@@ -2634,7 +2652,7 @@ mod tests {
     #[tokio::test]
     async fn tick_skips_all_when_the_scheduled_trigger_kill_is_engaged() {
         let project = tempfile::tempdir().expect("create shadow project");
-        let state = test_state(None).await;
+        let (state, _home) = test_state(None).await;
         let now = timestamp("2026-07-20T10:10:00Z");
         let old = timestamp("2026-07-20T10:00:00Z").to_rfc3339();
         seed_project(&state, project.path(), "shadow", &old).await;
@@ -2656,13 +2674,18 @@ mod tests {
     /// refuses a turn whose folder will not resolve.
     async fn errand_state() -> (AppState, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("create files root");
-        let root = crate::files::ensure_root(temp.path()).expect("prepare files root");
-        let state = test_state(None).await;
+        let files = temp.path().join("files");
+        std::fs::create_dir_all(&files).expect("create files root");
+        let root = crate::files::ensure_root(&files).expect("prepare files root");
+        let (state, _home) = test_state(None).await;
+        // A stand-in home of its own, in the directory this helper returns and beside the files
+        // root rather than inside it: `test_state`'s own is dropped when this function returns.
+        let machine_root = temp.path().join("nucleos-home");
         (
             AppState {
                 files_root: Some(root),
                 workflow_library: None,
-                machine_config_root: None,
+                machine_config_root: Some(machine_root),
                 secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
                 ..state
             },

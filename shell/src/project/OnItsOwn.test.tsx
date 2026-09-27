@@ -30,6 +30,7 @@ function rules(overrides: Partial<ProjectRules> = {}): ProjectRules {
     project_id: "alpha",
     project_root: "C:/repos/alpha",
     rules_file: "present",
+    rules_path: "~/.nucleos/projects/alpha/autopilot.yaml",
     rules_error: null,
     gate_command: null,
     gate_before_publish: false,
@@ -74,7 +75,8 @@ describe("OnItsOwn", () => {
   it("reads the rules itself from nothing but a project id", async () => {
     await mount(rules());
 
-    expect(await screen.findByText(".ai/autopilot.yaml")).toBeDefined();
+    // Named where the daemon says it is, and not in the project's `.ai/`, where it no longer lives.
+    expect(await screen.findByText("~/.nucleos/projects/alpha/autopilot.yaml")).toBeDefined();
     expect(await screen.findByRole("heading", { name: "Judge" })).toBeDefined();
     expect(screen.getByRole("heading", { name: "Work-in-progress ceiling" })).toBeDefined();
     expect(daemon.apiFetch).toHaveBeenCalledWith("/projects/alpha/rules");
@@ -86,7 +88,7 @@ describe("OnItsOwn", () => {
     await mount(rules({ rules_file: "unreadable", rules_error: "unknown field `schedule`" }));
 
     const alert = await screen.findByRole("alert");
-    const edit = within(alert).getByRole("link", { name: /Edit .ai\/autopilot.yaml/ });
+    const edit = within(alert).getByRole("link", { name: /Edit ~\/\.nucleos\/projects\/alpha\/autopilot\.yaml/ });
     expect(edit.getAttribute("href")).toBe("/projects/alpha/state");
   });
 

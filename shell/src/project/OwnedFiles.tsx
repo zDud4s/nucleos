@@ -1,7 +1,11 @@
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
-import { useProjectOwnership, useWriteProjectFile, type Claim } from "../data/project-config";
-import { useProjectCat } from "../data/projects";
+import {
+  useProjectOwnedFile,
+  useProjectOwnership,
+  useWriteProjectFile,
+  type Claim,
+} from "../data/project-config";
 import { ErrorNote, Inset, Quiet, StaleNote } from "../ui";
 
 /**
@@ -13,7 +17,7 @@ import { ErrorNote, Inset, Quiet, StaleNote } from "../ui";
  *
  * **Why a raw editor and not a form, when a form is what the design asked for.** A form would have
  * to read the YAML, set a field, and write the whole file back — and re-serialising YAML destroys
- * comments. `.ai/autopilot.yaml`'s own loader has a branch for a file that is nothing but comments,
+ * comments. The rules file's own loader has a branch for a file that is nothing but comments,
  * with a note saying why: commenting the `gate_command:` line out is how somebody switches a gate
  * off for an afternoon. A form here would silently delete the note explaining why a schedule is
  * disabled, which is precisely the "second author of a document git already owns" failure the old
@@ -26,7 +30,10 @@ import { ErrorNote, Inset, Quiet, StaleNote } from "../ui";
  * happily and leaves the project ungated for ever.
  *
  * **Nothing here hard-codes a path.** The list comes from `GET /projects/{id}/ownership`, so the
- * fence the page draws and the fence the daemon enforces are the same fence.
+ * fence the page draws and the fence the daemon enforces are the same fence — and so does where
+ * each file lives: the núcleo's own files are in `~/.nucleos/projects/<id>/`, not in the project,
+ * and the page learns that from each row's `display` and reads the text through
+ * `GET /projects/{id}/owned`, never through `cat`.
  */
 
 export interface OwnedFilesProps {
@@ -95,20 +102,26 @@ const REFUSALS: Record<string, string> = {
     "the emergency stop is engaged, so nothing writes — including this. The file is still editable in an editor.",
   no_project_root: "the núcleo has no folder recorded for this project.",
   not_ours: "the núcleo does not consider this app the author of that file.",
-  unwritable: "that path does not land inside the project folder.",
+  unwritable: "that path does not land inside the folder it belongs in.",
+  no_machine_root: "this machine has no home directory, so there is nowhere to keep the file.",
+  bad_project_id:
+    "this project's id cannot name a folder, so the núcleo has nowhere to keep its files. Re-add the project under a simpler id.",
   internal: "the núcleo hit an error of its own while writing.",
 };
 
 function OwnedFile({ projectId, claim }: { projectId: string; claim: Claim }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<string | null>(null);
-  const file = useProjectCat(projectId, claim.path, open);
+  const file = useProjectOwnedFile(projectId, claim.path, open);
+  // The daemon's own spelling of where the file is. A daemon older than `display` has only the
+  // identity, which is still the right name to show.
+  const shown = claim.display ?? claim.path;
   const write = useWriteProjectFile();
 
   /**
    * A file that is not there yet is a state, not an error.
    *
-   * `cat` answers 404 for it, and a project with no rules file is the ordinary case for a project
+   * `owned` answers 404 for it, and a project with no rules file is the ordinary case for a project
    * nobody has scheduled anything in. Saving creates it — which is the one thing this editor can do
    * that reading cannot.
    */
@@ -127,7 +140,7 @@ function OwnedFile({ projectId, claim }: { projectId: string; claim: Claim }) {
   return (
     <Inset>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <p className="font-mono text-sm text-text">{claim.path}</p>
+        <p className="font-mono text-sm text-text">{shown}</p>
         <button
           type="button"
           onClick={() => setOpen(!open)}
@@ -149,7 +162,7 @@ function OwnedFile({ projectId, claim }: { projectId: string; claim: Claim }) {
               </p>
             ) : null}
             <textarea
-              aria-label={claim.path}
+              aria-label={shown}
               value={text}
               spellCheck={false}
               rows={14}
