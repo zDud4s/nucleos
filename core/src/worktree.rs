@@ -94,6 +94,14 @@ pub enum Owner {
     /// same name for the life of the item, which is what lets a retry, a resolution and a resume
     /// all arrive back at the same checkout.
     Item(i64),
+    /// One worker of a controller's execution wave (perfil-de-velocidade spec §4.6), keyed on
+    /// `wave_workers.id`.
+    ///
+    /// A slot owner and NEVER a worktree owner. A wave's units are checked out by the controller,
+    /// by git directly (spec §4.2), and the `worktrees` CHECK refuses `'wave'` — that refusal is
+    /// the rule, not a gap. It lives in this enum because `concurrency` keys slots on it, and a
+    /// second owner type for one column would be two vocabularies for the same thing.
+    Wave(i64),
 }
 
 impl Owner {
@@ -102,12 +110,13 @@ impl Owner {
             Owner::Run(_) => "run",
             Owner::Job(_) => "job",
             Owner::Item(_) => "item",
+            Owner::Wave(_) => "wave",
         }
     }
 
     pub fn id(self) -> i64 {
         match self {
-            Owner::Run(id) | Owner::Job(id) | Owner::Item(id) => id,
+            Owner::Run(id) | Owner::Job(id) | Owner::Item(id) | Owner::Wave(id) => id,
         }
     }
 
@@ -127,7 +136,7 @@ impl Owner {
     pub fn feed_run_id(self) -> Option<i64> {
         match self {
             Owner::Run(id) => Some(id),
-            Owner::Job(_) | Owner::Item(_) => None,
+            Owner::Job(_) | Owner::Item(_) | Owner::Wave(_) => None,
         }
     }
 
@@ -1380,6 +1389,8 @@ async fn feed_subject(pool: &SqlitePool, owner: Owner) -> Option<feed::Subject> 
                 .flatten()
                 .map(feed::Subject::Job)
         }
+        // Never reached in practice: a wave owns no tree, so no feed line is ever about one.
+        Owner::Wave(_) => None,
     }
 }
 

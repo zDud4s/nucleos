@@ -93,6 +93,13 @@ pub fn build_router(state: AppState) -> Router {
         // because it answers about the same set — the roster — seen through capacity rather than
         // through mode.
         .route("/concurrency", get(get_concurrency))
+        // A controller's wave asks here for the slots its workers will hold, keeps them by renewing,
+        // and gives them back (perfil-de-velocidade spec §4.6). Beside `/concurrency` because they
+        // spend what that route reads. Admin by default, by being in no table in `auth.rs`: taking
+        // capacity is not something a read-only key buys.
+        .route("/concurrency/waves", post(post_wave))
+        .route("/concurrency/waves/{id}", delete(delete_wave))
+        .route("/concurrency/waves/{id}/renew", post(post_wave_renew))
         // Beside `/concurrency` because it is about the same picture: that route says how much fits,
         // this one asks that two of the things inside it not be there at once. Admin by default, by
         // being in no table in `auth.rs` — it files a request that changes how the fleet schedules,
@@ -4495,6 +4502,86 @@ async fn get_concurrency(
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct WaveRequest {
+    /// Where the controller stands. The project is resolved from it the way the session hook
+    /// resolves one, so a controller never has to know an id the daemon made up.
+    cwd: String,
+    workers: i64,
+}
+
+async fn post_wave(
+    State(state): State<AppState>,
+    Json(body): Json<WaveRequest>,
+) -> Result<Json<crate::wave::Grant>, (StatusCode, String)> {
+    if !(1..=crate::wave::MAX_WORKERS).contains(&body.workers) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "a wave asks for 1 to {} workers, not {}",
+                crate::wave::MAX_WORKERS,
+                body.workers
+            ),
+        ));
+    }
+    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    let root = crate::git_exec::toplevel(std::path::Path::new(&body.cwd), deadline)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("{} is not inside a git checkout: {error}", body.cwd),
+            )
+        })?;
+    // 404 and not 400: the request is well formed, and the answer is that this daemon cannot vouch
+    // for that repository's capacity — not on its roster, or the roster could not be read. Both fail
+    // the safe way: the controller reads either as `no_capacity_authority` and runs one worker.
+    let project_id = vcs::project_for_worktree(&state.pool, &root, deadline)
+        .await
+        .map_err(|error| (StatusCode::NOT_FOUND, error))?;
+    crate::wave::grant(&state.pool, &project_id, body.workers, chrono::Utc::now())
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%project_id, %error, "granting a wave its slots failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not grant the wave its slots".to_owned(),
+            )
+        })
+}
+
+/// 204 renewed; 410 lapsed or released, and its slots are given back; 404 no such wave.
+async fn post_wave_renew(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::wave::renew(&state.pool, id, chrono::Utc::now()).await {
+        Ok(crate::wave::Renewal::Renewed) => Ok(StatusCode::NO_CONTENT),
+        Ok(crate::wave::Renewal::Lapsed) => Err(StatusCode::GONE),
+        Ok(crate::wave::Renewal::Unknown) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(wave_id = id, %error, "renewing a wave's lease failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// 204 released, including a second time; 404 no such wave.
+async fn delete_wave(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::wave::release(&state.pool, id, chrono::Utc::now()).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(wave_id = id, %error, "releasing a wave's slots failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// The four readings the project workspace leads with, in one answer.
@@ -15397,6 +15484,172 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         db.close().await;
+    }
+
+    /// A repository on the roster, and the checkout a controller would stand in.
+    async fn rostered_checkout(state: &AppState) -> tempfile::TempDir {
+        let dir = crate::git_exec::tests::space_free_tempdir("nucleos-wave-");
+        crate::git_exec::tests::initialize_repo(dir.path());
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'shadow', ?)",
+        )
+        .bind(dir.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        dir
+    }
+
+    fn wave_body(cwd: &std::path::Path, workers: i64) -> serde_json::Value {
+        serde_json::json!({ "cwd": cwd.to_string_lossy(), "workers": workers })
+    }
+
+    /// A controller standing in a rostered checkout is granted slots, and they show in the house
+    /// readout as the wave's — the same slots every other piece of local work is counted in.
+    #[tokio::test]
+    async fn a_wave_is_granted_slots_for_the_checkout_it_stands_in() {
+        let state = test_state().await;
+        let checkout = rostered_checkout(&state).await;
+
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/concurrency/waves",
+            "test-token",
+            Some(wave_body(checkout.path(), 2)),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let grant = json_body(response).await;
+        assert_eq!(grant["granted"], 2);
+        assert!(grant["wave_id"].is_i64());
+        assert_eq!(grant["lease_seconds"], crate::wave::LEASE_SECONDS);
+        assert!(grant["reason"].is_null());
+
+        let readout = get_json(&state, "/concurrency").await;
+        assert_eq!(readout["house"]["held"], 2);
+        let slots = readout["projects"][0]["slots"].as_array().unwrap();
+        assert_eq!(slots.len(), 2);
+        assert!(
+            slots.iter().all(|slot| slot["owner_kind"] == "wave"),
+            "{slots:?}"
+        );
+    }
+
+    /// Outside every rostered repository the daemon is not the capacity authority, and says so with
+    /// a 404 — which the controller reads as `no_capacity_authority` and runs one worker.
+    #[tokio::test]
+    async fn a_wave_outside_every_rostered_repository_finds_no_authority() {
+        let state = test_state().await;
+        let stranger = crate::git_exec::tests::space_free_tempdir("nucleos-wave-");
+        crate::git_exec::tests::initialize_repo(stranger.path());
+
+        let response = api_token_request(
+            state,
+            "POST",
+            "/concurrency/waves",
+            "test-token",
+            Some(wave_body(stranger.path(), 2)),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // The handler's 404, not the router's: a route that does not exist answers 404 too, with an
+        // empty body, and this test would then pass before a line of the feature was written.
+        let said = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&said).contains("roster"),
+            "{said:?}"
+        );
+    }
+
+    /// One to `MAX_WORKERS`, refused outside it rather than trimmed into a grant nobody asked for.
+    #[tokio::test]
+    async fn a_wave_asks_for_one_to_four_workers() {
+        let state = test_state().await;
+        let checkout = rostered_checkout(&state).await;
+
+        for workers in [0, crate::wave::MAX_WORKERS + 1] {
+            let response = api_token_request(
+                state.clone(),
+                "POST",
+                "/concurrency/waves",
+                "test-token",
+                Some(wave_body(checkout.path(), workers)),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{workers} workers"
+            );
+        }
+    }
+
+    /// Taking capacity is not a read: the weakest key reads `/concurrency` and cannot spend it.
+    #[tokio::test]
+    async fn a_read_only_key_cannot_take_capacity() {
+        let (state, db) = file_test_state().await;
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+
+        let response = api_token_request(
+            state,
+            "POST",
+            "/concurrency/waves",
+            &token,
+            Some(serde_json::json!({ "cwd": ".", "workers": 1 })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        db.close().await;
+    }
+
+    /// The whole life of a lease over HTTP: renewed, released, then gone — and release twice is
+    /// harmless, while an unknown wave is a 404 either way.
+    #[tokio::test]
+    async fn a_lease_is_renewed_released_and_then_gone() {
+        let state = test_state().await;
+        let checkout = rostered_checkout(&state).await;
+        let grant = json_body(
+            api_token_request(
+                state.clone(),
+                "POST",
+                "/concurrency/waves",
+                "test-token",
+                Some(wave_body(checkout.path(), 1)),
+            )
+            .await,
+        )
+        .await;
+        let wave = grant["wave_id"].as_i64().unwrap();
+        let call = |method: &'static str, uri: String| {
+            let state = state.clone();
+            async move {
+                api_token_request(state, method, &uri, "test-token", None)
+                    .await
+                    .status()
+            }
+        };
+
+        let renew = format!("/concurrency/waves/{wave}/renew");
+        let lease = format!("/concurrency/waves/{wave}");
+        assert_eq!(call("POST", renew.clone()).await, StatusCode::NO_CONTENT);
+        assert_eq!(call("DELETE", lease.clone()).await, StatusCode::NO_CONTENT);
+        assert_eq!(call("POST", renew).await, StatusCode::GONE);
+        assert_eq!(call("DELETE", lease).await, StatusCode::NO_CONTENT);
+        assert_eq!(
+            call("POST", "/concurrency/waves/9999/renew".into()).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            call("DELETE", "/concurrency/waves/9999".into()).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(get_json(&state, "/concurrency").await["house"]["held"], 0);
     }
 
     /// Reading a run's live output is a READ, and the weakest key reaches it through the real

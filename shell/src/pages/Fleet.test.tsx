@@ -59,6 +59,7 @@ import { Fleet } from "./Fleet";
 import { FleetCanvas } from "../canvas/FleetCanvas";
 import { buildFleet, isValidConnection, loadLayout, saveLayout, slotDetail, zonesFor } from "../canvas/model";
 import { ApiRefusal } from "../data/client";
+import { cancellableOwner } from "../data/fleet";
 import { keys } from "../data/keys";
 import type {
   Concurrency,
@@ -552,6 +553,17 @@ describe("Fleet — columns", () => {
     // job arm already reports, reported the same way.
     const gone = slot({ slot: 1, owner_kind: "item", owner_id: 7, job_id: 99, ordinal: 0, item_status: "running" });
     expect(slotDetail(gone, [job({ id: 41 })], undefined, 50).kind).toBe("orphaned");
+  });
+
+  it("never takes a wave's slot for the run that shares its number, nor offers to cancel it", () => {
+    // A wave's worker is a controller's process, and `owner_id` for it is
+    // `wave_workers.id`. Looked up among the runs it would carry an unrelated
+    // run's description, and the cancel button would send
+    // `POST /runs/<that number>/cancel` — stopping work the wave never owned.
+    const wave = slot({ slot: 1, owner_kind: "wave", owner_id: 7 });
+
+    expect(slotDetail(wave, [job()], [run({ id: 7 })]).kind).toBe("unknown");
+    expect(cancellableOwner(wave)).toBeNull();
   });
 
   it("shows an item's card its own collision, and no cancel it has no route for", async () => {

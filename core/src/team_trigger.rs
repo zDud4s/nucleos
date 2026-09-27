@@ -843,7 +843,17 @@ async fn fire(
     // no conversation anybody is reading for it to speak into — and inventing one would mean a
     // department talking to a room with nobody in it. What a triggered run has to say goes where it
     // already went: the delivery, and the feed.
-    match crate::team::start_with(state, &trigger.team_id, &request, lineage, None).await {
+    // A trigger has no person to ask, so it runs at `normal`.
+    match crate::team::start_with(
+        state,
+        &trigger.team_id,
+        &request,
+        lineage,
+        crate::speed::Speed::Normal,
+        None,
+    )
+    .await
+    {
         Ok(id) => Some(id),
         Err(error) => note(error.to_string()).await,
     }
