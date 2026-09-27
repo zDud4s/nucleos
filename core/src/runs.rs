@@ -3320,11 +3320,19 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // it does: left out, the FIRST resume still lands in the right tree — it was resolved from the
     // predecessor's own row — while the successor it writes carries no item, so approving that one
     // resolves to the job's tree instead. One approval looks correct; two do not.
+    //
+    // `read_untrusted` and `permission_mode` are copied from the paused row for the reason the
+    // handoff successor copies them: this is the same session, so a stranger's words the paused run
+    // read are still in its context, and the hook's refusals on that flag must keep applying. Read
+    // inside this transaction, and a row that has vanished reads as tainted — the direction
+    // `read_untrusted_context` fails in.
     let result = sqlx::query(
         "INSERT INTO runs
            (project_id, cwd, prompt, status, mode, session_id, created_at, job_id, stage, item_id,
-            steerable)
-         VALUES (?, ?, ?, 'running', 'worktree', ?, ?, ?, ?, ?, ?)",
+            steerable, read_untrusted, permission_mode)
+         VALUES (?, ?, ?, 'running', 'worktree', ?, ?, ?, ?, ?, ?,
+                 COALESCE((SELECT read_untrusted FROM runs WHERE id = ?), 1),
+                 (SELECT permission_mode FROM runs WHERE id = ?))",
     )
     .bind(&wt_project_id)
     .bind(&wt_path)
@@ -3335,6 +3343,8 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     .bind(stage.as_deref())
     .bind(item_id)
     .bind(steerable)
+    .bind(original_run_id)
+    .bind(original_run_id)
     .execute(&mut *tx)
     .await?;
     let resume_id = result.last_insert_rowid();
@@ -6087,6 +6097,62 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             held, 1,
             "the resume is running, so the sweep has nothing to collect"
         );
+    }
+
+    /// An approved resume keeps the paused run's taint and its permission rung.
+    ///
+    /// The resume continues the SAME session, so a stranger's words the paused run read are still in
+    /// the context the resumed one works from. `hooks.rs` refuses on `read_untrusted`, and a resume
+    /// row born with the column's default of 0 would lift those refusals off a conversation that
+    /// still holds exactly what they exist for. `permission_mode` travels for the reason the handoff
+    /// successor gives: the same work must not change rung halfway through.
+    #[tokio::test]
+    async fn an_approved_resume_keeps_the_taint_and_the_rung_of_the_run_it_continues() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        let paused: i64 =
+            sqlx::query_scalar("SELECT id FROM runs WHERE status = 'awaiting_approval'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE runs SET read_untrusted = 1, permission_mode = 'dont_ask' WHERE id = ?")
+            .bind(paused)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let (read_untrusted, permission_mode): (i64, Option<String>) =
+            sqlx::query_as("SELECT read_untrusted, permission_mode FROM runs WHERE id = ?")
+                .bind(resume_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(read_untrusted, 1, "the resumed session still holds what was read");
+        assert_eq!(permission_mode.as_deref(), Some("dont_ask"));
+    }
+
+    /// And a clean run resumes clean: carrying the column is not the same as setting it.
+    #[tokio::test]
+    async fn an_approved_resume_of_a_clean_run_is_not_marked() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let (read_untrusted, permission_mode): (i64, Option<String>) =
+            sqlx::query_as("SELECT read_untrusted, permission_mode FROM runs WHERE id = ?")
+                .bind(resume_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(read_untrusted, 0);
+        assert_eq!(permission_mode, None);
     }
 
     /// A resume after approval still launches with the CLI's permission barrier down.
