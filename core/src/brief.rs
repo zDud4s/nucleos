@@ -11,8 +11,13 @@ use sqlx::SqlitePool;
 
 use crate::knowledge::{self, Brief, Budget, Context, Scope, Scored};
 
-/// Bounded work on the briefing hot path, as `knowledge::MAX_READ` bounds the candidate fetch.
+/// Bound the query expression; `knowledge::MAX_READ` separately bounds candidates and rank reads.
 const MAX_QUERY_TERMS: usize = 64;
+
+/// At the 30-second job tick, 64 units of each kind is 7,680 per hour, well above the rate at
+/// which CLI-backed items and runs can finish. Each unit touches at most `knowledge::MAX_READ`
+/// trace rows, so one pass also has a fixed counter-write ceiling.
+const SWEEP_BATCH: i64 = 64;
 
 /// Briefing traces keep the same 90-day window as `feed::DEFAULT_RETENTION_DAYS` and
 /// `council::DEFAULT_COUNCIL_RETENTION_DAYS`, not the transcript's 30 days. The risk in spec
@@ -75,15 +80,33 @@ fn normalise_fts(bm25: &[Option<f64>]) -> Vec<f64> {
         .collect()
 }
 
-async fn fts_ranks(pool: &SqlitePool, expression: &str) -> sqlx::Result<HashMap<i64, f64>> {
-    let rows: Vec<(i64, f64)> = sqlx::query_as(
+async fn fts_ranks(
+    pool: &SqlitePool,
+    expression: &str,
+    candidates: &[i64],
+) -> sqlx::Result<HashMap<i64, f64>> {
+    if candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders = vec!["?"; candidates.len()].join(", ");
+    // SAFETY: only literal `?` placeholders are interpolated, as in `knowledge::for_scope`.
+    let sql = sqlx::AssertSqlSafe(format!(
         "SELECT rowid, bm25(knowledge_fts)
            FROM knowledge_fts
-          WHERE knowledge_fts MATCH ?",
-    )
-    .bind(expression)
-    .fetch_all(pool)
-    .await?;
+          WHERE knowledge_fts MATCH ?
+            AND rowid IN ({placeholders})
+          ORDER BY bm25(knowledge_fts)
+          LIMIT ?"
+    ));
+    let mut query = sqlx::query_as(sql).bind(expression);
+    for candidate in candidates {
+        query = query.bind(candidate);
+    }
+    let rows: Vec<(i64, f64)> = query
+        .bind(knowledge::MAX_READ as i64)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().collect())
 }
 
@@ -91,8 +114,9 @@ async fn fts_ranks(pool: &SqlitePool, expression: &str) -> sqlx::Result<HashMap<
 pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Result<Brief> {
     let scope = context.chain.last().unwrap_or(&Scope::Machine);
     let mut known = knowledge::for_scope(pool, scope).await?;
+    let candidate_ids: Vec<i64> = known.iter().map(|candidate| candidate.id).collect();
     let ranks = match match_expression(query) {
-        Some(expression) => match fts_ranks(pool, &expression).await {
+        Some(expression) => match fts_ranks(pool, &expression, &candidate_ids).await {
             Ok(ranks) => ranks,
             Err(error) => {
                 tracing::warn!(
@@ -447,16 +471,22 @@ pub(crate) async fn credit_run(pool: &SqlitePool, run_id: i64) -> sqlx::Result<u
     }
 }
 
-/// Retry every durable, uncredited unit whose verdict is now final.
+/// Retry a bounded batch of durable, uncredited units whose verdict is now final.
 ///
 /// This follows the `job_notes.delivered_at IS NULL` queue precedent: because both the verdict and
-/// trace are durable, a crash between the verdict and credit is repaired by the next sweep.
-pub(crate) async fn sweep(pool: &SqlitePool) -> sqlx::Result<u64> {
+/// trace are durable, a crash between the verdict and credit is repaired by the next sweep. Units
+/// are visited oldest first by their monotonic ids and the rest wait for the next tick. Dead,
+/// item-less job-node rows are still scanned; their retirement was deferred by the owner on
+/// 2026-09-24.
+async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
     let item_ids: Vec<i64> = sqlx::query_scalar(
         "SELECT DISTINCT item_id
            FROM run_knowledge
-          WHERE credited_at IS NULL AND item_id IS NOT NULL",
+          WHERE credited_at IS NULL AND item_id IS NOT NULL
+          ORDER BY item_id
+          LIMIT ?",
     )
+    .bind(batch)
     .fetch_all(pool)
     .await?;
     let mut total = 0;
@@ -475,8 +505,11 @@ pub(crate) async fn sweep(pool: &SqlitePool) -> sqlx::Result<u64> {
            JOIN runs r ON r.id = rk.run_id
           WHERE rk.credited_at IS NULL
             AND rk.item_id IS NULL
-            AND r.job_id IS NULL",
+            AND r.job_id IS NULL
+          ORDER BY rk.run_id
+          LIMIT ?",
     )
+    .bind(batch)
     .fetch_all(pool)
     .await?;
     for run_id in run_ids {
@@ -490,6 +523,10 @@ pub(crate) async fn sweep(pool: &SqlitePool) -> sqlx::Result<u64> {
     Ok(total)
 }
 
+pub(crate) async fn sweep(pool: &SqlitePool) -> sqlx::Result<u64> {
+    sweep_at_most(pool, SWEEP_BATCH).await
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::DateTime;
@@ -497,8 +534,8 @@ mod tests {
     use sqlx::{Row, SqlitePool};
 
     use super::{
-        Verdict, credit_item, credit_run, item_verdict, match_expression, normalise_fts, of, prune,
-        record, run_verdict, sweep,
+        Verdict, credit_item, credit_run, fts_ranks, item_verdict, match_expression, normalise_fts,
+        of, prune, record, run_verdict, sweep, sweep_at_most,
     };
     use crate::job::ItemState;
     use crate::knowledge::{Context, Scope, Scored};
@@ -709,6 +746,21 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn the_trace_prune_reads_by_age_through_an_index() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let plan = sqlx::query("EXPLAIN QUERY PLAN DELETE FROM run_knowledge WHERE at < ?")
+            .bind("2026-01-01T00:00:00+00:00")
+            .fetch_all(&pool)
+            .await?;
+
+        assert!(plan.iter().any(|row| {
+            row.try_get::<String, _>("detail")
+                .is_ok_and(|detail| detail.contains("idx_run_knowledge_at"))
+        }));
+        Ok(())
+    }
+
     #[test]
     fn the_fts_signal_is_min_max_within_one_pass() {
         assert_eq!(normalise_fts(&[None, None]), vec![0.0, 0.0]);
@@ -724,6 +776,18 @@ mod tests {
         assert_eq!(match_expression(""), None);
         assert_eq!(match_expression("\"\" \""), None);
         assert_eq!(match_expression("a b a"), Some("\"a\" OR \"b\"".into()));
+    }
+
+    #[tokio::test]
+    async fn the_fts_rank_read_is_bounded_to_the_candidates() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let a = seed(&pool, "project", Some("p1"), "zanzibar rollout").await?;
+        let _b = seed(&pool, "project", Some("p2"), "zanzibar elsewhere").await?;
+
+        let ranks = fts_ranks(&pool, "\"zanzibar\"", &[a]).await?;
+        assert_eq!(ranks.keys().copied().collect::<Vec<_>>(), vec![a]);
+        assert!(fts_ranks(&pool, "\"zanzibar\"", &[]).await?.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -925,6 +989,62 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_sweep_pass_credits_at_most_its_batch_and_the_next_finishes_the_rest()
+    -> sqlx::Result<()> {
+        let pool = test_pool().await;
+
+        let dead_knowledge = seed(&pool, "machine", None, "dead job node").await?;
+        let dead_job = seed_job(&pool, "running", 0).await?;
+        let dead_run = seed_run(&pool, "completed", Some(0), None, Some(dead_job)).await?;
+        record(&pool, dead_run, None, &[scored(dead_knowledge, true)]).await?;
+
+        let mut item_ids = Vec::new();
+        for title in ["item one", "item two", "item three"] {
+            let knowledge_id = seed(&pool, "machine", None, title).await?;
+            let job_id = seed_job(&pool, "completed", 0).await?;
+            let run_id =
+                seed_run(&pool, "completed", Some(0), Some("passed"), Some(job_id)).await?;
+            let item_id =
+                seed_item(&pool, job_id, "passed", Some("passed"), 0, Some(run_id)).await?;
+            record(&pool, run_id, Some(item_id), &[scored(knowledge_id, true)]).await?;
+            item_ids.push(item_id);
+        }
+
+        let mut standalone_run_ids = Vec::new();
+        for title in ["run one", "run two", "run three"] {
+            let knowledge_id = seed(&pool, "machine", None, title).await?;
+            let run_id = seed_run(&pool, "completed", Some(0), Some("passed"), None).await?;
+            record(&pool, run_id, None, &[scored(knowledge_id, true)]).await?;
+            standalone_run_ids.push(run_id);
+        }
+
+        assert_eq!(sweep_at_most(&pool, 2).await?, 4);
+        let last_item_stamp: Option<String> =
+            sqlx::query_scalar("SELECT credited_at FROM run_knowledge WHERE item_id = ?")
+                .bind(item_ids[2])
+                .fetch_one(&pool)
+                .await?;
+        assert!(last_item_stamp.is_none());
+        let last_run_stamp: Option<String> =
+            sqlx::query_scalar("SELECT credited_at FROM run_knowledge WHERE run_id = ?")
+                .bind(standalone_run_ids[2])
+                .fetch_one(&pool)
+                .await?;
+        assert!(last_run_stamp.is_none());
+        let dead_stamp: Option<String> =
+            sqlx::query_scalar("SELECT credited_at FROM run_knowledge WHERE run_id = ?")
+                .bind(dead_run)
+                .fetch_one(&pool)
+                .await?;
+        assert!(dead_stamp.is_none());
+
+        assert_eq!(sweep_at_most(&pool, 2).await?, 2);
+        assert_eq!(sweep_at_most(&pool, 2).await?, 0);
+        assert_eq!(counters(&pool, dead_knowledge).await?, (0, 0, 0, None));
         Ok(())
     }
 

@@ -873,7 +873,7 @@ pub async fn for_scope(pool: &SqlitePool, scope: &Scope) -> sqlx::Result<Vec<Kno
 }
 
 /// How many approved rows are read before rendering ever begins.
-const MAX_READ: usize = 200;
+pub(crate) const MAX_READ: usize = 200;
 
 /// Everything the store holds, in every status, newest first.
 ///
