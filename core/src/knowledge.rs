@@ -346,7 +346,9 @@ const NEUTRAL_RECENCY: f64 = 0.5;
 const W_FTS: f64 = 0.35;
 /// Confirmed by owner 2026-09-23. Files and map communities overlap: the signal this project has for free because it already builds the map (spec §5.1).
 const W_STRUCTURE: f64 = 0.20;
-/// Confirmed by owner 2026-09-23. Measured outcomes. Kept at least W_RECENCY so a recently shown failure cannot outrank a row nobody has measured (spec §5.4).
+/// Confirmed by owner 2026-09-23. Measured outcomes. When the other signals are equal,
+/// `W_USE * NEUTRAL_UTILITY >= W_RECENCY` guarantees that a never-shown row never scores below a
+/// failed row. At the extreme they tie, and `(layer, kind, id)` breaks the tie (spec §5.4).
 const W_USE: f64 = 0.20;
 /// Confirmed by owner 2026-09-23. The chain already decides entitlement; specificity only tips a contradiction towards the most specific scope (spec §3.4).
 const W_SCOPE: f64 = 0.15;
@@ -376,7 +378,8 @@ fn scored_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<(&'a Know
                 s_structure: structural_overlap(row, context),
                 s_recency: recencies[index],
                 // `outcome_count == 0` is absence, not failure. Give it the median measured
-                // utility from this pass, or the named neutral midpoint when the set is empty.
+                // utility from this pass, floored at `NEUTRAL_UTILITY`, or `NEUTRAL_UTILITY` when
+                // nothing is measured.
                 s_use: if row.outcome_count == 0 {
                     utility_if_absent
                 } else {
@@ -505,7 +508,10 @@ fn median_measured_utility(known: &[Known]) -> f64 {
         .filter(|row| row.outcome_count > 0)
         .map(|row| row.green_count as f64 / row.outcome_count as f64)
         .collect();
-    median(measured).unwrap_or(NEUTRAL_UTILITY)
+    // An unmeasured row is never scored as worse than even (owner, 2026-09-24).
+    median(measured)
+        .map(|m| m.max(NEUTRAL_UTILITY))
+        .unwrap_or(NEUTRAL_UTILITY)
 }
 
 fn median(mut values: Vec<f64>) -> Option<f64> {
@@ -2175,8 +2181,8 @@ mod tests {
     /// absence, and what that is worth as a NUMBER is decided here and tested in a table. Without this,
     /// whoever implements it picks a value by taste and D6's table tests that taste.
     ///
-    /// The utility component of a row with no outcome is the MEDIAN of the candidates that have one, and a
-    /// neutral constant when none of them does.
+    /// The utility component of a row with no outcome is the MEDIAN of the candidates that have one,
+    /// floored at the neutral constant, and the neutral constant when none of them does.
     #[test]
     fn a_row_nobody_has_measured_scores_like_the_middle_of_the_ones_somebody_has() {
         let context = Context {
@@ -2190,6 +2196,8 @@ mod tests {
             ("odd", vec![(1, 5), (3, 5), (5, 5)], 0.6),
             ("even", vec![(1, 5), (4, 5)], 0.5),
             ("single", vec![(3, 4)], 0.75),
+            ("mostly failed", vec![(0, 5), (0, 5), (5, 5)], 0.5),
+            ("low", vec![(1, 5), (1, 5)], 0.5),
             ("none", Vec::new(), NEUTRAL_UTILITY),
         ];
 
@@ -2212,6 +2220,47 @@ mod tests {
                 "{name}: expected {expected}, got {actual}"
             );
         }
+    }
+
+    #[test]
+    fn a_never_shown_row_never_scores_below_a_recent_failure() {
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let mut recent_failure = one(1, "memory", "recent failure", "bad");
+        recent_failure.shown_count = 4;
+        recent_failure.outcome_count = 4;
+        recent_failure.last_shown_at = Some("2026-09-20T00:00:00+00:00".into());
+        let mut old_failure = one(2, "memory", "old failure", "bad");
+        old_failure.shown_count = 4;
+        old_failure.outcome_count = 4;
+        old_failure.last_shown_at = Some("2026-09-01T00:00:00+00:00".into());
+        let mut old_green = one(3, "memory", "old green", "good");
+        old_green.shown_count = 4;
+        old_green.outcome_count = 4;
+        old_green.green_count = 4;
+        old_green.last_shown_at = Some("2026-09-01T00:00:00+00:00".into());
+        let never_shown = one(4, "memory", "never shown", "new");
+        let rows = vec![recent_failure, old_failure, old_green, never_shown];
+
+        let scored = scored_candidates(&rows, &context);
+        let score = |id| {
+            scored
+                .iter()
+                .find(|(row, _)| row.id == id)
+                .map(|(_, scored)| scored)
+                .expect("row is scored")
+        };
+        assert!(
+            score(4).score >= score(1).score,
+            "a never-shown row must not score below a recent measured failure"
+        );
+        assert_eq!(score(4).s_use, NEUTRAL_UTILITY);
+        assert_eq!(score(4).s_recency, 0.0);
     }
 
     /// This is the realistic fixture: every signal except utility is equal, because the pass that
