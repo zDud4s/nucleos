@@ -1451,6 +1451,19 @@ async fn prepare_handoff_successor(
         .execute(pool)
         .await?;
 
+    // And the conflict follows its resolver, exactly as it does across `resume_approved_run`. Both
+    // callers reach here after the predecessor's terminal write, so a link left on it names a run
+    // that reads `completed`. `resolver.rs` asks both of its questions by joining this column onto a
+    // live run — `next_conflict`'s "two never run at once" brake and `settled_resolutions`' "is there
+    // a resolution here to stop" — so both would miss the successor that is actually doing the work:
+    // a new escalation of the same merge could mint a second agent for the same two branches, and a
+    // conflict settled another way could not cancel the one still spending.
+    sqlx::query("UPDATE vcs_requests SET resolution_run_id = ? WHERE resolution_run_id = ?")
+        .bind(successor_id)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+
     Ok(Some(HandoffSuccessor {
         id: successor_id,
         session_id,
@@ -7124,6 +7137,79 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 .unwrap(),
             None,
             "a node was given a slot of its own, so the job now costs two"
+        );
+    }
+
+    /// **The conflict follows its resolver across a context handoff**, as it already does across an
+    /// approval resume (`a_resumed_resolution_keeps_the_conflict_it_was_minted_for`).
+    ///
+    /// Both callers reach the handoff after the predecessor's terminal write, so by the time the
+    /// successor exists the predecessor reads `completed`. `resolver.rs` asks both of its questions
+    /// through `vcs_requests.resolution_run_id` joined onto a live run — "is a resolution of this
+    /// merge already under way" and "is there a resolution here to stop" — and a link left on the
+    /// predecessor answers both with no: a second agent can be minted for the same two branches, and
+    /// the one still working cannot be cancelled when its conflict is settled another way.
+    #[tokio::test]
+    async fn a_handoff_of_a_resolution_run_hands_the_resolution_to_its_successor() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, mode, context_fill, created_at)
+             VALUES (43301, 'proj', 'resolve it', 'completed', 'worktree', ?, '2026-09-27T00:00:00Z')",
+        )
+        .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The escalated merge this run was minted to resolve, admitted through the real INSERT.
+        let request = crate::vcs::submit(
+            &pool,
+            &crate::vcs::ResolvedRepo::synthetic("proj", "C:/repos/proj", "proj"),
+            &crate::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            crate::vcs::Origin::Shell,
+        )
+        .await
+        .expect("admit the merge");
+        sqlx::query(
+            "UPDATE vcs_requests SET status = 'escalated', resolution_run_id = 43301 WHERE id = ?",
+        )
+        .bind(request)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let successor = prepare_handoff_successor(&pool, 43301)
+            .await
+            .unwrap()
+            .expect("the run was over the threshold and had no successor yet");
+
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT resolution_run_id FROM vcs_requests WHERE id = ?")
+                .bind(request)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            linked,
+            Some(successor.id),
+            "the conflict still points at run 43301, which reads completed — the resolution looks \
+             dead to the resolver while its successor is working"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(successor.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "running",
+            "the resolver's brake joins onto a live run, so the run the link names must be one"
         );
     }
 
