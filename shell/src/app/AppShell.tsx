@@ -16,6 +16,8 @@ import { NotificationsDrawer } from "./NotificationsDrawer";
 import { PaletteTrigger } from "./PaletteTrigger";
 import { QuotaNotch } from "./QuotaNotch";
 import { useNotchMode, useSetNotchMode } from "./notch-mode";
+import { useScreenLine } from "./screen-line";
+import { useNotchAlong } from "./notch-place";
 import { Sidebar } from "./Sidebar";
 import { NAV_ITEMS } from "./nav";
 
@@ -43,7 +45,6 @@ export function AppShell() {
  * the log with failures nobody can act on.
  */
 function Frame() {
-  const notched = useNotchMode() === "contained";
   /**
    * Whether anything in the machine wants looking at, for the rail's one dot.
    *
@@ -164,12 +165,14 @@ function Frame() {
           <KillSwitchControl />
         </Sidebar>
         {/*
-          The gutter the contained notch stands in. Asked for here rather than reserved always,
-          because with the notch floating there is nothing at the page's right edge to make room
-          for — and asked for by the same hook the notch itself reads, which is one cache entry in
-          react-query and therefore one answer, not two that can disagree.
+          The gutter the contained notch stands in, reserved in BOTH modes. It used to be asked for
+          only while the notch was contained, and that made moving the notch move the app: the page
+          is centred in whatever the main column leaves it, so 5rem arriving or leaving on the right
+          slid every page sideways by half of that the moment the notch floated out or docked back.
+          The owner's call: moving the notch must not move anything else. With the notch floating
+          the strip is empty — and on a maximised window it is still where the floating notch sits.
         */}
-        <main className={notched ? "app-main app-main-notched" : "app-main"}>
+        <main className="app-main app-main-notched">
           {/*
             The notch, contained. Against the right edge of the window rather than inside the page,
             because it is about the machine and not about whatever page is open — and because that
@@ -197,8 +200,20 @@ function Frame() {
 function ContainedNotch() {
   const mode = useNotchMode();
   const setMode = useSetNotchMode();
+  // Where along the edge the owner dragged it, shared with the floating window through storage.
+  const [along, moveAlong] = useNotchAlong();
+  // The line the floating notch hangs from, so docking it here does not move it up or down.
+  const line = useScreenLine(mode === "contained", along);
   if (mode !== "contained") return null;
-  return <QuotaNotch host="contained" onMove={() => void setMode("global").catch(() => {})} />;
+  return (
+    <QuotaNotch
+      host="contained"
+      line={line}
+      along={along}
+      onAlong={moveAlong}
+      onMove={() => void setMode("global").catch(() => {})}
+    />
+  );
 }
 
 /**

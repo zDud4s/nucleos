@@ -526,19 +526,19 @@ const SHOTS_TO_TAKE = [
      gives it. A `viewport` frames it with a little room around the drawing instead of the harness's
      default 1440x960 canvas, which would photograph a couple hundred pixels of notch on most of a
      thousand pixels of black. */
-  ["60-notch-floating-folded", { path: "/teams", window: "notch", viewport: { width: 640, height: 240 } }],
+  ["60-notch-floating-folded", { path: "/teams", window: "notch", viewport: { width: 640, height: 280 } }],
   /* Unfolded, via `hover` rather than `press`: `QuotaNotch` opens on `onPointerEnter`, and this is
      the one state of it nothing could photograph before — a click would land on whichever control
      sits under the pointer instead of on the wrapper the gesture actually needs. This is the
      provider names, the arcs read in full, and — if the sidecar has gone stale — the way back into
      the app, none of which the folded shot above shows at all. */
-  ["61-notch-floating-unfolded", { path: "/teams", window: "notch", hover: ".quota-notch", viewport: { width: 640, height: 240 } }],
+  ["61-notch-floating-unfolded", { path: "/teams", window: "notch", hover: ".quota-notch", viewport: { width: 640, height: 620 } }],
   /* And in light, for the reason several pairs above already are one: the unfolded notch draws its
      "last known" caption on `--text-faint`, and whether faint text over a transparent, borderless
      window still reads is a contrast question a dark shot alone cannot answer. */
   [
     "62-notch-floating-unfolded-light",
-    { path: "/teams", window: "notch", hover: ".quota-notch", viewport: { width: 640, height: 240 }, theme: "light" },
+    { path: "/teams", window: "notch", hover: ".quota-notch", viewport: { width: 640, height: 620 }, theme: "light" },
   ],
   /* The other host, same component: `host="contained"` draws it at the top of an ordinary page
      (`AppShell.tsx`) rather than floating, and needs none of the options above — `contained` is

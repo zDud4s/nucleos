@@ -52,8 +52,41 @@ describe("NotchWindow", () => {
   it("asks to be fitted to its drawing", async () => {
     renderWithQuery(<NotchWindow />);
     await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("notch_fit", { width: 0, height: 0, rest: 0 }),
+      expect(tauri.invoke).toHaveBeenCalledWith("notch_fit", {
+        width: 0,
+        height: 0,
+        rest: 0,
+        // Nobody has moved it: the middle of the edge, where it has always hung.
+        along: 0.5,
+      }),
     );
+  });
+
+  /**
+   * Where the owner dragged it travels with every fit, and moving it asks for a fit of its own —
+   * a drag moves the window without changing the size the `ResizeObserver` watches, so without
+   * this the Rust side would never hear that the notch had moved.
+   */
+  it("hangs where the owner dragged it, and asks again when it is moved", async () => {
+    window.localStorage.setItem("nucleos.notch-along", "0.25");
+    const { container } = renderWithQuery(<NotchWindow />);
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("notch_fit", expect.objectContaining({ along: 0.25 })),
+    );
+    await waitFor(() => expect(container.querySelector(".quota-notch-rail")).not.toBeNull());
+
+    const rail = container.querySelector(".quota-notch-rail")!;
+    Object.defineProperty(window.screen, "availHeight", { value: 1000, configurable: true });
+    fireEvent.pointerDown(rail, { button: 0, screenY: 400, pointerId: 1 });
+    fireEvent.pointerMove(rail, { screenY: 650, pointerId: 1 });
+    fireEvent.pointerUp(rail, { screenY: 650, pointerId: 1 });
+
+    // 250 screen pixels of a 1000-pixel work area is a quarter of the way further down.
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("notch_fit", expect.objectContaining({ along: 0.5 })),
+    );
+    expect(window.localStorage.getItem("nucleos.notch-along")).toBe("0.5");
+    window.localStorage.removeItem("nucleos.notch-along");
   });
 
   it("docks the notch back inside the app from its own control", async () => {

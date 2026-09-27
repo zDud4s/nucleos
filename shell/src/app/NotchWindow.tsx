@@ -3,6 +3,7 @@ import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { QuotaNotch } from "./QuotaNotch";
 import { useSetNotchMode } from "./notch-mode";
+import { useNotchAlong } from "./notch-place";
 
 /**
  * The whole page of the floating notch window: the notch, and nothing else.
@@ -21,6 +22,13 @@ import { useSetNotchMode } from "./notch-mode";
 export function NotchWindow() {
   const frame = useRef<HTMLDivElement>(null);
   const setMode = useSetNotchMode();
+  // How far down the edge the owner dragged the notch, sent with every fit so the Rust side hangs
+  // the window there (`notch.rs`, `hang_along`). Read through a ref by the fit below, which is
+  // set up once; the effect after it asks for a fit whenever the position changes, because a drag
+  // moves the window without changing the size the `ResizeObserver` is watching.
+  const [along, moveAlong] = useNotchAlong();
+  const alongNow = useRef(along);
+  const refit = useRef<() => void>(() => {});
 
   useEffect(() => {
     const element = frame.current;
@@ -38,18 +46,34 @@ export function NotchWindow() {
       // Caught and dropped: a fit that fails leaves the window where it was, which is still a
       // notch, and there is nowhere in this window to say more.
       Promise.resolve()
-        .then(() => invoke("notch_fit", { width: Math.ceil(box.width), height, rest }))
+        .then(() =>
+          invoke("notch_fit", { width: Math.ceil(box.width), height, rest, along: alongNow.current }),
+        )
         .catch(() => {});
     };
+    refit.current = fit;
     fit();
     const observer = new ResizeObserver(fit);
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
 
+  // A new position is a new place for the same box: fit again. Skipped when it is the one the fit
+  // above already sent, which is the first render and every render a drag did not cause.
+  useEffect(() => {
+    if (alongNow.current === along) return;
+    alongNow.current = along;
+    refit.current();
+  }, [along]);
+
   return (
     <div className="notch-window" ref={frame}>
-      <QuotaNotch host="global" onMove={() => void setMode("contained").catch(() => {})} />
+      <QuotaNotch
+        host="global"
+        along={along}
+        onAlong={moveAlong}
+        onMove={() => void setMode("contained").catch(() => {})}
+      />
     </div>
   );
 }
