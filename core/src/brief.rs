@@ -19,6 +19,19 @@ const MAX_QUERY_TERMS: usize = 64;
 /// trace rows, so one pass also has a fixed counter-write ceiling.
 const SWEEP_BATCH: i64 = 64;
 
+/// Item statuses that are final without consulting their job. This mirrors `item_verdict`; the
+/// `the_sweep_selects_exactly_the_items_item_verdict_calls_final` agreement test keeps the SQL
+/// prefilter and the Rust verdict rule aligned.
+const FINAL_ITEM_STATUSES: [&str; 7] = [
+    "passed",
+    "failed",
+    crate::job::STATUS_CANCELLED,
+    "gate_errored",
+    crate::job::STATUS_SKIPPED,
+    crate::job::STATUS_SUPERSEDED,
+    "orphaned",
+];
+
 /// Briefing traces keep the same 90-day window as `feed::DEFAULT_RETENTION_DAYS` and
 /// `council::DEFAULT_COUNCIL_RETENTION_DAYS`, not the transcript's 30 days. The risk in spec
 /// section 13.6 is not the volume of one run: the consolidator grows the store by itself, so
@@ -474,21 +487,34 @@ pub(crate) async fn credit_run(pool: &SqlitePool, run_id: i64) -> sqlx::Result<u
 /// Retry a bounded batch of durable, uncredited units whose verdict is now final.
 ///
 /// This follows the `job_notes.delivered_at IS NULL` queue precedent: because both the verdict and
-/// trace are durable, a crash between the verdict and credit is repaired by the next sweep. Units
-/// are visited oldest first by their monotonic ids and the rest wait for the next tick. Dead,
-/// item-less job-node rows are still scanned; their retirement was deferred by the owner on
-/// 2026-09-24.
+/// trace are durable, a crash between the verdict and credit is repaired by the next sweep. Only
+/// final units take a batch slot, and final units are visited oldest first by their monotonic ids.
+/// The item prefilter exactly mirrors `item_verdict`. The run prefilter uses the unit run's own
+/// terminal status; a terminal handoff or approval run whose chain tail is still live can therefore
+/// take a slot until that tail ends, when `credit_run` follows the chain and credits it.
 async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
-    let item_ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT DISTINCT item_id
-           FROM run_knowledge
-          WHERE credited_at IS NULL AND item_id IS NOT NULL
-          ORDER BY item_id
-          LIMIT ?",
-    )
-    .bind(batch)
-    .fetch_all(pool)
-    .await?;
+    let final_item_placeholders = vec!["?"; FINAL_ITEM_STATUSES.len()].join(", ");
+    let terminal_job_placeholders = vec!["?"; crate::job::TERMINAL_STATUSES.len()].join(", ");
+    let mut item_query = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT DISTINCT rk.item_id
+           FROM run_knowledge rk
+           JOIN job_items i ON i.id = rk.item_id
+           JOIN jobs j ON j.id = i.job_id
+          WHERE rk.credited_at IS NULL
+            AND rk.item_id IS NOT NULL
+            AND (i.status IN ({final_item_placeholders})
+                 OR (i.status = 'gate_failed' AND i.gate_attempts > j.gate_retries)
+                 OR j.status IN ({terminal_job_placeholders}))
+          ORDER BY rk.item_id
+          LIMIT ?"
+    )));
+    for status in FINAL_ITEM_STATUSES {
+        item_query = item_query.bind(status);
+    }
+    for status in crate::job::TERMINAL_STATUSES {
+        item_query = item_query.bind(status);
+    }
+    let item_ids: Vec<i64> = item_query.bind(batch).fetch_all(pool).await?;
     let mut total = 0;
     for item_id in item_ids {
         match credit_item_by_id(pool, item_id).await {
@@ -499,19 +525,22 @@ async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
         }
     }
 
-    let run_ids: Vec<i64> = sqlx::query_scalar(
+    let terminal_run_placeholders = vec!["?"; crate::runs::TERMINAL_RUN_STATUSES.len()].join(", ");
+    let mut run_query = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT DISTINCT rk.run_id
            FROM run_knowledge rk
            JOIN runs r ON r.id = rk.run_id
           WHERE rk.credited_at IS NULL
             AND rk.item_id IS NULL
             AND r.job_id IS NULL
+            AND r.status IN ({terminal_run_placeholders})
           ORDER BY rk.run_id
-          LIMIT ?",
-    )
-    .bind(batch)
-    .fetch_all(pool)
-    .await?;
+          LIMIT ?"
+    )));
+    for status in crate::runs::TERMINAL_RUN_STATUSES {
+        run_query = run_query.bind(status);
+    }
+    let run_ids: Vec<i64> = run_query.bind(batch).fetch_all(pool).await?;
     for run_id in run_ids {
         match credit_run(pool, run_id).await {
             Ok(credited) => total += credited,
@@ -529,13 +558,15 @@ pub(crate) async fn sweep(pool: &SqlitePool) -> sqlx::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use chrono::DateTime;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use sqlx::{Row, SqlitePool};
 
     use super::{
-        Verdict, credit_item, credit_run, fts_ranks, item_verdict, match_expression, normalise_fts,
-        of, prune, record, run_verdict, sweep, sweep_at_most,
+        SWEEP_BATCH, Verdict, credit_item, credit_run, fts_ranks, item_verdict, match_expression,
+        normalise_fts, of, prune, record, run_verdict, sweep, sweep_at_most,
     };
     use crate::job::ItemState;
     use crate::knowledge::{Context, Scope, Scored};
@@ -1023,6 +1054,22 @@ mod tests {
         }
 
         assert_eq!(sweep_at_most(&pool, 2).await?, 4);
+        for item_id in &item_ids[..2] {
+            let stamp: Option<String> =
+                sqlx::query_scalar("SELECT credited_at FROM run_knowledge WHERE item_id = ?")
+                    .bind(item_id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert!(stamp.is_some());
+        }
+        for run_id in &standalone_run_ids[..2] {
+            let stamp: Option<String> =
+                sqlx::query_scalar("SELECT credited_at FROM run_knowledge WHERE run_id = ?")
+                    .bind(run_id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert!(stamp.is_some());
+        }
         let last_item_stamp: Option<String> =
             sqlx::query_scalar("SELECT credited_at FROM run_knowledge WHERE item_id = ?")
                 .bind(item_ids[2])
@@ -1045,6 +1092,145 @@ mod tests {
         assert_eq!(sweep_at_most(&pool, 2).await?, 2);
         assert_eq!(sweep_at_most(&pool, 2).await?, 0);
         assert_eq!(counters(&pool, dead_knowledge).await?, (0, 0, 0, None));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_final_units_take_no_slot_in_a_sweep_pass() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let stuck = seed(&pool, "machine", None, "stuck").await?;
+
+        for _ in 0..(SWEEP_BATCH + 1) {
+            let job_id = seed_job(&pool, "waiting", 1).await?;
+            let run_id = seed_run(&pool, "completed", Some(0), None, Some(job_id)).await?;
+            let item_id = seed_item(
+                &pool,
+                job_id,
+                "gate_failed",
+                Some("failed"),
+                1,
+                Some(run_id),
+            )
+            .await?;
+            record(&pool, run_id, Some(item_id), &[scored(stuck, true)]).await?;
+        }
+        for _ in 0..(SWEEP_BATCH + 1) {
+            let run_id = seed_run(&pool, "awaiting_approval", None, None, None).await?;
+            record(&pool, run_id, None, &[scored(stuck, true)]).await?;
+        }
+
+        let final_item_knowledge = seed(&pool, "machine", None, "final item").await?;
+        let final_job = seed_job(&pool, "completed", 1).await?;
+        let final_item_run =
+            seed_run(&pool, "completed", Some(0), Some("passed"), Some(final_job)).await?;
+        let final_item = seed_item(
+            &pool,
+            final_job,
+            "passed",
+            Some("passed"),
+            1,
+            Some(final_item_run),
+        )
+        .await?;
+        record(
+            &pool,
+            final_item_run,
+            Some(final_item),
+            &[scored(final_item_knowledge, true)],
+        )
+        .await?;
+
+        let final_run_knowledge = seed(&pool, "machine", None, "final run").await?;
+        let final_run = seed_run(&pool, "completed", Some(0), Some("passed"), None).await?;
+        record(&pool, final_run, None, &[scored(final_run_knowledge, true)]).await?;
+
+        assert_eq!(sweep(&pool).await?, 2);
+        let final_item_counters = counters(&pool, final_item_knowledge).await?;
+        assert_eq!(
+            (
+                final_item_counters.0,
+                final_item_counters.1,
+                final_item_counters.2
+            ),
+            (1, 1, 1)
+        );
+        assert!(final_item_counters.3.is_some());
+        let final_run_counters = counters(&pool, final_run_knowledge).await?;
+        assert_eq!(
+            (
+                final_run_counters.0,
+                final_run_counters.1,
+                final_run_counters.2
+            ),
+            (1, 1, 1)
+        );
+        assert!(final_run_counters.3.is_some());
+        assert_eq!(counters(&pool, stuck).await?, (0, 0, 0, None));
+        let uncredited: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM run_knowledge WHERE credited_at IS NULL")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(uncredited, 2 * (SWEEP_BATCH + 1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_sweep_selects_exactly_the_items_item_verdict_calls_final() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let knowledge_id = seed(&pool, "machine", None, "agreement").await?;
+        let statuses = [
+            "pending",
+            "running",
+            "implemented",
+            "merging",
+            "conflicted",
+            "reverted",
+            "gate_failed",
+            "passed",
+            "failed",
+            "cancelled",
+            "gate_errored",
+            "skipped",
+            "superseded",
+            "orphaned",
+            "bogus",
+        ];
+        let mut expected = BTreeSet::new();
+        let mut all = BTreeSet::new();
+
+        for status in statuses {
+            for (gate_attempts, gate_retries) in [(1, 1), (2, 1)] {
+                for job_status in ["running", "completed"] {
+                    let job_id = seed_job(&pool, job_status, gate_retries).await?;
+                    let item_id =
+                        seed_item(&pool, job_id, status, None, gate_attempts, None).await?;
+                    let run_id = seed_run(&pool, "completed", Some(0), None, Some(job_id)).await?;
+                    record(&pool, run_id, Some(item_id), &[scored(knowledge_id, true)]).await?;
+                    all.insert(item_id);
+
+                    let state = crate::job::item_state_from(status, gate_attempts, gate_retries);
+                    let job_ended = crate::job::TERMINAL_STATUSES.contains(&job_status);
+                    if item_verdict(state, None, job_ended, None).is_some() {
+                        expected.insert(item_id);
+                    }
+                }
+            }
+        }
+
+        sweep_at_most(&pool, 10_000).await?;
+        let credited: BTreeSet<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT item_id
+               FROM run_knowledge
+              WHERE item_id IS NOT NULL AND credited_at IS NOT NULL",
+        )
+        .fetch_all(&pool)
+        .await?
+        .into_iter()
+        .collect();
+
+        assert_eq!(credited, expected);
+        assert!(!expected.is_empty());
+        assert_ne!(expected, all);
         Ok(())
     }
 
