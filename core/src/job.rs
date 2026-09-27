@@ -3917,15 +3917,21 @@ async fn spawn_node(
             }
             if let Some(briefing) = briefing.as_ref() {
                 let item_id = match item {
-                    Some(ItemClaim { ordinal, .. }) => sqlx::query_scalar(
+                    Some(ItemClaim { ordinal, .. }) => match sqlx::query_scalar(
                         "SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?",
                     )
                     .bind(job.id)
                     .bind(ordinal as i64)
                     .fetch_optional(pool)
                     .await
-                    .ok()
-                    .flatten(),
+                    {
+                        Ok(id) => id,
+                        // A NULL item_id is never credited, so say this failure out loud.
+                        Err(error) => {
+                            tracing::warn!(job_id = job.id, run_id, ordinal, %error, "could not resolve a node's item; its briefing trace is written without one and will never be credited");
+                            None
+                        }
+                    },
                     None => None,
                 };
                 // The trace names a run, which exists only now, in the same order as note delivery.
