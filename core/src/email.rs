@@ -578,7 +578,7 @@ pub async fn ingest_batch(
             &format!(
                 "{foreign_in_sent} message{} in {mailbox} {} not written by this account, so \
                  the recipients were not recorded as people you have written to — check \
-                 `sent_mailbox` in .ai/email.yaml",
+                 `sent_mailbox` in ~/.nucleos/email.yaml",
                 if foreign_in_sent == 1 { "" } else { "s" },
                 if foreign_in_sent == 1 { "was" } else { "were" },
             ),

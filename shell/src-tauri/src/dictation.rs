@@ -766,7 +766,7 @@ pub fn voice_hotkeys_unavailable() -> Option<&'static str> {
 }
 
 /// Called by the Voice tab once it has read `GET /voice/config`, because that is the only place the
-/// configured chords exist — `.ai/voice.yaml` is self-governing and the shell may not read it.
+/// configured chords exist — `~/.nucleos/voice.yaml` is self-governing and the shell may not read it.
 /// Re-registering replaces what was there, so editing the config and reloading the tab is enough.
 #[tauri::command]
 pub fn voice_register_hotkeys(

@@ -122,16 +122,17 @@ use std::sync::Arc;
 const TOKEN_KEY: &str = "daemon-token";
 const TELEGRAM_TOKEN_KEY: &str = "telegram-token";
 /// The mailbox password (spec §3.4). An app password, in Credential Manager rather than in
-/// `.ai/email.yaml`, so the one secret the pillar needs never sits in a file next to the config.
+/// `~/.nucleos/email.yaml`, so the one secret the pillar needs never sits in a file next to the config.
 const EMAIL_PASSWORD_KEY: &str = "email-imap-password";
 /// The web search provider's API key, in Credential Manager like every other secret — no key on
-/// disk, and in particular not in `.ai/web.yaml`, which is a versioned file.
+/// disk, and in particular not in `~/.nucleos/web.yaml`, which is plain text anybody may open.
 const WEB_SEARCH_KEY: &str = "web-search-api-key";
 /// OpenRouter's own API key, in Credential Manager for the same reason every secret above is: it
-/// never sits in `.ai/models.yaml`, which only ever names the model (`hosted_assistant_model`) and
-/// is a versioned file. `openai_compatible::OpenAiCompatibleChat::new` refuses outright when this comes back
-/// `None` — see its own doc comment for why that refusal happens before any request leaves the
-/// machine rather than after a 401 comes back.
+/// never sits in `~/.nucleos/nucleos-models.yaml`, which only ever names the model
+/// (`hosted_assistant_model`) and is plain text anybody may open.
+/// `openai_compatible::OpenAiCompatibleChat::new` refuses outright when this comes back `None` —
+/// see its own doc comment for why that refusal happens before any request leaves the machine
+/// rather than after a 401 comes back.
 const OPENROUTER_KEY: &str = "openrouter-api-key";
 
 /// Reads a secret from stdin rather than from `argv`.
@@ -190,6 +191,31 @@ fn seeded_library() -> Option<std::path::PathBuf> {
         }
     }
     Some(root)
+}
+
+/// Copies this machine's settings from the old `.ai/` beside the working directory into `root`,
+/// and puts a line in the feed for each file it copied.
+///
+/// The copying is [`machine_config::migrate_legacy`]'s, and so is everything about when it does and
+/// does not happen; this only supplies the two directories and tells somebody. The feed line is
+/// said because a person looking for why their settings moved will look there, and a log line is
+/// read by nobody on a desktop. A lost feed line is logged and let go: the copy already happened.
+async fn migrate_machine_settings(pool: &sqlx::SqlitePool, root: &std::path::Path) {
+    let Ok(started_in) = std::env::current_dir() else {
+        // No working directory means no `.ai/` beside it either, so there is nothing to copy.
+        return;
+    };
+    for file in machine_config::migrate_legacy(root, &started_in) {
+        let summary = format!(
+            "{} copied from .ai/{file} in the directory the daemon was started from; the old file \
+             was left where it was and is no longer read",
+            machine_config::display_path(file)
+        );
+        if let Err(error) = feed::append(pool, None, "config_migrated", &summary, None, None).await
+        {
+            tracing::warn!(%error, file, "a settings file was copied but the feed line was lost");
+        }
+    }
 }
 
 /// Um numero, ou um travessao quando nao ha nenhum.
@@ -555,7 +581,7 @@ async fn main() {
     }
 
     // The other half of the hosted route. `hosted_assistant_model` names the model in
-    // `.ai/nucleos-models.yaml` and this stores the key, and until both exist the route refuses
+    // `~/.nucleos/nucleos-models.yaml` and this stores the key, and until both exist the route refuses
     // (`assistants::Refusal::HostedModelNamedButNoKey`) rather than answering. There was no way at
     // all to store this before: the resolver at the bottom of `main` has read `OPENROUTER_KEY`
     // since the hosted route shipped, and nothing on this machine ever wrote it — so the whole
@@ -573,7 +599,7 @@ async fn main() {
                     // alternative is a chat that refuses with no visible reason: the key alone
                     // gets a conversation nowhere, and the daemon reads both ONCE, at startup.
                     eprintln!(
-                        "name a model in `hosted_assistant_model` (.ai/nucleos-models.yaml) too, \
+                        "name a model in `hosted_assistant_model` (~/.nucleos/nucleos-models.yaml) too, \
                          then restart the daemon — both are read at startup and neither half \
                          answers a chat on its own"
                     );
@@ -797,11 +823,30 @@ async fn main() {
     };
     tracing::info!("nucleos-core token loaded from the system credential store");
 
-    let models_config_path = std::path::PathBuf::from(config::MODELS_CONFIG_PATH);
-    let models_config = config::load_models_config(&models_config_path).unwrap_or_else(|e| {
-        tracing::warn!("failed to parse .ai/nucleos-models.yaml ({e}), using defaults");
-        config::ModelsConfig::default()
-    });
+    // This machine's settings, all under one root — see `machine_config`'s header for why it is
+    // `~/.nucleos/` and no longer the directory the daemon happened to be launched from. `None` (no
+    // home directory) reads every file as absent, which is what an absent file has always meant:
+    // each pillar starts on its defaults.
+    let machine_config_root = machine_config::root();
+    match &machine_config_root {
+        Some(root) => migrate_machine_settings(&pool, root).await,
+        None => tracing::warn!(
+            "no home directory, so {} cannot be read; every pillar starts on its defaults",
+            machine_config::ROOT_DISPLAY
+        ),
+    }
+    let machine_file = |file: &str| machine_config_root.as_ref().map(|root| root.join(file));
+
+    let models_config = machine_file(config::MODELS_CONFIG_FILE)
+        .map(|path| config::load_models_config(&path))
+        .unwrap_or_else(|| Ok(config::ModelsConfig::default()))
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "failed to parse {} ({e}), using defaults",
+                config::MODELS_CONFIG_DISPLAY_PATH
+            );
+            config::ModelsConfig::default()
+        });
     let (triage_runner, local_triage_disabled): (
         Option<Arc<dyn runner::CommandRunner>>,
         Option<String>,
@@ -855,11 +900,14 @@ async fn main() {
         (None, None)
     };
 
-    // Relative to the working directory, so it matters where the daemon was launched from — which
-    // is exactly why the "off" message below has to name the path it looked at.
-    let email_config_path = std::path::Path::new(".ai/email.yaml");
-    let email_config_found = email_config_path.exists();
-    let email_config = config::load_email_config(email_config_path);
+    let email_config_path = machine_file(machine_config::EMAIL_FILE);
+    let email_config_found = email_config_path
+        .as_deref()
+        .is_some_and(std::path::Path::exists);
+    let email_config = email_config_path
+        .as_deref()
+        .map(config::load_email_config)
+        .unwrap_or_default();
     // Built whether or not the pillar is enabled: it is two small files, and having it always in a
     // known state means enabling email later is a config edit rather than a fresh directory.
     let triage_sandbox = dirs.data_local_dir().join("triage-sandbox");
@@ -880,20 +928,36 @@ async fn main() {
         }
     };
 
-    // Relative to the working directory like the email pillar's, for the same reason: it matters where
-    // the daemon was launched from, so the "off" path has to be discoverable rather than mysterious.
-    let voice_config = config::load_voice_config(std::path::Path::new(".ai/voice.yaml"));
-    let calendar_config = config::load_calendar_config(std::path::Path::new(".ai/calendar.yaml"));
-    let web_config = config::load_web_config(std::path::Path::new(".ai/web.yaml"));
-    let browser_config = config::load_browser_config(std::path::Path::new(".ai/browser.yaml"));
-    let telegram_config = config::load_telegram_config(std::path::Path::new(".ai/telegram.yaml"));
+    let voice_config = machine_file(machine_config::VOICE_FILE)
+        .as_deref()
+        .map(config::load_voice_config)
+        .unwrap_or_default();
+    let calendar_config = machine_file(machine_config::CALENDAR_FILE)
+        .as_deref()
+        .map(config::load_calendar_config)
+        .unwrap_or_default();
+    let web_config = machine_file(machine_config::WEB_FILE)
+        .as_deref()
+        .map(config::load_web_config)
+        .unwrap_or_default();
+    let browser_config = machine_file(machine_config::BROWSER_FILE)
+        .as_deref()
+        .map(config::load_browser_config)
+        .unwrap_or_default();
+    let telegram_config = machine_file(machine_config::TELEGRAM_FILE)
+        .as_deref()
+        .map(config::load_telegram_config)
+        .unwrap_or_default();
     // The path is named once and reused, because two facts come off it: what the file SAYS
     // (`load_github_config`) and whether it EXISTS at all. The second is the pillar's opt-in — see
-    // `GithubRuntime::configured` — and deriving it from a second literal is how the two would come
+    // `GithubRuntime::configured` — and deriving it from a second lookup is how the two would come
     // to disagree about which file they mean.
-    let github_path = std::path::Path::new(".ai/github.yaml");
-    let github_config = config::load_github_config(github_path);
-    let github_configured = github_path.exists();
+    let github_path = machine_file(machine_config::GITHUB_FILE);
+    let github_config = github_path
+        .as_deref()
+        .map(config::load_github_config)
+        .unwrap_or_default();
+    let github_configured = github_path.as_deref().is_some_and(std::path::Path::exists);
     // Resolved here and carried on the runtime, so the daemon and the health probe can never end up
     // asking about two different programs — the mistake `cli_probe` names when it says to use "the
     // resolved path, not the configured name".
@@ -1260,15 +1324,10 @@ async fn main() {
         // `None` when this machine has no home directory to hang a library off. Resolved here and
         // not per request, like `files_root` above: it is a fact about the machine.
         workflow_library: seeded_library(),
-        // Said out loud on failure rather than swallowed: every settings route refuses
-        // without it, and "the daemon cannot name its own working directory" is not a
-        // sentence anybody should have to infer from a 500.
         secrets: std::sync::Arc::new(secrets::OsCredentialStore),
-        machine_config_root: std::env::current_dir()
-            .inspect_err(|error| {
-                tracing::warn!(%error, "the daemon cannot name its own working directory; this machine's settings cannot be edited from the app")
-            })
-            .ok(),
+        // The root every file above was read from, so the settings page writes the same files the
+        // daemon reads. `None` was already warned about where it was resolved.
+        machine_config_root: machine_config_root.clone(),
         telegram_doctrine: telegram_config.doctrine,
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
@@ -1306,10 +1365,10 @@ async fn main() {
             ollama_base_url: runner::OLLAMA_BASE_URL.to_string(),
             http: reqwest::Client::new(),
         }),
-        quota: Arc::new(quota::QuotaRuntime::new(quota_client::QuotaClient::new(
-            sidecar::QUOTA_ADDR,
-            quota_sidecar_token.clone(),
-        ), models_config.active_runner().to_string())),
+        quota: Arc::new(quota::QuotaRuntime::new(
+            quota_client::QuotaClient::new(sidecar::QUOTA_ADDR, quota_sidecar_token.clone()),
+            models_config.active_runner().to_string(),
+        )),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_tails: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1612,16 +1671,18 @@ async fn main() {
             }
         });
     } else if email_config_found {
-        tracing::info!("email pillar disabled (.ai/email.yaml says enabled: false)");
+        tracing::info!(
+            "email pillar disabled ({} says enabled: false)",
+            machine_config::display_path(machine_config::EMAIL_FILE)
+        );
     } else {
         // Not the same thing, and saying so cost a diagnosis: a daemon started from the wrong
-        // directory reported the user's config as switched off while that file sat there reading
-        // `enabled: true`. Absolute, because the whole point is which directory was searched.
+        // directory once reported the user's config as switched off while that file sat there
+        // reading `enabled: true`. The files no longer depend on where the daemon was started, but
+        // "off because absent" and "off because it says so" are still two different sentences.
         tracing::info!(
-            path = %std::path::absolute(email_config_path)
-                .unwrap_or_else(|_| email_config_path.to_path_buf())
-                .display(),
-            "email pillar off — no config file here (the path is relative to the working directory)"
+            "email pillar off — {} does not exist",
+            machine_config::display_path(machine_config::EMAIL_FILE)
         );
     }
 

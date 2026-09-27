@@ -145,7 +145,7 @@ pub fn speakable(text: &str, finished: bool) -> Vec<String> {
     units
 }
 
-/// Speaks by spawning the command named in `.ai/voice.yaml`.
+/// Speaks by spawning the command named in `~/.nucleos/voice.yaml`.
 ///
 /// Chosen over embedding a synthesiser in-process for the reason decision 5 of the voice design
 /// already paid for once: a heavy native dependency compiled with CUDA under this repository's pinned

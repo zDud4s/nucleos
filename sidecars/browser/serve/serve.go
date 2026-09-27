@@ -442,7 +442,7 @@ func writeDriverError(w http.ResponseWriter, verb string, err error) {
 		http.Error(w, "a person is driving this profile", http.StatusConflict)
 	case errors.Is(err, browser.ErrTooManySessions):
 		// The REASON in the body, like ErrNotInstalled above, because the ceiling is something the
-		// caller can act on: close a session. `.ai/browser.yaml` makes the same argument about
+		// caller can act on: close a session. `~/.nucleos/browser.yaml` makes the same argument about
 		// `max_profiles` — a refusal that leaves the owner guessing is one they resolve by raising
 		// the limit. `err.Error()` carries the counts the pool wrapped in.
 		//

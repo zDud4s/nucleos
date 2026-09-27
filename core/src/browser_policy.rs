@@ -223,7 +223,7 @@ fn listed(origin: &str, project_sites: &[String]) -> bool {
 fn normalise_entry(entry: &str) -> Option<String> {
     let entry = entry.trim();
     if entry.is_empty() || entry == "." {
-        // An empty line in `.ai/browser.yaml` must match nothing. Left alone it would parse into
+        // An empty line in `~/.nucleos/browser.yaml` must match nothing. Left alone it would parse into
         // something, and a formatting slip would quietly widen the list.
         return None;
     }
@@ -480,7 +480,7 @@ mod tests {
         }
     }
 
-    /// A formatting slip in `.ai/browser.yaml` must not widen the list.
+    /// A formatting slip in `~/.nucleos/browser.yaml` must not widen the list.
     #[test]
     fn empty_and_junk_entries_match_nothing() {
         let sloppy = vec![

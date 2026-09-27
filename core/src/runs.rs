@@ -4034,7 +4034,7 @@ pub const DEFAULT_TRANSCRIPT_RETENTION_DAYS: i64 = 30;
 ///
 /// An environment variable rather than a config file, matching `NUCLEOS_WORKTREE_RETENTION_HOURS`
 /// in `worktree.rs`: runs are not a pillar, and a knob nobody has yet asked to turn does not earn
-/// a `.ai/*.yaml` of its own.
+/// a settings file of its own.
 fn transcript_retention_days() -> i64 {
     std::env::var("NUCLEOS_TRANSCRIPT_RETENTION_DAYS")
         .ok()

@@ -1322,7 +1322,7 @@ impl NucleosTools {
         description = "Do something on GitHub through NucleOS: workflow_run, run_rerun, pr_create, \
                        pr_comment, issue_close, or api_read to GET a REST path. The \
                        núcleo runs it, never you. Whether it happens straight away or waits for a \
-                       person is the owner\'s to decide in .ai/github.yaml — an operation off that \
+                       person is the owner\'s to decide in ~/.nucleos/github.yaml — an operation off that \
                        list is FILED for approval and answers with a number, and your turn carries \
                        on either way. Nothing here is ever refused outright for being off the list."
     )]

@@ -543,7 +543,7 @@ async fn speaker_probe(configured: bool, command: String) -> SubsystemReadout {
 /// Whether the GitHub pillar could act if it were asked to.
 ///
 /// **`asked_for` is `enabled` AND the file existing, and both halves are load-bearing.**
-/// `GithubConfig::enabled` defaults to TRUE so that a machine with no `.ai/github.yaml` is capable
+/// `GithubConfig::enabled` defaults to TRUE so that a machine with no `~/.nucleos/github.yaml` is capable
 /// of everything and autonomous in nothing — which means `enabled` alone can no longer distinguish
 /// "the owner wants this" from "the owner has never heard of it". Grading on `enabled` alone would
 /// put a red row on every installation that has never touched GitHub, and this module's own header

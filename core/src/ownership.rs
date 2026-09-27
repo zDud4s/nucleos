@@ -24,8 +24,8 @@
 //! over, and both mistakes point outward from the project:
 //!
 //! - **Seven of those files are not a project's.** `email`, `voice`, `calendar`, `web`, `browser`,
-//!   `github`, `council` and `nucleos-models` are loaded relative to the daemon's own working
-//!   directory — they are this machine's settings. A route under `/projects/{id}` that wrote them
+//!   `github`, `council` and `nucleos-models` are this machine's settings — then loaded relative to
+//!   the daemon's own working directory, now from `~/.nucleos/`. A route under `/projects/{id}` that wrote them
 //!   would edit one daemon's configuration through a URL naming a project, and would do it
 //!   identically whichever project was named.
 //! - **`.ai/` in a project usually belongs to somebody else.** In this repository it holds
@@ -278,9 +278,12 @@ mod tests {
             ".ai/project.yaml",
             ".ai/models.yaml",
             ".ai/pricing.yaml",
-            // And this machine's own settings, which are not any project's however they are spelled.
+            // And this machine's own settings, which are not any project's however they are spelled
+            // — in the `.ai/` they used to be read from, or under the name they have now.
             ".ai/email.yaml",
             ".ai/github.yaml",
+            "email.yaml",
+            "nucleos-models.yaml",
         ] {
             assert!(
                 matches!(owner_of(CLAIMS, path), Owner::Repository),

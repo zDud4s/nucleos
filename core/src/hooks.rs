@@ -356,7 +356,7 @@ async fn shell_rules_of(state: &AppState, project_id: Option<&str>) -> ProjectRu
     }
 }
 
-/// The GitHub policy this decision is taken under: the machine default from `.ai/github.yaml` with
+/// The GitHub policy this decision is taken under: the machine default from `~/.nucleos/github.yaml` with
 /// the project's declared operations laid over it, read at decision time and never cached.
 ///
 /// The sentence `shell_rules_of` makes, about the other table, and §4.4 of
@@ -4261,7 +4261,7 @@ mod tests {
     /// not the daemon's.
     ///
     /// `test_state` ships `GithubRuntime::default()`, whose policy is autonomous in NOTHING — so the
-    /// `allow` below cannot be coming from `.ai/github.yaml`, and the two runs differ in exactly one
+    /// `allow` below cannot be coming from `~/.nucleos/github.yaml`, and the two runs differ in exactly one
     /// column again. Hand `classify` `state.github.policy` here instead of the layered one and this
     /// is the test that says so; the constructor could be perfect and the feature would still be
     /// unreachable, which is the failure this chunk has already fixed twice.

@@ -98,7 +98,7 @@ func selectDriver(cfg config.Config) (browser.Driver, func(), error) {
 		}
 
 		// Spec §9.5: the download happens when the pillar is ACTIVATED, which is now — the daemon
-		// only starts this process once `.ai/browser.yaml` says so. It runs in the background and
+		// only starts this process once `~/.nucleos/browser.yaml` says so. It runs in the background and
 		// this process serves immediately, answering every request with a refusal that names the
 		// revision, the path and why the last attempt failed. That is §9.5's "indisponível com a
 		// razão", and it is why this is not a fatal error the way an unknown driver is.

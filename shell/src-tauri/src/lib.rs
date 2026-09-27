@@ -110,7 +110,7 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             None,
         ))
-        // The chords themselves are NOT registered here. They live in `.ai/voice.yaml`, which only the
+        // The chords themselves are NOT registered here. They live in `~/.nucleos/voice.yaml`, which only the
         // daemon reads, so the Voice tab registers them through `voice_register_hotkeys` once it has
         // read `GET /voice/config` — and a daemon that is not up yet simply means no hotkey yet.
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())

@@ -114,7 +114,7 @@ pub fn extension_for(requested: Option<&str>) -> Option<&'static str> {
     }
 }
 
-/// Transcribes by spawning the command named in `.ai/voice.yaml`.
+/// Transcribes by spawning the command named in `~/.nucleos/voice.yaml`.
 ///
 /// Chosen over embedding whisper.cpp in-process for the reason the local-triage design already paid
 /// for: compiling a heavy native dependency with CUDA under this repository's pinned GNU/MinGW host is
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn an_unquoted_command_splits_the_way_it_always_did() {
-        // The existing contract, unchanged: every `.ai/voice.yaml` written before quoting existed
+        // The existing contract, unchanged: every `~/.nucleos/voice.yaml` written before quoting existed
         // must keep working.
         assert_eq!(
             split_command("whisper-cli -m model.bin -bo 1 -bs 1"),

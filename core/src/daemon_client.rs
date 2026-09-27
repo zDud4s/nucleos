@@ -1268,7 +1268,7 @@ async fn json_or_refusal(response: reqwest::Response, context: &str) -> Result<V
     let status = response.status();
     if !status.is_success() {
         // The body when there is one, because the web routes put the actionable half there — "the
-        // web pillar is off: set enabled: true in .ai/web.yaml" is a sentence somebody can act on
+        // web pillar is off: set enabled: true in ~/.nucleos/web.yaml" is a sentence somebody can act on
         // and `503` alone is not. Truncated because this string lands in a model's context and the
         // thing most likely to answer a request with kilobytes of body is a proxy, not the daemon.
         let detail = response.text().await.unwrap_or_default();
@@ -1299,7 +1299,7 @@ async fn text_or_refusal(response: reqwest::Response, context: &str) -> Result<S
 
 /// The shared refusal-message formatting for `json_or_refusal` and `text_or_refusal`: the body
 /// when there is one, because the web routes put the actionable half there — "the web pillar is
-/// off: set enabled: true in .ai/web.yaml" is a sentence somebody can act on and `503` alone is
+/// off: set enabled: true in ~/.nucleos/web.yaml" is a sentence somebody can act on and `503` alone is
 /// not. Truncated because this string lands in a model's context and the thing most likely to
 /// answer a request with kilobytes of body is a proxy, not the daemon.
 fn refusal_message(status: reqwest::StatusCode, detail: &str, context: &str) -> String {
@@ -1655,7 +1655,7 @@ mod tests {
     async fn a_web_call_the_daemon_refused_says_the_web_did_not_answer() {
         let url = refusing_daemon(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "the web pillar is off: set enabled: true in .ai/web.yaml",
+            "the web pillar is off: set enabled: true in ~/.nucleos/web.yaml",
         )
         .await;
         let client = DaemonClient::new(url, "test-token".to_string());

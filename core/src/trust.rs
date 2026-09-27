@@ -290,7 +290,7 @@ mod tests {
         }
     }
 
-    /// A formatting slip in `.ai/web.yaml` must not become a system that trusts everything.
+    /// A formatting slip in `~/.nucleos/web.yaml` must not become a system that trusts everything.
     #[test]
     fn an_empty_allowlist_entry_matches_nothing() {
         let sloppy = vec![String::new(), "  ".to_string(), ".".to_string()];

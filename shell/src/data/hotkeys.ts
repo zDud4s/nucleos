@@ -1,7 +1,7 @@
 /**
  * The three global chords, registered with the host once per launch — from the shell, not a page.
  *
- * The host does not register them itself: they are configured in `.ai/voice.yaml`, which only the
+ * The host does not register them itself: they are configured in `~/.nucleos/voice.yaml`, which only the
  * daemon reads, so the webview reads `GET /voice/config` and hands them over
  * (`shell/src-tauri/src/lib.rs` says the same from the other side). Until 2026-09-21 the Voice page
  * did that handing over, which meant a "global" chord did not exist until somebody had opened the

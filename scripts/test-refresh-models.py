@@ -11,7 +11,7 @@ catalogue's job is to CHECK it.
 What that check has to get right, and what each mistake costs:
 
   dead id      An id that stopped existing is the whole reason this half was
-               written. `.ai/nucleos-models.yaml` is gitignored, so a row this
+               written. `~/.nucleos/nucleos-models.yaml` is in no repository, so a row this
                script silently dropped would leave no diff, no history and
                nothing to notice — while a row it keeps and complains about is a
                menu entry somebody can go fix. Kept, loudly, never dropped.

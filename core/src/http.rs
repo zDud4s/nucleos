@@ -3881,10 +3881,11 @@ fn machine_config_root(
 /// never been configured" is the answer the page most needs and an absent row cannot give it. That
 /// is the same reason `GET /projects/{id}/ownership` serves claims rather than files.
 ///
-/// `resolved` is served beside each row for a reason this machine makes concrete: there are twenty
-/// worktrees on it, every one of them has an `.ai/`, and `.ai/voice.yaml` names a different file in
-/// each. A page that showed the relative path alone would let somebody edit settings with great
-/// confidence in the wrong checkout.
+/// `display` is the spelling a person is shown (`~/.nucleos/voice.yaml`) and `resolved` the file the
+/// daemon actually opens. The second used to matter more than it does: when these files were
+/// relative to the working directory, twenty worktrees meant twenty candidate files, and the
+/// absolute path was the only thing that said which one the page was editing. It is still served,
+/// because "which file is this" deserves an answer that is not an abbreviation.
 ///
 /// No secret is in any of these files by construction — every one of them lives in the OS
 /// credential store instead, and each config type's doc says so where the temptation was closest.
@@ -3902,6 +3903,7 @@ async fn get_machine_config(
                 let contents = std::fs::read_to_string(&target).ok();
                 serde_json::json!({
                     "path": setting.path,
+                    "display": crate::machine_config::display_path(setting.path),
                     "area": setting.area,
                     "what": setting.what,
                     "takes_effect": setting.takes_effect,
@@ -3917,6 +3919,7 @@ async fn get_machine_config(
 
     Ok(Json(serde_json::json!({
         "root": root.display().to_string(),
+        "root_display": crate::machine_config::ROOT_DISPLAY,
         "settings": rows,
     })))
 }
@@ -3929,8 +3932,8 @@ async fn get_machine_config(
 ///
 /// **Admin, by appearing in no table in `auth.rs`.** `permits` is default-deny, which is what
 /// protects a route nobody thought about; this one was thought about, and the answer is the same.
-/// It matters more here than for a project's rules file: `.ai/github.yaml` names what a run may do
-/// on GitHub without asking, and `.ai/nucleos-models.yaml` names the models every route is built
+/// It matters more here than for a project's rules file: `~/.nucleos/github.yaml` names what a run may do
+/// on GitHub without asking, and `~/.nucleos/nucleos-models.yaml` names the models every route is built
 /// from. The control token reaches this, and `assistant.rs` hands that token to an MCP-only
 /// assistant turn — which is precisely why the kill switch is consulted below.
 ///
@@ -3954,6 +3957,13 @@ async fn post_machine_config(
     };
 
     let root = machine_config_root(&state)?;
+    // The root may not exist yet — it is created by the first file anybody writes into it — and
+    // `safe_write_target` canonicalises the root before it will answer. Created only once the path
+    // is known to be a row, so a refused path still leaves nothing behind.
+    std::fs::create_dir_all(&root).map_err(|error| {
+        tracing::warn!(%error, "could not create this machine's settings directory");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
     // `setting.path` and not `body.path`: the caller's spelling has been matched against the table
     // and has done its job. Joining the table's own string is what makes a path that normalises to
     // a row unable to reach a file the row does not name.
@@ -3983,7 +3993,10 @@ async fn post_machine_config(
         &state.pool,
         None,
         "config_written",
-        &format!("{} written from the app", setting.path),
+        &format!(
+            "{} written from the app",
+            crate::machine_config::display_path(setting.path)
+        ),
         None,
         // A machine setting or a credential: nothing a run, a job or a council owns.
         None,
@@ -7251,7 +7264,7 @@ async fn delete_project_shell_rule(
 /// Two consequences worth stating here, because both look like bugs at this route and are not:
 ///
 /// - **`api_read` is refused.** It is deliberately outside `ACTION_CEILING` — not even
-///   `.ai/github.yaml` can turn it on — so it is outside this too. A project able to declare it
+///   `~/.nucleos/github.yaml` can turn it on — so it is outside this too. A project able to declare it
 ///   would be a way round the ceiling wearing a different route.
 /// - **`run_logs` is refused, and it is a `ReadOp` whose prefix the ceiling admits.** Its argv
 ///   carries `--log`, which is in `REFUSED_READ_FLAGS`; `declarable_read_ops` says why in full.
@@ -7268,7 +7281,7 @@ fn declarable_github_ops() -> Vec<&'static str> {
 /// **Every operation with a flag, and not the admitted names alone.** Two lists of strings, or one
 /// list of the declarable, would have fixed a picker and left the other half unsayable — and the
 /// half that cannot be said is the one that matters. `api_read` is outside `ACTION_CEILING`: no
-/// route, no `.ai/github.yaml` and no owner can turn it on. A page that only knew the admitted names
+/// route, no `~/.nucleos/github.yaml` and no owner can turn it on. A page that only knew the admitted names
 /// would either omit it, which quietly claims this núcleo cannot do it at all, or draw a control for
 /// it — and a checkbox that cannot be switched on is a lie about who decides. `declarable: false` is
 /// how an operation gets drawn as a FACT: it exists, it is refused here, and nothing on this screen
@@ -10588,7 +10601,7 @@ async fn get_local_model_size(
 ///
 /// **`menu()` is the allowlist, not the request body.** This is the one route in this file that
 /// makes the machine fetch gigabytes from a name somebody sent, so the name has to be one that was
-/// already written into `.ai/nucleos-models.yaml` or that Ollama already has. Refused with the same
+/// already written into `~/.nucleos/nucleos-models.yaml` or that Ollama already has. Refused with the same
 /// `400` a model the catalogue does not offer gets from `patch_chat`, and for the same reason:
 /// it is the person's name that is wrong, not this daemon's state.
 ///
@@ -17103,7 +17116,7 @@ mod tests {
             // in and which the núcleo has never opened.
             ".ai/models.yaml",
             // This machine's settings, which are not any project's however the URL is spelled.
-            ".ai/github.yaml",
+            "~/.nucleos/github.yaml",
             "../escape.yaml",
             ".ai/../../escape.yaml",
         ] {
@@ -18689,10 +18702,9 @@ mod tests {
         // the cloud would break both promises at once, silently, on the bill.
         //
         // The condition needs no setup and is not at the mercy of a file outside the repository:
-        // it is the same one `cloud_choice` documents relying on. `models_config` reads
-        // `.ai/nucleos-models.yaml` relative to the working directory, a test runs from the crate
-        // root, `core/.ai/` does not exist, and `ModelsConfig::default` has
-        // `local_triage_model: None`.
+        // it is the same one `cloud_choice` documents relying on. `config::models_config_path` is
+        // `None` under `cargo test`, so `models_config` is served `ModelsConfig::default`, which
+        // has `local_triage_model: None`.
         let mut state = test_state().await;
         // A fake that WOULD answer, so a fallback would succeed and this test would not see it.
         state.runner = extracting_runner();
@@ -20604,8 +20616,8 @@ mod tests {
     ///
     /// "This has never been set up" is the answer the page most needs and an absent row cannot
     /// give it — the same reason `GET /projects/{id}/ownership` serves claims rather than files.
-    /// The resolved path is asserted too, because on a machine with twenty worktrees the relative
-    /// path alone would let somebody edit settings with great confidence in the wrong checkout.
+    /// The resolved path is asserted too, because it is the page's answer to "which file is this",
+    /// and so is the `~/.nucleos/` spelling a person is shown instead of a username-bearing one.
     #[tokio::test]
     async fn the_fence_lists_every_setting_including_the_ones_never_configured() {
         let (state, temp) = state_with_machine_root().await;
@@ -20626,7 +20638,45 @@ mod tests {
                     .starts_with(temp.path().to_str().unwrap()),
                 "every row must name the file it would actually write"
             );
+            assert_eq!(
+                row["display"],
+                format!("~/.nucleos/{}", row["path"].as_str().unwrap()),
+                "a person is shown the tilde spelling, never a username-bearing path"
+            );
         }
+        assert_eq!(body["root_display"], "~/.nucleos");
+    }
+
+    /// The first write on a machine that has never had a settings directory creates it.
+    ///
+    /// `~/.nucleos/` exists only once something has been put in it, and `safe_write_target`
+    /// canonicalises the root before it answers — so without the route creating it, the very first
+    /// setting anybody saved from the page would be refused for a directory nobody was asked for.
+    #[tokio::test]
+    async fn the_first_write_creates_the_settings_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".nucleos");
+        let mut state = test_state().await;
+        state.machine_config_root = Some(root.clone());
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({ "path": "calendar.yaml", "contents": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(root.join("calendar.yaml").is_file());
+
+        // And the feed line names the file the way a person is shown it.
+        let summary: String = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE kind = 'config_written' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(summary, "~/.nucleos/calendar.yaml written from the app");
     }
 
     /// A write lands, and the next read is the file rather than what the caller said it was.
@@ -20638,7 +20688,7 @@ mod tests {
             "POST",
             "/config/machine",
             Some(serde_json::json!({
-                "path": ".ai/calendar.yaml",
+                "path": "calendar.yaml",
                 "contents": "working_hours_start: \"10:00\"\n",
             })),
         )
@@ -20646,7 +20696,7 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         // On disk, under the root the state named — not merely in the answer.
-        let written = std::fs::read_to_string(temp.path().join(".ai/calendar.yaml")).unwrap();
+        let written = std::fs::read_to_string(temp.path().join("calendar.yaml")).unwrap();
         assert!(written.contains("10:00"));
 
         let (_, body) = workflow_call(state, "GET", "/config/machine", None).await;
@@ -20654,7 +20704,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|row| row["path"] == ".ai/calendar.yaml")
+            .find(|row| row["path"] == "calendar.yaml")
             .unwrap()
             .clone();
         assert_eq!(row["exists"], true);
@@ -20675,7 +20725,7 @@ mod tests {
             state.clone(),
             "POST",
             "/config/machine",
-            Some(serde_json::json!({ "path": ".ai/browser.yaml", "contents": good })),
+            Some(serde_json::json!({ "path": "browser.yaml", "contents": good })),
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
@@ -20685,7 +20735,7 @@ mod tests {
             "POST",
             "/config/machine",
             Some(serde_json::json!({
-                "path": ".ai/browser.yaml",
+                "path": "browser.yaml",
                 "contents": "max_sessions: \"not a number\"\n",
             })),
         )
@@ -20696,7 +20746,7 @@ mod tests {
         assert!(!body["detail"].as_str().unwrap().is_empty());
 
         assert_eq!(
-            std::fs::read_to_string(temp.path().join(".ai/browser.yaml")).unwrap(),
+            std::fs::read_to_string(temp.path().join("browser.yaml")).unwrap(),
             good,
             "a refused write must not have touched the file"
         );
@@ -20714,7 +20764,10 @@ mod tests {
         for path in [
             ".ai/project.yaml",
             ".ai/autopilot.yaml",
-            "../.ai/voice.yaml",
+            "../voice.yaml",
+            // The spelling every row had before the files moved to `~/.nucleos/`. A caller still
+            // sending it would be writing a file the daemon no longer reads.
+            ".ai/voice.yaml",
         ] {
             let (status, body) = workflow_call(
                 state.clone(),
@@ -20727,14 +20780,14 @@ mod tests {
             assert_eq!(body["refusal"], "not_ours");
         }
         assert!(
-            !temp.path().join(".ai").exists(),
+            std::fs::read_dir(temp.path()).unwrap().next().is_none(),
             "a refused write must not have created so much as a directory"
         );
     }
 
     /// The kill switch stops a settings write, and the reason is not symmetry with the project
     /// route — it is that the control token reaches here and `assistant.rs` hands that token to an
-    /// MCP-only assistant turn. `.ai/github.yaml` names what a run may do without asking.
+    /// MCP-only assistant turn. `~/.nucleos/github.yaml` names what a run may do without asking.
     #[tokio::test]
     async fn the_kill_switch_stops_a_settings_write() {
         let (state, _temp) = state_with_machine_root().await;
@@ -20751,7 +20804,7 @@ mod tests {
             state,
             "POST",
             "/config/machine",
-            Some(serde_json::json!({ "path": ".ai/calendar.yaml", "contents": "" })),
+            Some(serde_json::json!({ "path": "calendar.yaml", "contents": "" })),
         )
         .await;
         assert_eq!(status, StatusCode::LOCKED);
@@ -20760,8 +20813,9 @@ mod tests {
 
     /// Without a root, both routes refuse by name rather than guessing at one.
     ///
-    /// A daemon that cannot name its own working directory has no idea which of this machine's
-    /// twenty checkouts it would be editing, and picking one would be the worst available answer.
+    /// A daemon on a machine with no home directory has nowhere these files belong, and picking some
+    /// other directory — the working one, say, which is where they used to be — would be editing a
+    /// file the daemon does not read.
     #[tokio::test]
     async fn without_a_root_every_settings_route_refuses() {
         let state = test_state().await;
@@ -20775,7 +20829,7 @@ mod tests {
             state,
             "POST",
             "/config/machine",
-            Some(serde_json::json!({ "path": ".ai/calendar.yaml", "contents": "" })),
+            Some(serde_json::json!({ "path": "calendar.yaml", "contents": "" })),
         )
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -25695,8 +25749,8 @@ mod tests {
     ///
     /// The other half — `true` for a model this machine has, `false` for one it does not — is
     /// pinned by `config.rs`'s `a_local_row_is_marked_by_whether_this_machine_has_it` and NOT here,
-    /// and that is a limit rather than a preference: `models_config()` resolves to
-    /// `core/.ai/nucleos-models.yaml` under `cargo test`, a path that does not exist, so a unit
+    /// and that is a limit rather than a preference: `models_config()` reads no
+    /// file at all under `cargo test` (see `config::models_config_path`), so a unit
     /// test here is served the built-in defaults and those name no local model at all. What this
     /// test can prove is the half that travels: the route serves the field, and a route that is not
     /// `local` reports it as `null` rather than as a `false` that would put "not installed" on most
@@ -25731,12 +25785,12 @@ mod tests {
     /// A pull is the one route in this file that makes this machine fetch gigabytes from a name in
     /// a request body, and the catalogue is what keeps that name from being anybody's to choose:
     /// `menu()` is read here, not `body.model`, so the only models this daemon can be made to
-    /// download are the ones somebody already wrote into `.ai/nucleos-models.yaml` or that Ollama
+    /// download are the ones somebody already wrote into `~/.nucleos/nucleos-models.yaml` or that Ollama
     /// already has.
     ///
     /// The accept path is deliberately not tested here, and the reason is the one
     /// `the_menu_reports_installed_for_local_rows_and_nothing_else` above gives: `models_config()`
-    /// resolves to `core/.ai/nucleos-models.yaml` under `cargo test`, which does not exist, so the
+    /// reads no file at all under `cargo test` (see `config::models_config_path`), so the
     /// menu a unit test is served names no local model to accept. What CAN be proved here is the
     /// half that matters for safety — a name the menu does not carry is refused before any network
     /// call is made — and it is proved with a name that is real on a real machine (`llama3.2:3b`)

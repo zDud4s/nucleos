@@ -33,7 +33,7 @@ use crate::browser_client::{BrowserClient, BrowserError, Placement, Session};
 use crate::browser_policy::{self, Outcome, Profile, Requester, Surface};
 use crate::state::AppState;
 
-/// What the daemon carries for this pillar. Built once at startup from `.ai/browser.yaml`.
+/// What the daemon carries for this pillar. Built once at startup from `~/.nucleos/browser.yaml`.
 #[derive(Debug)]
 pub struct BrowserRuntime {
     /// Spec §14.2: the pillar ships off and stays off until the fence, the profiles, the handoff and
@@ -46,7 +46,7 @@ impl BrowserRuntime {
     /// The pillar, off. Named rather than derived, for `WebRuntime::disabled`'s reason: a derived
     /// default would invent a client pointing at nothing, and "off" should be a state somebody chose.
     ///
-    /// `#[cfg(test)]` because production always builds a real one from `.ai/browser.yaml`; this is
+    /// `#[cfg(test)]` because production always builds a real one from `~/.nucleos/browser.yaml`; this is
     /// what the `test_state()` fixtures hold.
     #[cfg(test)]
     pub fn disabled() -> Self {

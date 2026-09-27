@@ -256,7 +256,7 @@ pub struct ConfiguredAssistants {
     pool: sqlx::SqlitePool,
     /// The address of whichever local server the resolved engine is configured against: Ollama's
     /// own `runner::OLLAMA_BASE_URL` on an install that named no engine, and the `local_base_url`
-    /// its `.ai/nucleos-models.yaml` names on one that did. `main.rs` passes
+    /// its `~/.nucleos/nucleos-models.yaml` names on one that did. `main.rs` passes
     /// `config::ResolvedLocalEngine::base_url`, never the constant directly, and
     /// `config::ModelsConfig::local_engine` has already refused any address that is not this
     /// machine's — so what is held here is loopback by the time the constructor sees it, and

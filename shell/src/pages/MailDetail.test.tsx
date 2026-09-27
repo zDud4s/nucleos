@@ -251,7 +251,7 @@ describe("MailDetail — sending a reply", () => {
         throw new ApiRefusal(
           503,
           "unavailable",
-          "no submission host is configured — set smtp_host in .ai/email.yaml",
+          "no submission host is configured — set smtp_host in ~/.nucleos/email.yaml",
         );
       }
       return undefined;
@@ -270,7 +270,7 @@ describe("MailDetail — sending a reply", () => {
     // The daemon's own sentence, verbatim — not the shell's generic
     // "the part of the núcleo this needs is not available" reading of a 503.
     expect(
-      await screen.findByText("no submission host is configured — set smtp_host in .ai/email.yaml"),
+      await screen.findByText("no submission host is configured — set smtp_host in ~/.nucleos/email.yaml"),
     ).toBeDefined();
     expect(screen.queryByText(/this shell has no reading/)).toBeNull();
   });

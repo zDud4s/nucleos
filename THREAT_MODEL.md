@@ -108,9 +108,9 @@ and then act.
 
 **Trust is a property of the origin, and it is a conjunction.** `core/src/trust.rs` returns `Raw` only when the owner is
 present in the foreground (`attention::owner_is_present`) AND both the requested host and the final host are on
-`trusted_hosts` in `.ai/web.yaml`. Everything else is `Quarantined`: a local model reads the page and the agent receives
+`trusted_hosts` in `~/.nucleos/web.yaml`. Everything else is `Quarantined`: a local model reads the page and the agent receives
 a summary. The default is quarantine, reached by omission — there is no denylist, so a host nobody has listed is never
-trusted by accident. An absent, unreadable or malformed `.ai/web.yaml` yields an EMPTY allowlist rather than a
+trusted by accident. An absent, unreadable or malformed `~/.nucleos/web.yaml` yields an EMPTY allowlist rather than a
 convenient one, so a broken file costs fidelity and never safety.
 
 **Trust never travels up.** The decision is made over the requested URL and the final URL together. An allowlisted host
@@ -139,7 +139,8 @@ ranges, link-local (169.254.169.254) and multicast are refused with no window be
 that resolves differently the second time it is asked does not get through. `safe.CheckURL` deliberately does NOT judge
 the host, and a test fails if someone adds that.
 
-`.ai/web.yaml` is in `classifier.rs`'s `SELF_GOVERNING_FILES`. Appending to `trusted_hosts` is not a file write, it is
+`~/.nucleos/web.yaml` is guarded by `classifier.rs`'s `names_machine_settings` (and its old `.ai/web.yaml` spelling by
+`SELF_GOVERNING_FILES` as well). Appending to `trusted_hosts` is not a file write, it is
 granting trust, and an autonomous run that could add a host it controls would be writing its own permission slip.
 
 ### What this does not solve
@@ -374,9 +375,9 @@ cancelled, is pruned or leaves no synthesis is walked past, never waited on.
 
    **The measurement this entry asked for has been taken** (2026-08-04, against the live datastore: 67 runs, 65 of them `Unrestricted`). `WebFetch`/`WebSearch` were called by **zero** runs. They appear in 15 runs' events only inside the `system`/`init` payload that advertises all 46 tools — capability advertised, never exercised. The same query shape finds 9 runs that called `Bash`, so it would have found a web call had there been one.
 
-   **And it is still not closed, for a reason the measurement itself surfaces.** "Unify the path" assumes there is a path to unify onto, and there is not yet: `web_pages` is empty, `mcp__nucleos__web_read` has zero callers, and gap 10 below records that nothing in the pillar has met a real server. Today the edit would be a removal rather than a redirect — it would take the only working web access an agent has and give back nothing. **Trigger:** make it part of the same change that first sets `enabled: true` in `.ai/web.yaml`, which is the moment the redirect becomes real. The cost of waiting is bounded by the measurement above: a capability nothing has used cannot have been abused.
-8. `trusted_hosts` is judged by host and nothing else, so an allowlisted host that serves user-published content grants `Raw` to whoever published it. The shipped list is two curated documentation sites for this reason, and the rule for adding one is written in `.ai/web.yaml`: the allowlist does not say "this site will not attack me", it says "summarising this costs fidelity AND I asked for it". A forum, a wiki or a code-hosting domain is the worst candidate precisely when it is otherwise trustworthy.
-9. The search query leaves the machine. Brave is the shipped provider partly because it does not log API queries, but the query is still data, and a pillar searching on its own would send a correspondent's name to a third party. `pillar_search_enabled` exists in `.ai/web.yaml` for that reason and is off; nothing consumes it yet, so no pillar can search today.
+   **And it is still not closed, for a reason the measurement itself surfaces.** "Unify the path" assumes there is a path to unify onto, and there is not yet: `web_pages` is empty, `mcp__nucleos__web_read` has zero callers, and gap 10 below records that nothing in the pillar has met a real server. Today the edit would be a removal rather than a redirect — it would take the only working web access an agent has and give back nothing. **Trigger:** make it part of the same change that first sets `enabled: true` in `~/.nucleos/web.yaml`, which is the moment the redirect becomes real. The cost of waiting is bounded by the measurement above: a capability nothing has used cannot have been abused.
+8. `trusted_hosts` is judged by host and nothing else, so an allowlisted host that serves user-published content grants `Raw` to whoever published it. The shipped list is two curated documentation sites for this reason, and the rule for adding one is written in `~/.nucleos/web.yaml`: the allowlist does not say "this site will not attack me", it says "summarising this costs fidelity AND I asked for it". A forum, a wiki or a code-hosting domain is the worst candidate precisely when it is otherwise trustworthy.
+9. The search query leaves the machine. Brave is the shipped provider partly because it does not log API queries, but the query is still data, and a pillar searching on its own would send a correspondent's name to a third party. `pillar_search_enabled` exists in `~/.nucleos/web.yaml` for that reason and is off; nothing consumes it yet, so no pillar can search today.
 10. Nothing in the web pillar has been exercised against a real server. There is no provider key on this machine and no test leaves it, deliberately. The first `enabled: true` is the first contact.
 11. A stranger's words can reach a council's synthesis. A phase-1 seat holds `get_email`, `get_email_queue` and `list_files`, so it can read mail somebody else wrote; its answer then enters the ranking seats' prompts in phase 2 and the chairman's in phase 3. The turn-marking rule (`ReadsUntrusted` then no `Acts`) is redundant inside a council rather than protective — there is no `Acts` on `COUNCIL_TOOLS` for it to refuse — so what bounds this is the absence of any acting tool in the whole pillar, not the taint. **The residual is influence on text the owner reads, never a tool call**, which is a smaller claim than the one email triage makes and is stated here rather than in a comment. Narrowing it further means removing the mail tools from the list, which would also remove the reason somebody would ask a council about their own correspondence.
 

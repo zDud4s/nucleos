@@ -57,7 +57,7 @@ pub struct ClassTally {
 /// CODE — bumped by hand once per policy change, and stamped here so two differently-classified
 /// decisions can be told apart after the fact. `policy_digest` is the CONFIGURATION, and it exists
 /// because from version 10 the code stopped being the whole answer: part of the policy is
-/// `.ai/github.yaml`, which is gitignored and travels with nobody, so two machines on the same
+/// `~/.nucleos/github.yaml`, which lives in one person's home and travels with nobody, so two machines on the same
 /// version can decide one `gh` line differently. Since `Policy::for_project`, part of it is also
 /// `project_github_ops` — so two PROJECTS on one machine can too, and the digest is what tells those
 /// two rows apart.
@@ -377,7 +377,7 @@ pub async fn shadow_readiness(
         // contract above is that each action class contributes exactly one row, "even when
         // historical classifier versions recorded different decisions for it" — grouping by digest
         // would fragment the sample, and with `READINESS_MIN_REVIEWED = 10` every edit of
-        // `.ai/github.yaml` would restart ten reviews of progress toward promotion. Whoever tuned
+        // `~/.nucleos/github.yaml` would restart ten reviews of progress toward promotion. Whoever tuned
         // their policy more often would be permanently further from being allowed to use it.
         //
         // It goes into a WARNING and not into the tuple, deliberately. `shadow_readiness` returns

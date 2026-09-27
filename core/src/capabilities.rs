@@ -1686,11 +1686,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a running Ollama at runner::OLLAMA_BASE_URL with the configured local model pulled"]
     async fn um_ollama_real_declara_um_array_de_capacidades() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("core/ has a parent");
-        let models = crate::config::load_models_config(&repo.join(".ai/nucleos-models.yaml"))
-            .expect("the daemon's own models config must parse");
+        // The file the daemon reads, on purpose: the question is about THIS machine's model.
+        let root = crate::machine_config::root().expect("this machine must have a home directory");
+        let models =
+            crate::config::load_models_config(&root.join(crate::config::MODELS_CONFIG_FILE))
+                .expect("the daemon's own models config must parse");
         let model = models
             .local_triage_model
             .clone()

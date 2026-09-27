@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the models each agent CLI currently offers into `.ai/nucleos-models.yaml`.
+"""Write the models each agent CLI currently offers into `~/.nucleos/nucleos-models.yaml`.
 
 The daemon's model picker is built from `assistant_choices` in that file, and it has to be written
 by somebody: neither CLI can enumerate its own models on demand, so a list left to be maintained by
@@ -59,8 +59,11 @@ import sys
 import urllib.error
 import urllib.request
 
-REPO = pathlib.Path(__file__).resolve().parent.parent
-CONFIG = REPO / ".ai" / "nucleos-models.yaml"
+# This machine's settings folder, the one the daemon reads (`machine_config::root` in the núcleo).
+# Not the repository's `.ai/`, where the file used to live: the daemon copies an old one from there
+# once, at startup, and never reads it again.
+CONFIG = pathlib.Path.home() / ".nucleos" / "nucleos-models.yaml"
+CONFIG_DISPLAY = "~/.nucleos/nucleos-models.yaml"
 CODEX_CACHE = pathlib.Path.home() / ".codex" / "models_cache.json"
 
 DOCS = "https://platform.claude.com/docs/en"
@@ -467,7 +470,7 @@ def refresh_hosted(rows: list[dict], served: dict[str, dict]) -> tuple[list[dict
     """PURE: each hand-written hosted row against the live catalogue.
 
     Returns the rows to write and the problems to shout about. A row whose id is GONE is KEPT, and
-    that is the load-bearing decision: `.ai/nucleos-models.yaml` is gitignored, so a row this
+    that is the load-bearing decision: `~/.nucleos/nucleos-models.yaml` is in no repository, so a row this
     script quietly deleted would leave no diff, no history and nothing at all to notice — the exact
     silent staleness the script exists to prevent, committed by the script itself. Dropping a
     person's configuration is also not a refresher's call to make. It says so instead, and `main`
@@ -626,7 +629,10 @@ def main() -> int:
     args = parser.parse_args()
 
     if not CONFIG.exists():
-        fail(f"{CONFIG} is not there")
+        fail(
+            f"{CONFIG_DISPLAY} is not there — write it from the app's System page, or start the "
+            "daemon once from the checkout whose .ai/nucleos-models.yaml it should copy"
+        )
         return 1
     text = CONFIG.read_text(encoding="utf-8")
     kept = existing_choices(text)
@@ -736,7 +742,7 @@ def main() -> int:
         return 1 if complained else 0
 
     CONFIG.write_text(splice(text, block), encoding="utf-8", newline="\n")
-    print(f"\nwrote {len(refreshed)} choice(s) to {CONFIG.relative_to(REPO)}")
+    print(f"\nwrote {len(refreshed)} choice(s) to {CONFIG_DISPLAY}")
     print("the daemon re-reads this file per request — nothing needs restarting")
     return 1 if complained else 0
 

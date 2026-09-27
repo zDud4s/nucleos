@@ -26,7 +26,7 @@ use crate::state::AppState;
 use crate::trust::{Decision, Requester, Trust};
 use crate::web_client::{WebClient, WebError};
 
-/// What the daemon carries for this pillar. Built once at startup from `.ai/web.yaml`.
+/// What the daemon carries for this pillar. Built once at startup from `~/.nucleos/web.yaml`.
 #[derive(Debug)]
 pub struct WebRuntime {
     pub enabled: bool,
@@ -52,7 +52,7 @@ impl WebRuntime {
     /// derived default would invent an empty pair that silently points nowhere. Naming the state
     /// makes "off" a thing somebody chose.
     ///
-    /// `#[cfg(test)]` because production always builds a real one from `.ai/web.yaml`; this is what
+    /// `#[cfg(test)]` because production always builds a real one from `~/.nucleos/web.yaml`; this is what
     /// the fourteen `test_state()` fixtures hold. Left ungated it is dead code in the daemon, and
     /// this repository answers that warning rather than silencing it.
     #[cfg(test)]
@@ -723,7 +723,7 @@ fn quarantine_unavailable(why: String) -> axum::response::Response {
 fn disabled() -> axum::response::Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        "the web pillar is off: set enabled: true in .ai/web.yaml",
+        "the web pillar is off: set enabled: true in ~/.nucleos/web.yaml",
     )
         .into_response()
 }

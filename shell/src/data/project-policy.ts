@@ -294,7 +294,7 @@ export function useProjectGitOps(projectId: string | null) {
  * discover the list by POSTing something invalid.
  *
  * **Every operation, with a flag, and the `false` ones are the reason.** An operation outside the
- * ceilings — `api_read` is the standing example, and not even `.ai/github.yaml` can turn it on — is
+ * ceilings — `api_read` is the standing example, and not even `~/.nucleos/github.yaml` can turn it on — is
  * a FACT to show and never a control to draw. Serving only the admitted names would leave a page
  * two bad choices again: omit it, which claims this daemon cannot do it at all, or draw a checkbox
  * that cannot be ticked, which is a lie about who decides. `declarable: false` is how it gets drawn
