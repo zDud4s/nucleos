@@ -27,6 +27,15 @@ export interface Harness {
   files: number;
 }
 
+/**
+ * The gate this app proposes — the command whose exit code says *green* — and which file said so.
+ * A proposal and never a setting: onboarding shows it in a field and stores what was confirmed.
+ */
+export interface GateProposal {
+  command: string;
+  source: string;
+}
+
 export interface Detected {
   /** The folder as the filesystem resolved it — what gets registered, not what was typed. */
   root: string;
@@ -38,6 +47,8 @@ export interface Detected {
   commands: Suggestion[];
   /** Never silent: a truncated list that did not say so would read as the whole of what is there. */
   commands_omitted: number;
+  /** What the gate could be: the project's own declared full suite, else a `test` or `check`. */
+  gate: GateProposal | null;
   /** A project this daemon already keeps at this folder. The one thing the folder cannot say. */
   taken_by: string | null;
 }

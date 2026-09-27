@@ -134,6 +134,13 @@ pub fn build_router(state: AppState) -> Router {
             get(get_project_folder).delete(delete_project_folder),
         )
         .route("/projects/{id}/rules", get(get_project_rules))
+        // Bringing a project under NucleOS: the GET is what a person reads before confirming (what is
+        // in the folder, the proposed gate), the POST is the confirmation. In no table in `auth.rs`,
+        // so Admin's by default-deny — it writes the gate command and an executable hook.
+        .route(
+            "/projects/{id}/onboard",
+            get(get_project_onboarding).post(post_project_onboard),
+        )
         .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/map", get(get_project_map))
         // Which specs a project has, so the extraction button offers a list and not a text box.
@@ -3093,15 +3100,21 @@ async fn get_autopilot_state(
 async fn post_autopilot_state(
     State(state): State<AppState>,
     Json(body): Json<AutopilotStateRequest>,
-) -> Result<Json<AutopilotStateResponse>, StatusCode> {
-    let mode = Mode::from_db_str(&body.mode).ok_or(StatusCode::BAD_REQUEST)?;
+) -> Result<Json<AutopilotStateResponse>, axum::response::Response> {
+    let mode = Mode::from_db_str(&body.mode).ok_or(StatusCode::BAD_REQUEST.into_response())?;
     let project_root = body.project_root.as_deref().map(std::path::Path::new);
-    autopilot::set_project_mode(&state.pool, &body.project_id, mode, project_root)
-        .await
-        .map_err(activation_status)?;
+    autopilot::set_project_mode(
+        &state.pool,
+        state.machine_config_root.as_deref(),
+        &body.project_id,
+        mode,
+        project_root,
+    )
+    .await
+    .map_err(activation_status)?;
     let mode = autopilot::project_mode(&state.pool, &body.project_id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
 
     Ok(Json(AutopilotStateResponse {
         project_id: body.project_id,
@@ -3266,13 +3279,22 @@ async fn budget_response(state: &AppState) -> Result<BudgetResponse, StatusCode>
     })
 }
 
-fn activation_status(error: ActivationError) -> StatusCode {
+/// The mode door's refusals on the wire.
+///
+/// Three of the four prerequisites are still the bare 422 they always were, and the shell's copy
+/// for that answer names all of them. `NotOnboarded` alone carries a name, `not_onboarded`, because
+/// it is the one refusal the shell can resolve in place — by running onboarding
+/// (`POST /projects/{id}/onboard`) — and a status shared with three other causes could not tell it
+/// to. The name is opaque on purpose: it says what is missing, never where a file would have been.
+fn activation_status(error: ActivationError) -> axum::response::Response {
     match error {
+        ActivationError::NotOnboarded => {
+            refusal(StatusCode::UNPROCESSABLE_ENTITY, "not_onboarded").into_response()
+        }
         ActivationError::NotAGitRepo
         | ActivationError::ProjectRootRequired
-        | ActivationError::NotOnboarded
-        | ActivationError::HookNotRegistered => StatusCode::UNPROCESSABLE_ENTITY,
-        ActivationError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        | ActivationError::HookNotRegistered => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        ActivationError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -3992,7 +4014,7 @@ async fn post_machine_config(
     }
 
     let contents = body.contents;
-    tokio::task::spawn_blocking(move || write_atomically(&target, &contents))
+    tokio::task::spawn_blocking(move || crate::project_state::write_atomically(&target, &contents))
         .await
         .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
         .map_err(|error| {
@@ -6528,7 +6550,7 @@ async fn post_project_write(
     }
 
     let contents = body.contents;
-    tokio::task::spawn_blocking(move || write_atomically(&target, &contents))
+    tokio::task::spawn_blocking(move || crate::project_state::write_atomically(&target, &contents))
         .await
         .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
         .map_err(|error| {
@@ -6560,24 +6582,229 @@ async fn post_project_write(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Write through a temporary file in the same directory, then rename over the target.
+/* ------------------------------------------------------------- onboarding -- */
+
+#[derive(Deserialize)]
+struct OnboardingQuery {
+    /// The folder to read, for a project that has no root on record yet — one being added, or one
+    /// in `off`, whose root `set_project_mode` cleared. Absent means the root on record.
+    root: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OnboardRequest {
+    /// As [`OnboardingQuery::root`].
+    #[serde(default)]
+    project_root: Option<String>,
+    /// The gate command a person confirmed. Absent, null or blank is "none confirmed", which leaves
+    /// the project's rules exactly as they are — see `onboarding::onboard`.
+    #[serde(default)]
+    gate_command: Option<String>,
+}
+
+/// What a person reads before onboarding a project, and what they read after.
+#[derive(Serialize)]
+struct OnboardingView {
+    project_id: String,
+    root: String,
+    /// The marker, when the project was onboarded; `null` when it was not.
+    onboarded: Option<crate::onboarding::Marker>,
+    /// Where the marker is, as a person is shown it.
+    marker_path: String,
+    harnesses: Vec<crate::detect::Harness>,
+    /// The gate this app would propose from the folder (`detect::propose_gate`).
+    proposed_gate: Option<crate::detect::GateProposal>,
+    /// The gate the project's rules already name, which the field should start from when there is
+    /// one: onboarding again must not quietly swap a gate somebody chose for a guess.
+    configured_gate: Option<String>,
+    /// Whether this daemon's classifier hook is wired at the root right now.
+    hook_wired: bool,
+}
+
+/// The folder onboarding is about: the one the request names, or the one on record.
 ///
-/// A plain truncate-and-write leaves the rules file half-written if anything goes wrong mid-write,
-/// and a half-written `autopilot.yaml` is not a smaller file — it is an *unreadable* one, which
-/// `gate.rs` reports as `gate errored` on every completed run from then on. Rename is atomic on both
-/// platforms and replaces an existing file on both, so the file is either wholly the old one or
-/// wholly the new one.
-///
-/// The temporary lives beside the target because rename is only atomic within a filesystem. Two
-/// writes racing would collide on it; they would be writing the same class of content to the same
-/// file, and the loser is a request the caller is watching.
-fn write_atomically(target: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
+/// A named folder is held to what `GET /projects/detect` holds a path to — absolute, there, a
+/// folder — because pointing at a folder is what bringing a project in IS, exactly as adding one
+/// is. The same key reaches both doors, and it is the owner's.
+async fn onboarding_root(
+    state: &AppState,
+    id: &str,
+    named: Option<String>,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    let Some(named) = named
+        .map(|root| root.trim().to_string())
+        .filter(|root| !root.is_empty())
+    else {
+        return resolve_project_root(state, id)
+            .await
+            .map_err(|status| refusal(status, "no_project_root"));
+    };
+    let root = PathBuf::from(named);
+    if !root.is_absolute() {
+        return Err(refusal(StatusCode::BAD_REQUEST, "not_absolute"));
     }
-    let temp = target.with_extension("nucleos-tmp");
-    std::fs::write(&temp, contents)?;
-    std::fs::rename(&temp, target)
+    match tokio::fs::metadata(&root).await {
+        Ok(meta) if meta.is_dir() => Ok(root),
+        Ok(_) => Err(refusal(StatusCode::UNPROCESSABLE_ENTITY, "not_a_folder")),
+        Err(_) => Err(refusal(StatusCode::NOT_FOUND, "no_such_folder")),
+    }
+}
+
+async fn onboarding_view(
+    state: &AppState,
+    id: &str,
+    root: PathBuf,
+) -> Result<OnboardingView, (StatusCode, Json<serde_json::Value>)> {
+    let machine_root = machine_config_root(state)?;
+    let project_id = id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let found = crate::detect::inspect_folder(&root);
+        // An unreadable rules file has no gate this can name; the POST refuses it by name.
+        let configured_gate = crate::config::load_schedule_rules(Some(&machine_root), &project_id)
+            .ok()
+            .and_then(|rules| rules.gate_command);
+        OnboardingView {
+            onboarded: crate::onboarding::read_marker(Some(&machine_root), &project_id),
+            marker_path: crate::project_state::display_path(
+                &project_id,
+                crate::onboarding::MARKER_FILE,
+            ),
+            harnesses: found.harnesses,
+            proposed_gate: found.gate,
+            configured_gate,
+            hook_wired: crate::autopilot::classifier_hook_is_wired(&root),
+            root: root.to_string_lossy().into_owned(),
+            project_id,
+        }
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+}
+
+/// What onboarding would find and propose, and whether it already happened.
+///
+/// Reads and proposes, like `GET /projects/detect`; nothing is stored until the POST. Admin's by
+/// default-deny, beside the POST: it reads the project's rules, and `GET /projects/{id}/rules`,
+/// which serves the same gate, has always been Admin's.
+async fn get_project_onboarding(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<OnboardingQuery>,
+) -> Result<Json<OnboardingView>, (StatusCode, Json<serde_json::Value>)> {
+    project_state_dir(&state, &id)?;
+    let root = onboarding_root(&state, &id, query.root).await?;
+    onboarding_view(&state, &id, root).await.map(Json)
+}
+
+/// A refusal with its reason beside its name — the shape `POST /write` uses for `invalid`.
+fn refusal_with_detail(
+    status: StatusCode,
+    name: &'static str,
+    detail: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({ "refusal": name, "detail": detail })),
+    )
+}
+
+/// Onboards a project to NucleOS, with the gate command a person confirmed. Idempotent.
+///
+/// The one thing activation now asks of a project besides the classifier hook (`autopilot.rs`),
+/// and the act is `onboarding::onboard`'s: check the gate, detect the harnesses, install the hook
+/// with the same `wire_classifier_hook` every other door uses, store the gate as `gate_command` in
+/// the project's `autopilot.yaml` — where the gate already lives — and write the marker last.
+///
+/// **In no table in `auth.rs`, so Admin's by default-deny**, for `POST /projects/{id}/write`'s
+/// reason and a second one: it sets what *green* means, and it writes an executable hook into a
+/// folder. The folder may be named in the body, which the two session doors that wire the hook
+/// refuse to allow; here it is allowed because a project being brought in has no folder on record
+/// yet, and naming one is what `GET /projects/detect` already lets this same key do.
+///
+/// **No kill-switch check, unlike `POST /write`.** Onboarding starts nothing, and it is the
+/// prerequisite of registering a project, which the stop has never refused; the wizard adds
+/// projects while the stop is engaged, and this must not be what makes it fail.
+///
+/// Refusals, all `{refusal, detail?}`: the root's (`no_project_root`, `not_absolute`,
+/// `no_such_folder`, `not_a_folder`), the state directory's (`no_machine_root`, `bad_project_id`),
+/// then `invalid_gate` and `rules_unreadable` (422, with the reason) before anything is written,
+/// and `hook_unwritable` (409, with the reason) for a `.claude/settings.json` this cannot parse.
+async fn post_project_onboard(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<OnboardRequest>,
+) -> Result<Json<OnboardingView>, (StatusCode, Json<serde_json::Value>)> {
+    project_state_dir(&state, &id)?;
+    let machine_root = machine_config_root(&state)?;
+    let root = onboarding_root(&state, &id, body.project_root).await?;
+    let gate = body
+        .gate_command
+        .map(|command| command.trim().to_string())
+        .filter(|command| !command.is_empty());
+
+    let (project_id, project_root, confirmed) = (id.clone(), root.clone(), gate.clone());
+    let now = chrono::Utc::now().to_rfc3339();
+    tokio::task::spawn_blocking(move || {
+        crate::onboarding::onboard(
+            &machine_root,
+            &project_id,
+            &project_root,
+            confirmed.as_deref(),
+            &now,
+        )
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(|error| match error {
+        crate::onboarding::OnboardError::BadId => {
+            refusal(StatusCode::UNPROCESSABLE_ENTITY, "bad_project_id")
+        }
+        crate::onboarding::OnboardError::Gate(detail) => {
+            refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "invalid_gate", detail)
+        }
+        crate::onboarding::OnboardError::Rules(detail) => {
+            refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "rules_unreadable", detail)
+        }
+        crate::onboarding::OnboardError::Hook(detail) => {
+            refusal_with_detail(StatusCode::CONFLICT, "hook_unwritable", detail)
+        }
+        crate::onboarding::OnboardError::Io(error) => {
+            tracing::warn!(%error, project_id = %id, "onboarding a project failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    })?;
+
+    let summary = match &gate {
+        Some(command) => format!(
+            "onboarded at {}: classifier hook installed, gate command confirmed as `{command}`",
+            root.display()
+        ),
+        None => format!(
+            "onboarded at {}: classifier hook installed, no gate command confirmed",
+            root.display()
+        ),
+    };
+    // After the act, and loudly on failure, for `post_project_write`'s reason. Spelled as a literal
+    // and not as `onboarding::FEED_KIND`, because the shell's completeness test reads feed kinds out
+    // of this source; the test below holds the two equal.
+    if let Err(error) = feed::append(
+        &state.pool,
+        Some(&id),
+        "project_onboarded",
+        &summary,
+        None,
+        None,
+    )
+    .await
+    {
+        tracing::error!(
+            %error,
+            project_id = %id,
+            "a project was onboarded and its feed line was not recorded"
+        );
+    }
+
+    onboarding_view(&state, &id, root).await.map(Json)
 }
 
 /* ------------------------------------------------------- project commands -- */
@@ -17207,6 +17434,178 @@ mod tests {
         assert_eq!(
             set_wip_limit(state, "nowhere", serde_json::json!({ "limit": 1 })).await,
             StatusCode::NOT_FOUND,
+        );
+    }
+
+    /* ------------------------------------------------------- onboarding -- */
+
+    /// The mode door's one named refusal: a project nobody onboarded is `not_onboarded`, opaque —
+    /// no path in it — and the three other prerequisites stay the bare 422 they always were.
+    #[tokio::test]
+    async fn activating_a_project_nobody_onboarded_is_refused_by_name() {
+        let mut state = test_state().await;
+        let _home = with_project_home(&mut state);
+        let folder = tempfile::tempdir().unwrap();
+        crate::autopilot::wire_classifier_hook(folder.path()).unwrap();
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/state",
+            Some(serde_json::json!({
+                "project_id": "alpha",
+                "mode": "shadow",
+                "project_root": folder.path().to_string_lossy(),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, serde_json::json!({ "refusal": "not_onboarded" }));
+
+        // Onboarded, the hook refusal is still the bare status.
+        let bare = tempfile::tempdir().unwrap();
+        crate::onboarding::onboard(
+            state.machine_config_root.as_deref().unwrap(),
+            "beta",
+            bare.path(),
+            None,
+            "now",
+        )
+        .unwrap();
+        std::fs::remove_file(bare.path().join(".claude/hooks/ask_daemon.py")).unwrap();
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/autopilot/state",
+            Some(serde_json::json!({
+                "project_id": "beta",
+                "mode": "shadow",
+                "project_root": bare.path().to_string_lossy(),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, serde_json::Value::Null);
+    }
+
+    /// The whole flow over HTTP: read the proposal, confirm a gate, and the project can be put in
+    /// shadow — with the gate where the daemon reads it, the hook wired, and a feed line.
+    #[tokio::test]
+    async fn onboarding_proposes_then_takes_the_confirmed_gate_and_opens_activation() {
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join("package.json"),
+            r#"{"scripts": {"test": "vitest run"}}"#,
+        )
+        .unwrap();
+        let root = folder.path().to_string_lossy().into_owned();
+
+        let (status, view) = workflow_call(
+            state.clone(),
+            "GET",
+            &format!("/projects/alpha/onboard?root={}", urlencoding(&root)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["onboarded"], serde_json::Value::Null);
+        assert_eq!(view["proposed_gate"]["command"], "npm run test");
+        assert_eq!(view["hook_wired"], false);
+        assert_eq!(
+            view["marker_path"],
+            "~/.nucleos/projects/alpha/onboarded.yaml"
+        );
+
+        let (status, view) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/onboard",
+            Some(serde_json::json!({ "project_root": root, "gate_command": " npm run test " })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["onboarded"]["gate_command"], "npm run test");
+        assert_eq!(view["configured_gate"], "npm run test");
+        assert_eq!(view["hook_wired"], true);
+        let rules = crate::config::load_schedule_rules(Some(home.path()), "alpha").unwrap();
+        assert_eq!(rules.gate_command.as_deref(), Some("npm run test"));
+
+        let kind: String = sqlx::query_scalar(
+            "SELECT kind FROM feed WHERE project_id = 'alpha' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(kind, crate::onboarding::FEED_KIND);
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/state",
+            Some(serde_json::json!({ "project_id": "alpha", "mode": "shadow", "project_root": root })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Registered now, so the root on record serves; and a second onboarding is the same state.
+        let (status, view) = workflow_call(
+            state,
+            "POST",
+            "/projects/alpha/onboard",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["configured_gate"], "npm run test");
+    }
+
+    /// Each refusal before anything is written, by name.
+    #[tokio::test]
+    async fn onboarding_refuses_by_name_before_it_writes() {
+        let mut state = test_state().await;
+        let _home = with_project_home(&mut state);
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().to_string_lossy().into_owned();
+
+        for (body, status, name) in [
+            (
+                serde_json::json!({}),
+                StatusCode::NOT_FOUND,
+                "no_project_root",
+            ),
+            (
+                serde_json::json!({ "project_root": "relative/path" }),
+                StatusCode::BAD_REQUEST,
+                "not_absolute",
+            ),
+            (
+                serde_json::json!({ "project_root": root, "gate_command": "a\nb" }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_gate",
+            ),
+        ] {
+            let (got, answer) =
+                workflow_call(state.clone(), "POST", "/projects/alpha/onboard", Some(body)).await;
+            assert_eq!(
+                (got, answer["refusal"].as_str()),
+                (status, Some(name)),
+                "{answer}"
+            );
+        }
+        let (got, answer) = workflow_call(
+            state,
+            "POST",
+            "/projects/a:b/onboard",
+            Some(serde_json::json!({ "project_root": root })),
+        )
+        .await;
+        assert_eq!(got, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(answer["refusal"], "bad_project_id");
+        assert!(
+            !folder.path().join(".claude").exists(),
+            "no hook was installed"
         );
     }
 

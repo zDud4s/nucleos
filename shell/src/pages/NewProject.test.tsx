@@ -342,11 +342,48 @@ describe("adding a project", () => {
 
     const receipt = screen.getByText("Adding it will:").nextElementSibling as HTMLElement;
     expect(within(receipt).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
-      "register thing at C:/Projects/thing, in shadow",
+      "register thing at C:/Projects/thing, in shadow, onboarded with no gate command",
       "adopt .ai as its way of working",
       "declare gate, not as a gate",
       "an open-proposal ceiling of 2",
     ]);
+  });
+
+  /**
+   * Onboarding is part of registering: the mode door refuses a project nobody onboarded. The gate
+   * starts from the núcleo's proposal, is sent as the person left it, and blank is none.
+   */
+  it("onboards with the gate as confirmed before it registers", async () => {
+    const { state } = await openWizard({
+      detected: detected({ gate: { command: "npm run test", source: "package.json" } }),
+    });
+    await look();
+
+    const gate = (await screen.findByLabelText("Gate command")) as HTMLInputElement;
+    expect(gate.value).toBe("npm run test");
+    expect(screen.getByText(/proposed from package\.json/)).toBeTruthy();
+    fireEvent.change(gate, { target: { value: "npm run ci" } });
+    expect(screen.getByText(/onboarded with the gate/).textContent).toContain("npm run ci");
+
+    fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
+    await waitFor(() => expect(state.projects.length).toBe(1));
+    expect(state.onboarded).toEqual([
+      { projectId: "thing", project_root: "C:/Projects/thing", gate_command: "npm run ci" },
+    ]);
+  });
+
+  /** A refused onboarding registers nothing, and pressing again is a retry. */
+  it("registers nothing when onboarding is refused", async () => {
+    await openWizard({
+      detected: detected(),
+      onboardRefusal: { status: 409, code: "hook_unwritable", detail: "settings.json is not JSON" },
+    });
+    await look();
+    fireEvent.click(await screen.findByRole("button", { name: "add it, in shadow" }));
+
+    expect(await screen.findByText("hook_unwritable")).toBeTruthy();
+    expect(screen.queryByText(/Registered as/)).toBeNull();
+    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty("disabled", false);
   });
 
   /** Steps two and three arrive below the focus; focus goes to them, so they are heard. */

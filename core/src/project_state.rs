@@ -3,7 +3,7 @@
 //! [`crate::machine_config`] moved this machine's settings out of the daemon's working directory
 //! and into `~/.nucleos/`. This module is the same move for the two files the núcleo keeps per
 //! project — the autopilot rules and the workflow pins — which used to sit in the project's own
-//! `.ai/` folder.
+//! `.ai/` folder, and for the marker that says the project was onboarded (`crate::onboarding`).
 //!
 //! # Why not the project's `.ai/`
 //!
@@ -43,8 +43,17 @@ pub const AUTOPILOT_FILE: &str = "autopilot.yaml";
 /// Parsed by [`crate::workflows::parse_pins`].
 pub const PINS_FILE: &str = "workflows.yaml";
 
+/// That a person onboarded this project to NucleOS, when, and what they confirmed. Written only by
+/// [`crate::onboarding`] — the onboarding route and its one-time migration — and never copied from
+/// anywhere: it has no older home, because it records a decision this app did not ask for before.
+pub const ONBOARDED_FILE: &str = "onboarded.yaml";
+
 /// Every file this module places, in the order [`migrate_legacy`] copies them.
 pub const FILES: &[&str] = &[AUTOPILOT_FILE, PINS_FILE];
+
+/// Every file a project's state directory holds: [`FILES`] plus the onboarding marker. What the
+/// classifier guards by name, because each of them decides something about what a run may do.
+pub const ALL_FILES: &[&str] = &[AUTOPILOT_FILE, PINS_FILE, ONBOARDED_FILE];
 
 /// Where every row of [`FILES`] used to live, relative to the project's root.
 const LEGACY_DIR: &str = ".ai";
@@ -103,6 +112,28 @@ pub fn display_path(project_id: &str, name: &str) -> String {
         "{}/{PROJECTS_DIR}/{project_id}/{name}",
         crate::machine_config::ROOT_DISPLAY
     )
+}
+
+/// Write through a temporary file in the same directory, then rename over the target.
+///
+/// Every writer of a state file goes through this: the write door (`http.rs`) and onboarding.
+///
+/// A plain truncate-and-write leaves the rules file half-written if anything goes wrong mid-write,
+/// and a half-written `autopilot.yaml` is not a smaller file — it is an *unreadable* one, which
+/// `gate.rs` reports as `gate errored` on every completed run from then on. Rename is atomic on both
+/// platforms and replaces an existing file on both, so the file is either wholly the old one or
+/// wholly the new one.
+///
+/// The temporary lives beside the target because rename is only atomic within a filesystem. Two
+/// writes racing would collide on it; they would be writing the same class of content to the same
+/// file, and the loser is a request the caller is watching.
+pub fn write_atomically(target: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = target.with_extension("nucleos-tmp");
+    std::fs::write(&temp, contents)?;
+    std::fs::rename(&temp, target)
 }
 
 /* --------------------------------------------------------------- migration -- */

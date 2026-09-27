@@ -22,9 +22,10 @@
 //!
 //! Two things bound it. The route is in no scope table, so `auth::permits` — default-deny — leaves
 //! it to Admin and Control, which is the key of the person sitting at the machine. And it reads
-//! **four files by name**, never a tree: a `package.json`, a `Makefile`, a Cargo config and the
-//! existence of four folders. It cannot be pointed at a directory to have its contents enumerated,
-//! which is the capability worth not building.
+//! **files by name**, never a tree: a `package.json`, a `Makefile`, a Cargo config, the
+//! project's own `.ai/project.yaml` when it has one, and the existence of four folders. It cannot be
+//! pointed at a directory to have its contents enumerated, which is the capability worth not
+//! building.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -66,6 +67,20 @@ pub struct Harness {
     pub files: usize,
 }
 
+/// The command this app proposes as the project's gate — the one whose exit code says *green* — and
+/// where the proposal came from.
+///
+/// A proposal and never a setting: onboarding (`crate::onboarding`) shows it in an editable field
+/// and stores only what a person confirmed there. Guessing the quality bar and writing it down
+/// unasked would put a claim in the project nobody made.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GateProposal {
+    pub command: String,
+    /// Shown beside the field, for the reason [`Suggestion::source`] is: somebody deciding whether
+    /// this is their bar has to be able to tell which file said so.
+    pub source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Detected {
     /// The folder, as the filesystem resolved it. Sent back so what gets registered is what was
@@ -83,6 +98,8 @@ pub struct Detected {
     /// How many commands were found beyond the ceiling. Never silent: a truncated list that did not
     /// say so would read as the whole of what is there.
     pub commands_omitted: usize,
+    /// What the gate could be, when anything here suggests one. See [`propose_gate`].
+    pub gate: Option<GateProposal>,
     /// A project this daemon already has at this root, if any.
     ///
     /// The one thing here that is not about the folder. Adding a project twice under two names is
@@ -127,6 +144,7 @@ pub fn inspect_folder(root: &Path) -> Detected {
     }
 
     let (commands, commands_omitted) = suggestions(root);
+    let gate = propose_gate(root, &commands);
 
     Detected {
         root: root.to_string_lossy().into_owned(),
@@ -137,8 +155,56 @@ pub fn inspect_folder(root: &Path) -> Detected {
         harnesses,
         commands,
         commands_omitted,
+        gate,
         taken_by: None,
     }
+}
+
+/// The command a project's gate could be, from what the folder already says — or nothing.
+///
+/// In order, and the order is who is best placed to know:
+///
+/// 1. **The project's own declared full suite**, `commands.test_full` in `.ai/project.yaml`, when
+///    the project keeps that file. It is the project writing down, in its own words, what *green*
+///    means, and a proposal cannot do better than repeat it. **Only a hint**: a project without the
+///    file, or with a `test_full` this cannot read as ONE command, simply falls through — nothing in
+///    NucleOS requires that file or the workflow it belongs to. One command and not a list, because
+///    a gate is spawned directly and never through a shell, so two entries could not be chained.
+/// 2. **A command called `test`**, then **one called `check`**, among the ones [`suggestions`]
+///    found. The conventional names for "run everything that has to pass".
+fn propose_gate(root: &Path, commands: &[Suggestion]) -> Option<GateProposal> {
+    if let Some(command) = read_bounded(&root.join(".ai").join("project.yaml"))
+        .as_deref()
+        .and_then(declared_full_suite)
+    {
+        return Some(GateProposal {
+            command,
+            source: ".ai/project.yaml (commands.test_full)".to_string(),
+        });
+    }
+    ["test", "check"].iter().find_map(|name| {
+        commands
+            .iter()
+            .find(|suggestion| suggestion.name == *name)
+            .map(|suggestion| GateProposal {
+                command: suggestion.command.clone(),
+                source: suggestion.source.to_string(),
+            })
+    })
+}
+
+/// `commands.test_full` out of a `project.yaml`, when it is one command: a string, or a list of
+/// exactly one. Anything else — no key, a list of several, a file that is not YAML — is no hint.
+fn declared_full_suite(text: &str) -> Option<String> {
+    let value: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
+    let declared = value.get("commands")?.get("test_full")?;
+    let command = match declared {
+        serde_yaml::Value::String(command) => command.as_str(),
+        serde_yaml::Value::Sequence(entries) if entries.len() == 1 => entries[0].as_str()?,
+        _ => return None,
+    };
+    let command = command.trim();
+    (!command.is_empty() && !command.contains(['\n', '\r'])).then(|| command.to_string())
 }
 
 /// Files under a folder, stopping at a depth and a count.
@@ -447,6 +513,52 @@ mod tests {
         assert_eq!(found.harnesses[0].path, ".ai");
         assert_eq!(found.harnesses[0].files, 2);
         assert!(found.harnesses[0].what.contains("pipeline"));
+    }
+
+    /// The project's own declared full suite wins over a guess from a script's name, and is only
+    /// ever a hint: a list of several, or no file, falls through to `test`, then `check`.
+    #[test]
+    fn the_gate_is_proposed_from_the_projects_own_word_first_and_a_conventional_name_after() {
+        let temp = folder();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts": {"check": "tsc", "test": "vitest run"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_folder(temp.path()).gate,
+            Some(GateProposal {
+                command: "npm run test".to_string(),
+                source: "package.json".to_string(),
+            })
+        );
+
+        std::fs::create_dir_all(temp.path().join(".ai")).unwrap();
+        std::fs::write(
+            temp.path().join(".ai/project.yaml"),
+            "commands:\n  test_full:\n    - bash scripts/gates.sh all\n",
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_folder(temp.path()).gate,
+            Some(GateProposal {
+                command: "bash scripts/gates.sh all".to_string(),
+                source: ".ai/project.yaml (commands.test_full)".to_string(),
+            })
+        );
+
+        // Two commands cannot be one gate, so the declaration is no hint and the name wins again.
+        std::fs::write(
+            temp.path().join(".ai/project.yaml"),
+            "commands:\n  test_full:\n    - a\n    - b\n",
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_folder(temp.path()).gate.unwrap().command,
+            "npm run test"
+        );
+
+        assert_eq!(inspect_folder(folder().path()).gate, None);
     }
 
     /// A folder that is not a repository is reported as one, not refused. `set_project_mode` only

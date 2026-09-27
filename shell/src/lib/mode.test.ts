@@ -109,7 +109,7 @@ describe("promotionConfirmLabel", () => {
  * only be read; as a list each one can be drawn as a path, and the words around it stay one copy.
  */
 describe("MODE_SENTENCES", () => {
-  it("the 422 prerequisites are data, four items and a plus, three of them paths", () => {
+  it("the 422 prerequisites are data, four items and a plus, two of them paths", () => {
     // Narrowed through `unknown` by the test itself, so what is asserted is the shape and not
     // whatever the module's own type already promises.
     const value: unknown = MODE_SENTENCES.unprocessable;
@@ -122,11 +122,10 @@ describe("MODE_SENTENCES", () => {
     const paths = [...list.items, list.plus]
       .filter((item) => item.path !== undefined)
       .map((item) => item.path);
-    expect(paths).toEqual([
-      ".ai/workflow/workflow.md",
-      ".claude/hooks/ask_daemon.py",
-      ".claude/settings.json",
-    ]);
+    // Onboarding is a prerequisite and not a file: whether the project keeps any particular
+    // workflow in its folder is none of the mode door's business.
+    expect(paths).toEqual([".claude/hooks/ask_daemon.py", ".claude/settings.json"]);
+    expect(list.items.map((item) => item.text)).toContain("the project onboarded to NucleOS");
 
     // The other two answers are still sentences: nothing in them is a list.
     expect(MODE_SENTENCES.bad_request).toBe("that is not one of the three settings");
@@ -142,7 +141,7 @@ describe("MODE_SENTENCES", () => {
  * against itself — hence the two guards at the top of the case.
  */
 const OLD_UNPROCESSABLE =
-  "the núcleo would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these: a folder, .ai/workflow/workflow.md inside it, .claude/hooks/ask_daemon.py on disk, and a PreToolUse hook in .claude/settings.json naming that file — plus, to act, a folder that is a git repository.";
+  "the núcleo would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these: a folder, the project onboarded to NucleOS, .claude/hooks/ask_daemon.py on disk, and a PreToolUse hook in .claude/settings.json naming that file — plus, to act, a folder that is a git repository.";
 
 describe("MODE_REFUSAL_PROSE", () => {
   it("the prose form is byte-identical to the sentence it replaces", () => {
@@ -153,6 +152,9 @@ describe("MODE_REFUSAL_PROSE", () => {
     expect(MODE_REFUSAL_PROSE).toBeDefined();
     expect(MODE_REFUSAL_PROSE.unprocessable).toBe(OLD_UNPROCESSABLE);
     expect(MODE_REFUSAL_PROSE.bad_request).toBe("that is not one of the three settings");
+    // The one named refusal says what is missing, and never where a workflow's file would be.
+    expect(MODE_REFUSAL_PROSE.not_onboarded).toMatch(/has not been onboarded/);
+    expect(MODE_REFUSAL_PROSE.not_onboarded).not.toMatch(/\.ai\/|workflow\.md/);
     expect(MODE_REFUSAL_PROSE.internal).toBe(
       "the núcleo hit an error of its own while changing this",
     );

@@ -10,6 +10,7 @@ import {
   type Detected,
   type Harness,
 } from "../data/detect";
+import { useOnboard } from "../data/onboarding";
 import { useDeclareProjectCommand } from "../data/project-commands";
 import { useSetWipLimit } from "../data/projects";
 import { useSetProjectMode } from "../data/autopilot";
@@ -255,11 +256,14 @@ function Found({
   const [wip, setWip] = useState<number | null>(2);
   const [ran, setRan] = useState<Ran | null>(null);
   const [busy, setBusy] = useState(false);
+  /** The gate command to confirm, starting from what the núcleo proposes. Blank is none. */
+  const [gate, setGate] = useState(found.gate?.command ?? "");
 
   const library = useWorkflowLibrary();
   const projects = useProjects();
   const kill = useKillSwitch();
   const setMode = useSetProjectMode();
+  const onboard = useOnboard();
   const setWipLimit = useSetWipLimit();
   const declare = useDeclareProjectCommand();
   const adopt = useAdoptWorkflow();
@@ -330,14 +334,29 @@ function Found({
         <>
           register <span className="font-mono">{projectId}</span> at{" "}
           <span className="font-mono">{found.root}</span>, in{" "}
-          <StateBadge domain="autopilot" state="shadow" />
+          <StateBadge domain="autopilot" state="shadow" />, onboarded with{" "}
+          {gate.trim() === "" ? (
+            "no gate command"
+          ) : (
+            <>
+              the gate <span className="font-mono">{gate.trim()}</span>
+            </>
+          )}
         </>
       ),
       doing: "registering the project",
-      // **Shadow, always.** §9. A project that started acting on its own the moment it was added
-      // would be one nobody had decided to trust yet.
-      run: () =>
-        setMode.mutateAsync({ project_id: projectId, mode: "shadow", project_root: found.root }),
+      // Onboarding first, in the same step: the mode door refuses a project nobody onboarded, and
+      // the two together are what "registering" means. Onboarding is idempotent, so a retry after a
+      // refused registration repeats nothing that matters. **Shadow, always.** §9. A project that
+      // started acting on its own the moment it was added would be one nobody had decided to trust.
+      run: async () => {
+        await onboard.mutateAsync({ projectId, projectRoot: found.root, gateCommand: gate });
+        return setMode.mutateAsync({
+          project_id: projectId,
+          mode: "shadow",
+          project_root: found.root,
+        });
+      },
     },
     ...(adopting !== null
       ? [
@@ -490,8 +509,9 @@ function Found({
           <div className="mt-4 flex flex-col gap-1.5">
             <p className="max-w-(--measure) text-sm text-text-muted">
               Found in this folder. Tick the ones worth having a button for — nothing is saved that
-              is not ticked, and none of them becomes a gate here: saying a command's result decides
-              whether the project is green is a claim to make deliberately, on the project's page.
+              is not ticked, and ticking one does not make it the gate: saying a command's result
+              decides whether the project is green is a claim made deliberately, in the gate field
+              below.
             </p>
             {found.commands.map((suggestion) => (
               <label key={suggestion.name} className="flex flex-wrap items-baseline gap-2 text-sm">
@@ -564,6 +584,25 @@ function Found({
               </ConflictNote>
             </div>
           ) : null}
+
+          {/* The one claim about what a result MEANS that this page makes, and it makes it only in
+              words somebody confirmed: the field starts from the núcleo's proposal and is stored
+              as typed. Blank is a real answer — no gate — and can be set later with the rules. */}
+          <Field
+            label="Gate command"
+            helper={
+              found.gate === null
+                ? "the command whose exit code says this project is green — nothing here suggests one, and blank is none"
+                : `the command whose exit code says this project is green — proposed from ${found.gate.source}; blank is none`
+            }
+          >
+            <input
+              value={gate}
+              spellCheck={false}
+              onChange={(event) => setGate(event.target.value)}
+              className="w-full max-w-xl font-mono"
+            />
+          </Field>
 
           {found.harnesses.length === 0 && library.data !== undefined && library.data.length > 0 ? (
             <Field label="Workflow">

@@ -2375,6 +2375,40 @@ mod tests {
         }
     }
 
+    /// Onboarding a project is the owner's: the POST sets the gate command and writes an executable
+    /// hook into a folder it may be told the name of, and the GET serves the rules' gate, which
+    /// `GET /projects/{id}/rules` has always kept to Admin. Safe today by being in no table, and
+    /// this is what says no to filing either beside the `/projects/{id}/…` reads.
+    #[test]
+    fn onboarding_a_project_is_in_no_scope_table() {
+        const ONBOARD_ROUTE: &str = "/projects/{id}/onboard";
+        for method in [Method::GET, Method::POST] {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, &method, ONBOARD_ROUTE)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &method, ONBOARD_ROUTE)
+                    && !route_is_listed(TEAM_ROUTES, &method, ONBOARD_ROUTE)
+                    && !route_is_listed(EMAIL_ROUTES, &method, ONBOARD_ROUTE)
+                    && !route_is_listed(COUNCIL_ROUTES, &method, ONBOARD_ROUTE),
+                "{method} {ONBOARD_ROUTE} must stay out of every scope table"
+            );
+            for scope in [
+                Scope::Run(7),
+                Scope::ApiToken(ApiTokenLevel::ReadOnly),
+                Scope::ApiToken(ApiTokenLevel::RunCreating),
+            ] {
+                assert!(
+                    !permits(&scope, &method, "/projects/7/onboard"),
+                    "{scope:?} must not reach {method} {ONBOARD_ROUTE}"
+                );
+            }
+            assert!(permits(
+                &Scope::ApiToken(ApiTokenLevel::Admin),
+                &method,
+                "/projects/7/onboard"
+            ));
+        }
+    }
+
     /// A project's commands are the owner's, to read and to run.
     ///
     /// The run route spawns a process of the project's own choosing, which is plainly not a read.

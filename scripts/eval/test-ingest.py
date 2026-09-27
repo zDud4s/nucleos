@@ -274,7 +274,7 @@ def main():
                 # True is the 422 every refusal here used to be; a number is that status instead.
                 raise urllib.error.HTTPError(
                     "http://x" + path, 422 if code is True else code, "Refused", {},
-                    io.BytesIO(b"project is not onboarded to .ai/workflow"))
+                    io.BytesIO(b"{\"refusal\":\"not_onboarded\"}"))
             if (method, path) == ("POST", "/runs"):
                 return {"id": 900500}
             return {}

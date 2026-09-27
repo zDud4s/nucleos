@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 15;
+pub const CLASSIFIER_VERSION: u32 = 16;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -1867,7 +1867,8 @@ const HOME_SPELLINGS: &[&str] = &["~/", "$home/", "${home}/", "%userprofile%/", 
 /// never had one, be writing the owner's GitHub policy one restart later.
 ///
 /// **Each project's own state, by name, however it is rooted.** `autopilot.yaml` (the gate
-/// command, and so what *green* means) and `workflows.yaml` live in `~/.nucleos/projects/<id>/`
+/// command, and so what *green* means), `workflows.yaml` and `onboarded.yaml` (the marker
+/// activation requires) live in `~/.nucleos/projects/<id>/`
 /// (`project_state.rs`). The home spelling is covered by the first answer above; the absolute one
 /// is matched here as `.nucleos/projects/<any id>/<file>`, which a job worktree
 /// (`.nucleos/worktrees/...`) never is. The old `.ai/workflows.yaml` is guarded for the reason the
@@ -1894,7 +1895,7 @@ fn names_machine_settings(raw: &str) -> bool {
 /// [`names_machine_settings`].
 fn names_project_state(normalized: &str) -> bool {
     let parts: Vec<&str> = normalized.split('/').collect();
-    let in_state_dir = crate::project_state::FILES.iter().any(|file| {
+    let in_state_dir = crate::project_state::ALL_FILES.iter().any(|file| {
         matches!(
             parts.as_slice(),
             [.., ".nucleos", "projects", id, name] if !id.is_empty() && name == file
@@ -4766,7 +4767,9 @@ mod tests {
     /// `autopilot.yaml` and `workflows.yaml` under any `.nucleos/projects/<id>/`, however that
     /// directory is rooted, and the old `.ai/workflows.yaml` a startup migration still copies from,
     /// are `self-governing-file` — a tightening only. (A home-spelled path was already refused by
-    /// 14; what 15 adds is the absolute spelling and the legacy pins file.)
+    /// 14; what 15 adds is the absolute spelling and the legacy pins file.) 16 adds the onboarding
+    /// marker, `onboarded.yaml`, to that set: it is what lets a project be activated at all, so an
+    /// agent writing its own is an agent onboarding itself — a tightening only.
     /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
@@ -4781,7 +4784,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 15);
+        assert_eq!(CLASSIFIER_VERSION, 16);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
@@ -4878,6 +4881,7 @@ mod tests {
                 "~/.nucleos/projects/alpha/autopilot.yaml",
                 r"~\.nucleos\projects\alpha\workflows.yaml",
                 "$HOME/.nucleos/projects/my project/autopilot.yaml",
+                "~/.nucleos/projects/alpha/onboarded.yaml",
                 ".ai/workflows.yaml",
                 ".ai/autopilot.yaml",
             ] {
@@ -4906,6 +4910,7 @@ mod tests {
         for command in [
             "echo 'gate_command: true' > ~/.nucleos/projects/alpha/autopilot.yaml",
             "cp evil.yaml C:/Users/someone/.nucleos/projects/alpha/autopilot.yaml",
+            "cp marker.yaml C:/Users/someone/.nucleos/projects/alpha/onboarded.yaml",
             "cp evil.yaml .ai/workflows.yaml",
         ] {
             let asked = classify("Bash", &json!({ "command": command }), cwd);

@@ -17,6 +17,7 @@ import {
   promotionConsequence,
 } from "../lib/mode";
 import { ErrorNote, Inset, ModeSwitch, Quiet, StaleNote } from "../ui";
+import { OnboardPanel } from "./Onboard";
 
 /**
  * The settings this app is the author of — the ones that live in the database.
@@ -138,7 +139,7 @@ function Block({
  * same thing about the same state, and two copies of a sentence about restraint would eventually
  * say two different things.
  *
- * **No optimistic draw.** The route answers a bare 422 for four different missing prerequisites, so
+ * **No optimistic draw.** The route answers a 422 for four different missing prerequisites, so
  * a mode drawn ahead of the answer would have to be un-drawn — and whether a project acts on its
  * own is the one thing nobody may be unsure about.
  */
@@ -220,6 +221,12 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
 
       {refused !== null ? (
         <ErrorNote>{MODE_REFUSAL_PROSE[refused.code] ?? refused.detail}</ErrorNote>
+      ) : null}
+      {/* The one refusal this block can resolve in place: onboard, then choose again. */}
+      {refused?.code === "not_onboarded" ? (
+        <Inset>
+          <OnboardPanel projectId={project.project_id} root={project.project_root ?? ""} />
+        </Inset>
       ) : null}
     </Block>
   );

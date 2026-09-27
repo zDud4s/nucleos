@@ -136,6 +136,12 @@ export const keys = {
   projects: {
     all: ["projects"] as const,
     rules: (projectId: string) => ["projects", projectId, "rules"] as const,
+    /**
+     * What onboarding would find and propose — `GET /projects/{id}/onboard`. Keyed by the folder
+     * too, because a project with no root on record is read at the folder somebody typed.
+     */
+    onboarding: (projectId: string, root: string) =>
+      ["projects", projectId, "onboarding", root] as const,
     ls: (projectId: string, path: string) => ["projects", projectId, "ls", path] as const,
     cat: (projectId: string, path: string) => ["projects", projectId, "cat", path] as const,
     grep: (projectId: string, q: string, path: string) =>

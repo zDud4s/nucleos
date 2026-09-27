@@ -93,6 +93,9 @@ impl Mode {
 pub enum ActivationError {
     NotAGitRepo,
     ProjectRootRequired,
+    /// Nobody onboarded this project: there is no marker in its state directory
+    /// (`crate::onboarding`). The one refusal the mode door names on the wire, as `not_onboarded`,
+    /// because it is the one the shell can act on with a single button.
     NotOnboarded,
     HookNotRegistered,
     Database(sqlx::Error),
@@ -105,7 +108,7 @@ impl fmt::Display for ActivationError {
             Self::ProjectRootRequired => {
                 write!(formatter, "project_root is required to enable shadow mode")
             }
-            Self::NotOnboarded => write!(formatter, "project is not onboarded to .ai/workflow"),
+            Self::NotOnboarded => write!(formatter, "project has not been onboarded to NucleOS"),
             Self::HookNotRegistered => {
                 write!(formatter, "a PreToolUse hook is not registered")
             }
@@ -143,8 +146,14 @@ pub async fn project_mode(pool: &SqlitePool, project_id: &str) -> sqlx::Result<M
     })
 }
 
+/// Puts `project_id` into `mode`, after the prerequisites that mode needs.
+///
+/// `machine_root` is `AppState::machine_config_root` — `~/.nucleos` in production, a temporary
+/// directory in a test — and is where the onboarding marker is looked for. `None` (no home
+/// directory) has no marker anywhere, so it refuses `shadow` and `active` as `NotOnboarded`.
 pub async fn set_project_mode(
     pool: &SqlitePool,
+    machine_root: Option<&Path>,
     project_id: &str,
     mode: Mode,
     project_root: Option<&Path>,
@@ -152,14 +161,16 @@ pub async fn set_project_mode(
     match mode {
         Mode::Active => {
             let project_root = project_root.ok_or(ActivationError::ProjectRootRequired)?;
-            activation_prerequisites(project_root)?;
+            activation_prerequisites(machine_root, project_id, project_root)?;
             if !project_root.join(".git").exists() {
                 return Err(ActivationError::NotAGitRepo);
             }
         }
-        Mode::Shadow => {
-            activation_prerequisites(project_root.ok_or(ActivationError::ProjectRootRequired)?)?
-        }
+        Mode::Shadow => activation_prerequisites(
+            machine_root,
+            project_id,
+            project_root.ok_or(ActivationError::ProjectRootRequired)?,
+        )?,
         Mode::Off => {}
     }
 
@@ -550,8 +561,20 @@ pub(crate) fn classifier_hook_is_wired(dir: &Path) -> bool {
     registered && dir.join(HOOK_SCRIPT).is_file()
 }
 
-fn activation_prerequisites(project_root: &Path) -> Result<(), ActivationError> {
-    if !project_root.join(".ai/workflow/workflow.md").is_file() {
+/// What `shadow` and `active` both need: a person onboarded the project, and this daemon's
+/// classifier hook is wired at its root.
+///
+/// **Onboarded, not "uses the AI workflow".** This used to look for `.ai/workflow/workflow.md` in
+/// the project, which made a harness one layer above a project's way of working depend on one
+/// particular way of working. The marker is the project's own decision to be brought under
+/// NucleOS, recorded by `crate::onboarding` — and a project that passed the old check was given
+/// one at startup, so nothing activatable before stopped being so.
+fn activation_prerequisites(
+    machine_root: Option<&Path>,
+    project_id: &str,
+    project_root: &Path,
+) -> Result<(), ActivationError> {
+    if !crate::onboarding::is_onboarded(machine_root, project_id) {
         return Err(ActivationError::NotOnboarded);
     }
     if !classifier_hook_is_wired(project_root) {
@@ -666,10 +689,21 @@ mod tests {
         pool
     }
 
-    fn write_workflow(root: &TempDir) {
-        let workflow_dir = root.path().join(".ai/workflow");
-        fs::create_dir_all(&workflow_dir).unwrap();
-        fs::write(workflow_dir.join("workflow.md"), "# Workflow").unwrap();
+    /// The stand-in for `~/.nucleos` beside one test's project: inside the project's own temporary
+    /// directory, so it lives exactly as long and is never a real home.
+    fn home(root: &TempDir) -> std::path::PathBuf {
+        root.path().join("home")
+    }
+
+    /// Records `project_id` as onboarded under `root`'s stand-in home — the marker, and nothing
+    /// that onboarding would also have done, so each prerequisite stays testable on its own.
+    fn onboard(root: &TempDir, project_id: &str) {
+        crate::project_state::write_for_test(
+            &home(root),
+            project_id,
+            crate::onboarding::MARKER_FILE,
+            "onboarded_at: '2026-09-27T12:00:00+00:00'\nproject_root: here\n",
+        );
     }
 
     fn write_settings(root: &TempDir, contents: &str) {
@@ -1379,12 +1413,18 @@ mod tests {
     async fn shadow_mode_round_trips_when_both_prerequisites_exist() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
-        write_workflow(&root);
+        onboard(&root, "project-a");
         write_nucleos_hook(&root);
 
-        set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
-            .await
-            .unwrap();
+        set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Shadow,
+            Some(root.path()),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             project_mode(&pool, "project-a").await.unwrap(),
@@ -1393,28 +1433,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_workflow_rejects_shadow_and_leaves_mode_off() {
+    async fn a_project_nobody_onboarded_rejects_shadow_and_leaves_mode_off() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
         write_nucleos_hook(&root);
 
-        let error = set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
-            .await
-            .unwrap_err();
+        let error = set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Shadow,
+            Some(root.path()),
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, ActivationError::NotOnboarded));
         assert_eq!(project_mode(&pool, "project-a").await.unwrap(), Mode::Off);
+        // No home directory is no marker anywhere, and the same refusal.
+        let error = set_project_mode(&pool, None, "project-a", Mode::Shadow, Some(root.path()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ActivationError::NotOnboarded));
+    }
+
+    /// The AI workflow's own file is no longer what "onboarded" means: a project that has it and
+    /// no marker is refused, and one with the marker and no `.ai/` at all is let in. (A project
+    /// that had the file before this changed was given a marker at startup — `onboarding.rs`.)
+    #[tokio::test]
+    async fn the_ai_workflow_file_is_neither_needed_nor_enough() {
+        let pool = test_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        write_nucleos_hook(&root);
+        fs::create_dir_all(root.path().join(".ai/workflow")).unwrap();
+        fs::write(root.path().join(".ai/workflow/workflow.md"), "# Workflow").unwrap();
+
+        let error = set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Shadow,
+            Some(root.path()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ActivationError::NotOnboarded));
+
+        let plain = tempfile::tempdir().unwrap();
+        write_nucleos_hook(&plain);
+        onboard(&plain, "project-b");
+        set_project_mode(
+            &pool,
+            Some(&home(&plain)),
+            "project-b",
+            Mode::Shadow,
+            Some(plain.path()),
+        )
+        .await
+        .unwrap();
+        assert!(!plain.path().join(".ai").exists());
+        assert_eq!(
+            project_mode(&pool, "project-b").await.unwrap(),
+            Mode::Shadow
+        );
     }
 
     #[tokio::test]
     async fn missing_settings_rejects_shadow_and_leaves_mode_off() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
-        write_workflow(&root);
+        onboard(&root, "project-a");
 
-        let error = set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
-            .await
-            .unwrap_err();
+        let error = set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Shadow,
+            Some(root.path()),
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, ActivationError::HookNotRegistered));
         assert_eq!(project_mode(&pool, "project-a").await.unwrap(), Mode::Off);
@@ -1424,12 +1522,18 @@ mod tests {
     async fn malformed_settings_json_rejects_shadow_and_leaves_mode_off() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
-        write_workflow(&root);
+        onboard(&root, "project-a");
         write_settings(&root, "{ this is not valid json ");
 
-        let error = set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
-            .await
-            .unwrap_err();
+        let error = set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Shadow,
+            Some(root.path()),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, ActivationError::HookNotRegistered));
         assert_eq!(project_mode(&pool, "project-a").await.unwrap(), Mode::Off);
     }
@@ -1438,12 +1542,18 @@ mod tests {
     async fn settings_without_pretooluse_key_rejects_shadow_and_leaves_mode_off() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
-        write_workflow(&root);
+        onboard(&root, "project-a");
         write_settings(&root, r#"{"hooks":{"PostToolUse":[{"command":"x"}]}}"#);
 
-        let error = set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
-            .await
-            .unwrap_err();
+        let error = set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Shadow,
+            Some(root.path()),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, ActivationError::HookNotRegistered));
         assert_eq!(project_mode(&pool, "project-a").await.unwrap(), Mode::Off);
     }
@@ -1455,15 +1565,21 @@ mod tests {
     async fn a_pretooluse_hook_that_is_not_ours_rejects_shadow() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
-        write_workflow(&root);
+        onboard(&root, "project-a");
         write_settings(
             &root,
             r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"npx prettier --write ."}]}]}}"#,
         );
 
-        let error = set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
-            .await
-            .unwrap_err();
+        let error = set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Shadow,
+            Some(root.path()),
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, ActivationError::HookNotRegistered));
         assert_eq!(project_mode(&pool, "project-a").await.unwrap(), Mode::Off);
@@ -1473,7 +1589,7 @@ mod tests {
     async fn the_real_hook_satisfies_the_prerequisite() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
-        write_workflow(&root);
+        onboard(&root, "project-a");
         write_settings(
             &root,
             r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""}]}]}}"#,
@@ -1481,9 +1597,15 @@ mod tests {
         std::fs::create_dir_all(root.path().join(".claude/hooks")).unwrap();
         std::fs::write(root.path().join(".claude/hooks/ask_daemon.py"), "#").unwrap();
 
-        set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
-            .await
-            .expect("the nucleos hook is registered and present");
+        set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Shadow,
+            Some(root.path()),
+        )
+        .await
+        .expect("the nucleos hook is registered and present");
         assert_eq!(
             project_mode(&pool, "project-a").await.unwrap(),
             Mode::Shadow
@@ -1496,15 +1618,21 @@ mod tests {
     async fn a_registered_hook_whose_script_is_absent_rejects_shadow() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
-        write_workflow(&root);
+        onboard(&root, "project-a");
         write_settings(
             &root,
             r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""}]}]}}"#,
         );
 
-        let error = set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
-            .await
-            .unwrap_err();
+        let error = set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Shadow,
+            Some(root.path()),
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, ActivationError::HookNotRegistered));
     }
@@ -1513,12 +1641,18 @@ mod tests {
     async fn empty_pretooluse_rejects_shadow_and_leaves_mode_off() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
-        write_workflow(&root);
+        onboard(&root, "project-a");
         write_settings(&root, r#"{"hooks":{"PreToolUse":[]}}"#);
 
-        let error = set_project_mode(&pool, "project-a", Mode::Shadow, Some(root.path()))
-            .await
-            .unwrap_err();
+        let error = set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Shadow,
+            Some(root.path()),
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, ActivationError::HookNotRegistered));
         assert_eq!(project_mode(&pool, "project-a").await.unwrap(), Mode::Off);
@@ -1528,13 +1662,19 @@ mod tests {
     async fn active_mode_round_trips_with_all_prerequisites() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
-        write_workflow(&root);
+        onboard(&root, "project-a");
         write_nucleos_hook(&root);
         git_init(&root);
 
-        set_project_mode(&pool, "project-a", Mode::Active, Some(root.path()))
-            .await
-            .unwrap();
+        set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Active,
+            Some(root.path()),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             project_mode(&pool, "project-a").await.unwrap(),
@@ -1554,12 +1694,18 @@ mod tests {
     async fn active_mode_rejected_when_not_a_git_repo() {
         let pool = test_pool().await;
         let root = tempfile::tempdir().unwrap();
-        write_workflow(&root);
+        onboard(&root, "project-a");
         write_nucleos_hook(&root);
 
-        let error = set_project_mode(&pool, "project-a", Mode::Active, Some(root.path()))
-            .await
-            .unwrap_err();
+        let error = set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Active,
+            Some(root.path()),
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, ActivationError::NotAGitRepo));
         assert_eq!(project_mode(&pool, "project-a").await.unwrap(), Mode::Off);
@@ -1568,28 +1714,30 @@ mod tests {
     #[tokio::test]
     async fn active_mode_still_requires_onboarding_and_hook() {
         let pool = test_pool().await;
-        let missing_workflow_root = tempfile::tempdir().unwrap();
+        let not_onboarded_root = tempfile::tempdir().unwrap();
         // Everything else in place, so the failure can only be the missing onboarding.
-        write_nucleos_hook(&missing_workflow_root);
-        git_init(&missing_workflow_root);
+        write_nucleos_hook(&not_onboarded_root);
+        git_init(&not_onboarded_root);
 
         let error = set_project_mode(
             &pool,
-            "missing-workflow",
+            Some(&home(&not_onboarded_root)),
+            "not-onboarded",
             Mode::Active,
-            Some(missing_workflow_root.path()),
+            Some(not_onboarded_root.path()),
         )
         .await
         .unwrap_err();
         assert!(matches!(error, ActivationError::NotOnboarded));
 
         let missing_hook_root = tempfile::tempdir().unwrap();
-        write_workflow(&missing_hook_root);
+        onboard(&missing_hook_root, "missing-hook");
         write_settings(&missing_hook_root, r#"{"hooks":{"PreToolUse":[]}}"#);
         git_init(&missing_hook_root);
 
         let error = set_project_mode(
             &pool,
+            Some(&home(&missing_hook_root)),
             "missing-hook",
             Mode::Active,
             Some(missing_hook_root.path()),
@@ -1603,15 +1751,16 @@ mod tests {
     async fn autopilot_projects_lists_shadow_and_active() {
         let pool = test_pool().await;
         let shadow_root = tempfile::tempdir().unwrap();
-        write_workflow(&shadow_root);
+        onboard(&shadow_root, "project-shadow");
         write_nucleos_hook(&shadow_root);
         let active_root = tempfile::tempdir().unwrap();
-        write_workflow(&active_root);
+        onboard(&active_root, "project-active");
         write_nucleos_hook(&active_root);
         git_init(&active_root);
 
         set_project_mode(
             &pool,
+            Some(&home(&shadow_root)),
             "project-shadow",
             Mode::Shadow,
             Some(shadow_root.path()),
@@ -1620,13 +1769,14 @@ mod tests {
         .unwrap();
         set_project_mode(
             &pool,
+            Some(&home(&active_root)),
             "project-active",
             Mode::Active,
             Some(active_root.path()),
         )
         .await
         .unwrap();
-        set_project_mode(&pool, "project-off", Mode::Off, None)
+        set_project_mode(&pool, None, "project-off", Mode::Off, None)
             .await
             .unwrap();
 

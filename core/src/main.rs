@@ -61,6 +61,7 @@ mod mentions;
 mod notes;
 mod notify;
 mod notify_policy;
+mod onboarding;
 mod openai_compatible;
 mod ownership;
 mod pii_shadow;
@@ -275,6 +276,64 @@ async fn migrate_project_state(pool: &sqlx::SqlitePool, root: &std::path::Path) 
         .await
         {
             tracing::warn!(%error, %project_id, file, "a project state file was copied but the feed line was lost");
+        }
+    }
+}
+
+/// Marks every rostered project that passed the old activation check as onboarded, once, and puts
+/// a line in that project's feed for each one.
+///
+/// So that nobody loses autopilot on update: activation used to require `.ai/workflow/workflow.md`
+/// and now requires the onboarding marker, so a project that had the first and not the second is
+/// given a `migrated: true` marker. The rules are [`onboarding::migrate_legacy`]'s; this reads the
+/// same roster [`migrate_project_state`] reads — every project with a root on record — and tells
+/// somebody, for the reason [`migrate_machine_settings`] gives.
+async fn migrate_onboarding(pool: &sqlx::SqlitePool, root: &std::path::Path) {
+    let roster: Vec<(String, String)> = match sqlx::query_as(
+        "SELECT project_id, project_root FROM autopilot_state WHERE project_root IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(roster) => roster,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the project roster, so no project was marked onboarded");
+            return;
+        }
+    };
+    let roster: Vec<(String, std::path::PathBuf)> = roster
+        .into_iter()
+        .map(|(id, project_root)| (id, std::path::PathBuf::from(project_root)))
+        .collect();
+    let root = root.to_path_buf();
+    let now = chrono::Utc::now().to_rfc3339();
+    let marked =
+        match tokio::task::spawn_blocking(move || onboarding::migrate_legacy(&root, &roster, &now))
+            .await
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                tracing::warn!(%error, "marking projects onboarded did not finish");
+                return;
+            }
+        };
+    for project_id in marked {
+        let summary = format!(
+            "marked onboarded in {}, because this project had .ai/workflow/workflow.md, which is \
+             what onboarded meant before; that file is no longer read",
+            project_state::display_path(&project_id, onboarding::MARKER_FILE)
+        );
+        if let Err(error) = feed::append(
+            pool,
+            Some(&project_id),
+            onboarding::FEED_KIND,
+            &summary,
+            None,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(%error, %project_id, "a project was marked onboarded but the feed line was lost");
         }
     }
 }
@@ -893,6 +952,7 @@ async fn main() {
         Some(root) => {
             migrate_machine_settings(&pool, root).await;
             migrate_project_state(&pool, root).await;
+            migrate_onboarding(&pool, root).await;
         }
         None => tracing::warn!(
             "no home directory, so {} cannot be read; every pillar starts on its defaults",

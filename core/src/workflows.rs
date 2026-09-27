@@ -711,7 +711,7 @@ fn save_pins(path: &Path, pins: &Pins) -> Result<(), Refused> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| Refused::Io(error.to_string()))?;
     }
-    // The same temp-then-rename `http::write_atomically` uses, for the same reason: a half-written
+    // The same temp-then-rename `project_state::write_atomically` uses, for the same reason: a half-written
     // pins file is not a smaller one, it is a project whose workflows all became `missing`.
     let temp = path.with_extension("nucleos-tmp");
     std::fs::write(&temp, render_pins(pins)).map_err(|error| Refused::Io(error.to_string()))?;
