@@ -3764,9 +3764,12 @@ async fn spawn_node(
     // stops two passes starting two nodes on one tree. What changed is only that the status it
     // compares against is passed in rather than hard-coded — a hard-coded `'pending'` silently
     // refused every retriable item, which read as the job stopping for no reason.
+    // The gate verdict belongs to the attempt it measured, so every new attempt clears it in the
+    // same compare-and-swap that claims the item. This matters after a replan: the Superseded arm of
+    // `brief::item_verdict` reads the stored verdict before it falls back to the latest run.
     if let Some(ItemClaim { ordinal, held }) = item {
         let claimed = sqlx::query(
-            "UPDATE job_items SET status = 'running'
+            "UPDATE job_items SET status = 'running', gate_status = NULL
              WHERE job_id = ? AND ordinal = ? AND status = ?",
         )
         .bind(job.id)
@@ -4036,13 +4039,21 @@ async fn spawn_node(
 /// released to `pending` would have lost the red gate that made it retriable while keeping the
 /// `gate_attempts` that gate cost it, so a budget of one would be spent on an attempt that never
 /// ran, and the item would come back as though nothing had ever measured it.
+///
+/// The claim clears the previous attempt's gate verdict. Giving up a retry claim therefore restores
+/// `failed` alongside `gate_failed`, the same pairing [`record_gate`] writes, so a later replan cannot
+/// mistake that released red gate for an ungated attempt.
 async fn release_item(pool: &SqlitePool, job: &JobRow, item: Option<ItemClaim>) {
     let Some(ItemClaim { ordinal, held }) = item else {
         return;
     };
     let _ = sqlx::query(
-        "UPDATE job_items SET status = ? WHERE job_id = ? AND ordinal = ? AND status = 'running'",
+        "UPDATE job_items
+         SET status = ?,
+             gate_status = CASE WHEN ? = 'gate_failed' THEN 'failed' ELSE gate_status END
+         WHERE job_id = ? AND ordinal = ? AND status = 'running'",
     )
+    .bind(held)
     .bind(held)
     .bind(job.id)
     .bind(ordinal as i64)
@@ -12996,6 +13007,184 @@ mod tests {
             prompt.contains("FAILED tests/test_cursor.py::test_guard"),
             "the node that has to answer the gate was not told what it said: {prompt}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retried_item_that_fails_without_a_gate_is_judged_by_its_run_before_and_after_a_replan()
+     {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-retryverdict-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+
+        let job_id = seed_job_in(
+            &pool,
+            "project-a",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner)
+            .await
+            .expect("provision the job's worktree");
+        crate::worktree::record(
+            &pool,
+            owner,
+            "project-a",
+            &repo.to_string_lossy(),
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the job's worktree");
+        sqlx::query("UPDATE jobs SET gate_retries = 1 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_items(&pool, job_id, &["gate_failed"]).await;
+        sqlx::query(
+            "UPDATE job_items SET gate_status = 'failed', gate_attempts = 1
+             WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        let (status, gate_status, run_id): (String, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT status, gate_status, run_id FROM job_items
+                 WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "running");
+        assert_eq!(
+            gate_status, None,
+            "the old attempt's gate was still attached"
+        );
+        let run_id = run_id.expect("the retried item has a node of its own attached to it");
+
+        sqlx::query("UPDATE runs SET status = 'interrupted', exit_code = NULL WHERE id = ?")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert!(matches!(
+            reconcile_nodes(&state, &job).await.unwrap(),
+            Reconciled::KeepGoing
+        ));
+        assert_eq!(item_statuses(&pool, job_id).await, vec!["failed"]);
+
+        let (status, gate_status, gate_attempts): (String, Option<String>, i64) = sqlx::query_as(
+            "SELECT status, gate_status, gate_attempts FROM job_items
+                 WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let gate_retries: i64 = sqlx::query_scalar("SELECT gate_retries FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let (run_status, exit_code): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, exit_code FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let run = Some((run_status.as_str(), exit_code));
+
+        assert_eq!(
+            crate::brief::item_verdict(
+                item_state_from(&status, gate_attempts, gate_retries),
+                gate_status.as_deref(),
+                false,
+                run,
+            ),
+            Some(crate::brief::Verdict::NoOutcome)
+        );
+        assert_eq!(
+            crate::brief::item_verdict(
+                item_state_from(STATUS_SUPERSEDED, gate_attempts, gate_retries),
+                gate_status.as_deref(),
+                false,
+                run,
+            ),
+            Some(crate::brief::Verdict::NoOutcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_released_retry_claim_keeps_its_red_gate() {
+        let pool = test_pool().await;
+        let retry_job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, retry_job_id, &["running"]).await;
+        sqlx::query(
+            "UPDATE job_items SET gate_status = NULL, gate_attempts = 1
+             WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(retry_job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let retry_job = load_job(&pool, retry_job_id).await.unwrap();
+
+        release_item(
+            &pool,
+            &retry_job,
+            Some(ItemClaim {
+                ordinal: 0,
+                held: "gate_failed",
+            }),
+        )
+        .await;
+
+        let retry: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, gate_status FROM job_items WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(retry_job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retry, ("gate_failed".into(), Some("failed".into())));
+
+        let pending_job_id = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        seed_items(&pool, pending_job_id, &["running"]).await;
+        let pending_job = load_job(&pool, pending_job_id).await.unwrap();
+
+        release_item(
+            &pool,
+            &pending_job,
+            Some(ItemClaim {
+                ordinal: 0,
+                held: "pending",
+            }),
+        )
+        .await;
+
+        let pending: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, gate_status FROM job_items WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(pending_job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, ("pending".into(), None));
     }
 
     /// Out of retries, the tree still governs, and nothing about that branch has moved.
