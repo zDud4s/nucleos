@@ -28,7 +28,7 @@ const Name = "codex"
 
 // tailBytes bounds how much of a transcript is read looking for the last reading. A session file
 // grows without limit; the readings are appended, so the answer is always near the end. The same
-// trick, and roughly the same size, as `scripts/statusline-context.py`.
+// trick, and roughly the same size, as `.ai/scripts/statusline-context.py`.
 const tailBytes = 256 << 10
 
 // defaultScanBufferCap and defaultMaxLineBytes bound the scanner used to read a transcript's tail:
@@ -75,7 +75,7 @@ type bucket struct {
 	// two spellings. Dividing here, once, is the whole reason package reading exists.
 	UsedPercent float64 `json:"used_percent"`
 	// WindowMinutes is how the window is named: 300 is the five-hour window, 10080 the seven-day
-	// one (the latter matching WEEKLY_WINDOW_MINUTES in `scripts/usage_split.py`).
+	// one (the latter matching WEEKLY_WINDOW_MINUTES in `.ai/scripts/usage_split.py`).
 	WindowMinutes int `json:"window_minutes"`
 	// ResetsAt is epoch SECONDS here, where Anthropic sends an ISO string. Two providers, two
 	// spellings of an instant; both become a time.Time before leaving their package.

@@ -14,7 +14,7 @@ samples and its tests depend on that, while everything here touches the filesyst
 `ladder.py` accumulates its results in a list and prints a tab-separated summary at the end. It
 never writes them anywhere. The nineteen cells of 2026-08-17/19 — about $45 of measurement — went
 to a terminal that has since closed, and survive only as prose transcribed by hand into
-`ABLATION.md`'s tables. That is the exact shape `scripts/evidence_gate.py` refuses in a Handoff:
+`ABLATION.md`'s tables. That is the exact shape `.ai/scripts/evidence_gate.py` refuses in a Handoff:
 a number reported rather than recorded. A gate that decides promotions from hand-transcribed rows
 inherits the problem, so rows carry `source` — `ladder` for a cell this module wrote as it
 happened, `manual` for one typed in afterwards. The distinction is the one `workflow.md` Rule 5

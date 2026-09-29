@@ -207,20 +207,22 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     fi
   done
   if [ -z "$py" ]; then
-    echo "python missing — the hook filter, eval approver and usage-split tests need it (scripts/doctor.sh reports this)" >&2
+    echo "python missing — the hook filter and eval approver need it (scripts/doctor.sh reports this)" >&2
     failures="$failures  hooks: python not installed"$'\n'
   else
+    # F5: the packet-gate and cross-tool usage-accounting tests moved out of this target along
+    # with the tools they cover, to `.ai/scripts/`: they are workflow tooling, not product
+    # tooling, and this target — unlike `workflow` in `.ai/tests/catalog.yaml` — is a
+    # `scripts/gates.sh` leg that CI can run on a fresh, gitignore-respecting clone. They are
+    # covered by the `workflow` catalog group's own command instead (see
+    # `.ai/tests/catalog.yaml`), which is why only product tests remain below.
     run "hooks: filter"   . "$py" scripts/test-hook-filter.py
-    run "hooks: evidence" . "$py" scripts/test-evidence-gate.py
-    run "hooks: review"   . "$py" scripts/test-review-gate.py
     run "gates: summary"  . "$py" scripts/test-gates-summary.py
     run "gates: own target" . "$py" scripts/test-own-cargo-target.py
     run "eval: approver"  . "$py" scripts/eval/test-auto-approve.py
     run "eval: promote"   . "$py" scripts/eval/test-promote.py
     run "eval: ingest"    . "$py" scripts/eval/test-ingest.py
     run "eval: layer"     . "$py" scripts/eval/test-layer.py
-    run "usage: split"    . "$py" scripts/test-usage-split.py
-    run "usage: statusline" . "$py" scripts/test-statusline-context.py
     # Hermetic like its neighbours: the network is behind one seam the test swaps out, so this
     # runs green on a machine with no route to OpenRouter at all.
     run "models: refresh"   . "$py" scripts/test-refresh-models.py

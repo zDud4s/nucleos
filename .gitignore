@@ -140,8 +140,12 @@ shell/target-test/
 
 # Python bytecode. Never needed an entry before: the only test that imported a module
 # loaded it from `.claude/`, which is ignored wholesale, so the cache landed out of sight.
-# `scripts/test-usage-split.py` imports a module that lives in `scripts/`, and the cache
-# appeared in a tracked directory — where the test selector, which refuses to answer for
-# any path no catalog group claims, stopped the gate over a build artefact.
+# `scripts/test-usage-split.py` used to import a module that lived in `scripts/`, and the
+# cache appeared in a tracked directory — where the test selector, which refuses to answer
+# for any path no catalog group claims, stopped the gate over a build artefact. F5 moved
+# that test and its module to `.ai/scripts/`, itself gitignored wholesale, so this specific
+# case is moot — but `scripts/eval/` still imports across its own sibling modules (`ingest.py`
+# imports `promote`, `test-ingest.py` imports `ingest`, and so on) and is still tracked, so
+# the same failure mode reaches it and these two lines stay needed.
 __pycache__/
 *.pyc
