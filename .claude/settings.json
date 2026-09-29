@@ -45,7 +45,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${CLAUDE_PROJECT_DIR}/scripts/evidence_gate.py\" --hook"
+            "command": "python \"${CLAUDE_PROJECT_DIR}/.ai/scripts/evidence_gate.py\" --hook"
           }
         ]
       }
@@ -55,7 +55,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${CLAUDE_PROJECT_DIR}/scripts/evidence_gate.py\" --hook"
+            "command": "python \"${CLAUDE_PROJECT_DIR}/.ai/scripts/evidence_gate.py\" --hook"
           }
         ]
       }
