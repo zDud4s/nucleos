@@ -108,6 +108,18 @@ impl DaemonClient {
         }
     }
 
+    /// The same client, speaking for one run from now on.
+    ///
+    /// The id comes from the daemon's own `runs` row, never from a model. See `RUN_ID_HEADER`.
+    pub fn for_run(&self, run_id: i64) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            token: self.token.clone(),
+            run_id: Some(run_id),
+            http: self.http.clone(),
+        }
+    }
+
     pub fn from_env() -> Result<Self, String> {
         // `NUCLEOS_DAEMON_URL` still wins: the daemon writes it into everything it launches, and
         // it is the only value that survives a client running somewhere the daemon's own
@@ -639,13 +651,11 @@ impl DaemonClient {
     /// off `RUN_ID_HEADER`, which `request` above sets from the run this client was built for — so
     /// a run can name itself and has no way to name anybody else. A field here would be a field a
     /// model could fill in, and "which run taught this?" would stop being evidence.
-    ///
-    /// `project_id` is `Option` and travels as JSON `null` when absent, which the door reads as
-    /// machine-wide. Omitting the key entirely would mean the same thing to serde and something
-    /// different to a reader of the wire, so it is sent.
+    /// The declaration's project is deliberately not a parameter for the same reason: the daemon
+    /// derives it from that run, so the caller cannot name another project or widen it to the whole
+    /// machine.
     pub async fn declare_refinement(
         &self,
-        project_id: Option<&str>,
         kind: &str,
         title: &str,
         body: &str,
@@ -654,7 +664,6 @@ impl DaemonClient {
         let response = self
             .request(reqwest::Method::POST, "/knowledge")
             .json(&serde_json::json!({
-                "project_id": project_id,
                 "kind": kind,
                 "title": title,
                 "body": body,
@@ -1732,6 +1741,22 @@ mod tests {
             client.web_read("https://192.168.1.1/admin").await.is_err(),
             "a 403 carrying JSON must not be handed back as the page"
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_declaration_hands_the_refusal_back_to_the_model() {
+        let url = refusing_daemon(
+            axum::http::StatusCode::BAD_REQUEST,
+            r#"{"refusal":"missing_run_id"}"#,
+        )
+        .await;
+
+        let refusal = DaemonClient::new(url, "test-token".to_string())
+            .declare_refinement("memory", "t", "b", "r")
+            .await
+            .expect_err("a refused declaration must not be reported as knowledge");
+
+        assert!(refusal.contains("missing_run_id"), "said {refusal:?}");
     }
 
     /// A daemon that answers one canned refusal to everything.

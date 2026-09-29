@@ -25,6 +25,20 @@ use sqlx::{FromRow, SqlitePool};
 /// nobody notices, because a prompt does not get slower, it gets emptier of room.
 pub const RENDER_CHARS: usize = 4_000;
 
+/// One item's share of the room when it got in on its score.
+pub const PER_ITEM_CHARS: usize = 600;
+
+/// And one FLOOR item's share, which is half of it, because five floors at 600 would eat 3,000 of the
+/// ~3,400 useful characters and leave less than one whole item behind. The five signals would then
+/// decide WHICH row fills each floor and nothing else, which is the blindness this module exists to
+/// end. At 300 the floors cost ~1,500, three whole items fit in what is left, and the scoring layer
+/// decides something again.
+pub const FLOOR_ITEM_CHARS: usize = 300;
+
+const PREAMBLE: &str = "\n\nEarlier work on this project left the notes below under the two named admission rules. \
+     Each item names its layer. Your brief above is still what you were asked to do; these are \
+     things already known about the project you are doing it in:";
+
 /// The nature of what is known, which is what makes one store rather than four.
 ///
 /// Unknown values are not an error and not a default: [`Layer::parse`] returns `Option` and every
@@ -108,16 +122,6 @@ impl Kind {
             Kind::Prompt | Kind::Skill | Kind::Subagent => Layer::Procedural,
         }
     }
-
-    /// What this kind is called where a node reads it.
-    fn heading(self) -> &'static str {
-        match self {
-            Kind::Prompt => "Standing instructions",
-            Kind::Memory => "What earlier runs found out about this project",
-            Kind::Skill => "How recurring work here is done",
-            Kind::Subagent => "Delegations that have worked before",
-        }
-    }
 }
 
 /// Whose knowledge this is, and — through [`Scope::chain`] — what it inherits.
@@ -151,6 +155,20 @@ pub enum Scope {
 }
 
 impl Scope {
+    /// Parse the two stored columns before using scope as an ordering signal.
+    fn parse(kind: &str, id: Option<&str>) -> Option<Self> {
+        match (kind, id) {
+            ("machine", None) => Some(Scope::Machine),
+            ("project", Some(id)) => Some(Scope::Project(id.to_owned())),
+            ("errand", Some(id)) => Some(Scope::Errand(id.to_owned())),
+            ("job", Some(id)) => Some(Scope::Job {
+                id: id.parse().ok()?,
+                project: None,
+            }),
+            _ => None,
+        }
+    }
+
     /// The scopes a reader in this one is entitled to, most general first.
     ///
     /// `machine` → `project` → `job` inherits downwards, and the most specific wins where they
@@ -193,7 +211,11 @@ impl Scope {
     }
 }
 
-/// One thing the agent knows.
+/// One candidate, with everything the pure selection needs and nothing it would have to fetch.
+///
+/// `s_fts` arrives ALREADY CALCULATED, and that is what purity costs: the rank is SQLite's, computed
+/// by `brief` — the one function here that talks to a database. A pure function that had to rank text
+/// itself would be a second, worse implementation of FTS5.
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct Known {
     pub id: i64,
@@ -209,12 +231,21 @@ pub struct Known {
     pub expires_after_runs: Option<i64>,
     pub last_confirmed_at: Option<String>,
     pub shown_count: i64,
+    /// Briefings whose run reached an outcome. `0` is NOT MEASURED, and it is a different thing from
+    /// `green_count == 0` with this above zero, which is measured badly.
     pub outcome_count: i64,
     pub green_count: i64,
     pub last_shown_at: Option<String>,
     pub kind: String,
     pub title: String,
     pub body: String,
+    /// SQLite's rank for this row against the context's query, normalised. `0.0` when the row
+    /// did not match at all, which on day one is every row.
+    ///
+    /// Not a column of `knowledge`: the rank belongs to a QUERY, so `#[sqlx(default)]` leaves it
+    /// zero for every reader that selects `COLUMNS`, and `brief` sets it after the fetch.
+    #[sqlx(default)]
+    pub s_fts: f64,
     pub status: String,
     pub proposal_id: Option<i64>,
     pub supersedes: Option<i64>,
@@ -222,6 +253,555 @@ pub struct Known {
     pub created_at: String,
     pub activated_at: Option<String>,
     pub ended_at: Option<String>,
+}
+
+/// The kind of node whose work is being briefed, in the order the job graph uses them.
+#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(test, expect(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    Plan,
+    Implement,
+    Review,
+    Replan,
+}
+
+/// What the work is, as far as the selection is allowed to know it.
+pub struct Context {
+    /// The scope and its chain (machine -> project -> job; an errand inherits from machine alone).
+    pub chain: Vec<Scope>,
+    /// The files the worktree touched, or the ones the item declares.
+    pub files: Vec<String>,
+    /// The communities and modules of the project map those files inhabit — the signal this project
+    /// has for free because it already builds the map.
+    pub communities: Vec<String>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(test, expect(dead_code))]
+    pub node: Option<NodeKind>,
+    /// The normalised signature of the red gate, when there is one.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(test, expect(dead_code))]
+    pub gate: Option<String>,
+}
+
+/// The room, and the three numbers that decide how it is spent.
+pub struct Budget {
+    pub render_chars: usize,
+    pub per_item_chars: usize,
+    pub floor_item_chars: usize,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            render_chars: RENDER_CHARS,
+            per_item_chars: PER_ITEM_CHARS,
+            floor_item_chars: FLOOR_ITEM_CHARS,
+        }
+    }
+}
+
+/// One candidate's TRACE and not the signal: whether it was shown and the five scores that decided
+/// why it won or lost.
+pub struct Scored {
+    pub knowledge_id: i64,
+    pub shown: bool,
+    pub s_fts: f64,
+    pub s_scope: f64,
+    pub s_structure: f64,
+    pub s_recency: f64,
+    pub s_use: f64,
+    /// The weighted sum of the five signals above — the one number the order uses, carried so the
+    /// trace can say why a row won or lost.
+    pub score: f64,
+}
+
+impl Scored {
+    fn weighted(&self) -> f64 {
+        self.s_fts * W_FTS
+            + self.s_structure * W_STRUCTURE
+            + self.s_use * W_USE
+            + self.s_scope * W_SCOPE
+            + self.s_recency * W_RECENCY
+    }
+}
+
+/// What a node reads, and what it was not shown.
+pub struct Brief {
+    pub block: Option<String>,
+    /// One entry per candidate, shown or not, with the five signals — this is what `brief` writes to
+    /// `run_knowledge`, and the reason the trace can answer WHICH signal elected a row.
+    pub trace: Vec<Scored>,
+}
+
+/// The midpoint of the bounded utility range: without any outcomes, there is evidence for neither
+/// success nor failure, so the neutral value must favour neither end.
+const NEUTRAL_UTILITY: f64 = 0.5;
+
+/// The midpoint of the bounded recency range: without a show timestamp, there is evidence for
+/// neither end, so the neutral value must favour neither end.
+const NEUTRAL_RECENCY: f64 = 0.5;
+
+/// Confirmed by owner 2026-09-23. The text match against this very work is the most direct evidence of relevance, but it is 0.0 for every row on day one, so it cannot be the whole score.
+const W_FTS: f64 = 0.35;
+/// Confirmed by owner 2026-09-23. Files and map communities overlap: the signal this project has for free because it already builds the map (spec §5.1).
+const W_STRUCTURE: f64 = 0.20;
+/// Confirmed by owner 2026-09-23. Measured outcomes. When the other signals are equal,
+/// `W_USE * NEUTRAL_UTILITY >= W_RECENCY` guarantees that a never-shown row never scores below a
+/// failed row. At the extreme they tie, and `(layer, kind, id)` breaks the tie (spec §5.4).
+const W_USE: f64 = 0.20;
+/// Confirmed by owner 2026-09-23. The chain already decides entitlement; specificity only tips a contradiction towards the most specific scope (spec §3.4).
+const W_SCOPE: f64 = 0.15;
+/// Confirmed by owner 2026-09-23. Decay (spec §8.1) measures less than it seems — run-less contexts leave no trace to refresh it (D15) — so it weighs least.
+const W_RECENCY: f64 = 0.10;
+
+/// Score every candidate once. Each signal and their one weighted score are on the unit scale; the
+/// caller follows that score only with stable vocabulary and id tie-breakers.
+fn scored_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<(&'a Known, Scored)> {
+    let utility_if_absent = median_measured_utility(known);
+    let recencies = normalised_recencies(known);
+
+    known
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| Layer::parse(&row.layer).is_some())
+        .filter(|(_, row)| Kind::parse(&row.kind).is_some())
+        .filter_map(|(index, row)| {
+            let mut scored = Scored {
+                knowledge_id: row.id,
+                shown: false,
+                // Nothing writes `s_fts` today: it is `#[sqlx(default)]`, so every production row
+                // is 0.0 and only tests set it. Task 3.1 will min-max normalise it per pass; until
+                // then and after, this clamp keeps out-of-contract input from outweighing the rest.
+                s_fts: finite_or_zero(row.s_fts).clamp(0.0, 1.0),
+                s_scope: scope_specificity(row, context)?,
+                s_structure: structural_overlap(row, context),
+                s_recency: recencies[index],
+                // `outcome_count == 0` is absence, not failure. Give it the median measured
+                // utility from this pass, floored at `NEUTRAL_UTILITY`, or `NEUTRAL_UTILITY` when
+                // nothing is measured.
+                s_use: if row.outcome_count == 0 {
+                    utility_if_absent
+                } else {
+                    row.green_count as f64 / row.outcome_count as f64
+                },
+                score: 0.0,
+            };
+            scored.score = scored.weighted();
+            Some((row, scored))
+        })
+        .collect()
+}
+
+fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+fn scope_specificity(row: &Known, context: &Context) -> Option<f64> {
+    let row_scope = Scope::parse(&row.scope_kind, row.scope_id.as_deref())?;
+    context
+        .chain
+        .iter()
+        .position(|scope| scope.columns() == row_scope.columns())
+        .map(|index| (index + 1) as f64 / context.chain.len() as f64)
+        // A recognised but out-of-chain candidate is not entitled to inherit into this context.
+        .or(Some(0.0))
+}
+
+fn structural_overlap(row: &Known, context: &Context) -> f64 {
+    let possible = context.files.len() + context.communities.len();
+    if possible == 0 {
+        return 0.0;
+    }
+    let Some(points_at) = row.points_at.as_deref() else {
+        return 0.0;
+    };
+    let references = structural_references(points_at);
+    context
+        .files
+        .iter()
+        .chain(&context.communities)
+        .filter(|candidate| {
+            let candidate = normalise_reference(candidate);
+            references.iter().any(|reference| reference == &candidate)
+        })
+        .count() as f64
+        / possible as f64
+}
+
+fn structural_references(raw: &str) -> Vec<String> {
+    fn collect(value: &serde_json::Value, into: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(value) => into.push(normalise_reference(value)),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect(value, into);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values() {
+                    collect(value, into);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut references = Vec::new();
+    if let Ok(value) = serde_json::from_str(raw) {
+        collect(&value, &mut references);
+    } else {
+        references.extend(
+            raw.split([',', ';', '\n'])
+                .map(normalise_reference)
+                .filter(|reference| !reference.is_empty()),
+        );
+    }
+    references.sort();
+    references.dedup();
+    references
+}
+
+fn normalise_reference(reference: &str) -> String {
+    reference
+        .trim()
+        .trim_matches(['"', '\'', '[', ']', '{', '}'])
+        .replace('\\', "/")
+}
+
+fn normalised_recencies(known: &[Known]) -> Vec<f64> {
+    let timestamps: Vec<Option<f64>> = known
+        .iter()
+        .map(|row| {
+            row.last_shown_at
+                .as_deref()
+                .and_then(|shown| chrono::DateTime::parse_from_rfc3339(shown).ok())
+                .map(|shown| shown.timestamp_micros() as f64)
+        })
+        .collect();
+    let shown: Vec<f64> = timestamps.iter().flatten().copied().collect();
+    let Some(min) = shown.iter().copied().min_by(f64::total_cmp) else {
+        return vec![NEUTRAL_RECENCY; known.len()];
+    };
+    let max = shown
+        .iter()
+        .copied()
+        .max_by(f64::total_cmp)
+        .expect("a minimum means there is also a maximum");
+    let normalise = |timestamp: f64| {
+        if max == min {
+            NEUTRAL_RECENCY
+        } else {
+            (timestamp - min) / (max - min)
+        }
+    };
+    let absent = median(shown.into_iter().map(normalise).collect()).unwrap_or(NEUTRAL_RECENCY);
+    timestamps
+        .into_iter()
+        .map(|timestamp| timestamp.map(&normalise).unwrap_or(absent))
+        .collect()
+}
+
+fn median_measured_utility(known: &[Known]) -> f64 {
+    let measured: Vec<f64> = known
+        .iter()
+        .filter(|row| row.outcome_count > 0)
+        .map(|row| row.green_count as f64 / row.outcome_count as f64)
+        .collect();
+    // An unmeasured row is never scored as worse than even (owner, 2026-09-24).
+    median(measured)
+        .map(|m| m.max(NEUTRAL_UTILITY))
+        .unwrap_or(NEUTRAL_UTILITY)
+}
+
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len().is_multiple_of(2) {
+        // The even median is the arithmetic mean of the two middle values, not the lower middle.
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    })
+}
+
+/// The candidates in `(score desc, layer, kind, id asc)` order for the selector to consider.
+fn ordered_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<&'a Known> {
+    let mut candidates: Vec<(Layer, Kind, &Known, Scored)> = scored_candidates(known, context)
+        .into_iter()
+        .filter_map(|(row, scored)| {
+            Some((
+                Layer::parse(&row.layer)?,
+                Kind::parse(&row.kind)?,
+                row,
+                scored,
+            ))
+        })
+        .collect();
+    candidates.sort_by(|left, right| {
+        right
+            .3
+            .score
+            .total_cmp(&left.3.score)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.id.cmp(&right.2.id))
+    });
+    candidates.into_iter().map(|(_, _, row, _)| row).collect()
+}
+
+struct Selected<'a> {
+    row: &'a Known,
+    width: usize,
+    chars: usize,
+}
+
+struct Selection<'a> {
+    items: Vec<Selected<'a>>,
+    omitted: Vec<usize>,
+}
+
+fn same_scope(row: &Known, scope: &Scope) -> bool {
+    Scope::parse(&row.scope_kind, row.scope_id.as_deref())
+        .is_some_and(|row_scope| row_scope.columns() == scope.columns())
+}
+
+fn scope_heading(scope: &Scope) -> String {
+    match scope {
+        Scope::Machine => "\n\nHouse-wide knowledge:".into(),
+        Scope::Project(id) => format!("\n\nKnowledge about project {id}:"),
+        Scope::Errand(id) => format!("\n\nKnowledge about errand {id}:"),
+        Scope::Job { id, .. } => format!("\n\nKnowledge about job {id}:"),
+    }
+}
+
+fn cut_notice(omitted: usize) -> String {
+    format!(
+        "\n\n({omitted} further admitted {} in this scope {} not shown here, to leave room for the work.)",
+        if omitted == 1 { "note" } else { "notes" },
+        if omitted == 1 { "is" } else { "are" }
+    )
+}
+
+fn item_piece(row: &Known, width: usize) -> String {
+    let layer = Layer::parse(&row.layer).expect("selection only carries recognised layers");
+    format!(
+        "\n- [{}] {}: {}",
+        layer.as_str(),
+        row.title,
+        clip(&row.body, width)
+    )
+}
+
+fn char_count(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn select_pass<'a>(
+    candidates: &[&'a Known],
+    groups: &[Scope],
+    budget: &Budget,
+    initial_notices: &[bool],
+    reserve_new_notices: bool,
+) -> Selection<'a> {
+    let totals: Vec<usize> = groups
+        .iter()
+        .map(|scope| {
+            candidates
+                .iter()
+                .filter(|row| same_scope(row, scope))
+                .count()
+        })
+        .collect();
+    let mut notices = initial_notices.to_vec();
+    let mut used = char_count(PREAMBLE)
+        + groups
+            .iter()
+            .map(|scope| char_count(&scope_heading(scope)))
+            .sum::<usize>()
+        + notices
+            .iter()
+            .enumerate()
+            .filter(|(_, reserved)| **reserved)
+            .map(|(index, _)| char_count(&cut_notice(totals[index])))
+            .sum::<usize>();
+
+    let floor_counts = [
+        (Layer::Semantic, 2usize),
+        (Layer::Episodic, 1usize),
+        (Layer::Procedural, 1usize),
+        (Layer::Working, 1usize),
+    ];
+    let mut floor_ids = Vec::new();
+    let mut priority = Vec::new();
+    for (layer, count) in floor_counts {
+        for row in candidates
+            .iter()
+            .copied()
+            .filter(|row| Layer::parse(&row.layer) == Some(layer))
+            .take(count)
+        {
+            floor_ids.push(row.id);
+            priority.push((row, budget.floor_item_chars));
+        }
+    }
+    priority.extend(
+        candidates
+            .iter()
+            .copied()
+            .filter(|row| !floor_ids.contains(&row.id))
+            .map(|row| (row, budget.per_item_chars)),
+    );
+
+    let mut selected: Vec<Selected<'a>> = Vec::new();
+    for (row, width) in priority {
+        let group = groups
+            .iter()
+            .position(|scope| same_scope(row, scope))
+            .expect("candidate belongs to one present scope group");
+        let chars = char_count(&item_piece(row, width));
+        if used.saturating_add(chars) <= budget.render_chars {
+            used += chars;
+            selected.push(Selected { row, width, chars });
+            continue;
+        }
+
+        if !reserve_new_notices || notices[group] {
+            continue;
+        }
+        notices[group] = true;
+        used = used.saturating_add(char_count(&cut_notice(totals[group])));
+        while used > budget.render_chars {
+            let Some(removed) = selected.pop() else {
+                break;
+            };
+            used -= removed.chars;
+            let removed_group = groups
+                .iter()
+                .position(|scope| same_scope(removed.row, scope))
+                .expect("selected row belongs to one present scope group");
+            if !notices[removed_group] {
+                notices[removed_group] = true;
+                used = used.saturating_add(char_count(&cut_notice(totals[removed_group])));
+            }
+        }
+    }
+
+    let omitted = groups
+        .iter()
+        .enumerate()
+        .map(|(index, scope)| {
+            totals[index]
+                - selected
+                    .iter()
+                    .filter(|item| same_scope(item.row, scope))
+                    .count()
+        })
+        .collect();
+    Selection {
+        items: selected,
+        omitted,
+    }
+}
+
+// Only what a person approved. Filtered here rather than trusted from the caller's query:
+// `select` is the last thing between a `proposed` row and a node's prompt, and something that
+// reaches a prompt unapproved makes the approval decorative, which is the entire mechanism.
+// The only named exceptions are a measured consolidator observation and an evidenced working
+// fact read inside the same job; spelling their complete shapes here keeps a third one out.
+fn admitted(row: &Known, context: &Context) -> bool {
+    match row.status.as_str() {
+        "active" if row.source == "consolidator" => {
+            row.layer == "episodic" && row.observations.is_some()
+        }
+        "active" => true,
+        "live" => {
+            row.source == "run"
+                && row.layer == "working"
+                && row
+                    .evidence
+                    .as_deref()
+                    .is_some_and(|evidence| !evidence.trim().is_empty())
+                && context
+                    .chain
+                    .iter()
+                    .any(|scope| matches!(scope, Scope::Job { .. }) && same_scope(row, scope))
+        }
+        _ => false,
+    }
+}
+
+/// Select a bounded briefing without doing I/O.
+///
+/// Admission applies spec §4.5 first: approved rows plus the two named exceptions, measured
+/// consolidator observations and evidenced same-job working facts. Structure then owns its bytes
+/// first. Populated layers claim their item floors, and candidates left over compete in
+/// [`ordered_candidates`] order. The first pass discovers which scope groups are cut; the second
+/// reserves those notices before choosing rows and accounts for any cut it exposes at the
+/// boundary. The trace covers every admitted candidate.
+pub fn select(known: &[Known], context: &Context, budget: &Budget) -> Brief {
+    let admitted: Vec<Known> = known
+        .iter()
+        .filter(|row| admitted(row, context))
+        .cloned()
+        .collect();
+    let candidates: Vec<&Known> = ordered_candidates(&admitted, context)
+        .into_iter()
+        .filter(|row| context.chain.iter().any(|scope| same_scope(row, scope)))
+        .collect();
+    if candidates.is_empty() {
+        return Brief {
+            block: None,
+            trace: scored_candidates(&admitted, context)
+                .into_iter()
+                .map(|(_, scored)| scored)
+                .collect(),
+        };
+    }
+
+    let groups: Vec<Scope> = context
+        .chain
+        .iter()
+        .filter(|scope| candidates.iter().any(|row| same_scope(row, scope)))
+        .cloned()
+        .collect();
+    let first = select_pass(
+        &candidates,
+        &groups,
+        budget,
+        &vec![false; groups.len()],
+        false,
+    );
+    let reserved: Vec<bool> = first.omitted.iter().map(|omitted| *omitted > 0).collect();
+    let selected = select_pass(&candidates, &groups, budget, &reserved, true);
+    let shown: Vec<i64> = selected.items.iter().map(|item| item.row.id).collect();
+
+    let mut block = String::from(PREAMBLE);
+    for (index, scope) in groups.iter().enumerate() {
+        block.push_str(&scope_heading(scope));
+        for item in selected
+            .items
+            .iter()
+            .filter(|item| same_scope(item.row, scope))
+        {
+            block.push_str(&item_piece(item.row, item.width));
+        }
+        if selected.omitted[index] > 0 {
+            block.push_str(&cut_notice(selected.omitted[index]));
+        }
+    }
+    let block = (char_count(&block) <= budget.render_chars).then_some(block);
+    let trace = scored_candidates(&admitted, context)
+        .into_iter()
+        .map(|(_, mut scored)| {
+            scored.shown = block.is_some() && shown.contains(&scored.knowledge_id);
+            scored
+        })
+        .collect();
+    Brief { block, trace }
 }
 
 /// Every column of the store, in the order the migration declares them.
@@ -238,73 +818,21 @@ const COLUMNS: &str = "id, layer, scope_kind, scope_id, source, generator, evide
 ///
 /// Appended to the brief and never replacing it, exactly as `notes::render` is — a node handed a
 /// standing instruction instead of its task does the standing instruction.
-pub fn render(known: &[Known]) -> Option<String> {
-    // Only what a person approved. Filtered here rather than trusted from the caller's query: this
-    // function is the last thing between a `proposed` row and a node's prompt, and something that
-    // reaches a prompt unapproved makes the approval decorative, which is the entire mechanism.
-    let mut live: Vec<(Kind, &Known)> = known
-        .iter()
-        .filter(|row| row.status == "active")
-        // Both vocabularies, and neither is decoration. The store carries no CHECK constraints, so
-        // this pair is what makes an unrecognised value an INVISIBLE row rather than a counted one
-        // — a row whose layer this binary cannot name is a row it cannot honestly render.
-        .filter(|row| Layer::parse(&row.layer).is_some())
-        .filter_map(|row| Kind::parse(&row.kind).map(|kind| (kind, row)))
-        .collect();
-    if live.is_empty() {
-        return None;
-    }
-    // Kind first, id second: what a node reads first is a property of the store, never of the order
-    // rows happened to come back from SQLite.
-    live.sort_by_key(|(kind, row)| (*kind, row.id));
-
-    let mut block = String::from(
-        "\n\nEarlier work on this project left the notes below, and a person approved every one of \
-         them before it reached you. Your brief above is still what you were asked to do; these are \
-         things already known about the project you are doing it in:",
-    );
-
-    let mut shown = 0usize;
-    let mut heading_written: Option<Kind> = None;
-    for (kind, row) in &live {
-        // Rendered before it is measured, so the decision to include it is made on the length of
-        // what will actually be written rather than on an estimate of it.
-        let mut piece = String::new();
-        if heading_written != Some(*kind) {
-            piece.push_str(&format!("\n\n{}:", kind.heading()));
-        }
-        piece.push_str(&format!("\n- {}: {}", row.title, clip(&row.body)));
-
-        if block.len() + piece.len() > RENDER_CHARS {
-            break;
-        }
-        block.push_str(&piece);
-        heading_written = Some(*kind);
-        shown += 1;
-    }
-
-    // Said, never silent. A store trimmed without saying so reads as the whole of what is known, and
-    // a node that believes it has been told everything stops asking.
-    let omitted = live.len() - shown;
-    if omitted > 0 {
-        block.push_str(&format!(
-            "\n\n({omitted} further approved {} not shown here, to leave room for the work.)",
-            if omitted == 1 { "note is" } else { "notes are" }
-        ));
-    }
-    Some(block)
+/// It trusts [`select`] for admission and holds no second copy of the rule.
+#[cfg_attr(not(test), allow(dead_code))] // Tests only since Task 3.4; production goes through brief::of.
+pub fn render(known: &[Known], context: &Context) -> Option<String> {
+    select(known, context, &Budget::default()).block
 }
 
 /// One row's share of the room.
 ///
 /// By chars and not bytes: a slice through a UTF-8 boundary panics on exactly the inputs nobody
 /// writes tests with, and a body is free text somebody wrote.
-fn clip(body: &str) -> String {
-    const PER_ITEM_CHARS: usize = 600;
-    if body.chars().count() <= PER_ITEM_CHARS {
+fn clip(body: &str, width: usize) -> String {
+    if body.chars().count() <= width {
         return body.to_owned();
     }
-    let mut cut: String = body.chars().take(PER_ITEM_CHARS).collect();
+    let mut cut: String = body.chars().take(width).collect();
     cut.push('…');
     cut
 }
@@ -351,7 +879,7 @@ pub async fn for_scope(pool: &SqlitePool, scope: &Scope) -> sqlx::Result<Vec<Kno
 }
 
 /// How many approved rows are read before rendering ever begins.
-const MAX_READ: usize = 200;
+pub(crate) const MAX_READ: usize = 200;
 
 /// Everything the store holds, in every status, newest first.
 ///
@@ -1041,7 +1569,10 @@ mod tests {
 
         // The row exists, is `active`, is in scope, and still reaches nothing. That is the whole of
         // what "no CHECK constraints" costs and the whole of what the Rust constants buy.
-        let block = render(&read).expect("the known layer still renders");
+        // Rendering now groups by the reading context; the assertion remains about the unknown
+        // layer, so it supplies the project context without changing what it proves.
+        let block =
+            render(&read, &project_context_for("mine")).expect("the known layer still renders");
         assert!(
             !block.contains("mercury is retrograde"),
             "a row this binary cannot name reached a node's prompt: {block}"
@@ -1254,7 +1785,12 @@ mod tests {
         assert_eq!(approve(&pool, proposal_id).await.unwrap(), knowledge_id);
         let after = for_scope(&pool, &mine).await.unwrap();
         assert_eq!(after.len(), 1, "approving did not activate the lesson");
-        assert!(render(&after).is_some(), "an active lesson renders nothing");
+        // Rendering now needs the scope chain that the store read represented; approval remains
+        // the assertion under test rather than the new grouping.
+        assert!(
+            render(&after, &project_context_for("mine")).is_some(),
+            "an active lesson renders nothing"
+        );
 
         // The door derives what 0088 could not say, and derives it the way the migration does.
         assert_eq!(
@@ -1313,6 +1849,7 @@ mod tests {
             kind: kind.into(),
             title: title.into(),
             body: body.into(),
+            s_fts: 0.0,
             status: "active".into(),
             proposal_id: Some(1),
             supersedes: None,
@@ -1323,11 +1860,115 @@ mod tests {
         }
     }
 
+    fn project_context() -> Context {
+        project_context_for("p")
+    }
+
+    fn project_context_for(id: &str) -> Context {
+        Context {
+            chain: vec![Scope::Machine, Scope::Project(id.into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        }
+    }
+
+    fn job_context(id: i64) -> Context {
+        Context {
+            chain: vec![
+                Scope::Machine,
+                Scope::Project("p".into()),
+                Scope::Job {
+                    id,
+                    project: Some("p".into()),
+                },
+            ],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        }
+    }
+
+    /// `prompt_budget.rs`, `budget.rs` and `token_efficiency.rs` exist to measure this: a briefing that
+    /// changes at every node BREAKS THE PROMPT CACHE. So machine and project scope are written first —
+    /// they do not change between nodes of the same job — and what the task chose comes last.
+    #[test]
+    fn two_nodes_of_the_same_job_read_the_same_bytes_before_the_bytes_that_are_theirs() {
+        let mut machine = one(1, "memory", "house", "shared house fact");
+        machine.scope_kind = "machine".into();
+        machine.scope_id = None;
+        let project = one(2, "memory", "project", "shared project fact");
+        let mut left = one(3, "memory", "left", "left-node fact");
+        left.scope_kind = "job".into();
+        left.scope_id = Some("77".into());
+        left.points_at = Some("core/src/left.rs".into());
+        let mut right = one(4, "memory", "right", "right-node fact");
+        right.scope_kind = "job".into();
+        right.scope_id = Some("77".into());
+        right.points_at = Some("core/src/right.rs".into());
+        let known = [machine, project, left, right];
+        let context = |file: &str| Context {
+            chain: vec![
+                Scope::Machine,
+                Scope::Project("p".into()),
+                Scope::Job {
+                    id: 77,
+                    project: Some("p".into()),
+                },
+            ],
+            files: vec![file.into()],
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+
+        let left = render(&known, &context("core/src/left.rs")).expect("left node is briefed");
+        let right = render(&known, &context("core/src/right.rs")).expect("right node is briefed");
+        let job_heading = "\n\nKnowledge about job 77:";
+        let left_job = left
+            .find(job_heading)
+            .expect("left brief has its job group");
+        let right_job = right
+            .find(job_heading)
+            .expect("right brief has its job group");
+
+        assert_eq!(&left[..left_job], &right[..right_job]);
+        assert_ne!(&left[left_job..], &right[right_job..]);
+    }
+
+    /// The layer is an item tag and not a heading, and that is what the reader needs to see: the tag is
+    /// what distinguishes a MEASUREMENT from something a person approved.
+    #[test]
+    fn every_item_says_which_layer_it_came_from() {
+        let semantic = one(1, "memory", "fact", "approved fact");
+        let mut episodic = one(2, "memory", "measurement", "measured result");
+        episodic.layer = Layer::Episodic.as_str().into();
+        episodic.source = "consolidator".into();
+        episodic.observations = Some(3);
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+
+        let block = render(&[semantic, episodic], &context).expect("both items render");
+        assert!(block.contains("\n- [semantic] fact: approved fact"));
+        assert!(block.contains("\n- [episodic] measurement: measured result"));
+        assert!(!block.contains("\n\nSemantic:"));
+        assert!(!block.contains("\n\nEpisodic:"));
+    }
+
     /// A project that has learned nothing must cost nothing. The block is appended to every node of
     /// every job, so an empty store that still wrote a heading would tax every run for ever.
     #[test]
     fn a_project_with_nothing_learned_adds_nothing_to_the_brief() {
-        assert!(render(&[]).is_none());
+        // Scope headings are written only for present groups, so the new grouped block must still
+        // cost nothing when there is no knowledge.
+        assert!(render(&[], &project_context()).is_none());
     }
 
     /// The failure this wording exists to prevent: a node handed a standing instruction INSTEAD of
@@ -1335,12 +1976,17 @@ mod tests {
     /// test asserts the item's own brief is still there beside it.
     #[test]
     fn the_block_adds_to_the_brief_rather_than_replacing_it() {
-        let block = render(&[one(
-            1,
-            "prompt",
-            "Run fmt",
-            "Always run cargo fmt before finishing.",
-        )])
+        // Scope groups replace kind headings, but the preamble still has to preserve the node's
+        // own brief as the governing instruction.
+        let block = render(
+            &[one(
+                1,
+                "prompt",
+                "Run fmt",
+                "Always run cargo fmt before finishing.",
+            )],
+            &project_context(),
+        )
         .expect("one active row renders");
         assert!(block.contains("Run fmt"), "the title is missing: {block}");
         assert!(
@@ -1353,36 +1999,309 @@ mod tests {
         );
     }
 
-    /// Grouped, and in the order of the enum rather than the order rows happen to arrive. A node
-    /// reading an instruction after four delegation specs has already spent its attention.
+    /// Scope groups deliberately replace the old per-kind headings: stable machine and project
+    /// bytes precede the job's own bytes, whatever order the rows happened to arrive in.
     #[test]
     fn the_kinds_arrive_in_a_fixed_order_whatever_order_the_rows_do() {
-        let block = render(&[
-            one(4, "subagent", "zzz-delegation", "s"),
-            one(3, "skill", "zzz-skill", "k"),
-            one(2, "memory", "zzz-fact", "m"),
-            one(1, "prompt", "zzz-instruction", "p"),
-        ])
-        .expect("renders");
-        // Distinctive needles, because the first version of this test used "P"/"M"/"K"/"S" and "S"
-        // matched the S of "Standing instructions" — it was comparing a heading against an item and
-        // failing on a renderer that was right.
+        let mut job = one(4, "subagent", "job item", "s");
+        job.scope_kind = "job".into();
+        job.scope_id = Some("77".into());
+        let project = one(3, "skill", "project item", "k");
+        let mut machine = one(2, "memory", "machine item", "m");
+        machine.scope_kind = "machine".into();
+        machine.scope_id = None;
+        let block = render(&[job, project, machine], &job_context(77)).expect("renders");
         let at = |needle: &str| {
             block
                 .find(needle)
                 .unwrap_or_else(|| panic!("{needle} missing"))
         };
         assert!(
-            at("zzz-instruction") < at("zzz-fact"),
-            "instructions must come before facts: {block}"
+            at("machine item") < at("project item"),
+            "machine scope must come before project scope: {block}"
         );
         assert!(
-            at("zzz-fact") < at("zzz-skill"),
-            "facts must come before skills: {block}"
+            at("project item") < at("job item"),
+            "project scope must come before job scope: {block}"
         );
         assert!(
-            at("zzz-skill") < at("zzz-delegation"),
-            "skills must come before delegations: {block}"
+            !block.contains("Standing instructions:"),
+            "the removed kind heading came back: {block}"
+        );
+    }
+
+    /// D6 is this test and nothing else. Without the `id` tail, two rows of the same scope with the same
+    /// files and rank 0 tie, two distributions become indistinguishable, and "deterministic" is a word.
+    /// `render`'s `sort_by_key` carries the reason in the house's own words: "what a node reads first
+    /// is a property of the store, never of the order rows happened to come back from SQLite."
+    #[test]
+    fn two_candidates_that_tie_on_every_signal_are_still_ordered_the_same_way_every_time() {
+        let mut higher_score = one(90, "subagent", "higher-score", "s");
+        higher_score.layer = Layer::Working.as_str().into();
+        higher_score.s_fts = 1.0;
+
+        let tied_second = one(20, "memory", "tied-second", "m2");
+        let tied_first = one(10, "memory", "tied-first", "m1");
+        let prompt = one(80, "prompt", "prompt", "p");
+        let skill = one(70, "skill", "skill", "k");
+
+        // The tied pair shares project scope `p`, this one selection context (and therefore its files),
+        // and rank 0.0. The other rows make each earlier key observable before the id tail is asserted.
+        let first = vec![
+            higher_score.clone(),
+            tied_second.clone(),
+            prompt.clone(),
+            tied_first.clone(),
+            skill.clone(),
+        ];
+        let second = vec![skill, tied_first, prompt, tied_second, higher_score];
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let ids = |rows: &[Known]| {
+            ordered_candidates(rows, &context)
+                .into_iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        let first_ids = ids(&first);
+        let second_ids = ids(&second);
+        assert_eq!(first_ids.as_bytes(), second_ids.as_bytes());
+        assert_eq!(first_ids, "90,10,20,80,70");
+    }
+
+    #[test]
+    fn the_order_is_score_then_layer_then_kind_then_id() {
+        let mut highest_score = one(50, "subagent", "highest score", "working");
+        highest_score.layer = Layer::Working.as_str().into();
+        highest_score.s_fts = 0.5;
+        let memory = one(40, "memory", "memory", "semantic");
+        let prompt = one(30, "prompt", "prompt", "procedural");
+        let later_skill = one(20, "skill", "later skill", "procedural");
+        let earlier_skill = one(10, "skill", "earlier skill", "procedural");
+        let rows = vec![highest_score, memory, prompt, later_skill, earlier_skill];
+        let ids = |rows: &[Known]| {
+            ordered_candidates(rows, &project_context())
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(&rows), vec![50, 40, 30, 10, 20]);
+        let reversed = rows.into_iter().rev().collect::<Vec<_>>();
+        assert_eq!(ids(&reversed), vec![50, 40, 30, 10, 20]);
+    }
+
+    #[test]
+    fn every_signal_and_the_score_are_on_the_unit_scale() {
+        let context = Context {
+            chain: vec![
+                Scope::Machine,
+                Scope::Project("p".into()),
+                Scope::Job {
+                    id: 77,
+                    project: Some("p".into()),
+                },
+            ],
+            files: vec!["a.rs".into(), "b.rs".into()],
+            communities: vec!["core".into()],
+            node: None,
+            gate: None,
+        };
+        let mut r1 = one(1, "memory", "best", "job");
+        r1.scope_kind = "job".into();
+        r1.scope_id = Some("77".into());
+        r1.points_at = Some(r#"["a.rs","b.rs","core"]"#.into());
+        r1.s_fts = 7.0;
+        r1.shown_count = 4;
+        r1.outcome_count = 4;
+        r1.green_count = 3;
+        r1.last_shown_at = Some("2026-09-21T00:00:00+00:00".into());
+        let mut r2 = one(2, "memory", "failed", "machine");
+        r2.scope_kind = "machine".into();
+        r2.scope_id = None;
+        r2.s_fts = -2.0;
+        r2.shown_count = 2;
+        r2.outcome_count = 2;
+        r2.last_shown_at = Some("2026-09-01T00:00:00+00:00".into());
+        let mut r3 = one(3, "memory", "unknown", "project");
+        r3.s_fts = f64::NAN;
+        let rows = vec![r1, r2, r3];
+
+        let scored = scored_candidates(&rows, &context);
+        for (row, candidate) in &scored {
+            for (name, value) in [
+                ("s_fts", candidate.s_fts),
+                ("s_scope", candidate.s_scope),
+                ("s_structure", candidate.s_structure),
+                ("s_recency", candidate.s_recency),
+                ("s_use", candidate.s_use),
+                ("score", candidate.score),
+            ] {
+                assert!(
+                    (0.0..=1.0).contains(&value),
+                    "row {} has {name} outside the unit scale: {value}",
+                    row.id
+                );
+            }
+        }
+        let fts = |id| {
+            scored
+                .iter()
+                .find(|(row, _)| row.id == id)
+                .map(|(_, candidate)| candidate.s_fts)
+                .expect("row is scored")
+        };
+        assert_eq!(fts(1), 1.0);
+        assert_eq!(fts(2), 0.0);
+        assert_eq!(fts(3), 0.0);
+        assert_eq!(ordered_candidates(&rows, &context)[0].id, 1);
+
+        let expected = scored
+            .iter()
+            .find(|(row, _)| row.id == 1)
+            .map(|(_, candidate)| candidate.score)
+            .expect("row 1 is scored");
+        let traced = select(&rows, &context, &Budget::default())
+            .trace
+            .into_iter()
+            .find(|candidate| candidate.knowledge_id == 1)
+            .map(|candidate| candidate.score)
+            .expect("row 1 reaches the trace");
+        assert_eq!(traced, expected);
+    }
+
+    /// A new row does not compete from the bottom as if it had failed: the selection treats absence as
+    /// absence, and what that is worth as a NUMBER is decided here and tested in a table. Without this,
+    /// whoever implements it picks a value by taste and D6's table tests that taste.
+    ///
+    /// The utility component of a row with no outcome is the MEDIAN of the candidates that have one,
+    /// floored at the neutral constant, and the neutral constant when none of them does.
+    #[test]
+    fn a_row_nobody_has_measured_scores_like_the_middle_of_the_ones_somebody_has() {
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let cases = [
+            ("odd", vec![(1, 5), (3, 5), (5, 5)], 0.6),
+            ("even", vec![(1, 5), (4, 5)], 0.5),
+            ("single", vec![(3, 4)], 0.75),
+            ("mostly failed", vec![(0, 5), (0, 5), (5, 5)], 0.5),
+            ("low", vec![(1, 5), (1, 5)], 0.5),
+            ("none", Vec::new(), NEUTRAL_UTILITY),
+        ];
+
+        for (name, measured, expected) in cases {
+            let mut rows = vec![one(100, "memory", "not measured", "new")];
+            for (offset, (green_count, outcome_count)) in measured.into_iter().enumerate() {
+                let mut row = one(offset as i64 + 1, "memory", "measured", "old");
+                row.green_count = green_count;
+                row.outcome_count = outcome_count;
+                rows.push(row);
+            }
+
+            let actual = scored_candidates(&rows, &context)
+                .into_iter()
+                .find(|(row, _)| row.id == 100)
+                .map(|(_, scored)| scored.s_use)
+                .expect("the unmeasured row is scored");
+            assert!(
+                (actual - expected).abs() < f64::EPSILON,
+                "{name}: expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_never_shown_row_never_scores_below_a_recent_failure() {
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let mut recent_failure = one(1, "memory", "recent failure", "bad");
+        recent_failure.shown_count = 4;
+        recent_failure.outcome_count = 4;
+        recent_failure.last_shown_at = Some("2026-09-20T00:00:00+00:00".into());
+        let mut old_failure = one(2, "memory", "old failure", "bad");
+        old_failure.shown_count = 4;
+        old_failure.outcome_count = 4;
+        old_failure.last_shown_at = Some("2026-09-01T00:00:00+00:00".into());
+        let mut old_green = one(3, "memory", "old green", "good");
+        old_green.shown_count = 4;
+        old_green.outcome_count = 4;
+        old_green.green_count = 4;
+        old_green.last_shown_at = Some("2026-09-01T00:00:00+00:00".into());
+        let never_shown = one(4, "memory", "never shown", "new");
+        let rows = vec![recent_failure, old_failure, old_green, never_shown];
+
+        let scored = scored_candidates(&rows, &context);
+        let score = |id| {
+            scored
+                .iter()
+                .find(|(row, _)| row.id == id)
+                .map(|(_, scored)| scored)
+                .expect("row is scored")
+        };
+        assert!(
+            score(4).score >= score(1).score,
+            "a never-shown row must not score below a recent measured failure"
+        );
+        assert_eq!(score(4).s_use, NEUTRAL_UTILITY);
+        assert_eq!(score(4).s_recency, 0.0);
+    }
+
+    /// This is the realistic fixture: every signal except utility is equal, because the pass that
+    /// records an outcome also records the show at the same instant. The never-shown row's recency
+    /// is absence, not zero, so it must not order like an old measured failure.
+    #[test]
+    fn not_measured_does_not_order_like_measured_and_failed() {
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let not_measured = one(1, "memory", "not measured", "new");
+        let mut failed = one(2, "memory", "failed", "bad");
+        failed.shown_count = 4;
+        failed.outcome_count = 4;
+        failed.last_shown_at = Some("2026-09-20T00:00:00+00:00".into());
+        let mut green = one(3, "memory", "green", "good");
+        green.shown_count = 4;
+        green.outcome_count = 4;
+        green.green_count = 4;
+        green.last_shown_at = Some("2026-09-20T00:00:00+00:00".into());
+        let rows = vec![failed, not_measured, green];
+
+        let scored = scored_candidates(&rows, &context);
+        let utility = |id| {
+            scored
+                .iter()
+                .find(|(row, _)| row.id == id)
+                .map(|(_, scored)| scored.s_use)
+                .expect("row is scored")
+        };
+        assert_ne!(utility(1), utility(2));
+        assert_eq!(
+            ordered_candidates(&rows, &context)
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 2]
         );
     }
 
@@ -1394,11 +2313,13 @@ mod tests {
         let many: Vec<Known> = (1..=60)
             .map(|i| one(i, "memory", &format!("fact {i}"), &"x".repeat(300)))
             .collect();
-        let block = render(&many).expect("renders");
+        // The new selector accounts for each scope heading and its own cut notice, so the old loose
+        // byte bound becomes the exact character ceiling the grouped block promises.
+        let block = render(&many, &project_context()).expect("renders");
         assert!(
-            block.len() <= RENDER_CHARS * 2,
+            block.chars().count() <= RENDER_CHARS,
             "unbounded: {} chars from {} rows",
-            block.len(),
+            block.chars().count(),
             many.len()
         );
         assert!(
@@ -1407,17 +2328,254 @@ mod tests {
         );
     }
 
-    /// Only what a person approved. A `proposed` row reaching a prompt would make the approval
-    /// decorative, which is the whole mechanism.
+    /// The test `the_block_is_bounded_and_says_what_it_left_out` cannot write today — it only
+    /// asserts `<= RENDER_CHARS * 2`, because the cut notice is appended AFTER the loop. Two passes
+    /// make the real ceiling assertable.
+    #[test]
+    fn the_block_never_passes_the_ceiling_however_much_is_on_offer() {
+        let many: Vec<Known> = (1..=60)
+            .map(|i| one(i, "memory", &format!("fact {i}"), &"x".repeat(1_000)))
+            .collect();
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let budget = Budget {
+            render_chars: RENDER_CHARS,
+            per_item_chars: PER_ITEM_CHARS,
+            floor_item_chars: FLOOR_ITEM_CHARS,
+        };
+
+        let brief = select(&many, &context, &budget);
+        let block = brief.block.expect("some of sixty active rows render");
+        assert!(
+            block.chars().count() <= RENDER_CHARS,
+            "the block passed its ceiling: {} > {RENDER_CHARS}",
+            block.chars().count()
+        );
+        assert!(block.contains("not shown"), "the cut was silent: {block}");
+    }
+
+    /// A floor reserved for a layer with no candidate is dead budget, and two layers are born empty.
+    #[test]
+    fn a_layer_with_nothing_in_it_reserves_no_floor() {
+        let mut first = one(1, "memory", "first", &"a".repeat(301));
+        first.s_fts = 0.9;
+        let mut second = one(2, "memory", "second", &"b".repeat(301));
+        second.s_fts = 0.6;
+        let mut third = one(3, "memory", "third", "small scored remainder");
+        third.s_fts = 0.3;
+        let known = [first, second, third];
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let budget = Budget {
+            render_chars: 1_100,
+            per_item_chars: PER_ITEM_CHARS,
+            floor_item_chars: FLOOR_ITEM_CHARS,
+        };
+
+        let brief = select(&known, &context, &budget);
+        assert_eq!(
+            brief.trace.iter().filter(|row| row.shown).count(),
+            3,
+            "empty episodic, procedural, and working layers consumed room: {:?}",
+            brief
+                .trace
+                .iter()
+                .map(|row| (row.knowledge_id, row.shown))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Structural first: the current preamble, one heading per PRESENT SCOPE GROUP, and one cut
+    /// notice per group that was actually cut. Groups of scope and not of layer — a block ordered
+    /// by scope interleaves layers, so a per-layer heading has nowhere to sit.
+    #[test]
+    fn the_headings_and_the_notices_come_off_the_top_before_any_floor_is_reserved() {
+        // The preamble no longer claims every item was approved because §4.5 names two exceptions;
+        // the structural reservation still measures those exact bytes before choosing any item.
+        let preamble = PREAMBLE;
+        assert!(preamble.contains("two named admission rules"));
+        let machine_heading = "\n\nHouse-wide knowledge:";
+        let project_heading = "\n\nKnowledge about project p:";
+        let notice = "\n\n(1 further admitted note in this scope is not shown here, to leave room for the work.)";
+        let structural_chars = [preamble, machine_heading, project_heading, notice, notice]
+            .into_iter()
+            .map(|part| part.chars().count())
+            .sum();
+
+        let mut machine = one(1, "memory", "machine item", &"m".repeat(301));
+        machine.scope_kind = "machine".into();
+        machine.scope_id = None;
+        let project = one(2, "memory", "project item", &"p".repeat(301));
+        let known = [machine, project];
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let budget = Budget {
+            render_chars: structural_chars,
+            per_item_chars: PER_ITEM_CHARS,
+            floor_item_chars: FLOOR_ITEM_CHARS,
+        };
+
+        let brief = select(&known, &context, &budget);
+        let block = brief
+            .block
+            .expect("present groups still render their structure");
+        assert_eq!(block.chars().count(), structural_chars);
+        assert!(block.contains(machine_heading));
+        assert!(block.contains(project_heading));
+        assert_eq!(block.matches(notice).count(), 2);
+        assert!(!block.contains("machine item"));
+        assert!(!block.contains("project item"));
+        assert!(brief.trace.iter().all(|row| !row.shown));
+    }
+
+    /// The two clips are different numbers and the test says which is which.
+    #[test]
+    fn a_floor_item_is_cut_at_three_hundred_and_one_that_won_on_score_at_six_hundred() {
+        let mut floor = one(1, "memory", "floor", &"f".repeat(301));
+        floor.s_fts = 0.9;
+        let mut other_floor = one(2, "memory", "other floor", "short");
+        other_floor.s_fts = 0.6;
+        let mut scored = one(3, "memory", "score", &"s".repeat(601));
+        scored.s_fts = 0.3;
+        let known = [floor, other_floor, scored];
+        let context = Context {
+            chain: vec![Scope::Machine, Scope::Project("p".into())],
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        };
+        let budget = Budget {
+            render_chars: RENDER_CHARS,
+            per_item_chars: PER_ITEM_CHARS,
+            floor_item_chars: FLOOR_ITEM_CHARS,
+        };
+
+        let brief = select(&known, &context, &budget);
+        let block = brief.block.expect("all three rows fit");
+        assert!(
+            block.contains(&format!("{}…", "f".repeat(FLOOR_ITEM_CHARS))),
+            "the floor item was not clipped at {FLOOR_ITEM_CHARS}: {block}"
+        );
+        assert!(
+            block.contains(&format!("{}…", "s".repeat(PER_ITEM_CHARS))),
+            "the score winner was not clipped at {PER_ITEM_CHARS}: {block}"
+        );
+        assert_eq!(brief.trace.iter().filter(|row| row.shown).count(), 3);
+    }
+
+    /// The admission rule is asserted on `select`, the seam every caller passes through. Active
+    /// rows still represent approval. The only rows that may bypass it are (a) an `active`
+    /// consolidator `episodic` row with observations and (b) a `live` run `working` row with
+    /// non-empty evidence, read only inside the job that wrote it. Enumerating the surrounding
+    /// status/source/layer space makes a third exception fail here rather than reach a prompt.
     #[test]
     fn nothing_that_a_person_has_not_approved_reaches_a_node() {
-        let mut waiting = one(1, "prompt", "Not yet", "This was never approved.");
-        waiting.status = "proposed".into();
-        let mut taken_back = one(2, "prompt", "Taken back", "This was reverted.");
-        taken_back.status = "reverted".into();
+        let context = job_context(77);
+        let statuses = ["active", "proposed", "live", "rejected", "reverted"];
+        let sources = ["owner", "run", "consolidator"];
+        let layers = ["semantic", "episodic", "procedural", "working"];
+        let mut id = 0;
+
+        for status in statuses {
+            for source in sources {
+                for layer in layers {
+                    id += 1;
+                    let title = format!("{status}/{source}/{layer}");
+                    let mut row = one(id, "memory", &title, "candidate");
+                    row.status = status.into();
+                    row.source = source.into();
+                    row.layer = layer.into();
+                    row.proposal_id =
+                        (status == "active" && source != "consolidator").then_some(id);
+                    if source == "consolidator" {
+                        row.observations = Some(1);
+                    }
+                    if status == "live" {
+                        row.scope_kind = "job".into();
+                        row.scope_id = Some("77".into());
+                        row.evidence = Some("run:900001".into());
+                    }
+
+                    let measured_exception = status == "active"
+                        && source == "consolidator"
+                        && layer == "episodic"
+                        && row.observations.is_some();
+                    let working_exception = status == "live"
+                        && source == "run"
+                        && layer == "working"
+                        && row
+                            .evidence
+                            .as_deref()
+                            .is_some_and(|value| !value.is_empty());
+                    let approved = status == "active" && source != "consolidator";
+                    assert_eq!(
+                        select(std::slice::from_ref(&row), &context, &Budget::default(),)
+                            .block
+                            .is_some(),
+                        approved || measured_exception || working_exception,
+                        "the admission rule was wrong for {title}"
+                    );
+                    assert_eq!(
+                        select(std::slice::from_ref(&row), &context, &Budget::default(),)
+                            .trace
+                            .iter()
+                            .any(|scored| scored.knowledge_id == id),
+                        approved || measured_exception || working_exception,
+                        "a row the admission rule refuses was scored as a candidate for {title}"
+                    );
+                }
+            }
+        }
+
+        let mut measurement_without_observations = one(100, "memory", "unmeasured", "body");
+        measurement_without_observations.source = "consolidator".into();
+        measurement_without_observations.layer = "episodic".into();
+        measurement_without_observations.proposal_id = None;
+        measurement_without_observations.observations = None;
+
+        let mut working_without_evidence = one(101, "memory", "unsupported", "body");
+        working_without_evidence.status = "live".into();
+        working_without_evidence.source = "run".into();
+        working_without_evidence.layer = "working".into();
+        working_without_evidence.scope_kind = "job".into();
+        working_without_evidence.scope_id = Some("77".into());
+        working_without_evidence.evidence = Some("   ".into());
+
+        let mut another_jobs_working_fact = working_without_evidence.clone();
+        another_jobs_working_fact.id = 102;
+        another_jobs_working_fact.title = "another job's".into();
+        another_jobs_working_fact.scope_id = Some("78".into());
+        another_jobs_working_fact.evidence = Some("run:900002".into());
+
         assert!(
-            render(&[waiting, taken_back]).is_none(),
-            "something nobody approved reached a node's prompt"
+            select(
+                &[
+                    measurement_without_observations,
+                    working_without_evidence,
+                    another_jobs_working_fact,
+                ],
+                &context,
+                &Budget::default(),
+            )
+            .block
+            .is_none(),
+            "an incomplete or cross-job exception reached a node's prompt"
         );
     }
 

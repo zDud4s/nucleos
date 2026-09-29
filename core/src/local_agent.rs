@@ -92,6 +92,14 @@ pub trait ToolBox: Send + Sync {
     /// nothing, leaving a stranger's words in a turn that still counted as clean.
     async fn call(&self, name: &str, arguments: &Value) -> ToolAnswer;
 
+    /// A copy of this box that speaks for one run.
+    ///
+    /// `None` means the box carries no identity and is used as it is, as with `NoTools` and test
+    /// fakes.
+    fn for_run(&self, _run_id: i64) -> Option<Box<dyn ToolBox>> {
+        None
+    }
+
     /// Whether this tool may still run once the turn has read third-party text.
     ///
     /// Defaults to yes so a fake tool box in a test is not silently governed by a barrier it never
@@ -382,6 +390,18 @@ impl LocalAssistant {
             taint,
         )
         .await
+    }
+
+    pub async fn answer_as_run(
+        &self,
+        run_id: i64,
+        history: &[(String, String)],
+        prompt: &str,
+        taint: &std::sync::atomic::AtomicBool,
+    ) -> std::io::Result<Turn> {
+        let scoped = self.tools.for_run(run_id);
+        let tools: &dyn ToolBox = scoped.as_deref().unwrap_or(&*self.tools);
+        run_turn(&*self.chat, tools, SYSTEM_PROMPT, history, prompt, taint).await
     }
 }
 

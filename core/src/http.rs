@@ -13855,9 +13855,9 @@ struct LeaveNoteResponse {
     note_id: i64,
 }
 
+/// Scope comes from the run, and a `project_id` key is accepted and ignored.
 #[derive(serde::Deserialize)]
-struct ProposeKnowledgeRequest {
-    project_id: Option<String>,
+pub(crate) struct ProposeKnowledgeRequest {
     kind: String,
     title: String,
     body: String,
@@ -13871,25 +13871,29 @@ struct ProposeKnowledgeRequest {
     supersedes: Option<i64>,
 }
 
-/// The one door into the layer — the owner writing directly, and a run declaring what it learned.
-///
-/// One handler and not two, because the two differ in exactly one fact: whether a run is behind the
-/// request. That fact arrives as a header rather than as a field, so the door cannot be told a lie
-/// about who taught it; everything else about the write is identical, and a second route would be
-/// the same body with a different name on it.
+/// The one door a run declares through.
 ///
 /// It still goes through the proposal, rather than inserting an `active` row: the review trail is
 /// what makes the layer safe to have at all, and a second way in that skipped it would be the way
-/// everything eventually got written. The owner simply approves their own in the next call.
-async fn post_knowledge(
+/// everything eventually got written.
+pub(crate) async fn post_knowledge(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(request): Json<ProposeKnowledgeRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
-    let kind = crate::knowledge::Kind::parse(request.kind.trim()).ok_or((
-        StatusCode::BAD_REQUEST,
-        "kind must be one of prompt, memory, skill, subagent".to_owned(),
-    ))?;
+) -> Result<(StatusCode, Json<serde_json::Value>), axum::response::Response> {
+    // These are the relay's named slugs for the same header, rather than sentences, for the reason
+    // on `refusal`. A model reads the body verbatim through `declare_refinement`. By owner scope,
+    // 2026-09-24, every other refusal in this handler stays prose.
+    let Some(origin_run_id) = sending_run_id_of(&headers) else {
+        return Err(refusal(StatusCode::BAD_REQUEST, "missing_run_id").into_response());
+    };
+    let kind = crate::knowledge::Kind::parse(request.kind.trim()).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "kind must be one of prompt, memory, skill, subagent".to_owned(),
+        )
+            .into_response()
+    })?;
     let title = request.title.trim();
     let body = request.body.trim();
     // A refinement with no words is an empty heading in every later prompt, for ever.
@@ -13897,25 +13901,39 @@ async fn post_knowledge(
         return Err((
             StatusCode::BAD_REQUEST,
             "a refinement needs both a title and a body".to_owned(),
-        ));
+        )
+            .into_response());
     }
+    let project_id = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT project_id FROM runs WHERE id = ?",
+    )
+    .bind(origin_run_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, run_id = origin_run_id, "reading a declaration's run scope failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the refinement's scope could not be determined".to_owned(),
+        )
+            .into_response()
+    })?
+    .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "unknown_sender").into_response())?;
     let (knowledge_id, proposal_id) = crate::knowledge::propose(
         &state.pool,
         crate::knowledge::Declaration {
-            project_id: request.project_id.as_deref(),
+            project_id: project_id.as_deref(),
             // Off the header and never off the body: `RUN_ID_HEADER` is set from an environment
             // variable the run's own tools have nothing able to read or alter, so a run can name
-            // itself and cannot name anybody else. Absent for the owner writing from the app, who
-            // is not a run — which is why the column stays nullable rather than the door demanding
-            // one.
-            origin_run_id: sending_run_id_of(&headers),
+            // itself and cannot name anybody else.
+            origin_run_id: Some(origin_run_id),
             kind,
             title,
             body,
             reasoning: request
                 .reasoning
                 .as_deref()
-                .unwrap_or("written by the owner"),
+                .unwrap_or("declared by a run with no reason given"),
             supersedes: request.supersedes,
         },
     )
@@ -13924,10 +13942,10 @@ async fn post_knowledge(
     // between "that id is not there" and "that id is not yours", and the two have different fixes.
     .map_err(|error| match error {
         crate::knowledge::ProposeError::UnknownPredecessor(_) => {
-            (StatusCode::NOT_FOUND, error.to_string())
+            (StatusCode::NOT_FOUND, error.to_string()).into_response()
         }
         crate::knowledge::ProposeError::ForeignPredecessor(_) => {
-            (StatusCode::CONFLICT, error.to_string())
+            (StatusCode::CONFLICT, error.to_string()).into_response()
         }
         crate::knowledge::ProposeError::Db(error) => {
             tracing::warn!(%error, "proposing a refinement failed");
@@ -13935,6 +13953,7 @@ async fn post_knowledge(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "the refinement could not be written".to_owned(),
             )
+                .into_response()
         }
     })?;
     Ok((
@@ -33435,6 +33454,15 @@ mod tests {
     #[tokio::test]
     async fn a_refinement_declared_by_a_run_records_which_run_taught_it() {
         let state = test_state().await;
+        let run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('nucleos', 'learn the rule', 'completed', 'real',
+                     '2026-09-21T00:00:00Z')
+             RETURNING id",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
 
         let response = build_router(state.clone())
             .oneshot(
@@ -33443,10 +33471,9 @@ mod tests {
                     .uri("/knowledge")
                     .header("Authorization", "Bearer test-token")
                     .header("content-type", "application/json")
-                    .header(crate::daemon_client::RUN_ID_HEADER, "4242")
+                    .header(crate::daemon_client::RUN_ID_HEADER, run_id.to_string())
                     .body(Body::from(
                         serde_json::json!({
-                            "project_id": "nucleos",
                             "kind": "memory",
                             "title": "the suite needs Git's echo on PATH",
                             "body": "five tests spawn echo as a program, and the only real echo.exe \
@@ -33472,19 +33499,17 @@ mod tests {
                 .unwrap();
         assert_eq!(
             origin,
-            Some(4242),
+            Some(run_id),
             "the run that declared it must be on the row"
         );
     }
 
-    /// The owner writing from the app is not a run, and stays unattributed.
+    /// Only a run declares (owner decision 2026-09-23).
     ///
-    /// The companion of the test above, and the reason the header is read as an `Option` rather
-    /// than demanded: `POST /knowledge` is also the door the owner writes through, where there is
-    /// no run to name. A missing header must leave the column NULL — never fail the write, and
-    /// never invent an id.
+    /// A chat turn is a run and declares as one (Task 5.2a). An owner-side declaration from the UI
+    /// will get its own route.
     #[tokio::test]
-    async fn a_refinement_written_by_the_owner_names_no_run() {
+    async fn a_declaration_with_no_run_behind_it_is_refused() {
         let state = test_state().await;
 
         let response = build_router(state.clone())
@@ -33508,18 +33533,166 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["refusal"], "missing_run_id");
+        let knowledge_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let proposal_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proposals WHERE kind = 'refinement'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            knowledge_count, 0,
+            "a refused declaration writes no knowledge"
+        );
+        assert_eq!(
+            proposal_count, 0,
+            "a refused declaration writes no proposal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declaration_whose_run_header_is_not_a_run_id_is_refused_by_name() {
+        let state = test_state().await;
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/knowledge")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header(crate::daemon_client::RUN_ID_HEADER, "not-a-run")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "kind": "prompt",
+                            "title": "commit messages are English here",
+                            "body": "fixed by the owner, and it applies to every project on this \
+                                     machine",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["refusal"], "missing_run_id");
+        let knowledge_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let proposal_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proposals WHERE kind = 'refinement'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            knowledge_count, 0,
+            "a refused declaration writes no knowledge"
+        );
+        assert_eq!(
+            proposal_count, 0,
+            "a refused declaration writes no proposal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declaration_naming_a_run_that_does_not_exist_is_refused() {
+        let state = test_state().await;
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/knowledge")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header(crate::daemon_client::RUN_ID_HEADER, "4242")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "kind": "prompt",
+                            "title": "commit messages are English here",
+                            "body": "a nonexistent run cannot teach this rule",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["refusal"], "unknown_sender");
+        let knowledge_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let proposal_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proposals WHERE kind = 'refinement'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            knowledge_count, 0,
+            "a refused declaration writes no knowledge"
+        );
+        assert_eq!(
+            proposal_count, 0,
+            "a refused declaration writes no proposal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_of_one_project_whose_body_names_another_declares_in_its_own() {
+        let state = test_state().await;
+        let run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('nucleos', 'learn the rule', 'completed', 'real',
+                     '2026-09-21T00:00:00Z')
+             RETURNING id",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/knowledge")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header(crate::daemon_client::RUN_ID_HEADER, run_id.to_string())
+                    .body(Body::from(
+                        serde_json::json!({
+                            "project_id": "someone-else",
+                            "kind": "memory",
+                            "title": "the declaration belongs to its run",
+                            "body": "an old client's project field cannot choose the scope",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
         assert_eq!(response.status(), StatusCode::CREATED);
         let knowledge_id = json_body(response).await["knowledge_id"]
             .as_i64()
             .expect("what was created answers its own id");
-
-        let origin: Option<i64> =
-            sqlx::query_scalar("SELECT origin_run_id FROM knowledge WHERE id = ?")
+        let scope: (String, Option<String>) =
+            sqlx::query_as("SELECT scope_kind, scope_id FROM knowledge WHERE id = ?")
                 .bind(knowledge_id)
                 .fetch_one(&state.pool)
                 .await
                 .unwrap();
-        assert_eq!(origin, None, "no run declared it, so no run is named");
+        assert_eq!(scope, ("project".to_owned(), Some("nucleos".to_owned())));
     }
 
     /// The whole life of a `PUT /notifications/policy`, at the route level: it replaces (never

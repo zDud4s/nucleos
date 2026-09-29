@@ -1400,7 +1400,7 @@ impl Outcome {
 /// is a verdict about the code and is worth another attempt; a gate that would not run measured
 /// nothing, so there is nothing to attempt again, and buying past it with a retry would mean
 /// building on work nothing has looked at.
-fn item_state_from(status: &str, gate_attempts: i64, gate_retries: i64) -> ItemState {
+pub(crate) fn item_state_from(status: &str, gate_attempts: i64, gate_retries: i64) -> ItemState {
     match status {
         "running" => ItemState::Running,
         "implemented" => ItemState::Implemented,
@@ -3764,9 +3764,12 @@ async fn spawn_node(
     // stops two passes starting two nodes on one tree. What changed is only that the status it
     // compares against is passed in rather than hard-coded — a hard-coded `'pending'` silently
     // refused every retriable item, which read as the job stopping for no reason.
+    // The gate verdict belongs to the attempt it measured, so every new attempt clears it in the
+    // same compare-and-swap that claims the item. This matters after a replan: the Superseded arm of
+    // `brief::item_verdict` reads the stored verdict before it falls back to the latest run.
     if let Some(ItemClaim { ordinal, held }) = item {
         let claimed = sqlx::query(
-            "UPDATE job_items SET status = 'running'
+            "UPDATE job_items SET status = 'running', gate_status = NULL
              WHERE job_id = ? AND ordinal = ? AND status = ?",
         )
         .bind(job.id)
@@ -3802,6 +3805,8 @@ async fn spawn_node(
             Vec::new()
         }
     };
+    // The query is the node's own task text, before catch-up, notes, or knowledge are appended.
+    let task_text = prompt.clone();
     let mut prompt = prompt;
     // Before the notes and before the lessons, because it is about the CHECKOUT this node is
     // about to open its editor in, and everything else is about the work. An item going round
@@ -3829,16 +3834,35 @@ async fn spawn_node(
     // is what the owner is saying NOW about this job, and it should be the last thing read.
     //
     // Best-effort, like the notes above: a layer that cannot be read is a reason to say so, never a
-    // reason to refuse to start the node.
-    let learned = match crate::refine::active_for(pool, Some(job.project_id.as_str())).await {
-        Ok(learned) => learned,
+    // reason to refuse to start the node. The fetch now follows the context's most specific scope
+    // (the job's), a superset of the project read it replaces.
+    let pid = job.project_id.clone();
+    let context = crate::knowledge::Context {
+        chain: vec![
+            crate::knowledge::Scope::Machine,
+            crate::knowledge::Scope::Project(pid.clone()),
+            crate::knowledge::Scope::Job {
+                id: job.id,
+                project: Some(pid.clone()),
+            },
+        ],
+        files: Vec::new(),
+        communities: Vec::new(),
+        node: None,
+        gate: None,
+    };
+    let briefing = match crate::brief::of(pool, &context, &task_text).await {
+        Ok(briefing) => Some(briefing),
         Err(error) => {
-            tracing::warn!(job_id = job.id, %error, "could not read the refinement layer");
-            Vec::new()
+            tracing::warn!(job_id = job.id, %error, "could not read project knowledge");
+            None
         }
     };
-    if let Some(block) = crate::refine::render(&learned) {
-        prompt.push_str(&block);
+    if let Some(block) = briefing
+        .as_ref()
+        .and_then(|briefing| briefing.block.as_ref())
+    {
+        prompt.push_str(block);
     }
 
     // An item of a job a team directs gets a checkout of its own; everything else — every node of
@@ -3893,6 +3917,34 @@ async fn spawn_node(
                 // again to the next node, which is confusing but not silent, and there is nothing
                 // to undo — the run is already started.
                 tracing::warn!(job_id = job.id, run_id, %error, "could not mark a job's notes delivered");
+            }
+            if let Some(briefing) = briefing.as_ref() {
+                let item_id = match item {
+                    Some(ItemClaim { ordinal, .. }) => match sqlx::query_scalar(
+                        "SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?",
+                    )
+                    .bind(job.id)
+                    .bind(ordinal as i64)
+                    .fetch_optional(pool)
+                    .await
+                    {
+                        Ok(id) => id,
+                        // A NULL item_id is never credited, so say this failure out loud.
+                        Err(error) => {
+                            tracing::warn!(job_id = job.id, run_id, ordinal, %error, "could not resolve a node's item; its briefing trace is written without one and will never be credited");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                // The trace names a run, which exists only now, in the same order as note delivery.
+                // Record it exactly once per run because its primary key rejects a second pass; the
+                // item is what the eventual verdict credits.
+                if let Err(error) =
+                    crate::brief::record(pool, run_id, item_id, &briefing.trace).await
+                {
+                    tracing::warn!(job_id = job.id, run_id, %error, "could not record a node's briefing trace");
+                }
             }
             if let Some(ItemClaim { ordinal, .. }) = item {
                 let _ =
@@ -3987,13 +4039,21 @@ async fn spawn_node(
 /// released to `pending` would have lost the red gate that made it retriable while keeping the
 /// `gate_attempts` that gate cost it, so a budget of one would be spent on an attempt that never
 /// ran, and the item would come back as though nothing had ever measured it.
+///
+/// The claim clears the previous attempt's gate verdict. Giving up a retry claim therefore restores
+/// `failed` alongside `gate_failed`, the same pairing [`record_gate`] writes, so a later replan cannot
+/// mistake that released red gate for an ungated attempt.
 async fn release_item(pool: &SqlitePool, job: &JobRow, item: Option<ItemClaim>) {
     let Some(ItemClaim { ordinal, held }) = item else {
         return;
     };
     let _ = sqlx::query(
-        "UPDATE job_items SET status = ? WHERE job_id = ? AND ordinal = ? AND status = 'running'",
+        "UPDATE job_items
+         SET status = ?,
+             gate_status = CASE WHEN ? = 'gate_failed' THEN 'failed' ELSE gate_status END
+         WHERE job_id = ? AND ordinal = ? AND status = 'running'",
     )
+    .bind(held)
     .bind(held)
     .bind(job.id)
     .bind(ordinal as i64)
@@ -4189,6 +4249,7 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
                 .bind(ordinal as i64)
                 .execute(pool)
                 .await;
+        credit_the_briefing(pool, job, ordinal).await;
         tracing::debug!(job_id = job.id, ordinal, why, "item not gated");
         Step::Continued
     };
@@ -4415,6 +4476,16 @@ const GATE_OUTPUT_TAIL: usize = 4096;
 /// says so where they would have been.
 const REPLAN_GATE_BUDGET: usize = GATE_OUTPUT_TAIL * crate::config::MAX_ITEMS_CEILING;
 
+/// Credit only after the item's verdict write.
+///
+/// `credit_item` reads that verdict back from the row, so a write that failed credits nothing and
+/// the tick's sweep can retry after the durable state is final.
+async fn credit_the_briefing(pool: &SqlitePool, job: &JobRow, ordinal: usize) {
+    if let Err(error) = crate::brief::credit_item(pool, job.id, ordinal as i64).await {
+        tracing::warn!(job_id = job.id, ordinal, %error, "could not credit an item's briefing");
+    }
+}
+
 /// The last [`GATE_OUTPUT_TAIL`] bytes of a gate's output, cut where a character actually ends.
 ///
 /// The boundary walk is not defensive tidiness: slicing a `String` mid-character panics, and a gate
@@ -4617,6 +4688,7 @@ async fn record_gate(
             .bind(ordinal as i64)
             .execute(pool)
             .await;
+            credit_the_briefing(pool, job, ordinal).await;
             say(
                 pool,
                 job,
@@ -4647,6 +4719,7 @@ async fn record_gate(
         tracing::warn!(job_id = job.id, ordinal, %error, "could not record a gate verdict");
         return Step::Stopped;
     }
+    credit_the_briefing(pool, job, ordinal).await;
 
     if let Some(note) = note {
         say(
@@ -5541,6 +5614,15 @@ pub async fn job_tick(state: &AppState, now: DateTime<Utc>) {
         }
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "could not sweep orphaned concurrency slots"),
+    }
+
+    // The interval's first tick is the startup pass, so this heals a crash between a final verdict
+    // and its credit within one tick. It stays after the kill switch: an engaged switch defers the
+    // work without losing it because `credited_at` remains NULL.
+    match crate::brief::sweep(&state.pool).await {
+        Ok(0) => {}
+        Ok(credited) => tracing::debug!(credited, "credited briefings whose verdict is final"),
+        Err(error) => tracing::warn!(%error, "could not sweep uncredited briefings"),
     }
 
     // Before the jobs are driven, because the measurement is about the state the trees are in NOW
@@ -8032,6 +8114,77 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    async fn seed_active_knowledge(pool: &sqlx::SqlitePool, title: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'project', 'project-a', 'owner', 'memory', ?, 'body', 'active', ?)",
+        )
+        .bind(title)
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn seed_shown_item_trace(
+        pool: &sqlx::SqlitePool,
+        job_id: i64,
+        ordinal: i64,
+        run_id: i64,
+    ) -> i64 {
+        let knowledge_id = seed_active_knowledge(pool, "the cursor helper lives in ui").await;
+        let item_id: i64 =
+            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
+                .bind(job_id)
+                .bind(ordinal)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        crate::brief::record(
+            pool,
+            run_id,
+            Some(item_id),
+            &[crate::knowledge::Scored {
+                knowledge_id,
+                shown: true,
+                s_fts: 0.0,
+                s_scope: 0.0,
+                s_structure: 0.0,
+                s_recency: 0.0,
+                s_use: 0.0,
+                score: 0.0,
+            }],
+        )
+        .await
+        .unwrap();
+        knowledge_id
+    }
+
+    async fn knowledge_counts(pool: &sqlx::SqlitePool, knowledge_id: i64) -> (i64, i64, i64) {
+        sqlx::query_as("SELECT shown_count, outcome_count, green_count FROM knowledge WHERE id = ?")
+            .bind(knowledge_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn trace_credited_at(
+        pool: &sqlx::SqlitePool,
+        run_id: i64,
+        knowledge_id: i64,
+    ) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT credited_at FROM run_knowledge WHERE run_id = ? AND knowledge_id = ?",
+        )
+        .bind(run_id)
+        .bind(knowledge_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     /// Undoing a skipped node happens in the tree that node wrote in, and nowhere else.
@@ -12963,6 +13116,184 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retried_item_that_fails_without_a_gate_is_judged_by_its_run_before_and_after_a_replan()
+     {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-retryverdict-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+
+        let job_id = seed_job_in(
+            &pool,
+            "project-a",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner)
+            .await
+            .expect("provision the job's worktree");
+        crate::worktree::record(
+            &pool,
+            owner,
+            "project-a",
+            &repo.to_string_lossy(),
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the job's worktree");
+        sqlx::query("UPDATE jobs SET gate_retries = 1 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_items(&pool, job_id, &["gate_failed"]).await;
+        sqlx::query(
+            "UPDATE job_items SET gate_status = 'failed', gate_attempts = 1
+             WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        let (status, gate_status, run_id): (String, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT status, gate_status, run_id FROM job_items
+                 WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "running");
+        assert_eq!(
+            gate_status, None,
+            "the old attempt's gate was still attached"
+        );
+        let run_id = run_id.expect("the retried item has a node of its own attached to it");
+
+        sqlx::query("UPDATE runs SET status = 'interrupted', exit_code = NULL WHERE id = ?")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert!(matches!(
+            reconcile_nodes(&state, &job).await.unwrap(),
+            Reconciled::KeepGoing
+        ));
+        assert_eq!(item_statuses(&pool, job_id).await, vec!["failed"]);
+
+        let (status, gate_status, gate_attempts): (String, Option<String>, i64) = sqlx::query_as(
+            "SELECT status, gate_status, gate_attempts FROM job_items
+                 WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let gate_retries: i64 = sqlx::query_scalar("SELECT gate_retries FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let (run_status, exit_code): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, exit_code FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let run = Some((run_status.as_str(), exit_code));
+
+        assert_eq!(
+            crate::brief::item_verdict(
+                item_state_from(&status, gate_attempts, gate_retries),
+                gate_status.as_deref(),
+                false,
+                run,
+            ),
+            Some(crate::brief::Verdict::NoOutcome)
+        );
+        assert_eq!(
+            crate::brief::item_verdict(
+                item_state_from(STATUS_SUPERSEDED, gate_attempts, gate_retries),
+                gate_status.as_deref(),
+                false,
+                run,
+            ),
+            Some(crate::brief::Verdict::NoOutcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_released_retry_claim_keeps_its_red_gate() {
+        let pool = test_pool().await;
+        let retry_job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, retry_job_id, &["running"]).await;
+        sqlx::query(
+            "UPDATE job_items SET gate_status = NULL, gate_attempts = 1
+             WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(retry_job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let retry_job = load_job(&pool, retry_job_id).await.unwrap();
+
+        release_item(
+            &pool,
+            &retry_job,
+            Some(ItemClaim {
+                ordinal: 0,
+                held: "gate_failed",
+            }),
+        )
+        .await;
+
+        let retry: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, gate_status FROM job_items WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(retry_job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retry, ("gate_failed".into(), Some("failed".into())));
+
+        let pending_job_id = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        seed_items(&pool, pending_job_id, &["running"]).await;
+        let pending_job = load_job(&pool, pending_job_id).await.unwrap();
+
+        release_item(
+            &pool,
+            &pending_job,
+            Some(ItemClaim {
+                ordinal: 0,
+                held: "pending",
+            }),
+        )
+        .await;
+
+        let pending: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, gate_status FROM job_items WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(pending_job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, ("pending".into(), None));
+    }
+
     /// Out of retries, the tree still governs, and nothing about that branch has moved.
     ///
     /// `gate_retries = 0` is every job written before migration 0068, so this is the regression the
@@ -13016,6 +13347,131 @@ mod tests {
             attempts, 1,
             "the red gate happened, and it is counted whether or not it bought anything"
         );
+    }
+
+    #[tokio::test]
+    async fn the_last_red_gate_of_an_item_credits_its_briefing_and_a_retriable_one_does_not() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        sqlx::query("UPDATE jobs SET gate_retries = 1 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_items(&pool, job_id, &["implemented"]).await;
+        let run_id = seed_node(&pool, job_id, "implement", "completed").await;
+        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = 0")
+            .bind(run_id)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let knowledge_id = seed_shown_item_trace(&pool, job_id, 0, run_id).await;
+        let job = load_job(&pool, job_id).await.unwrap();
+
+        record_gate(
+            &state,
+            &job,
+            0,
+            crate::gate::GateOutcome::Failed {
+                exit_code: 1,
+                output: "red".into(),
+            },
+        )
+        .await;
+
+        assert_eq!(knowledge_counts(&pool, knowledge_id).await, (0, 0, 0));
+        assert_eq!(trace_credited_at(&pool, run_id, knowledge_id).await, None);
+
+        record_gate(
+            &state,
+            &job,
+            0,
+            crate::gate::GateOutcome::Failed {
+                exit_code: 1,
+                output: "red".into(),
+            },
+        )
+        .await;
+
+        assert_eq!(knowledge_counts(&pool, knowledge_id).await, (1, 1, 0));
+        assert!(
+            trace_credited_at(&pool, run_id, knowledge_id)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_green_gate_credits_the_items_briefing_green() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["implemented"]).await;
+        let run_id = seed_node(&pool, job_id, "implement", "completed").await;
+        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = 0")
+            .bind(run_id)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let knowledge_id = seed_shown_item_trace(&pool, job_id, 0, run_id).await;
+        let job = load_job(&pool, job_id).await.unwrap();
+
+        record_gate(&state, &job, 0, crate::gate::GateOutcome::Passed).await;
+
+        assert_eq!(knowledge_counts(&pool, knowledge_id).await, (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn an_item_passed_without_a_gate_is_credited_by_its_run() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        sqlx::query("UPDATE jobs SET gate_each = 0 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_items(&pool, job_id, &["implemented", "implemented"]).await;
+        let run_id = seed_node(&pool, job_id, "implement", "completed").await;
+        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = 0")
+            .bind(run_id)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let knowledge_id = seed_shown_item_trace(&pool, job_id, 0, run_id).await;
+        let job = load_job(&pool, job_id).await.unwrap();
+
+        gate_item(&state, &job, 0, 2).await;
+
+        assert_eq!(knowledge_counts(&pool, knowledge_id).await, (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn the_job_tick_credits_what_a_crash_left_uncredited() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "gate_failed").await.unwrap();
+        seed_items(&pool, job_id, &["gate_failed"]).await;
+        let run_id = seed_node(&pool, job_id, "implement", "completed").await;
+        sqlx::query(
+            "UPDATE job_items
+                SET run_id = ?, gate_status = 'failed', gate_attempts = 1
+              WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(run_id)
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let knowledge_id = seed_shown_item_trace(&pool, job_id, 0, run_id).await;
+
+        job_tick(&state, Utc::now()).await;
+
+        assert_eq!(knowledge_counts(&pool, knowledge_id).await, (1, 1, 0));
     }
 
     /// `gate_after_each_item: false` buys back the intermediate suite runs. The final gate runs
@@ -13710,6 +14166,82 @@ mod tests {
     /// pass whether or not the item's brief survived.
     const A_NOTE: &str = "when you get to item 3, update the docs too";
     const AN_ITEM: &str = "rename the cursor helper";
+
+    /// Drives the production briefing seam through run creation and the item-keyed trace write.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_leaves_the_trace_of_its_briefing_once_its_run_exists() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-brief-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+
+        let job_id = seed_job_in(
+            &pool,
+            "project-a",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner)
+            .await
+            .expect("provision the job's worktree");
+        crate::worktree::record(
+            &pool,
+            owner,
+            "project-a",
+            &repo.to_string_lossy(),
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the job's worktree");
+        seed_items(&pool, job_id, &["pending"]).await;
+        sqlx::query("UPDATE job_items SET description = ? WHERE job_id = ? AND ordinal = 0")
+            .bind(AN_ITEM)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_active_knowledge(&pool, "the cursor helper lives in ui").await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        let (item_id, run_id): (i64, Option<i64>) =
+            sqlx::query_as("SELECT id, run_id FROM job_items WHERE job_id = ? AND ordinal = 0")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let run_id = run_id.expect("the item's node started, so its briefing has a run to name");
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(prompt.contains("the cursor helper lives in ui"));
+
+        let trace: Vec<(bool, Option<i64>, f64, Option<String>)> = sqlx::query_as(
+            "SELECT shown, item_id, s_fts, credited_at
+               FROM run_knowledge
+              WHERE run_id = ?",
+        )
+        .bind(run_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(trace.len(), 1);
+        assert!(trace[0].0);
+        assert_eq!(trace[0].1, Some(item_id));
+        assert!(trace[0].2 > 0.0);
+        assert_eq!(trace[0].3, None);
+    }
 
     /// The one seam a job's words have to cross, driven end to end.
     ///

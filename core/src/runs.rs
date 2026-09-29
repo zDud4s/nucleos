@@ -1933,6 +1933,13 @@ fn spawn_run(
                         .await;
                     }
 
+                    // A handed-off run starts a chain that is still live, so sweep only after the
+                    // handoff has had the chance to link its successor. The verdict reader leaves
+                    // that chain for a later terminal pass.
+                    if terminal_write_won && let Err(error) = crate::brief::sweep(&pool).await {
+                        tracing::warn!(%error, run_id = id, "briefing credit not recorded");
+                    }
+
                     // Judged from the row the terminal write just put there, so it is gated on the
                     // same CAS: losing the race means the numbers in `runs` belong to whoever won,
                     // and reading them here would count another attempt's spending as this one's.
@@ -4154,11 +4161,12 @@ pub async fn prune_transcripts(
 /// otherwise never reach a sweep at all — the lesson `triage::run_triage_loop` already learned.
 const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Retention for everything finished work leaves behind: a run's transcript, its events, its
-/// entries in the activity feed, and the councils that are over.
+/// Retention for everything finished work leaves behind: a run's transcript and events, its
+/// entries in the activity feed, councils that are over, queued VCS output tails, and briefing
+/// traces.
 ///
-/// One loop rather than four, because they are the same sweep at different windows and splitting
-/// them would mean four tasks waking on the same hour to take the same write lock. Every failure
+/// One loop rather than five, because they are the same sweep at different windows and splitting
+/// them would mean five tasks waking on the same hour to take the same write lock. Every failure
 /// is best-effort and logged: a sweep that could not run is a fuller disk later, not a reason to
 /// take a daemon down now.
 pub async fn run_retention_loop(state: AppState) {
@@ -4199,6 +4207,16 @@ pub async fn run_retention_loop(state: AppState) {
             Ok(0) => {}
             Ok(pruned) => tracing::info!(pruned, "vcs: outputs past the retention window"),
             Err(error) => tracing::warn!(%error, "vcs: retention sweep failed"),
+        }
+        match crate::brief::prune(&state.pool, crate::brief::retention_days(), now).await {
+            Ok(0) => {}
+            Ok(pruned) => {
+                tracing::info!(
+                    pruned,
+                    "knowledge: briefing traces past the retention window"
+                )
+            }
+            Err(error) => tracing::warn!(%error, "knowledge: trace retention sweep failed"),
         }
     }
 }
