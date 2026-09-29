@@ -284,6 +284,23 @@ pub struct Context {
     pub gate: Option<String>,
 }
 
+impl Context {
+    /// Every context outside a job inherits only this chain (spec sections 3.4 and 6).
+    pub fn for_project(project_id: Option<&str>) -> Self {
+        let mut chain = vec![Scope::Machine];
+        if let Some(project_id) = project_id {
+            chain.push(Scope::Project(project_id.to_owned()));
+        }
+        Self {
+            chain,
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        }
+    }
+}
+
 /// The room, and the three numbers that decide how it is spent.
 pub struct Budget {
     pub render_chars: usize,

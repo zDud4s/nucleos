@@ -217,6 +217,23 @@ pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Resu
     Ok(knowledge::select(&known, context, &Budget::default()))
 }
 
+/// A layer that cannot be read is a reason to say so, never a reason to refuse to start the node.
+/// Every context outside `spawn_node` reads through this one best-effort helper.
+pub async fn for_prompt(
+    pool: &SqlitePool,
+    context: &Context,
+    query: &str,
+    site: &'static str,
+) -> Option<Brief> {
+    match of(pool, context, query).await {
+        Ok(briefing) => Some(briefing),
+        Err(error) => {
+            tracing::warn!(site, %error, "could not read what is known; continuing without it");
+            None
+        }
+    }
+}
+
 /// Persist every candidate, shown or not, so the trace answers why a row lost.
 ///
 /// The timestamp is RFC 3339 because `knowledge::recency` parses that format and treats anything
