@@ -1791,6 +1791,20 @@ impl Driver {
         prompt: String,
         with_tools: bool,
     ) -> SeatOutcome {
+        // Section 6 gives council seats machine knowledge only. Append it to the prompt because
+        // state.runner may be Codex, and leave no trace because a seat is not an outcome (D15).
+        let prompt = match crate::brief::for_prompt(
+            &self.state.pool,
+            &crate::knowledge::Context::for_project(None),
+            &prompt,
+            "council",
+        )
+        .await
+        .and_then(|briefing| briefing.block)
+        {
+            Some(block) => format!("{prompt}{block}"),
+            None => prompt,
+        };
         let request = crate::runner::RunRequest {
             prompt,
             // The council's OWN key, never `state.token`. `auth::COUNCIL_ROUTES` is what it reaches.
@@ -3811,6 +3825,47 @@ mod tests {
 
     fn is_synthesis(prompt: &str) -> bool {
         prompt.contains("Synthesize one final chairman answer")
+    }
+
+    #[tokio::test]
+    async fn a_cloud_seat_is_told_what_the_house_knows_and_leaves_no_trace() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("the first answer".into()),
+            Scripted::Answers("the second answer".into()),
+        ]
+        .into();
+        *runner.stage2.lock().unwrap() = [
+            Scripted::Answers("A: 1".into()),
+            Scripted::Answers("A: 1".into()),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(roster(2))).await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'machine', NULL, 'owner', 'memory',
+                     'zanzibar house rule', 'body', 'active',
+                     '2026-08-19T00:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let id = start(&state, "zanzibar?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+
+        assert_eq!(row.status, STATUS_DONE);
+        assert!(
+            prompts(&runner)
+                .iter()
+                .all(|prompt| prompt.contains("zanzibar house rule"))
+        );
+        let traces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_knowledge")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(traces, 0);
     }
 
     /// The non-regression test, and the most important one in this file: `rounds: 1` is what ships,
