@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 17;
+pub const CLASSIFIER_VERSION: u32 = 18;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -22,7 +22,27 @@ pub const CLASSIFIER_VERSION: u32 = 17;
 /// this file's own changes were written under.
 ///
 /// `TodoWrite` writes the agent's task list, which lives in the session and not in the project.
-const READ_LOCAL_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Skill", "TodoWrite"];
+///
+/// `ToolSearch`, `ScheduleWakeup` and the `Task*` list tools joined on the judge spec's D13
+/// (2026-09-26-autopilot-modo-juiz-design.md). They are this same kind of thing: `ToolSearch`
+/// loads a tool's schema into the session (the tool itself still arrives here as its own call),
+/// `ScheduleWakeup` asks the CLI to resume the session later, and `TaskCreate`/`TaskUpdate`/
+/// `TaskList`/`TaskGet` are the CLI's newer spelling of `TodoWrite`'s list. Measured on the
+/// daemon's own ledger: 32 parked tool calls across 269 worktree runs, and in the last 30 days
+/// `ToolSearch` and `ScheduleWakeup` were the only tools still parking autonomous work.
+const READ_LOCAL_TOOLS: &[&str] = &[
+    "Read",
+    "Grep",
+    "Glob",
+    "Skill",
+    "TodoWrite",
+    "ToolSearch",
+    "ScheduleWakeup",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskList",
+    "TaskGet",
+];
 /// Tools that put bytes in a file the project keeps.
 ///
 /// **`NotebookEdit` joined this list on 2026-09-08, and it is a LOOSENING, deliberately.** Before
@@ -4782,7 +4802,10 @@ mod tests {
     /// agent writing its own is an agent onboarding itself — a tightening only. 17 adds the
     /// materialization record, `materialized.yaml`, and the per-worktree records under
     /// `materialized/`: rewriting one is how an agent would make the next materialization overwrite
-    /// a file a person edited — a tightening only.
+    /// a file a person edited — a tightening only. 18 (spec A D13, 2026-09-27) adds the agent's own
+    /// session tools — `ToolSearch`, `ScheduleWakeup`, `TaskCreate`/`TaskUpdate`/`TaskList`/
+    /// `TaskGet` — to `READ_LOCAL_TOOLS`: they change nothing outside the session, exactly like
+    /// `TodoWrite` beside them, and were parking autonomous runs.
     /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
@@ -4797,7 +4820,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 17);
+        assert_eq!(CLASSIFIER_VERSION, 18);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
@@ -5765,6 +5788,35 @@ mod tests {
         }
         for tool_name in ["Edit", "Write", "Read", "Agent", "NotebookEdit"] {
             assert!(!reads_github_policy(tool_name), "{tool_name}");
+        }
+    }
+
+    /// Spec A D13 (2026-09-26-autopilot-modo-juiz-design.md): the agent's own bookkeeping tools
+    /// change nothing outside the session, exactly like `TodoWrite` beside them, and parked
+    /// autonomous runs on 15 of the last 30 days' refusals. What is left in `unrecognized-tool`
+    /// after this is genuinely external.
+    #[test]
+    fn the_agents_own_bookkeeping_tools_are_local() {
+        for tool in [
+            "ToolSearch",
+            "ScheduleWakeup",
+            "TaskCreate",
+            "TaskUpdate",
+            "TaskList",
+            "TaskGet",
+        ] {
+            assert_classification(
+                classify(tool, &json!({}), Some(Path::new("C:/work/repo"))),
+                "allow",
+                "read-local",
+            );
+        }
+        for tool in ["WebFetch", "WebSearch", "mcp__github__create_issue"] {
+            assert_classification(
+                classify(tool, &json!({}), Some(Path::new("C:/work/repo"))),
+                "pending_approval",
+                "unrecognized-tool",
+            );
         }
     }
 }
