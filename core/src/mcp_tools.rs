@@ -339,6 +339,14 @@ struct DeclareRefinementParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct RecallParams {
+    /// Words to find in what the house or this run's project knows.
+    query: String,
+    /// Optionally narrow the answer to `semantic`, `episodic` or `procedural` knowledge.
+    layer: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ProposeActionParams {
     /// What to do: `send_email`, `file_document` or `calendar_event`.
     kind: String,
@@ -886,6 +894,21 @@ impl NucleosTools {
                 .declare_refinement(&kind, &title, &body, &reasoning)
                 .await,
         )
+    }
+
+    #[tool(
+        description = "Recall only what a person approved, plus measurements the daemon took \
+                       itself. Every answer says its source, how many times it was observed, and \
+                       its evidence, so a measurement can be told from an approved statement. \
+                       Scope is this run's project plus the house and cannot be named. It never \
+                       answers what this run or any run proposed, nor anything in the working \
+                       layer."
+    )]
+    async fn recall(
+        &self,
+        Parameters(RecallParams { query, layer }): Parameters<RecallParams>,
+    ) -> String {
+        json_result(self.client.recall(&query, layer.as_deref()).await)
     }
 
     #[tool(
@@ -1830,6 +1853,8 @@ pub const LOCAL_TOOLS: &[&str] = &[
     "list_projects",
     "list_proposals",
     "list_teams",
+    // A chat that can teach the layer can also ask what people approved into it.
+    "recall",
     "vcs_ticket",
 ];
 
@@ -2235,6 +2260,7 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // ours would build the exact laundry chute a department needs least: untrusted text in one end,
     // a file the core wrote out the other, and authority to act on the day that authority exists.
     ("read_team_file", ToolEffect::ReadsUntrusted),
+    ("recall", ToolEffect::ReadsOwn),
     ("reject_proposal", ToolEffect::Acts),
     // `Acts`, and this one is the barrier itself rather than a label on it. Every other tool on
     // this table is classified so that `permitted_after_untrusted` can decide whether to let it
@@ -2553,6 +2579,7 @@ impl crate::local_agent::ToolBox for LocalToolBox {
                     .declare_refinement(Parameters(parsed!(DeclareRefinementParams)))
                     .await
             }
+            "recall" => self.tools.recall(Parameters(parsed!(RecallParams))).await,
             "propose_action" => {
                 self.tools
                     .propose_action(Parameters(parsed!(ProposeActionParams)))
@@ -3564,6 +3591,7 @@ mod tests {
                 "propose_action",
                 "propose_teammate",
                 "read_team_file",
+                "recall",
                 "reject_proposal",
                 "report_to_owner",
                 // The pair a reader will want to tell apart, and they are next to each other by
@@ -3901,6 +3929,222 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    async fn recall_at_door(
+        pool: &SqlitePool,
+        run_id: Option<i64>,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/knowledge/recall")
+            .header("content-type", "application/json");
+        if let Some(run_id) = run_id {
+            request = request.header(crate::daemon_client::RUN_ID_HEADER, run_id.to_string());
+        }
+        let response = axum::Router::new()
+            .route(
+                "/knowledge/recall",
+                axum::routing::post(crate::http::recall_knowledge),
+            )
+            .with_state(declaration_test_state(pool.clone()))
+            .oneshot(
+                request
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+        });
+        (status, body)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_known(
+        pool: &SqlitePool,
+        layer: &str,
+        scope_kind: &str,
+        scope_id: Option<&str>,
+        source: &str,
+        status: &str,
+        title: &str,
+        evidence: Option<&str>,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, evidence, kind, title, body, status, created_at)
+             VALUES (?, ?, ?, ?, ?, 'memory', ?, 'body', ?, '2026-09-20T00:00:00Z')",
+        )
+        .bind(layer)
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(source)
+        .bind(evidence)
+        .bind(title)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// A run can ask what people approved, but cannot turn its own proposal into an answer.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_run_cannot_read_back_what_it_just_declared(pool: SqlitePool) {
+        let run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('nucleos', 'learn the rule', 'completed', 'real',
+                     '2026-09-20T00:00:00Z')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        declare_at_write_door(&pool, run_id, None, "zanzibar lesson the run declared").await;
+        seed_known(
+            &pool,
+            "semantic",
+            "project",
+            Some("nucleos"),
+            "owner",
+            "active",
+            "zanzibar rule a person approved",
+            None,
+        )
+        .await;
+
+        let (status, body) = recall_at_door(
+            &pool,
+            Some(run_id),
+            serde_json::json!({"query": "zanzibar"}),
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let answers = body.as_array().expect("recall answers with a list");
+        let titles: Vec<_> = answers
+            .iter()
+            .filter_map(|answer| answer["title"].as_str())
+            .collect();
+        assert_eq!(titles, ["zanzibar rule a person approved"]);
+        for key in ["source", "observations", "evidence"] {
+            assert!(answers[0].get(key).is_some(), "recall omitted {key}");
+        }
+    }
+
+    /// Working memory reaches a node only through its briefing, never through recall.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recall_does_not_answer_with_the_working_layer(pool: SqlitePool) {
+        let job_id: i64 = sqlx::query_scalar(
+            "INSERT INTO jobs
+               (project_id, project_root, status, max_items, gate_retries, created_at)
+             VALUES ('nucleos', 'C:/tmp', 'implementing', 1, 0, '2026-09-20T00:00:00Z')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (project_id, job_id, prompt, status, mode, created_at)
+             VALUES ('nucleos', ?, 'learn the rule', 'completed', 'real',
+                     '2026-09-20T00:00:00Z')
+             RETURNING id",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let evidence = serde_json::json!([{"t": "run", "id": run_id}]).to_string();
+        let job_scope = job_id.to_string();
+        seed_known(
+            &pool,
+            "working",
+            "job",
+            Some(&job_scope),
+            "run",
+            "live",
+            "zanzibar working fact",
+            Some(&evidence),
+        )
+        .await;
+        seed_known(
+            &pool,
+            "working",
+            "project",
+            Some("nucleos"),
+            "owner",
+            "active",
+            "zanzibar active working row",
+            None,
+        )
+        .await;
+        seed_known(
+            &pool,
+            "semantic",
+            "project",
+            Some("nucleos"),
+            "owner",
+            "active",
+            "zanzibar rule a person approved",
+            None,
+        )
+        .await;
+
+        let (status, body) = recall_at_door(
+            &pool,
+            Some(run_id),
+            serde_json::json!({"query": "zanzibar"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let titles: Vec<_> = body
+            .as_array()
+            .expect("recall answers with a list")
+            .iter()
+            .filter_map(|answer| answer["title"].as_str())
+            .collect();
+        assert_eq!(titles, ["zanzibar rule a person approved"]);
+
+        let (status, body) = recall_at_door(
+            &pool,
+            Some(run_id),
+            serde_json::json!({"query": "zanzibar", "layer": "working"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(body.to_string().contains("briefing"), "{body}");
+    }
+
+    /// The scope comes from the server, exactly as an errand's does; the model cannot name it.
+    #[test]
+    fn the_recall_parameters_carry_no_scope() {
+        let tool = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "recall")
+            .expect("recall is registered");
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("recall publishes its parameters");
+        let mut names: Vec<_> = properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["layer", "query"]);
+        for name in names {
+            let lowered = name.to_lowercase();
+            for forbidden in ["project", "scope", "run", "job", "errand"] {
+                assert!(!lowered.contains(forbidden), "recall takes {name}");
+            }
+        }
     }
 
     /// The scope comes from the run and never from the body. The daemon knows the project from

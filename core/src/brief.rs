@@ -14,6 +14,24 @@ use crate::knowledge::{self, Brief, Budget, Context, Scope, Scored};
 /// Bound the query expression; `knowledge::MAX_READ` separately bounds candidates and rank reads.
 const MAX_QUERY_TERMS: usize = 64;
 
+/// The most knowledge rows one explicit recall returns.
+pub const RECALL_LIMIT: usize = 10;
+
+/// One approved answer returned by explicit recall.
+#[derive(serde::Serialize)]
+pub struct Recalled {
+    pub id: i64,
+    pub layer: String,
+    pub kind: String,
+    pub scope_kind: String,
+    pub scope_id: Option<String>,
+    pub source: String,
+    pub observations: Option<i64>,
+    pub evidence: Option<String>,
+    pub title: String,
+    pub body: String,
+}
+
 /// At the 30-second job tick, 64 units of each kind is 7,680 per hour, well above the rate at
 /// which CLI-backed items and runs can finish. Each unit touches at most `knowledge::MAX_READ`
 /// trace rows, so one pass also has a fixed counter-write ceiling.
@@ -121,6 +139,54 @@ async fn fts_ranks(
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().collect())
+}
+
+/// Recall only D12-approved (`active`) knowledge in the daemon-selected scope.
+///
+/// `live` rows arrive ONLY through the automatic briefing, with a floor of one item in the last
+/// scope group, so if node 1 leaves five facts, node 2 is guaranteed one and may not see the
+/// others. That is deliberate. Errors propagate here because the HTTP handler decides how they are
+/// reported.
+pub async fn recall(
+    pool: &SqlitePool,
+    scope: &Scope,
+    query: &str,
+    layer: Option<knowledge::Layer>,
+) -> sqlx::Result<Vec<Recalled>> {
+    let Some(expression) = match_expression(query) else {
+        return Ok(Vec::new());
+    };
+    let mut known = knowledge::for_scope(pool, scope).await?;
+    known.retain(|row| {
+        row.layer != knowledge::Layer::Working.as_str()
+            && layer.is_none_or(|layer| row.layer == layer.as_str())
+            && knowledge::approved(row)
+    });
+    let candidate_ids: Vec<i64> = known.iter().map(|row| row.id).collect();
+    let ranks = fts_ranks(pool, &expression, &candidate_ids).await?;
+    known.retain(|row| ranks.contains_key(&row.id));
+    known.sort_by(|left, right| {
+        ranks[&left.id]
+            .total_cmp(&ranks[&right.id])
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    Ok(known
+        .into_iter()
+        .take(RECALL_LIMIT)
+        .map(|row| Recalled {
+            id: row.id,
+            layer: row.layer,
+            kind: row.kind,
+            scope_kind: row.scope_kind,
+            scope_id: row.scope_id,
+            source: row.source,
+            observations: row.observations,
+            evidence: row.evidence,
+            title: row.title,
+            body: row.body,
+        })
+        .collect())
 }
 
 /// Fetch the context's candidates, add their query-local FTS signal, and select without writing.
