@@ -2409,6 +2409,51 @@ mod tests {
         }
     }
 
+    /// Placing a workflow's files is the owner's: the POSTs write files that govern what every
+    /// agent in the project does — skills, cockpits, the pipeline itself — and the preview GET names
+    /// them with their hashes. Safe today by being in no table, and this says no to filing the GET
+    /// beside the `/projects/{id}/…` reads or the sync beside `/vcs/land`, which a run may call.
+    #[test]
+    fn placing_a_workflows_files_is_in_no_scope_table() {
+        for (method, route, concrete) in [
+            (
+                Method::GET,
+                "/projects/{id}/workflows/{name}/materialize",
+                "/projects/7/workflows/dev/materialize",
+            ),
+            (
+                Method::POST,
+                "/projects/{id}/workflows/{name}/materialize",
+                "/projects/7/workflows/dev/materialize",
+            ),
+            (Method::POST, "/workflows/sync", "/workflows/sync"),
+        ] {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, &method, route)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &method, route)
+                    && !route_is_listed(TEAM_ROUTES, &method, route)
+                    && !route_is_listed(EMAIL_ROUTES, &method, route)
+                    && !route_is_listed(COUNCIL_ROUTES, &method, route),
+                "{method} {route} must stay out of every scope table"
+            );
+            for scope in [
+                Scope::Run(7),
+                Scope::ApiToken(ApiTokenLevel::ReadOnly),
+                Scope::ApiToken(ApiTokenLevel::RunCreating),
+            ] {
+                assert!(
+                    !permits(&scope, &method, concrete),
+                    "{scope:?} must not reach {method} {route}"
+                );
+            }
+            assert!(permits(
+                &Scope::ApiToken(ApiTokenLevel::Admin),
+                &method,
+                concrete
+            ));
+        }
+    }
+
     /// A project's commands are the owner's, to read and to run.
     ///
     /// The run route spawns a process of the project's own choosing, which is plainly not a read.

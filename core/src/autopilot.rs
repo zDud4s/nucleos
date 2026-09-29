@@ -345,7 +345,7 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
 
 /// The hook script that makes a project's tool calls reach this daemon. Written with forward
 /// slashes because it is compared against a JSON command string, where that is the spelling.
-const HOOK_SCRIPT: &str = ".claude/hooks/ask_daemon.py";
+pub(crate) const HOOK_SCRIPT: &str = ".claude/hooks/ask_daemon.py";
 
 /// This daemon's classifier hook, carried inside the binary so it can be installed anywhere.
 ///

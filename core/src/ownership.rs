@@ -277,6 +277,11 @@ pub(crate) fn normalise(rel: &str) -> Option<String> {
 
 /// Who owns `rel` in this project.
 ///
+/// A workflow's row may name a DIRECTORY — `owns: [.ai/workflow/]` provides every file under it
+/// (`workflow_materialize.rs`) — so a project row also answers for the paths beneath it. Only a
+/// project row: the núcleo's own rows are single files in the state directory, and a path under
+/// one of them is not a question with an answer.
+///
 /// Pure, and takes the table as an argument rather than reading `CLAIMS` directly, because the
 /// table is about to grow a per-project half: a workflow installed into a project declares the
 /// files it owns, and that arrives from the database. Passing it in is what keeps this function —
@@ -285,9 +290,19 @@ pub fn owner_of<'a>(claims: &'a [Claim], rel: &str) -> Owner<'a> {
     let Some(path) = normalise(rel) else {
         return Owner::Repository;
     };
+    // Exact first, so a file a workflow names by itself answers with that row even when a
+    // directory row of another workflow also covers it.
     claims
         .iter()
         .find(|claim| claim.path.as_ref() == path.as_str())
+        .or_else(|| {
+            claims.iter().find(|claim| {
+                claim.home == Home::Project
+                    && path
+                        .strip_prefix(claim.path.as_ref())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
         .map_or(Owner::Repository, Owner::Declared)
 }
 
@@ -546,6 +561,44 @@ mod tests {
             panic!("the rules file must still be declared");
         };
         assert!(rules.validate.is_some());
+    }
+
+    /// A directory a workflow owns answers for every file beneath it, and for nothing beside it.
+    #[test]
+    fn a_directory_a_workflow_owns_covers_the_files_under_it() {
+        let mut claims = CLAIMS.to_vec();
+        claims.push(Claim {
+            path: std::borrow::Cow::Borrowed(".ai/workflow"),
+            home: Home::Project,
+            owner: std::borrow::Cow::Borrowed("dev"),
+            what: std::borrow::Cow::Borrowed("the dev workflow's"),
+            validate: None,
+        });
+        for path in [
+            ".ai/workflow/workflow.md",
+            "./.ai/workflow/x/y.md",
+            ".ai/workflow",
+        ] {
+            assert!(
+                matches!(owner_of(&claims, path), Owner::Declared(claim) if claim.owner == "dev"),
+                "{path}"
+            );
+        }
+        for path in [
+            ".ai/workflowx.md",
+            ".ai/workflows/dev/a.md",
+            ".ai/memory.md",
+        ] {
+            assert!(
+                matches!(owner_of(&claims, path), Owner::Repository),
+                "{path}"
+            );
+        }
+        // A state row is never a directory: nothing lives under the rules file.
+        assert!(matches!(
+            owner_of(&claims, "autopilot.yaml/x"),
+            Owner::Repository
+        ));
     }
 
     /// A bundle cannot take the file that decides what green means.

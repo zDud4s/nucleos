@@ -114,6 +114,8 @@ mod web_client;
 mod webhook;
 mod wip;
 mod workflow_graph;
+mod workflow_materialize;
+mod workflow_package;
 mod workflows;
 mod worktree;
 
@@ -483,6 +485,59 @@ fn land_target_from(args: &[String]) -> Option<String> {
         .cloned()
 }
 
+/// The checkout `--workflow-sync` names: the argument after the flag, or the working directory.
+/// Absolute either way, because the daemon resolving it runs somewhere else.
+fn workflow_sync_target(args: &[String]) -> Result<String, String> {
+    let at = args
+        .iter()
+        .position(|arg| arg == "--workflow-sync")
+        .ok_or("--workflow-sync was not given")?;
+    let named = args
+        .get(at + 1)
+        .filter(|value| !value.starts_with("--"))
+        .map(std::path::PathBuf::from);
+    let path = match named {
+        Some(path) => path,
+        None => std::env::current_dir().map_err(|error| error.to_string())?,
+    };
+    std::path::absolute(&path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// `--workflow-package <name> <version> --from <project> --manifest <bundle.yaml>`, all required.
+/// Refused as a usage line rather than guessed: packaging writes a version that is never
+/// rewritten, so a default that picked the wrong folder would be permanent.
+fn workflow_package_args(
+    args: &[String],
+) -> Result<(String, String, std::path::PathBuf, std::path::PathBuf), String> {
+    const USAGE: &str = "usage: nucleos-core --workflow-package <name> <version> --from <project root> --manifest <bundle.yaml>";
+    let at = args
+        .iter()
+        .position(|arg| arg == "--workflow-package")
+        .ok_or(USAGE)?;
+    let positional = |offset: usize| {
+        args.get(at + offset)
+            .filter(|value| !value.starts_with("--"))
+            .cloned()
+            .ok_or(USAGE)
+    };
+    let value_of = |flag: &str| {
+        args.iter()
+            .position(|arg| arg == flag)
+            .and_then(|index| args.get(index + 1))
+            .filter(|value| !value.starts_with("--"))
+            .map(std::path::PathBuf::from)
+            .ok_or(USAGE)
+    };
+    Ok((
+        positional(1)?,
+        positional(2)?,
+        value_of("--from")?,
+        value_of("--manifest")?,
+    ))
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--print-token") {
@@ -752,6 +807,93 @@ async fn main() {
         if let Err(e) = mcp_tools::run_stdio(served).await {
             eprintln!("mcp-tools failed: {e}");
             std::process::exit(1);
+        }
+        return;
+    }
+
+    // `nucleos-core --workflow-sync [<checkout>]`: put the project's pinned workflows into a
+    // worktree made by hand. A thin client, for `--land`'s reason: which project the checkout
+    // belongs to is answered from the roster, and the roster is the running daemon's database. The
+    // daemon also holds the kill switch this write must respect.
+    if std::env::args().any(|a| a == "--workflow-sync") {
+        let args: Vec<String> = std::env::args().collect();
+        let path = match workflow_sync_target(&args) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        };
+        let token = match secrets::load_secret(TOKEN_KEY) {
+            Ok(Some(token)) => token,
+            _ => {
+                eprintln!("no daemon token stored yet — start the daemon once to generate one");
+                std::process::exit(1);
+            }
+        };
+        let response = reqwest::Client::new()
+            .post(format!("{}/workflows/sync", daemon_client::daemon_url()))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "path": path }))
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    eprintln!("the daemon refused: {text}");
+                    std::process::exit(1);
+                }
+                println!("{text}");
+            }
+            Err(error) => {
+                eprintln!("the daemon is not reachable: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // `nucleos-core --workflow-package <name> <version> --from <project> --manifest <bundle.yaml>`:
+    // copy a workflow out of a project into the library as a new version, and commit it there.
+    //
+    // No daemon: this reads a folder and writes `~/.nucleos/workflows/`, and neither is the
+    // database. A library a running daemon lists mid-copy sees no manifest yet, which it already
+    // treats as somebody's scratch folder (`workflows::read_bundle`), until the manifest is written
+    // last.
+    if std::env::args().any(|a| a == "--workflow-package") {
+        let args: Vec<String> = std::env::args().collect();
+        let (name, version, from, manifest) = match workflow_package_args(&args) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        };
+        let Some(library) = workflows::library_root() else {
+            eprintln!("this machine has no home directory, so it has no workflow library");
+            std::process::exit(1);
+        };
+        match workflow_package::package(&library, &name, &version, &from, &manifest).await {
+            Ok(packaged) => {
+                println!(
+                    "{name}@{version}: {} files into {} ({})",
+                    packaged.files,
+                    packaged.dir.display(),
+                    packaged.hash
+                );
+                match packaged.commit {
+                    Ok(commit) => println!("recorded in the library's history as {commit}"),
+                    Err(why) => {
+                        eprintln!("packaged, but not recorded in the library's history: {why}")
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -2045,5 +2187,45 @@ mod tests {
             " --verbose".to_owned(),
         ];
         assert_eq!(land_target_from(&args), None);
+    }
+
+    fn words(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_owned).collect()
+    }
+
+    /// Every part of a packaging request is required: a version is written once, so a guessed
+    /// folder or manifest would be a permanent mistake.
+    #[test]
+    fn packaging_needs_every_argument_and_takes_them_in_any_flag_order() {
+        let parsed = workflow_package_args(&words(
+            "nucleos-core --workflow-package dev 1.0.0 --manifest m.yaml --from /p",
+        ))
+        .unwrap();
+        assert_eq!(parsed.0, "dev");
+        assert_eq!(parsed.1, "1.0.0");
+        assert_eq!(parsed.2, std::path::PathBuf::from("/p"));
+        assert_eq!(parsed.3, std::path::PathBuf::from("m.yaml"));
+
+        for line in [
+            "nucleos-core --workflow-package dev --from /p --manifest m.yaml",
+            "nucleos-core --workflow-package dev 1.0.0 --from /p",
+            "nucleos-core --workflow-package dev 1.0.0 --from --manifest m.yaml",
+        ] {
+            assert!(workflow_package_args(&words(line)).is_err(), "{line}");
+        }
+    }
+
+    /// A named checkout is sent as given, made absolute; no name means the working directory.
+    #[test]
+    fn workflow_sync_names_the_argument_or_the_working_directory() {
+        let named = workflow_sync_target(&words("nucleos-core --workflow-sync some/tree")).unwrap();
+        assert!(std::path::Path::new(&named).is_absolute());
+        assert!(named.replace('\\', "/").ends_with("some/tree"));
+
+        let bare = workflow_sync_target(&words("nucleos-core --workflow-sync")).unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(bare),
+            std::path::absolute(std::env::current_dir().unwrap()).unwrap()
+        );
     }
 }

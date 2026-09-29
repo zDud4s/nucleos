@@ -343,6 +343,11 @@ pub fn build_router(state: AppState) -> Router {
         // ever writes into the library, and that asymmetry is §6.3's second exit staying honest:
         // "edit it in the library" means the editor, not a form in this app.
         .route("/workflows/library", get(get_workflow_library))
+        // `nucleos-core --workflow-sync <path>`: materialize a project's pinned workflows into a
+        // worktree somebody made by hand. House-wide rather than under a project because the
+        // caller does not know which project the path belongs to — the daemon finds out, from the
+        // repository the worktree shares with a rostered root. In no scope table: it writes.
+        .route("/workflows/sync", post(post_workflow_sync))
         .route(
             "/projects/{id}/workflows",
             get(get_project_workflows).post(post_project_workflow),
@@ -362,6 +367,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/projects/{id}/workflows/{name}/diff",
             get(get_project_workflow_diff),
+        )
+        // Put the pinned bundle's files where agents read them (`workflow_materialize.rs`). The GET
+        // is the same computation with nothing written — which files would be written, replaced,
+        // adopted, removed, and which are left alone because somebody edited them. Both in no scope
+        // table: the POST writes files that govern what an agent does, and the GET names them.
+        .route(
+            "/projects/{id}/workflows/{name}/materialize",
+            get(get_project_workflow_materialize).post(post_project_workflow_materialize),
         )
         .route(
             "/projects/{id}/workflows/{name}/graph",
@@ -8341,13 +8354,15 @@ async fn post_project_workflow(
     Path(id): Path<String>,
     Json(body): Json<InstallRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (_, pins, library) = workflow_write_root(&state, &id).await?;
+    let (root, pins, library) = workflow_write_root(&state, &id).await?;
+    let record = materialized_record(&state, &id)?;
     let project_id = id.clone();
 
-    let installed = tokio::task::spawn_blocking(move || {
+    let (installed, placed) = tokio::task::spawn_blocking(move || {
         let bundle = bundle_or_refusal(&library, &body.name, Some(&body.version))?;
         crate::workflows::install(&pins, &bundle)?;
-        Ok::<_, crate::workflows::Refused>(bundle)
+        let placed = materialize_after_pin(&root, &pins, &library, &record, &bundle.name);
+        Ok::<_, crate::workflows::Refused>((bundle, placed))
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
@@ -8357,12 +8372,59 @@ async fn post_project_workflow(
         &state,
         &project_id,
         &format!(
-            "{}@{} installed from the app",
+            "{}@{} installed from the app{placed}",
             installed.name, installed.version
         ),
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// This project's materialization record, `~/.nucleos/projects/<id>/materialized.yaml`.
+fn materialized_record(
+    state: &AppState,
+    id: &str,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    Ok(project_state_dir(state, id)?.join(crate::project_state::MATERIALIZED_FILE))
+}
+
+/// Put a just-pinned workflow's files into the project, and say in a few words what happened.
+///
+/// **After the pin, and never undoing it.** The pin is the decision a person made; placing the
+/// files is its consequence, and a file that could not be placed — or one left alone because it
+/// was edited — is something to be told about, not a reason to take the decision back. The answer
+/// is the tail of the feed line, and `GET .../materialize` shows the whole report.
+fn materialize_after_pin(
+    root: &std::path::Path,
+    pins: &std::path::Path,
+    library: &std::path::Path,
+    record: &std::path::Path,
+    name: &str,
+) -> String {
+    use crate::workflow_materialize as materialize;
+    match materialize::sync(
+        root,
+        pins,
+        library,
+        record,
+        Some(name),
+        materialize::Mode::Apply,
+    ) {
+        Ok(outcomes) => outcomes
+            .into_iter()
+            .find_map(|outcome| match (outcome.report, outcome.error) {
+                (_, Some(error)) => Some(format!("; its files could not all be placed: {error}")),
+                (Some(report), None) if !report.is_empty() => {
+                    Some(format!("; files — {}", report.summary()))
+                }
+                _ => None,
+            })
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(%error, workflow = name, "a workflow was pinned and its files were not placed");
+            format!("; its files were not placed: {error}")
+        }
+    }
 }
 
 /// Stop using a workflow. Never deletes an ejected copy — see `workflows::uninstall`.
@@ -8440,13 +8502,15 @@ async fn post_project_workflow_update(
     Json(body): Json<UpdateRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let (root, pins, library) = workflow_write_root(&state, &id).await?;
+    let record = materialized_record(&state, &id)?;
     let now = chrono::Utc::now();
     let project_id = id.clone();
 
-    let bundle = tokio::task::spawn_blocking(move || {
+    let (bundle, placed) = tokio::task::spawn_blocking(move || {
         let bundle = bundle_or_refusal(&library, &name, body.version.as_deref())?;
         crate::workflows::update(&root, &pins, &bundle, now)?;
-        Ok::<_, crate::workflows::Refused>(bundle)
+        let placed = materialize_after_pin(&root, &pins, &library, &record, &bundle.name);
+        Ok::<_, crate::workflows::Refused>((bundle, placed))
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
@@ -8455,7 +8519,10 @@ async fn post_project_workflow_update(
     workflow_feed(
         &state,
         &project_id,
-        &format!("{}@{} taken from the library", bundle.name, bundle.version),
+        &format!(
+            "{}@{} taken from the library{placed}",
+            bundle.name, bundle.version
+        ),
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
@@ -8773,6 +8840,232 @@ async fn post_project_workflow_adopt(
 
     workflow_feed(&state, &id, &said).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Materialize one pinned workflow in `root`, or say only what it would do.
+///
+/// The pin is looked up first so that a workflow this project does not use is a 404, the same
+/// `not_installed` every route beside this one answers, rather than an empty list.
+fn materialize_one(
+    root: &std::path::Path,
+    pins: &std::path::Path,
+    library: &std::path::Path,
+    record: &std::path::Path,
+    name: &str,
+    mode: crate::workflow_materialize::Mode,
+) -> Result<crate::workflow_materialize::PinOutcome, (StatusCode, Json<serde_json::Value>)> {
+    let pinned = crate::workflows::read_pins(pins).map_err(|detail| {
+        refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "unreadable_pins", detail)
+    })?;
+    if !pinned.workflows.iter().any(|pin| pin.name == name) {
+        return Err(workflow_refusal(crate::workflows::Refused::NotInstalled));
+    }
+    crate::workflow_materialize::sync(root, pins, library, record, Some(name), mode)
+        .map_err(|detail| {
+            refusal_with_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unreadable_record",
+                detail,
+            )
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| workflow_refusal(crate::workflows::Refused::NotInstalled))
+}
+
+/// What materializing this workflow into the project would do, with nothing written.
+///
+/// The preview the page shows before the button, and the one place a conflict can be read in
+/// full: both hashes and the bundle's copy of the file, which is enough to diff it.
+async fn get_project_workflow_materialize(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<crate::workflow_materialize::PinOutcome>, (StatusCode, Json<serde_json::Value>)> {
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+    let library = library_or_refusal(&state)?;
+    let pins = pins_file(&state, &id)?;
+    let record = materialized_record(&state, &id)?;
+    tokio::task::spawn_blocking(move || {
+        materialize_one(
+            &root,
+            &pins,
+            &library,
+            &record,
+            &name,
+            crate::workflow_materialize::Mode::Preview,
+        )
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map(Json)
+}
+
+/// Put this workflow's files into the project. Never over a file somebody edited — see
+/// `workflow_materialize.rs` — and the answer lists every file left alone and why.
+///
+/// **The stop first**, through `workflow_write_root` like every workflow write: these are files
+/// that govern what an agent does, the same class of write `POST /write` refuses while the kill
+/// switch is engaged.
+async fn post_project_workflow_materialize(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<crate::workflow_materialize::PinOutcome>, (StatusCode, Json<serde_json::Value>)> {
+    let (root, pins, library) = workflow_write_root(&state, &id).await?;
+    let record = materialized_record(&state, &id)?;
+    let outcome = tokio::task::spawn_blocking(move || {
+        materialize_one(
+            &root,
+            &pins,
+            &library,
+            &record,
+            &name,
+            crate::workflow_materialize::Mode::Apply,
+        )
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))??;
+
+    let said = match (&outcome.report, &outcome.error, &outcome.skipped) {
+        (_, Some(error), _) => format!("{}: files could not all be placed: {error}", outcome.name),
+        (Some(report), None, _) => format!("files placed — {}", report.summary()),
+        (None, None, Some(why)) => format!("{}: nothing placed — {why}", outcome.name),
+        (None, None, None) => format!("{}: nothing placed", outcome.name),
+    };
+    workflow_feed(&state, &id, &said).await;
+    Ok(Json(outcome))
+}
+
+#[derive(Deserialize)]
+struct WorkflowSyncRequest {
+    /// The checkout, absolute. `nucleos-core --workflow-sync` sends its argument or its cwd.
+    path: String,
+}
+
+#[derive(serde::Serialize)]
+struct WorkflowSyncAnswer {
+    project_id: String,
+    outcomes: Vec<crate::workflow_materialize::PinOutcome>,
+}
+
+/// Materialize a project's pinned workflows into a checkout somebody made by hand.
+///
+/// **Which project is decided by the repository, not by the caller.** The checkout's git common
+/// directory (`git_exec::repo_key`) is compared against every rostered root's; the one that shares
+/// it is the project. A caller naming the project would be a caller able to put one project's
+/// workflow into another's checkout, and the path already says which it is.
+///
+/// A worktree gets its own record under `~/.nucleos/projects/<id>/materialized/`, so a file edited
+/// in it is protected exactly as one edited in the main checkout; the main checkout itself, named
+/// here, uses the project's record.
+async fn post_workflow_sync(
+    State(state): State<AppState>,
+    Json(body): Json<WorkflowSyncRequest>,
+) -> Result<Json<WorkflowSyncAnswer>, (StatusCode, Json<serde_json::Value>)> {
+    if crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+    let asked = std::path::PathBuf::from(&body.path);
+    if !asked.is_absolute() {
+        return Err(refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "path_not_absolute",
+        ));
+    }
+    let checkout = tokio::fs::canonicalize(&asked)
+        .await
+        .map_err(|_| refusal(StatusCode::NOT_FOUND, "no_such_path"))?;
+    let deadline = std::time::Instant::now() + DETECT_GIT_BUDGET;
+    let key = crate::git_exec::repo_key(&checkout, deadline)
+        .await
+        .map_err(|detail| {
+            refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "not_a_checkout", detail)
+        })?;
+
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT project_id, project_root FROM autopilot_state")
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+    let mut found = None;
+    for (project_id, root) in rows {
+        let Some(root) = root else { continue };
+        let root = std::path::PathBuf::from(root);
+        if crate::git_exec::repo_key(&root, deadline).await.as_ref() == Ok(&key) {
+            found = Some((project_id, root));
+            break;
+        }
+    }
+    let Some((project_id, root)) = found else {
+        return Err(refusal(StatusCode::NOT_FOUND, "no_project"));
+    };
+    if crate::autopilot::scoped_kill_engaged(&state.pool, "project", &project_id)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let library = library_or_refusal(&state)?;
+    let state_dir = project_state_dir(&state, &project_id)?;
+    let pins = state_dir.join(crate::project_state::PINS_FILE);
+    let is_main = tokio::fs::canonicalize(&root).await.ok().as_ref() == Some(&checkout);
+    let record = if is_main {
+        state_dir.join(crate::project_state::MATERIALIZED_FILE)
+    } else {
+        crate::workflow_materialize::worktree_record(&state_dir, &checkout)
+    };
+    let target = checkout.clone();
+    let outcomes = tokio::task::spawn_blocking(move || {
+        crate::workflow_materialize::sync(
+            &target,
+            &pins,
+            &library,
+            &record,
+            None,
+            crate::workflow_materialize::Mode::Apply,
+        )
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(|detail| {
+        refusal_with_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unreadable_record",
+            detail,
+        )
+    })?;
+
+    let said: Vec<String> = outcomes
+        .iter()
+        .map(
+            |outcome| match (&outcome.report, &outcome.error, &outcome.skipped) {
+                (_, Some(error), _) => format!("{}: {error}", outcome.name),
+                (Some(report), None, _) => report.summary(),
+                (None, None, why) => format!(
+                    "{}: nothing placed ({})",
+                    outcome.name,
+                    why.as_deref().unwrap_or("no reason given")
+                ),
+            },
+        )
+        .collect();
+    if !said.is_empty() {
+        workflow_feed(
+            &state,
+            &project_id,
+            &format!("synced into {}: {}", checkout.display(), said.join("; ")),
+        )
+        .await;
+    }
+    Ok(Json(WorkflowSyncAnswer {
+        project_id,
+        outcomes,
+    }))
 }
 
 /// One feed line, after the fact and loudly on failure.
@@ -21213,6 +21506,214 @@ mod tests {
         assert_ne!(installed[0]["hash"], installed[0]["origin_hash"]);
         // Drift is not an update on offer: nobody published a new version.
         assert!(installed[0]["update_available"].is_null());
+    }
+
+    /// A library bundle that provides files, for the materialization routes.
+    fn providing_library() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, library) = library_with(&[(
+            "dev",
+            "1.0",
+            "owns:\n  - .ai/workflow/\n  - .claude/settings.json\n",
+        )]);
+        let at = library.join("dev/1.0");
+        std::fs::create_dir_all(at.join(".ai/workflow")).unwrap();
+        std::fs::write(at.join(".ai/workflow/workflow.md"), "the pipeline").unwrap();
+        std::fs::create_dir_all(at.join(".claude")).unwrap();
+        std::fs::write(at.join(".claude/settings.json"), "{}").unwrap();
+        (dir, library)
+    }
+
+    /// Installing puts the bundle's files where agents read them, recorded outside the project; a
+    /// later edit is left alone by the next materialization and named in its answer; the preview
+    /// writes nothing.
+    #[tokio::test]
+    async fn installing_places_the_files_and_an_edit_is_never_placed_over() {
+        let mut state = test_state().await;
+        let (_lib, library) = providing_library();
+        state.workflow_library = Some(library.clone());
+        let home = with_project_home(&mut state);
+        let project = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "dev", "version": "1.0" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let placed = project.path().join(".ai/workflow/workflow.md");
+        assert_eq!(std::fs::read_to_string(&placed).unwrap(), "the pipeline");
+        assert!(
+            home.path()
+                .join("projects/alpha")
+                .join(crate::project_state::MATERIALIZED_FILE)
+                .is_file(),
+            "the record is the project's state, outside the project"
+        );
+
+        std::fs::write(&placed, "mine").unwrap();
+        let (status, preview) = workflow_call(
+            state.clone(),
+            "GET",
+            "/projects/alpha/workflows/dev/materialize",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(preview["report"]["applied"], false);
+        assert_eq!(preview["report"]["conflicts"][0]["kind"], "edited");
+
+        let (status, answer) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/dev/materialize",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            answer["report"]["conflicts"][0]["path"],
+            ".ai/workflow/workflow.md"
+        );
+        assert!(answer["report"]["conflicts"][0]["bundle_file"].is_string());
+        assert_eq!(std::fs::read_to_string(&placed).unwrap(), "mine");
+
+        let (status, _) = workflow_call(
+            state,
+            "GET",
+            "/projects/alpha/workflows/nope/materialize",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Materializing writes files that govern agents, so the stop refuses it before a byte lands.
+    #[tokio::test]
+    async fn materializing_waits_for_the_stop() {
+        let mut state = test_state().await;
+        let (_lib, library) = providing_library();
+        state.workflow_library = Some(library);
+        let _home = with_project_home(&mut state);
+        let project = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        crate::workflows::install(
+            &state
+                .machine_config_root
+                .clone()
+                .unwrap()
+                .join("projects/alpha")
+                .join(crate::project_state::PINS_FILE),
+            &crate::workflows::read_bundle(
+                &state.workflow_library.clone().unwrap().join("dev/1.0"),
+                "dev",
+                "1.0",
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        for (method, uri) in [
+            ("POST", "/projects/alpha/workflows/dev/materialize"),
+            ("POST", "/workflows/sync"),
+        ] {
+            let body = (uri == "/workflows/sync")
+                .then(|| serde_json::json!({ "path": project.path().to_string_lossy() }));
+            let (status, answer) = workflow_call(state.clone(), method, uri, body).await;
+            assert_eq!(status, StatusCode::LOCKED, "{uri}");
+            assert_eq!(answer["refusal"], "kill_switch");
+        }
+        assert!(!project.path().join(".ai/workflow/workflow.md").exists());
+    }
+
+    /// A worktree made by hand is matched to its project through the repository they share, and
+    /// gets a record of its own, so an edit in it is protected exactly as one in the main checkout.
+    #[tokio::test]
+    async fn a_hand_made_worktree_is_synced_by_the_repository_it_shares() {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        let mut state = test_state().await;
+        let (_lib, library) = providing_library();
+        state.workflow_library = Some(library.clone());
+        let home = with_project_home(&mut state);
+        let project = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        git(project.path(), &["init", "--quiet"]);
+        std::fs::write(project.path().join("README.md"), "x").unwrap();
+        git(project.path(), &["add", "README.md"]);
+        git(project.path(), &["commit", "--quiet", "-m", "init"]);
+        let trees = tempfile::tempdir().unwrap();
+        let tree = trees.path().join("by-hand");
+        git(
+            project.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "side",
+                &tree.to_string_lossy(),
+            ],
+        );
+        crate::workflows::install(
+            &home
+                .path()
+                .join("projects/alpha")
+                .join(crate::project_state::PINS_FILE),
+            &crate::workflows::read_bundle(&library.join("dev/1.0"), "dev", "1.0")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let (status, answer) = workflow_call(
+            state.clone(),
+            "POST",
+            "/workflows/sync",
+            Some(serde_json::json!({ "path": tree.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["project_id"], "alpha");
+        assert_eq!(
+            std::fs::read_to_string(tree.join(".ai/workflow/workflow.md")).unwrap(),
+            "the pipeline"
+        );
+        // The daemon's own hook file is never a bundle's to place.
+        assert!(!tree.join(".claude/settings.json").exists());
+        assert_eq!(
+            answer["outcomes"][0]["report"]["reserved"][0],
+            ".claude/settings.json"
+        );
+        let records = home
+            .path()
+            .join("projects/alpha")
+            .join(crate::project_state::WORKTREE_RECORDS_DIR);
+        assert_eq!(std::fs::read_dir(&records).unwrap().count(), 1);
+        // The main checkout was not touched by a sync of its worktree.
+        assert!(!project.path().join(".ai/workflow/workflow.md").exists());
+
+        let (status, answer) = workflow_call(
+            state,
+            "POST",
+            "/workflows/sync",
+            Some(serde_json::json!({ "path": trees.path().to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(answer["refusal"], "not_a_checkout");
     }
 
     /// A credential goes in, and only its presence ever comes back.

@@ -2708,6 +2708,20 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
             .await;
             return Err(CreateRunError::Db(error));
         }
+        // The project's pinned workflow, into a tree this run brought — never into a job's tree a
+        // node inherits, which got it when the job opened it. Fail-soft and said out loud: see
+        // `workflow_materialize::into_worktree`. Before a resolution stages its conflict, so the
+        // resolver reads the same rules every other agent in this project does.
+        if owns_a_tree {
+            crate::workflow_materialize::into_worktree(
+                &state.pool,
+                state.machine_config_root.as_deref(),
+                state.workflow_library.as_deref(),
+                worktree_project_id,
+                &info.path,
+            )
+            .await;
+        }
         // A conflict's one attempt is claimed HERE: after the row exists, because the claim IS this
         // run's id, and before the agent does, because the whole point is that no second agent can
         // ever be minted against the same escalation. Losing the compare-and-set means something
@@ -8489,6 +8503,51 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         assert!(summary.contains(&branch));
 
         let _ = crate::worktree::remove(&repo, &spawn_cwd, &[]).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn f5_a_run_owned_worktree_gets_the_projects_pinned_workflow() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-workflow-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (container, repo) = init_contained_repo("nucleos-runs-workflow-repo-");
+        let (mut state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let home = container.path().join("nucleos-home");
+        let library = container.path().join("workflows");
+        let bundle_dir = library.join("dev").join("1.0");
+        std::fs::create_dir_all(bundle_dir.join(".ai/workflow")).unwrap();
+        std::fs::write(bundle_dir.join("bundle.yaml"), "owns:\n  - .ai/workflow/\n").unwrap();
+        std::fs::write(bundle_dir.join(".ai/workflow/rule.md"), "pinned").unwrap();
+        let bundle = crate::workflows::read_bundle(&bundle_dir, "dev", "1.0")
+            .unwrap()
+            .unwrap();
+        let pins = crate::project_state::file(
+            Some(&home),
+            "proj",
+            crate::project_state::PINS_FILE,
+        )
+        .unwrap();
+        crate::workflows::install(&pins, &bundle).unwrap();
+        state.machine_config_root = Some(home);
+        state.workflow_library = Some(library);
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
+        let worktree: String = sqlx::query_scalar(
+            "SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(FsPath::new(&worktree).join(".ai/workflow/rule.md")).unwrap(),
+            "pinned"
+        );
+        let _ = crate::worktree::remove(&repo, FsPath::new(&worktree), &[]).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

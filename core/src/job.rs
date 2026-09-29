@@ -2260,6 +2260,19 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
         .await;
     }
 
+    // The project's workflow, into the tree its nodes will read it from. `.ai/`, `.claude/` and
+    // their like are usually gitignored, so a fresh worktree has none of them; without this every
+    // job ran without the rules its project pinned, and nothing said so. Fail-soft: a missing
+    // workflow is a feed line, never a failed job (`workflow_materialize::into_worktree`).
+    crate::workflow_materialize::into_worktree(
+        &state.pool,
+        state.machine_config_root.as_deref(),
+        state.workflow_library.as_deref(),
+        request.project_id,
+        &info.path,
+    )
+    .await;
+
     // Two sentences rather than one with a hole in it. A job nobody scheduled has no rule, and
     // `for rule 'None'` would be a line a person reads as a bug in the scheduler.
     let started = match request.rule_name {
@@ -10886,6 +10899,61 @@ mod tests {
         .await
         .expect("record the job's worktree");
         job_id
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn f5_a_jobs_worktree_gets_the_projects_pinned_workflow() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = walkable_repo("nucleos-job-workflow-", "git --version");
+        let root = tempfile::tempdir().unwrap();
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let mut state = with_home(test_state(pool.clone()).await, &container);
+        let library = container.path().join("workflows");
+        let bundle_dir = library.join("dev").join("1.0");
+        std::fs::create_dir_all(bundle_dir.join(".ai/workflow")).unwrap();
+        std::fs::write(bundle_dir.join("bundle.yaml"), "owns:\n  - .ai/workflow/\n").unwrap();
+        std::fs::write(bundle_dir.join(".ai/workflow/rule.md"), "pinned").unwrap();
+        let bundle = crate::workflows::read_bundle(&bundle_dir, "dev", "1.0")
+            .unwrap()
+            .unwrap();
+        let pins = crate::project_state::file(
+            state.machine_config_root.as_deref(),
+            "nucleos",
+            crate::project_state::PINS_FILE,
+        )
+        .unwrap();
+        crate::workflows::install(&pins, &bundle).unwrap();
+        state.workflow_library = Some(library);
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let job_id = match start(
+            &state,
+            &StartRequest {
+                project_id: "nucleos",
+                project_root: &project_root,
+                rule_name: None,
+                prompt: "do it",
+                max_items: 1,
+                gate_each: true,
+                review: false,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+            },
+        )
+        .await
+        {
+            JobStart::Started(id) => id,
+            other => panic!("job did not start: {other:?}"),
+        };
+        let (worktree, _) = job_worktree(&pool, job_id).await.unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(".ai/workflow/rule.md")).unwrap(),
+            "pinned"
+        );
     }
 
     /// The thesis of the whole feature, walked end to end for the first time: **one trigger

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 16;
+pub const CLASSIFIER_VERSION: u32 = 17;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -1867,8 +1867,10 @@ const HOME_SPELLINGS: &[&str] = &["~/", "$home/", "${home}/", "%userprofile%/", 
 /// never had one, be writing the owner's GitHub policy one restart later.
 ///
 /// **Each project's own state, by name, however it is rooted.** `autopilot.yaml` (the gate
-/// command, and so what *green* means), `workflows.yaml` and `onboarded.yaml` (the marker
-/// activation requires) live in `~/.nucleos/projects/<id>/`
+/// command, and so what *green* means), `workflows.yaml`, `onboarded.yaml` (the marker
+/// activation requires) and `materialized.yaml` with its per-worktree siblings under
+/// `materialized/` (what the app last wrote of a workflow into a checkout, and so which of those
+/// files it may overwrite) live in `~/.nucleos/projects/<id>/`
 /// (`project_state.rs`). The home spelling is covered by the first answer above; the absolute one
 /// is matched here as `.nucleos/projects/<any id>/<file>`, which a job worktree
 /// (`.nucleos/worktrees/...`) never is. The old `.ai/workflows.yaml` is guarded for the reason the
@@ -1901,7 +1903,15 @@ fn names_project_state(normalized: &str) -> bool {
             [.., ".nucleos", "projects", id, name] if !id.is_empty() && name == file
         )
     });
+    let worktree_record = matches!(
+        parts.as_slice(),
+        [.., ".nucleos", "projects", id, dir, name]
+            if !id.is_empty()
+                && *dir == crate::project_state::WORKTREE_RECORDS_DIR
+                && !name.is_empty()
+    );
     in_state_dir
+        || worktree_record
         || path_has_suffix(
             normalized,
             &format!(".ai/{}", crate::project_state::PINS_FILE),
@@ -4769,7 +4779,10 @@ mod tests {
     /// are `self-governing-file` — a tightening only. (A home-spelled path was already refused by
     /// 14; what 15 adds is the absolute spelling and the legacy pins file.) 16 adds the onboarding
     /// marker, `onboarded.yaml`, to that set: it is what lets a project be activated at all, so an
-    /// agent writing its own is an agent onboarding itself — a tightening only.
+    /// agent writing its own is an agent onboarding itself — a tightening only. 17 adds the
+    /// materialization record, `materialized.yaml`, and the per-worktree records under
+    /// `materialized/`: rewriting one is how an agent would make the next materialization overwrite
+    /// a file a person edited — a tightening only.
     /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
@@ -4784,7 +4797,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 16);
+        assert_eq!(CLASSIFIER_VERSION, 17);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
@@ -4882,6 +4895,8 @@ mod tests {
                 r"~\.nucleos\projects\alpha\workflows.yaml",
                 "$HOME/.nucleos/projects/my project/autopilot.yaml",
                 "~/.nucleos/projects/alpha/onboarded.yaml",
+                "~/.nucleos/projects/alpha/materialized.yaml",
+                "~/.nucleos/projects/alpha/materialized/job-12-0a1b2c3d.yaml",
                 ".ai/workflows.yaml",
                 ".ai/autopilot.yaml",
             ] {
@@ -4906,11 +4921,25 @@ mod tests {
                 "pending_approval",
                 "self-governing-file",
             );
+            // The materialization records, which only the absolute spelling reaches by name: the
+            // home spelling is refused above as any file under `~/.nucleos` is.
+            for record in [
+                r"C:\Users\someone\.nucleos\projects\alpha\materialized.yaml",
+                r"C:\Users\someone\.nucleos\projects\alpha\materialized\job-12-0a1b2c3d.yaml",
+            ] {
+                assert_classification(
+                    classify(tool, &json!({ "file_path": record }), None),
+                    "pending_approval",
+                    "self-governing-file",
+                );
+            }
         }
         for command in [
             "echo 'gate_command: true' > ~/.nucleos/projects/alpha/autopilot.yaml",
             "cp evil.yaml C:/Users/someone/.nucleos/projects/alpha/autopilot.yaml",
             "cp marker.yaml C:/Users/someone/.nucleos/projects/alpha/onboarded.yaml",
+            "cp record.yaml C:/Users/someone/.nucleos/projects/alpha/materialized.yaml",
+            "cp record.yaml C:/Users/someone/.nucleos/projects/alpha/materialized/job-3-aa.yaml",
             "cp evil.yaml .ai/workflows.yaml",
         ] {
             let asked = classify("Bash", &json!({ "command": command }), cwd);

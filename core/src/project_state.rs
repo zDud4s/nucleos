@@ -48,12 +48,27 @@ pub const PINS_FILE: &str = "workflows.yaml";
 /// anywhere: it has no older home, because it records a decision this app did not ask for before.
 pub const ONBOARDED_FILE: &str = "onboarded.yaml";
 
+/// What `workflow_materialize.rs` last wrote into the project's own checkout, file by file, per
+/// bundle. The hash of every file it put there, so that a later run can tell a file it may replace
+/// (unchanged since it wrote it) from one a person edited (never replaced). Written only by that
+/// module.
+pub const MATERIALIZED_FILE: &str = "materialized.yaml";
+
+/// The directory beside [`MATERIALIZED_FILE`] holding one record per WORKTREE of the project, named
+/// by `workflow_materialize::worktree_record`. A worktree is a second checkout with its own files,
+/// so the edit protection has to be kept per checkout; the main checkout's record is the file
+/// above.
+pub const WORKTREE_RECORDS_DIR: &str = "materialized";
+
 /// Every file this module places, in the order [`migrate_legacy`] copies them.
 pub const FILES: &[&str] = &[AUTOPILOT_FILE, PINS_FILE];
 
 /// Every file a project's state directory holds: [`FILES`] plus the onboarding marker. What the
 /// classifier guards by name, because each of them decides something about what a run may do.
-pub const ALL_FILES: &[&str] = &[AUTOPILOT_FILE, PINS_FILE, ONBOARDED_FILE];
+///
+/// The materialization record is here too: an agent that could rewrite it could make the next
+/// materialization overwrite a file a person edited, by recording that edit as the app's own.
+pub const ALL_FILES: &[&str] = &[AUTOPILOT_FILE, PINS_FILE, ONBOARDED_FILE, MATERIALIZED_FILE];
 
 /// Where every row of [`FILES`] used to live, relative to the project's root.
 const LEGACY_DIR: &str = ".ai";
@@ -128,10 +143,23 @@ pub fn display_path(project_id: &str, name: &str) -> String {
 /// writes racing would collide on it; they would be writing the same class of content to the same
 /// file, and the loser is a request the caller is watching.
 pub fn write_atomically(target: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    write_bytes_atomically(target, contents.as_bytes())
+}
+
+/// [`write_atomically`] for bytes, which is what a bundle's files are: `workflow_materialize.rs`
+/// copies them into a project unread, and a script or an image is not a `&str`.
+///
+/// The temporary is the target's name with `.nucleos-tmp` APPENDED rather than swapped for its
+/// extension. Swapping is harmless for the state files, which are alone in their directory; a
+/// bundle writes `plan.md` and `plan.py` side by side, and both would have raced for one
+/// `plan.nucleos-tmp`.
+pub fn write_bytes_atomically(target: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temp = target.with_extension("nucleos-tmp");
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".nucleos-tmp");
+    let temp = target.with_file_name(name);
     std::fs::write(&temp, contents)?;
     std::fs::rename(&temp, target)
 }
