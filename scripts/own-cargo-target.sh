@@ -22,7 +22,7 @@
 # (`worktree_scripts`) comparing nothing. This script is a word of the command, so that check holds it
 # against the project root's copy exactly as it holds `scripts/gates.sh`.
 #
-# The line for `.ai/autopilot.yaml`:
+# The line for the project's `autopilot.yaml` (`~/.nucleos/projects/<id>/autopilot.yaml`):
 #
 #   gate_command: '"C:/Program Files/Git/bin/bash.exe" scripts/own-cargo-target.sh C:/Projects/.cargo-target-gates bash scripts/gates.sh core'
 #

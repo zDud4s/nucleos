@@ -33,6 +33,7 @@ import type { Branches, Commit } from "../data/project-git";
 import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
 import type { GraphNode, WorkflowGraph } from "../data/workflow-graph";
 import type { Detected } from "../data/detect";
+import type { Onboarding } from "../data/onboarding";
 import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
 
@@ -173,7 +174,7 @@ export interface DaemonState {
   /** What every workflow-changing route refuses with, or `null` to accept. */
   workflowRefusal: { status: number; code: string; detail: string } | null;
   /**
-   * A `.ai/workflows.yaml` the daemon cannot parse.
+   * A pins file (`~/.nucleos/projects/<id>/workflows.yaml`) the daemon cannot parse.
    *
    * Its own field rather than a variant of `workflows`, because it is a different answer with a
    * different sentence: an empty list says *this project uses no workflow*, and that is precisely
@@ -198,6 +199,13 @@ export interface DaemonState {
   detected: Detected | null;
   /** Every workflow adopted from a folder, as it was sent. */
   adopted: { name: string; path: string }[];
+  /**
+   * Every onboarding the shell asked for, as it asked for it. What `GET /projects/{id}/onboard`
+   * answers is derived from this and from `detected`: a project in here reads as onboarded.
+   */
+  onboarded: { projectId: string; project_root?: string; gate_command: string | null }[];
+  /** What the onboarding route refuses with, or `null` to accept. */
+  onboardRefusal: { status: number; code: string; detail: string } | null;
   /**
    * What a project would forget by leaving, and what is holding it here.
    *
@@ -349,7 +357,9 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     text: { diff: "", cat: "" },
     ownership: [
       {
-        path: ".ai/autopilot.yaml",
+        path: "autopilot.yaml",
+        home: "state",
+        display: "~/.nucleos/projects/alpha/autopilot.yaml",
         owner: "core",
         what: "what this project does on its own, and the gate command that decides what green means",
       },
@@ -371,6 +381,8 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     overlays: [],
     detected: null,
     adopted: [],
+    onboarded: [],
+    onboardRefusal: null,
     record: {
       forgets: { runs: 0, jobs: 0, proposals: 0, decisions: 0, stamps: 0, commands: 0, feed: 0 },
       holds: { slots: 0, worktrees: 0 },
@@ -591,8 +603,44 @@ export function detected(overrides: Partial<Detected> = {}): Detected {
     harnesses: [],
     commands: [],
     commands_omitted: 0,
+    gate: null,
     taken_by: null,
     ...overrides,
+  };
+}
+
+/**
+ * What `GET /projects/{id}/onboard` answers over this fake daemon: the folder as `detected` found
+ * it, and onboarded once the shell has asked for it. Refused as the daemon refuses it when a test
+ * sets `onboardRefusal`.
+ */
+function onboardingOf(state: DaemonState, path: string): Onboarding {
+  if (state.onboardRefusal !== null) {
+    const { status, code, detail } = state.onboardRefusal;
+    throw new ApiRefusal(status, code, detail);
+  }
+  const projectId = decodeURIComponent(path.split("/")[2].split("?")[0]);
+  const found = state.detected ?? detected();
+  const last = [...state.onboarded].reverse().find((row) => row.projectId === projectId);
+  return {
+    project_id: projectId,
+    root: last?.project_root ?? found.root,
+    onboarded:
+      last === undefined
+        ? null
+        : {
+            onboarded_at: "2026-09-27T12:00:00+00:00",
+            project_root: last.project_root ?? found.root,
+            gate_command: last.gate_command,
+            harnesses: found.harnesses.map((harness) => harness.path),
+            hook_installed: true,
+            migrated: false,
+          },
+    marker_path: `~/.nucleos/projects/${projectId}/onboarded.yaml`,
+    harnesses: found.harnesses,
+    proposed_gate: found.gate,
+    configured_gate: last?.gate_command ?? null,
+    hook_wired: last !== undefined,
   };
 }
 
@@ -860,6 +908,17 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         return state.githubListings[sent.op.op];
       }
 
+      // Onboarding, recorded as sent and answered with the view the GET now serves.
+      if (/^\/projects\/[^/]+\/onboard$/.test(path) && typeof init.body === "string") {
+        if (state.onboardRefusal !== null) {
+          const { status, code, detail } = state.onboardRefusal;
+          throw new ApiRefusal(status, code, detail);
+        }
+        const body = JSON.parse(init.body) as { project_root?: string; gate_command: string | null };
+        state.onboarded.push({ projectId: decodeURIComponent(path.split("/")[2]), ...body });
+        return onboardingOf(state, path);
+      }
+
       // The one write the shell can make from the frame. Applied to the state so
       // that the refetch after the mutation reads back what was written.
       if (path === "/autopilot/kill" && typeof init.body === "string") {
@@ -1067,6 +1126,7 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       }
       return state.workflows;
     }
+    if (/^\/projects\/[^/]+\/onboard(\?|$)/.test(path)) return onboardingOf(state, path);
     if (path.startsWith("/projects/detect")) {
       if (state.detected === null) {
         throw new ApiRefusal(404, "no_such_folder", "there is nothing at that path");
@@ -1150,7 +1210,9 @@ export interface HarnessOptions {
 export function daemonText(state: DaemonState): (path: string) => Promise<string> {
   return async (path) => {
     if (path.includes("/diff")) return state.text.diff;
-    if (path.includes("/cat")) {
+    // `owned` is the claimed files' own read, and it answers exactly as `cat` does — including the
+    // 404 for a file not written yet — so the two share the one text a test sets.
+    if (path.includes("/cat") || path.includes("/owned")) {
       // `null` is a file that is not there — a 404, and a different fact from an empty file. A
       // project with no rules file yet is the ordinary case, and the editor says a different
       // sentence for it.

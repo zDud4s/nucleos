@@ -6,7 +6,7 @@
 //!
 //! **It is not a branch in `scheduler_tick`,** and the reason is structural. That loop is
 //! `for (project_id, project_root, project_mode) in autopilot_projects(...)`, and everything after
-//! depends on those three: it loads `.ai/autopilot.yaml` from the root, asks
+//! depends on those three: it loads the project's `autopilot.yaml` by its id, asks
 //! `wip_permits_new_run(project_id)`, keys its state on `(project_id, rule_name)` and compares
 //! `last_head_sha`. A team has none of them and will get none — a department works over a folder,
 //! not a repository. What is reused is what is PURE and knows nothing about projects: `next_fire`,

@@ -1,0 +1,1139 @@
+//! §spec motor-de-workflows
+//!
+//! Put a pinned bundle's files where agents read them, and never over a file somebody edited.
+//!
+//! [`crate::workflows`] keeps the library, the pins and the drift between them, and until this
+//! module nothing ever put a bundle's files into a project. A workflow was pinned and then read by
+//! nobody: agents read `.ai/workflow/`, `.claude/skills/` and the like in the checkout they work
+//! in, and those were placed there by hand — in this repository by a gitignored script that copied
+//! the main checkout's core over every worktree, overwrote blindly, and on 2026-09-19 took a
+//! worktree's own edits with it, with no history to bring them back from.
+//!
+//! # What a bundle provides is its `owns:` list
+//!
+//! The manifest already declared the project files a workflow authors, for the ownership fence
+//! (`ownership.rs`). That list is what is materialized, and nothing else in the bundle: the graph,
+//! the manifest and anything else are the library's to keep. An entry is a relative path in the
+//! spelling [`crate::ownership::normalise`] accepts — no `..`, nothing absolute, no backslash — and
+//! it names either a FILE in the bundle or a DIRECTORY of it, in which case every file under it is
+//! provided. A trailing slash is accepted and changes nothing. The bundle directory mirrors the
+//! project: the bundle's `.ai/workflow/workflow.md` is the project's `.ai/workflow/workflow.md`.
+//!
+//! This module still parses nothing but the manifest. Which files a workflow consists of is the
+//! bundle's to say; how they are copied is decided by their hashes alone.
+//!
+//! # The record is what makes overwriting safe
+//!
+//! Every file this module writes is recorded with the hash of what it wrote, in
+//! `~/.nucleos/projects/<id>/materialized.yaml` for the project's main checkout and in one file per
+//! worktree under `materialized/` beside it. The record is keyed by bundle name and carries the
+//! version it was written from. On every later run, each file the bundle provides is one of:
+//!
+//! - **missing** — written;
+//! - **identical to the bundle's** — left alone, and recorded (adopted) if it was not yet;
+//! - **unchanged since this module wrote it** — its hash is the recorded one — overwritten;
+//! - **edited** — present, recorded, and not what was recorded — NEVER overwritten, reported as a
+//!   conflict with both hashes and the path of the bundle's copy, which is enough to show a diff;
+//! - **there before and never recorded** — a conflict too, since nothing says whose it is.
+//!
+//! A file the previous version provided and the new one does not is deleted when it is unchanged
+//! since it was written, and kept and reported when it was edited.
+//!
+//! **Refuse rather than guess.** A record that does not parse stops the whole run: without it an
+//! unchanged file and an edited one look the same, and the only safe reading of *I cannot tell*
+//! is not to write.
+//!
+//! # Files the daemon installs are never a bundle's
+//!
+//! `.claude/settings.json` and `.claude/hooks/` carry the classifier hook that onboarding wires
+//! (`autopilot::wire_classifier_hook`). A bundle that provided them would unwire the gate every
+//! tool call passes through, so those paths are skipped whatever a manifest says, and reported.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::workflows;
+
+/// Paths a bundle may never provide, because the daemon installs them itself. See the module
+/// header. A path equal to one of these, or under one ending in `/`, is skipped.
+const RESERVED: &[&str] = &[
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+    ".claude/hooks/",
+];
+
+/// Whether `rel` is a path the daemon installs and no bundle may write.
+pub fn reserved(rel: &str) -> bool {
+    // Derived from the hook's own path rather than written out a second time, so moving the hook
+    // cannot leave a bundle able to overwrite it.
+    let hook_dir = crate::autopilot::HOOK_SCRIPT
+        .rsplit_once('/')
+        .map_or("", |(dir, _)| dir);
+    RESERVED.iter().any(|entry| match entry.strip_suffix('/') {
+        Some(dir) => rel == dir || rel.starts_with(&format!("{dir}/")),
+        None => rel == *entry,
+    }) || (!hook_dir.is_empty() && rel.starts_with(&format!("{hook_dir}/")))
+}
+
+/* ----------------------------------------------------------------- record -- */
+
+/// What was written into one checkout, per bundle.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Record {
+    #[serde(default)]
+    pub bundles: BTreeMap<String, RecordedBundle>,
+}
+
+/// One bundle's files as they were last written: relative path to the hash of the bytes written.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecordedBundle {
+    pub version: String,
+    #[serde(default)]
+    pub files: BTreeMap<String, String>,
+}
+
+/// Read a record. An absent file is an empty record — nothing was ever written — and anything
+/// that does not parse is an error the caller must stop on (see the module header).
+pub fn read_record(path: &Path) -> Result<Record, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match serde_yaml::from_str::<Option<Record>>(&text) {
+            Ok(record) => Ok(record.unwrap_or_default()),
+            Err(error) => Err(format!("{}: {error}", path.display())),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Record::default()),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+fn render_record(record: &Record) -> String {
+    let body = serde_yaml::to_string(record).unwrap_or_else(|_| "bundles: {}\n".to_string());
+    format!(
+        "# Written by NucleOS. What each workflow bundle last wrote into this checkout, and the\n\
+         # hash of each file as written: a file whose hash still matches may be replaced by the next\n\
+         # version, and one that does not was edited and never is. Rewritten whole on every run.\n{body}"
+    )
+}
+
+/// The record for one worktree of a project, under the project's state directory.
+///
+/// Named after the worktree's directory, for a person looking at the folder, and a hash of its
+/// full path, because two hand-made worktrees called `feature` in two different parents are two
+/// checkouts and must not share one record.
+///
+/// The path is hashed in one spelling whoever names it: the daemon names a tree it opened by the
+/// path it built, and `POST /workflows/sync` by a canonical one, which on Windows carries a `\\?\`
+/// prefix and may differ in case. Hashed as given, one tree would get two records, and a file
+/// edited in it before a hand-run sync would read as untracked rather than edited.
+pub fn worktree_record(state_dir: &Path, worktree: &Path) -> PathBuf {
+    let spelled = worktree.to_string_lossy().replace('\\', "/");
+    let spelled = match spelled.strip_prefix("//?/") {
+        Some(rest) => match rest.strip_prefix("UNC/") {
+            Some(share) => format!("//{share}"),
+            None => rest.to_string(),
+        },
+        None => spelled,
+    };
+    let full = if cfg!(windows) {
+        spelled.to_lowercase()
+    } else {
+        spelled
+    };
+    let tag = &workflows::hash_of(full.as_bytes())[..8];
+    let name: String = worktree
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect();
+    let name = name.trim_start_matches('.');
+    let file = if name.is_empty() {
+        format!("{tag}.yaml")
+    } else {
+        format!("{name}-{tag}.yaml")
+    };
+    state_dir
+        .join(crate::project_state::WORKTREE_RECORDS_DIR)
+        .join(file)
+}
+
+/* ------------------------------------------------------------------ owned -- */
+
+/// The entries of an `owns:` list in the one spelling this module compares, dropping any that
+/// [`crate::ownership::normalise`] refuses — which is how `..`, an absolute path or a backslash
+/// never reaches a join.
+pub fn owns_entries(owns: &[String]) -> Vec<String> {
+    owns.iter()
+        .filter_map(|entry| crate::ownership::normalise(entry))
+        .collect()
+}
+
+/// Whether `file` (a bundle-relative path) is provided by `entries`: named exactly, or under a
+/// directory one of them names.
+fn provided(entries: &[String], file: &str) -> bool {
+    entries
+        .iter()
+        .any(|entry| file == entry || file.starts_with(&format!("{entry}/")))
+}
+
+/* ------------------------------------------------------------------ report -- */
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictKind {
+    /// Written by this module, then changed in the checkout. Never overwritten.
+    Edited,
+    /// There before this module ever wrote it, and not the bundle's bytes.
+    Untracked,
+    /// The new version no longer provides it, and it was edited, so it is kept.
+    RemovedEdited,
+    /// The path resolves outside the checkout (a link or a junction on the way). Not touched.
+    Unsafe,
+}
+
+/// A file left alone, with enough to show a diff.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Conflict {
+    pub path: String,
+    pub kind: ConflictKind,
+    /// What the checkout holds now. `None` when there is no file to hash — a directory in its
+    /// place, or a path that could not be resolved.
+    pub local_hash: Option<String>,
+    /// What this module last wrote there, when it ever did.
+    pub recorded_hash: Option<String>,
+    /// What the bundle provides now, when it still provides it.
+    pub bundle_hash: Option<String>,
+    /// The bundle's copy of the file, absolute, for the diff. `None` for a removed file.
+    pub bundle_file: Option<String>,
+}
+
+/// Whether a run writes or only says what it would write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Apply,
+    Preview,
+}
+
+/// What one bundle's materialization did — or, in preview, would do.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Report {
+    pub name: String,
+    pub version: String,
+    /// Whether anything was written. `false` for a preview, whose lists say what WOULD happen.
+    pub applied: bool,
+    /// Missing, and written.
+    pub written: Vec<String>,
+    /// Unchanged since the last write, and replaced by the new version.
+    pub updated: Vec<String>,
+    /// Already the bundle's bytes, and recorded as this module's from now on.
+    pub adopted: Vec<String>,
+    /// No longer provided, unchanged since written, and removed.
+    pub deleted: Vec<String>,
+    /// Already current. Counted, not listed: it is the ordinary case.
+    pub unchanged: usize,
+    pub conflicts: Vec<Conflict>,
+    /// Paths the manifest named that the daemon installs itself. See [`reserved`].
+    pub reserved: Vec<String>,
+}
+
+impl Report {
+    /// Whether the bundle provided nothing here at all — an `owns:` list that is empty, or that
+    /// names nothing the bundle has. Not worth a word in a feed line.
+    pub fn is_empty(&self) -> bool {
+        self.written.is_empty()
+            && self.updated.is_empty()
+            && self.adopted.is_empty()
+            && self.deleted.is_empty()
+            && self.unchanged == 0
+            && self.conflicts.is_empty()
+            && self.reserved.is_empty()
+    }
+
+    /// One line for the feed.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        for (count, word) in [
+            (self.written.len(), "written"),
+            (self.updated.len(), "updated"),
+            (self.adopted.len(), "adopted"),
+            (self.deleted.len(), "removed"),
+        ] {
+            if count > 0 {
+                parts.push(format!("{count} {word}"));
+            }
+        }
+        if parts.is_empty() {
+            parts.push("nothing to change".to_string());
+        }
+        if !self.conflicts.is_empty() {
+            parts.push(format!(
+                "{} left alone because they were edited here",
+                self.conflicts.len()
+            ));
+        }
+        format!("{}@{}: {}", self.name, self.version, parts.join(", "))
+    }
+}
+
+/* ------------------------------------------------------------ materialize -- */
+
+fn io(error: impl std::fmt::Display) -> String {
+    error.to_string()
+}
+
+/// What the checkout holds at `target`: `Ok(None)` for nothing, `Err(())` for something that is not
+/// a file, `Ok(Some(hash))` for a file.
+fn local_hash(target: &Path) -> Result<Option<String>, ()> {
+    match std::fs::symlink_metadata(target) {
+        Err(_) => Ok(None),
+        Ok(meta) if meta.is_file() => std::fs::read(target)
+            .map(|bytes| Some(workflows::hash_of(&bytes)))
+            .map_err(|_| ()),
+        Ok(_) => Err(()),
+    }
+}
+
+/// Remove directories left empty by a deletion, up to (never including) `root`.
+fn prune_empty_parents(root: &Path, file: &Path) {
+    let mut dir = file.parent();
+    while let Some(current) = dir {
+        if current == root || !current.starts_with(root) {
+            return;
+        }
+        // `remove_dir` refuses a directory that is not empty, which is the whole test.
+        if std::fs::remove_dir(current).is_err() {
+            return;
+        }
+        dir = current.parent();
+    }
+}
+
+/// Materialize one bundle into `checkout`, recording what was written in `record_path`.
+///
+/// `bundle` is read from its own directory (`bundle.path`): the library's version directory, or a
+/// project's ejected copy. Returns the report, or an error when nothing could be decided safely —
+/// an unreadable record, or a bundle that cannot be walked. A per-file failure to write is an
+/// error too, and the record is saved first for every file already written, so a second run
+/// resumes rather than reporting its own writes as somebody's edits.
+pub fn materialize(
+    bundle: &workflows::Bundle,
+    checkout: &Path,
+    record_path: &Path,
+    mode: Mode,
+) -> Result<Report, String> {
+    let bundle_dir = Path::new(&bundle.path);
+    let mut record = read_record(record_path)?;
+    let before = record.clone();
+    let previous = record
+        .bundles
+        .get(&bundle.name)
+        .map(|recorded| recorded.files.clone())
+        .unwrap_or_default();
+
+    let entries = owns_entries(&bundle.owns);
+    let mut report = Report {
+        name: bundle.name.clone(),
+        version: bundle.version.clone(),
+        applied: mode == Mode::Apply,
+        ..Report::default()
+    };
+
+    let mut offered = BTreeMap::new();
+    if !entries.is_empty() {
+        for (path, hash) in workflows::file_hashes(bundle_dir).map_err(io)? {
+            if !provided(&entries, &path) {
+                continue;
+            }
+            if reserved(&path) {
+                report.reserved.push(path);
+                continue;
+            }
+            offered.insert(path, hash);
+        }
+    }
+
+    let mut files: BTreeMap<String, String> = BTreeMap::new();
+    let mut outcome: Result<(), String> = Ok(());
+
+    for (path, bundle_hash) in &offered {
+        let recorded = previous.get(path).cloned();
+        let conflict = |kind, local: Option<String>| Conflict {
+            path: path.clone(),
+            kind,
+            local_hash: local,
+            recorded_hash: recorded.clone(),
+            bundle_hash: Some(bundle_hash.clone()),
+            bundle_file: Some(bundle_dir.join(path).to_string_lossy().into_owned()),
+        };
+        let Ok(target) = crate::inspect::safe_write_target(checkout, path) else {
+            report.conflicts.push(conflict(ConflictKind::Unsafe, None));
+            continue;
+        };
+        let local = match local_hash(&target) {
+            Ok(local) => local,
+            Err(()) => {
+                report
+                    .conflicts
+                    .push(conflict(ConflictKind::Untracked, None));
+                continue;
+            }
+        };
+
+        let write = match (&local, &recorded) {
+            (Some(local), _) if local == bundle_hash => {
+                if recorded.as_deref() == Some(bundle_hash.as_str()) {
+                    report.unchanged += 1;
+                } else {
+                    report.adopted.push(path.clone());
+                }
+                files.insert(path.clone(), bundle_hash.clone());
+                false
+            }
+            (None, _) => {
+                report.written.push(path.clone());
+                true
+            }
+            (Some(local), Some(recorded)) if local == recorded => {
+                report.updated.push(path.clone());
+                true
+            }
+            (Some(local), Some(recorded)) => {
+                report
+                    .conflicts
+                    .push(conflict(ConflictKind::Edited, Some(local.clone())));
+                // Kept as it was: the file is still the one this module last wrote plus somebody's
+                // edit, and the next run must go on seeing it as edited rather than as untracked.
+                files.insert(path.clone(), recorded.clone());
+                false
+            }
+            (Some(local), None) => {
+                report
+                    .conflicts
+                    .push(conflict(ConflictKind::Untracked, Some(local.clone())));
+                false
+            }
+        };
+
+        if !write || mode == Mode::Preview {
+            continue;
+        }
+        let written = if outcome.is_ok() {
+            std::fs::read(bundle_dir.join(path))
+                .and_then(|bytes| {
+                    // Hashed again from the bytes actually written: the bundle could change between
+                    // the walk and the copy, and the record must describe the file on disk.
+                    let hash = workflows::hash_of(&bytes);
+                    crate::project_state::write_bytes_atomically(&target, &bytes).map(|()| hash)
+                })
+                .map_err(|error| format!("{path}: {error}"))
+        } else {
+            Err(String::new())
+        };
+        match written {
+            Ok(hash) => {
+                files.insert(path.clone(), hash);
+            }
+            Err(error) => {
+                if outcome.is_ok() {
+                    outcome = Err(error);
+                }
+                // Not written, so what this module last wrote there is still what it last wrote.
+                // Dropping it would make the untouched file read as somebody's on the retry.
+                if let Some(recorded) = recorded {
+                    files.insert(path.clone(), recorded);
+                }
+            }
+        }
+    }
+
+    // What the previous version provided and this one does not.
+    for (path, recorded) in &previous {
+        if offered.contains_key(path) || reserved(path) {
+            continue;
+        }
+        let Ok(target) = crate::inspect::safe_write_target(checkout, path) else {
+            continue;
+        };
+        match local_hash(&target) {
+            Ok(None) => {}
+            Ok(Some(local)) if &local == recorded => {
+                report.deleted.push(path.clone());
+                if mode == Mode::Apply {
+                    let removed = if outcome.is_ok() {
+                        std::fs::remove_file(&target).map_err(|error| format!("{path}: {error}"))
+                    } else {
+                        Err(String::new())
+                    };
+                    match removed {
+                        Ok(()) => prune_empty_parents(checkout, &target),
+                        Err(error) => {
+                            if outcome.is_ok() {
+                                outcome = Err(error);
+                            }
+                            files.insert(path.clone(), recorded.clone());
+                        }
+                    }
+                }
+            }
+            Ok(local) => {
+                report.conflicts.push(Conflict {
+                    path: path.clone(),
+                    kind: ConflictKind::RemovedEdited,
+                    local_hash: local,
+                    recorded_hash: Some(recorded.clone()),
+                    bundle_hash: None,
+                    bundle_file: None,
+                });
+                // Kept with the hash this module last wrote, not dropped: the file is still ours
+                // plus somebody's edit, and every later run must go on reporting it — and may
+                // still remove it once the edit is reverted to what was written.
+                files.insert(path.clone(), recorded.clone());
+            }
+            Err(()) => {}
+        }
+    }
+
+    if mode == Mode::Apply {
+        if files.is_empty() {
+            record.bundles.remove(&bundle.name);
+        } else {
+            record.bundles.insert(
+                bundle.name.clone(),
+                RecordedBundle {
+                    version: bundle.version.clone(),
+                    files,
+                },
+            );
+        }
+        // Written even when a file failed, and before the failure is returned: every file already
+        // written is recorded, so the retry sees them as this module's and not as somebody's edits.
+        if record != before {
+            crate::project_state::write_atomically(record_path, &render_record(&record))
+                .map_err(|error| format!("{}: {error}", record_path.display()))?;
+        }
+    }
+    outcome.map(|()| report)
+}
+
+/* ------------------------------------------------------------------- pins -- */
+
+/// What happened to one pinned workflow when a checkout was synced.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PinOutcome {
+    pub name: String,
+    pub version: String,
+    /// Why nothing was materialized, when nothing was. See [`source_of`].
+    pub skipped: Option<String>,
+    pub report: Option<Report>,
+    /// A failure after the run started. The checkout may be partly written; the record says which.
+    pub error: Option<String>,
+}
+
+impl PinOutcome {
+    /// Whether this checkout is left without the workflow it pins, which is what a feed line has to
+    /// say. An adopted workflow is not: it is the project's own folder, there is nothing to put.
+    pub fn is_missing(&self) -> bool {
+        self.error.is_some()
+            || self
+                .skipped
+                .as_deref()
+                .is_some_and(|why| !why.starts_with("adopted"))
+    }
+}
+
+/// Where a pin's files come from, or why they come from nowhere.
+///
+/// - **Adopted** (`pin.path`): the project's own folder, already where it is read. Nothing to do.
+/// - **Ejected**, with its copy present in `checkout`: the copy. Ejecting is taking the files into
+///   the project, so the project's copy — not the library's — is what it runs.
+/// - Otherwise **the library** at the pinned version, and only when it still hashes to the pin:
+///   a drifted bundle is bytes nobody pinned, and these files govern what an agent does.
+pub fn source_of(
+    checkout: &Path,
+    pin: &workflows::Pin,
+    library_root: &Path,
+) -> Result<workflows::Bundle, String> {
+    if pin.path.is_some() {
+        return Err("adopted: the project's own folder is already in place".to_string());
+    }
+    if pin.ejected_at.is_some()
+        && let Some(copy) = workflows::copy_path(checkout, pin).filter(|dir| dir.is_dir())
+    {
+        return workflows::read_bundle(&copy, &pin.name, &pin.version)
+            .map_err(io)?
+            .ok_or_else(|| "ejected: the project's copy has no bundle.yaml".to_string());
+    }
+    let dir = library_root.join(&pin.name).join(&pin.version);
+    let bundle = workflows::read_bundle(&dir, &pin.name, &pin.version)
+        .map_err(io)?
+        .ok_or_else(|| format!("missing: the library has no {}@{}", pin.name, pin.version))?;
+    if bundle.hash != pin.hash {
+        return Err(format!(
+            "drifted: the library's {}@{} is not what was pinned",
+            pin.name, pin.version
+        ));
+    }
+    Ok(bundle)
+}
+
+/// Materialize every workflow `pins_file` pins — or only `only`, when given — into `checkout`.
+pub fn sync(
+    checkout: &Path,
+    pins_file: &Path,
+    library_root: &Path,
+    record_path: &Path,
+    only: Option<&str>,
+    mode: Mode,
+) -> Result<Vec<PinOutcome>, String> {
+    let pins = workflows::read_pins(pins_file)?;
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for pin in pins.workflows {
+        if only.is_some_and(|name| name != pin.name) {
+            continue;
+        }
+        seen.insert(pin.name.clone());
+        let mut outcome = PinOutcome {
+            name: pin.name.clone(),
+            version: pin.version.clone(),
+            skipped: None,
+            report: None,
+            error: None,
+        };
+        match source_of(checkout, &pin, library_root) {
+            Err(why) => outcome.skipped = Some(why),
+            Ok(bundle) => match materialize(&bundle, checkout, record_path, mode) {
+                Ok(report) => outcome.report = Some(report),
+                Err(error) => outcome.error = Some(error),
+            },
+        }
+        out.push(outcome);
+    }
+    if let Some(name) = only
+        && !seen.contains(name)
+    {
+        return Err(format!("this project does not use {name}"));
+    }
+    Ok(out)
+}
+
+/* --------------------------------------------------------------- worktrees -- */
+
+/// Materialize a project's pinned workflows into a worktree the daemon just created.
+///
+/// **Fail-soft, and loudly so.** A job whose tree lacks its workflow still has its code, its task
+/// and its gate; failing it would trade a degraded run for none. But a run without its rules looks
+/// exactly like a run nobody gave rules to, so every pin that did not arrive is a warning in the
+/// log and a `worktree_workflow_missing` line in the feed, naming what is missing and why.
+///
+/// A project with no state directory, no pins or no library is a project using no workflow, which
+/// is not a failure and says nothing.
+pub async fn into_worktree(
+    pool: &sqlx::SqlitePool,
+    machine_root: Option<&Path>,
+    library_root: Option<&Path>,
+    project_id: &str,
+    worktree: &Path,
+) {
+    let (Some(machine_root), Some(library_root)) = (machine_root, library_root) else {
+        return;
+    };
+    // `integration-*` trees are never synced, by decision rather than by omission. They are the
+    // daemon's own merge-computation checkouts (`git_exec::integration_worktree`): no agent runs
+    // in one, `prepare_integration_worktree` resets and cleans it before every operation, and the
+    // gate that measures a merge there must measure the merge commit as it is, not the commit plus
+    // untracked rules this module put beside it. No caller passes one today — they are opened by
+    // `git_exec`, never by `worktree::create_at` — and this guard keeps it that way if one ever does.
+    if worktree.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .starts_with(crate::git_exec::INTEGRATION_PREFIX)
+    }) {
+        return;
+    }
+    let Some(state_dir) = crate::project_state::dir(machine_root, project_id) else {
+        return;
+    };
+    let pins_file = state_dir.join(crate::project_state::PINS_FILE);
+    if !pins_file.is_file() {
+        return;
+    }
+    let record = worktree_record(&state_dir, worktree);
+    let checkout = worktree.to_path_buf();
+    let library = library_root.to_path_buf();
+    let synced = tokio::task::spawn_blocking(move || {
+        sync(&checkout, &pins_file, &library, &record, None, Mode::Apply)
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result);
+
+    let missing: Vec<String> = match synced {
+        Err(error) => vec![error],
+        Ok(outcomes) => {
+            for outcome in &outcomes {
+                if let Some(report) = &outcome.report
+                    && !report.conflicts.is_empty()
+                {
+                    tracing::warn!(
+                        project_id,
+                        worktree = %worktree.display(),
+                        workflow = %outcome.name,
+                        conflicts = report.conflicts.len(),
+                        "a worktree already held edited copies of workflow files; they were left alone"
+                    );
+                }
+            }
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.is_missing())
+                .map(|outcome| {
+                    format!(
+                        "{}@{} ({})",
+                        outcome.name,
+                        outcome.version,
+                        outcome
+                            .error
+                            .as_deref()
+                            .or(outcome.skipped.as_deref())
+                            .unwrap_or("unknown")
+                    )
+                })
+                .collect()
+        }
+    };
+    if missing.is_empty() {
+        return;
+    }
+    let said = format!(
+        "{} is missing its workflow: {}",
+        worktree
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| worktree.display().to_string()),
+        missing.join("; ")
+    );
+    tracing::warn!(project_id, worktree = %worktree.display(), "{said}");
+    if let Err(error) = crate::feed::append(
+        pool,
+        Some(project_id),
+        "worktree_workflow_missing",
+        &said,
+        None,
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, project_id, "a worktree is missing its workflow and the feed line was not recorded");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A library holding one bundle, and a checkout beside it. Returns (library, checkout, record).
+    fn setup(files: &[(&str, &str)], owns: &[&str]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        shelve(temp.path(), "1.0", files, owns);
+        let record = temp.path().join("state").join("materialized.yaml");
+        (temp, checkout, record)
+    }
+
+    fn shelve(root: &Path, version: &str, files: &[(&str, &str)], owns: &[&str]) {
+        let dir = root.join("lib").join("dev").join(version);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = format!(
+            "owns:\n{}",
+            owns.iter()
+                .map(|entry| format!("  - {entry}\n"))
+                .collect::<String>()
+        );
+        std::fs::write(dir.join(workflows::MANIFEST), manifest).unwrap();
+        for (path, contents) in files {
+            let target = dir.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, contents).unwrap();
+        }
+    }
+
+    fn bundle(root: &Path, version: &str) -> workflows::Bundle {
+        workflows::read_bundle(&root.join("lib").join("dev").join(version), "dev", version)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn a_first_run_writes_every_owned_file_and_nothing_else() {
+        let (temp, checkout, record) = setup(
+            &[
+                (".ai/workflow/workflow.md", "the pipeline"),
+                (".ai/workflow/dispatch.md", "dispatch"),
+                (".claude/agents/wf-planner.md", "planner"),
+                ("graph.yaml", "nodes: []"),
+            ],
+            &[".ai/workflow/", ".claude/agents/wf-planner.md"],
+        );
+        let report =
+            materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+
+        assert_eq!(report.written.len(), 3);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(
+            read(&checkout.join(".ai/workflow/workflow.md")),
+            "the pipeline"
+        );
+        assert_eq!(
+            read(&checkout.join(".claude/agents/wf-planner.md")),
+            "planner"
+        );
+        // The graph and the manifest are the library's; only what `owns` names is provided.
+        assert!(!checkout.join("graph.yaml").exists());
+        assert!(!checkout.join(workflows::MANIFEST).exists());
+
+        let recorded = read_record(&record).unwrap();
+        assert_eq!(recorded.bundles["dev"].version, "1.0");
+        assert_eq!(
+            recorded.bundles["dev"].files[".ai/workflow/workflow.md"],
+            workflows::hash_of(b"the pipeline")
+        );
+        assert!(read(&record).starts_with("# Written by NucleOS."));
+    }
+
+    /// The 2026-09-19 loss, as a test: an edited file survives a new version, and says so.
+    #[test]
+    fn an_edited_file_is_never_overwritten_and_an_unchanged_one_is() {
+        let (temp, checkout, record) =
+            setup(&[("a.md", "one"), ("b.md", "two")], &["a.md", "b.md"]);
+        materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        std::fs::write(checkout.join("a.md"), "mine").unwrap();
+
+        shelve(
+            temp.path(),
+            "1.1",
+            &[("a.md", "ONE"), ("b.md", "TWO")],
+            &["a.md", "b.md"],
+        );
+        let report =
+            materialize(&bundle(temp.path(), "1.1"), &checkout, &record, Mode::Apply).unwrap();
+
+        assert_eq!(read(&checkout.join("a.md")), "mine");
+        assert_eq!(read(&checkout.join("b.md")), "TWO");
+        assert_eq!(report.updated, vec!["b.md".to_string()]);
+        assert_eq!(report.conflicts.len(), 1);
+        let conflict = &report.conflicts[0];
+        assert_eq!(conflict.kind, ConflictKind::Edited);
+        assert_eq!(
+            conflict.local_hash.as_deref(),
+            Some(workflows::hash_of(b"mine").as_str())
+        );
+        assert_eq!(
+            conflict.recorded_hash.as_deref(),
+            Some(workflows::hash_of(b"one").as_str())
+        );
+        assert_eq!(
+            conflict.bundle_hash.as_deref(),
+            Some(workflows::hash_of(b"ONE").as_str())
+        );
+        assert!(conflict.bundle_file.as_deref().unwrap().ends_with("a.md"));
+
+        // And it stays a conflict on the next run, rather than turning into an untracked file.
+        let again =
+            materialize(&bundle(temp.path(), "1.1"), &checkout, &record, Mode::Apply).unwrap();
+        assert_eq!(again.conflicts[0].kind, ConflictKind::Edited);
+        assert_eq!(again.unchanged, 1);
+    }
+
+    #[test]
+    fn a_file_there_before_is_a_conflict_unless_it_is_already_the_bundles() {
+        let (temp, checkout, record) = setup(
+            &[("same.md", "same"), ("other.md", "bundle")],
+            &["same.md", "other.md"],
+        );
+        std::fs::write(checkout.join("same.md"), "same").unwrap();
+        std::fs::write(checkout.join("other.md"), "somebody's").unwrap();
+
+        let report =
+            materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        assert_eq!(report.adopted, vec!["same.md".to_string()]);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(report.conflicts[0].kind, ConflictKind::Untracked);
+        assert!(report.conflicts[0].recorded_hash.is_none());
+        assert_eq!(read(&checkout.join("other.md")), "somebody's");
+
+        let recorded = read_record(&record).unwrap();
+        assert!(recorded.bundles["dev"].files.contains_key("same.md"));
+        assert!(!recorded.bundles["dev"].files.contains_key("other.md"));
+    }
+
+    #[test]
+    fn a_file_the_new_version_dropped_is_removed_only_when_nobody_touched_it() {
+        let (temp, checkout, record) = setup(
+            &[("keep.md", "k"), ("gone/a.md", "a"), ("edited.md", "e")],
+            &["keep.md", "gone", "edited.md"],
+        );
+        materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        std::fs::write(checkout.join("edited.md"), "mine").unwrap();
+
+        shelve(temp.path(), "2.0", &[("keep.md", "k")], &["keep.md"]);
+        let report =
+            materialize(&bundle(temp.path(), "2.0"), &checkout, &record, Mode::Apply).unwrap();
+
+        assert_eq!(report.deleted, vec!["gone/a.md".to_string()]);
+        assert!(
+            !checkout.join("gone").exists(),
+            "an emptied directory goes with its file"
+        );
+        assert_eq!(read(&checkout.join("edited.md")), "mine");
+        assert_eq!(report.conflicts[0].kind, ConflictKind::RemovedEdited);
+        let recorded = read_record(&record).unwrap();
+        assert_eq!(recorded.bundles["dev"].version, "2.0");
+        // The edited file stays recorded with what was written, so later runs still see it as
+        // edited rather than forgetting it; the removed one is gone from the record.
+        assert_eq!(
+            recorded.bundles["dev"].files.keys().collect::<Vec<_>>(),
+            vec!["edited.md", "keep.md"]
+        );
+        assert_eq!(
+            recorded.bundles["dev"].files["edited.md"],
+            workflows::hash_of(b"e")
+        );
+    }
+
+    #[test]
+    fn f5_an_edited_removed_file_stays_recorded_for_later_syncs() {
+        let (temp, checkout, record) = setup(&[("edited.md", "before")], &["edited.md"]);
+        materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        std::fs::write(checkout.join("edited.md"), "mine").unwrap();
+
+        shelve(temp.path(), "2.0", &[], &[]);
+        let removed =
+            materialize(&bundle(temp.path(), "2.0"), &checkout, &record, Mode::Apply).unwrap();
+        assert_eq!(removed.conflicts[0].kind, ConflictKind::RemovedEdited);
+
+        let again =
+            materialize(&bundle(temp.path(), "2.0"), &checkout, &record, Mode::Apply).unwrap();
+        assert_eq!(again.conflicts.len(), 1);
+        assert_eq!(again.conflicts[0].kind, ConflictKind::RemovedEdited);
+    }
+
+    #[tokio::test]
+    async fn f5_a_missing_workflow_is_fail_soft_and_writes_a_feed_line() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        crate::project_state::write_for_test(
+            temp.path(),
+            "project",
+            crate::project_state::PINS_FILE,
+            "workflows:\n  - name: dev\n    version: 1.0\n    hash: sha256:missing\n    origin: test\n",
+        );
+
+        into_worktree(
+            &pool,
+            Some(temp.path()),
+            Some(&temp.path().join("library")),
+            "project",
+            &worktree,
+        )
+        .await;
+
+        let kind: String = sqlx::query_scalar("SELECT kind FROM feed ORDER BY id DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kind, "worktree_workflow_missing");
+        assert!(worktree.is_dir());
+    }
+
+    #[test]
+    fn a_preview_writes_nothing_and_says_what_it_would_do() {
+        let (temp, checkout, record) = setup(&[("a.md", "one")], &["a.md"]);
+        let report = materialize(
+            &bundle(temp.path(), "1.0"),
+            &checkout,
+            &record,
+            Mode::Preview,
+        )
+        .unwrap();
+        assert!(!report.applied);
+        assert_eq!(report.written, vec!["a.md".to_string()]);
+        assert!(!checkout.join("a.md").exists());
+        assert!(!record.exists());
+    }
+
+    /// The hook the daemon installs is never a bundle's, whatever the manifest claims.
+    #[test]
+    fn the_files_the_daemon_installs_are_never_materialized() {
+        let (temp, checkout, record) = setup(
+            &[
+                (".claude/settings.json", "{}"),
+                (".claude/hooks/ask_daemon.py", "evil"),
+                (".claude/skills/plan/SKILL.md", "plan"),
+            ],
+            &[".claude"],
+        );
+        let report =
+            materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        assert_eq!(
+            report.written,
+            vec![".claude/skills/plan/SKILL.md".to_string()]
+        );
+        assert_eq!(report.reserved.len(), 2);
+        assert!(!checkout.join(".claude/settings.json").exists());
+        assert!(!checkout.join(".claude/hooks").exists());
+    }
+
+    /// An entry that climbs out of the project is dropped before it can be joined onto anything.
+    #[test]
+    fn an_owns_entry_that_leaves_the_project_provides_nothing() {
+        assert_eq!(
+            owns_entries(&[
+                "../outside".into(),
+                "/etc".into(),
+                "C:/x".into(),
+                r".ai\x".into(),
+                "./.ai/workflow/".into(),
+            ]),
+            vec![".ai/workflow".to_string()]
+        );
+    }
+
+    /// Without the record an unchanged file and an edited one look the same, so a record that
+    /// cannot be read stops the run instead of being guessed around.
+    #[test]
+    fn an_unreadable_record_stops_the_run_before_anything_is_written() {
+        let (temp, checkout, record) = setup(&[("a.md", "one")], &["a.md"]);
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(&record, "bundles: [not, a, map").unwrap();
+        assert!(materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).is_err());
+        assert!(!checkout.join("a.md").exists());
+    }
+
+    /// A tree named by the daemon's path and by a canonical one shares one record.
+    #[cfg(windows)]
+    #[test]
+    fn one_worktree_spelled_two_ways_keeps_one_record() {
+        let state = Path::new("/state");
+        let plain = worktree_record(state, Path::new(r"C:\trees\job-12"));
+        assert_eq!(
+            plain,
+            worktree_record(state, Path::new(r"\\?\c:\Trees\job-12"))
+        );
+        assert_eq!(plain, worktree_record(state, Path::new("C:/trees/job-12")));
+    }
+
+    /// The daemon's merge-computation trees run no agent, so they get no workflow — and no feed
+    /// line saying it is missing, which is what a pin with no library would otherwise produce.
+    #[tokio::test]
+    async fn an_integration_tree_is_never_synced() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp
+            .path()
+            .join(format!("{}project", crate::git_exec::INTEGRATION_PREFIX));
+        std::fs::create_dir_all(&tree).unwrap();
+        crate::project_state::write_for_test(
+            temp.path(),
+            "project",
+            crate::project_state::PINS_FILE,
+            "workflows:\n  - name: dev\n    version: 1.0\n    hash: sha256:missing\n    origin: test\n",
+        );
+
+        into_worktree(
+            &pool,
+            Some(temp.path()),
+            Some(&temp.path().join("library")),
+            "project",
+            &tree,
+        )
+        .await;
+
+        let lines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(lines, 0);
+    }
+
+    #[test]
+    fn two_worktrees_with_one_name_keep_two_records() {
+        let state = Path::new("/state");
+        let a = worktree_record(state, Path::new("/one/feature"));
+        let b = worktree_record(state, Path::new("/two/feature"));
+        assert_ne!(a, b);
+        assert!(a.starts_with(state.join("materialized")));
+        assert!(
+            a.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("feature-")
+        );
+    }
+
+    /// The pins decide what is synced: a drifted bundle is not, an ejected one comes from the
+    /// project's copy, an adopted one is the project's own folder and needs nothing.
+    #[test]
+    fn syncing_follows_the_pins_and_refuses_bytes_nobody_pinned() {
+        let (temp, checkout, record) = setup(&[("a.md", "one")], &["a.md"]);
+        let pins = temp
+            .path()
+            .join("state")
+            .join(crate::project_state::PINS_FILE);
+        let library = temp.path().join("lib");
+        workflows::install(&pins, &bundle(temp.path(), "1.0")).unwrap();
+
+        let outcomes = sync(&checkout, &pins, &library, &record, None, Mode::Apply).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].report.as_ref().unwrap().written.len(), 1);
+
+        std::fs::write(library.join("dev/1.0/a.md"), "tampered").unwrap();
+        let outcomes = sync(&checkout, &pins, &library, &record, None, Mode::Apply).unwrap();
+        assert!(
+            outcomes[0]
+                .skipped
+                .as_deref()
+                .unwrap()
+                .starts_with("drifted")
+        );
+        assert!(outcomes[0].is_missing());
+        assert_eq!(read(&checkout.join("a.md")), "one");
+
+        assert!(
+            sync(
+                &checkout,
+                &pins,
+                &library,
+                &record,
+                Some("nope"),
+                Mode::Preview
+            )
+            .is_err()
+        );
+    }
+}

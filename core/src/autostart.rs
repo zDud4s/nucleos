@@ -82,8 +82,10 @@ fn register(exe_path: &Path) -> std::io::Result<()> {
 /// The dev build layout is `<repo_root>/core/target/debug/nucleos-core.exe` — the repo root is
 /// four directory levels up from the exe file (debug -> target -> core -> repo root). Falls back
 /// to the exe's own directory if the path is shallower than that (e.g. a future packaged layout),
-/// which is still a reasonable place to look for `.ai/nucleos-models.yaml` (Chunk 5 Task 1) even
-/// if not exactly right for every possible layout — better than omitting `<WorkingDirectory>`
+/// which is still a reasonable working directory even if not exactly right for every possible
+/// layout. It no longer decides where this machine's settings are read from (`~/.nucleos/` does
+/// that), but it is still where the one-time copy of an old `.ai/` looks, and still what the
+/// daemon's remaining relative paths resolve against — better than omitting `<WorkingDirectory>`
 /// altogether, which Task Scheduler does NOT default to the exe's own directory on its own.
 fn working_directory_for(exe_path: &Path) -> PathBuf {
     exe_path

@@ -335,7 +335,7 @@ describe("what runs on its own", () => {
     // Where that switch lives is one press away, not a line every opening has to read past.
     const section = screen.getByRole("region", { name: "GitHub operations without asking" });
     fireEvent.click(within(section).getAllByRole("button", { name: "why?" })[0]);
-    expect(section.textContent).toContain(".ai/github.yaml");
+    expect(section.textContent).toContain("~/.nucleos/github.yaml");
   });
 
   /**
@@ -1104,7 +1104,7 @@ describe("the remote", () => {
 
     const section = await remote();
     expect(section.textContent).toContain("gh is not on this machine's PATH");
-    expect(section.textContent).toMatch(/\.ai\/github\.yaml/);
+    expect(section.textContent).toMatch(/~\/\.nucleos\/github\.yaml/);
   });
 
   /**

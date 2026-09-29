@@ -55,6 +55,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ingest  # noqa: E402
+import layer as layer_module  # noqa: E402
 
 # Overridable, because a checked-in script that only runs on the machine it was written on is a
 # personal note with a path in the repository. Defaults are this machine's.
@@ -166,20 +167,38 @@ def start_approver(project):
     )
 
 
-def activate(project, tree):
-    """Put the cell's own project in `shadow`, rooted at the cell's own tree.
+def onboarding_request(layer, tree):
+    """The body of `POST /projects/{id}/onboard` for one cell: its tree, and its layer's gate.
+
+    Pure, so a test can hold it without a daemon. The gate is `layer.gate_for`'s — H3's, and `None`
+    ("no gate confirmed") for every other layer, which leaves the project's rules untouched.
+    """
+    return {"project_root": tree, "gate_command": layer_module.gate_for(layer)}
+
+
+def activate(project, tree, layer):
+    """Onboard the cell's own project, then put it in `shadow`, rooted at the cell's own tree.
 
     Needed since `a840181`: a worktree run for a project in `off` is refused, and a project this
     daemon has never heard of reads as off. `shadow`, not `active` — the gate refuses only `off`,
     and `shadow` is the least the door accepts.
 
-    Checked to be inert before it was written. The scheduler, the repo trigger and the webhook all
-    act only on `.ai/autopilot.yaml` rules, and an eval tree has none: H2 has no file at all (the
-    loader answers `AutopilotRules::default()`), and H3's carries `gate_command` and `schedules: []`
-    and no `repo_triggers`. The project exists for exactly one reason — so this cell's run is let in.
+    Onboarding first, because the mode door refuses a project nobody onboarded. It goes through the
+    daemon rather than through files, so the marker and H3's gate land where the daemon reads them —
+    `~/.nucleos/projects/<project>/` — under the id this function registers. It also (re)wires the
+    classifier hook at the tree's ROOT, which the H2/H3 trees already carry: the root is what
+    activation inspects, and the worktree the agent is handed is checked out from HEAD, which this
+    does not touch.
 
-    Raises the daemon's `HTTPError` when activation is refused, so the caller records the cell.
+    Checked to be inert before it was written. The scheduler, the repo trigger and the webhook all
+    act only on a project's autopilot rules, and an eval project has none but H3's `gate_command`:
+    no `schedules`, no `repo_triggers`. The project exists for exactly one reason — so this cell's
+    run is let in.
+
+    Raises the daemon's `HTTPError` when onboarding or activation is refused, so the caller records
+    the cell.
     """
+    call(f"/projects/{project}/onboard", "POST", onboarding_request(layer, tree))
     call("/autopilot/state", "POST", {"project_id": project, "mode": "shadow", "project_root": tree})
 
 
@@ -421,7 +440,7 @@ def main(argv):
                 body["project_id"] = project
                 # After `prepare`, not before: activation inspects the tree `layer.py` just wrote.
                 try:
-                    activate(project, tree)
+                    activate(project, tree, layer)
                 except urllib.error.HTTPError as error:
                     say(f"    ativacao recusada: HTTP {error.code} {error.read().decode()[:200]}")
                     results.append((task, layer, "refused", None, None, None))

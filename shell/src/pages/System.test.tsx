@@ -145,15 +145,17 @@ const MACHINE_AREAS = [
 
 function machineWorld(): MachineConfig {
   return {
-    root: "C:/Projects/nucleos",
+    root: "C:/Users/someone/.nucleos",
+    root_display: "~/.nucleos",
     settings: MACHINE_AREAS.map((area) => ({
-      path: `.ai/${area}.yaml`,
+      path: `${area}.yaml`,
+      display: `~/.nucleos/${area}.yaml`,
       area,
       what: `what ${area} does`,
       takes_effect: "when the daemon restarts",
       exists: false,
       contents: null,
-      resolved: `C:/Projects/nucleos/.ai/${area}.yaml`,
+      resolved: `C:/Users/someone/.nucleos/${area}.yaml`,
     })),
   };
 }
@@ -1072,16 +1074,16 @@ describe("System - this machine's settings", () => {
     expect(daemon.apiFetch).toHaveBeenCalledWith("/config/machine");
   });
 
-  it("names the absolute file each row would write, not the relative one", async () => {
+  it("names the absolute file each row would write, beside the name a person is shown", async () => {
     const world = systemWorld();
     daemon.apiFetch.mockImplementation(systemFetch(world));
 
     await renderSystemAt("/system/settings");
 
-    // There are twenty-odd worktrees on this machine and every one has an
-    // `.ai/`. The relative path alone would let somebody edit settings with
-    // great confidence in the wrong checkout.
-    expect(await screen.findByText("C:/Projects/nucleos/.ai/voice.yaml")).toBeDefined();
+    // "Which file is this" gets the real answer, and the editor is labelled with
+    // the `~/.nucleos/` spelling rather than a bare file name.
+    expect(await screen.findByText("C:/Users/someone/.nucleos/voice.yaml")).toBeDefined();
+    expect(await screen.findByLabelText("~/.nucleos/voice.yaml")).toBeDefined();
   });
 
   it("saves a file and shows what the daemon said about when it starts mattering", async () => {
@@ -1090,13 +1092,13 @@ describe("System - this machine's settings", () => {
 
     await renderSystemAt("/system/settings");
 
-    const editor = await screen.findByLabelText(".ai/calendar.yaml");
+    const editor = await screen.findByLabelText("~/.nucleos/calendar.yaml");
     fireEvent.change(editor, { target: { value: 'working_hours_start: "10:00"\n' } });
     fireEvent.click(within(editor.closest("section") as HTMLElement).getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
       expect(
-        world.machine.settings.find((row) => row.path === ".ai/calendar.yaml")?.contents,
+        world.machine.settings.find((row) => row.path === "calendar.yaml")?.contents,
       ).toContain("10:00");
     });
     // Saved is not the same as in effect, and the page says which it means. The
@@ -1112,14 +1114,14 @@ describe("System - this machine's settings", () => {
 
     await renderSystemAt("/system/settings");
 
-    const editor = await screen.findByLabelText(".ai/browser.yaml");
+    const editor = await screen.findByLabelText("~/.nucleos/browser.yaml");
     fireEvent.change(editor, { target: { value: "!!bad\n" } });
     fireEvent.click(within(editor.closest("section") as HTMLElement).getByRole("button", { name: "Save" }));
 
     // The daemon's sentence, not a generic "invalid" that would send somebody
     // back to a file they cannot see to look for a line nobody named.
     expect(await screen.findByText(/did not find expected node content/)).toBeDefined();
-    expect(world.machine.settings.find((row) => row.path === ".ai/browser.yaml")?.exists).toBe(false);
+    expect(world.machine.settings.find((row) => row.path === "browser.yaml")?.exists).toBe(false);
   });
 });
 

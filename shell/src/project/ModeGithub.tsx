@@ -636,7 +636,7 @@ function sentencesFor(refusal: ApiRefusal): Record<string, string> {
 
 const ADVICE: Record<number, string> = {
   403: "The token lives in this machine's Credential Manager and the daemon reads it there at every call, so pasting one and asking again is all this needs.",
-  503: "Either GitHub is switched off for this machine (enabled in .ai/github.yaml, on the System page) or gh is not installed where the daemon can find it. The sentence before this says which; fix it, then restart the daemon.",
+  503: "Either GitHub is switched off for this machine (enabled in ~/.nucleos/github.yaml, on the System page) or gh is not installed where the daemon can find it. The sentence before this says which; fix it, then restart the daemon.",
   504: "GitHub or the network took longer than the núcleo waits. Asking again should settle it.",
 };
 
@@ -796,7 +796,7 @@ function RowFailure({ error, sentences }: { error: unknown; sentences: Record<st
  * What each operation DOES, in words, beside the id the daemon knows it by.
  *
  * `pr_list` is a name for the machine; "list open pull requests" is the sentence somebody decides
- * on. The id stays on the row, in mono, because it is what a refusal quotes and what `.ai/github.yaml`
+ * on. The id stays on the row, in mono, because it is what a refusal quotes and what `~/.nucleos/github.yaml`
  * is written in. A kind this map does not know is drawn by its id alone — a new operation must not
  * wait for this table to be granted.
  */
@@ -885,7 +885,7 @@ function AutonomousOps({ projectId, stopped }: { projectId: string; stopped: boo
         A granted read is used when an agent types <span className="font-mono">gh …</span> in one of
         this project's worktrees, and only while GitHub is switched on for this machine:{" "}
         <span className="font-mono">enabled: false</span> in{" "}
-        <span className="font-mono">.ai/github.yaml</span> (System › Settings) makes the núcleo
+        <span className="font-mono">~/.nucleos/github.yaml</span> (System › Settings) makes the núcleo
         ignore every project's grants, and nothing on this page overrides that. A granted action is
         stored and does nothing yet. An operation this build does not allow is listed so you know it
         exists; nothing on this machine can grant it.

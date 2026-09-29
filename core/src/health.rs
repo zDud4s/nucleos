@@ -18,9 +18,8 @@
 use serde::Serialize;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::fs::OpenOptions;
 use std::future::Future;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -82,18 +81,6 @@ pub struct HealthReadout {
     pub subsystems: Vec<SubsystemReadout>,
 }
 
-#[derive(Debug, Serialize)]
-#[cfg_attr(not(test), allow(dead_code))]
-struct HealthBreachIntent {
-    task_id: &'static str,
-    problem: String,
-    outcome: &'static str,
-    constraints: &'static str,
-    open_questions: &'static str,
-    accepted_by: &'static str,
-    accepted_at: String,
-}
-
 #[cfg_attr(not(test), allow(dead_code))]
 impl HealthReadout {
     /// A degraded or down aggregate is the health signal's breach; disabled is not a breach.
@@ -102,26 +89,30 @@ impl HealthReadout {
     }
 }
 
+/// The feed kind a breached health signal is recorded under.
+pub const BREACH_INTENT_KIND: &str = "health_breach_intent";
+
 /// Records one breached health signal without starting any autonomous work.
 ///
 /// This is deliberately a seam rather than a call from [`readout`]: health polling has no project
 /// rules, and wiring this recorder into a trigger is an owner-approved follow-up. When enabled by
-/// the caller, one JSONL record matching the intent packet's fields is appended to the project's
-/// local ledger.
+/// the caller, one line is written to that project's feed, under [`BREACH_INTENT_KIND`].
+///
+/// **The feed, and no longer `.ai/local/ledgers/intents.jsonl`.** That ledger is the AI dev
+/// workflow's, in the project's own `.ai/` folder, and the product has no business writing into it
+/// — the same line `project_state.rs` draws for the rules file. The feed is the daemon's own record
+/// of what happened to a project, it is where a person already looks, and it needed no new table.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn record_breach_intent(
-    project_root: &Path,
+pub async fn record_breach_intent(
+    pool: &SqlitePool,
+    project_id: &str,
     rules: &crate::config::AutopilotRules,
     readout: &HealthReadout,
-) -> io::Result<bool> {
+) -> sqlx::Result<bool> {
     if !rules.health_breach_intent || !readout.is_breach() {
         return Ok(false);
     }
 
-    let ledger = project_root.join(".ai/local/ledgers/intents.jsonl");
-    if let Some(parent) = ledger.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let problem = format!(
         "Health signal breached: status={}; {}",
         health_state_name(readout.status),
@@ -139,19 +130,19 @@ pub fn record_breach_intent(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let record = HealthBreachIntent {
-        task_id: "health-breach",
-        problem,
-        outcome: "Review the breached health signal before taking action.",
-        constraints: "Recording only; do not enqueue a job, start a run, or touch the approval queue.",
-        open_questions: "none",
-        accepted_by: "health-monitor",
-        accepted_at: chrono::Utc::now().to_rfc3339(),
-    };
-    let mut file = OpenOptions::new().create(true).append(true).open(ledger)?;
-    let serialized = serde_json::to_string(&record).map_err(io::Error::other)?;
-    file.write_all(serialized.as_bytes())?;
-    file.write_all(b"\n")?;
+    let summary = format!(
+        "{problem}. Review it before taking action; this is a record only, and nothing was \
+         queued, started or sent for approval."
+    );
+    crate::feed::append(
+        pool,
+        Some(project_id),
+        BREACH_INTENT_KIND,
+        &summary,
+        None,
+        None,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -547,7 +538,7 @@ async fn speaker_probe(configured: bool, command: String) -> SubsystemReadout {
 /// Whether the GitHub pillar could act if it were asked to.
 ///
 /// **`asked_for` is `enabled` AND the file existing, and both halves are load-bearing.**
-/// `GithubConfig::enabled` defaults to TRUE so that a machine with no `.ai/github.yaml` is capable
+/// `GithubConfig::enabled` defaults to TRUE so that a machine with no `~/.nucleos/github.yaml` is capable
 /// of everything and autonomous in nothing — which means `enabled` alone can no longer distinguish
 /// "the owner wants this" from "the owner has never heard of it". Grading on `enabled` alone would
 /// put a red row on every installation that has never touched GitHub, and this module's own header
@@ -1021,8 +1012,8 @@ mod tests {
 
     /// Why not `down`: a `down` row takes the whole readout down, and with `health_breach_intent`
     /// on that writes a breach record for a hole nobody has.
-    #[test]
-    fn an_unwired_missing_interpreter_leaves_the_aggregate_up_and_writes_no_breach() {
+    #[tokio::test]
+    async fn an_unwired_missing_interpreter_leaves_the_aggregate_up_and_writes_no_breach() {
         let subsystems = vec![
             SubsystemReadout::ok("sqlite_pool"),
             hook_interpreter_row(None, false),
@@ -1034,13 +1025,17 @@ mod tests {
         assert_eq!(readout.status, HealthState::Ok);
         assert!(!readout.is_breach());
 
-        let root = tempfile::tempdir().unwrap();
+        let pool = migrated_pool().await;
         let rules = crate::config::AutopilotRules {
             health_breach_intent: true,
             ..Default::default()
         };
-        assert!(!record_breach_intent(root.path(), &rules, &readout).unwrap());
-        assert!(!root.path().join(".ai/local/ledgers/intents.jsonl").exists());
+        assert!(
+            !record_breach_intent(&pool, "alpha", &rules, &readout)
+                .await
+                .unwrap()
+        );
+        assert_eq!(breach_lines(&pool).await, 0);
 
         // The control: wired somewhere, the same missing interpreter still takes the readout down.
         assert_eq!(
@@ -1100,42 +1095,57 @@ mod tests {
         assert!(hook_wired_in_any_project(&pool).await);
     }
 
-    #[test]
-    fn health_breach_intent_is_inert_when_the_rule_is_off() {
-        let root = tempfile::tempdir().unwrap();
+    /// How many breach lines the feed holds.
+    async fn breach_lines(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = ?")
+            .bind(BREACH_INTENT_KIND)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_breach_intent_is_inert_when_the_rule_is_off() {
+        let pool = migrated_pool().await;
         let result = record_breach_intent(
-            root.path(),
+            &pool,
+            "alpha",
             &crate::config::AutopilotRules::default(),
             &breached_readout(),
         )
+        .await
         .unwrap();
 
         assert!(!result);
-        assert!(!root.path().join(".ai/local/ledgers/intents.jsonl").exists());
+        assert_eq!(breach_lines(&pool).await, 0);
     }
 
-    #[test]
-    fn an_enabled_health_breach_writes_one_intent_packet_record() {
-        let root = tempfile::tempdir().unwrap();
+    /// One feed line, on the project's own feed, naming what breached — and nothing written into
+    /// any project folder, which is where the old ledger used to be.
+    #[tokio::test]
+    async fn an_enabled_health_breach_writes_one_feed_line() {
+        let pool = migrated_pool().await;
         let rules = crate::config::AutopilotRules {
             health_breach_intent: true,
             ..Default::default()
         };
-        let readout = breached_readout();
 
-        assert!(record_breach_intent(root.path(), &rules, &readout).unwrap());
-
-        let ledger =
-            std::fs::read_to_string(root.path().join(".ai/local/ledgers/intents.jsonl")).unwrap();
-        assert_eq!(ledger.lines().count(), 1);
-        let record: serde_json::Value = serde_json::from_str(ledger.trim()).unwrap();
-        assert_eq!(record["task_id"], "health-breach");
-        assert_eq!(
-            record["outcome"],
-            "Review the breached health signal before taking action."
+        assert!(
+            record_breach_intent(&pool, "alpha", &rules, &breached_readout())
+                .await
+                .unwrap()
         );
-        assert!(record["problem"].as_str().unwrap().contains("cli_binary"));
-        assert!(record["accepted_at"].as_str().unwrap().contains('T'));
+
+        let rows: Vec<(Option<String>, String)> =
+            sqlx::query_as("SELECT project_id, summary FROM feed WHERE kind = ?")
+                .bind(BREACH_INTENT_KIND)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.as_deref(), Some("alpha"));
+        assert!(rows[0].1.contains("cli_binary"), "{}", rows[0].1);
+        assert!(rows[0].1.contains("nothing was queued"), "{}", rows[0].1);
     }
 
     #[test]

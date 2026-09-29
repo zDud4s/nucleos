@@ -105,7 +105,7 @@ export function promotionConfirmLabel(project: ProjectSummary): string {
 /**
  * One prerequisite of a mode change: words before a path, the path, words after it.
  *
- * The path is its own field so a surface with room can draw it as a path (`<code>`) — three of
+ * The path is its own field so a surface with room can draw it as a path (`<code>`) — two of
  * the five prerequisites are files a person has to go and look at, and inside a sentence they could
  * only be read. Any of the three parts may be absent; `prerequisiteText` joins them back into words.
  */
@@ -128,9 +128,12 @@ export interface PrerequisiteList {
 /**
  * What the mode door says when it says no.
  *
- * The 422 is the one worth writing copy for, and the copy is deliberately a *list* rather than a
- * diagnosis: the route answers a bare status with an empty body for four different prerequisites,
- * so the honest answer names all four and admits which one is unknown.
+ * The bare 422 is the one worth writing copy for, and the copy is deliberately a *list* rather than
+ * a diagnosis: the route answers it with an empty body for three different prerequisites, so the
+ * honest answer names all of them and admits which one is unknown. The fourth, a project nobody
+ * onboarded, comes back NAMED — `not_onboarded` — because it is the one a page can resolve in
+ * place, by running onboarding; it is still listed here, since a surface that cannot tell the two
+ * apart must not drop it.
  *
  * **The list is data, and each surface renders it the way it can** — as a list where there is room,
  * each path drawn as a path, or as the prose sentence `MODE_REFUSAL_PROSE` joins from it, inside a
@@ -138,6 +141,7 @@ export interface PrerequisiteList {
  */
 export const MODE_SENTENCES: {
   unprocessable: PrerequisiteList;
+  not_onboarded: string;
   bad_request: string;
   internal: string;
 } = {
@@ -145,12 +149,14 @@ export const MODE_SENTENCES: {
     lead: "the núcleo would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these:",
     items: [
       { text: "a folder" },
-      { path: ".ai/workflow/workflow.md", after: " inside it" },
+      { text: "the project onboarded to NucleOS" },
       { path: ".claude/hooks/ask_daemon.py", after: " on disk" },
       { text: "a PreToolUse hook in ", path: ".claude/settings.json", after: " naming that file" },
     ],
     plus: { text: "to act, a folder that is a git repository" },
   },
+  not_onboarded:
+    "this project has not been onboarded — onboard it, confirming the command that decides whether it is green, and try again",
   bad_request: "that is not one of the three settings",
   internal: "the núcleo hit an error of its own while changing this",
 };
@@ -176,6 +182,7 @@ function prerequisiteProse(list: PrerequisiteList): string {
  */
 export const MODE_REFUSAL_PROSE: Record<string, string> = {
   unprocessable: prerequisiteProse(MODE_SENTENCES.unprocessable),
+  not_onboarded: MODE_SENTENCES.not_onboarded,
   bad_request: MODE_SENTENCES.bad_request,
   internal: MODE_SENTENCES.internal,
 };

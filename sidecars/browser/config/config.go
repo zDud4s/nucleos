@@ -3,7 +3,7 @@
 // Package config reads the sidecar's entire configuration from the environment.
 //
 // Like the web and email sidecars this process holds no config file of its own and stores nothing on
-// disk. The owner's settings live in `.ai/browser.yaml`, are read by the núcleo, and arrive here as
+// disk. The owner's settings live in `~/.nucleos/browser.yaml`, are read by the núcleo, and arrive here as
 // variables — so there is exactly one place where the pillar is configured, and it is the one the
 // classifier guards (spec §3.5, §8).
 package config
@@ -41,7 +41,7 @@ type Config struct {
 	// Chrome of the same major version.
 	ExecutablePath string
 	// CacheMB, MaxProfiles and DiskBudgetMB are spec §8's ceilings, read by the núcleo from
-	// `.ai/browser.yaml`. They arrive here as numbers because this process has no config file: one
+	// `~/.nucleos/browser.yaml`. They arrive here as numbers because this process has no config file: one
 	// place is configured, and it is the one the classifier guards.
 	CacheMB      int
 	MaxProfiles  int
@@ -51,7 +51,7 @@ type Config struct {
 // DefaultAddr follows the daemon (8791), echo (8792), email attachments (8793) and web (8794).
 const DefaultAddr = "127.0.0.1:8795"
 
-// The defaults match the `.ai/browser.yaml` spec §8 ships, so a sidecar started with nothing but a
+// The defaults match the `~/.nucleos/browser.yaml` spec §8 ships, so a sidecar started with nothing but a
 // token behaves the way the documented configuration says it does.
 const (
 	defaultOpenTimeout  = 30 * time.Second

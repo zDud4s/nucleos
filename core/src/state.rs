@@ -149,7 +149,7 @@ pub type RunTails = Arc<Mutex<HashMap<i64, Arc<Mutex<String>>>>>;
 /// The email pillar's process-wide settings, resolved once at startup.
 ///
 /// Grouped into one struct rather than spread across `AppState` because they are read together and
-/// change together: spec §3.4 makes this config startup-time on purpose, so editing `.ai/email.yaml`
+/// change together: spec §3.4 makes this config startup-time on purpose, so editing `~/.nucleos/email.yaml`
 /// means restarting the daemon, never recompiling it.
 /// `Debug` is written by hand rather than derived, and the test at the bottom of this file is what
 /// keeps it that way — see `sidecar_token` below.
@@ -352,20 +352,18 @@ pub struct AppState {
     /// variable, which is process-global: two tests setting it would race, and `set_var` is
     /// `unsafe` in this edition for exactly that reason.
     pub workflow_library: Option<std::path::PathBuf>,
-    /// The directory every row in [`crate::machine_config`] is relative to — the daemon's own
-    /// working directory, resolved once at startup.
+    /// The directory every row in [`crate::machine_config`] is relative to — `~/.nucleos/`, from
+    /// [`crate::machine_config::root`], resolved once at startup and the same one `main.rs` loaded
+    /// every settings file from.
     ///
-    /// Once and not per request, for the reason `files_root` is canonicalised once: a process does
-    /// not change its working directory here, so a second reading would be the same answer bought
-    /// again. And a FIELD rather than `std::env::current_dir()` called inline, for exactly the
-    /// reason given for `workflow_library` above — it is what makes this root a thing a test can
-    /// point somewhere else, where the alternative would be a process-global environment variable
-    /// two tests would race on.
+    /// A FIELD rather than `machine_config::root()` called inline, for exactly the reason given for
+    /// `workflow_library` above — it is what makes this root a thing a test can point somewhere
+    /// else, where the alternative would be a process-global environment variable two tests would
+    /// race on, or a test writing into a real home directory.
     ///
-    /// `None` means the daemon could not name its own working directory, which is a real failure
-    /// and not a configuration: every route under `/config/machine` refuses rather than guessing at
-    /// a root. It is also what the test state carries, so the hundreds of tests that never touch
-    /// these routes need no directory to exist.
+    /// `None` means this machine has no home directory: every route under `/config/machine` refuses
+    /// rather than guessing at a root. It is also what the test state carries, so the hundreds of
+    /// tests that never touch these routes need no directory to exist.
     pub machine_config_root: Option<std::path::PathBuf>,
     /// Where this machine's credentials live.
     ///
@@ -377,7 +375,7 @@ pub struct AppState {
     /// The trait cannot READ a secret back, only answer whether one is set. See its own doc.
     pub secrets: std::sync::Arc<dyn crate::secrets::SecretStore>,
     /// The standing instructions a Telegram turn is launched with when the chat itself gave none,
-    /// resolved once at startup from `.ai/telegram.yaml`.
+    /// resolved once at startup from `~/.nucleos/telegram.yaml`.
     ///
     /// `None` — absent file, unreadable file, malformed file, or a `doctrine` that was blank —
     /// means every turn is launched exactly as it was before this field existed: nothing prepended,

@@ -94,11 +94,12 @@ pub fn resolved_within(root: &Path, rel: &str) -> Result<PathBuf, InspectError> 
     Ok(resolved)
 }
 
-/// Where a WRITE of `rel` should land, refused unless it lands inside the project.
+/// Where a WRITE of `rel` should land, refused unless it lands inside `root`.
 ///
-/// [`resolved_within`] cannot answer this, and the reason is the whole point of a second function:
-/// it canonicalizes the target, and a write's target routinely does not exist yet. `.ai/` itself may
-/// not exist in a project that has never been given rules.
+/// `root` is whatever directory the file belongs in: a project's folder, this machine's
+/// `~/.nucleos/`, or a project's state directory under it. [`resolved_within`] cannot answer this,
+/// and the reason is the whole point of a second function: it canonicalizes the target, and a
+/// write's target routinely does not exist yet — a subdirectory on the way to it may not either.
 ///
 /// So this resolves the deepest ancestor that DOES exist and requires that to be inside the root.
 /// That is the same guarantee for the same threat — a directory symlink or a junction inside the
@@ -932,8 +933,8 @@ pub(crate) mod tests {
 
     /// A file that does not exist yet is a legitimate write target, and this is the case
     /// `resolved_within` cannot serve: it canonicalizes the target, and there is nothing to
-    /// canonicalize. A project that has never been given rules has no `.ai/` either, so the missing
-    /// ancestor is the ordinary case rather than the edge one.
+    /// canonicalize. A directory on the way to a file nobody has written yet is often missing too,
+    /// so the missing ancestor is the ordinary case rather than the edge one.
     #[test]
     fn a_file_that_does_not_exist_yet_is_a_target() {
         let root = tempdir().unwrap();

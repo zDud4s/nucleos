@@ -246,6 +246,12 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     email_sent_mailbox_foreign: { tone: "danger", label: "sent mail filed elsewhere" },
     // Project settings and machine lines.
     config_written: { tone: "info", label: "project file written" },
+    // A project brought under NucleOS: by a person on the onboarding panel, or at startup for one
+    // that passed the old check (`onboarding.rs`). A record, like the write beside it.
+    project_onboarded: { tone: "info", label: "project onboarded" },
+    // A breached health readout, recorded for review and nothing more (`health.rs`). Pending,
+    // because it is a thing somebody is asked to look at; nothing was started on its account.
+    health_breach_intent: { tone: "pending", label: "health breach recorded" },
     workflow_changed: { tone: "info", label: "workflow changed" },
     command_finished: { tone: "info", label: "project command finished" },
     action_authorized: { tone: "info", label: "action authorised by a grant" },

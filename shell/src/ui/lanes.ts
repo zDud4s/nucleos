@@ -113,6 +113,8 @@ const LANE_OF: Record<string, FeedLane> = {
   "web.read": "errands",
 
   config_written: "machine",
+  project_onboarded: "machine",
+  health_breach_intent: "machine",
   workflow_changed: "machine",
   command_finished: "machine",
   action_authorized: "machine",

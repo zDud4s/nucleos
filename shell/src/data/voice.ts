@@ -34,7 +34,7 @@ export interface VoiceConfigView {
   /** The whole availability signal for the capture Teach — see this module's header. */
   armed: boolean;
   hints: string[];
-  /** The cleanup prompt's TEXT. There is no file path on the wire — it lives in `.ai/voice.yaml`. */
+  /** The cleanup prompt's TEXT. There is no file path on the wire — it lives in `~/.nucleos/voice.yaml`. */
   cleanup_prompt: string;
   /** `null` means cleanup is unarmed: every capture comes back `"raw"`. */
   cleanup_model: string | null;

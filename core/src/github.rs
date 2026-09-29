@@ -1351,7 +1351,7 @@ fn gh_forms() -> &'static [GhForm] {
 /// decision. The pillar has two doors and each was governed in its own vocabulary: `ACTION_CEILING`
 /// and `action_is_autonomous` speak operation KINDS, `READ_CEILING` and `read_is_autonomous` speak
 /// `gh` PREFIXES. Two vocabularies for one question is how the two doors came to answer it
-/// differently, and the design measured what that costs an owner: a `.ai/github.yaml` without `gh
+/// differently, and the design measured what that costs an owner: a `~/.nucleos/github.yaml` without `gh
 /// run view` stops an agent that types it into Bash and hands the same agent the same bytes through
 /// `github_read {op: run_status}`. One list of NAMES can govern both doors only if something can say
 /// which name a command line spells. This says it.
@@ -1627,7 +1627,7 @@ pub fn every_op() -> Vec<OpStanding> {
 
 /// What runs without asking.
 ///
-/// Built from `.ai/github.yaml` at startup as the MACHINE default, and immutable once built — it
+/// Built from `~/.nucleos/github.yaml` at startup as the MACHINE default, and immutable once built — it
 /// does no I/O after construction, which is what lets `classifier::classify` take it by reference
 /// and stay pure. There is deliberately no hot reload: a policy a run could reload is a policy a run
 /// could change in the middle of itself.
@@ -1908,12 +1908,12 @@ impl Default for Policy {
 /// empty list is working as intended. Those are different sentences to read at two in the morning,
 /// and only one of them is a problem.
 ///
-/// `Default` is what an ABSENT `.ai/github.yaml` produces — on, and autonomous in nothing — so a
+/// `Default` is what an ABSENT `~/.nucleos/github.yaml` produces — on, and autonomous in nothing — so a
 /// test that does not care about GitHub gets the shipped state rather than an invented one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubRuntime {
     pub enabled: bool,
-    /// Whether `.ai/github.yaml` EXISTS. Not whether it says anything useful.
+    /// Whether `~/.nucleos/github.yaml` EXISTS. Not whether it says anything useful.
     ///
     /// It is here because `enabled` defaults to true, so `enabled` alone can no longer answer "did
     /// anybody ask for this pillar" — and `health.rs` needs that answer or every machine that has
@@ -2409,7 +2409,7 @@ impl From<sqlx::Error> for DecisionError {
 /// The single place that answers "does this run now, or does it wait for a person".
 ///
 /// Shared by the HTTP route and by whatever internal trigger comes later, because two copies of this
-/// decision is how the tool and the trigger would come to disagree about the same `.ai/github.yaml`.
+/// decision is how the tool and the trigger would come to disagree about the same `~/.nucleos/github.yaml`.
 ///
 /// **A READ never files a proposal, and that is not an omission.** What limits reads is the EFFECT
 /// (`ReadOp::effect`) and not the autonomy list: a read that returns a stranger's prose marks the
@@ -3638,7 +3638,7 @@ mod tests {
     /// arrive, and without that narrowing `gh api -X DELETE` would run in Bash unasked.
     #[tokio::test]
     async fn api_read_is_never_autonomous_by_any_route_that_can_ask_for_it() {
-        // Route one: the owner's `.ai/github.yaml`, asking for it in both lists and asking beside
+        // Route one: the owner's `~/.nucleos/github.yaml`, asking for it in both lists and asking beside
         // entries the ceilings DO admit — so a narrowing that dropped the whole file would satisfy
         // this by accident and the kept entries prove it did not.
         let owner = policy_from(Some(
@@ -4043,7 +4043,7 @@ mod tests {
     /// What the map does not do, measured rather than promised.
     ///
     /// The map names an operation; it does not change who runs it. Under the WIDEST policy a
-    /// `.ai/github.yaml` can express — both ceilings, whole — the two doors still answer differently
+    /// `~/.nucleos/github.yaml` can express — both ceilings, whole — the two doors still answer differently
     /// about eleven of the sixteen operations, and this pins which eleven. Reads run typed whatever
     /// the list says (`submit`: *«A READ never files a proposal, and that is not an omission»*), and
     /// no action is ever autonomous in Bash because no `ACTION_CEILING` kind has a `READ_CEILING`

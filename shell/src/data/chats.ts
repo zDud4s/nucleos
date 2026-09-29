@@ -542,7 +542,7 @@ export function useChats() {
 /**
  * The models a conversation may be moved to.
  *
- * Not polled. This changes when somebody edits `.ai/nucleos-models.yaml`, which
+ * Not polled. This changes when somebody edits `~/.nucleos/nucleos-models.yaml`, which
  * is not something that happens while a menu is open — and a picker that
  * reshuffles under the cursor is worse than one a reload fixes. `staleTime` of
  * an hour rather than `Infinity` so a daemon restart is eventually noticed

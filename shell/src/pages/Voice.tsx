@@ -383,7 +383,7 @@ function CaptureButtons({
           same fact as a capture succeeding.
         </p>
         <p>
-          Configuration for this pillar lives in <code>.ai/voice.yaml</code>.
+          Configuration for this pillar lives in <code>~/.nucleos/voice.yaml</code>.
         </p>
       </Teach>
     );
@@ -534,7 +534,7 @@ function ConfigReadout({ config }: { config: ReturnType<typeof useVoiceConfig> }
             </ul>
           )}
           <p className="voice-config-source">
-            Read from <code>.ai/voice.yaml</code> — the prompt above is the literal text this pillar
+            Read from <code>~/.nucleos/voice.yaml</code> — the prompt above is the literal text this pillar
             uses, not a path to the file it comes from.
           </p>
         </>

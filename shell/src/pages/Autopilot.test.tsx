@@ -510,7 +510,76 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
   });
 
   /**
-   * The bare 422: four prerequisites share one status with an empty body, so the page lists them
+   * The named 422: a project nobody onboarded. The page says so — no workflow path anywhere — and
+   * offers onboarding in place; confirming it sends the gate as shown and asks for the mode again.
+   */
+  it("a project that was not onboarded is offered onboarding, and the change is retried after it", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "off", project_root: "C:/repos/alpha" })],
+      refuseMode: new ApiRefusal(422, "not_onboarded", "not_onboarded"),
+    });
+    const base = cockpitFetch(world);
+    const sent: unknown[] = [];
+    const view = (onboarded: boolean) => ({
+      project_id: "alpha",
+      root: "C:/repos/alpha",
+      onboarded: onboarded
+        ? {
+            onboarded_at: "now",
+            project_root: "C:/repos/alpha",
+            gate_command: "make ci",
+            harnesses: [],
+            hook_installed: true,
+            migrated: false,
+          }
+        : null,
+      marker_path: "~/.nucleos/projects/alpha/onboarded.yaml",
+      harnesses: [{ path: ".claude", what: "skills", files: 3 }],
+      proposed_gate: { command: "make ci", source: "Makefile" },
+      configured_gate: null,
+      hook_wired: onboarded,
+    });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path.startsWith("/projects/alpha/onboard")) {
+        if (init?.method === "POST") {
+          sent.push(JSON.parse(String(init.body)));
+          world.refuseMode = null;
+          return view(true);
+        }
+        return view(false);
+      }
+      return base(path, init);
+    });
+
+    await renderCockpit();
+    fireEvent.click(await screen.findByRole("button", { name: "Watch in shadow" }));
+
+    const note = await waitFor(() => {
+      const found = document.querySelector<HTMLElement>(".ap-fan-refusal");
+      expect(found).not.toBeNull();
+      return found as HTMLElement;
+    });
+    expect(note.textContent).toContain("has not been onboarded");
+    expect(note.textContent).not.toMatch(/\.ai\/|workflow\.md/);
+    expect(screen.queryByLabelText("Folder for alpha")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Onboard alpha" }));
+    const gate = (await screen.findByLabelText("Gate command")) as HTMLInputElement;
+    expect(gate.value).toBe("make ci");
+    fireEvent.click(screen.getByRole("button", { name: "onboard it" }));
+
+    await waitFor(() => expect(sent).toEqual([{ project_root: "C:/repos/alpha", gate_command: "make ci" }]));
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/autopilot/state", {
+        method: "POST",
+        body: JSON.stringify({ project_id: "alpha", mode: "shadow", project_root: "C:/repos/alpha" }),
+      });
+      expect(world.projects[0].mode).toBe("shadow");
+    });
+  });
+
+  /**
+   * The bare 422: three prerequisites share one status with an empty body, so the page lists them
    * all — each path drawn as a path — and admits it does not know which is missing. Then it hands
    * focus to the one of them the shell can supply, and the retry sends the refused mode again with
    * the folder that was typed.

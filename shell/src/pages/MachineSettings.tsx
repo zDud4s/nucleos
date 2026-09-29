@@ -58,14 +58,14 @@ export function MachineSettings() {
     <>
       <Panel title="This machine">
         <p className="sy-note">
-          These files belong to the daemon rather than to any project, and they are read from the
-          directory it was launched in. Every one of them is validated before a byte is written: a
+          These files belong to the daemon rather than to any project, and they live in your{" "}
+          <code>{config.data.root_display}</code> folder. Every one of them is validated before a byte is written: a
           file that would not parse is refused with the parser's own words, and what is on disk is
           left alone.
         </p>
         <dl className="sy-config-facts">
           <div className="sy-fact">
-            <dt>working directory</dt>
+            <dt>folder</dt>
             <dd>{config.data.root}</dd>
           </div>
         </dl>
@@ -127,7 +127,7 @@ function SettingPanel({
       </dl>
 
       <label className="sy-setting-label" htmlFor={`setting-${setting.area}`}>
-        <span className="sy-meta">{setting.path}</span>
+        <span className="sy-meta">{setting.display}</span>
       </label>
       <textarea
         id={`setting-${setting.area}`}

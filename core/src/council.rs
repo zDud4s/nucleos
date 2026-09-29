@@ -30,9 +30,10 @@ use crate::config::{CouncilConfig, CouncilSeat, SeatAgent, SeatKind, SeatSpec};
 /// And not `.ai/council.yaml`, which is where this started. `.ai/` is the agent harness's own
 /// directory inside one checkout, so the roster only existed for a daemon started from that
 /// directory, and every worktree on this machine was a council that had to be written again. The
-/// pillar is the product's, not the harness's; the file follows.
+/// pillar is the product's, not the harness's; the file follows. Every other machine setting
+/// followed it later, which is why the directory is now [`crate::machine_config::root`].
 pub fn config_path() -> Option<PathBuf> {
-    crate::commands::home().map(|home| home.join(".nucleos").join("council.yaml"))
+    crate::machine_config::root().map(|root| root.join(crate::machine_config::COUNCIL_FILE))
 }
 
 /// The same file as a person is shown it, and the only spelling any refusal uses.
@@ -1016,7 +1017,8 @@ pub struct RosterOverride {
 ///
 /// The accepted cost: a roster naming a deleted agent is discovered only when somebody asks a
 /// question. That refusal happens before the budget check and before any row is written, so it
-/// costs the owner one clear error and nothing else. It is the same cost `.ai/autopilot.yaml`
+/// costs the owner one clear error and nothing else. It is the same cost a project's
+/// `autopilot.yaml`
 /// already pays by naming a project root that has since moved.
 async fn resolve_roster(
     state: &crate::state::AppState,
@@ -5514,11 +5516,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a loopback OpenAI-compatible server (FreeToken / vLLM / llama.cpp / LM Studio) already serving the configured `local_assistant_model`, on a machine with enough RAM to hold a frontier MoE's expert pool — the 15.8 GB on this one is not enough"]
     async fn a_real_frontier_moe_answers_a_council_seat() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("core/ has a parent");
-        let models = crate::config::load_models_config(&repo.join(".ai/nucleos-models.yaml"))
-            .expect("the daemon's own models config must parse");
+        // The file the daemon reads, on purpose: the question is about THIS machine's model.
+        let root = crate::machine_config::root().expect("this machine must have a home directory");
+        let models =
+            crate::config::load_models_config(&root.join(crate::config::MODELS_CONFIG_FILE))
+                .expect("the daemon's own models config must parse");
         let engine = models
             .local_engine()
             .expect("`local_engine` must resolve for this test to mean anything");

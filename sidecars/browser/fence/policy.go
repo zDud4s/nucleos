@@ -616,7 +616,7 @@ func OriginOf(raw string) string {
 
 // NormaliseEntry brings a list entry into the shape [OriginOf] produces, or returns "".
 //
-// A bare host is accepted because that is what an owner writes in `.ai/browser.yaml`, and it gains
+// A bare host is accepted because that is what an owner writes in `~/.nucleos/browser.yaml`, and it gains
 // https:// rather than http:// — when an entry is ambiguous, the reading that must not win is the
 // permissive one.
 func NormaliseEntry(entry string) string {

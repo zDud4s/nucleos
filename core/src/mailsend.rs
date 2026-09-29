@@ -111,7 +111,7 @@ pub async fn send(state: &AppState, message: &SendRequest) -> Result<(), SendFai
 
     if state.email.smtp_host.trim().is_empty() {
         return Err(SendFailure::NotConfigured(
-            "no submission host is configured — set smtp_host in .ai/email.yaml",
+            "no submission host is configured — set smtp_host in ~/.nucleos/email.yaml",
         ));
     }
 

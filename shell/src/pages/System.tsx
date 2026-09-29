@@ -80,7 +80,7 @@ import "./system.css";
  *
  * The settings view is what answers that confession. `GET`/`POST
  * /config/machine` now serve the whole of this machine's settings — the nine
- * `.ai/*.yaml` whose author is the daemon rather than any project — so every
+ * files under `~/.nucleos/` whose author is the daemon rather than any project — so every
  * pillar can be configured here instead of in a text editor followed by a
  * restart. The config index above it stays, narrowed to what it is actually
  * good at: showing what the daemon is RUNNING, which is a different reading

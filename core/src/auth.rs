@@ -2318,8 +2318,8 @@ mod tests {
 
     /// Writing a project's own rules is the owner's, and nobody else's.
     ///
-    /// The file behind this route is `.ai/autopilot.yaml`, and it carries `gate_command` — the
-    /// command whose exit code decides what *green* means for every run in the project. A key that
+    /// The file behind this route is the project's `autopilot.yaml`, and it carries `gate_command` —
+    /// the command whose exit code decides what *green* means for every run in the project. A key that
     /// could rewrite it could set the gate to `true` and pass every gate it will ever face, which
     /// makes this the one write on the project surface where the blast radius is the whole quality
     /// bar rather than one file.
@@ -2359,6 +2359,99 @@ mod tests {
             &Method::GET,
             "/projects/7/ownership"
         ));
+
+        // Reading the claimed file's TEXT is not the fence, it is the rules — `gate_command`
+        // included — and `GET /projects/{id}/rules`, which serves the same facts, has always been
+        // Admin's. So `owned` is in no table either.
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits(&scope, &Method::GET, "/projects/7/owned"),
+                "{scope:?} must not read a project's rules file"
+            );
+        }
+    }
+
+    /// Onboarding a project is the owner's: the POST sets the gate command and writes an executable
+    /// hook into a folder it may be told the name of, and the GET serves the rules' gate, which
+    /// `GET /projects/{id}/rules` has always kept to Admin. Safe today by being in no table, and
+    /// this is what says no to filing either beside the `/projects/{id}/…` reads.
+    #[test]
+    fn onboarding_a_project_is_in_no_scope_table() {
+        const ONBOARD_ROUTE: &str = "/projects/{id}/onboard";
+        for method in [Method::GET, Method::POST] {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, &method, ONBOARD_ROUTE)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &method, ONBOARD_ROUTE)
+                    && !route_is_listed(TEAM_ROUTES, &method, ONBOARD_ROUTE)
+                    && !route_is_listed(EMAIL_ROUTES, &method, ONBOARD_ROUTE)
+                    && !route_is_listed(COUNCIL_ROUTES, &method, ONBOARD_ROUTE),
+                "{method} {ONBOARD_ROUTE} must stay out of every scope table"
+            );
+            for scope in [
+                Scope::Run(7),
+                Scope::ApiToken(ApiTokenLevel::ReadOnly),
+                Scope::ApiToken(ApiTokenLevel::RunCreating),
+            ] {
+                assert!(
+                    !permits(&scope, &method, "/projects/7/onboard"),
+                    "{scope:?} must not reach {method} {ONBOARD_ROUTE}"
+                );
+            }
+            assert!(permits(
+                &Scope::ApiToken(ApiTokenLevel::Admin),
+                &method,
+                "/projects/7/onboard"
+            ));
+        }
+    }
+
+    /// Placing a workflow's files is the owner's: the POSTs write files that govern what every
+    /// agent in the project does — skills, cockpits, the pipeline itself — and the preview GET names
+    /// them with their hashes. Safe today by being in no table, and this says no to filing the GET
+    /// beside the `/projects/{id}/…` reads or the sync beside `/vcs/land`, which a run may call.
+    #[test]
+    fn placing_a_workflows_files_is_in_no_scope_table() {
+        for (method, route, concrete) in [
+            (
+                Method::GET,
+                "/projects/{id}/workflows/{name}/materialize",
+                "/projects/7/workflows/dev/materialize",
+            ),
+            (
+                Method::POST,
+                "/projects/{id}/workflows/{name}/materialize",
+                "/projects/7/workflows/dev/materialize",
+            ),
+            (Method::POST, "/workflows/sync", "/workflows/sync"),
+        ] {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, &method, route)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &method, route)
+                    && !route_is_listed(TEAM_ROUTES, &method, route)
+                    && !route_is_listed(EMAIL_ROUTES, &method, route)
+                    && !route_is_listed(COUNCIL_ROUTES, &method, route),
+                "{method} {route} must stay out of every scope table"
+            );
+            for scope in [
+                Scope::Run(7),
+                Scope::ApiToken(ApiTokenLevel::ReadOnly),
+                Scope::ApiToken(ApiTokenLevel::RunCreating),
+            ] {
+                assert!(
+                    !permits(&scope, &method, concrete),
+                    "{scope:?} must not reach {method} {route}"
+                );
+            }
+            assert!(permits(
+                &Scope::ApiToken(ApiTokenLevel::Admin),
+                &method,
+                concrete
+            ));
+        }
     }
 
     /// A project's commands are the owner's, to read and to run.

@@ -396,7 +396,7 @@ function Inspector({
             "Saving…"
           ) : overlay.isSuccess ? (
             <>
-              Saved to <span className="font-mono">.ai/workflows.yaml</span> in this project.
+              Saved to this project&rsquo;s <span className="font-mono">workflows.yaml</span>.
             </>
           ) : null}
         </p>

@@ -181,7 +181,7 @@ pub struct VoiceRuntime {
     /// The two chords, carried through so `GET /voice/config` can report them.
     ///
     /// The núcleo never listens for a hotkey — it has no desktop. It holds these because the shell
-    /// must obey the same `.ai/voice.yaml` the daemon read, and the shell cannot read that file: it is
+    /// must obey the same `~/.nucleos/voice.yaml` the daemon read, and the shell cannot read that file: it is
     /// a self-governing file, and a second reader would be a second answer. Without this the two keys
     /// sat in the config file with nothing anywhere reading them.
     pub hotkey: String,
@@ -1166,7 +1166,7 @@ pub struct VoiceConfigView {
     pub retain_dictations_days: u8,
     /// The two chords the shell must register.
     ///
-    /// Reported rather than left to the shell to decide, because `.ai/voice.yaml` is where they are
+    /// Reported rather than left to the shell to decide, because `~/.nucleos/voice.yaml` is where they are
     /// configured and the shell may not read that file — it is self-governing, and a second reader
     /// would be a second answer. Before this endpoint carried them, both keys existed in the config
     /// and nothing anywhere read either one.
@@ -1939,48 +1939,24 @@ mod tests {
     /// Run it deliberately, from the repository root:
     ///   CARGO_TARGET_DIR=target/gate cargo test -p nucleos-core -- --ignored --nocapture real_pipeline
     ///
-    /// Paths resolve through `CARGO_MANIFEST_DIR` because cargo runs tests with the working directory
-    /// set to the PACKAGE root (`core/`), while the daemon reads `.ai/voice.yaml` relative to wherever
-    /// it was launched. A bare relative path here would look for `core/.ai/voice.yaml`.
-    ///
-    /// **And a baked path is a claim about a different checkout whenever the target directory is
-    /// shared.** `CARGO_HOME/config.toml` on this machine points every crate at one
-    /// `build.target-dir`, so a binary compiled inside a worktree is reused by the main checkout and
-    /// the other way round, while `env!` still answers with wherever it was BUILT. The same hole was
-    /// found open in `tests/module_map.rs` on 2026-08-26, reporting PASS having checked nothing;
-    /// `redact.rs` was closed with it, and this was the third reader and the one left.
-    ///
-    /// The damage here is a different shape from those two, which is why the guard is worth having
-    /// even on a test nobody runs by accident. This reads CONFIGURATION rather than sources: aimed
-    /// at another checkout it would arm itself from that checkout's `.ai/voice.yaml` and then
-    /// measure this machine's engine against it. That is a green run about a question nobody asked,
-    /// and green is exactly what somebody deliberately running this wants to see.
-    ///
-    /// An assertion and not a fallback, for the reason the other two give: a test quietly reading
-    /// another checkout's files is worse than one that refuses to run. `current_dir` is the honest
-    /// answer to which checkout this is, because cargo sets it to the package root.
+    /// It reads the same `~/.nucleos/voice.yaml` and `~/.nucleos/nucleos-models.yaml` the daemon
+    /// does, on purpose: the question is whether THIS machine's configured command works. It used to
+    /// resolve them against the checkout through `CARGO_MANIFEST_DIR`, with a guard against a shared
+    /// target directory handing it a binary built in another checkout; both went when the files
+    /// left the checkout, because there is no longer a checkout for the answer to depend on.
     #[tokio::test]
     #[ignore = "needs a CUDA whisper build, a running Ollama, and a probe recording"]
     async fn real_pipeline_transcribes_and_cleans_an_actual_recording() {
-        let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let running_in = std::env::current_dir().expect("the working directory must be readable");
-        assert_eq!(
-            built_in,
-            running_in.as_path(),
-            "this test binary was compiled in {} and is running in {} — a shared target \
-             directory handed this checkout a binary built somewhere else, so the config below \
-             would arm this run from the other checkout. Touch this file to force a rebuild.",
-            built_in.display(),
-            running_in.display(),
-        );
-        let repo = running_in.parent().expect("core/ has a parent");
-        let config = crate::config::load_voice_config(&repo.join(".ai/voice.yaml"));
+        let root = crate::machine_config::root().expect("this machine must have a home directory");
+        let config =
+            crate::config::load_voice_config(&root.join(crate::machine_config::VOICE_FILE));
         assert!(
             config.armed(),
-            "`.ai/voice.yaml` must set enabled: true and a stt_command for this test to mean anything"
+            "`~/.nucleos/voice.yaml` must set enabled: true and a stt_command for this test to mean anything"
         );
-        let models = crate::config::load_models_config(&repo.join(".ai/nucleos-models.yaml"))
-            .expect("the daemon's own models config must parse");
+        let models =
+            crate::config::load_models_config(&root.join(crate::config::MODELS_CONFIG_FILE))
+                .expect("the daemon's own models config must parse");
         let cleanup_model = models
             .voice_cleanup_model
             .clone()
@@ -2089,7 +2065,7 @@ mod tests {
     ///
     /// They are the only two config values the núcleo itself never acts on — it has no desktop — so
     /// nothing else in the daemon would notice them being dropped. Before they were carried, both keys
-    /// were dead config: readable in `.ai/voice.yaml`, and read by nothing.
+    /// were dead config: readable in `~/.nucleos/voice.yaml`, and read by nothing.
     #[test]
     fn the_hotkeys_reach_the_runtime_so_the_shell_can_obey_the_config() {
         let config = crate::config::VoiceConfig {
@@ -2701,7 +2677,7 @@ mod tests {
     }
 
     /// The window is told the third chord and whether anything can say a word, from the one file that
-    /// owns both. The shell may not read `.ai/voice.yaml`, so anything it is not told, it cannot know.
+    /// owns both. The shell may not read `~/.nucleos/voice.yaml`, so anything it is not told, it cannot know.
     #[test]
     fn the_runtime_carries_the_third_chord_and_whether_there_is_a_voice() {
         let config = crate::config::VoiceConfig {

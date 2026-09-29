@@ -3,7 +3,7 @@
 // Package config reads the sidecar's entire configuration from the environment.
 //
 // Like the email sidecar, this process holds no config file of its own and stores nothing on disk.
-// The owner's settings live in `.ai/web.yaml`, are read by the núcleo, and arrive here as variables
+// The owner's settings live in `~/.nucleos/web.yaml`, are read by the núcleo, and arrive here as variables
 // — so there is exactly one place where the trust allowlist and the provider choice are written,
 // and it is the one the classifier guards (spec §9).
 package config

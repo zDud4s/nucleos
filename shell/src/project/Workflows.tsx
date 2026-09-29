@@ -253,8 +253,8 @@ function Unreadable({ error, onRetry }: { error: unknown; onRetry: () => void })
     return (
       <div className="max-w-prose rounded-lg border border-tone-paused-border bg-tone-paused-bg p-4">
         <p className="text-sm text-text">
-          <span className="font-mono">.ai/workflows.yaml</span> does not parse, so the núcleo cannot
-          say what this project uses.
+          This project&rsquo;s <span className="font-mono">workflows.yaml</span> does not parse, so
+          the núcleo cannot say what this project uses.
         </p>
         <p className="mt-1 font-mono text-xs text-text-muted">{error.detail}</p>
       </div>

@@ -47,7 +47,7 @@ type Options struct {
 	CacheMB int
 }
 
-// DefaultCacheMB matches the value spec §8 ships in `.ai/browser.yaml`.
+// DefaultCacheMB matches the value spec §8 ships in `~/.nucleos/browser.yaml`.
 const DefaultCacheMB = 100
 
 // Args builds the command line, or refuses to.

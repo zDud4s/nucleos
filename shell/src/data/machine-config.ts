@@ -3,8 +3,8 @@ import { apiFetch } from "./client";
 import { keys } from "./keys";
 
 /**
- * This machine's own settings — the nine `.ai/*.yaml` files whose author is the
- * daemon rather than any project.
+ * This machine's own settings — the nine files under `~/.nucleos/` whose author
+ * is the daemon rather than any project.
  *
  * Deliberately its own module and not part of `data/system.ts`, for the reason
  * the núcleo gives for keeping two registries: a project's files and the
@@ -20,8 +20,10 @@ import { keys } from "./keys";
  * visible rather than to hide.
  */
 export interface MachineSetting {
-  /** Relative to the daemon's working directory, forward slashes. The wire identity of the row. */
+  /** A file name under {@link MachineConfig.root}. The wire identity of the row; never shown alone. */
   path: string;
+  /** The file as a person is shown it — `~/.nucleos/voice.yaml`. The label, and what messages say. */
+  display: string;
   /** `email`, `voice`, `calendar`, `web`, `browser`, `telegram`, `github`, `council`, `models`. */
   area: string;
   /** What editing it changes, in the núcleo's own words. Rendered as-is. */
@@ -41,16 +43,18 @@ export interface MachineSetting {
   /**
    * The absolute path this row would actually write.
    *
-   * Shown, not decorative: this machine has twenty-odd worktrees and every one
-   * has an `.ai/`, so the relative path alone would let somebody edit settings
-   * in the wrong checkout and believe they had not.
+   * Shown as the answer to "which file is this". It mattered more when these
+   * files lived in `.ai/` beside wherever the daemon was launched, and twenty-odd
+   * worktrees meant twenty-odd candidates; it is still the honest answer.
    */
   resolved: string;
 }
 
 export interface MachineConfig {
-  /** The daemon's working directory — the root every `path` above hangs off. */
+  /** This machine's settings folder, absolute — the root every `path` above hangs off. */
   root: string;
+  /** The same folder as a person is shown it: `~/.nucleos`. */
+  root_display: string;
   settings: MachineSetting[];
 }
 

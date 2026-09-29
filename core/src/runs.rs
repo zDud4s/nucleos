@@ -2535,7 +2535,10 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
         // and the two verdicts could disagree — the tree it built in is not the tree the job ships.
         gate_config = match (
             node.is_some() || item.is_some(),
-            crate::config::load_schedule_rules(std::path::Path::new(project_root)),
+            crate::config::load_schedule_rules(
+                state.machine_config_root.as_deref(),
+                worktree_project_id,
+            ),
         ) {
             (true, _) => GateConfig::NotConfigured,
             (false, Ok(rules)) => rules
@@ -2724,6 +2727,20 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
             )
             .await;
             return Err(CreateRunError::Db(error));
+        }
+        // The project's pinned workflow, into a tree this run brought — never into a job's tree a
+        // node inherits, which got it when the job opened it. Fail-soft and said out loud: see
+        // `workflow_materialize::into_worktree`. Before a resolution stages its conflict, so the
+        // resolver reads the same rules every other agent in this project does.
+        if owns_a_tree {
+            crate::workflow_materialize::into_worktree(
+                &state.pool,
+                state.machine_config_root.as_deref(),
+                state.workflow_library.as_deref(),
+                worktree_project_id,
+                &info.path,
+            )
+            .await;
         }
         // A conflict's one attempt is claimed HERE: after the row exists, because the claim IS this
         // run's id, and before the agent does, because the whole point is that no second agent can
@@ -3497,8 +3514,10 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
 
     // After the commit, because the resume row does not exist to be UPDATEd before it.
     let daemon_token = mint_run_token(&state.pool, resume_id).await;
-    let gate_config = match crate::config::load_schedule_rules(std::path::Path::new(&project_root))
-    {
+    let gate_config = match crate::config::load_schedule_rules(
+        state.machine_config_root.as_deref(),
+        &wt_project_id,
+    ) {
         Ok(rules) => rules
             .gate_command
             .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
@@ -4064,7 +4083,7 @@ pub const DEFAULT_TRANSCRIPT_RETENTION_DAYS: i64 = 30;
 ///
 /// An environment variable rather than a config file, matching `NUCLEOS_WORKTREE_RETENTION_HOURS`
 /// in `worktree.rs`: runs are not a pillar, and a knob nobody has yet asked to turn does not earn
-/// a `.ai/*.yaml` of its own.
+/// a settings file of its own.
 fn transcript_retention_days() -> i64 {
     std::env::var("NUCLEOS_TRANSCRIPT_RETENTION_DAYS")
         .ok()
@@ -5028,40 +5047,25 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         std::fs::write(dir.join(".claude/hooks/ask_daemon.py"), "# hook").expect("write hook");
     }
 
-    fn configure_gate(repo: &FsPath, command: &str) {
-        std::fs::create_dir_all(repo.join(".ai")).expect("create project config directory");
-        std::fs::write(
-            repo.join(".ai").join("autopilot.yaml"),
-            format!("gate_command: '{command}'\n"),
-        )
-        .expect("write project gate command");
-        assert!(git_ok(repo, &[OsStr::new("add"), OsStr::new("-A")]));
-        assert!(git_ok(
-            repo,
-            &[
-                OsStr::new("commit"),
-                OsStr::new("-m"),
-                OsStr::new("configure gate"),
-            ],
-        ));
+    /// Writes project `proj`'s gate where a run reads it: `<machine_root>/projects/proj/`, with
+    /// `machine_root` a temporary directory standing in for `~/.nucleos`. Nothing is written into
+    /// the repository, which is the point — the rules are not the project's files any more.
+    fn configure_gate(machine_root: &FsPath, command: &str) {
+        crate::project_state::write_for_test(
+            machine_root,
+            "proj",
+            crate::project_state::AUTOPILOT_FILE,
+            &format!("gate_command: '{command}'\n"),
+        );
     }
 
-    fn configure_unreadable_gate(repo: &FsPath) {
-        std::fs::create_dir_all(repo.join(".ai")).expect("create project config directory");
-        std::fs::write(
-            repo.join(".ai").join("autopilot.yaml"),
+    fn configure_unreadable_gate(machine_root: &FsPath) {
+        crate::project_state::write_for_test(
+            machine_root,
+            "proj",
+            crate::project_state::AUTOPILOT_FILE,
             "gate_command: [unterminated\n",
-        )
-        .expect("write malformed project gate configuration");
-        assert!(git_ok(repo, &[OsStr::new("add"), OsStr::new("-A")]));
-        assert!(git_ok(
-            repo,
-            &[
-                OsStr::new("commit"),
-                OsStr::new("-m"),
-                OsStr::new("configure unreadable gate"),
-            ],
-        ));
+        );
     }
 
     async fn test_state_with(delay: Option<Duration>, run_timeout: Duration) -> AppState {
@@ -8672,14 +8676,61 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn f5_a_run_owned_worktree_gets_the_projects_pinned_workflow() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-workflow-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (container, repo) = init_contained_repo("nucleos-runs-workflow-repo-");
+        let (mut state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let home = container.path().join("nucleos-home");
+        let library = container.path().join("workflows");
+        let bundle_dir = library.join("dev").join("1.0");
+        std::fs::create_dir_all(bundle_dir.join(".ai/workflow")).unwrap();
+        std::fs::write(bundle_dir.join("bundle.yaml"), "owns:\n  - .ai/workflow/\n").unwrap();
+        std::fs::write(bundle_dir.join(".ai/workflow/rule.md"), "pinned").unwrap();
+        let bundle = crate::workflows::read_bundle(&bundle_dir, "dev", "1.0")
+            .unwrap()
+            .unwrap();
+        let pins = crate::project_state::file(
+            Some(&home),
+            "proj",
+            crate::project_state::PINS_FILE,
+        )
+        .unwrap();
+        crate::workflows::install(&pins, &bundle).unwrap();
+        state.machine_config_root = Some(home);
+        state.workflow_library = Some(library);
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
+        let worktree: String = sqlx::query_scalar(
+            "SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(FsPath::new(&worktree).join(".ai/workflow/rule.md")).unwrap(),
+            "pinned"
+        );
+        let _ = crate::worktree::remove(&repo, FsPath::new(&worktree), &[]).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_worktree_run_records_its_gate_verdict() {
         let _env_lock = crate::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
-        let (_repo_container, repo) = init_contained_repo("nucleos-runs-gate-passes-");
-        configure_gate(&repo, r#"sh -c "exit 0""#);
-        let (state, _runner) =
+        let (repo_container, repo) = init_contained_repo("nucleos-runs-gate-passes-");
+        let home = repo_container.path().join("nucleos-home");
+        configure_gate(&home, r#"sh -c "exit 0""#);
+        let (mut state, _runner) =
             test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        state.machine_config_root = Some(home);
         let project_root = repo.to_string_lossy().into_owned();
 
         let id = create_worktree_run(&state, "do it", "proj", &project_root)
@@ -8718,10 +8769,12 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         let _env_lock = crate::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
-        let (_repo_container, repo) = init_contained_repo("nucleos-runs-gate-fails-");
-        configure_gate(&repo, r#"sh -c "exit 7""#);
-        let (state, _runner) =
+        let (repo_container, repo) = init_contained_repo("nucleos-runs-gate-fails-");
+        let home = repo_container.path().join("nucleos-home");
+        configure_gate(&home, r#"sh -c "exit 7""#);
+        let (mut state, _runner) =
             test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        state.machine_config_root = Some(home);
         let project_root = repo.to_string_lossy().into_owned();
 
         let id = create_worktree_run(&state, "do it", "proj", &project_root)
@@ -8790,11 +8843,13 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         let _env_lock = crate::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
-        let (_repo_container, repo) = init_contained_repo("nucleos-runs-gate-billing-");
+        let (repo_container, repo) = init_contained_repo("nucleos-runs-gate-billing-");
+        let home = repo_container.path().join("nucleos-home");
         // A full second of gate, so the margin below cannot be explained by scheduling noise.
-        configure_gate(&repo, r#"sh -c "sleep 1; exit 0""#);
-        let (state, _runner) =
+        configure_gate(&home, r#"sh -c "sleep 1; exit 0""#);
+        let (mut state, _runner) =
             test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        state.machine_config_root = Some(home);
         let project_root = repo.to_string_lossy().into_owned();
 
         let started = tokio::time::Instant::now();
@@ -8845,10 +8900,12 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         let _env_lock = crate::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
-        let (_repo_container, repo) = init_contained_repo("nucleos-runs-unreadable-gate-");
-        configure_unreadable_gate(&repo);
-        let (state, _runner) =
+        let (repo_container, repo) = init_contained_repo("nucleos-runs-unreadable-gate-");
+        let home = repo_container.path().join("nucleos-home");
+        configure_unreadable_gate(&home);
+        let (mut state, _runner) =
             test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        state.machine_config_root = Some(home);
         let project_root = repo.to_string_lossy().into_owned();
 
         let id = create_worktree_run(&state, "do it", "proj", &project_root)
@@ -8893,10 +8950,12 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         let _env_lock = crate::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
-        let (_repo_container, repo) = init_contained_repo("nucleos-runs-unreadable-gate-");
-        configure_unreadable_gate(&repo);
-        let (state, _runner) =
+        let (repo_container, repo) = init_contained_repo("nucleos-runs-unreadable-gate-");
+        let home = repo_container.path().join("nucleos-home");
+        configure_unreadable_gate(&home);
+        let (mut state, _runner) =
             test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        state.machine_config_root = Some(home);
         let project_root = repo.to_string_lossy().into_owned();
 
         let id = create_worktree_run(&state, "do it", "proj", &project_root)
@@ -8943,7 +9002,6 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
         let (_repo_container, repo) = init_contained_repo("nucleos-runs-without-gate-");
-        assert!(!repo.join(".ai").join("autopilot.yaml").exists());
         let (state, _runner) =
             test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
         let project_root = repo.to_string_lossy().into_owned();

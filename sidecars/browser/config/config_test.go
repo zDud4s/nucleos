@@ -85,7 +85,7 @@ func TestLoadRejectsNonsenseNumbers(t *testing.T) {
 }
 
 // TestTheCeilingsDefaultToTheOnesTheSpecShips. A sidecar started with nothing but a token must
-// behave the way the documented `.ai/browser.yaml` says it does — otherwise the file people read is
+// behave the way the documented `~/.nucleos/browser.yaml` says it does — otherwise the file people read is
 // not the configuration people run.
 func TestTheCeilingsDefaultToTheOnesTheSpecShips(t *testing.T) {
 	t.Setenv("NUCLEOS_DAEMON_TOKEN", "tok")

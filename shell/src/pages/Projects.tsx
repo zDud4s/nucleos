@@ -45,7 +45,7 @@ import "./projects.css";
  * "On its own" view, which is not.
  *
  * The page exists because two facts about a project were only readable by
- * leaving the app: what it will do on its own (`.ai/autopilot.yaml`, on disk)
+ * leaving the app: what it will do on its own (its `autopilot.yaml`, on disk)
  * and what its tree currently looks like. Both are shown here, and this page
  * edits neither FILE.
  *
@@ -56,8 +56,9 @@ import "./projects.css";
  * this page browses, and why nothing here is editable.
  *
  * It stopped being true of one file, and the exception is worth writing down so
- * nobody restores the rule over it in six months. `.ai/autopilot.yaml` is not a
- * document git owns: it is **gitignored, per-developer configuration** that the
+ * nobody restores the rule over it in six months. The project's `autopilot.yaml`
+ * is not a document git owns: it is **per-developer configuration, kept in
+ * `~/.nucleos/projects/<id>/` and not in the project at all**, that the
  * núcleo itself parses, with a schema, a range check and `deny_unknown_fields`.
  * An editor that holds text to that schema before saving is not a distracted
  * second author, it is a better-informed one — `vim` saves `gate_commmand:`

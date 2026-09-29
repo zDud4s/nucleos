@@ -193,7 +193,7 @@ func TestUploadCrossesTheWireWithBothOfItsArguments(t *testing.T) {
 //
 // That default is right for errors a caller cannot act on. The ceiling is not one of those — the
 // answer is to close a session — and a refusal that leaves the owner guessing is the one they
-// resolve by raising the limit, which is the argument `.ai/browser.yaml` already makes about
+// resolve by raising the limit, which is the argument `~/.nucleos/browser.yaml` already makes about
 // `max_profiles`.
 //
 // The status is asserted as well as the body, and 409 is forced rather than chosen: the núcleo's

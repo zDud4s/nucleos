@@ -8,7 +8,9 @@ import { keys } from "./keys";
  *
  * A workflow is a graph of how work moves through a project. The núcleo holds it as a **bundle** —
  * a directory in `~/.nucleos/workflows/<name>/<version>/` — and a project keeps a **pin** naming
- * one, in its own `.ai/workflows.yaml`.
+ * one, in `~/.nucleos/projects/<id>/workflows.yaml`. The pin is this app's record of what the
+ * project uses, so it lives with the app's state and not in the project; an ejected copy is the
+ * project's own files and stays in the project, under `.ai/workflows/<name>/`.
  *
  * **Nothing here polls.** A pin does not change unless somebody changes it, and neither does a
  * folder full of markdown; a three-second tick against either would be a cost with no reader. What

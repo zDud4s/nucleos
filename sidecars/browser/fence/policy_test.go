@@ -461,7 +461,7 @@ func TestOriginOf(t *testing.T) {
 	}
 }
 
-// TestNormaliseEntry covers what an owner actually writes in `.ai/browser.yaml`.
+// TestNormaliseEntry covers what an owner actually writes in `~/.nucleos/browser.yaml`.
 func TestNormaliseEntry(t *testing.T) {
 	cases := map[string]string{
 		"example.org":                  "https://example.org:443",

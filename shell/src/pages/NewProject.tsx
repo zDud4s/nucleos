@@ -10,6 +10,7 @@ import {
   type Detected,
   type Harness,
 } from "../data/detect";
+import { useOnboard } from "../data/onboarding";
 import { useDeclareProjectCommand } from "../data/project-commands";
 import { useSetWipLimit } from "../data/projects";
 import { useSetProjectMode } from "../data/autopilot";
@@ -255,11 +256,22 @@ function Found({
   const [wip, setWip] = useState<number | null>(2);
   const [ran, setRan] = useState<Ran | null>(null);
   const [busy, setBusy] = useState(false);
+  /**
+   * Whether onboarding was skipped because the stop was engaged, set inside `finish`'s register
+   * step and read once the whole plan lands. A `ref` and not `useState` there: `finish` needs the
+   * answer synchronously, in the same pass, to decide whether to navigate — a state update would
+   * not be visible until the next render, by which point the decision is already made.
+   */
+  const onboardWaitingRef = useRef(false);
+  const [onboardWaiting, setOnboardWaiting] = useState(false);
+  /** The gate command to confirm, starting from what the núcleo proposes. Blank is none. */
+  const [gate, setGate] = useState(found.gate?.command ?? "");
 
   const library = useWorkflowLibrary();
   const projects = useProjects();
   const kill = useKillSwitch();
   const setMode = useSetProjectMode();
+  const onboard = useOnboard();
   const setWipLimit = useSetWipLimit();
   const declare = useDeclareProjectCommand();
   const adopt = useAdoptWorkflow();
@@ -289,10 +301,15 @@ function Found({
     !registered && (projects.data?.some((row) => row.project_id === projectId) ?? false);
   const workflowChosen = adopting !== null || installing !== null;
   /**
-   * The emergency stop refuses a workflow write and nothing else of the four — registering, the
-   * commands and the ceiling are database rows that start nothing. So the stop is not a reason to
-   * refuse the project, only the workflow, and it is said here, before the first write, rather than
-   * found out after the project row already exists.
+   * The emergency stop pre-emptively refuses a workflow write and nothing else of the four —
+   * registering, the commands and the ceiling are database rows that start nothing. So the stop is
+   * not a reason to refuse the project, only the workflow, and it is said here, before the first
+   * write, rather than found out after the project row already exists.
+   *
+   * Onboarding, inside the register step, is the exception that proves this: it now consults the
+   * same switch, because it is a governance write like the ones `POST /write` already guards. It is
+   * not blocked here, because its refusal does not need to be — `finish`'s register step catches it
+   * and skips onboarding rather than the whole step, so the stop still never refuses the project.
    */
   const stopHolds = kill.data?.engaged === true && workflowChosen;
 
@@ -330,14 +347,43 @@ function Found({
         <>
           register <span className="font-mono">{projectId}</span> at{" "}
           <span className="font-mono">{found.root}</span>, in{" "}
-          <StateBadge domain="autopilot" state="shadow" />
+          <StateBadge domain="autopilot" state="shadow" />, onboarded with{" "}
+          {gate.trim() === "" ? (
+            "no gate command"
+          ) : (
+            <>
+              the gate <span className="font-mono">{gate.trim()}</span>
+            </>
+          )}
         </>
       ),
       doing: "registering the project",
-      // **Shadow, always.** §9. A project that started acting on its own the moment it was added
-      // would be one nobody had decided to trust yet.
-      run: () =>
-        setMode.mutateAsync({ project_id: projectId, mode: "shadow", project_root: found.root }),
+      // Onboarding first, in the same step: the mode door refuses a project nobody onboarded, and
+      // the two together are what "registering" means. Onboarding is idempotent, so a retry after a
+      // refused registration repeats nothing that matters. **Shadow, always.** §9. A project that
+      // started acting on its own the moment it was added would be one nobody had decided to trust.
+      //
+      // A `kill_switch` refusal from onboarding is not this step's failure: registering a project
+      // has never been something the stop refuses (see `stopHolds` above, for the workflow write),
+      // and onboarding is a governance write like the ones the stop already guards, so it now
+      // consults the same switch. Skip it rather than fail the whole step — the project still gets
+      // registered, in shadow, and onboarding can be finished from its Settings once released.
+      run: async () => {
+        try {
+          await onboard.mutateAsync({ projectId, projectRoot: found.root, gateCommand: gate });
+        } catch (error) {
+          if (isApiRefusal(error) && error.code === "kill_switch") {
+            onboardWaitingRef.current = true;
+          } else {
+            throw error;
+          }
+        }
+        return setMode.mutateAsync({
+          project_id: projectId,
+          mode: "shadow",
+          project_root: found.root,
+        });
+      },
     },
     ...(adopting !== null
       ? [
@@ -419,6 +465,7 @@ function Found({
     const frozen = plan;
     const id = projectId;
     setBusy(true);
+    onboardWaitingRef.current = false;
     setRan({ plan: frozen, projectId: id, reached: 0, error: null, failed: false });
     let at = 0;
     try {
@@ -427,7 +474,14 @@ function Found({
         await frozen[at].run();
       }
       setRan({ plan: frozen, projectId: id, reached: frozen.length, error: null, failed: false });
-      onDone(id);
+      // Onboarding waiting on the stop is not a reason to leave this page unfinished — the project
+      // is registered — but it is a reason to stay rather than navigate straight to a page whose
+      // Onboard panel would say the same thing to someone who never read it here.
+      if (onboardWaitingRef.current) {
+        setOnboardWaiting(true);
+      } else {
+        onDone(id);
+      }
     } catch (error) {
       setRan({ plan: frozen, projectId: id, reached: at, error, failed: true });
     } finally {
@@ -490,8 +544,9 @@ function Found({
           <div className="mt-4 flex flex-col gap-1.5">
             <p className="max-w-(--measure) text-sm text-text-muted">
               Found in this folder. Tick the ones worth having a button for — nothing is saved that
-              is not ticked, and none of them becomes a gate here: saying a command's result decides
-              whether the project is green is a claim to make deliberately, on the project's page.
+              is not ticked, and ticking one does not make it the gate: saying a command's result
+              decides whether the project is green is a claim made deliberately, in the gate field
+              below.
             </p>
             {found.commands.map((suggestion) => (
               <label key={suggestion.name} className="flex flex-wrap items-baseline gap-2 text-sm">
@@ -564,6 +619,25 @@ function Found({
               </ConflictNote>
             </div>
           ) : null}
+
+          {/* The one claim about what a result MEANS that this page makes, and it makes it only in
+              words somebody confirmed: the field starts from the núcleo's proposal and is stored
+              as typed. Blank is a real answer — no gate — and can be set later with the rules. */}
+          <Field
+            label="Gate command"
+            helper={
+              found.gate === null
+                ? "the command whose exit code says this project is green — nothing here suggests one, and blank is none"
+                : `the command whose exit code says this project is green — proposed from ${found.gate.source}; blank is none`
+            }
+          >
+            <input
+              value={gate}
+              spellCheck={false}
+              onChange={(event) => setGate(event.target.value)}
+              className="w-full max-w-xl font-mono"
+            />
+          </Field>
 
           {found.harnesses.length === 0 && library.data !== undefined && library.data.length > 0 ? (
             <Field label="Workflow">
@@ -651,6 +725,8 @@ function Found({
 
           {registered && ran?.failed === true ? (
             <Stopped ran={ran} />
+          ) : registered && onboardWaiting ? (
+            <OnboardWaiting projectId={ran?.projectId ?? projectId} />
           ) : (
             <>
               <div className="flex flex-wrap items-center gap-3">
@@ -759,6 +835,33 @@ function Stopped({ ran }: { ran: Ran }) {
         params={{ projectId: ran.projectId, view: "state" }}
       >
         Finish setting up {ran.projectId} on its page
+      </Link>
+    </div>
+  );
+}
+
+/**
+ * The receipt of a finish that landed in full, with onboarding held back by the stop.
+ *
+ * Not a failure — nothing here `stopped here`, and there is no retry to invite — so it does not
+ * reuse {@link Stopped}. It exists so the wizard says this once, in its own words, rather than
+ * navigating straight to the project's page and leaving that page's `Onboard` panel as the only
+ * place it is ever said.
+ */
+function OnboardWaiting({ projectId }: { projectId: string }) {
+  return (
+    <div className="flex flex-col items-start gap-2">
+      <p className="max-w-(--measure) text-sm text-text">
+        Registered as <span className="font-mono">{projectId}</span> in shadow. The stop is
+        engaged, so onboarding — the confirmed gate and the classifier hook — is waiting until it
+        is released; it can be finished from the project's Settings once it is.
+      </p>
+      <Link
+        className="text-sm"
+        to="/projects/$projectId/$view"
+        params={{ projectId, view: "state" }}
+      >
+        Go to {projectId}
       </Link>
     </div>
   );

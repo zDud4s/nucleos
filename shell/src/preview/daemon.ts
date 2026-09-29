@@ -666,7 +666,7 @@ export const AGENTS: Agent[] = [
  * The page's whole subject is what a project does when nobody is watching, and
  * the states that matter are the ones nothing else in the app reports: a rules
  * file that will not parse, a rule that is armed and inert, a queue that
- * refuses every merge over a key in a gitignored file, a brake that is holding.
+ * refuses every merge over a key in an unreviewed file, a brake that is holding.
  * A preview with one healthy project would photograph none of them.
  *
  * `alpha` works and is busy, `bravo` is broken in the two ways that stop a
@@ -840,10 +840,13 @@ function fromNow(ms: number): string {
 }
 
 function rules(overrides: Partial<ProjectRules>): ProjectRules {
+  const project_id = overrides.project_id ?? "x";
   return {
-    project_id: "x",
+    project_id,
     project_root: null,
     rules_file: "absent",
+    // What the daemon serves: the file lives with this machine's settings, not in the project.
+    rules_path: `~/.nucleos/projects/${project_id}/autopilot.yaml`,
     rules_error: null,
     gate_command: null,
     gate_before_publish: false,
@@ -944,7 +947,7 @@ const BRAVO_RULES: ProjectRules = rules({
 const CHARLIE_RULES: ProjectRules = rules({ project_id: "charlie" });
 
 /* A folder, a readable file, and nothing in it. Ordinary, and the page must not
-   dress it as a fault: the file is gitignored, so a fresh clone has none. */
+   dress it as a fault: a project has no rules until somebody writes some. */
 const DELTA_RULES: ProjectRules = rules({
   project_id: "delta",
   project_root: "C:/repos/delta",
@@ -1052,7 +1055,6 @@ index 8c2b0d4..1e9a3f7 100644
 
 /** Matches for `gate_before_publish`, spread over the files that mention it. */
 const MATCHES: InspectMatch[] = [
-  { path: ".ai/autopilot.yaml", line: 21, text: "gate_before_publish: true" },
   { path: "core/src/config.rs", line: 15, text: "    pub gate_before_publish: bool," },
   {
     path: "core/src/config.rs",
@@ -1252,7 +1254,7 @@ export const FEED: FeedEntry[] = [
 const NIGHT: Omit<FeedEntry, "id">[] = [
   { project_id: null, kind: "command_finished", summary: "project command `gates` on alpha exited 0 after 4m12s", run_id: null, errand_id: null, subject: null, created_at: ago(889 * MINUTE) },
   { project_id: "alpha", kind: "map_stamp_recorded", summary: "module map stamp for core/src/feed.rs at 4d2c1e2", run_id: null, errand_id: null, subject: null, created_at: ago(851 * MINUTE) },
-  { project_id: "alpha", kind: "config_written", summary: "wrote .ai/autopilot.yaml: gate command set to scripts/gates.sh shell", run_id: null, errand_id: null, subject: null, created_at: ago(759 * MINUTE) },
+  { project_id: "alpha", kind: "config_written", summary: "~/.nucleos/projects/alpha/autopilot.yaml written from the app", run_id: null, errand_id: null, subject: null, created_at: ago(759 * MINUTE) },
   { project_id: "bravo", kind: "run_interrupted", summary: "run 900585 interrupted: the núcleo restarted mid-turn", run_id: 900585, errand_id: null, subject: "run:900585", created_at: ago(686 * MINUTE) },
   { project_id: "charlie", kind: "job_started", summary: "job 54 started on job/54-flaky-hunt from the rule flaky hunt", run_id: null, errand_id: null, subject: "job:54", created_at: ago(637 * MINUTE) },
   { project_id: "charlie", kind: "job_finished", summary: "job 54 finished `completed` after 3 item(s)", run_id: null, errand_id: null, subject: "job:54", created_at: ago(593 * MINUTE) },

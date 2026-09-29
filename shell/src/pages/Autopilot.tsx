@@ -85,6 +85,7 @@ import {
   promotionConfirmLabel,
   promotionConsequence,
 } from "../lib/mode";
+import { OnboardPanel } from "../project/Onboard";
 import "./autopilot.css";
 
 /** The three periods the núcleo writes, as the noun each one is: `daily` becomes `day`, not `dai`. */
@@ -1049,17 +1050,23 @@ function FocusSetting({
   const gate = gateFor(project);
 
   /**
-   * A 422 is the *only* refusal that opens the root input.
-   *
-   * `activation_status` maps four different causes onto one bare 422 with an
-   * empty body — no root given, no `.ai/workflow/workflow.md`, no PreToolUse
-   * hook pointing at `ask_daemon.py`, or a root that is not a git repository —
-   * and the daemon sends nothing that distinguishes them. So the page names the
-   * set, says it does not know which, and offers the one of the four it can do
-   * something about. Guessing a single cause here would be wrong three times
-   * out of four.
+   * A project nobody onboarded is the one 422 the daemon names (`not_onboarded`), because it is
+   * the one this page can resolve in place: the onboarding panel, then the same change again.
    */
-  const needsRoot = refused !== undefined && refused.refusal.status === 422;
+  const notOnboarded = refused !== undefined && refused.refusal.code === "not_onboarded";
+  const [onboarding, setOnboarding] = useState(false);
+
+  /**
+   * A bare 422 is the *only* other refusal that opens the root input.
+   *
+   * `activation_status` maps three different causes onto one bare 422 with an
+   * empty body — no root given, no PreToolUse hook pointing at `ask_daemon.py`,
+   * or a root that is not a git repository — and the daemon sends nothing that
+   * distinguishes them. So the page names the set, says it does not know which,
+   * and offers the one of them it can do something about. Guessing a single
+   * cause here would be wrong two times out of three.
+   */
+  const needsRoot = refused !== undefined && refused.refusal.status === 422 && !notOnboarded;
 
   // A new 422 hands focus to the one prerequisite the shell can supply. Only a NEW one: walking
   // back to a project refused earlier must not pull focus out of the index.
@@ -1132,7 +1139,33 @@ function FocusSetting({
           </Button>
         </Inset>
       )}
-      {refused !== undefined && !needsRoot && (
+      {notOnboarded && (
+        <div className="ui-note ui-note-refusal ap-fan-refusal" role="status">
+          <span className="ui-note-code">{refused.refusal.code}</span>
+          <span className="ui-note-text">
+            {project.project_id} has not been onboarded to NucleOS, so it cannot be watched or let
+            act yet.
+          </span>
+        </div>
+      )}
+      {notOnboarded && !onboarding && (
+        <Button variant="ghost" onClick={() => setOnboarding(true)}>
+          Onboard {project.project_id}
+        </Button>
+      )}
+      {notOnboarded && onboarding && (
+        <Inset className="ap-project-root">
+          <OnboardPanel
+            projectId={project.project_id}
+            root={root.trim() === "" ? (project.project_root ?? "") : root}
+            onDone={() => {
+              setOnboarding(false);
+              onChange(refused.mode, root.trim() === "" ? project.project_root : root);
+            }}
+          />
+        </Inset>
+      )}
+      {refused !== undefined && !needsRoot && !notOnboarded && (
         <RefusalNote
           refusal={refused.refusal}
           sentences={{

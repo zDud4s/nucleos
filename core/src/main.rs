@@ -62,6 +62,7 @@ mod mentions;
 mod notes;
 mod notify;
 mod notify_policy;
+mod onboarding;
 mod openai_compatible;
 mod ownership;
 mod pii_shadow;
@@ -74,6 +75,7 @@ mod project_exit;
 mod project_map;
 mod project_policy;
 mod project_readings;
+mod project_state;
 mod prompt_budget;
 mod proposals;
 mod quota;
@@ -114,6 +116,8 @@ mod web_client;
 mod webhook;
 mod wip;
 mod workflow_graph;
+mod workflow_materialize;
+mod workflow_package;
 mod workflows;
 mod worktree;
 
@@ -124,16 +128,17 @@ use std::sync::Arc;
 const TOKEN_KEY: &str = "daemon-token";
 const TELEGRAM_TOKEN_KEY: &str = "telegram-token";
 /// The mailbox password (spec §3.4). An app password, in Credential Manager rather than in
-/// `.ai/email.yaml`, so the one secret the pillar needs never sits in a file next to the config.
+/// `~/.nucleos/email.yaml`, so the one secret the pillar needs never sits in a file next to the config.
 const EMAIL_PASSWORD_KEY: &str = "email-imap-password";
 /// The web search provider's API key, in Credential Manager like every other secret — no key on
-/// disk, and in particular not in `.ai/web.yaml`, which is a versioned file.
+/// disk, and in particular not in `~/.nucleos/web.yaml`, which is plain text anybody may open.
 const WEB_SEARCH_KEY: &str = "web-search-api-key";
 /// OpenRouter's own API key, in Credential Manager for the same reason every secret above is: it
-/// never sits in `.ai/models.yaml`, which only ever names the model (`hosted_assistant_model`) and
-/// is a versioned file. `openai_compatible::OpenAiCompatibleChat::new` refuses outright when this comes back
-/// `None` — see its own doc comment for why that refusal happens before any request leaves the
-/// machine rather than after a 401 comes back.
+/// never sits in `~/.nucleos/nucleos-models.yaml`, which only ever names the model
+/// (`hosted_assistant_model`) and is plain text anybody may open.
+/// `openai_compatible::OpenAiCompatibleChat::new` refuses outright when this comes back `None` —
+/// see its own doc comment for why that refusal happens before any request leaves the machine
+/// rather than after a 401 comes back.
 const OPENROUTER_KEY: &str = "openrouter-api-key";
 
 /// Reads a secret from stdin rather than from `argv`.
@@ -192,6 +197,149 @@ fn seeded_library() -> Option<std::path::PathBuf> {
         }
     }
     Some(root)
+}
+
+/// Copies this machine's settings from the old `.ai/` beside the working directory into `root`,
+/// and puts a line in the feed for each file it copied.
+///
+/// The copying is [`machine_config::migrate_legacy`]'s, and so is everything about when it does and
+/// does not happen; this only supplies the two directories and tells somebody. The feed line is
+/// said because a person looking for why their settings moved will look there, and a log line is
+/// read by nobody on a desktop. A lost feed line is logged and let go: the copy already happened.
+async fn migrate_machine_settings(pool: &sqlx::SqlitePool, root: &std::path::Path) {
+    let Ok(started_in) = std::env::current_dir() else {
+        // No working directory means no `.ai/` beside it either, so there is nothing to copy.
+        return;
+    };
+    for file in machine_config::migrate_legacy(root, &started_in) {
+        let summary = format!(
+            "{} copied from .ai/{file} in the directory the daemon was started from; the old file \
+             was left where it was and is no longer read",
+            machine_config::display_path(file)
+        );
+        if let Err(error) = feed::append(pool, None, "config_migrated", &summary, None, None).await
+        {
+            tracing::warn!(%error, file, "a settings file was copied but the feed line was lost");
+        }
+    }
+}
+
+/// Copies each rostered project's state files from its old `<project root>/.ai/` into
+/// `~/.nucleos/projects/<project_id>/`, and puts a line in that project's feed for each one.
+///
+/// The copying is [`project_state::migrate_legacy`]'s, and so is every rule about when it does and
+/// does not happen; this only reads the roster and tells somebody, for the reason
+/// [`migrate_machine_settings`] gives. The roster is every project with a root on record — a
+/// project in `off` has none, and its old files are copied the next time it is given one and the
+/// daemon starts.
+///
+/// An unreadable roster copies nothing and says so: those projects behave as projects with no rules
+/// file until the next start, which is the state an absent file has always meant.
+async fn migrate_project_state(pool: &sqlx::SqlitePool, root: &std::path::Path) {
+    let roster: Vec<(String, String)> = match sqlx::query_as(
+        "SELECT project_id, project_root FROM autopilot_state WHERE project_root IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(roster) => roster,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the project roster, so no project's .ai/ state was copied");
+            return;
+        }
+    };
+    let roster: Vec<(String, std::path::PathBuf)> = roster
+        .into_iter()
+        .map(|(id, project_root)| (id, std::path::PathBuf::from(project_root)))
+        .collect();
+    let root = root.to_path_buf();
+    let copied =
+        match tokio::task::spawn_blocking(move || project_state::migrate_legacy(&root, &roster))
+            .await
+        {
+            Ok(copied) => copied,
+            Err(error) => {
+                tracing::warn!(%error, "copying project state from .ai/ did not finish");
+                return;
+            }
+        };
+    for (project_id, file) in copied {
+        let summary = format!(
+            "{} copied from .ai/{file} in this project's folder; the old file was left where it \
+             was and is no longer read",
+            project_state::display_path(&project_id, file)
+        );
+        if let Err(error) = feed::append(
+            pool,
+            Some(&project_id),
+            "config_migrated",
+            &summary,
+            None,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(%error, %project_id, file, "a project state file was copied but the feed line was lost");
+        }
+    }
+}
+
+/// Marks every rostered project that passed the old activation check as onboarded, once, and puts
+/// a line in that project's feed for each one.
+///
+/// So that nobody loses autopilot on update: activation used to require `.ai/workflow/workflow.md`
+/// and now requires the onboarding marker, so a project that had the first and not the second is
+/// given a `migrated: true` marker. The rules are [`onboarding::migrate_legacy`]'s; this reads the
+/// same roster [`migrate_project_state`] reads — every project with a root on record — and tells
+/// somebody, for the reason [`migrate_machine_settings`] gives.
+async fn migrate_onboarding(pool: &sqlx::SqlitePool, root: &std::path::Path) {
+    let roster: Vec<(String, String)> = match sqlx::query_as(
+        "SELECT project_id, project_root FROM autopilot_state WHERE project_root IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(roster) => roster,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the project roster, so no project was marked onboarded");
+            return;
+        }
+    };
+    let roster: Vec<(String, std::path::PathBuf)> = roster
+        .into_iter()
+        .map(|(id, project_root)| (id, std::path::PathBuf::from(project_root)))
+        .collect();
+    let root = root.to_path_buf();
+    let now = chrono::Utc::now().to_rfc3339();
+    let marked =
+        match tokio::task::spawn_blocking(move || onboarding::migrate_legacy(&root, &roster, &now))
+            .await
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                tracing::warn!(%error, "marking projects onboarded did not finish");
+                return;
+            }
+        };
+    for project_id in marked {
+        let summary = format!(
+            "marked onboarded in {}, because this project had .ai/workflow/workflow.md, which is \
+             what onboarded meant before; that file is no longer read",
+            project_state::display_path(&project_id, onboarding::MARKER_FILE)
+        );
+        if let Err(error) = feed::append(
+            pool,
+            Some(&project_id),
+            onboarding::FEED_KIND,
+            &summary,
+            None,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(%error, %project_id, "a project was marked onboarded but the feed line was lost");
+        }
+    }
 }
 
 /// Um numero, ou um travessao quando nao ha nenhum.
@@ -337,6 +485,59 @@ fn land_target_from(args: &[String]) -> Option<String> {
     args.get(at + 1)
         .filter(|value| !value.trim().starts_with('-'))
         .cloned()
+}
+
+/// The checkout `--workflow-sync` names: the argument after the flag, or the working directory.
+/// Absolute either way, because the daemon resolving it runs somewhere else.
+fn workflow_sync_target(args: &[String]) -> Result<String, String> {
+    let at = args
+        .iter()
+        .position(|arg| arg == "--workflow-sync")
+        .ok_or("--workflow-sync was not given")?;
+    let named = args
+        .get(at + 1)
+        .filter(|value| !value.starts_with("--"))
+        .map(std::path::PathBuf::from);
+    let path = match named {
+        Some(path) => path,
+        None => std::env::current_dir().map_err(|error| error.to_string())?,
+    };
+    std::path::absolute(&path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// `--workflow-package <name> <version> --from <project> --manifest <bundle.yaml>`, all required.
+/// Refused as a usage line rather than guessed: packaging writes a version that is never
+/// rewritten, so a default that picked the wrong folder would be permanent.
+fn workflow_package_args(
+    args: &[String],
+) -> Result<(String, String, std::path::PathBuf, std::path::PathBuf), String> {
+    const USAGE: &str = "usage: nucleos-core --workflow-package <name> <version> --from <project root> --manifest <bundle.yaml>";
+    let at = args
+        .iter()
+        .position(|arg| arg == "--workflow-package")
+        .ok_or(USAGE)?;
+    let positional = |offset: usize| {
+        args.get(at + offset)
+            .filter(|value| !value.starts_with("--"))
+            .cloned()
+            .ok_or(USAGE)
+    };
+    let value_of = |flag: &str| {
+        args.iter()
+            .position(|arg| arg == flag)
+            .and_then(|index| args.get(index + 1))
+            .filter(|value| !value.starts_with("--"))
+            .map(std::path::PathBuf::from)
+            .ok_or(USAGE)
+    };
+    Ok((
+        positional(1)?,
+        positional(2)?,
+        value_of("--from")?,
+        value_of("--manifest")?,
+    ))
 }
 
 #[tokio::main]
@@ -557,7 +758,7 @@ async fn main() {
     }
 
     // The other half of the hosted route. `hosted_assistant_model` names the model in
-    // `.ai/nucleos-models.yaml` and this stores the key, and until both exist the route refuses
+    // `~/.nucleos/nucleos-models.yaml` and this stores the key, and until both exist the route refuses
     // (`assistants::Refusal::HostedModelNamedButNoKey`) rather than answering. There was no way at
     // all to store this before: the resolver at the bottom of `main` has read `OPENROUTER_KEY`
     // since the hosted route shipped, and nothing on this machine ever wrote it — so the whole
@@ -575,7 +776,7 @@ async fn main() {
                     // alternative is a chat that refuses with no visible reason: the key alone
                     // gets a conversation nowhere, and the daemon reads both ONCE, at startup.
                     eprintln!(
-                        "name a model in `hosted_assistant_model` (.ai/nucleos-models.yaml) too, \
+                        "name a model in `hosted_assistant_model` (~/.nucleos/nucleos-models.yaml) too, \
                          then restart the daemon — both are read at startup and neither half \
                          answers a chat on its own"
                     );
@@ -608,6 +809,93 @@ async fn main() {
         if let Err(e) = mcp_tools::run_stdio(served).await {
             eprintln!("mcp-tools failed: {e}");
             std::process::exit(1);
+        }
+        return;
+    }
+
+    // `nucleos-core --workflow-sync [<checkout>]`: put the project's pinned workflows into a
+    // worktree made by hand. A thin client, for `--land`'s reason: which project the checkout
+    // belongs to is answered from the roster, and the roster is the running daemon's database. The
+    // daemon also holds the kill switch this write must respect.
+    if std::env::args().any(|a| a == "--workflow-sync") {
+        let args: Vec<String> = std::env::args().collect();
+        let path = match workflow_sync_target(&args) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        };
+        let token = match secrets::load_secret(TOKEN_KEY) {
+            Ok(Some(token)) => token,
+            _ => {
+                eprintln!("no daemon token stored yet — start the daemon once to generate one");
+                std::process::exit(1);
+            }
+        };
+        let response = reqwest::Client::new()
+            .post(format!("{}/workflows/sync", daemon_client::daemon_url()))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "path": path }))
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    eprintln!("the daemon refused: {text}");
+                    std::process::exit(1);
+                }
+                println!("{text}");
+            }
+            Err(error) => {
+                eprintln!("the daemon is not reachable: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // `nucleos-core --workflow-package <name> <version> --from <project> --manifest <bundle.yaml>`:
+    // copy a workflow out of a project into the library as a new version, and commit it there.
+    //
+    // No daemon: this reads a folder and writes `~/.nucleos/workflows/`, and neither is the
+    // database. A library a running daemon lists mid-copy sees no manifest yet, which it already
+    // treats as somebody's scratch folder (`workflows::read_bundle`), until the manifest is written
+    // last.
+    if std::env::args().any(|a| a == "--workflow-package") {
+        let args: Vec<String> = std::env::args().collect();
+        let (name, version, from, manifest) = match workflow_package_args(&args) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        };
+        let Some(library) = workflows::library_root() else {
+            eprintln!("this machine has no home directory, so it has no workflow library");
+            std::process::exit(1);
+        };
+        match workflow_package::package(&library, &name, &version, &from, &manifest).await {
+            Ok(packaged) => {
+                println!(
+                    "{name}@{version}: {} files into {} ({})",
+                    packaged.files,
+                    packaged.dir.display(),
+                    packaged.hash
+                );
+                match packaged.commit {
+                    Ok(commit) => println!("recorded in the library's history as {commit}"),
+                    Err(why) => {
+                        eprintln!("packaged, but not recorded in the library's history: {why}")
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -799,11 +1087,34 @@ async fn main() {
     };
     tracing::info!("nucleos-core token loaded from the system credential store");
 
-    let models_config_path = std::path::PathBuf::from(config::MODELS_CONFIG_PATH);
-    let models_config = config::load_models_config(&models_config_path).unwrap_or_else(|e| {
-        tracing::warn!("failed to parse .ai/nucleos-models.yaml ({e}), using defaults");
-        config::ModelsConfig::default()
-    });
+    // This machine's settings, all under one root — see `machine_config`'s header for why it is
+    // `~/.nucleos/` and no longer the directory the daemon happened to be launched from. `None` (no
+    // home directory) reads every file as absent, which is what an absent file has always meant:
+    // each pillar starts on its defaults.
+    let machine_config_root = machine_config::root();
+    match &machine_config_root {
+        Some(root) => {
+            migrate_machine_settings(&pool, root).await;
+            migrate_project_state(&pool, root).await;
+            migrate_onboarding(&pool, root).await;
+        }
+        None => tracing::warn!(
+            "no home directory, so {} cannot be read; every pillar starts on its defaults",
+            machine_config::ROOT_DISPLAY
+        ),
+    }
+    let machine_file = |file: &str| machine_config_root.as_ref().map(|root| root.join(file));
+
+    let models_config = machine_file(config::MODELS_CONFIG_FILE)
+        .map(|path| config::load_models_config(&path))
+        .unwrap_or_else(|| Ok(config::ModelsConfig::default()))
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "failed to parse {} ({e}), using defaults",
+                config::MODELS_CONFIG_DISPLAY_PATH
+            );
+            config::ModelsConfig::default()
+        });
     let (triage_runner, local_triage_disabled): (
         Option<Arc<dyn runner::CommandRunner>>,
         Option<String>,
@@ -857,11 +1168,14 @@ async fn main() {
         (None, None)
     };
 
-    // Relative to the working directory, so it matters where the daemon was launched from — which
-    // is exactly why the "off" message below has to name the path it looked at.
-    let email_config_path = std::path::Path::new(".ai/email.yaml");
-    let email_config_found = email_config_path.exists();
-    let email_config = config::load_email_config(email_config_path);
+    let email_config_path = machine_file(machine_config::EMAIL_FILE);
+    let email_config_found = email_config_path
+        .as_deref()
+        .is_some_and(std::path::Path::exists);
+    let email_config = email_config_path
+        .as_deref()
+        .map(config::load_email_config)
+        .unwrap_or_default();
     // Built whether or not the pillar is enabled: it is two small files, and having it always in a
     // known state means enabling email later is a config edit rather than a fresh directory.
     let triage_sandbox = dirs.data_local_dir().join("triage-sandbox");
@@ -882,20 +1196,36 @@ async fn main() {
         }
     };
 
-    // Relative to the working directory like the email pillar's, for the same reason: it matters where
-    // the daemon was launched from, so the "off" path has to be discoverable rather than mysterious.
-    let voice_config = config::load_voice_config(std::path::Path::new(".ai/voice.yaml"));
-    let calendar_config = config::load_calendar_config(std::path::Path::new(".ai/calendar.yaml"));
-    let web_config = config::load_web_config(std::path::Path::new(".ai/web.yaml"));
-    let browser_config = config::load_browser_config(std::path::Path::new(".ai/browser.yaml"));
-    let telegram_config = config::load_telegram_config(std::path::Path::new(".ai/telegram.yaml"));
+    let voice_config = machine_file(machine_config::VOICE_FILE)
+        .as_deref()
+        .map(config::load_voice_config)
+        .unwrap_or_default();
+    let calendar_config = machine_file(machine_config::CALENDAR_FILE)
+        .as_deref()
+        .map(config::load_calendar_config)
+        .unwrap_or_default();
+    let web_config = machine_file(machine_config::WEB_FILE)
+        .as_deref()
+        .map(config::load_web_config)
+        .unwrap_or_default();
+    let browser_config = machine_file(machine_config::BROWSER_FILE)
+        .as_deref()
+        .map(config::load_browser_config)
+        .unwrap_or_default();
+    let telegram_config = machine_file(machine_config::TELEGRAM_FILE)
+        .as_deref()
+        .map(config::load_telegram_config)
+        .unwrap_or_default();
     // The path is named once and reused, because two facts come off it: what the file SAYS
     // (`load_github_config`) and whether it EXISTS at all. The second is the pillar's opt-in — see
-    // `GithubRuntime::configured` — and deriving it from a second literal is how the two would come
+    // `GithubRuntime::configured` — and deriving it from a second lookup is how the two would come
     // to disagree about which file they mean.
-    let github_path = std::path::Path::new(".ai/github.yaml");
-    let github_config = config::load_github_config(github_path);
-    let github_configured = github_path.exists();
+    let github_path = machine_file(machine_config::GITHUB_FILE);
+    let github_config = github_path
+        .as_deref()
+        .map(config::load_github_config)
+        .unwrap_or_default();
+    let github_configured = github_path.as_deref().is_some_and(std::path::Path::exists);
     // Resolved here and carried on the runtime, so the daemon and the health probe can never end up
     // asking about two different programs — the mistake `cli_probe` names when it says to use "the
     // resolved path, not the configured name".
@@ -1262,15 +1592,10 @@ async fn main() {
         // `None` when this machine has no home directory to hang a library off. Resolved here and
         // not per request, like `files_root` above: it is a fact about the machine.
         workflow_library: seeded_library(),
-        // Said out loud on failure rather than swallowed: every settings route refuses
-        // without it, and "the daemon cannot name its own working directory" is not a
-        // sentence anybody should have to infer from a 500.
         secrets: std::sync::Arc::new(secrets::OsCredentialStore),
-        machine_config_root: std::env::current_dir()
-            .inspect_err(|error| {
-                tracing::warn!(%error, "the daemon cannot name its own working directory; this machine's settings cannot be edited from the app")
-            })
-            .ok(),
+        // The root every file above was read from, so the settings page writes the same files the
+        // daemon reads. `None` was already warned about where it was resolved.
+        machine_config_root: machine_config_root.clone(),
         telegram_doctrine: telegram_config.doctrine,
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
@@ -1308,10 +1633,10 @@ async fn main() {
             ollama_base_url: runner::OLLAMA_BASE_URL.to_string(),
             http: reqwest::Client::new(),
         }),
-        quota: Arc::new(quota::QuotaRuntime::new(quota_client::QuotaClient::new(
-            sidecar::QUOTA_ADDR,
-            quota_sidecar_token.clone(),
-        ), models_config.active_runner().to_string())),
+        quota: Arc::new(quota::QuotaRuntime::new(
+            quota_client::QuotaClient::new(sidecar::QUOTA_ADDR, quota_sidecar_token.clone()),
+            models_config.active_runner().to_string(),
+        )),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_tails: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1498,7 +1823,10 @@ async fn main() {
     tokio::spawn(runs::run_retention_loop(state.clone()));
     tokio::spawn(vcs::run_queue_worker(
         state.pool.clone(),
-        std::sync::Arc::new(git_exec::GitExecutor::default()),
+        std::sync::Arc::new(git_exec::GitExecutor {
+            machine_root: machine_config_root.clone(),
+            ..git_exec::GitExecutor::default()
+        }),
     ));
     // Its own loop and not a step inside the queue worker's, for the reason `resolver.rs` opens
     // with: the worker holds a pool and a repository lock, and starting an agent needs an
@@ -1614,16 +1942,18 @@ async fn main() {
             }
         });
     } else if email_config_found {
-        tracing::info!("email pillar disabled (.ai/email.yaml says enabled: false)");
+        tracing::info!(
+            "email pillar disabled ({} says enabled: false)",
+            machine_config::display_path(machine_config::EMAIL_FILE)
+        );
     } else {
         // Not the same thing, and saying so cost a diagnosis: a daemon started from the wrong
-        // directory reported the user's config as switched off while that file sat there reading
-        // `enabled: true`. Absolute, because the whole point is which directory was searched.
+        // directory once reported the user's config as switched off while that file sat there
+        // reading `enabled: true`. The files no longer depend on where the daemon was started, but
+        // "off because absent" and "off because it says so" are still two different sentences.
         tracing::info!(
-            path = %std::path::absolute(email_config_path)
-                .unwrap_or_else(|_| email_config_path.to_path_buf())
-                .display(),
-            "email pillar off — no config file here (the path is relative to the working directory)"
+            "email pillar off — {} does not exist",
+            machine_config::display_path(machine_config::EMAIL_FILE)
         );
     }
 
@@ -1859,5 +2189,45 @@ mod tests {
             " --verbose".to_owned(),
         ];
         assert_eq!(land_target_from(&args), None);
+    }
+
+    fn words(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_owned).collect()
+    }
+
+    /// Every part of a packaging request is required: a version is written once, so a guessed
+    /// folder or manifest would be a permanent mistake.
+    #[test]
+    fn packaging_needs_every_argument_and_takes_them_in_any_flag_order() {
+        let parsed = workflow_package_args(&words(
+            "nucleos-core --workflow-package dev 1.0.0 --manifest m.yaml --from /p",
+        ))
+        .unwrap();
+        assert_eq!(parsed.0, "dev");
+        assert_eq!(parsed.1, "1.0.0");
+        assert_eq!(parsed.2, std::path::PathBuf::from("/p"));
+        assert_eq!(parsed.3, std::path::PathBuf::from("m.yaml"));
+
+        for line in [
+            "nucleos-core --workflow-package dev --from /p --manifest m.yaml",
+            "nucleos-core --workflow-package dev 1.0.0 --from /p",
+            "nucleos-core --workflow-package dev 1.0.0 --from --manifest m.yaml",
+        ] {
+            assert!(workflow_package_args(&words(line)).is_err(), "{line}");
+        }
+    }
+
+    /// A named checkout is sent as given, made absolute; no name means the working directory.
+    #[test]
+    fn workflow_sync_names_the_argument_or_the_working_directory() {
+        let named = workflow_sync_target(&words("nucleos-core --workflow-sync some/tree")).unwrap();
+        assert!(std::path::Path::new(&named).is_absolute());
+        assert!(named.replace('\\', "/").ends_with("some/tree"));
+
+        let bare = workflow_sync_target(&words("nucleos-core --workflow-sync")).unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(bare),
+            std::path::absolute(std::env::current_dir().unwrap()).unwrap()
+        );
     }
 }

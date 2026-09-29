@@ -10,7 +10,7 @@ pub struct ModelsConfig {
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub local_triage_model: Option<String>,
     /// Absent leaves voice cleanup unarmed, so a transcript is delivered raw rather than not at all.
-    /// Named here rather than in `.ai/voice.yaml` because pinning models is this file's whole job.
+    /// Named here rather than in `~/.nucleos/voice.yaml` because pinning models is this file's whole job.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub voice_cleanup_model: Option<String>,
     /// Which agent CLI answers a run. Absent — or naming anything startup does not recognise — keeps
@@ -52,7 +52,7 @@ pub struct ModelsConfig {
     ///
     /// Absent means `ollama`, which is the ship-dark posture `local_assistant_model` and
     /// `primary_runner` already carry, arriving through the one key where absence is not merely
-    /// "unarmed" but "the engine this machine has always used": every `.ai/nucleos-models.yaml` on
+    /// "unarmed" but "the engine this machine has always used": every `~/.nucleos/nucleos-models.yaml` on
     /// disk was written before this key existed and names none of them, so absence has to resolve
     /// to exactly today's behaviour or a file that worked this morning refuses this afternoon.
     ///
@@ -148,7 +148,7 @@ pub struct AssistantChoice {
     /// never guesses — a choice absent from that function's map keeps `None`, never `Some(false)`.
     ///
     /// `#[serde(default)]` is required, not decoration: `AssistantChoice` is `Deserialize` and is
-    /// read from `.ai/nucleos-models.yaml`'s `assistant_choices`, so without it every existing
+    /// read from `~/.nucleos/nucleos-models.yaml`'s `assistant_choices`, so without it every existing
     /// config file on disk — written before this field existed — stops parsing.
     #[serde(default)]
     pub tools: Option<bool>,
@@ -165,7 +165,7 @@ pub struct AssistantChoice {
     /// never probed from here, for the reason that function's own doc gives.
     ///
     /// `#[serde(default)]` for the same reason `tools` carries one, and it matters more here: a
-    /// `brain: local` row written into `.ai/nucleos-models.yaml` by hand names the model and
+    /// `brain: local` row written into `~/.nucleos/nucleos-models.yaml` by hand names the model and
     /// nothing else, because whether it is pulled is not a fact a config file can assert.
     #[serde(default)]
     pub installed: Option<bool>,
@@ -202,7 +202,9 @@ pub fn is_effort_level(config: &ModelsConfig, value: &str) -> bool {
 
 /// Loads the current models configuration, falling back to defaults on failure.
 pub fn models_config_now() -> ModelsConfig {
-    load_models_config(Path::new(MODELS_CONFIG_PATH)).unwrap_or_default()
+    models_config_path()
+        .and_then(|path| load_models_config(&path).ok())
+        .unwrap_or_default()
 }
 
 fn default_assistant_choices() -> Vec<AssistantChoice> {
@@ -414,7 +416,7 @@ impl ModelsConfig {
             // machine -- is the second, and dropping the rows is half the fix rather than an
             // extra: refusing only at `local_engine()` would leave the picker offering the models,
             // so the person picks one, the turn dies, and nothing on screen connects that to the
-            // line in `.ai/nucleos-models.yaml` that caused it.
+            // line in `~/.nucleos/nucleos-models.yaml` that caused it.
             choices.retain(|choice| choice.brain != "local");
         }
         match &self.hosted_assistant_model {
@@ -586,7 +588,7 @@ pub enum LocalEngineRefusal {
 
 impl LocalEngineRefusal {
     /// What an operator is told, in the voice of this crate's other refusals: the fault, then the
-    /// key in `.ai/nucleos-models.yaml` that fixes it.
+    /// key in `~/.nucleos/nucleos-models.yaml` that fixes it.
     ///
     /// Naming the key is the whole point. A refusal that only describes the fault sends its reader
     /// looking for which line produced it, and "local model refused" reads like a defect in the
@@ -598,16 +600,16 @@ impl LocalEngineRefusal {
         match self {
             Self::UnknownEngine(named) => format!(
                 "`local_engine: {named}` names no local engine this daemon serves; write `ollama` \
-                 or `openai_compatible` in {MODELS_CONFIG_PATH}, or remove the key to keep Ollama"
+                 or `openai_compatible` in {MODELS_CONFIG_DISPLAY_PATH}, or remove the key to keep Ollama"
             ),
             Self::NoBaseUrl => format!(
-                "`local_engine: openai_compatible` needs a `local_base_url` in {MODELS_CONFIG_PATH}: no port \
+                "`local_engine: openai_compatible` needs a `local_base_url` in {MODELS_CONFIG_DISPLAY_PATH}: no port \
                  is guessed here, because the only port worth guessing is Ollama's and a turn sent \
                  to it would reach whatever is listening there"
             ),
             Self::NotLoopback(refused) => format!(
                 "`local_base_url: {refused}` is not on this machine, and the local route only ever \
-                 talks to the loopback; fix `local_base_url` in {MODELS_CONFIG_PATH}, or choose a \
+                 talks to the loopback; fix `local_base_url` in {MODELS_CONFIG_DISPLAY_PATH}, or choose a \
                  hosted route deliberately"
             ),
         }
@@ -696,14 +698,33 @@ where
         .filter(|model| !model.is_empty()))
 }
 
-/// Where the pinned model names live, relative to the daemon's working directory.
+/// The file the pinned model names live in, relative to [`crate::machine_config::root`].
 ///
-/// A constant because two places need it and they must not drift: startup builds the runner from
-/// this file, and `GET /assistant/models` re-reads it per request so a choice added to it works
+/// A constant because several places need it and they must not drift: startup builds the runner
+/// from this file, and `GET /assistant/models` re-reads it per request so a choice added to it works
 /// without a restart. The second reader is the reason it stopped being a literal in `main.rs`.
-pub const MODELS_CONFIG_PATH: &str = ".ai/nucleos-models.yaml";
+pub const MODELS_CONFIG_FILE: &str = "nucleos-models.yaml";
 
-/// `.ai/nucleos-models.yaml`'s grammar, and the only place that decides what a valid one is.
+/// The same file as a person is shown it, and the only spelling a message uses. See
+/// [`crate::machine_config::ROOT_DISPLAY`].
+pub const MODELS_CONFIG_DISPLAY_PATH: &str = "~/.nucleos/nucleos-models.yaml";
+
+/// Where the daemon reads [`MODELS_CONFIG_FILE`], or `None` when there is nowhere to read it from —
+/// which every reader treats as an absent file, i.e. [`ModelsConfig::default`].
+///
+/// `None` under `cargo test` as well, and that is deliberate rather than a convenience: this file
+/// used to resolve against the working directory, a test runs from `core/`, `core/.ai/` never
+/// existed, and a whole family of tests was written against the defaults that absence produced.
+/// Resolving it now would hand those tests whatever this machine's owner has configured — a local
+/// model in one place, none in another — and a unit test must not read a real `~/.nucleos`.
+pub fn models_config_path() -> Option<std::path::PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    crate::machine_config::root().map(|root| root.join(MODELS_CONFIG_FILE))
+}
+
+/// `nucleos-models.yaml`'s grammar, and the only place that decides what a valid one is.
 ///
 /// Unlike its seven neighbours this file's loader could already refuse, so splitting the parser out
 /// buys no new strictness — it buys the write route a function with the shape every other claim's
@@ -721,7 +742,7 @@ pub fn load_models_config(path: &Path) -> std::io::Result<ModelsConfig> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// `.ai/email.yaml` (spec §3.4). Every field has a default, so a partial file is valid and an
+/// `~/.nucleos/email.yaml` (spec §3.4). Every field has a default, so a partial file is valid and an
 /// absent one switches the pillar off in silence rather than blocking startup.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -803,7 +824,7 @@ impl EmailConfig {
     }
 }
 
-/// `.ai/email.yaml`'s grammar, and the only place that decides what a valid one is.
+/// `~/.nucleos/email.yaml`'s grammar, and the only place that decides what a valid one is.
 ///
 /// Split out of [`load_email_config`] because a write route needs a parser that can REFUSE, and
 /// the loader by design cannot: it answers a malformed file with defaults precisely so that
@@ -816,7 +837,7 @@ pub fn parse_email_config(contents: &str) -> Result<EmailConfig, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Reads `.ai/email.yaml`. Absent or unreadable → defaults, with a warning; never an error, so a
+/// Reads `~/.nucleos/email.yaml`. Absent or unreadable → defaults, with a warning; never an error, so a
 /// typo in an optional pillar's config cannot stop the daemon from starting.
 pub fn load_email_config(path: &Path) -> EmailConfig {
     if !path.exists() {
@@ -861,7 +882,7 @@ Do NOT rephrase or restructure sentences that are already clear, and keep number
 versions, units and paths exactly as they were said — digits stay digits.
 Keep the original language. Return only the corrected text.";
 
-/// The chords the pillar ships with when `.ai/voice.yaml` names none, per platform.
+/// The chords the pillar ships with when `~/.nucleos/voice.yaml` names none, per platform.
 ///
 /// macOS is the reason this is a constant rather than three literals in `Default`: the
 /// `Ctrl+Alt` family is not free there. Cmd+Space is Spotlight, Ctrl+Space switches the input
@@ -891,7 +912,7 @@ const DEFAULT_HOTKEYS: [&str; 3] = [
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_HOTKEYS: [&str; 3] = ["Ctrl+Alt+Space", "Ctrl+Alt+M", "Ctrl+Alt+C"];
 
-/// `.ai/voice.yaml`. Every field defaults, so a partial file is valid and an absent one leaves the
+/// `~/.nucleos/voice.yaml`. Every field defaults, so a partial file is valid and an absent one leaves the
 /// pillar off without comment.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -1021,7 +1042,7 @@ impl VoiceConfig {
     }
 }
 
-/// `.ai/voice.yaml`'s grammar, and the only place that decides what a valid one is.
+/// `~/.nucleos/voice.yaml`'s grammar, and the only place that decides what a valid one is.
 ///
 /// Split out of [`load_voice_config`] because a write route needs a parser that can REFUSE, and
 /// the loader by design cannot: it answers a malformed file with defaults precisely so that
@@ -1034,7 +1055,7 @@ pub fn parse_voice_config(contents: &str) -> Result<VoiceConfig, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Reads `.ai/voice.yaml`. Absent, unreadable or malformed → defaults, with a warning; never an error.
+/// Reads `~/.nucleos/voice.yaml`. Absent, unreadable or malformed → defaults, with a warning; never an error.
 ///
 /// This follows `load_email_config` rather than `load_schedule_rules`, and the choice matters in two
 /// directions: a typo in a dictation aid must not stop the daemon from starting, and "off" is the
@@ -1092,7 +1113,7 @@ impl Default for CalendarConfig {
     }
 }
 
-/// `.ai/calendar.yaml`'s grammar, and the only place that decides what a valid one is.
+/// `~/.nucleos/calendar.yaml`'s grammar, and the only place that decides what a valid one is.
 ///
 /// Split out of [`load_calendar_config`] because a write route needs a parser that can REFUSE, and
 /// the loader by design cannot: it answers a malformed file with defaults precisely so that
@@ -1120,7 +1141,7 @@ pub fn load_calendar_config(path: &Path) -> CalendarConfig {
     }
 }
 
-/// `.ai/web.yaml`. The web pillar's settings, including the one list in this system that decides
+/// `~/.nucleos/web.yaml`. The web pillar's settings, including the one list in this system that decides
 /// what counts as trustworthy.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -1137,7 +1158,7 @@ pub struct WebConfig {
     /// asked (`trust.rs`, spec §5.2).
     ///
     /// Empty by default, and that is the load-bearing choice in this struct. Every other field's
-    /// default is a convenience; this one's is a refusal. A `.ai/web.yaml` that is missing,
+    /// default is a convenience; this one's is a refusal. A `~/.nucleos/web.yaml` that is missing,
     /// unreadable, or malformed therefore trusts NOTHING rather than falling back to a list nobody
     /// can see — the opposite direction from `VoiceConfig`, whose defaults are all benign.
     pub trusted_hosts: Vec<String>,
@@ -1168,7 +1189,7 @@ impl Default for WebConfig {
     }
 }
 
-/// `.ai/web.yaml`'s grammar, and the only place that decides what a valid one is.
+/// `~/.nucleos/web.yaml`'s grammar, and the only place that decides what a valid one is.
 ///
 /// Split out of [`load_web_config`] because a write route needs a parser that can REFUSE, and
 /// the loader by design cannot: it answers a malformed file with defaults precisely so that
@@ -1179,7 +1200,7 @@ pub fn parse_web_config(contents: &str) -> Result<WebConfig, String> {
     serde_yaml::from_str::<WebConfig>(contents).map_err(|error| error.to_string())
 }
 
-/// Reads `.ai/web.yaml`. Absent, unreadable or malformed → defaults, with a warning.
+/// Reads `~/.nucleos/web.yaml`. Absent, unreadable or malformed → defaults, with a warning.
 ///
 /// The failure mode is deliberately asymmetric with the rest of this module: falling back to
 /// defaults here means falling back to an EMPTY allowlist, so a broken file costs fidelity (more
@@ -1203,7 +1224,7 @@ pub fn load_web_config(path: &Path) -> WebConfig {
     }
 }
 
-/// `.ai/browser.yaml`. The browser pillar's switch and its ceilings (spec §8).
+/// `~/.nucleos/browser.yaml`. The browser pillar's switch and its ceilings (spec §8).
 ///
 /// The site lists are deliberately NOT here, and that omission is the pillar's central invariant:
 /// they live in `browser_sites` and grow only when a person finishes a login (spec §5.2). A field in
@@ -1243,7 +1264,7 @@ impl Default for BrowserConfig {
     }
 }
 
-/// `.ai/browser.yaml`'s grammar, and the only place that decides what a valid one is.
+/// `~/.nucleos/browser.yaml`'s grammar, and the only place that decides what a valid one is.
 ///
 /// Split out of [`load_browser_config`] because a write route needs a parser that can REFUSE, and
 /// the loader by design cannot: it answers a malformed file with defaults precisely so that
@@ -1254,7 +1275,7 @@ pub fn parse_browser_config(contents: &str) -> Result<BrowserConfig, String> {
     serde_yaml::from_str::<BrowserConfig>(contents).map_err(|error| error.to_string())
 }
 
-/// Reads `.ai/browser.yaml`. Absent, unreadable or malformed → defaults, with a warning.
+/// Reads `~/.nucleos/browser.yaml`. Absent, unreadable or malformed → defaults, with a warning.
 ///
 /// Defaults mean the pillar is OFF, so a broken file costs a capability and never grants one — the
 /// same asymmetry [`load_web_config`] has, and here it is easier to justify: there is nothing in
@@ -1276,7 +1297,7 @@ pub fn load_browser_config(path: &Path) -> BrowserConfig {
     }
 }
 
-/// `.ai/telegram.yaml`. Per-developer, gitignored, and read for exactly one thing: the standing
+/// `~/.nucleos/telegram.yaml`. Per-developer, gitignored, and read for exactly one thing: the standing
 /// doctrine a Telegram turn falls back on when the chat itself gave no instructions.
 ///
 /// Ships with no field this widens into a capability, unlike `GithubConfig` below — the whole
@@ -1302,7 +1323,7 @@ where
     Ok(Option::<String>::deserialize(deserializer)?.filter(|text| !text.trim().is_empty()))
 }
 
-/// `.ai/telegram.yaml`'s grammar, and the only place that decides what a valid one is.
+/// `~/.nucleos/telegram.yaml`'s grammar, and the only place that decides what a valid one is.
 ///
 /// Split out of [`load_telegram_config`] because a write route needs a parser that can REFUSE, and
 /// the loader by design cannot: it answers a malformed file with defaults precisely so that
@@ -1313,7 +1334,7 @@ pub fn parse_telegram_config(contents: &str) -> Result<TelegramConfig, String> {
     serde_yaml::from_str::<TelegramConfig>(contents).map_err(|error| error.to_string())
 }
 
-/// Reads `.ai/telegram.yaml`. Absent, unreadable or malformed → default (`doctrine: None`), with a
+/// Reads `~/.nucleos/telegram.yaml`. Absent, unreadable or malformed → default (`doctrine: None`), with a
 /// warning — the same asymmetry `load_web_config` and `load_browser_config` both take: a typo in a
 /// per-developer file must cost fidelity (no doctrine prepended) and never stop the daemon, and
 /// never invent a doctrine nobody wrote.
@@ -1334,7 +1355,7 @@ pub fn load_telegram_config(path: &Path) -> TelegramConfig {
     }
 }
 
-/// `.ai/github.yaml`. The GitHub pillar's switch and the two lists that decide what runs without
+/// `~/.nucleos/github.yaml`. The GitHub pillar's switch and the two lists that decide what runs without
 /// anybody watching.
 ///
 /// **`enabled` defaults to TRUE, which is the opposite of every other pillar that reaches the
@@ -1376,7 +1397,7 @@ impl Default for GithubConfig {
     }
 }
 
-/// `.ai/github.yaml`'s grammar, and the only place that decides what a valid one is.
+/// `~/.nucleos/github.yaml`'s grammar, and the only place that decides what a valid one is.
 ///
 /// Split out of [`load_github_config`] because a write route needs a parser that can REFUSE, and
 /// the loader by design cannot: it answers a malformed file with defaults precisely so that
@@ -1387,7 +1408,7 @@ pub fn parse_github_config(contents: &str) -> Result<GithubConfig, String> {
     serde_yaml::from_str::<GithubConfig>(contents).map_err(|error| error.to_string())
 }
 
-/// Reads `.ai/github.yaml`. Absent, unreadable or malformed -> defaults, with a warning.
+/// Reads `~/.nucleos/github.yaml`. Absent, unreadable or malformed -> defaults, with a warning.
 ///
 /// The same asymmetry `load_web_config` has and the same reason: falling back to defaults here means
 /// falling back to two EMPTY lists, so a broken file costs convenience — everything starts asking —
@@ -1785,7 +1806,7 @@ pub fn load_council_config(path: &Path, local_available: bool) -> Option<Council
     }
 }
 
-/// `.ai/council.yaml`'s grammar AND its roster rules, which for this file are the same question:
+/// `~/.nucleos/council.yaml`'s grammar AND its roster rules, which for this file are the same question:
 /// a council whose seats do not add up is not a council, so `faults` belongs on this side of the
 /// door rather than after it.
 ///
@@ -1836,17 +1857,19 @@ pub struct ScheduleRule {
 
 /// The ceiling the daemon puts on a rule's fan-out, whatever the file asks for.
 ///
-/// `.ai/` is gitignored and travels with nobody, so `autopilot.yaml` is per-developer configuration
-/// that no review ever sees. A number in it therefore cannot be the only thing standing between one
-/// trigger and an unbounded number of runs — the file may lower the fan-out, never raise it.
+/// A project's `autopilot.yaml` lives in `~/.nucleos/projects/<id>/` and travels with nobody, so
+/// it is per-developer configuration that no review ever sees. A number in it therefore cannot be
+/// the only thing standing between one trigger and an unbounded number of runs — the file may
+/// lower the fan-out, never raise it.
 pub const MAX_ITEMS_CEILING: usize = 5;
 
 /// The ceiling the daemon puts on how many EXTRA implement runs one red gate may buy.
 ///
 /// The same argument `MAX_ITEMS_CEILING` makes, against the same file. A retry is a whole run, and
-/// `.ai/autopilot.yaml` is per-developer configuration no review ever sees — a number in it cannot
-/// be the only thing standing between one red gate and an unbounded number of re-implements. It may
-/// lower the budget; it may not raise it past what the daemon is willing to spend on one item.
+/// the project's `autopilot.yaml` is per-developer configuration no review ever sees — a number in
+/// it cannot be the only thing standing between one red gate and an unbounded number of
+/// re-implements. It may lower the budget; it may not raise it past what the daemon is willing to
+/// spend on one item.
 ///
 /// Three rather than five, and lower than the fan-out ceiling on purpose: past the third attempt the
 /// evidence is that the item cannot be made to pass, and every further run is taken from the items
@@ -1950,7 +1973,7 @@ pub struct GraphConfig {
     ///
     /// `None` — the key absent — means what every `graph:` rule has always meant: only the house
     /// limit governs this job. That is the behaviour of every rule already sitting in somebody's
-    /// gitignored `.ai/autopilot.yaml`, and it must stay theirs, so there is no default number here.
+    /// `autopilot.yaml`, and it must stay theirs, so there is no default number here.
     ///
     /// A PUBLIC field, unlike `max_items` and `gate_retries`. Those two are private behind an
     /// accessor because the accessor applies a CEILING against a per-developer file no review sees.
@@ -1993,8 +2016,8 @@ impl GraphConfig {
     ///
     /// Private field plus this accessor for the same reason `max_items` has one, and it is worth
     /// saying twice because the failure is silent: a caller that read `gate_retries` straight off
-    /// the struct would honour whatever `.ai/autopilot.yaml` asked for, and the ceiling above would
-    /// be decorative — present in the code, absent from every job that actually runs.
+    /// the struct would honour whatever the project's `autopilot.yaml` asked for, and the ceiling
+    /// above would be decorative — present in the code, absent from every job that actually runs.
     pub fn gate_retries(&self) -> usize {
         self.gate_retries.min(MAX_GATE_RETRIES_CEILING)
     }
@@ -2024,7 +2047,7 @@ pub struct AutopilotRules {
     /// before this key existed. `deny_unknown_fields` above means a misspelling is a startup error,
     /// rather than a silently ignored line.
     ///
-    /// Turning this on records the breach in `.ai/local/ledgers/intents.jsonl` for an operator to
+    /// Turning this on records the breach as a line in the project's feed for an operator to
     /// review; it does not enqueue a job, start a run, or touch the approval queue. The
     /// `schedules` and `repo_triggers` lists stay empty because the file's own doctrine is
     /// "Creating this file must not start anything"; this key does not overrule that doctrine.
@@ -2080,21 +2103,37 @@ impl AutopilotRules {
     }
 }
 
-/// Where a project keeps its rules, relative to its root, in forward slashes.
+/// A project's rules, from `~/.nucleos/projects/<project_id>/autopilot.yaml`.
 ///
-/// Named once because two things have to agree about it and they live in different modules: this
-/// loader, and `ownership.rs`, which declares the file writable by the app. A registry that granted
-/// write to a path the loader never reads would be permission to write bytes nobody parses, which
-/// is the one thing that registry exists to prevent — so the claim is asserted against this const
-/// rather than against a second literal.
-pub const AUTOPILOT_RULES_PATH: &str = ".ai/autopilot.yaml";
+/// Keyed by the project's id and not by a folder, which is the whole of `project_state.rs`'s
+/// argument: the same file is found from the main checkout and from every worktree the daemon opens
+/// of it, and it does not move when the project's folder does. `machine_root` is
+/// `AppState::machine_config_root` in production and a temporary directory in a test.
+///
+/// No root, or an id that cannot name a directory, reads as a project with no file — the ordinary
+/// state, answered with `AutopilotRules::default()`. The file is named once, as
+/// [`crate::project_state::AUTOPILOT_FILE`], because two things have to agree about it: this loader
+/// and `ownership.rs`, which declares it writable by the app.
+pub fn load_schedule_rules(
+    machine_root: Option<&Path>,
+    project_id: &str,
+) -> std::io::Result<AutopilotRules> {
+    match crate::project_state::file(
+        machine_root,
+        project_id,
+        crate::project_state::AUTOPILOT_FILE,
+    ) {
+        Some(path) => load_schedule_rules_from(&path),
+        None => Ok(AutopilotRules::default()),
+    }
+}
 
-pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRules> {
-    let path = project_root.join(AUTOPILOT_RULES_PATH);
+/// The same rules, from one file. Absent is `AutopilotRules::default()`.
+pub fn load_schedule_rules_from(path: &Path) -> std::io::Result<AutopilotRules> {
     if !path.exists() {
         return Ok(AutopilotRules::default());
     }
-    parse_schedule_rules(&std::fs::read_to_string(&path)?)
+    parse_schedule_rules(&std::fs::read_to_string(path)?)
 }
 
 /// The same rules, from text that is not on disk yet.
@@ -2129,7 +2168,7 @@ pub fn parse_schedule_rules(contents: &str) -> std::io::Result<AutopilotRules> {
 /// caller has to look, and a hand-built `GraphConfig` in a test is not silently held to a rule that
 /// only the file-reading path enforces.
 ///
-/// Refused rather than clamped, both times, because `.ai/autopilot.yaml` is gitignored per-developer
+/// Refused rather than clamped, both times, because the project's `autopilot.yaml` is per-developer
 /// configuration no review ever sees. A number quietly corrected there is a number nobody learns was
 /// wrong: the file would keep reading as though it had asked for something, and the job would behave
 /// as though it had asked for something else.
@@ -2950,9 +2989,13 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
 
     fn rules_from(yaml: &str) -> std::io::Result<AutopilotRules> {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
-        std::fs::write(dir.path().join(".ai").join("autopilot.yaml"), yaml).unwrap();
-        load_schedule_rules(dir.path())
+        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
+        std::fs::write(
+            dir.path().join("projects").join("p").join("autopilot.yaml"),
+            yaml,
+        )
+        .unwrap();
+        load_schedule_rules(Some(dir.path()), "p")
     }
 
     #[test]
@@ -3024,7 +3067,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
 
     /// The same argument `max_items` is guarded by, against the same file.
     ///
-    /// `.ai/autopilot.yaml` is gitignored per-developer configuration no review ever sees, and a
+    /// a project's `autopilot.yaml` is per-developer configuration no review ever sees, and a
     /// retry is a whole run: a number in that file cannot be the only thing standing between one red
     /// gate and an unbounded number of re-implements. It may lower the budget; it may not raise it
     /// past what the daemon is willing to spend on one item.
@@ -3078,7 +3121,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
 
     /// Absent means absent, and never zero. A rule that says nothing about money keeps exactly
     /// today's behaviour — only the house limit governs — and every `graph:` rule already sitting in
-    /// somebody's gitignored `.ai/autopilot.yaml` says nothing about money. Defaulting this to a
+    /// somebody's `autopilot.yaml` says nothing about money. Defaulting this to a
     /// number would put a ceiling on all of them overnight, and the first evidence would be a job
     /// stopping for a limit nobody set.
     ///
@@ -3098,9 +3141,9 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     ///
     /// Both halves matter and the second more. `#[serde(deny_unknown_fields)]` means the key had to
     /// be declared before any file could carry it, so the first half is the whole of "the nightly
-    /// job can be run by a team". And every rule already sitting in somebody's gitignored
-    /// `.ai/autopilot.yaml` omits it, so the second half is the promise that none of those nights
-    /// changes shape because this landed.
+    /// job can be run by a team". And every rule already sitting in somebody's `autopilot.yaml`
+    /// omits it, so the second half is the promise that none of those nights changes shape because
+    /// this landed.
     ///
     /// Nothing here checks that the team exists, and nothing here can: this is a file and the
     /// catalogue is a table. `job::start` reads it when the job is made, which is the only moment
@@ -3133,8 +3176,8 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     /// allowance is not a number anyone meant to write.
     ///
     /// Clamping it silently to zero would be the worse of the two failures: the job would stop at
-    /// its first node while `.ai/autopilot.yaml` still read as though it had asked for something,
-    /// and the file is gitignored per-developer configuration that no review ever sees.
+    /// its first node while the project's `autopilot.yaml` still read as though it had asked for
+    /// something, and the file is per-developer configuration that no review ever sees.
     #[test]
     fn a_negative_budget_is_malformed_rather_than_clamped() {
         let error = rules_from(
@@ -3837,7 +3880,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     fn schedule_rules_missing_file_returns_default() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            load_schedule_rules(dir.path()).unwrap(),
+            load_schedule_rules(Some(dir.path()), "p").unwrap(),
             AutopilotRules::default()
         );
     }
@@ -3848,7 +3891,11 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     #[test]
     fn a_project_that_configured_nothing_keeps_the_attention_brake() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_schedule_rules(dir.path()).unwrap().attention_brake());
+        assert!(
+            load_schedule_rules(Some(dir.path()), "p")
+                .unwrap()
+                .attention_brake()
+        );
         assert!(AutopilotRules::default().attention_brake());
     }
 
@@ -3869,24 +3916,32 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     #[test]
     fn the_attention_brake_is_switched_off_by_name_and_back_on_by_name() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
-        let path = dir.path().join(".ai").join("autopilot.yaml");
+        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
+        let path = dir.path().join("projects").join("p").join("autopilot.yaml");
 
         std::fs::write(&path, "attention_brake: false\n").unwrap();
-        assert!(!load_schedule_rules(dir.path()).unwrap().attention_brake());
+        assert!(
+            !load_schedule_rules(Some(dir.path()), "p")
+                .unwrap()
+                .attention_brake()
+        );
 
         // Spelled out rather than left to the test above: "absent" and "present and true" are
         // different inputs that must reach the same answer, and only one of them is the default.
         std::fs::write(&path, "attention_brake: true\n").unwrap();
-        assert!(load_schedule_rules(dir.path()).unwrap().attention_brake());
+        assert!(
+            load_schedule_rules(Some(dir.path()), "p")
+                .unwrap()
+                .attention_brake()
+        );
     }
 
     #[test]
     fn schedule_rules_parses_two_entries() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
         std::fs::write(
-            dir.path().join(".ai").join("autopilot.yaml"),
+            dir.path().join("projects").join("p").join("autopilot.yaml"),
             "schedules:\n\
              \x20\x20- name: nightly-build\n\
              \x20\x20\x20\x20cron: \"0 2 * * *\"\n\
@@ -3898,7 +3953,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         )
         .unwrap();
 
-        let rules = load_schedule_rules(dir.path()).unwrap();
+        let rules = load_schedule_rules(Some(dir.path()), "p").unwrap();
         assert_eq!(rules.schedules.len(), 2);
 
         assert_eq!(rules.schedules[0].name, "nightly-build");
@@ -3914,9 +3969,9 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     #[test]
     fn schedule_rules_entry_without_cwd_is_none() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
         std::fs::write(
-            dir.path().join(".ai").join("autopilot.yaml"),
+            dir.path().join("projects").join("p").join("autopilot.yaml"),
             "schedules:\n\
              \x20\x20- name: morning-report\n\
              \x20\x20\x20\x20cron: \"0 8 * * *\"\n\
@@ -3924,7 +3979,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         )
         .unwrap();
 
-        let rules = load_schedule_rules(dir.path()).unwrap();
+        let rules = load_schedule_rules(Some(dir.path()), "p").unwrap();
         assert_eq!(rules.schedules[0].cwd, None);
     }
 
@@ -3936,10 +3991,14 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     fn schedule_rules_with_no_yaml_document_is_not_a_gate_rather_than_an_error() {
         for contents in ["", "   \n\n", "# just a comment\n# and another\n"] {
             let dir = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
-            std::fs::write(dir.path().join(".ai").join("autopilot.yaml"), contents).unwrap();
+            std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
+            std::fs::write(
+                dir.path().join("projects").join("p").join("autopilot.yaml"),
+                contents,
+            )
+            .unwrap();
 
-            let rules = load_schedule_rules(dir.path())
+            let rules = load_schedule_rules(Some(dir.path()), "p")
                 .unwrap_or_else(|e| panic!("{contents:?} must not be an error, got {e}"));
             assert_eq!(rules.gate_command, None);
             assert!(
@@ -3954,22 +4013,22 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     #[test]
     fn schedule_rules_malformed_yaml_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
         std::fs::write(
-            dir.path().join(".ai").join("autopilot.yaml"),
+            dir.path().join("projects").join("p").join("autopilot.yaml"),
             "schedules: [not, valid, for this struct",
         )
         .unwrap();
 
-        assert!(load_schedule_rules(dir.path()).is_err());
+        assert!(load_schedule_rules(Some(dir.path()), "p").is_err());
     }
 
     #[test]
     fn repo_triggers_parse_and_default_empty() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
         std::fs::write(
-            dir.path().join(".ai").join("autopilot.yaml"),
+            dir.path().join("projects").join("p").join("autopilot.yaml"),
             "repo_triggers:\n\
              \x20\x20- name: review-main\n\
              \x20\x20\x20\x20branch: main\n\
@@ -3977,7 +4036,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         )
         .unwrap();
 
-        let rules = load_schedule_rules(dir.path()).unwrap();
+        let rules = load_schedule_rules(Some(dir.path()), "p").unwrap();
         assert!(rules.schedules.is_empty());
         assert_eq!(rules.repo_triggers.len(), 1);
         assert_eq!(rules.repo_triggers[0].name, "review-main");
@@ -4127,7 +4186,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
 
     /// `Brain::Local`'s promise is that a local turn never leaves this machine. Written in a doc
     /// comment that is a claim; asserted here it is a check. Without it, `local_base_url` makes
-    /// "local" mean "whatever address the file says", and one line in `.ai/nucleos-models.yaml`
+    /// "local" mean "whatever address the file says", and one line in `~/.nucleos/nucleos-models.yaml`
     /// is enough to post mail and repository contents to a third party under the name of the
     /// route chosen precisely to avoid that.
     ///
@@ -4191,7 +4250,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         );
     }
 
-    /// Every `.ai/nucleos-models.yaml` on this machine was written before these three keys
+    /// Every `~/.nucleos/nucleos-models.yaml` on this machine was written before these three keys
     /// existed and names none of them. If absence resolved to anything but Ollama on
     /// `runner::OLLAMA_BASE_URL`, a file that worked this morning would answer a refusal this
     /// afternoon, for a feature its owner never asked for -- the same "an existing file keeps

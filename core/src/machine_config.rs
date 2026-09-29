@@ -1,11 +1,22 @@
 //! Who may write THIS MACHINE's settings, and what a valid one looks like.
 //!
 //! [`crate::ownership`] answers the same question for a file in a PROJECT, and its header explains
-//! at length why nine files are deliberately absent from that table: they are loaded relative to
-//! the daemon's own working directory, so a route under `/projects/{id}` that wrote one would edit
-//! a single daemon's configuration through a URL naming a project, and would do it identically
-//! whichever project was named. That reasoning stands. This module is the other half of it — the
-//! same fence, around the files whose owner is the daemon rather than any project.
+//! at length why nine files are deliberately absent from that table: they are this machine's, so a
+//! route under `/projects/{id}` that wrote one would edit a single daemon's configuration through a
+//! URL naming a project, and would do it identically whichever project was named. That reasoning
+//! stands. This module is the other half of it — the same fence, around the files whose owner is
+//! the daemon rather than any project.
+//!
+//! # Where they live: `~/.nucleos/`, and no longer the daemon's working directory
+//!
+//! They used to be `.ai/<file>.yaml` relative to wherever the daemon was launched, which made two
+//! mistakes at once. `.ai/` is the agent workflow harness's directory, not the product's, so the
+//! product's settings sat inside somebody else's folder; and "relative to the working directory"
+//! meant a machine with twenty worktrees had twenty candidate copies of every setting, of which the
+//! daemon read whichever one it happened to be started beside. [`root`] is one directory per
+//! person, the same one the council's roster and the workflow library already used, and every row
+//! below is a file name relative to it. [`migrate_legacy`] copies the old files over once, at
+//! startup, and never deletes one.
 //!
 //! Everything that made the project registry work is kept, because the reasons are unchanged:
 //!
@@ -35,10 +46,46 @@
 //! effect, which is the failure that looks most like success. So `takes_effect` is a field, it is
 //! served with the row, and the page is expected to say it out loud.
 //!
-//! `.ai/nucleos-models.yaml` is the one with a nuance rather than a flat answer, and it gets a
+//! `nucleos-models.yaml` is the one with a nuance rather than a flat answer, and it gets a
 //! sentence of its own below.
 
+use std::path::{Path, PathBuf};
+
 use crate::ownership::Validator;
+
+/// The directory under the home directory that holds every row of [`SETTINGS`].
+const ROOT_DIR: &str = ".nucleos";
+
+/// [`root`] as a person is shown it, and the only spelling any message uses.
+///
+/// Deliberately not the absolute path: the absolute one is what the daemon opens, this is what
+/// somebody can be told to go and edit on any machine without the sentence carrying a username.
+/// `council::CONFIG_DISPLAY_PATH` made the same choice first, for the same reason.
+pub const ROOT_DISPLAY: &str = "~/.nucleos";
+
+/// Where this machine's settings live, or `None` when there is no home directory to hang them off.
+///
+/// `None` is not an error anybody can fix from here: every loader treats it as "the file is
+/// absent" and the pillar starts on its defaults, which is what an absent file has always meant.
+/// The settings routes refuse by name rather than guess at another directory.
+pub fn root() -> Option<PathBuf> {
+    crate::commands::home().map(|home| home.join(ROOT_DIR))
+}
+
+/// `file` as a person is shown it: `~/.nucleos/<file>`. See [`ROOT_DISPLAY`].
+pub fn display_path(file: &str) -> String {
+    format!("{ROOT_DISPLAY}/{file}")
+}
+
+/// The file names, one per row, so `main.rs` loads each from the same string the table serves.
+pub const EMAIL_FILE: &str = "email.yaml";
+pub const VOICE_FILE: &str = "voice.yaml";
+pub const CALENDAR_FILE: &str = "calendar.yaml";
+pub const WEB_FILE: &str = "web.yaml";
+pub const BROWSER_FILE: &str = "browser.yaml";
+pub const TELEGRAM_FILE: &str = "telegram.yaml";
+pub const GITHUB_FILE: &str = "github.yaml";
+pub const COUNCIL_FILE: &str = "council.yaml";
 
 /// One of this machine's settings files, with everything a caller needs to act on it safely.
 ///
@@ -47,9 +94,9 @@ use crate::ownership::Validator;
 /// daemon parses is a property of the build, so a row that had to be allocated would be a row
 /// describing something this module does not have.
 pub struct Setting {
-    /// Relative to the daemon's working directory, forward slashes — the same spelling `main.rs`
-    /// uses to load it, and the reason `main.rs` keeps saying that it matters where the daemon was
-    /// launched from. Compared against a caller's path only after [`crate::ownership::normalise`].
+    /// A file name relative to [`root`] — the same string `main.rs` joins onto it to load the file,
+    /// and the row's identity on the wire. Compared against a caller's path only after
+    /// [`crate::ownership::normalise`]. A person is shown [`display_path`] of it, never this alone.
     pub path: &'static str,
     /// The area this file configures, as a stable wire value the page keys its own words off.
     pub area: &'static str,
@@ -127,63 +174,63 @@ fn validate_models(contents: &str) -> Result<(), String> {
 /// that has not answered the membership rule.
 pub static SETTINGS: &[Setting] = &[
     Setting {
-        path: ".ai/email.yaml",
+        path: EMAIL_FILE,
         area: "email",
         what: "whether this machine reads a mailbox, which one, how often, what interrupts you, and how long a classified message keeps its body",
         takes_effect: "when the daemon restarts — the mailbox is polled by a sidecar started with this file's contents",
         validate: validate_email,
     },
     Setting {
-        path: ".ai/voice.yaml",
+        path: VOICE_FILE,
         area: "voice",
         what: "whether this machine opens a microphone, the three chords that reach it, the commands that transcribe and speak, and the terms it is told it hears badly",
         takes_effect: "when the daemon restarts — the chords are registered with the operating system at startup",
         validate: validate_voice,
     },
     Setting {
-        path: ".ai/calendar.yaml",
+        path: CALENDAR_FILE,
         area: "calendar",
         what: "the zone an event means when nobody says, and the window a proposal may land in — emphatically not when you are busy, which comes from real events only",
         takes_effect: "when the daemon restarts",
         validate: validate_calendar,
     },
     Setting {
-        path: ".ai/web.yaml",
+        path: WEB_FILE,
         area: "web",
         what: "whether this machine searches the web, through whom, and the one list that decides whose extracted text reaches an agent raw",
         takes_effect: "when the daemon restarts — the search sidecar is started with this file's contents",
         validate: validate_web,
     },
     Setting {
-        path: ".ai/browser.yaml",
+        path: BROWSER_FILE,
         area: "browser",
         what: "whether this machine drives a browser, and the ceilings on live tabs, profiles and disk it may spend doing it",
         takes_effect: "when the daemon restarts",
         validate: validate_browser,
     },
     Setting {
-        path: ".ai/telegram.yaml",
+        path: TELEGRAM_FILE,
         area: "telegram",
         what: "the standing instructions a Telegram turn is launched with when the chat has none of its own",
         takes_effect: "when the daemon restarts",
         validate: validate_telegram,
     },
     Setting {
-        path: ".ai/github.yaml",
+        path: GITHUB_FILE,
         area: "github",
         what: "whether the GitHub pillar is on at all, and the two lists of what a run may read and do there without asking first",
         takes_effect: "when the daemon restarts — and note that this file EXISTING is itself the pillar's opt-in",
         validate: validate_github,
     },
     Setting {
-        path: ".ai/council.yaml",
+        path: COUNCIL_FILE,
         area: "council",
         what: "who sits on this machine's council, which model or agent answers for each seat, and how long a seat gets",
         takes_effect: "when the daemon restarts",
         validate: validate_council,
     },
     Setting {
-        path: crate::config::MODELS_CONFIG_PATH,
+        path: crate::config::MODELS_CONFIG_FILE,
         area: "models",
         what: "which model each route runs on, which agent CLI answers a run, and the rows a conversation's model picker offers",
         // The one row whose answer is not flat, and the nuance is worth the longer sentence: the
@@ -202,6 +249,70 @@ pub static SETTINGS: &[Setting] = &[
 pub fn setting_for(rel: &str) -> Option<&'static Setting> {
     let path = crate::ownership::normalise(rel)?;
     SETTINGS.iter().find(|setting| setting.path == path)
+}
+
+/* --------------------------------------------------------------- migration -- */
+
+/// Where [`SETTINGS`] used to live, relative to the daemon's working directory.
+const LEGACY_DIR: &str = ".ai";
+
+/// Copies each settings file from where it used to live into [`root`], once, and never over one
+/// that is already there. Returns the files it copied, in table order.
+///
+/// `legacy_base` is the directory the daemon was started from — the only place the old relative
+/// `.ai/<file>` could have meant anything — and both directories are arguments so a test can point
+/// them at temporary ones rather than at a real home.
+///
+/// **Copy, never move.** The old file is left where it was: it may be tracked in a checkout, and a
+/// daemon that deleted a file out of somebody's working tree at startup would be making a change to
+/// a repository nobody asked for. After the copy the old one is simply no longer read.
+///
+/// **Never overwrite.** A file already in the root is somebody's current settings, and the copy is
+/// opened with `create_new` so that holds even against a writer racing this one.
+///
+/// **The council is skipped.** Its roster moved to `~/.nucleos/council.yaml` long before the rest,
+/// deliberately without a migration, and every daemon since has ignored `.ai/council.yaml` — so one
+/// found there now is a roster nobody has been running, and copying it would resurrect it.
+///
+/// Failures are logged and skipped, file by file: an optional pillar that stays on its defaults is
+/// the same outcome a missing file has always had, and it must not stop the daemon from starting.
+pub fn migrate_legacy(root: &Path, legacy_base: &Path) -> Vec<&'static str> {
+    let mut copied = Vec::new();
+    for setting in SETTINGS {
+        if setting.path == COUNCIL_FILE {
+            continue;
+        }
+        let target = root.join(setting.path);
+        let source = legacy_base.join(LEGACY_DIR).join(setting.path);
+        if target.exists() || !source.is_file() {
+            continue;
+        }
+        let copy = || -> std::io::Result<()> {
+            let contents = std::fs::read(&source)?;
+            std::fs::create_dir_all(root)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)?;
+            std::io::Write::write_all(&mut file, &contents)
+        };
+        match copy() {
+            Ok(()) => {
+                tracing::info!(
+                    file = setting.path,
+                    to = %display_path(setting.path),
+                    "copied a settings file from the working directory's .ai/ into this machine's settings; the old file was left where it was and is no longer read"
+                );
+                copied.push(setting.path);
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                file = setting.path,
+                "could not copy a settings file from the working directory's .ai/; the pillar starts on its defaults"
+            ),
+        }
+    }
+    copied
 }
 
 /* ------------------------------------------------------------ the other half -- */
@@ -226,11 +337,12 @@ pub struct Secret {
 ///
 /// # Why these live in the credential store and not in the files above
 ///
-/// Every config type in `config.rs` says it where the temptation was closest: `.ai/email.yaml`
-/// holds the mailbox but not its password, `.ai/web.yaml` holds the provider but not its key,
-/// `.ai/nucleos-models.yaml` names the hosted model but not the OpenRouter key. Those files are
-/// versioned and this is a single-user desktop; a secret in one of them is a secret in somebody's
-/// git history. Keeping the split is what lets `GET /config/machine` serve file contents verbatim.
+/// Every config type in `config.rs` says it where the temptation was closest: `email.yaml` holds
+/// the mailbox but not its password, `web.yaml` holds the provider but not its key,
+/// `nucleos-models.yaml` names the hosted model but not the OpenRouter key. Those files are plain
+/// text a person opens, copies and pastes into a bug report — and until they moved to
+/// `~/.nucleos/` they sat inside a checkout, one `git add` away from somebody's history. Keeping
+/// the split is what lets `GET /config/machine` serve file contents verbatim.
 ///
 /// # Why the app may write them at all
 ///
@@ -259,7 +371,7 @@ pub static SECRETS: &[Secret] = &[
     Secret {
         key: "email-imap-password",
         area: "email",
-        what: "the mailbox's app password; without it the email sidecar does not start, whatever `.ai/email.yaml` says",
+        what: "the mailbox's app password; without it the email sidecar does not start, whatever `~/.nucleos/email.yaml` says",
     },
     Secret {
         key: "telegram-token",
@@ -410,14 +522,18 @@ mod tests {
     #[test]
     fn the_shared_path_guard_is_what_answers() {
         assert!(
-            setting_for("./.ai/email.yaml").is_some(),
+            setting_for("./email.yaml").is_some(),
             "the same file, spelled the long way"
         );
         for path in [
-            "../.ai/email.yaml",
-            ".ai\\email.yaml",
-            "/.ai/email.yaml",
-            "C:/Projects/nucleos/.ai/email.yaml",
+            "../email.yaml",
+            "x\\..\\email.yaml",
+            "/email.yaml",
+            "C:/Users/someone/.nucleos/email.yaml",
+            "~/.nucleos/email.yaml",
+            // The old spelling names nothing now: the row is a file under the root, and a caller
+            // still sending `.ai/` would be writing somewhere the daemon no longer reads.
+            ".ai/email.yaml",
             "",
         ] {
             assert!(
@@ -433,6 +549,8 @@ mod tests {
     #[test]
     fn a_path_outside_the_table_is_not_this_machines_setting() {
         for path in [
+            "project.yaml",
+            "workflows/x/bundle.yaml",
             ".ai/project.yaml",
             ".ai/models.yaml",
             ".ai/pricing.yaml",
@@ -496,7 +614,7 @@ mod tests {
     ///
     /// The guard above is only worth having if it refuses what is wrong and nothing else: every
     /// install that exists today names no engine at all, and a door that started refusing those
-    /// would make `.ai/nucleos-models.yaml` uneditable on every machine in the field.
+    /// would make `nucleos-models.yaml` uneditable on every machine in the field.
     #[test]
     fn a_models_file_that_names_no_local_engine_is_still_accepted() {
         assert!(
@@ -510,6 +628,119 @@ mod tests {
         assert!(
             validate_models(&models_file("local_engine: ollama\n")).is_ok(),
             "naming the engine it already used changes nothing"
+        );
+    }
+
+    /// Every row is a bare file name under the root, and a person is shown it as `~/.nucleos/...`.
+    ///
+    /// The absence is asserted as hard as the presence, like the council's own test: a row that
+    /// reached back for `.ai/` would be a setting that exists once per checkout again.
+    #[test]
+    fn every_row_is_a_file_under_the_root_and_is_shown_with_a_tilde() {
+        for setting in SETTINGS {
+            assert!(
+                !setting.path.contains(['/', '\\']),
+                "{} must be a file name relative to the root",
+                setting.path
+            );
+            assert_eq!(
+                display_path(setting.path),
+                format!("~/.nucleos/{}", setting.path)
+            );
+        }
+        // The council was here first, and the two must not drift into two ideas of one directory.
+        assert_eq!(
+            display_path(COUNCIL_FILE),
+            crate::council::CONFIG_DISPLAY_PATH
+        );
+        assert_eq!(
+            display_path(crate::config::MODELS_CONFIG_FILE),
+            crate::config::MODELS_CONFIG_DISPLAY_PATH
+        );
+        if let (Some(root), Some(council)) = (root(), crate::council::config_path()) {
+            assert_eq!(council, root.join(COUNCIL_FILE));
+        }
+    }
+
+    /// Two temporary directories standing in for the home root and the directory the daemon was
+    /// started from, so no test here ever touches a real `~/.nucleos`.
+    fn migration_dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("home").join(".nucleos");
+        let cwd = temp.path().join("checkout");
+        std::fs::create_dir_all(cwd.join(".ai")).unwrap();
+        (temp, root, cwd)
+    }
+
+    /// A file only the old place has is copied, the root is created for it, and the old one stays.
+    #[test]
+    fn a_legacy_file_is_copied_into_the_root_and_left_where_it_was() {
+        let (_temp, root, cwd) = migration_dirs();
+        std::fs::write(cwd.join(".ai/email.yaml"), "enabled: true\n").unwrap();
+        std::fs::write(cwd.join(".ai/nucleos-models.yaml"), "claude_model: x\n").unwrap();
+
+        let copied = migrate_legacy(&root, &cwd);
+
+        assert_eq!(copied, vec![EMAIL_FILE, crate::config::MODELS_CONFIG_FILE]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("email.yaml")).unwrap(),
+            "enabled: true\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("nucleos-models.yaml")).unwrap(),
+            "claude_model: x\n"
+        );
+        assert!(
+            cwd.join(".ai/email.yaml").exists(),
+            "copy, never move: the old file may be tracked in a checkout"
+        );
+        assert!(
+            !root.join("voice.yaml").exists(),
+            "nothing is invented for a file the old place did not have"
+        );
+    }
+
+    /// A file already in the root is somebody's current settings, and it wins.
+    #[test]
+    fn a_file_already_in_the_root_is_never_overwritten() {
+        let (_temp, root, cwd) = migration_dirs();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("web.yaml"), "enabled: false\n").unwrap();
+        std::fs::write(cwd.join(".ai/web.yaml"), "enabled: true\n").unwrap();
+
+        assert!(migrate_legacy(&root, &cwd).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("web.yaml")).unwrap(),
+            "enabled: false\n"
+        );
+    }
+
+    /// The council's `.ai/` roster is a file every daemon since the move has ignored, so it is not
+    /// resurrected. See [`migrate_legacy`].
+    #[test]
+    fn the_councils_old_roster_is_not_migrated() {
+        let (_temp, root, cwd) = migration_dirs();
+        std::fs::write(cwd.join(".ai/council.yaml"), "members: []\n").unwrap();
+
+        assert!(migrate_legacy(&root, &cwd).is_empty());
+        assert!(
+            !root.exists(),
+            "with nothing to copy, the root is not even created"
+        );
+    }
+
+    /// A second start copies nothing: the first copy is now the file that wins.
+    #[test]
+    fn migrating_twice_copies_once() {
+        let (_temp, root, cwd) = migration_dirs();
+        std::fs::write(cwd.join(".ai/github.yaml"), "enabled: true\n").unwrap();
+
+        assert_eq!(migrate_legacy(&root, &cwd), vec![GITHUB_FILE]);
+        std::fs::write(cwd.join(".ai/github.yaml"), "enabled: false\n").unwrap();
+        assert!(migrate_legacy(&root, &cwd).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("github.yaml")).unwrap(),
+            "enabled: true\n"
         );
     }
 }

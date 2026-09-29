@@ -380,7 +380,7 @@ export interface ReplyInput {
  * nowhere to send from answers 503 only after the attempt. Every refusal this
  * route makes is bare prose the daemon wrote on purpose
  * (`"a recipient must not contain a line break"`, `"no submission host is
- * configured — set smtp_host in .ai/email.yaml"`, …) and is worth showing
+ * configured — set smtp_host in ~/.nucleos/email.yaml"`, …) and is worth showing
  * verbatim rather than translated into shell copy.
  */
 export function useSendReply() {

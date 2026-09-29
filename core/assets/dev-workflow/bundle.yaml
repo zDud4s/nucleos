@@ -1,0 +1,147 @@
+# The `dev-workflow` bundle manifest.
+#
+# This is a controller INPUT for `--workflow-package`, not an embedded seeded copy of the
+# workflow core: `--workflow-package` reads a project's live `.ai/`, `.claude/`, `.agents/` trees
+# and writes a bundle into the library (`workflow_package.rs`); this file is the `owns:` list that
+# packaging step ships alongside the packaged files, in the one shape `workflows.rs` parses
+# (`ManifestFile`: `description`, `origin`, `owns`). `name` and `version` are NOT fields in this
+# file — they come from where the bundle sits in the library, `lib/<name>/<version>/bundle.yaml`
+# (`workflows::read_bundle`).
+#
+# `owns:` is the only thing this file's `owns` list is for: the set of PROJECT files this workflow
+# claims authorship of (`ownership.rs`, `workflow_materialize::owns_entries`). It is not a listing
+# of what gets copied — the graph and this manifest are the library's own, never materialized into
+# a project (`workflow_materialize.rs` tests: `!checkout.join("graph.yaml").exists()`). A row here
+# with no trailing `/` claims exactly that file; a row ending `/` claims everything under that
+# directory (`normalise` drops the trailing slash; `owner_of` then matches the exact path or a
+# `/`-bounded prefix underneath it — both forms end up compared the same way).
+#
+# ---------------------------------------------------------------- what this bundle owns, and why
+#
+# Workflow CORE only — the read-only layer `workflow.md`'s own Layer model table describes as
+# "changes only when evolving the workflow": the pipeline instructions, the packet schemas, the
+# phase cockpits, and the generic tooling that reads them. Nothing here is a project's own state.
+#
+# EXCLUDED, deliberately, and not by omission:
+#   - `.ai/tests/`               — the project's OWN test catalog (`select_tests.py` reads it
+#                                   against THIS project's paths); a template that shipped one
+#                                   would overwrite a project's test coverage with its own sample.
+#                                   The plan's manifest sentence said to include it; the confirmed
+#                                   brief and the execution packet both override that — see
+#                                   `.ai/local/desacoplar-f5-green.md` step 3.
+#   - `.ai/project.yaml`,
+#     `.ai/models.yaml`,
+#     `.ai/pricing.yaml`         — per-project/per-machine configuration (`workflow.md`'s "Project
+#                                   state" row): who is dispatched, what things cost here. A
+#                                   template claiming these would fight `seed_worktree.py`'s STATE
+#                                   list, which copies them only when absent and never overwrites.
+#   - `.ai/memory.md`,
+#     `.ai/decisions.md`,
+#     `.ai/memory-archive.md`   — this project's own accumulated findings and decisions. Never a
+#                                   template's to author; see the owner's HARD CONSTRAINT in
+#                                   `CLAUDE.md` on agent working material never entering git.
+#   - `.ai/specs/`, `.ai/plans/` — persisted TASK INSTANCES (design docs and execution plans for
+#                                   this project's own work), not workflow contract.
+#   - `.ai/local/`                — gitignored runtime output (ledgers, job files, pipeline runs,
+#                                   agent-run records). Generated, never authored, never owned.
+#   - `.claude/hooks/ask_daemon.py` — has ONE source, `core/hooks/ask_daemon.py`, compiled into the
+#                                   daemon via `include_str!` (`core/src/autopilot.rs`,
+#                                   `core/src/triage.rs`); the copy under `.claude/hooks/` is held
+#                                   byte-equal by `scripts/test-hook-filter.py`, not authored by a
+#                                   packaged workflow.
+#   - `.claude/settings.json`     — this project's own hook wiring (which commands run on
+#                                   `PreToolUse`/`PostToolUse`/`Stop`/`SubagentStop`) and its own
+#                                   `permissions`/`sandbox` blocks; a template overwriting it would
+#                                   silently rewrite a project's security gate.
+#
+# `.ai/scripts/` entries are listed one by one on purpose, not as a blanket `.ai/scripts/`
+# directory row: every file below is GENERIC workflow tooling today, but the directory is where a
+# project-specific script could land next, and a blanket claim would silently annex it. Same
+# reasoning as `.ai/tests/catalog.yaml`'s `workflow` group, which lists this directory's files
+# individually rather than claiming it wholesale.
+
+description: >-
+  The dev-workflow pipeline: triage/plan/execute/review/maintain phases, their packet schemas,
+  their Claude Code and Codex cockpits, and the generic tooling (ledgers, test-catalog selection,
+  cockpit/skill parity checks, speed resolution, worktree seeding) that runs them.
+origin: ai-dev-workflow-template
+
+owns:
+  # ---- pipeline instructions and packet schemas -------------------------------------------
+  - .ai/workflow/
+  - .ai/packets/
+
+  # ---- generic .ai/scripts/ tooling (see the note above on why these are listed, not the dir) --
+  - .ai/scripts/assemble_prompt.py
+  - .ai/scripts/auto_select_scorer.py
+  - .ai/scripts/check_cockpits.py
+  - .ai/scripts/council_run.py
+  - .ai/scripts/demo.py
+  - .ai/scripts/ledger_append.py
+  - .ai/scripts/ledger_schema.py
+  - .ai/scripts/log_event.py
+  - .ai/scripts/log_intent.py
+  - .ai/scripts/log_metrics.py
+  - .ai/scripts/log_rework.py
+  - .ai/scripts/pipeline_fanout.py
+  - .ai/scripts/pipeline_schema.py
+  - .ai/scripts/resolve_speed.py
+  - .ai/scripts/seed_worktree.py
+  - .ai/scripts/select_tests.py
+  - .ai/scripts/sync_skills.py
+  - .ai/scripts/test_auto_select_scorer.py
+  - .ai/scripts/test_cockpit_gates.py
+  - .ai/scripts/test_ledger_schema.py
+  - .ai/scripts/test_resolve_speed.py
+  - .ai/scripts/test_todos_parser.py
+  - .ai/scripts/todos_parser.py
+  - .ai/scripts/triage_check.py
+  - .ai/scripts/usage_audit.py
+  # The nine tools F5 relocates out of the product's own `scripts/` (workflow-only: packet gates,
+  # cross-tool usage accounting, the context-ceiling status line, session-path auditing). Listed
+  # here for when the controller lands them under `.ai/scripts/`; see
+  # `.../scratchpad/f5-moved-tools/scripts/` for the adjusted copies and
+  # `.../scratchpad/f5-live-edits.md` for every tracked reference that names their old path.
+  - .ai/scripts/evidence_gate.py
+  - .ai/scripts/test-evidence-gate.py
+  - .ai/scripts/review_gate.py
+  - .ai/scripts/test-review-gate.py
+  - .ai/scripts/usage_split.py
+  - .ai/scripts/test-usage-split.py
+  - .ai/scripts/statusline-context.py
+  - .ai/scripts/test-statusline-context.py
+  - .ai/scripts/session_trace.py
+
+  # ---- the workflow's own Claude Code skills (not this project's other .claude/skills/*) -------
+  # Excludes agent-creator/, agent-improver/, skill-authoring/, usage-audit/: general Claude Code
+  # meta-skills that live beside the workflow's in this project's .claude/skills/ but ship from
+  # elsewhere, not from ai-dev-workflow-template. Confirmed against .agents/skills/, the Codex
+  # mirror `sync_skills.py` regenerates from exactly this set (minus codex/, its own bridge skill,
+  # which the mirror does not need a mirror of; plus claude/, the mirror's own bridge skill).
+  - .claude/skills/bootstrap/
+  - .claude/skills/claude/
+  - .claude/skills/codex/
+  - .claude/skills/executor/
+  - .claude/skills/maintenance/
+  - .claude/skills/orchestrate/
+  - .claude/skills/orchestrate-agents/
+  - .claude/skills/orchestrate-tdd/
+  - .claude/skills/planner/
+  - .claude/skills/rescue/
+  - .claude/skills/reviewer/
+  - .claude/skills/run-pipeline/
+  - .claude/skills/synthesizer/
+
+  # ---- the phase cockpits: explicit files, not a blanket .claude/agents/ (a project may have
+  # non-`wf-*` agents of its own under the same directory) -----------------------------------
+  - .claude/agents/wf-bootstrap.md
+  - .claude/agents/wf-executor.md
+  - .claude/agents/wf-maintenance.md
+  - .claude/agents/wf-planner.md
+  - .claude/agents/wf-rescue.md
+  - .claude/agents/wf-reviewer.md
+  - .claude/agents/wf-synthesizer.md
+
+  # ---- the Codex-controller mirror: regenerated wholesale by sync_skills.py, so unlike
+  # .claude/skills/ above there is no non-workflow content to carve out of it ------------------
+  - .agents/skills/

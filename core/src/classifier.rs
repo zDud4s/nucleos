@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 13;
+pub const CLASSIFIER_VERSION: u32 = 17;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -64,6 +64,13 @@ pub(crate) const WRITE_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 /// nobody was awake to give, so the cost of the refusal was the whole night's work rather than one
 /// declined delegation.
 const SUBAGENT_TOOLS: &[&str] = &["Agent", "Task"];
+
+/// Files whose CONTENTS are the policy, matched as a path suffix wherever they sit.
+///
+/// The four `.ai/<machine setting>` entries below predate the move of this machine's settings to
+/// `~/.nucleos/` and are kept for the reasons each gives. `names_machine_settings` now covers all
+/// nine of those files in both places, so they are no longer the whole of that guard — they are
+/// where the argument for each file is written down.
 const SELF_GOVERNING_FILES: &[&str] = &[
     ".ai/autopilot.yaml",
     // Holds `stt_command`, a string the daemon spawns on a hotkey press. That is the same shape as
@@ -457,7 +464,7 @@ pub fn writes_files(tool_name: &str) -> bool {
 /// reach for a file read.
 ///
 /// **The contract of `policy`: BORROWED, ALREADY NARROWED, and it does no I/O.** It is
-/// `.ai/github.yaml` intersected with `github.rs`'s compiled ceilings, and all three production
+/// `~/.nucleos/github.yaml` intersected with `github.rs`'s compiled ceilings, and all three production
 /// callers must be handed the policy of the SAME PROJECT - `hooks.rs` twice and `runs.rs` once. A
 /// caller left holding an empty policy while the others hold a real one would make the hook and the
 /// resume disagree about one command line, which is the divergence the paragraph above exists to
@@ -921,7 +928,7 @@ fn classify_shell_command(
 enum Segment {
     ReadLocal,
     VcsLocal,
-    /// A `gh` read on an autonomy list — the owner's `.ai/github.yaml`, or this project's own
+    /// A `gh` read on an autonomy list — the owner's `~/.nucleos/github.yaml`, or this project's own
     /// declared operations, which `Policy::for_project` lays over it. Membership is decided outside
     /// this file, which is why it is named rather than folded into `ReadLocal`: a scoreboard that
     /// could not tell the two apart could not tell a compiled policy from an edited one.
@@ -1006,6 +1013,14 @@ fn classify_segment(
     }
     if is_safe_command(&normalized) {
         return Segment::ReadLocal;
+    }
+    // Everything below WIDENS — a project's declared prefix, the owner's GitHub list, confinement to
+    // the workspace — and none of them may widen a command onto this machine's own settings. A
+    // compiled read above (`cat`, `grep`) still reads them; what cannot happen is a project that
+    // declared `cp` getting `cp x ~/.nucleos/github.yaml` for free, or a job node's `cp x
+    // .ai/github.yaml` counting as confined to its workspace. See `names_machine_settings`.
+    if segment_names_machine_settings(segment) {
+        return Segment::Unrecognized;
     }
     // Decision #3's widening half. After every compiled permission, so it only ever changes the
     // answer for a command this file had no opinion about; after `shell_form_is_readable`, so a
@@ -1638,7 +1653,7 @@ fn checks_formatting_without_writing(command: &str) -> bool {
 /// themselves.
 ///
 /// Split out when the GitHub policy became a second list, and the split is the point: a command
-/// named in `.ai/github.yaml` clears exactly the same shape guards a compiled entry does. Had that
+/// named in `~/.nucleos/github.yaml` clears exactly the same shape guards a compiled entry does. Had that
 /// path grown its own conjunction the two would have drifted, and the one an owner edits is the one
 /// that would have ended up shorter.
 ///
@@ -1820,6 +1835,101 @@ fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>) -> bool {
         || SELF_GOVERNING_DIRS
             .iter()
             .any(|dir| normalized.starts_with(dir) || normalized.contains(&format!("/{dir}")))
+        || names_machine_settings(file_path)
+}
+
+/// Spellings the shell or the editor turns into the home directory before the path is used.
+/// Lowercase, because they are compared after `fold_for_match`.
+const HOME_SPELLINGS: &[&str] = &["~/", "$home/", "${home}/", "%userprofile%/", "%homepath%/"];
+
+/// PURE: whether `raw` names this machine's own settings — `~/.nucleos/`, where the daemon reads
+/// them, or the old `.ai/<file>` it copies them from once.
+///
+/// **Why this is its own check rather than nine more lines in `SELF_GOVERNING_FILES`.** Those files
+/// moved out of the project and into the home directory, and a suffix list is matched against a
+/// path glued onto the run's workspace — so `~/.nucleos/github.yaml` arrived here as
+/// `<workspace>/~/.nucleos/github.yaml`, lay "inside" the workspace, and was an ordinary allowed
+/// write. The same was true of `$HOME/...` and `%USERPROFILE%\...`. Two answers, both needed:
+///
+/// - **Anything under a home-spelled `.nucleos/`** is refused whole: every file there is the
+///   owner's (the settings, the council's roster, the workflow library), none is a run's to write.
+///   Only a HOME spelling is matched, because `.nucleos/` as a bare path segment is also where this
+///   daemon puts job worktrees (`<repo>/.nucleos/worktrees/job-26/...`) and every write inside one
+///   would otherwise ask.
+/// - **Each settings file by name, however it is rooted** — an absolute `C:/Users/me/.nucleos/...`
+///   included, which on a run with a workspace is already refused as `outside-workspace` and on
+///   one without is otherwise only `no-workspace`. Derived from [`crate::machine_config::SETTINGS`]
+///   so a tenth file cannot be added there and forgotten here.
+///
+/// **The old `.ai/<file>` is still guarded, and that is not nostalgia.** At every start the daemon
+/// copies `<working directory>/.ai/<file>` into `~/.nucleos/` for any file the latter lacks, so a
+/// run that could write `.ai/github.yaml` in the daemon's own checkout would, on a machine that
+/// never had one, be writing the owner's GitHub policy one restart later.
+///
+/// **Each project's own state, by name, however it is rooted.** `autopilot.yaml` (the gate
+/// command, and so what *green* means), `workflows.yaml`, `onboarded.yaml` (the marker
+/// activation requires) and `materialized.yaml` with its per-worktree siblings under
+/// `materialized/` (what the app last wrote of a workflow into a checkout, and so which of those
+/// files it may overwrite) live in `~/.nucleos/projects/<id>/`
+/// (`project_state.rs`). The home spelling is covered by the first answer above; the absolute one
+/// is matched here as `.nucleos/projects/<any id>/<file>`, which a job worktree
+/// (`.nucleos/worktrees/...`) never is. The old `.ai/workflows.yaml` is guarded for the reason the
+/// old settings files are: startup copies it into a project's state directory when that has none.
+/// (`.ai/autopilot.yaml` was always in [`SELF_GOVERNING_FILES`].)
+fn names_machine_settings(raw: &str) -> bool {
+    let folded = fold_for_match(&raw.replace('\\', "/"));
+    let under_home_settings = HOME_SPELLINGS.iter().any(|home| {
+        folded
+            .strip_prefix(home)
+            .is_some_and(|rest| path_has_prefix(&normalize_path(rest, None), ".nucleos"))
+    });
+    let normalized = normalize_path(&folded, None);
+    under_home_settings
+        || crate::machine_config::SETTINGS.iter().any(|setting| {
+            path_has_suffix(&normalized, &format!(".nucleos/{}", setting.path))
+                || path_has_suffix(&normalized, &format!(".ai/{}", setting.path))
+        })
+        || names_project_state(&normalized)
+}
+
+/// PURE: whether an already-normalised, case-folded path is one project's state file — under
+/// `.nucleos/projects/<id>/` — or the old `.ai/workflows.yaml` it is migrated from. See
+/// [`names_machine_settings`].
+fn names_project_state(normalized: &str) -> bool {
+    let parts: Vec<&str> = normalized.split('/').collect();
+    let in_state_dir = crate::project_state::ALL_FILES.iter().any(|file| {
+        matches!(
+            parts.as_slice(),
+            [.., ".nucleos", "projects", id, name] if !id.is_empty() && name == file
+        )
+    });
+    let worktree_record = matches!(
+        parts.as_slice(),
+        [.., ".nucleos", "projects", id, dir, name]
+            if !id.is_empty()
+                && *dir == crate::project_state::WORKTREE_RECORDS_DIR
+                && !name.is_empty()
+    );
+    in_state_dir
+        || worktree_record
+        || path_has_suffix(
+            normalized,
+            &format!(".ai/{}", crate::project_state::PINS_FILE),
+        )
+}
+
+/// PURE: whether any word of one shell command names this machine's settings. See
+/// [`names_machine_settings`].
+///
+/// `--flag=value` is split for the reason `confined_to_workspace` splits it: the path is on the
+/// right of the `=`.
+fn segment_names_machine_settings(segment: &str) -> bool {
+    shell_words(segment).iter().any(|word| {
+        let candidate = word
+            .split_once('=')
+            .map_or(word.as_str(), |(_, value)| value);
+        names_machine_settings(candidate)
+    })
 }
 
 fn targets_file_that_runs_on_next_command(tool_input: &Value, cwd: Option<&Path>) -> bool {
@@ -2120,7 +2230,7 @@ mod tests {
     ///
     /// It shadows the glob-imported `super::classify`, and that is the regression guarantee itself
     /// rather than a convenience: every assertion in this module goes on reading exactly as it did,
-    /// and each one now also asserts that a daemon with no `.ai/github.yaml` answers precisely what
+    /// and each one now also asserts that a daemon with no `~/.nucleos/github.yaml` answers precisely what
     /// it answered before the argument existed. Rewriting ninety-odd call sites by hand would have
     /// been ninety chances to change a verdict while claiming to preserve one.
     ///
@@ -4660,7 +4770,19 @@ mod tests {
     /// tightening it would be read wrong. What made it safe to make was `written_path` landing
     /// in the same commit, so the workspace boundary and the self-governing guards find a
     /// `notebook_path` where they would otherwise have found no path at all and waved the
-    /// write through.
+    /// write through. 14 followed this machine's settings to `~/.nucleos/`: a write to any of the
+    /// nine files there or in their old `.ai/`, or to anything under a home-spelled `.nucleos/`,
+    /// is a `self-governing-file`, and no project `allow` or workspace confinement widens a shell
+    /// command that names one — a tightening only. 15 followed each project's own state there too:
+    /// `autopilot.yaml` and `workflows.yaml` under any `.nucleos/projects/<id>/`, however that
+    /// directory is rooted, and the old `.ai/workflows.yaml` a startup migration still copies from,
+    /// are `self-governing-file` — a tightening only. (A home-spelled path was already refused by
+    /// 14; what 15 adds is the absolute spelling and the legacy pins file.) 16 adds the onboarding
+    /// marker, `onboarded.yaml`, to that set: it is what lets a project be activated at all, so an
+    /// agent writing its own is an agent onboarding itself — a tightening only. 17 adds the
+    /// materialization record, `materialized.yaml`, and the per-worktree records under
+    /// `materialized/`: rewriting one is how an agent would make the next materialization overwrite
+    /// a file a person edited — a tightening only.
     /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
@@ -4675,7 +4797,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 13);
+        assert_eq!(CLASSIFIER_VERSION, 17);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
@@ -4752,6 +4874,197 @@ mod tests {
                 "self-governing-file",
             );
         }
+    }
+
+    /// This machine's settings moved to `~/.nucleos/`, and every spelling of that directory an
+    /// agent might send is still a governance write — never an ordinary allowed one.
+    ///
+    /// The tilde, `$HOME` and `%USERPROFILE%` forms are the ones that matter most: the suffix list
+    /// is matched against a path glued onto the workspace, so before `names_machine_settings` they
+    /// landed "inside" it and were allowed. The absolute form is refused one step earlier, as a
+    /// write outside the workspace, and with no workspace at all it still asks.
+    /// A project's rules and pins moved to `~/.nucleos/projects/<id>/`, and an agent may no more
+    /// write them there than it could in the project's `.ai/`. Home-spelled, absolute, and in the
+    /// shell — plus the old `.ai/workflows.yaml`, which startup still migrates from.
+    #[test]
+    fn writing_a_projects_state_in_its_new_home_asks_for_approval() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for tool in ["Edit", "Write"] {
+            for path in [
+                "~/.nucleos/projects/alpha/autopilot.yaml",
+                r"~\.nucleos\projects\alpha\workflows.yaml",
+                "$HOME/.nucleos/projects/my project/autopilot.yaml",
+                "~/.nucleos/projects/alpha/onboarded.yaml",
+                "~/.nucleos/projects/alpha/materialized.yaml",
+                "~/.nucleos/projects/alpha/materialized/job-12-0a1b2c3d.yaml",
+                ".ai/workflows.yaml",
+                ".ai/autopilot.yaml",
+            ] {
+                assert_classification(
+                    classify(tool, &json!({ "file_path": path }), cwd),
+                    "pending_approval",
+                    "self-governing-file",
+                );
+            }
+            // Absolute: outside the workspace is refused outright, and with no workspace at all it
+            // is still the owner's file by name rather than an ordinary `no-workspace` write.
+            let absolute = r"C:\Users\someone\.nucleos\projects\alpha\autopilot.yaml";
+            assert_eq!(
+                classify(tool, &json!({ "file_path": absolute }), cwd)
+                    .decision
+                    .decision,
+                "deny",
+                "{tool}"
+            );
+            assert_classification(
+                classify(tool, &json!({ "file_path": absolute }), None),
+                "pending_approval",
+                "self-governing-file",
+            );
+            // The materialization records, which only the absolute spelling reaches by name: the
+            // home spelling is refused above as any file under `~/.nucleos` is.
+            for record in [
+                r"C:\Users\someone\.nucleos\projects\alpha\materialized.yaml",
+                r"C:\Users\someone\.nucleos\projects\alpha\materialized\job-12-0a1b2c3d.yaml",
+            ] {
+                assert_classification(
+                    classify(tool, &json!({ "file_path": record }), None),
+                    "pending_approval",
+                    "self-governing-file",
+                );
+            }
+        }
+        for command in [
+            "echo 'gate_command: true' > ~/.nucleos/projects/alpha/autopilot.yaml",
+            "cp evil.yaml C:/Users/someone/.nucleos/projects/alpha/autopilot.yaml",
+            "cp marker.yaml C:/Users/someone/.nucleos/projects/alpha/onboarded.yaml",
+            "cp record.yaml C:/Users/someone/.nucleos/projects/alpha/materialized.yaml",
+            "cp record.yaml C:/Users/someone/.nucleos/projects/alpha/materialized/job-3-aa.yaml",
+            "cp evil.yaml .ai/workflows.yaml",
+        ] {
+            let asked = classify("Bash", &json!({ "command": command }), cwd);
+            assert_eq!(asked.decision.decision, "pending_approval", "{command}");
+        }
+        // A file of the same name that is not in a project's state directory stays ordinary.
+        assert_eq!(
+            classify("Write", &json!({ "file_path": "docs/autopilot.yaml" }), cwd)
+                .decision
+                .decision,
+            "allow"
+        );
+    }
+
+    #[test]
+    fn writing_this_machines_settings_in_home_asks_for_approval() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for tool in ["Edit", "Write"] {
+            for path in [
+                "~/.nucleos/github.yaml",
+                r"~\.nucleos\github.yaml",
+                "$HOME/.nucleos/github.yaml",
+                "${HOME}/.nucleos/nucleos-models.yaml",
+                r"%USERPROFILE%\.nucleos\voice.yaml",
+                "~/.nucleos/../.nucleos/email.yaml",
+                // Not a settings file, but under the owner's directory all the same.
+                "~/.nucleos/workflows/autopilot/1.0/bundle.yaml",
+            ] {
+                assert_classification(
+                    classify(tool, &json!({ "file_path": path }), cwd),
+                    "pending_approval",
+                    "self-governing-file",
+                );
+            }
+            let absolute = classify(
+                tool,
+                &json!({ "file_path": r"C:\Users\someone\.nucleos\github.yaml" }),
+                cwd,
+            );
+            assert_eq!(absolute.decision.decision, "deny", "{tool}");
+            assert_classification(
+                classify(
+                    tool,
+                    &json!({ "file_path": r"C:\Users\someone\.nucleos\github.yaml" }),
+                    None,
+                ),
+                "pending_approval",
+                "self-governing-file",
+            );
+        }
+    }
+
+    /// The old `.ai/<file>` is guarded for all nine files, not only the four that were listed before
+    /// the move: the daemon copies any of them into `~/.nucleos/` at startup when the new one is
+    /// missing, so writing one in the daemon's checkout is writing the owner's settings later.
+    #[test]
+    fn every_legacy_settings_file_in_a_project_asks_for_approval() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for setting in crate::machine_config::SETTINGS {
+            assert_classification(
+                classify(
+                    "Write",
+                    &json!({ "file_path": format!(".ai/{}", setting.path) }),
+                    cwd,
+                ),
+                "pending_approval",
+                "self-governing-file",
+            );
+        }
+    }
+
+    /// A job's worktree lives under `<repo>/.nucleos/worktrees/`, so `.nucleos/` as a bare segment
+    /// must not be what the guard matches — only a home spelling of it, or a settings file by name.
+    #[test]
+    fn a_write_inside_a_worktree_under_dot_nucleos_is_still_ordinary() {
+        let worktree = Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-26");
+        assert_classification(
+            classify(
+                "Write",
+                &json!({ "file_path": "C:/Projects/nucleos/.nucleos/worktrees/job-26/core/src/x.rs" }),
+                Some(worktree),
+            ),
+            "allow",
+            "read-local",
+        );
+    }
+
+    /// The shell half: a redirect or a copy onto this machine's settings is never allowed, whether
+    /// a person is asked or the node may be confined, and a project that declared the program
+    /// cannot widen it onto them.
+    #[test]
+    fn a_shell_write_onto_this_machines_settings_is_never_allowed() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for command in [
+            "echo x > ~/.nucleos/nucleos-models.yaml",
+            "echo x >> $HOME/.nucleos/github.yaml",
+            "cp evil.yaml ~/.nucleos/github.yaml",
+            "cp evil.yaml .ai/github.yaml",
+            "cp --target-directory=~/.nucleos evil.yaml",
+        ] {
+            let asked = classify("Bash", &json!({ "command": command }), cwd);
+            assert_eq!(asked.decision.decision, "pending_approval", "{command}");
+            let confined = classify_asked_for(command, cwd);
+            assert_ne!(confined.decision.decision, "allow", "{command}");
+            let declared = super::classify(
+                "Bash",
+                &json!({ "command": command }),
+                cwd,
+                &crate::github::Policy::empty(),
+                &shell_rules(&["cp", "echo"], &[]),
+                Unrecognized::MayBeConfined,
+            );
+            assert_ne!(declared.decision.decision, "allow", "{command}");
+        }
+        // Reading them is still a read.
+        assert_eq!(
+            classify(
+                "Bash",
+                &json!({ "command": "cat ~/.nucleos/github.yaml" }),
+                cwd
+            )
+            .decision
+            .decision,
+            "allow"
+        );
     }
 
     /// A read the owner listed passes, and it is recorded under its own class rather than as one
