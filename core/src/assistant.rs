@@ -2983,6 +2983,18 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// A chat id no other test in this process is using.
+    ///
+    /// `ChatSlot::acquire` is process-global, while these tests run in parallel. Reusing an id in
+    /// two tests lets one test borrow the other's slot and makes the loser report a busy chat.
+    fn a_chat(prefix: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+        format!(
+            "{prefix}:{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
     struct CliAssistants {
         claude: Option<Arc<dyn crate::runner::CommandRunner>>,
         codex: Option<Arc<dyn crate::runner::CommandRunner>>,
@@ -3551,8 +3563,9 @@ mod tests {
     async fn a_conversation_with_no_row_routes_exactly_as_it_did_before() {
         let mut state = test_state().await;
         state.assistants = Arc::new(FixedAssistants(fake_local_assistant("na máquina")));
+        let telegram_chat = a_chat("-100200300");
 
-        let from_telegram = send_message(&state, "-100200300", "olá", Origin::Telegram)
+        let from_telegram = send_message(&state, &telegram_chat, "olá", Origin::Telegram)
             .await
             .unwrap();
         let from_shell = send_message(&state, "no-row-shell", "olá", Origin::Shell)
@@ -4569,8 +4582,9 @@ mod tests {
     async fn a_turn_records_which_client_sent_it() {
         let state = test_state().await;
         let pool = state.pool.clone();
+        let telegram_chat = a_chat("-100200300");
 
-        let from_telegram = send_message(&state, "-100200300", "olá", Origin::Telegram)
+        let from_telegram = send_message(&state, &telegram_chat, "olá", Origin::Telegram)
             .await
             .unwrap();
         let from_shell = send_message(&state, "a-shell-chat", "hello", Origin::Shell)
@@ -4597,10 +4611,11 @@ mod tests {
             assistants: Arc::new(FixedAssistants(fake_local_assistant("answered here"))),
             ..test_state().await
         };
-        crate::chats::set_brain(&local.pool, "a-local-chat", crate::chats::Brain::Local)
+        let local_chat = a_chat("a-local-chat");
+        crate::chats::set_brain(&local.pool, &local_chat, crate::chats::Brain::Local)
             .await
             .unwrap();
-        let locally = send_message(&local, "a-local-chat", "hello", Origin::Shell)
+        let locally = send_message(&local, &local_chat, "hello", Origin::Shell)
             .await
             .unwrap();
         let recorded: Option<String> = sqlx::query_scalar("SELECT origin FROM runs WHERE id = ?")
@@ -7628,18 +7643,19 @@ mod tests {
             assistants: Arc::new(FixedAssistants(fake_local_assistant("answered here"))),
             ..test_state().await
         };
-        crate::chats::set_brain(&local.pool, "a-local-chat", crate::chats::Brain::Local)
+        let chat_id = a_chat("a-local-chat");
+        crate::chats::set_brain(&local.pool, &chat_id, crate::chats::Brain::Local)
             .await
             .unwrap();
         crate::chats::set_permission_mode(
             &local.pool,
-            "a-local-chat",
+            &chat_id,
             crate::chats::PermissionMode::Bypass,
         )
         .await
         .unwrap();
 
-        let id = send_message(&local, "a-local-chat", "olá", Origin::Shell)
+        let id = send_message(&local, &chat_id, "olá", Origin::Shell)
             .await
             .unwrap();
 

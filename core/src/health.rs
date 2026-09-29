@@ -483,7 +483,11 @@ fn probes_a_program(configured: bool, command: &str) -> bool {
 ///
 /// Absent config is `Ok`, not a failure. Voice being off is a state, not a fault.
 async fn voice_probe(armed: bool, command: String) -> SubsystemReadout {
-    run_probe("voice_transcriber", async move {
+    voice_probe_within(armed, command, PROBE_TIMEOUT).await
+}
+
+async fn voice_probe_within(armed: bool, command: String, budget: Duration) -> SubsystemReadout {
+    run_probe_with_timeout("voice_transcriber", budget, async move {
         if !armed {
             return Ok(HealthState::Ok);
         }
@@ -1247,10 +1251,20 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn an_unquoted_transcriber_path_still_probes_its_first_token() {
-        let readout = voice_probe(true, "cmd -m model.bin".to_string()).await;
+        let readout = voice_probe_within(
+            true,
+            "cmd -m model.bin".to_string(),
+            Duration::from_secs(10),
+        )
+        .await;
         assert_ne!(readout.reason, Some(FailureCategory::Missing));
 
-        let missing = voice_probe(true, "definitely-not-a-program-anywhere -x".to_string()).await;
+        let missing = voice_probe_within(
+            true,
+            "definitely-not-a-program-anywhere -x".to_string(),
+            Duration::from_secs(10),
+        )
+        .await;
         assert_eq!(
             missing.status,
             HealthState::Down,
@@ -1263,12 +1277,14 @@ mod tests {
     #[tokio::test]
     async fn an_unquoted_transcriber_path_still_probes_its_first_token_on_unix() {
         // `sh` exists on every Unix host.
-        let readout = voice_probe(true, "sh -m model.bin".to_string()).await;
+        let readout =
+            voice_probe_within(true, "sh -m model.bin".to_string(), Duration::from_secs(10)).await;
         assert_ne!(readout.reason, Some(FailureCategory::Missing));
 
-        let missing = voice_probe(
+        let missing = voice_probe_within(
             true,
             "/nonexistent-nucleos/definitely-not-a-program -x".to_string(),
+            Duration::from_secs(10),
         )
         .await;
         assert_eq!(
