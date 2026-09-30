@@ -528,6 +528,9 @@ pub fn build_router(state: AppState) -> Router {
         // is an agent writing into what agents are told, which is the governance question
         // `notes.rs` refuses in its own words, and it is the owner's to answer rather than mine.
         .route("/knowledge", get(list_knowledge).post(post_knowledge))
+        // Like `/runs/awaiting-approval` above, this literal coexists with `/{id}` because static
+        // segments win in matchit.
+        .route("/knowledge/recall", post(recall_knowledge))
         .route("/knowledge/{id}", get(get_knowledge))
         .route("/knowledge/{id}/revert", post(revert_knowledge))
         .route("/assistant/message", post(post_assistant_message))
@@ -14576,6 +14579,12 @@ pub(crate) struct ProposeKnowledgeRequest {
     supersedes: Option<i64>,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct RecallRequest {
+    query: String,
+    layer: Option<String>,
+}
+
 /// The one door a run declares through.
 ///
 /// It still goes through the proposal, rather than inserting an `active` row: the review trail is
@@ -14668,6 +14677,75 @@ pub(crate) async fn post_knowledge(
             "proposal_id": proposal_id,
         })),
     ))
+}
+
+pub(crate) async fn recall_knowledge(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<RecallRequest>,
+) -> Result<Json<Vec<crate::brief::Recalled>>, axum::response::Response> {
+    let query = request.query.trim();
+    if query.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "recall needs a query").into_response());
+    }
+    let layer = match request.layer.as_deref().map(str::trim) {
+        None => None,
+        Some(layer) => match crate::knowledge::Layer::parse(layer) {
+            Some(layer) => Some(layer),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "layer must be one of semantic, episodic, procedural",
+                )
+                    .into_response());
+            }
+        },
+    };
+    if layer == Some(crate::knowledge::Layer::Working) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the working layer is never recalled: it reaches a node only through its briefing",
+        )
+            .into_response());
+    }
+
+    let scope = match sending_run_id_of(&headers) {
+        None => crate::knowledge::Scope::Machine,
+        Some(run_id) => {
+            let project_id =
+                sqlx::query_scalar::<_, Option<String>>("SELECT project_id FROM runs WHERE id = ?")
+                    .bind(run_id)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(%error, run_id, "reading a recall's run scope failed");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "recall's scope could not be determined",
+                        )
+                            .into_response()
+                    })?
+                    .ok_or_else(|| {
+                        refusal(StatusCode::BAD_REQUEST, "unknown_sender").into_response()
+                    })?;
+            project_id.map_or(
+                crate::knowledge::Scope::Machine,
+                crate::knowledge::Scope::Project,
+            )
+        }
+    };
+
+    crate::brief::recall(&state.pool, &scope, query, layer)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "recalling approved knowledge failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "known facts could not be recalled",
+            )
+                .into_response()
+        })
 }
 
 /// Everything the layer holds, in every status.

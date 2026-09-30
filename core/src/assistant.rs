@@ -2348,6 +2348,23 @@ pub(crate) fn may_keep_process(policy: crate::runner::ToolPolicy, cli: &str) -> 
     matches!(policy, crate::runner::ToolPolicy::Unrestricted) && cli == "claude"
 }
 
+fn system_prompt_with_knowledge(
+    cli: &str,
+    instructions: Option<String>,
+    block: Option<&str>,
+) -> Option<String> {
+    if cli != "claude" {
+        return instructions;
+    }
+    let Some(block) = block else {
+        return instructions;
+    };
+    match instructions {
+        Some(instructions) => Some(format!("{instructions}{block}")),
+        None => Some(block.trim_start().to_owned()),
+    }
+}
+
 /// Whether a rooted shell conversation may answer through Codex.
 pub(crate) fn may_answer_on_codex(cwd: Option<&str>) -> bool {
     tool_policy_for(
@@ -2649,6 +2666,23 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             evict_live(&turn.slot.chat_id);
         }
 
+        // Section 6 gives conversations machine knowledge only. Claude receives it through the
+        // per-invocation system flag so resumed history does not accumulate copies. Codex rejects
+        // that flag, so it receives no block. A conversation is not an outcome, so D15 adds no
+        // briefing trace here.
+        let knowledge = if cli == "claude" {
+            crate::brief::for_prompt(
+                &pool,
+                &crate::knowledge::Context::for_project(None),
+                &text,
+                "assistant",
+            )
+            .await
+            .and_then(|briefing| briefing.block)
+        } else {
+            None
+        };
+
         let request = crate::runner::RunRequest {
             prompt: text,
             env,
@@ -2745,7 +2779,11 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // from `chats::answering`, where `origin` no longer exists — always wins when it is
             // there, and the configured Telegram doctrine only fills the slot when it is empty. A
             // person's own instructions are never replaced, only completed.
-            append_system_prompt: answering.system_prompt.clone().or(doctrine),
+            append_system_prompt: system_prompt_with_knowledge(
+                cli,
+                answering.system_prompt.clone().or(doctrine),
+                knowledge.as_deref(),
+            ),
             // What this conversation is called, so the session it mints is findable in the CLI's
             // own `--resume` picker instead of being one more nameless timestamp there.
             session_name: answering.session_name.clone(),
@@ -5495,6 +5533,95 @@ mod tests {
             ..test_state().await
         };
         (state, runner)
+    }
+
+    #[tokio::test]
+    async fn a_claude_turn_is_told_what_the_house_knows_and_leaves_no_trace() {
+        let (state, runner) = state_with_doctrine(None).await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'machine', NULL, 'owner', 'memory',
+                     'zanzibar house rule', 'body', 'active',
+                     '2026-08-19T00:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let turn = send_message(&state, &id, "zanzibar?", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, turn).await;
+
+        let sent = runner.last_append_system_prompt.lock().unwrap().clone();
+        assert!(matches!(
+            sent,
+            Some(Some(ref prompt)) if prompt.contains("zanzibar house rule")
+        ));
+        let traces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_knowledge")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(traces, 0);
+    }
+
+    #[tokio::test]
+    async fn a_conversations_own_instructions_come_first_and_the_knowledge_after() {
+        let (state, runner) = state_with_doctrine(None).await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'machine', NULL, 'owner', 'memory',
+                     'zanzibar house rule', 'body', 'active',
+                     '2026-08-19T00:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_system_prompt(&state.pool, &id, Some("Answer in Portuguese."))
+            .await
+            .unwrap();
+
+        let turn = send_message(&state, &id, "zanzibar?", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, turn).await;
+
+        let sent = runner
+            .last_append_system_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .flatten()
+            .unwrap();
+        assert!(sent.starts_with("Answer in Portuguese."));
+        assert!(sent.contains("zanzibar house rule"));
+    }
+
+    #[test]
+    fn the_knowledge_block_goes_to_a_claude_turn_and_never_to_a_codex_one() {
+        for (cli, instructions, block, expected) in [
+            ("codex", Some("X"), Some("\n\nB"), Some("X")),
+            ("codex", None, Some("\n\nB"), None),
+            ("claude", None, None, None),
+            ("claude", Some("X"), None, Some("X")),
+            ("claude", Some("X"), Some("\n\nB"), Some("X\n\nB")),
+            ("claude", None, Some("\n\nB"), Some("B")),
+        ] {
+            assert_eq!(
+                system_prompt_with_knowledge(cli, instructions.map(str::to_owned), block)
+                    .as_deref(),
+                expected,
+                "{cli} {instructions:?} {block:?}"
+            );
+        }
     }
 
     /// A Telegram turn with no instructions of its own is not a turn with no instructions at all —

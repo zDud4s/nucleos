@@ -14,6 +14,24 @@ use crate::knowledge::{self, Brief, Budget, Context, Scope, Scored};
 /// Bound the query expression; `knowledge::MAX_READ` separately bounds candidates and rank reads.
 const MAX_QUERY_TERMS: usize = 64;
 
+/// The most knowledge rows one explicit recall returns.
+pub const RECALL_LIMIT: usize = 10;
+
+/// One approved answer returned by explicit recall.
+#[derive(serde::Serialize)]
+pub struct Recalled {
+    pub id: i64,
+    pub layer: String,
+    pub kind: String,
+    pub scope_kind: String,
+    pub scope_id: Option<String>,
+    pub source: String,
+    pub observations: Option<i64>,
+    pub evidence: Option<String>,
+    pub title: String,
+    pub body: String,
+}
+
 /// At the 30-second job tick, 64 units of each kind is 7,680 per hour, well above the rate at
 /// which CLI-backed items and runs can finish. Each unit touches at most `knowledge::MAX_READ`
 /// trace rows, so one pass also has a fixed counter-write ceiling.
@@ -123,6 +141,54 @@ async fn fts_ranks(
     Ok(rows.into_iter().collect())
 }
 
+/// Recall only D12-approved (`active`) knowledge in the daemon-selected scope.
+///
+/// `live` rows arrive ONLY through the automatic briefing, with a floor of one item in the last
+/// scope group, so if node 1 leaves five facts, node 2 is guaranteed one and may not see the
+/// others. That is deliberate. Errors propagate here because the HTTP handler decides how they are
+/// reported.
+pub async fn recall(
+    pool: &SqlitePool,
+    scope: &Scope,
+    query: &str,
+    layer: Option<knowledge::Layer>,
+) -> sqlx::Result<Vec<Recalled>> {
+    let Some(expression) = match_expression(query) else {
+        return Ok(Vec::new());
+    };
+    let mut known = knowledge::for_scope(pool, scope).await?;
+    known.retain(|row| {
+        row.layer != knowledge::Layer::Working.as_str()
+            && layer.is_none_or(|layer| row.layer == layer.as_str())
+            && knowledge::approved(row)
+    });
+    let candidate_ids: Vec<i64> = known.iter().map(|row| row.id).collect();
+    let ranks = fts_ranks(pool, &expression, &candidate_ids).await?;
+    known.retain(|row| ranks.contains_key(&row.id));
+    known.sort_by(|left, right| {
+        ranks[&left.id]
+            .total_cmp(&ranks[&right.id])
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    Ok(known
+        .into_iter()
+        .take(RECALL_LIMIT)
+        .map(|row| Recalled {
+            id: row.id,
+            layer: row.layer,
+            kind: row.kind,
+            scope_kind: row.scope_kind,
+            scope_id: row.scope_id,
+            source: row.source,
+            observations: row.observations,
+            evidence: row.evidence,
+            title: row.title,
+            body: row.body,
+        })
+        .collect())
+}
+
 /// Fetch the context's candidates, add their query-local FTS signal, and select without writing.
 pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Result<Brief> {
     let scope = context.chain.last().unwrap_or(&Scope::Machine);
@@ -149,6 +215,23 @@ pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Resu
         candidate.s_fts = s_fts;
     }
     Ok(knowledge::select(&known, context, &Budget::default()))
+}
+
+/// A layer that cannot be read is a reason to say so, never a reason to refuse to start the node.
+/// Every context outside `spawn_node` reads through this one best-effort helper.
+pub async fn for_prompt(
+    pool: &SqlitePool,
+    context: &Context,
+    query: &str,
+    site: &'static str,
+) -> Option<Brief> {
+    match of(pool, context, query).await {
+        Ok(briefing) => Some(briefing),
+        Err(error) => {
+            tracing::warn!(site, %error, "could not read what is known; continuing without it");
+            None
+        }
+    }
 }
 
 /// Persist every candidate, shown or not, so the trace answers why a row lost.
@@ -558,7 +641,7 @@ pub(crate) async fn sweep(pool: &SqlitePool) -> sqlx::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, fs, path::Path};
 
     use chrono::DateTime;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -570,6 +653,13 @@ mod tests {
     };
     use crate::job::ItemState;
     use crate::knowledge::{Context, Scope, Scored};
+
+    const BRIEFED_CONTEXTS: &[&str] =
+        &["assistant.rs", "council.rs", "job.rs", "runs.rs", "team.rs"];
+    const UNBRIEFED_LAUNCHERS: &[(&str, &str)] = &[(
+        "map_intent.rs",
+        "map derivation is deliberately unbriefed because it creates the map that later scopes briefing",
+    )];
 
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -1500,5 +1590,123 @@ mod tests {
             );
         }
         assert_eq!(item_verdict(ItemState::Conflicted, None, false, None), None);
+    }
+
+    /// `BRIEFED_CONTEXTS` is a constant: this test fails the day a new context appears outside
+    /// it. It is a list rather than discovery because the limits below make discovery incomplete.
+    ///
+    /// Launches do have a marker, `crate::runner::RunRequest {`, so this scan can find them. The
+    /// append channel has no marker at all because it is ordinary `String` concatenation. The
+    /// house gives that channel a marker by making `brief` the only module that produces the block:
+    /// only `brief.rs` calls `knowledge::select`, and only `knowledge.rs` writes `PREAMBLE`. Without
+    /// that decision this test is blind in exactly the direction from which `spawn_node` came.
+    ///
+    /// Its limits are deliberate and named. (a) Its granularity is the file, so a second launcher
+    /// inside an already listed file is invisible. That is true today of `council::run_local_seat`,
+    /// team's `local_agent::run_turn` branch, and `assistant::spawn_local_turn`/`errand_turn`: they
+    /// build prompts and are deliberately not briefed. (b) It reads only `core/src/*.rs`, not
+    /// subdirectories or other crates such as `shell/src-tauri` and `sidecars/`. (c) A launcher that
+    /// does not spell `crate::runner::RunRequest {` (for example, imported `RunRequest {` or a
+    /// builder) is invisible. (d) `map_seam.rs` is the nearest relative and a warning, not a
+    /// precedent: it enforces the inverse direction. It derives `Seam::uncalled` on every read but
+    /// never asserts it, because "Served routes no call here reaches -- and no screen is not
+    /// nothing." A static scan does not see who calls over HTTP.
+    #[test]
+    fn no_context_builds_a_prompt_for_an_agent_without_going_through_the_one_producer() {
+        let built_in = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let running_in = std::env::current_dir().expect("the working directory must be readable");
+        assert_eq!(
+            built_in,
+            running_in.as_path(),
+            "this test binary was compiled in {} and is running in {} -- a shared target directory \
+             handed this checkout a binary built somewhere else, so this scan would read the other \
+             checkout's sources. Touch this file to force a rebuild.",
+            built_in.display(),
+            running_in.display(),
+        );
+
+        let mut sources = fs::read_dir(running_in.join("src"))
+            .expect("core source directory must be readable")
+            .map(|entry| entry.expect("core source entry must be readable").path())
+            .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("rs"))
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("core source file names must be UTF-8")
+                    .to_owned();
+                let source = fs::read_to_string(&path).expect("core source file must be readable");
+                let source = source.replace("\r\n", "\n");
+                let production = source
+                    .split_once("\n#[cfg(test)]\nmod ")
+                    .map_or(source.as_str(), |(production, _)| production)
+                    .to_owned();
+                (name, production)
+            })
+            .collect::<Vec<_>>();
+        sources.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let expected = BRIEFED_CONTEXTS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<BTreeSet<_>>();
+        let callers = sources
+            .iter()
+            .filter(|(name, source)| {
+                name != "brief.rs"
+                    && (source.contains("brief::of(") || source.contains("brief::for_prompt("))
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(file) = callers.difference(&expected).next() {
+            panic!(
+                "{file} calls brief::of/brief::for_prompt but is absent from BRIEFED_CONTEXTS; add the context to the constant"
+            );
+        }
+        if let Some(file) = expected.difference(&callers).next() {
+            panic!(
+                "{file} is in BRIEFED_CONTEXTS but no longer calls brief::of/brief::for_prompt; remove the stale entry or restore briefing"
+            );
+        }
+
+        let launchers = sources
+            .iter()
+            .filter(|(_, source)| source.contains("crate::runner::RunRequest {"))
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>();
+        let unbriefed = UNBRIEFED_LAUNCHERS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect::<BTreeSet<_>>();
+        for file in &launchers {
+            if !expected.contains(file) && !unbriefed.contains(file) {
+                panic!(
+                    "{file} builds a RunRequest and is in neither BRIEFED_CONTEXTS nor UNBRIEFED_LAUNCHERS: brief it through brief::for_prompt, or list it as unbriefed with the reason"
+                );
+            }
+        }
+        for (file, reason) in UNBRIEFED_LAUNCHERS {
+            assert!(
+                launchers.contains(*file),
+                "{file} is stale in UNBRIEFED_LAUNCHERS ({reason}); remove it or restore the RunRequest launcher"
+            );
+        }
+
+        for (file, source) in &sources {
+            if file != "brief.rs"
+                && (source.contains("knowledge::select(") || source.contains("knowledge::render("))
+            {
+                panic!(
+                    "{file} produces a knowledge block outside brief.rs; route it through brief::of or brief::for_prompt"
+                );
+            }
+            if file != "knowledge.rs"
+                && source.contains("Earlier work on this project left the notes below")
+            {
+                panic!(
+                    "{file} writes the knowledge preamble outside knowledge.rs; keep PREAMBLE's only definition in knowledge.rs"
+                );
+            }
+        }
     }
 }

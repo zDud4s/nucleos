@@ -3053,6 +3053,21 @@ async fn spawn_agent(
         crate::speed::Capacity::solo()
     });
 
+    // Section 6 gives department agents machine knowledge only. Append it to the prompt because
+    // state.runner may be Codex, and leave no trace because an agent turn is not an outcome (D15).
+    let prompt = match crate::brief::for_prompt(
+        &state.pool,
+        &crate::knowledge::Context::for_project(None),
+        &prompt,
+        "team",
+    )
+    .await
+    .and_then(|briefing| briefing.block)
+    {
+        Some(block) => format!("{prompt}{block}"),
+        None => prompt,
+    };
+
     let request = crate::runner::RunRequest {
         prompt,
         // The RUN's own key, never `state.token`. `auth::TEAM_ROUTES` is what it reaches.
@@ -7397,6 +7412,81 @@ mod tests {
                 "{speed}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_department_agent_is_told_what_the_house_knows_and_leaves_no_trace() {
+        let (mut state, _root) = state_with_root().await;
+        let runner = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        state.runner = runner.clone();
+        marketing(&state).await;
+        sqlx::query(
+            "INSERT INTO team_runs (id, team_id, request, workspace, token, state,
+                                    created_at, updated_at)
+             VALUES ('tr-knowledge', 'marketing', 'write it', 'ws', 'a-secret', 'working',
+                     '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'machine', NULL, 'owner', 'memory',
+                     'zanzibar house rule', 'body', 'active',
+                     '2026-08-19T00:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let run = fetch_run(&state, "tr-knowledge").await;
+        let agent = crate::agent::Agent {
+            id: "copywriter".to_owned(),
+            name: "copywriter".to_owned(),
+            speciality: "writes".to_owned(),
+            prompt: "write".to_owned(),
+            engine: "claude".to_owned(),
+            model: None,
+            tool_policy: "unrestricted".to_owned(),
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            updated_at: "2026-08-26T00:00:00Z".to_owned(),
+        };
+        let (run_id, session_id) = open_run(&state, &run.id, "zanzibar work", false)
+            .await
+            .unwrap();
+
+        spawn_agent(
+            &state,
+            &run,
+            &agent,
+            run_id,
+            session_id,
+            "zanzibar work".into(),
+        )
+        .await;
+
+        for _ in 0..80 {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                let prompt = runner.last_prompt.lock().unwrap().clone().unwrap();
+                assert!(prompt.starts_with("zanzibar work"));
+                assert!(prompt.contains("zanzibar house rule"));
+                let traces: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM run_knowledge WHERE run_id = ?")
+                        .bind(run_id)
+                        .fetch_one(&state.pool)
+                        .await
+                        .unwrap();
+                assert_eq!(traces, 0);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the department agent's run never reached a terminal status");
     }
 
     /// A local member has no stream, so it has no peak and no `compacted` -- but it does know how

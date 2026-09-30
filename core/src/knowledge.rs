@@ -284,6 +284,23 @@ pub struct Context {
     pub gate: Option<String>,
 }
 
+impl Context {
+    /// Every context outside a job inherits only this chain (spec sections 3.4 and 6).
+    pub fn for_project(project_id: Option<&str>) -> Self {
+        let mut chain = vec![Scope::Machine];
+        if let Some(project_id) = project_id {
+            chain.push(Scope::Project(project_id.to_owned()));
+        }
+        Self {
+            chain,
+            files: Vec::new(),
+            communities: Vec::new(),
+            node: None,
+            gate: None,
+        }
+    }
+}
+
 /// The room, and the three numbers that decide how it is spent.
 pub struct Budget {
     pub render_chars: usize,
@@ -707,6 +724,21 @@ fn select_pass<'a>(
     }
 }
 
+/// Whether a row carries the approval required outside the automatic briefing.
+///
+/// Consolidator measurements count only when they have both their episodic shape and a measured
+/// observation count. `recall` shares this rule with briefing admission rather than inventing a
+/// second meaning for `active`.
+pub(crate) fn approved(row: &Known) -> bool {
+    match row.status.as_str() {
+        "active" if row.source == "consolidator" => {
+            row.layer == "episodic" && row.observations.is_some()
+        }
+        "active" => true,
+        _ => false,
+    }
+}
+
 // Only what a person approved. Filtered here rather than trusted from the caller's query:
 // `select` is the last thing between a `proposed` row and a node's prompt, and something that
 // reaches a prompt unapproved makes the approval decorative, which is the entire mechanism.
@@ -714,10 +746,7 @@ fn select_pass<'a>(
 // fact read inside the same job; spelling their complete shapes here keeps a third one out.
 fn admitted(row: &Known, context: &Context) -> bool {
     match row.status.as_str() {
-        "active" if row.source == "consolidator" => {
-            row.layer == "episodic" && row.observations.is_some()
-        }
-        "active" => true,
+        "active" => approved(row),
         "live" => {
             row.source == "run"
                 && row.layer == "working"
