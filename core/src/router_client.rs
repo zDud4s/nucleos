@@ -153,11 +153,19 @@ impl std::fmt::Debug for RouterClient {
 impl RouterClient {
     /// `timeout` bounds the connect AND the whole call: a router that accepts and never answers must
     /// cost a run no more than one that is not listening at all.
+    ///
+    /// The body carries the task's text, and the router is on loopback by construction
+    /// (`route_advice::is_loopback`), so nothing may carry it further: no proxy from the
+    /// environment (`HTTP_PROXY`/`ALL_PROXY` would send a loopback call through it) and no
+    /// redirect (a 307/308 re-POSTs the body to wherever it points). A redirect is answered as
+    /// the non-success status it is, and the launch falls back.
     pub fn new(base_url: &str, timeout: Duration) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(timeout)
                 .connect_timeout(timeout)
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
             base: base_url.trim_end_matches('/').to_owned(),
@@ -583,5 +591,40 @@ mod tests {
             ));
         }
         assert!(received.try_recv().is_err());
+    }
+
+    /// The task text goes to the loopback router and nowhere else: a router (or anything squatting
+    /// on its port) that answers with a redirect elsewhere is not followed — a 307/308 would re-POST
+    /// the whole body to the new address — and the call is a failure that falls back.
+    #[tokio::test]
+    async fn a_redirect_is_never_followed_with_the_task_in_it() {
+        let (elsewhere, mut forwarded) = stub_router(200, advice_json()).await;
+        let target = format!("{elsewhere}/v1/route");
+        let app = axum::Router::new().route(
+            "/v1/route",
+            axum::routing::post(move || {
+                let target = target.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, target)],
+                    )
+                }
+            }),
+        );
+        let url = serve(app).await;
+
+        let answer = RouterClient::new(&url, Duration::from_secs(2))
+            .route(&RouteRequest {
+                task: "the secret task".into(),
+                ..RouteRequest::default()
+            })
+            .await;
+
+        assert!(
+            matches!(answer, Err(RouterError::Unavailable(_))),
+            "{answer:?}"
+        );
+        assert!(forwarded.try_recv().is_err(), "the redirect was followed");
     }
 }
