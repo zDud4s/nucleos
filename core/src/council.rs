@@ -1803,7 +1803,7 @@ impl Driver {
         let request = crate::runner::RunRequest {
             prompt,
             // The council's OWN key, never `state.token`. `auth::COUNCIL_ROUTES` is what it reaches.
-            env: crate::runs::run_env(&self.token, run_id, None),
+            env: crate::runs::run_env(&self.token, run_id, None, crate::speed::Capacity::solo()),
             cwd: None,
             permission: crate::runner::Permission::Default,
             resume_session_id: None,

@@ -2646,6 +2646,16 @@ pub async fn spend_of(pool: &sqlx::SqlitePool, team_run_id: &str) -> f64 {
 /// validated on the way in, but a value written around that validation is exactly what a
 /// ceiling exists for, so it is applied here, at the one place that opens the fan.
 async fn round_width(state: &AppState, run: &TeamRun) -> Result<i64, sqlx::Error> {
+    Ok(run_capacity(state, run).await?.parallel_ceiling)
+}
+
+/// This run's speed and the width it opens, as one value: `round_width` enforces the width, and
+/// `spawn_agent` hands both to the session it launches. One reader, so the number a session is
+/// told and the number the fan is held to cannot come from two different queries.
+async fn run_capacity(
+    state: &AppState,
+    run: &TeamRun,
+) -> Result<crate::speed::Capacity, sqlx::Error> {
     let (stored, speed): (i64, Option<String>) = sqlx::query_as(
         "SELECT t.max_parallel, r.speed FROM teams t JOIN team_runs r ON r.team_id = t.id
          WHERE r.id = ?",
@@ -2654,11 +2664,11 @@ async fn round_width(state: &AppState, run: &TeamRun) -> Result<i64, sqlx::Error
     .fetch_one(&state.pool)
     .await?;
     let speed = crate::speed::Speed::from_column(speed.as_deref());
-    let (width, degraded) = crate::speed::team_width(speed, stored);
+    let (_, degraded) = crate::speed::team_width(speed, stored);
     if let Some(reason) = degraded {
         tracing::info!(team_run = %run.id, reason, "the speed asked for more width than this team allows");
     }
-    Ok(width)
+    Ok(crate::speed::Capacity::team(speed, stored))
 }
 
 /// A round: start what is pending, up to the team's parallelism, and replan when it is empty.
@@ -3036,10 +3046,17 @@ async fn spawn_agent(
         None
     };
 
+    // What the session is told it may use. An unreadable row tells it the narrowest thing, a team
+    // of one at `normal` — the direction that cannot overstate what `round_width` will open.
+    let capacity = run_capacity(state, run).await.unwrap_or_else(|error| {
+        tracing::warn!(team_run = %run.id, %error, "could not read the run's speed; the session is told normal");
+        crate::speed::Capacity::solo()
+    });
+
     let request = crate::runner::RunRequest {
         prompt,
         // The RUN's own key, never `state.token`. `auth::TEAM_ROUTES` is what it reaches.
-        env: crate::runs::run_env(&token, run_id, None),
+        env: crate::runs::run_env(&token, run_id, None, capacity),
         // No working directory, exactly as a council seat has none — which is also why the
         // `PreToolUse` hook may never fire and why the route table has to hold alone.
         cwd: None,
@@ -7309,6 +7326,77 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         panic!("the specialist's run never reached a terminal status");
+    }
+
+    /// A department's session is told the run's speed and the round width that speed opens, under
+    /// the neutral names the workflow reads. The width is the one `round_width` enforces — the
+    /// team's column widened and bounded here — so the workflow is never told a number the daemon
+    /// would not itself open.
+    #[tokio::test]
+    async fn a_departments_session_is_told_its_speed_and_ceiling() {
+        for (speed, expected_ceiling) in [("normal", "2"), ("fast", "4"), ("thorough", "2")] {
+            let (mut state, _root) = state_with_root().await;
+            let runner = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+            state.runner = runner.clone();
+            marketing(&state).await;
+            let id = format!("tr-speed-{speed}");
+            sqlx::query(
+                "INSERT INTO team_runs (id, team_id, request, workspace, token, state, speed,
+                                        created_at, updated_at)
+                 VALUES (?, 'marketing', 'write it', 'ws', 'a-secret', 'working', ?,
+                         '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
+            )
+            .bind(&id)
+            .bind(speed)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            let run = fetch_run(&state, &id).await;
+            let agent = crate::agent::Agent {
+                id: "copywriter".to_owned(),
+                name: "copywriter".to_owned(),
+                speciality: "writes".to_owned(),
+                prompt: "write".to_owned(),
+                engine: "claude".to_owned(),
+                model: None,
+                // Not `mcp_only`, for the reason the pressure test above gives.
+                tool_policy: "unrestricted".to_owned(),
+                created_at: "2026-08-26T00:00:00Z".to_owned(),
+                updated_at: "2026-08-26T00:00:00Z".to_owned(),
+            };
+            let (run_id, session_id) = open_run(&state, &run.id, "do the work", false)
+                .await
+                .unwrap();
+
+            spawn_agent(
+                &state,
+                &run,
+                &agent,
+                run_id,
+                session_id,
+                "do the work".into(),
+            )
+            .await;
+            settled_run(&state, run_id).await;
+
+            let env = runner
+                .last_env
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the launch reached the runner");
+            let value = |name: &str| {
+                env.iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            };
+            assert_eq!(value("WORKFLOW_SPEED").as_deref(), Some(speed));
+            assert_eq!(
+                value("WORKFLOW_PARALLEL_CEILING").as_deref(),
+                Some(expected_ceiling),
+                "{speed}"
+            );
+        }
     }
 
     /// A local member has no stream, so it has no peak and no `compacted` -- but it does know how
