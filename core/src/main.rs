@@ -487,17 +487,24 @@ fn land_target_from(args: &[String]) -> Option<String> {
         .cloned()
 }
 
-/// The checkout `--workflow-sync` names: the argument after the flag, or the working directory.
-/// Absolute either way, because the daemon resolving it runs somewhere else.
+/// The checkout `--workflow-sync` names: the first word after the flag that is neither a flag nor
+/// `--project`'s value, or the working directory. Absolute either way, because the daemon
+/// resolving it runs somewhere else.
 fn workflow_sync_target(args: &[String]) -> Result<String, String> {
     let at = args
         .iter()
         .position(|arg| arg == "--workflow-sync")
         .ok_or("--workflow-sync was not given")?;
-    let named = args
-        .get(at + 1)
-        .filter(|value| !value.starts_with("--"))
-        .map(std::path::PathBuf::from);
+    let mut rest = args[at + 1..].iter();
+    let mut named = None;
+    while let Some(word) = rest.next() {
+        if word == "--project" {
+            rest.next();
+        } else if !word.starts_with("--") {
+            named = Some(std::path::PathBuf::from(word));
+            break;
+        }
+    }
     let path = match named {
         Some(path) => path,
         None => std::env::current_dir().map_err(|error| error.to_string())?,
@@ -2300,7 +2307,15 @@ mod tests {
                 .ends_with("some/tree")
         );
 
-        // The flag right after `--workflow-sync` is not mistaken for the checkout.
+        // The flag right after `--workflow-sync` is not mistaken for the checkout, and a checkout
+        // after it is still found.
+        let before = "nucleos-core --workflow-sync --project beta some/tree";
+        assert!(
+            workflow_sync_target(&words(before))
+                .unwrap()
+                .replace('\\', "/")
+                .ends_with("some/tree")
+        );
         let bare = "nucleos-core --workflow-sync --project beta";
         assert_eq!(
             std::path::PathBuf::from(workflow_sync_target(&words(bare)).unwrap()),
