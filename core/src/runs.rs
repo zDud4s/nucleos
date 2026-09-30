@@ -500,10 +500,15 @@ const MAX_AUTONOMOUS_ATTEMPTS: u32 = 2;
 /// `artifacts` is the directory a job's nodes hand work to each other through, and is `Some` only
 /// for a node of a job. An ordinary run has no successor to write to, and handing it the variable
 /// anyway would advertise a protocol nothing in its prompt describes.
+///
+/// `capacity` is the speed/ceiling contract every session is handed (`speed::Capacity::env`), set
+/// here once rather than at each launcher so no launcher can forget it. A lone run passes
+/// `Capacity::solo()`; a department's session passes what its round was granted.
 pub(crate) fn run_env(
     token: &str,
     id: i64,
     artifacts: Option<&std::path::Path>,
+    capacity: crate::speed::Capacity,
 ) -> Vec<(String, String)> {
     let mut env = vec![
         // Derived, never written out again. This is the address every tool a run calls will use to
@@ -522,6 +527,7 @@ pub(crate) fn run_env(
             path.to_string_lossy().into_owned(),
         ));
     }
+    env.extend(capacity.env());
     env
 }
 
@@ -1552,7 +1558,12 @@ async fn spawn_handoff_if_needed(
         gate_config,
         max_attempts,
         tool_policy,
-        run_env(&daemon_token, successor.id, node_artifacts.as_deref()),
+        run_env(
+            &daemon_token,
+            successor.id,
+            node_artifacts.as_deref(),
+            crate::speed::Capacity::solo(),
+        ),
         // Inherited, and this is the decision the paragraph that used to sit here asked for: a
         // handoff continues one task, and being able to speak to that task is a property of the
         // task rather than of the process currently doing it. `prepare_handoff_successor` now
@@ -2880,7 +2891,12 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
         gate_config,
         max_attempts,
         tool_policy,
-        run_env(&daemon_token, id, node_artifacts.as_deref()),
+        run_env(
+            &daemon_token,
+            id,
+            node_artifacts.as_deref(),
+            crate::speed::Capacity::solo(),
+        ),
         steerable,
         run_timeout_for_mode(state.run_timeout, mode),
         progress_timeout_for_mode(state.progress_timeout, mode),
@@ -3583,6 +3599,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
             job_id
                 .map(|_| std::path::PathBuf::from(&wt_path).join(crate::worktree::ARTIFACTS_DIR))
                 .as_deref(),
+            crate::speed::Capacity::solo(),
         ),
         // Inherited from the run being resumed, like the handoff successor's. The row above carries
         // the same value, so the launch listens exactly when `post_run_message` will admit a turn.
@@ -4258,7 +4275,7 @@ mod run_env_tests {
     /// it will be forgotten in the direction that fails silently.
     #[test]
     fn a_run_calls_back_on_the_port_this_daemon_binds() {
-        let env = run_env("tok", 7, None);
+        let env = run_env("tok", 7, None, crate::speed::Capacity::solo());
         let url = env
             .iter()
             .find(|(key, _)| key == "NUCLEOS_DAEMON_URL")
@@ -4269,6 +4286,36 @@ mod run_env_tests {
         assert_eq!(
             url,
             crate::daemon_client::url_for(crate::daemon_client::port())
+        );
+    }
+
+    /// Every session the daemon launches carries the speed/ceiling contract the workflow reads —
+    /// a lone run as a team of one at `normal`, a department's session with what it was granted.
+    #[test]
+    fn a_run_is_told_its_speed_and_parallel_ceiling() {
+        let value = |env: &[(String, String)], name: &str| {
+            env.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+
+        let solo = run_env("tok", 7, None, crate::speed::Capacity::solo());
+        assert_eq!(value(&solo, "WORKFLOW_SPEED").as_deref(), Some("normal"));
+        assert_eq!(
+            value(&solo, "WORKFLOW_PARALLEL_CEILING").as_deref(),
+            Some("1")
+        );
+
+        let fast = run_env(
+            "tok",
+            7,
+            None,
+            crate::speed::Capacity::team(crate::speed::Speed::Fast, 3),
+        );
+        assert_eq!(value(&fast, "WORKFLOW_SPEED").as_deref(), Some("fast"));
+        assert_eq!(
+            value(&fast, "WORKFLOW_PARALLEL_CEILING").as_deref(),
+            Some("6")
         );
     }
 }

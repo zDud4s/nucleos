@@ -2509,9 +2509,9 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                         )
                     }
                 };
-                crate::runs::run_env(&key, id, None)
+                crate::runs::run_env(&key, id, None, crate::speed::Capacity::solo())
             }
-            _ => crate::runs::run_env(&control_token, id, None),
+            _ => crate::runs::run_env(&control_token, id, None, crate::speed::Capacity::solo()),
         };
         let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         {
