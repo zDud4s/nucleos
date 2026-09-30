@@ -346,7 +346,7 @@ pub struct Secret {
 ///
 /// # Why the app may write them at all
 ///
-/// Four of the five are settable today only by `nucleos-core --set-*`, which reads from stdin
+/// Four of the six are settable today only by `nucleos-core --set-*`, which reads from stdin
 /// rather than argv — a Windows command line is readable by any process running as the same user
 /// and is recorded verbatim in PSReadLine's history, so a token passed as an argument is a token on
 /// disk in cleartext at the exact moment somebody was securely storing it. That reasoning is about
@@ -354,6 +354,8 @@ pub struct Secret {
 /// every one of these. The fifth, `web-search-api-key`, has no setter at all: `main.rs` reads it
 /// and nothing in the repository writes it, so the web pillar is reachable today only by opening
 /// Credential Manager by hand.
+/// The sixth, `typesafe-api-key` (spec A), is set only here: there is no `--set-*` flag for it,
+/// because the app is where the judge is switched on.
 ///
 /// # Why `daemon-token` is not here
 ///
@@ -387,6 +389,11 @@ pub static SECRETS: &[Secret] = &[
         key: "openrouter-api-key",
         area: "models",
         what: "OpenRouter's key; without it a hosted chat turn is refused before any request leaves the machine, however `hosted_assistant_model` is set",
+    },
+    Secret {
+        key: crate::judge::TYPESAFE_KEY,
+        area: "models",
+        what: "TypeSafe's key for the autopilot's judge (the Jev); without it a project in observe or enforce decides exactly as it would with the judge off, and nothing is sent",
     },
 ];
 
@@ -450,6 +457,14 @@ mod tests {
                 secret.key
             );
         }
+    }
+
+    /// Spec A D3: the judge's key is set and forgotten through the same doors as every other
+    /// credential, beside the models' settings file, under the name the client reads.
+    #[test]
+    fn the_judges_key_is_a_credential_this_app_may_set() {
+        let secret = secret_for(crate::judge::TYPESAFE_KEY).expect("listed");
+        assert_eq!(secret.area, "models");
     }
 
     /// Every credential names an area that has a settings file, so the page can put the key beside
