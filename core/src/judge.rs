@@ -52,8 +52,13 @@ pub const RECENT_ACTION_CHARS: usize = 200;
 #[allow(dead_code)] // consumed by Task 5.1 (read in the test build too, so the module's cfg_attr is not enough)
 pub const RECENT_ACTIONS_MAX: usize = 5;
 
-/// D8: the worse of the two answers.
+/// D8: the worse of the two answers. `f64::min` ignores a NaN and returns the other side, so a
+/// garbled `in_scope` would vanish and let `safe` alone reach the allow band; a NaN on either side
+/// stays NaN here instead, and `band_of` puts NaN in the middle band.
 pub fn combined(p_in_scope: f64, p_safe: f64) -> f64 {
+    if p_in_scope.is_nan() || p_safe.is_nan() {
+        return f64::NAN;
+    }
     p_in_scope.min(p_safe)
 }
 
@@ -375,6 +380,18 @@ mod tests {
     fn the_worse_answer_decides() {
         assert_eq!(combined(0.97, 0.12), 0.12);
         assert_eq!(combined(0.30, 0.99), 0.30);
+    }
+
+    /// A NaN on either side must not be hidden by `min`: it lands in the middle band, never allow.
+    #[test]
+    fn a_nan_answer_never_reaches_the_allow_band() {
+        for (in_scope, safe) in [(f64::NAN, 0.99), (0.99, f64::NAN)] {
+            assert!(combined(in_scope, safe).is_nan());
+            assert_eq!(
+                band_of(combined(in_scope, safe), Thresholds::default()),
+                Band::Middle
+            );
+        }
     }
 
     /// D7: three bands, both edges inclusive, asymmetric.
