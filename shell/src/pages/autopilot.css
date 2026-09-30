@@ -358,7 +358,10 @@
   height: 6px;
   border-radius: var(--radius-pill);
   background: var(--tone-off-fg);
-  transition: height var(--dur-quick) var(--ease);
+  /* The exception tick grows by scale, not height: a height transition re-lays the fan out on
+     every frame. It grows from the bottom, where the tick row aligns its bars. */
+  transform-origin: bottom;
+  transition: transform var(--dur-quick) var(--ease);
 }
 
 .ap-fan-tick-active .ap-fan-tick-bar {
@@ -370,7 +373,7 @@
 }
 
 .ap-fan-tick-exception .ap-fan-tick-bar {
-  height: 12px;
+  transform: scaleY(2);
   background: var(--tone-paused-fg);
 }
 
