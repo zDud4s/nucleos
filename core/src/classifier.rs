@@ -403,7 +403,7 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     // `/usr/bin` first — and CLAUDE.md was corrected on 2026-08-30 so a run stops being told to
     // write it.
     "export",
-    // Spec A D13 (2026-09-27-autopilot-juiz-A.md): reads measured parking autonomous
+    // Spec A D13 (2026-09-26-autopilot-modo-juiz-design.md): reads measured parking autonomous
     // runs on the daemon's ledger. `git stash list`/`show` print refs and diffs; `stash` itself,
     // `pop`, `apply`, `push` and `drop` write, and are not prefixes of these.
     "git stash list",
@@ -1614,10 +1614,10 @@ fn is_safe_command(command: &str) -> bool {
 /// reason — its whole grammar is a script block — and so is its alias `where`, which in cmd and
 /// Git bash is a harmless lookup and in PowerShell is that same filter.
 ///
-/// *Porquê fora de `is_safe_command`:* essa função é partilhada pelas listas que não dependem da
-/// shell, e pôr lá uma regra só de PowerShell obrigava a passar-lhe a shell em todos os
-/// chamadores. *Porquê sem `sleep`/`Start-Sleep`:* uma pausa sem fim prende o run como um
-/// `tail -f`, que o classificador já recusa pela mesma razão.
+/// Kept out of `is_safe_command` because that function serves the shell-agnostic lists, and a
+/// PowerShell-only rule there would force every caller to pass the shell. `sleep`/`Start-Sleep`
+/// are absent on purpose: an unbounded pause holds the run like a `tail -f`, which the classifier
+/// already refuses for the same reason.
 fn shapes_output_only(command: &str) -> bool {
     const SHAPERS: &[&str] = &[
         "select-object",
@@ -2861,7 +2861,7 @@ mod tests {
     }
 
     /// Spec A D13: shell reads that wrote nothing and still parked autonomous runs, each spelled
-    /// the way the daemon's ledger recorded it (classifier version 18, 2026-09-09..14).
+    /// the way the daemon's ledger recorded it (classifier version 13, 2026-09-09..14).
     #[test]
     fn the_reads_that_parked_autonomous_runs_are_allowed() {
         let workspace = Some(Path::new("C:/work/repo"));
