@@ -2037,6 +2037,16 @@ pub trait CommandRunner: Send + Sync {
         None
     }
 
+    /// The llm-router this runner consults before a run, or `None` when routing is off.
+    ///
+    /// Defaulted to `None`, and only `route_advice::RoutedRunner` answers `Some`: that wrapper is
+    /// built by `main.rs` only when `.ai/router.yaml` turns routing on, so a daemon with routing off
+    /// holds the very runner it held before routing existed. A capability on the trait rather than
+    /// an `AppState` field, so no state literal anywhere had to learn about it.
+    fn router(&self) -> Option<std::sync::Arc<crate::route_advice::Router>> {
+        None
+    }
+
     /// What this runner would itself write into the model's prompt for `request`, or `None` for a
     /// runner whose prompt this daemon does not author.
     ///
@@ -3083,6 +3093,13 @@ pub(crate) fn stage_codex_images(
         .collect()
 }
 
+/// The model a Codex launch runs: the request's own when it names one, else the runner's
+/// configured model. A routed run names its model on the request, so this is where that choice
+/// reaches the command line.
+pub(crate) fn codex_model<'a>(request: &'a RunRequest, configured: &'a str) -> &'a str {
+    request.model.as_deref().unwrap_or(configured)
+}
+
 /// The full `codex exec` argument vector for one run, or the reason this tool cannot perform the
 /// run that was asked for. Pure for the same reason `cli_args` is: the flags deciding which model
 /// answers and where it is allowed to work are asserted in tests instead of inspected on a live
@@ -3425,12 +3442,8 @@ impl CommandRunner for CodexCliRunner {
             images: staged_files.0.clone(),
             sandbox_mode: self.sandbox_mode,
         };
-        let args = codex_cli_args(
-            &request,
-            request.model.as_deref().unwrap_or(&self.model),
-            &staged,
-        )
-        .map_err(std::io::Error::other)?;
+        let args = codex_cli_args(&request, codex_model(&request, &self.model), &staged)
+            .map_err(std::io::Error::other)?;
 
         // The Codex CLI binary. Overridable via `NUCLEOS_CODEX_BIN` for the same reason
         // `NUCLEOS_CLAUDE_BIN` exists: on Windows the npm-installed `codex` is a `.cmd` shim that
@@ -7328,6 +7341,35 @@ mod tests {
         assert!(
             !directoryless_args.iter().any(|arg| arg == "-C"),
             "an absent cwd must not invent a directory: {directoryless_args:?}"
+        );
+    }
+
+    /// A routed run names its model on the request, and the Codex launch must run THAT model rather
+    /// than the one the runner was built with. Without this the router's advice would be recorded
+    /// as applied while the configured model answered.
+    #[test]
+    fn codex_launch_uses_the_requested_model_over_its_own() {
+        let mut request = baseline_run_request();
+        request.model = None;
+        assert_eq!(codex_model(&request, "cfg-model"), "cfg-model");
+
+        request.model = Some("gpt-x".into());
+        assert_eq!(codex_model(&request, "cfg-model"), "gpt-x");
+
+        let args = codex_cli_args(
+            &request,
+            codex_model(&request, "cfg-model"),
+            &CodexStaged::default(),
+        )
+        .expect("a baseline request asks for nothing the tool cannot honour");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-m" && pair[1] == "gpt-x"),
+            "the requested model must follow -m: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "cfg-model"),
+            "the configured model must not reach the vector: {args:?}"
         );
     }
 

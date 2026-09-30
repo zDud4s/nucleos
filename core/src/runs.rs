@@ -1511,6 +1511,7 @@ async fn spawn_handoff_if_needed(
     progress_timeout: std::time::Duration,
     classifier_governs_tools: bool,
     model: Option<String>,
+    effort: Option<String>,
 ) {
     let successor = match prepare_handoff_successor(&state.pool, run_id).await {
         Ok(Some(successor)) => successor,
@@ -1583,6 +1584,11 @@ async fn spawn_handoff_if_needed(
         // Inherited: a successor is the same node continuing the same task, so it belongs on the
         // model its predecessor's stage was routed to.
         model,
+        // Inherited with the model, for the same reason.
+        effort,
+        // Never routed again: the model and effort above are already the predecessor's resolved
+        // choice, and a second opinion halfway through one task would be a different run.
+        None,
     );
 }
 
@@ -1619,6 +1625,11 @@ fn spawn_run(
     // Which model answers this run, or `None` for the runner's own. Decided by the caller, because
     // only it knows the stage — `spawn_run` must not learn to read job nodes.
     model: Option<String>,
+    // The reasoning effort, or `None` for the CLI's own default.
+    effort: Option<String>,
+    // What the llm-router is told about this run, or `None` for a run that is never routed (a
+    // triage run, whose mail must not leave the machine, and a handoff successor).
+    route: Option<crate::route_advice::RouteQuery>,
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
@@ -1627,6 +1638,31 @@ fn spawn_run(
     let run_tails = state.run_tails.clone();
 
     spawn_registered(state, id, async move {
+        // The router is asked HERE, inside the run's own task and before its first attempt, so
+        // neither the HTTP handler nor the job tick ever waits on it. With routing off this hands
+        // back exactly what it was given and writes nothing.
+        let resolved = crate::route_advice::resolve(
+            &pool,
+            id,
+            runner,
+            model,
+            effort,
+            route,
+            crate::route_advice::RunShape {
+                permission,
+                classifier_governs_tools,
+                tool_policy,
+                resume: resume_session_id.is_some(),
+            },
+            crate::route_advice::speed_of(&env),
+        )
+        .await;
+        let runner = resolved.runner;
+        let model = resolved.model;
+        let effort = resolved.effort;
+        // What an outcome is reported against once the gate has spoken. Held for the whole run and
+        // not read yet: the report is the next step of this feature, not this one.
+        let _route_decision = (resolved.decision_id, resolved.router);
         let mut attempt: u32 = 1;
         loop {
             // A fresh session channel per attempt: persist session_id the instant the runner parses it
@@ -1695,7 +1731,7 @@ fn spawn_run(
                 ambient_mcp: false,
                 // Cloned rather than moved: the request is built once per attempt.
                 model: model.clone(),
-                effort: None,
+                effort: effort.clone(),
                 fallback_model: Vec::new(),
                 add_dirs: Vec::new(),
                 max_budget_usd: None,
@@ -1940,6 +1976,7 @@ fn spawn_run(
                             progress_timeout,
                             classifier_governs_tools,
                             model.clone(),
+                            effort.clone(),
                         ))
                         .await;
                     }
@@ -2096,6 +2133,7 @@ fn spawn_run(
                             progress_timeout,
                             classifier_governs_tools,
                             model.clone(),
+                            effort.clone(),
                         ))
                         .await;
                     }
@@ -2143,6 +2181,9 @@ pub struct JobNode {
     pub stage: &'static str,
     pub worktree_path: String,
     pub branch: String,
+    /// The queue position of the item this node implements, or `None` for a node with no item (plan,
+    /// replan, review). Read for the llm-router's request, which names what already failed the item.
+    pub item_ordinal: Option<usize>,
 }
 
 /// A conflict the daemon is about to hand an agent: which escalated request it came from, and the
@@ -2865,6 +2906,39 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
     // from where the process starts — asking the project root would answer about a directory this
     // run never enters.
     let governed_by_classifier = classifier_governs_tools(mode, tool_policy, spawn_cwd.as_deref());
+    // What the llm-router is told. Never for triage: mail text must not leave the machine. The
+    // item's history is read now, before `job.rs` points the item at this run and the attempt that
+    // failed it stops being reachable from there.
+    let route = if mode == crate::email::TRIAGE_MODE {
+        None
+    } else {
+        let item_ref = match (node, item) {
+            (Some(node), _) => {
+                node.item_ordinal
+                    .map(|ordinal| crate::route_advice::ItemRef::Ordinal {
+                        job_id: node.job_id,
+                        ordinal: ordinal as i64,
+                    })
+            }
+            (None, Some(item)) => Some(crate::route_advice::ItemRef::Id(item.item_id)),
+            (None, None) => None,
+        };
+        let item_context = match item_ref {
+            Some(item_ref) if state.runner.router().is_some() => {
+                Some(crate::route_advice::item_context(&state.pool, item_ref, id).await)
+            }
+            _ => None,
+        };
+        Some(crate::route_advice::RouteQuery {
+            task: prompt.clone(),
+            stage: node
+                .map(|node| node.stage)
+                .or(item.map(|item| item.stage))
+                .map(str::to_owned),
+            item: item_context,
+            resume: false,
+        })
+    };
     // Folded HERE, where both facts are in hand, rather than in `cli_args` where they used to be
     // two fields and an `else if`. A shadow run is planning and stays planning even in a tree that
     // wires the classifier — which is the old precedence, kept, but now as a value that cannot be
@@ -2906,6 +2980,8 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
         state
             .runner
             .model_for_stage(node.as_ref().map(|node| node.stage)),
+        None,
+        route,
     );
 
     Ok(id)
@@ -3564,6 +3640,8 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         crate::runner::ToolPolicy::Unrestricted,
         Some(std::path::Path::new(&wt_path)),
     );
+    // Taken before `prompt` moves into the launch.
+    let prompt_for_route = prompt.clone();
     spawn_run(
         state,
         state.runner.clone(),
@@ -3614,6 +3692,15 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // The resume row carries the node's stage forward, so an approved plan node resumes on the
         // plan model rather than dropping back to the runner's own.
         state.runner.model_for_stage(stage.as_deref()),
+        None,
+        // Routed like any launch, but as a resume: only the runner that holds the session is
+        // eligible, whatever the router would prefer.
+        Some(crate::route_advice::RouteQuery {
+            task: prompt_for_route,
+            stage: stage.clone(),
+            item: None,
+            resume: true,
+        }),
     );
 
     Ok(resume_id)
@@ -5194,6 +5281,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 stage: "implement",
                 worktree_path: info.path.to_string_lossy().into_owned(),
                 branch: info.branch.clone(),
+                item_ordinal: None,
             },
         )
         .await
@@ -8097,6 +8185,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             Duration::from_secs(30),
             false,
             None,
+            None,
         )
         .await;
 
@@ -8300,6 +8389,115 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 "mode {mode}"
             );
         }
+    }
+
+    /// Fronts `state.runner` with a shadow-mode router at `url`, the way `main.rs` does when
+    /// `.ai/router.yaml` turns routing on.
+    fn front_with_shadow_router(state: &mut AppState, url: &str) {
+        let inner = state.runner.clone();
+        let config = crate::route_advice::RouterConfig {
+            mode: crate::route_advice::Mode::Shadow,
+            url: url.to_owned(),
+            timeout_ms: 1000,
+            ..crate::route_advice::RouterConfig::off()
+        };
+        let router = Arc::new(crate::route_advice::Router::new(
+            config,
+            crate::route_advice::Available {
+                kind: crate::route_advice::RunnerKind::Claude,
+                runner: inner.clone(),
+                default_model: "claude-sonnet-5".into(),
+                models: vec!["claude-*".into()],
+            },
+            Vec::new(),
+        ));
+        state.runner = Arc::new(crate::route_advice::RoutedRunner { inner, router });
+    }
+
+    /// Shadow, end to end through `spawn_run`: the router is asked, its advice lands on the row
+    /// beside what ran, and the launch itself is exactly the configured one.
+    #[tokio::test]
+    async fn a_shadow_routed_run_records_the_advice_and_launches_as_configured() {
+        let (mut state, runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let (url, mut asked) = crate::router_client::test_support::stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_s", "runner": "claude",
+                               "model": "claude-opus-5", "effort": "high"}),
+        )
+        .await;
+        front_with_shadow_router(&mut state, &url);
+
+        let id = create_run_inner(&state, "route me".into(), None, None, "real", false)
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if runner.last_model.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(*runner.last_model.lock().unwrap(), Some(None));
+        assert_eq!(*runner.last_effort.lock().unwrap(), Some(None));
+        let sent = asked.recv().await.expect("the router was asked");
+        assert_eq!(sent["task"], "route me");
+        let row: (Option<String>, Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT model, route_mode, route_decision_id, advised_model FROM runs WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("claude-sonnet-5".into()),
+                Some("shadow".into()),
+                Some("rt_s".into()),
+                Some("claude-opus-5".into()),
+            )
+        );
+    }
+
+    /// Mail text never reaches the router, whatever the router's mode.
+    #[tokio::test]
+    async fn a_triage_run_is_never_routed() {
+        let (mut state, runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let (url, mut asked) = crate::router_client::test_support::stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_t", "runner": "claude", "model": "claude-opus-5"}),
+        )
+        .await;
+        front_with_shadow_router(&mut state, &url);
+
+        let id = create_run_inner(
+            &state,
+            "a private email".into(),
+            None,
+            None,
+            crate::email::TRIAGE_MODE,
+            false,
+        )
+        .await
+        .unwrap();
+        for _ in 0..200 {
+            if runner.last_tool_policy.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(runner.last_tool_policy.lock().unwrap().is_some(), "it launched");
+        assert!(asked.try_recv().is_err(), "the router must not be asked");
+        let mode: Option<String> = sqlx::query_scalar("SELECT route_mode FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, None);
     }
 
     /// The production opt-in, and the thing that was missing: `spawn_run` hardcoded `steerable:

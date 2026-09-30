@@ -85,6 +85,8 @@ mod redact;
 mod relay;
 mod repo_trigger;
 mod resolver;
+mod route_advice;
+mod router_client;
 mod run_stop;
 mod runner;
 mod runs;
@@ -1339,6 +1341,13 @@ async fn main() {
         }
         None => Arc::new(claude_runner()),
     };
+    // The llm-router as an adviser. Off unless `.ai/router.yaml` turns it on, and off hands back
+    // the very runner built above.
+    let primary_runner = route_advice::front(
+        primary_runner,
+        &models_config,
+        route_advice::load_config(std::path::Path::new(".ai/router.yaml")),
+    );
 
     // The email sidecar's own key, minted before `AppState` exists rather than beside the spawn.
     //

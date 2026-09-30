@@ -3913,6 +3913,7 @@ async fn spawn_node(
                     stage,
                     worktree_path: path.to_string_lossy().into_owned(),
                     branch,
+                    item_ordinal: item.as_ref().map(|claim| claim.ordinal),
                 },
             )
             .await
