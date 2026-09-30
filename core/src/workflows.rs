@@ -225,6 +225,9 @@ struct ManifestFile {
     /// Files in a project this workflow is the author of. See [`crate::ownership`].
     #[serde(default)]
     owns: Vec<String>,
+    /// A bundle-relative file whose text is the managed block of the project's `AGENTS.md`. See
+    /// [`crate::workflow_materialize`]. Absent, and the bundle never touches `AGENTS.md`.
+    agents_block: Option<String>,
 }
 
 /// One bundle in the library, as it is on disk right now.
@@ -235,6 +238,9 @@ pub struct Bundle {
     pub description: Option<String>,
     pub origin: String,
     pub owns: Vec<String>,
+    /// The manifest's `agents_block`, as written. Validated where it is read, not here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents_block: Option<String>,
     pub hash: String,
     /// Absolute, for the "open it in the editor" door. The shell never joins onto it.
     pub path: String,
@@ -266,6 +272,7 @@ pub fn read_bundle(dir: &Path, name: &str, version: &str) -> std::io::Result<Opt
             .origin
             .unwrap_or_else(|| format!("library:{name}@{version}")),
         owns: manifest.owns,
+        agents_block: manifest.agents_block,
         hash: digest_of(&files),
         path: dir.to_string_lossy().into_owned(),
     }))

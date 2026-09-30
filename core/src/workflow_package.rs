@@ -52,6 +52,8 @@ pub struct Packaged {
 struct Owns {
     #[serde(default)]
     owns: Vec<String>,
+    /// The managed block's source (`workflow_materialize`), which must be among what is copied.
+    agents_block: Option<String>,
 }
 
 /// Copy one file or directory tree, files only, skipping symlinks for the reason
@@ -100,10 +102,9 @@ pub async fn package(
     }
     let text = std::fs::read_to_string(manifest)
         .map_err(|error| format!("{}: {error}", manifest.display()))?;
-    let owns = serde_yaml::from_str::<Option<Owns>>(&text)
+    let Owns { owns, agents_block } = serde_yaml::from_str::<Option<Owns>>(&text)
         .map_err(|error| format!("{}: {error}", manifest.display()))?
-        .unwrap_or_default()
-        .owns;
+        .unwrap_or_default();
     if owns.is_empty() {
         return Err(format!(
             "{} names no files under `owns:`, so there is nothing to package",
@@ -123,6 +124,34 @@ pub async fn package(
             return Err(format!("`{rel}` is not in {}", project_root.display()));
         }
         entries.push(rel);
+    }
+    // Only what `owns:` names is copied, so a block source outside it would ship a bundle whose
+    // manifest points at nothing — and materializing that stops every run it is pinned into.
+    if let Some(source) = &agents_block {
+        let covered = crate::ownership::normalise(source).filter(|rel| {
+            crate::workflow_materialize::provided(&entries, rel)
+                && std::fs::symlink_metadata(project_root.join(rel))
+                    .is_ok_and(|meta| meta.is_file())
+        });
+        let Some(rel) = covered else {
+            return Err(format!(
+                "agents_block `{source}` must be a file in the project under one of the `owns:` \
+                 entries, or it is not packaged"
+            ));
+        };
+        // The source is the whole region, markers included; one without them would ship a bundle
+        // every materialization of which stops (`workflow_materialize::render_block`).
+        let framed = std::fs::read(project_root.join(&rel))
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|text| crate::workflow_materialize::render_block(&text));
+        if framed.is_none() {
+            return Err(format!(
+                "agents_block `{source}` must be UTF-8 text whose first line is the begin marker \
+                 and last line the end marker of the AI WORKFLOW MANAGED BLOCK, with neither in \
+                 between"
+            ));
+        }
     }
 
     let home = library_root.join(name);
@@ -340,6 +369,64 @@ mod tests {
         assert!(packaged.dir.join(".ai/workflow/workflow.md").is_file());
         assert!(packaged.commit.is_err());
         assert!(packaged.commit.unwrap_err().contains("git"));
+    }
+
+    /// The managed block's source ships with the bundle or the bundle is not packaged: without it
+    /// a materialization would have no block to write, and nothing to tell a dropped one from.
+    #[tokio::test]
+    async fn a_managed_block_the_owns_list_does_not_cover_refuses_packaging() {
+        let temp = project();
+        let library = temp.path().join("lib");
+        let root = temp.path().join("project");
+        std::fs::write(root.join(".ai/workflow/agents-block.md"), BLOCK).unwrap();
+        std::fs::write(root.join("block.md"), BLOCK).unwrap();
+
+        let outside = temp.path().join("outside.yaml");
+        std::fs::write(
+            &outside,
+            "owns:\n  - .ai/workflow/\nagents_block: block.md\n",
+        )
+        .unwrap();
+        let error = package(&library, "dev", "1.0.0", &root, &outside)
+            .await
+            .unwrap_err();
+        assert!(error.contains("block.md"), "{error}");
+        assert!(!library.exists());
+
+        let inside = temp.path().join("inside.yaml");
+        std::fs::write(
+            &inside,
+            "owns:\n  - .ai/workflow/\nagents_block: .ai/workflow/agents-block.md\n",
+        )
+        .unwrap();
+        let packaged = package(&library, "dev", "1.0.0", &root, &inside)
+            .await
+            .unwrap();
+        assert!(packaged.dir.join(".ai/workflow/agents-block.md").is_file());
+    }
+
+    const BLOCK: &str =
+        "# >>> AI WORKFLOW MANAGED BLOCK >>>\n\nrules\n\n# <<< AI WORKFLOW MANAGED BLOCK <<<\n";
+
+    /// The source is the whole region, markers included: one without them would package fine and
+    /// then stop every materialization it is pinned into, so it is refused here instead.
+    #[tokio::test]
+    async fn a_managed_block_source_without_its_markers_refuses_packaging() {
+        let temp = project();
+        let library = temp.path().join("lib");
+        let root = temp.path().join("project");
+        std::fs::write(root.join(".ai/workflow/agents-block.md"), "rules\n").unwrap();
+        let manifest = temp.path().join("bundle.yaml");
+        std::fs::write(
+            &manifest,
+            "owns:\n  - .ai/workflow/\nagents_block: .ai/workflow/agents-block.md\n",
+        )
+        .unwrap();
+        let error = package(&library, "dev", "1.0.0", &root, &manifest)
+            .await
+            .unwrap_err();
+        assert!(error.contains("MANAGED BLOCK"), "{error}");
+        assert!(!library.exists());
     }
 
     #[tokio::test]

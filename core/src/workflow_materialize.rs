@@ -48,6 +48,27 @@
 //! `.claude/settings.json` and `.claude/hooks/` carry the classifier hook that onboarding wires
 //! (`autopilot::wire_classifier_hook`). A bundle that provided them would unwire the gate every
 //! tool call passes through, so those paths are skipped whatever a manifest says, and reported.
+//!
+//! # The managed block in `AGENTS.md`
+//!
+//! `AGENTS.md` is the project's file — its own notes, gotchas and invariants — but its top carries
+//! the workflow's entry point between two marker lines, and that region used to be kept by hand.
+//! A manifest may name one bundle file as `agents_block:`; that file is the whole region, verbatim,
+//! its first line the begin marker and its last the end marker — the installer's own
+//! `agents-block.md` has always been written that way. Only the region is ever written:
+//! replaced where the markers are, prepended with one blank line where they are not, and the whole
+//! file created where there is none. Everything outside the markers is never touched, and the
+//! file's own line endings are kept. The bundle never owns `AGENTS.md` as a whole file, so a
+//! bundle naming a block and also providing `AGENTS.md` has the latter skipped as reserved.
+//!
+//! The region follows the per-file rules above, recorded under the key [`AGENTS_BLOCK_KEY`] with
+//! the hash of the region as written, line breaks counted as `\n` so a checkout that converts them
+//! does not read as an edit. An edited region is a conflict and stays; one there before and never
+//! recorded is adopted only when it is already the bundle's; a version that stops naming a block
+//! takes the region out when it is unchanged, and leaves it recorded and reported when it is not.
+//! A block source that is missing, not text or not framed by the markers stops the run before
+//! anything is written: without it, "the new version dropped the block" and "the block could not be
+//! read" look the same, and a source without markers would write a region no later run could find.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -76,6 +97,10 @@ pub fn reserved(rel: &str) -> bool {
         None => rel == *entry,
     }) || (!hook_dir.is_empty() && rel.starts_with(&format!("{hook_dir}/")))
 }
+
+/// The record key of the managed block in `AGENTS.md`. Not a path: `#` keeps it from ever being
+/// mistaken for a file the bundle provides, and the removal pass skips it for the same reason.
+pub const AGENTS_BLOCK_KEY: &str = "AGENTS.md#managed-block";
 
 /* ----------------------------------------------------------------- record -- */
 
@@ -179,7 +204,7 @@ pub fn owns_entries(owns: &[String]) -> Vec<String> {
 
 /// Whether `file` (a bundle-relative path) is provided by `entries`: named exactly, or under a
 /// directory one of them names.
-fn provided(entries: &[String], file: &str) -> bool {
+pub(crate) fn provided(entries: &[String], file: &str) -> bool {
     entries
         .iter()
         .any(|entry| file == entry || file.starts_with(&format!("{entry}/")))
@@ -284,6 +309,274 @@ impl Report {
     }
 }
 
+/* ---------------------------------------------------------- managed block -- */
+
+/// The project file the managed block lives in.
+const AGENTS_FILE: &str = "AGENTS.md";
+const BLOCK_BEGIN: &str = "# >>> AI WORKFLOW MANAGED BLOCK >>>";
+const BLOCK_END: &str = "# <<< AI WORKFLOW MANAGED BLOCK <<<";
+
+/// The block a bundle offers: rendered with `\n` line breaks, its hash, and the bundle file it
+/// came from (for a conflict's diff).
+struct OfferedBlock {
+    rendered: String,
+    hash: String,
+    source_file: String,
+}
+
+/// The region a source is: the source itself, with `\n` line breaks and its last line ended.
+/// `None` unless its first line is the begin marker, its last the end marker, and neither marker
+/// appears anywhere else — a marker inside would make the written region end where the next run
+/// cannot tell it does. Packaging refuses such a source with the same test (`workflow_package`).
+pub(crate) fn render_block(source: &str) -> Option<String> {
+    let text = source.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+    let body = text.trim_end_matches('\n');
+    let lines: Vec<&str> = body.split('\n').collect();
+    let framed = lines.len() >= 2
+        && lines.first() == Some(&BLOCK_BEGIN)
+        && lines.last() == Some(&BLOCK_END)
+        && lines[1..lines.len() - 1]
+            .iter()
+            .all(|line| *line != BLOCK_BEGIN && *line != BLOCK_END);
+    framed.then(|| format!("{body}\n"))
+}
+
+/// Read the block `source` (a bundle-relative path from the manifest) names. Any failure is the
+/// whole run's: see the module header.
+fn read_block(bundle_dir: &Path, source: &str) -> Result<OfferedBlock, String> {
+    let rel = crate::ownership::normalise(source).ok_or_else(|| {
+        format!("agents_block `{source}` is not a relative path inside the bundle")
+    })?;
+    let file = bundle_dir.join(&rel);
+    // Not followed through a link, for the reason `workflows::file_hashes` skips them.
+    let is_file = std::fs::symlink_metadata(&file).is_ok_and(|meta| meta.is_file());
+    if !is_file {
+        return Err(format!("agents_block `{rel}` is not a file in the bundle"));
+    }
+    let bytes = std::fs::read(&file).map_err(|error| format!("agents_block `{rel}`: {error}"))?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| format!("agents_block `{rel}` is not UTF-8 text"))?;
+    let rendered = render_block(&text).ok_or_else(|| {
+        format!(
+            "agents_block `{rel}` must start with `{BLOCK_BEGIN}` and end with `{BLOCK_END}`, \
+             with neither marker in between"
+        )
+    })?;
+    Ok(OfferedBlock {
+        hash: workflows::hash_of(rendered.as_bytes()),
+        rendered,
+        source_file: file.to_string_lossy().into_owned(),
+    })
+}
+
+/// Where the markers are in a file's text.
+enum Region {
+    Absent,
+    /// From the start of the begin marker's line to the end of the end marker's, line break
+    /// included.
+    At(std::ops::Range<usize>),
+    /// A begin marker and no end marker after it: nothing says where the block stops, so nothing
+    /// in it is touched.
+    Unclosed,
+}
+
+fn find_region(text: &str) -> Region {
+    let mut offset = 0;
+    let mut begin = None;
+    for line in text.split_inclusive('\n') {
+        let bom = if line.starts_with('\u{feff}') { 3 } else { 0 };
+        let bare = line[bom..].trim_end_matches('\n').trim_end_matches('\r');
+        match begin {
+            None if bare == BLOCK_BEGIN => begin = Some(offset + bom),
+            Some(start) if bare == BLOCK_END => return Region::At(start..offset + line.len()),
+            _ => {}
+        }
+        offset += line.len();
+    }
+    if begin.is_some() {
+        Region::Unclosed
+    } else {
+        Region::Absent
+    }
+}
+
+/// The region's hash, line breaks counted as `\n` and the last line always ended, so it compares
+/// with a rendered block whatever the checkout did to its line endings.
+fn region_hash(region: &str) -> String {
+    let mut text = region.replace("\r\n", "\n");
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    workflows::hash_of(text.as_bytes())
+}
+
+/// What one run does to `AGENTS.md`, decided before anything is written.
+struct BlockPlan {
+    target: PathBuf,
+    /// The whole new file — `Some(None)` to delete it, when the block was all it held — and what
+    /// the record holds once that is on disk.
+    change: Option<(Option<String>, Option<String>)>,
+    /// What the record holds when nothing changes, or when the change fails to land.
+    keep: Option<String>,
+}
+
+/// Decide the managed block's fate, reporting it. `None` when there is nothing to decide or the
+/// file cannot be safely reached.
+fn plan_block(
+    checkout: &Path,
+    offered: Option<&OfferedBlock>,
+    recorded: Option<&str>,
+    report: &mut Report,
+) -> Option<BlockPlan> {
+    if offered.is_none() && recorded.is_none() {
+        return None;
+    }
+    let key = AGENTS_BLOCK_KEY.to_string();
+    let keep = recorded.map(str::to_string);
+    let conflict = |kind, local: Option<String>| Conflict {
+        path: key.clone(),
+        kind,
+        local_hash: local,
+        recorded_hash: keep.clone(),
+        bundle_hash: offered.map(|block| block.hash.clone()),
+        bundle_file: offered.map(|block| block.source_file.clone()),
+    };
+    // What an edit is called: still offered, it is an edit; no longer offered, a kept removal.
+    let edited = if offered.is_some() {
+        ConflictKind::Edited
+    } else {
+        ConflictKind::RemovedEdited
+    };
+
+    let Ok(target) = crate::inspect::safe_write_target(checkout, AGENTS_FILE) else {
+        if offered.is_some() {
+            report.conflicts.push(conflict(ConflictKind::Unsafe, None));
+        }
+        // Not dropped from the record: an unreachable file is not evidence the block is gone.
+        return keep.map(|hash| BlockPlan {
+            target: checkout.join(AGENTS_FILE),
+            change: None,
+            keep: Some(hash),
+        });
+    };
+    let text = match std::fs::symlink_metadata(&target) {
+        Err(_) => None,
+        Ok(meta) if meta.is_file() => {
+            match std::fs::read(&target)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+            {
+                Some(text) => Some(text),
+                None => {
+                    // Not text: no marker can be found in it, and writing back would corrupt it.
+                    let kind = keep.as_ref().map_or(ConflictKind::Untracked, |_| edited);
+                    report.conflicts.push(conflict(kind, None));
+                    return Some(BlockPlan {
+                        target,
+                        change: None,
+                        keep,
+                    });
+                }
+            }
+        }
+        Ok(_) => {
+            if offered.is_some() {
+                report
+                    .conflicts
+                    .push(conflict(ConflictKind::Untracked, None));
+            }
+            return Some(BlockPlan {
+                target,
+                change: None,
+                keep,
+            });
+        }
+    };
+
+    let eol = match &text {
+        Some(text) if text.contains("\r\n") => "\r\n",
+        _ => "\n",
+    };
+    let region = text.as_deref().map_or(Region::Absent, find_region);
+    let mut plan = BlockPlan {
+        target,
+        change: None,
+        keep: keep.clone(),
+    };
+
+    match offered {
+        Some(block) => {
+            let rendered = block.rendered.replace('\n', eol);
+            let written = Some(block.hash.clone());
+            match (&text, region) {
+                (None, _) => {
+                    report.written.push(key.clone());
+                    plan.change = Some((Some(rendered), written));
+                }
+                (Some(text), Region::Absent) => {
+                    report.written.push(key.clone());
+                    let (bom, body) = text
+                        .strip_prefix('\u{feff}')
+                        .map_or(("", text.as_str()), |body| ("\u{feff}", body));
+                    plan.change = Some((Some(format!("{bom}{rendered}{eol}{body}")), written));
+                }
+                (Some(_), Region::Unclosed) => {
+                    let kind = keep.as_ref().map_or(ConflictKind::Untracked, |_| edited);
+                    report.conflicts.push(conflict(kind, None));
+                }
+                (Some(text), Region::At(range)) => {
+                    let local = region_hash(&text[range.clone()]);
+                    if local == block.hash {
+                        if recorded == Some(block.hash.as_str()) {
+                            report.unchanged += 1;
+                        } else {
+                            report.adopted.push(key.clone());
+                        }
+                        plan.keep = written;
+                    } else if recorded == Some(local.as_str()) {
+                        report.updated.push(key.clone());
+                        let replaced =
+                            format!("{}{rendered}{}", &text[..range.start], &text[range.end..]);
+                        plan.change = Some((Some(replaced), written));
+                    } else if recorded.is_some() {
+                        // Kept with what was written, so the next run still sees an edit.
+                        report.conflicts.push(conflict(edited, Some(local)));
+                    } else {
+                        report
+                            .conflicts
+                            .push(conflict(ConflictKind::Untracked, Some(local)));
+                    }
+                }
+            }
+        }
+        None => match (&text, region) {
+            // Gone already: nothing to remove, and nothing left to remember.
+            (None, _) | (Some(_), Region::Absent) => plan.keep = None,
+            (Some(_), Region::Unclosed) => report.conflicts.push(conflict(edited, None)),
+            (Some(text), Region::At(range)) => {
+                let local = region_hash(&text[range.clone()]);
+                if recorded == Some(local.as_str()) {
+                    report.deleted.push(key.clone());
+                    let head = &text[..range.start];
+                    let mut rest = &text[range.end..];
+                    // A block at the top was prepended with one blank line after it; take that too.
+                    if head.trim_start_matches('\u{feff}').is_empty() {
+                        rest = rest.strip_prefix(eol).unwrap_or(rest);
+                    }
+                    let left = format!("{head}{rest}");
+                    // A file that held nothing but the block was this module's to create, and goes.
+                    let contents =
+                        (!left.trim_start_matches('\u{feff}').is_empty()).then_some(left);
+                    plan.change = Some((contents, None));
+                } else {
+                    report.conflicts.push(conflict(edited, Some(local)));
+                }
+            }
+        },
+    }
+    Some(plan)
+}
+
 /* ------------------------------------------------------------ materialize -- */
 
 fn io(error: impl std::fmt::Display) -> String {
@@ -347,13 +640,21 @@ pub fn materialize(
         ..Report::default()
     };
 
+    // Read before anything is written: a block that cannot be read stops the run (module header).
+    let block = match &bundle.agents_block {
+        Some(source) => Some(read_block(bundle_dir, source)?),
+        None => None,
+    };
+
     let mut offered = BTreeMap::new();
     if !entries.is_empty() {
         for (path, hash) in workflows::file_hashes(bundle_dir).map_err(io)? {
-            if !provided(&entries, &path) {
+            if !provided(&entries, &path) || path == AGENTS_BLOCK_KEY {
                 continue;
             }
-            if reserved(&path) {
+            // With a block, `AGENTS.md` is the project's file with one region of ours in it, and
+            // a whole-file copy would overwrite the project's part.
+            if reserved(&path) || (block.is_some() && path == AGENTS_FILE) {
                 report.reserved.push(path);
                 continue;
             }
@@ -455,9 +756,43 @@ pub fn materialize(
         }
     }
 
-    // What the previous version provided and this one does not.
+    if let Some(plan) = plan_block(
+        checkout,
+        block.as_ref(),
+        previous.get(AGENTS_BLOCK_KEY).map(String::as_str),
+        &mut report,
+    ) {
+        let mut recorded = plan.keep;
+        if let (Some((contents, after)), Mode::Apply) = (plan.change, mode) {
+            let applied = if outcome.is_ok() {
+                match &contents {
+                    Some(text) => {
+                        crate::project_state::write_bytes_atomically(&plan.target, text.as_bytes())
+                    }
+                    None => std::fs::remove_file(&plan.target),
+                }
+                .map_err(|error| format!("{AGENTS_FILE}: {error}"))
+            } else {
+                Err(String::new())
+            };
+            match applied {
+                Ok(()) => recorded = after,
+                Err(error) => {
+                    if outcome.is_ok() {
+                        outcome = Err(error);
+                    }
+                }
+            }
+        }
+        if let Some(hash) = recorded {
+            files.insert(AGENTS_BLOCK_KEY.to_string(), hash);
+        }
+    }
+
+    // What the previous version provided and this one does not. The block's key is not a path and
+    // was decided above.
     for (path, recorded) in &previous {
-        if offered.contains_key(path) || reserved(path) {
+        if offered.contains_key(path) || reserved(path) || path == AGENTS_BLOCK_KEY {
             continue;
         }
         let Ok(target) = crate::inspect::safe_write_target(checkout, path) else {
@@ -1135,5 +1470,215 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /* ------------------------------------------------------- managed block -- */
+
+    /// A source is the whole region, markers included, as the installer's `agents-block.md` is.
+    const BLOCK: &str = "# >>> AI WORKFLOW MANAGED BLOCK >>>\n\n## AI workflow integration\n\nthe rules\n\n# <<< AI WORKFLOW MANAGED BLOCK <<<\n";
+    const NEW_BLOCK: &str =
+        "# >>> AI WORKFLOW MANAGED BLOCK >>>\n\nnew rules\n\n# <<< AI WORKFLOW MANAGED BLOCK <<<\n";
+
+    /// Shelve a bundle whose manifest names `.ai/workflow/agents-block.md` as its managed block.
+    fn shelve_block(root: &Path, version: &str, source_text: &str) {
+        let source = ".ai/workflow/agents-block.md";
+        shelve(root, version, &[(source, source_text)], &[".ai/workflow/"]);
+        let manifest = root
+            .join("lib")
+            .join("dev")
+            .join(version)
+            .join(workflows::MANIFEST);
+        let text = read(&manifest);
+        std::fs::write(&manifest, format!("{text}agents_block: {source}\n")).unwrap();
+    }
+
+    fn block_setup(source_text: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (temp, checkout, record) = setup(&[], &[]);
+        shelve_block(temp.path(), "1.0", source_text);
+        (temp, checkout, record)
+    }
+
+    #[test]
+    fn the_managed_block_creates_a_missing_agents_file_holding_only_the_block() {
+        let (temp, checkout, record) = block_setup(BLOCK);
+        let report =
+            materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+
+        assert_eq!(read(&checkout.join("AGENTS.md")), BLOCK);
+        assert!(report.written.contains(&AGENTS_BLOCK_KEY.to_string()));
+        assert_eq!(
+            read_record(&record).unwrap().bundles["dev"].files[AGENTS_BLOCK_KEY],
+            workflows::hash_of(BLOCK.as_bytes())
+        );
+    }
+
+    /// The rest of the file is the project's, byte for byte, and so are its line endings.
+    #[test]
+    fn the_managed_block_is_prepended_when_there_are_no_markers_and_the_rest_is_untouched() {
+        let (temp, checkout, record) = block_setup(BLOCK);
+        let rest = "## Project: mine\r\n\r\nits own notes\r\n";
+        std::fs::write(checkout.join("AGENTS.md"), rest).unwrap();
+        let report =
+            materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+
+        assert!(report.written.contains(&AGENTS_BLOCK_KEY.to_string()));
+        assert_eq!(
+            read(&checkout.join("AGENTS.md")),
+            format!("{}\r\n{rest}", BLOCK.replace('\n', "\r\n"))
+        );
+    }
+
+    #[test]
+    fn an_unchanged_managed_block_is_replaced_by_the_new_version_and_nothing_else_moves() {
+        let (temp, checkout, record) = block_setup(BLOCK);
+        std::fs::write(checkout.join("AGENTS.md"), "above\n").unwrap();
+        materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        // Somebody adds a line after everything, which is theirs to add.
+        let now = read(&checkout.join("AGENTS.md"));
+        std::fs::write(checkout.join("AGENTS.md"), format!("{now}below\n")).unwrap();
+
+        shelve_block(temp.path(), "1.1", NEW_BLOCK);
+        let report =
+            materialize(&bundle(temp.path(), "1.1"), &checkout, &record, Mode::Apply).unwrap();
+
+        assert!(report.updated.contains(&AGENTS_BLOCK_KEY.to_string()));
+        assert_eq!(
+            read(&checkout.join("AGENTS.md")),
+            format!("{NEW_BLOCK}\nabove\nbelow\n")
+        );
+    }
+
+    #[test]
+    fn an_edited_managed_block_is_a_conflict_and_is_never_overwritten() {
+        let (temp, checkout, record) = block_setup(BLOCK);
+        materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        let edited = BLOCK.replace("the rules", "my rules");
+        std::fs::write(checkout.join("AGENTS.md"), &edited).unwrap();
+
+        shelve_block(temp.path(), "1.1", NEW_BLOCK);
+        let report =
+            materialize(&bundle(temp.path(), "1.1"), &checkout, &record, Mode::Apply).unwrap();
+
+        assert_eq!(read(&checkout.join("AGENTS.md")), edited);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(report.conflicts[0].path, AGENTS_BLOCK_KEY);
+        assert_eq!(report.conflicts[0].kind, ConflictKind::Edited);
+        assert_eq!(
+            report.conflicts[0].recorded_hash.as_deref(),
+            Some(workflows::hash_of(BLOCK.as_bytes()).as_str())
+        );
+        // Still edited on the next run, not forgotten into an untracked block.
+        let again =
+            materialize(&bundle(temp.path(), "1.1"), &checkout, &record, Mode::Apply).unwrap();
+        assert_eq!(again.conflicts[0].kind, ConflictKind::Edited);
+    }
+
+    /// Today's hand-kept AGENTS.md: the block is already there, never recorded, and exactly what
+    /// the bundle would write — so it is adopted, not reported. The source is LF and the checkout
+    /// CRLF, as the installer's template and this repository's AGENTS.md are: still identical.
+    #[test]
+    fn an_unrecorded_block_identical_to_the_bundles_is_adopted_and_a_different_one_is_not() {
+        let (temp, checkout, record) = block_setup(BLOCK);
+        let file = format!("{}\r\n## Project\r\n", BLOCK.replace('\n', "\r\n"));
+        std::fs::write(checkout.join("AGENTS.md"), &file).unwrap();
+        let report =
+            materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        assert_eq!(report.adopted, vec![AGENTS_BLOCK_KEY.to_string()]);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(read(&checkout.join("AGENTS.md")), file);
+        assert!(
+            read_record(&record).unwrap().bundles["dev"]
+                .files
+                .contains_key(AGENTS_BLOCK_KEY)
+        );
+
+        let (temp, checkout, record) = block_setup(BLOCK);
+        let theirs = BLOCK.replace("the rules", "their rules");
+        std::fs::write(checkout.join("AGENTS.md"), &theirs).unwrap();
+        let report =
+            materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        assert_eq!(report.conflicts[0].kind, ConflictKind::Untracked);
+        assert_eq!(read(&checkout.join("AGENTS.md")), theirs);
+    }
+
+    #[test]
+    fn a_dropped_managed_block_is_removed_when_unchanged_and_kept_when_edited() {
+        let (temp, checkout, record) = block_setup(BLOCK);
+        std::fs::write(checkout.join("AGENTS.md"), "## Project\n").unwrap();
+        materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+
+        shelve(temp.path(), "2.0", &[("x.md", "x")], &["x.md"]);
+        let report =
+            materialize(&bundle(temp.path(), "2.0"), &checkout, &record, Mode::Apply).unwrap();
+        assert!(report.deleted.contains(&AGENTS_BLOCK_KEY.to_string()));
+        assert_eq!(read(&checkout.join("AGENTS.md")), "## Project\n");
+        assert!(
+            !read_record(&record).unwrap().bundles["dev"]
+                .files
+                .contains_key(AGENTS_BLOCK_KEY)
+        );
+
+        let (temp, checkout, record) = block_setup(BLOCK);
+        materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        let edited = BLOCK.replace("the rules", "my rules");
+        std::fs::write(checkout.join("AGENTS.md"), &edited).unwrap();
+        shelve(temp.path(), "2.0", &[("x.md", "x")], &["x.md"]);
+        let report =
+            materialize(&bundle(temp.path(), "2.0"), &checkout, &record, Mode::Apply).unwrap();
+        assert_eq!(report.conflicts[0].kind, ConflictKind::RemovedEdited);
+        assert_eq!(report.conflicts[0].path, AGENTS_BLOCK_KEY);
+        assert_eq!(read(&checkout.join("AGENTS.md")), edited);
+        assert_eq!(
+            read_record(&record).unwrap().bundles["dev"].files[AGENTS_BLOCK_KEY],
+            workflows::hash_of(BLOCK.as_bytes())
+        );
+    }
+
+    #[test]
+    fn a_preview_of_the_managed_block_writes_nothing() {
+        let (temp, checkout, record) = block_setup(BLOCK);
+        std::fs::write(checkout.join("AGENTS.md"), "mine\n").unwrap();
+        let report = materialize(
+            &bundle(temp.path(), "1.0"),
+            &checkout,
+            &record,
+            Mode::Preview,
+        )
+        .unwrap();
+        assert!(report.written.contains(&AGENTS_BLOCK_KEY.to_string()));
+        assert_eq!(read(&checkout.join("AGENTS.md")), "mine\n");
+        assert!(!record.exists());
+    }
+
+    /// A source without its markers would write a region the next run cannot find, so the run
+    /// stops before any file, block or record is written — and says why.
+    #[test]
+    fn a_managed_block_source_without_its_markers_stops_the_run_and_writes_nothing() {
+        for source in [
+            "## AI workflow integration\n\nthe rules\n",
+            "# >>> AI WORKFLOW MANAGED BLOCK >>>\n\nno end\n",
+            "# >>> AI WORKFLOW MANAGED BLOCK >>>\n# <<< AI WORKFLOW MANAGED BLOCK <<<\nafter\n# <<< AI WORKFLOW MANAGED BLOCK <<<\n",
+        ] {
+            let (temp, checkout, record) = block_setup(source);
+            std::fs::write(checkout.join("AGENTS.md"), "mine\n").unwrap();
+            let error = materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply)
+                .unwrap_err();
+            assert!(error.contains("AI WORKFLOW MANAGED BLOCK"), "{error}");
+            assert_eq!(read(&checkout.join("AGENTS.md")), "mine\n");
+            assert!(!checkout.join(".ai/workflow/agents-block.md").exists());
+            assert!(!record.exists());
+        }
+    }
+
+    /// A bundle that names no block leaves AGENTS.md alone, markers and all.
+    #[test]
+    fn a_bundle_without_a_managed_block_never_touches_agents_md() {
+        let (temp, checkout, record) = setup(&[("a.md", "one")], &["a.md"]);
+        std::fs::write(checkout.join("AGENTS.md"), BLOCK).unwrap();
+        let report =
+            materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        assert_eq!(report.written, vec!["a.md".to_string()]);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(read(&checkout.join("AGENTS.md")), BLOCK);
     }
 }
