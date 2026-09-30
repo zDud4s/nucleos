@@ -46,11 +46,6 @@ pub const TASK_CHARS: usize = 4000;
 /// keeps the same tail (`route_api.GATE_OUTPUT_CHARS`), so sending more is only bytes.
 pub const GATE_TAIL_CHARS: usize = 1500;
 
-/// **The one switch P2 flips.** While `false`, the `runs` surface configured `apply` behaves as
-/// `shadow`: the advice is asked for and recorded, and the configured model launches. `choose` is
-/// complete and tested for `apply` already; turning runs on is this constant and nothing else.
-const RUNS_APPLY_LIVE: bool = false;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Off,
@@ -316,13 +311,9 @@ impl Router {
         self.config.mode_for(surface)
     }
 
-    /// The runs surface's mode as it is LIVE today: `apply` degrades to `shadow` until
-    /// [`RUNS_APPLY_LIVE`] is flipped.
+    /// The runs surface's mode: what `resolve` asks under and records.
     pub fn runs_mode(&self) -> Mode {
-        match self.mode_for(Surface::Runs) {
-            Mode::Apply if !RUNS_APPLY_LIVE => Mode::Shadow,
-            mode => mode,
-        }
+        self.mode_for(Surface::Runs)
     }
 
     pub fn available(&self, kind: RunnerKind) -> Option<&Available> {
@@ -1320,20 +1311,14 @@ mod tests {
         );
     }
 
-    /// P1 keeps `apply` off the runs surface. The day that changes it is one constant.
+    /// `apply` configured for runs is `apply` live: nothing between the file and the launch
+    /// quietly degrades it to `shadow`.
     #[test]
-    fn apply_on_runs_is_shadow_until_it_is_turned_on() {
+    fn apply_on_runs_is_live() {
         let (runner, _) = routed(config(Mode::Apply, DEFAULT_URL), Arc::new(Probe));
         let router = runner.router().unwrap();
         assert_eq!(router.mode_for(Surface::Runs), Mode::Apply);
-        assert_eq!(
-            router.runs_mode(),
-            if RUNS_APPLY_LIVE {
-                Mode::Apply
-            } else {
-                Mode::Shadow
-            }
-        );
+        assert_eq!(router.runs_mode(), Mode::Apply);
     }
 
     // --- the wrapper (the faithfulness risk) ---
@@ -1715,8 +1700,8 @@ mod tests {
         assert_eq!(sent["task"], "implement the thing");
     }
 
-    /// Driven through `resolve` directly with the runs surface's gate bypassed: `apply` is complete
-    /// and tested here even while runs keep it off.
+    /// The advice launches on its own runner, its effort held under the speed's ceiling, and the
+    /// row records what launched beside what was advised.
     #[tokio::test]
     async fn apply_launches_the_advice_on_its_runner_with_its_effort_clamped() {
         let pool = pool().await;
@@ -1764,19 +1749,71 @@ mod tests {
             Speed::Normal,
         )
         .await;
-        let row = route_row(&pool, run_id).await;
-        assert_eq!(row.3.as_deref(), Some(router.runs_mode().as_str()));
-        assert_eq!(row.6.as_deref(), Some("gpt-5.6-terra"));
-        if !RUNS_APPLY_LIVE {
-            assert!(Arc::ptr_eq(&resolved.runner, &runner));
-            assert_eq!(resolved.model, None);
-        }
+        assert!(Arc::ptr_eq(&resolved.runner, &codex));
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(resolved.effort.as_deref(), Some("medium"));
+        assert_eq!(resolved.decision_id.as_deref(), Some("rt_2"));
+        assert_eq!(
+            route_row(&pool, run_id).await,
+            (
+                Some("gpt-5.6-terra".into()),
+                Some("medium".into()),
+                Some("codex".into()),
+                Some("apply".into()),
+                Some("rt_2".into()),
+                Some("codex".into()),
+                Some("gpt-5.6-terra".into()),
+                Some("max".into()),
+            )
+        );
+    }
+
+    /// AC6 through the whole path: a run the classifier governs is offered its primary only, and
+    /// a router that names Codex anyway is ignored — in `apply` the run still launches on Claude.
+    #[tokio::test]
+    async fn apply_never_moves_a_governed_run_to_codex() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_3", "runner": "codex",
+                               "model": "gpt-5.6-terra", "effort": "low"}),
+        )
+        .await;
+        let (runner, _codex) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            Some("claude-sonnet-5".into()),
+            None,
+            Some(query()),
+            RunShape {
+                classifier_governs_tools: true,
+                ..shape()
+            },
+            Speed::Normal,
+        )
+        .await;
+
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(resolved.decision_id, None);
+        let sent = received.recv().await.unwrap();
+        assert_eq!(sent["runners"], serde_json::json!(["claude"]));
     }
 
     async fn assert_falls_back(url: &str, started_within: Duration) {
+        for mode in [Mode::Shadow, Mode::Apply] {
+            assert_falls_back_in(mode, url, started_within).await;
+        }
+    }
+
+    async fn assert_falls_back_in(mode: Mode, url: &str, started_within: Duration) {
         let pool = pool().await;
         let run_id = seed_run(&pool).await;
-        let mut config = config(Mode::Shadow, url);
+        let mut config = config(mode, url);
         config.timeout_ms = 150;
         let (runner, _) = routed(config, Arc::new(Probe));
         let started = std::time::Instant::now();
@@ -1800,7 +1837,7 @@ mod tests {
         assert_eq!(resolved.decision_id, None);
         let row = route_row(&pool, run_id).await;
         assert_eq!(row.0.as_deref(), Some("claude-sonnet-5"));
-        assert_eq!(row.3.as_deref(), Some("shadow"));
+        assert_eq!(row.3.as_deref(), Some(mode.as_str()));
         assert_eq!(row.4, None, "no decision to report against");
         assert_eq!(row.6, None);
     }
@@ -1886,5 +1923,243 @@ mod tests {
         assert_eq!(tail("ab", 5), "ab");
         assert_eq!(failed_label("m", Some("high")), "m@high");
         assert_eq!(failed_label("m", None), "m");
+    }
+}
+
+// ---- outcomes (P2) ----
+//
+// What became of a routed run, told back to the router so it can learn from it. Every report is
+// fire-and-forget: it is spawned, never awaited, and a failure only warns — a router that is down
+// must never cost a run, a gate or a job tick a single second. Only a run that holds a decision id
+// reports; a run launched with routing off, or on a fallback, has nothing to report against.
+
+pub use crate::router_client::Outcome;
+
+/// The router's word for a gate's verdict. `Errored` is the gate not measuring, which says nothing
+/// about the model, so it is `error` rather than `fail`.
+pub fn outcome_of_gate(outcome: &crate::gate::GateOutcome) -> Outcome {
+    match outcome {
+        crate::gate::GateOutcome::Passed => Outcome::Pass,
+        crate::gate::GateOutcome::Failed { .. } => Outcome::Fail,
+        crate::gate::GateOutcome::Errored { .. } => Outcome::Error,
+    }
+}
+
+/// What a run that ended `failed` without a gate verdict says about its infrastructure: a 429 is
+/// `rate_limited`, another API error a retry could get past is `error`. Anything else ended on the
+/// work itself and is left unreported — only a gate may say `fail`.
+pub fn outcome_of_run_end(stdout: &str) -> Option<Outcome> {
+    if crate::runner::failed_on_rate_limit(stdout) {
+        Some(Outcome::RateLimited)
+    } else if crate::runner::failed_on_a_transient_api_error(stdout) {
+        Some(Outcome::Error)
+    } else {
+        None
+    }
+}
+
+/// Reports `outcome` for `decision_id` on a task of its own and returns at once.
+pub fn report_detached(router: Arc<Router>, decision_id: String, outcome: Outcome) {
+    tokio::spawn(async move {
+        if let Err(error) = router.client.report(&decision_id, outcome).await {
+            tracing::warn!(
+                %decision_id,
+                outcome = outcome.as_str(),
+                %error,
+                "could not report a routed run's outcome to the llm-router"
+            );
+        }
+    });
+}
+
+/// Reports a sequential job item's gate verdict against the decision of the run the item points
+/// at. One DB read and a spawn: it cannot block on the network, and an unreadable row only warns.
+pub async fn report_item_gate(
+    pool: &SqlitePool,
+    router: Arc<Router>,
+    job_id: i64,
+    ordinal: i64,
+    outcome: &crate::gate::GateOutcome,
+) {
+    let decision: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT r.route_decision_id FROM job_items i JOIN runs r ON r.id = i.run_id
+          WHERE i.job_id = ? AND i.ordinal = ?",
+    )
+    .bind(job_id)
+    .bind(ordinal)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(job_id, ordinal, %error, "could not read an item's route decision");
+        None
+    });
+    if let Some(decision_id) = decision.flatten().filter(|id| !id.is_empty()) {
+        report_detached(router, decision_id, outcome_of_gate(outcome));
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use crate::gate::GateOutcome;
+    use crate::router_client::test_support::{dead_address, outcome_router, slow_router};
+
+    async fn pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    fn router_at(url: &str) -> Arc<Router> {
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::runner::FakeCommandRunner::default());
+        Arc::new(Router::new(
+            RouterConfig {
+                mode: Mode::Shadow,
+                url: url.to_owned(),
+                timeout_ms: 1000,
+                ..RouterConfig::off()
+            },
+            Available {
+                kind: RunnerKind::Claude,
+                runner,
+                default_model: "claude-sonnet-5".into(),
+                models: vec!["claude-*".into()],
+            },
+            Vec::new(),
+        ))
+    }
+
+    #[test]
+    fn gate_verdicts_map_to_router_outcomes() {
+        assert_eq!(outcome_of_gate(&GateOutcome::Passed), Outcome::Pass);
+        assert_eq!(
+            outcome_of_gate(&GateOutcome::Failed {
+                exit_code: 1,
+                output: "red".into()
+            }),
+            Outcome::Fail
+        );
+        assert_eq!(
+            outcome_of_gate(&GateOutcome::Errored {
+                reason: "no binary".into()
+            }),
+            Outcome::Error
+        );
+    }
+
+    #[test]
+    fn a_run_end_reports_only_what_the_infrastructure_did() {
+        let ended_on = |status: &str| {
+            format!(
+                "{{\"type\":\"result\",\"is_error\":true,\"terminal_reason\":\"api_error\",\
+                 \"api_error_status\":{status},\"result\":\"API Error\"}}"
+            )
+        };
+        assert_eq!(
+            outcome_of_run_end(&ended_on("429")),
+            Some(Outcome::RateLimited)
+        );
+        assert_eq!(outcome_of_run_end(&ended_on("529")), Some(Outcome::Error));
+        assert_eq!(outcome_of_run_end(&ended_on("null")), Some(Outcome::Error));
+        assert_eq!(outcome_of_run_end(&ended_on("400")), None);
+        assert_eq!(
+            outcome_of_run_end(
+                r#"{"type":"result","is_error":true,"terminal_reason":"max_turns"}"#
+            ),
+            None
+        );
+        assert_eq!(outcome_of_run_end(""), None);
+    }
+
+    /// Returns before the router has answered, and a router that is not there costs nothing.
+    #[tokio::test]
+    async fn a_detached_report_never_waits_on_the_router() {
+        let slow = slow_router(Duration::from_secs(5), serde_json::json!({})).await;
+        let dead = dead_address().await;
+        let started = std::time::Instant::now();
+        report_detached(router_at(&slow), "rt_1".into(), Outcome::Pass);
+        report_detached(router_at(&dead), "rt_1".into(), Outcome::Error);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    async fn seed_item(pool: &SqlitePool, decision: Option<&str>) -> i64 {
+        let job_id = sqlx::query(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
+             VALUES ('p', 'C:/p', 'implementing', 3, '2026-09-30T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at, route_decision_id)
+             VALUES ('p', 'x', 'completed', 'worktree', '2026-09-30T00:00:00Z', ?)",
+        )
+        .bind(decision)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status, run_id)
+             VALUES (?, 0, 'an item', 'gating', ?)",
+        )
+        .bind(job_id)
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        job_id
+    }
+
+    #[tokio::test]
+    async fn a_settled_item_gate_reports_its_decision() {
+        let pool = pool().await;
+        let (url, mut received) = outcome_router(200).await;
+        let job_id = seed_item(&pool, Some("rt_1")).await;
+
+        report_item_gate(
+            &pool,
+            router_at(&url),
+            job_id,
+            0,
+            &GateOutcome::Failed {
+                exit_code: 2,
+                output: "red".into(),
+            },
+        )
+        .await;
+
+        let (id, body) = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .expect("reported within 2s")
+            .unwrap();
+        assert_eq!(id, "rt_1");
+        assert_eq!(body, serde_json::json!({"status": "fail"}));
+    }
+
+    /// A run launched unrouted, or on a fallback, has no decision and reports nothing.
+    #[tokio::test]
+    async fn an_item_whose_run_holds_no_decision_reports_nothing() {
+        let pool = pool().await;
+        let (url, mut received) = outcome_router(200).await;
+        let job_id = seed_item(&pool, None).await;
+
+        report_item_gate(&pool, router_at(&url), job_id, 0, &GateOutcome::Passed).await;
+        report_item_gate(&pool, router_at(&url), job_id + 99, 0, &GateOutcome::Passed).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), received.recv())
+                .await
+                .is_err()
+        );
     }
 }

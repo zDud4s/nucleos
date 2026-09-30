@@ -1660,9 +1660,9 @@ fn spawn_run(
         let runner = resolved.runner;
         let model = resolved.model;
         let effort = resolved.effort;
-        // What an outcome is reported against once the gate has spoken. Held for the whole run and
-        // not read yet: the report is the next step of this feature, not this one.
-        let _route_decision = (resolved.decision_id, resolved.router);
+        // What an outcome is reported against once the run has ended: both `Some` only for a run
+        // the router actually advised, so a fallback or an unrouted run reports nothing.
+        let route_decision = resolved.decision_id.zip(resolved.router);
         let mut attempt: u32 = 1;
         loop {
             // A fresh session channel per attempt: persist session_id the instant the runner parses it
@@ -1886,6 +1886,27 @@ fn spawn_run(
                     warn_on_terminal_write_err(&completed, id, terminal_status);
                     let terminal_write_won =
                         matches!(&completed, Ok(result) if result.rows_affected() == 1);
+                    // The router hears how this run ended, under the same CAS as every other
+                    // announcement of it: the gate's verdict when there is one, otherwise what a
+                    // failed CLI says about its infrastructure (a 429, an API outage). A run that
+                    // failed on its own work, or timed out, reports nothing — only a gate says
+                    // `fail`. Detached: the report never delays the handoff or the sweep below.
+                    if terminal_write_won && let Some((decision_id, router)) = &route_decision {
+                        let outcome = match &gate_outcome {
+                            Some(gate) => Some(crate::route_advice::outcome_of_gate(gate)),
+                            None if terminal_status == "failed" => {
+                                crate::route_advice::outcome_of_run_end(&o.stdout)
+                            }
+                            None => None,
+                        };
+                        if let Some(outcome) = outcome {
+                            crate::route_advice::report_detached(
+                                std::sync::Arc::clone(router),
+                                decision_id.clone(),
+                                outcome,
+                            );
+                        }
+                    }
                     // A progress deadline kills the CLI before it can report what it spent, so the
                     // write above just recorded that NULL as final. The wall-clock arm approximates
                     // such a run from its duration; one cut by its own runner's deadline arrives
@@ -2042,6 +2063,16 @@ fn spawn_run(
                     .execute(&pool)
                     .await;
                     warn_on_terminal_write_err(&failed, id, "failed");
+                    // The CLI never ran on any attempt: infrastructure, not the model's work.
+                    if matches!(&failed, Ok(result) if result.rows_affected() == 1)
+                        && let Some((decision_id, router)) = &route_decision
+                    {
+                        crate::route_advice::report_detached(
+                            std::sync::Arc::clone(router),
+                            decision_id.clone(),
+                            crate::route_advice::Outcome::Error,
+                        );
+                    }
                     // Same principle as the completion feed row above: this announces the run's
                     // terminal outcome, so it must only fire when this write actually won the race.
                     if max_attempts > 1
@@ -8394,9 +8425,13 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     /// Fronts `state.runner` with a shadow-mode router at `url`, the way `main.rs` does when
     /// `.ai/router.yaml` turns routing on.
     fn front_with_shadow_router(state: &mut AppState, url: &str) {
+        front_with_router(state, url, crate::route_advice::Mode::Shadow);
+    }
+
+    fn front_with_router(state: &mut AppState, url: &str, mode: crate::route_advice::Mode) {
         let inner = state.runner.clone();
         let config = crate::route_advice::RouterConfig {
-            mode: crate::route_advice::Mode::Shadow,
+            mode,
             url: url.to_owned(),
             timeout_ms: 1000,
             ..crate::route_advice::RouterConfig::off()
@@ -8459,6 +8494,128 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 Some("claude-opus-5".into()),
             )
         );
+    }
+
+    /// A router that advises `advice` on `/v1/route` and hands every outcome report, as
+    /// `(decision id, body)`, to the returned receiver.
+    async fn advising_router(
+        advice: serde_json::Value,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) {
+        let (reported, reports) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new()
+            .route(
+                "/v1/route",
+                axum::routing::post(move || {
+                    let advice = advice.clone();
+                    async move { axum::Json(advice) }
+                }),
+            )
+            .route(
+                "/v1/route/{id}/outcome",
+                axum::routing::post(
+                    move |axum::extract::Path(id): axum::extract::Path<String>,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let reported = reported.clone();
+                        async move {
+                            let _ = reported.send((id, body));
+                            axum::http::StatusCode::OK
+                        }
+                    },
+                ),
+            );
+        (crate::router_client::test_support::serve(app).await, reports)
+    }
+
+    /// Apply, end to end through `spawn_run`: the advised model reaches the launch, its effort held
+    /// under the `normal` speed's ceiling.
+    #[tokio::test]
+    async fn an_applied_route_launches_the_advised_model_under_the_speed_ceiling() {
+        let (mut state, runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let (url, _reports) = advising_router(serde_json::json!({
+            "decision_id": "rt_a", "runner": "claude", "model": "claude-opus-5", "effort": "max"
+        }))
+        .await;
+        front_with_router(&mut state, &url, crate::route_advice::Mode::Apply);
+
+        let id = create_run_inner(&state, "route me".into(), None, None, "real", false)
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if runner.last_model.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            *runner.last_model.lock().unwrap(),
+            Some(Some("claude-opus-5".into()))
+        );
+        assert_eq!(
+            *runner.last_effort.lock().unwrap(),
+            Some(Some("medium".into()))
+        );
+        let row: (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT model, effort, route_mode FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("claude-opus-5".into()),
+                Some("medium".into()),
+                Some("apply".into())
+            )
+        );
+    }
+
+    /// A routed run the API rate-limited tells the router `rate_limited`, so it can lock the
+    /// subscription; the report is detached and the run still ends `failed`.
+    #[tokio::test]
+    async fn a_routed_run_that_ends_on_a_429_reports_rate_limited() {
+        let (mut state, runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: 1,
+            stdout: r#"{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"API Error: 429"}"#.to_string(),
+            stderr: String::new(),
+            session_id: None,
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+        });
+        let (url, mut reports) = advising_router(serde_json::json!({
+            "decision_id": "rt_r", "runner": "claude", "model": "claude-sonnet-5"
+        }))
+        .await;
+        front_with_shadow_router(&mut state, &url);
+
+        let id = create_run_inner(&state, "route me".into(), None, None, "real", false)
+            .await
+            .unwrap();
+
+        let (decision, body) = tokio::time::timeout(Duration::from_secs(5), reports.recv())
+            .await
+            .expect("reported within 5s")
+            .unwrap();
+        assert_eq!(decision, "rt_r");
+        assert_eq!(body, serde_json::json!({"status": "rate_limited"}));
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed");
     }
 
     /// Mail text never reaches the router, whatever the router's mode.

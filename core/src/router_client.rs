@@ -84,6 +84,28 @@ struct Targets {
     targets: Vec<RouteTarget>,
 }
 
+/// What became of a routed task, as `POST /v1/route/{id}/outcome` spells it (`route_api.OUTCOMES`).
+/// `pass`/`fail` are the caller's own gate; `rate_limited` makes the router lock the subscription by
+/// itself; `error` is infrastructure, a verdict on nothing the model did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Pass,
+    Fail,
+    RateLimited,
+    Error,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::RateLimited => "rate_limited",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// Why no advice came back. Four variants because each means something different, and
 /// the warning a person reads should say which one it was — though every one of them leads to the
 /// same place: the run launches exactly as it would have without a router.
@@ -187,6 +209,40 @@ impl RouterClient {
             .map(|targets| targets.targets)
             .map_err(body_error)
     }
+
+    /// Tell the router what became of `decision_id`. Only `status` is sent: no usage, no detail.
+    ///
+    /// An id that is not `[A-Za-z0-9_-]+` is refused before any request, since it goes into the
+    /// path. 404 (a decision the router no longer knows) and 409 (one already reported, e.g. by a
+    /// run's own gate before its item's) are `Ok`: there is nothing left to say either way.
+    pub async fn report(&self, decision_id: &str, status: Outcome) -> Result<(), RouterError> {
+        if decision_id.is_empty()
+            || !decision_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(RouterError::Invalid(format!(
+                "decision id {decision_id:?} is not one the router issues"
+            )));
+        }
+        let response = self
+            .http
+            .post(format!("{}/v1/route/{decision_id}/outcome", self.base))
+            .json(&serde_json::json!({ "status": status.as_str() }))
+            .send()
+            .await
+            .map_err(|error| RouterError::Unavailable(error.to_string()))?;
+        let status = response.status();
+        if status.is_success() || matches!(status.as_u16(), 404 | 409) {
+            return Ok(());
+        }
+        let body = response.text().await.unwrap_or_default();
+        let why = format!("{}: {}", status.as_u16(), body.trim());
+        Err(match status.as_u16() {
+            400 => RouterError::Invalid(why),
+            _ => RouterError::Unavailable(why),
+        })
+    }
 }
 
 /// A body that failed to decode is `Malformed`; one that failed to arrive (a timeout mid-body, a
@@ -250,6 +306,31 @@ pub mod test_support {
             }),
         );
         serve(app).await
+    }
+
+    /// A router whose `/v1/route/{id}/outcome` answers every report with `status`, and hands each
+    /// `(id, body)` it received to the returned receiver.
+    pub async fn outcome_router(
+        status: u16,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) {
+        let (sent, received) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/v1/route/{id}/outcome",
+            axum::routing::post(
+                move |axum::extract::Path(id): axum::extract::Path<String>,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let sent = sent.clone();
+                    async move {
+                        let _ = sent.send((id, body));
+                        axum::http::StatusCode::from_u16(status).unwrap()
+                    }
+                },
+            ),
+        );
+        (serve(app).await, received)
     }
 
     /// A loopback address nothing listens on: bound, read, and released.
@@ -446,5 +527,61 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].model, "claude-sonnet-5");
         assert_eq!(targets[0].effort, None);
+    }
+
+    /// The body is the status and nothing else, at the decision's own path.
+    #[tokio::test]
+    async fn a_report_posts_the_status_to_the_decisions_path() {
+        let (url, mut received) = outcome_router(200).await;
+        let client = RouterClient::new(&url, Duration::from_secs(2));
+        for (outcome, text) in [
+            (Outcome::Pass, "pass"),
+            (Outcome::Fail, "fail"),
+            (Outcome::RateLimited, "rate_limited"),
+            (Outcome::Error, "error"),
+        ] {
+            client.report("rt_1-a", outcome).await.unwrap();
+            let (id, body) = received.recv().await.unwrap();
+            assert_eq!(id, "rt_1-a");
+            assert_eq!(body, serde_json::json!({ "status": text }));
+        }
+    }
+
+    /// Unknown or already reported is nothing to warn about; a refusal or an outage is.
+    #[tokio::test]
+    async fn a_report_the_router_cannot_use_is_told_apart_from_one_it_already_has() {
+        for status in [404, 409] {
+            let (url, _rx) = outcome_router(status).await;
+            let client = RouterClient::new(&url, Duration::from_secs(2));
+            assert!(
+                client.report("rt_1", Outcome::Pass).await.is_ok(),
+                "{status}"
+            );
+        }
+        let (url, _rx) = outcome_router(400).await;
+        let client = RouterClient::new(&url, Duration::from_secs(2));
+        assert!(matches!(
+            client.report("rt_1", Outcome::Pass).await,
+            Err(RouterError::Invalid(_))
+        ));
+        let client = RouterClient::new(&dead_address().await, Duration::from_millis(300));
+        assert!(matches!(
+            client.report("rt_1", Outcome::Pass).await,
+            Err(RouterError::Unavailable(_))
+        ));
+    }
+
+    /// The id goes into the path, so one that could escape it never leaves the daemon.
+    #[tokio::test]
+    async fn a_decision_id_that_could_escape_the_path_is_never_sent() {
+        let (url, mut received) = outcome_router(200).await;
+        let client = RouterClient::new(&url, Duration::from_secs(2));
+        for id in ["", "../route", "rt 1", "rt_1?x=y", "rt/1"] {
+            assert!(matches!(
+                client.report(id, Outcome::Fail).await,
+                Err(RouterError::Invalid(_))
+            ));
+        }
+        assert!(received.try_recv().is_err());
     }
 }
