@@ -1285,6 +1285,19 @@ pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutc
         });
     }
 
+    // Spec A D14: the run is gone, so nobody can answer for it any more. After the claim, so a
+    // release that lost to an approval expires nothing; best-effort, because the run IS released
+    // either way and `expire_orphaned_approvals` heals a lost write at the next start.
+    if let Err(error) = crate::proposals::expire_for_run(
+        pool,
+        run_id,
+        "the run was released before anybody answered",
+    )
+    .await
+    {
+        tracing::warn!(run_id, %error, "could not expire the released run's pending approval");
+    }
+
     // Release stays a *run* concept: it un-pins a run paused for approval, and a run still owns its
     // own worktree. The `owner_kind` filter keeps it from ever matching a job whose id collides.
     let worktree: Option<WorktreeRow> = sqlx::query_as(

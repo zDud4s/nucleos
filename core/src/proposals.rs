@@ -876,6 +876,81 @@ pub(crate) async fn transition_in_transaction(
     Ok(true)
 }
 
+/// Spec A D14 (2026-09-26-autopilot-modo-juiz-design.md): the approval a stopped run was waiting
+/// on, closed by nobody's decision.
+///
+/// `expired` and not `rejected`, and the difference is what made the owner's answers useless as a
+/// label: measured on 2026-09-27, the 20 rejections in the ledger were the owner clearing proposals
+/// of runs that had already stopped, and read as "this action, no" they scored an AUC of 0.48. A
+/// rejection has to mean the action; a run that went away means nothing about it.
+///
+/// The status column has no CHECK (`0010_proposals.sql`), so this needs no migration. Guarded on
+/// `pending` like `transition`, so an answer that landed first keeps the last word.
+pub async fn expire_for_run(pool: &SqlitePool, run_id: i64, note: &str) -> sqlx::Result<u64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
+    let expired: Vec<i64> = sqlx::query_scalar(
+        "UPDATE proposals SET status = 'expired', decided_at = ?
+         WHERE run_id = ? AND kind = 'action-approval' AND status = 'pending'
+         RETURNING id",
+    )
+    .bind(&now)
+    .bind(run_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    record_expiries(&mut transaction, &expired, note, &now).await?;
+    transaction.commit().await?;
+    Ok(expired.len() as u64)
+}
+
+/// The same close, at startup, for approvals whose run is no longer waiting on them — rows a
+/// release or a job cancel left before `expire_for_run` existed, or that a crash left between the
+/// run's status write and the proposal's.
+pub async fn expire_orphaned_approvals(pool: &SqlitePool) -> sqlx::Result<u64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
+    let expired: Vec<i64> = sqlx::query_scalar(
+        "UPDATE proposals SET status = 'expired', decided_at = ?
+         WHERE kind = 'action-approval' AND status = 'pending'
+           AND NOT EXISTS (
+               SELECT 1 FROM runs
+               WHERE runs.id = proposals.run_id AND runs.status = 'awaiting_approval')
+         RETURNING id",
+    )
+    .bind(&now)
+    .fetch_all(&mut *transaction)
+    .await?;
+    record_expiries(
+        &mut transaction,
+        &expired,
+        "its run had stopped before anybody answered",
+        &now,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(expired.len() as u64)
+}
+
+async fn record_expiries(
+    transaction: &mut Transaction<'_, Sqlite>,
+    ids: &[i64],
+    note: &str,
+    at: &str,
+) -> sqlx::Result<()> {
+    for id in ids {
+        sqlx::query(
+            "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+             VALUES (?, 'pending', 'expired', ?, ?)",
+        )
+        .bind(id)
+        .bind(note)
+        .bind(at)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
 // Reject = discard: reject the pending proposal and discard its paused run.
 pub async fn reject_proposal(pool: &SqlitePool, id: i64) -> Result<(), RejectError> {
     let proposal = get(pool, id).await?.ok_or(RejectError::NotFound)?;
@@ -1047,6 +1122,80 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    async fn parked_run(pool: &sqlx::SqlitePool, status: &str) -> (i64, i64) {
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-a', 'do the thing', ?, 'worktree', '2026-09-27T00:00:00Z')",
+        )
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let proposal_id = create_action_approval(
+            pool,
+            run_id,
+            None,
+            Some("project-a"),
+            "Bash",
+            "unrecognized command",
+            Some("git push origin main"),
+        )
+        .await
+        .unwrap();
+        (run_id, proposal_id)
+    }
+
+    /// Spec A D14: a run released while it waited leaves no pending approval behind, and the
+    /// event log says why it closed.
+    #[tokio::test]
+    async fn a_released_run_expires_its_pending_approval() {
+        let pool = test_pool().await;
+        let (run_id, proposal_id) = parked_run(&pool, "awaiting_approval").await;
+
+        crate::worktree::release(&pool, run_id).await.unwrap();
+
+        let proposal = get(&pool, proposal_id).await.unwrap().unwrap();
+        assert_eq!(proposal.status, "expired");
+        let events: Vec<(String, String)> = sqlx::query_as(
+            "SELECT from_status, to_status FROM proposal_events WHERE proposal_id = ? ORDER BY id",
+        )
+        .bind(proposal_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            events.last().unwrap(),
+            &("pending".to_owned(), "expired".to_owned())
+        );
+    }
+
+    /// Approving and rejecting are untouched: a rejection stays a rejection, and expiring
+    /// afterwards finds nothing left to expire.
+    #[tokio::test]
+    async fn a_rejection_is_still_a_rejection() {
+        let pool = test_pool().await;
+        let (_run_id, proposal_id) = parked_run(&pool, "awaiting_approval").await;
+
+        reject_proposal(&pool, proposal_id).await.unwrap();
+
+        assert_eq!(get(&pool, proposal_id).await.unwrap().unwrap().status, "rejected");
+    }
+
+    /// Rows left behind before this existed are healed at startup, and a run still waiting keeps
+    /// its question.
+    #[tokio::test]
+    async fn startup_expires_approvals_whose_run_is_no_longer_waiting() {
+        let pool = test_pool().await;
+        let (_gone, orphan) = parked_run(&pool, "cancelled").await;
+        let (_waiting, live) = parked_run(&pool, "awaiting_approval").await;
+
+        assert_eq!(expire_orphaned_approvals(&pool).await.unwrap(), 1);
+
+        assert_eq!(get(&pool, orphan).await.unwrap().unwrap().status, "expired");
+        assert_eq!(get(&pool, live).await.unwrap().unwrap().status, "pending");
     }
 
     /// The distinction the run record was missing: resumed and acted, against resumed and did not.
