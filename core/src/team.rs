@@ -2086,33 +2086,15 @@ pub async fn propose_teammate(
         .clone()
         .or_else(|| director.as_ref().map(|agent| agent.engine.clone()))
         .unwrap_or_else(|| "claude".to_owned());
-    // Under `recruit: apply`, the model adviser's pick for this candidate before the director's
-    // own; any failure there is the director's own, exactly as before. Validated below either way.
-    let advised = match &request.model {
-        Some(_) => None,
-        None => {
-            crate::seat_advice::recruit_default(
-                state.runner.router(),
-                &engine,
-                &request.speciality,
-                &request.why,
-                &request.prompt,
-            )
-            .await
-        }
-    };
-    let model = request
-        .model
-        .clone()
-        .or(advised)
-        .or_else(|| director.as_ref().and_then(|agent| agent.model.clone()));
-
-    let proposed = crate::agent::AgentRequest {
+    let mut proposed = crate::agent::AgentRequest {
         name: request.name.trim().to_owned(),
         speciality: request.speciality.trim().to_owned(),
         prompt: request.prompt.clone(),
         engine,
-        model,
+        model: request
+            .model
+            .clone()
+            .or_else(|| director.as_ref().and_then(|agent| agent.model.clone())),
         tool_policy: request
             .tool_policy
             .clone()
@@ -2130,6 +2112,27 @@ pub async fn propose_teammate(
         return Err(RecruitError::Invalid(
             "say what you needed them for — it is the whole of what the owner will read".to_owned(),
         ));
+    }
+
+    // Under `recruit: apply`, the model adviser's pick for this candidate before the director's
+    // own; any failure there is the director's own, exactly as before. Asked only once the
+    // request is otherwise fileable, so a refused one sends its text nowhere; and an advised model
+    // that `validate_request` would refuse is dropped for the director's.
+    if request.model.is_none()
+        && let Some(advised) = crate::seat_advice::recruit_default(
+            state.runner.router(),
+            &proposed.engine,
+            &request.speciality,
+            &request.why,
+            &request.prompt,
+        )
+        .await
+    {
+        let director_model = proposed.model.replace(advised);
+        if let Err(why) = crate::agent::validate_request(&proposed) {
+            tracing::warn!(%why, "the adviser's model for a recruit was refused; keeping the director's");
+            proposed.model = director_model;
+        }
     }
 
     let payload = serde_json::json!({
@@ -6739,6 +6742,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(agent.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    /// A recruit that is refused anyway — no `why`, or a request `validate_request` rejects — is
+    /// refused before the adviser hears anything: the task text is not sent for nothing.
+    #[tokio::test]
+    async fn a_recruit_refused_on_its_own_terms_never_reaches_the_adviser() {
+        let (mut state, _root) = state_with_root().await;
+        let mut sent =
+            advised_runner(&mut state, &[("recruit", crate::route_advice::Mode::Apply)]).await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "prepare the launch", None)
+            .await
+            .unwrap();
+        let (director_run, _) = director_and_specialist(&state, &run_id).await;
+        let scope = Scope::TeamRun(run_id.clone());
+
+        let no_why = RecruitRequest {
+            why: "   ".to_owned(),
+            ..a_lawyer()
+        };
+        let unrestricted = RecruitRequest {
+            tool_policy: Some("unrestricted".to_owned()),
+            ..a_lawyer()
+        };
+        for refused in [no_why, unrestricted] {
+            let answer = propose_teammate(&state, &scope, &as_node(director_run), &refused).await;
+            assert!(
+                matches!(answer, Err(RecruitError::Invalid(_))),
+                "got {answer:?}"
+            );
+            assert!(sent.try_recv().is_err(), "the adviser was asked");
+        }
     }
 
     /// **The test that proves the director check works without inventing a scope.**
