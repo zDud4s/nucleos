@@ -9071,6 +9071,10 @@ async fn post_project_workflow_materialize(
 struct WorkflowSyncRequest {
     /// The checkout, absolute. `nucleos-core --workflow-sync` sends its argument or its cwd.
     path: String,
+    /// Which project, when more than one rostered project points at the checkout's repository.
+    /// Only ever a choice among those: a project the repository does not match is refused.
+    #[serde(default)]
+    project_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -9083,8 +9087,13 @@ struct WorkflowSyncAnswer {
 ///
 /// **Which project is decided by the repository, not by the caller.** The checkout's git common
 /// directory (`git_exec::repo_key`) is compared against every rostered root's; the one that shares
-/// it is the project. A caller naming the project would be a caller able to put one project's
-/// workflow into another's checkout, and the path already says which it is.
+/// it is the project. A caller naming a project the repository does not match would be a caller
+/// able to put one project's workflow into another's checkout, so `project_id` is refused (400,
+/// `project_not_a_match`) unless it is one of the matches.
+///
+/// **More than one match is not guessed.** Two rostered projects can point at one repository, and
+/// the first row is not an answer: without a `project_id` the sync is refused with 409
+/// `ambiguous_project`, naming every candidate (id and root), and nothing is written.
 ///
 /// A worktree gets its own record under `~/.nucleos/projects/<id>/materialized/`, so a file edited
 /// in it is protected exactly as one edited in the main checkout; the main checkout itself, named
@@ -9121,17 +9130,41 @@ async fn post_workflow_sync(
             .fetch_all(&state.pool)
             .await
             .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
-    let mut found = None;
+    let mut matches = Vec::new();
     for (project_id, root) in rows {
         let Some(root) = root else { continue };
         let root = std::path::PathBuf::from(root);
         if crate::git_exec::repo_key(&root, deadline).await.as_ref() == Ok(&key) {
-            found = Some((project_id, root));
-            break;
+            matches.push((project_id, root));
         }
     }
-    let Some((project_id, root)) = found else {
+    if matches.is_empty() {
         return Err(refusal(StatusCode::NOT_FOUND, "no_project"));
+    }
+    let (project_id, root) = match body.project_id.as_deref() {
+        Some(named) => matches
+            .into_iter()
+            .find(|(project_id, _)| project_id == named)
+            .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "project_not_a_match"))?,
+        None if matches.len() > 1 => {
+            let candidates: Vec<serde_json::Value> = matches
+                .iter()
+                .map(|(project_id, root)| {
+                    serde_json::json!({
+                        "project_id": project_id,
+                        "project_root": root.to_string_lossy(),
+                    })
+                })
+                .collect();
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "refusal": "ambiguous_project",
+                    "candidates": candidates,
+                })),
+            ));
+        }
+        None => matches.remove(0),
     };
     if crate::autopilot::scoped_kill_engaged(&state.pool, "project", &project_id)
         .await
@@ -22161,6 +22194,139 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(answer["refusal"], "not_a_checkout");
+    }
+
+    /// Two rostered projects on one repository, both pinning the providing bundle: the setup the
+    /// ambiguity tests share. Returns the guards and the main checkout both projects point at.
+    async fn two_projects_on_one_repository(
+        state: &mut AppState,
+    ) -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        let (lib, library) = providing_library();
+        state.workflow_library = Some(library.clone());
+        let home = with_project_home(state);
+        let project = project_with_rules(state, "alpha", "gate_command: cargo test\n").await;
+        git(project.path(), &["init", "--quiet"]);
+        std::fs::write(project.path().join("README.md"), "x").unwrap();
+        git(project.path(), &["add", "README.md"]);
+        git(project.path(), &["commit", "--quiet", "-m", "init"]);
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('beta', 'shadow', ?)",
+        )
+        .bind(project.path().to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        for id in ["alpha", "beta"] {
+            crate::workflows::install(
+                &home
+                    .path()
+                    .join("projects")
+                    .join(id)
+                    .join(crate::project_state::PINS_FILE),
+                &crate::workflows::read_bundle(&library.join("dev/1.0"), "dev", "1.0")
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        (lib, home, project)
+    }
+
+    /// Two projects sharing the repository is a question only the caller can answer: the sync
+    /// refuses, names both, and writes nothing, rather than picking whichever row came first.
+    #[tokio::test]
+    async fn a_repository_two_projects_share_is_refused_with_both_named() {
+        let mut state = test_state().await;
+        let (_lib, home, project) = two_projects_on_one_repository(&mut state).await;
+
+        let (status, answer) = workflow_call(
+            state,
+            "POST",
+            "/workflows/sync",
+            Some(serde_json::json!({ "path": project.path().to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+        assert_eq!(answer["refusal"], "ambiguous_project");
+        let mut named: Vec<&str> = answer["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate["project_id"].as_str().unwrap())
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, ["alpha", "beta"]);
+        assert!(answer["candidates"][0]["project_root"].is_string());
+        assert!(!project.path().join(".ai/workflow/workflow.md").exists());
+        for id in ["alpha", "beta"] {
+            assert!(
+                !home
+                    .path()
+                    .join("projects")
+                    .join(id)
+                    .join(crate::project_state::MATERIALIZED_FILE)
+                    .exists()
+            );
+        }
+    }
+
+    /// Naming one of the projects the repository matches settles it; naming one it does not is
+    /// refused, so the choice can never put one project's workflow into another's checkout.
+    #[tokio::test]
+    async fn a_named_project_settles_the_choice_only_among_the_matches() {
+        let mut state = test_state().await;
+        let (_lib, home, project) = two_projects_on_one_repository(&mut state).await;
+        let _stranger = project_with_rules(&state, "gamma", "gate_command: cargo test\n").await;
+
+        let (status, answer) = workflow_call(
+            state.clone(),
+            "POST",
+            "/workflows/sync",
+            Some(serde_json::json!({
+                "path": project.path().to_string_lossy(),
+                "project_id": "gamma",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(answer["refusal"], "project_not_a_match");
+        assert!(!project.path().join(".ai/workflow/workflow.md").exists());
+
+        let (status, answer) = workflow_call(
+            state,
+            "POST",
+            "/workflows/sync",
+            Some(serde_json::json!({
+                "path": project.path().to_string_lossy(),
+                "project_id": "beta",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["project_id"], "beta");
+        assert_eq!(
+            std::fs::read_to_string(project.path().join(".ai/workflow/workflow.md")).unwrap(),
+            "the pipeline"
+        );
+        let record = |id: &str| {
+            home.path()
+                .join("projects")
+                .join(id)
+                .join(crate::project_state::MATERIALIZED_FILE)
+        };
+        assert!(record("beta").is_file());
+        assert!(!record("alpha").exists());
     }
 
     /// A credential goes in, and only its presence ever comes back.
