@@ -207,6 +207,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     // Worktrees.
     worktree_gate_failed: { tone: "danger", label: "worktree gate failed" },
     worktree_provision_failed: { tone: "danger", label: "worktree could not be made" },
+    worktree_workflow_missing: { tone: "danger", label: "worktree has no workflow" },
     worktree_released: { tone: "off", label: "worktree released" },
     worktree_branch_kept: { tone: "info", label: "unmerged branch kept" },
     worktree_removed: { tone: "off", label: "worktree removed" },

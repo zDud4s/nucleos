@@ -75,6 +75,7 @@ const LANE_OF: Record<string, FeedLane> = {
   worktree_run_completed: "runs",
   worktree_gate_failed: "runs",
   worktree_provision_failed: "runs",
+  worktree_workflow_missing: "runs",
   worktree_released: "runs",
   worktree_branch_kept: "runs",
   worktree_removed: "runs",
