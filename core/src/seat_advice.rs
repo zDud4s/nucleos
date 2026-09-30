@@ -77,10 +77,16 @@ async fn ask(
     }
 }
 
-/// A council answer must stay on the seat's runner and on its `model_ref`. Not `check_answer`,
+/// A council answer must stay on the seat's runner and on its `model_ref`, and advise an effort the
+/// seat's model takes (`Router::check_effort`) — the one field it may change. Not `check_answer`,
 /// because that also holds the model to the runner's catalogue, and a council seat's `model_ref`
 /// is the council's choice, not the catalogue's — it would refuse every seat outside it.
-fn check_council(advice: &RouteAdvice, sent: &RouteRequest, model_ref: &str) -> Result<(), String> {
+fn check_council(
+    router: &Router,
+    advice: &RouteAdvice,
+    sent: &RouteRequest,
+    model_ref: &str,
+) -> Result<(), String> {
     if !sent.runners.iter().any(|runner| runner == &advice.runner) {
         return Err(format!(
             "runner {} is not among those sent {:?}",
@@ -94,7 +100,7 @@ fn check_council(advice: &RouteAdvice, sent: &RouteRequest, model_ref: &str) -> 
             advice.model
         ));
     }
-    Ok(())
+    router.check_effort(advice)
 }
 
 /// Writes what a seat launched beside what was advised, in ONE update of its `runs` row — the same
@@ -204,7 +210,7 @@ pub async fn route_council_seat(
     let model_ref = request.model.clone()?;
     let sent = council_request(&router, &request.prompt, &model_ref);
     let advice = ask(&router, &sent, Some(run_id), |advice| {
-        check_council(advice, &sent, &model_ref)
+        check_council(&router, advice, &sent, &model_ref)
     })
     .await;
     if mode == Mode::Apply
@@ -593,7 +599,14 @@ mod tests {
         .await;
         let (unprocessable, _a) = stub_router(422, serde_json::json!({"detail": "no tier"})).await;
         let (outside, _b) = stub_router(200, answer("gpt-5.6-terra", "high")).await;
-        for url in [dead_address().await, slow, unprocessable, outside] {
+        let (no_such_effort, _c) = stub_router(200, answer("claude-opus-5", "turbo")).await;
+        for url in [
+            dead_address().await,
+            slow,
+            unprocessable,
+            outside,
+            no_such_effort,
+        ] {
             let pool = pool().await;
             let run_id = seed_run(&pool).await;
             let router = router(&url, &[("team", Mode::Apply)], 200);
@@ -669,6 +682,46 @@ mod tests {
         );
         assert_eq!(launch.model.as_deref(), Some("claude-opus-5"));
         assert_eq!(launch.effort, None);
+    }
+
+    /// The advised effort goes straight to `--effort` / `model_reasoning_effort=`: one outside the
+    /// daemon's vocabulary, or outside what the models file says the seat's model takes, is ignored
+    /// and the seat launches exactly as it would have.
+    #[tokio::test]
+    async fn a_council_effort_the_seat_cannot_take_is_ignored() {
+        let (unknown, _a) = stub_router(200, answer("claude-opus-5", "turbo")).await;
+        let (too_high, _b) = stub_router(200, answer("claude-opus-5", "high")).await;
+        for (url, efforts) in [
+            (unknown, Vec::new()),
+            (too_high, vec!["low".to_owned(), "medium".to_owned()]),
+        ] {
+            let pool = pool().await;
+            let run_id = seed_run(&pool).await;
+            let config = RouterConfig {
+                mode: Mode::Apply,
+                url: url.clone(),
+                timeout_ms: 2500,
+                ..RouterConfig::off()
+            };
+            let primary = Available {
+                kind: RunnerKind::Claude,
+                runner: Arc::new(crate::runner::FakeCommandRunner::default()),
+                default_model: "claude-sonnet-5".into(),
+                models: vec!["claude-*".into()],
+            };
+            let router = Arc::new(
+                Router::new(config, primary, Vec::new())
+                    .with_model_efforts(vec![("claude-opus-5".to_owned(), efforts)]),
+            );
+            let mut launch = request(Some("claude-opus-5"), crate::speed::Speed::Normal);
+
+            let decision = route_council_seat(&pool, Some(router), run_id, &mut launch).await;
+
+            assert_eq!(decision, None, "{url}");
+            assert_eq!(launch.model.as_deref(), Some("claude-opus-5"));
+            assert_eq!(launch.effort, None, "{url}");
+            assert_eq!(recorded(&pool, run_id).await.4, None);
+        }
     }
 
     #[tokio::test]

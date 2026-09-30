@@ -283,6 +283,9 @@ pub struct Router {
     pub client: RouterClient,
     pub primary: Available,
     pub alternates: Vec<Available>,
+    /// The effort levels each model the models file lists takes, by its id (`ModelChoice::efforts`).
+    /// Only models that name some are here; a model absent from it is held to `EFFORT_ORDER` alone.
+    pub model_efforts: Vec<(String, Vec<String>)>,
 }
 
 impl std::fmt::Debug for Router {
@@ -303,7 +306,44 @@ impl Router {
             client,
             primary,
             alternates,
+            model_efforts: Vec::new(),
         }
+    }
+
+    /// The same router, holding each model's own effort levels (see `model_efforts`).
+    pub fn with_model_efforts(mut self, model_efforts: Vec<(String, Vec<String>)>) -> Self {
+        self.model_efforts = model_efforts
+            .into_iter()
+            .filter(|(_, efforts)| !efforts.is_empty())
+            .collect();
+        self
+    }
+
+    /// Whether the advised effort can be handed to the CLI as it comes. It goes to `--effort` /
+    /// `model_reasoning_effort=` unchecked by anything after this, so a level this daemon cannot
+    /// rank, or one the models file says the advised model (by id or tier) does not take, would
+    /// fail the launch at spawn: that is a router failure, and the launch falls back.
+    pub fn check_effort(&self, advice: &RouteAdvice) -> Result<(), String> {
+        let Some(effort) = advice.effort.as_deref() else {
+            return Ok(());
+        };
+        if !EFFORT_ORDER.contains(&effort) {
+            return Err(format!("effort {effort:?} is not one this daemon launches"));
+        }
+        let names = std::iter::once(advice.model.as_str()).chain(advice.tier.as_deref());
+        for name in names {
+            if let Some((model, efforts)) = self
+                .model_efforts
+                .iter()
+                .find(|(model, _)| model.eq_ignore_ascii_case(name))
+                && !efforts.iter().any(|level| level == effort)
+            {
+                return Err(format!(
+                    "effort {effort} is not one {model} takes {efforts:?}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The mode `surface` runs under.
@@ -432,6 +472,7 @@ impl Router {
                 own
             ));
         }
+        self.check_effort(advice)?;
         Ok(kind)
     }
 
@@ -883,7 +924,15 @@ pub fn front(
         url = %config.url,
         "llm-router advice is on"
     );
-    let router = Arc::new(Router::new(config, primary_available, alternates));
+    let model_efforts = models
+        .assistant_choices
+        .iter()
+        .filter(|choice| choice.brain == "cloud")
+        .map(|choice| (choice.id.clone(), choice.efforts.clone()))
+        .collect();
+    let router = Arc::new(
+        Router::new(config, primary_available, alternates).with_model_efforts(model_efforts),
+    );
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         let checking = Arc::clone(&router);
         handle.spawn(async move { checking.check_targets().await });
@@ -1559,6 +1608,54 @@ mod tests {
         );
     }
 
+    /// An effort goes to `--effort` / `model_reasoning_effort=` as it comes, so one this daemon
+    /// cannot rank, or one the models file says the chosen model does not take, is a router
+    /// failure: the launch would die at spawn.
+    #[test]
+    fn an_effort_outside_the_vocabulary_or_the_models_own_is_refused() {
+        let router = Router::new(
+            config(Mode::Apply, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*", "opus"]),
+            Vec::new(),
+        )
+        .with_model_efforts(vec![(
+            "opus".to_owned(),
+            vec!["low".to_owned(), "medium".to_owned()],
+        )]);
+        let sent = router.build_request(&query(), &[RunnerKind::Claude]);
+
+        for fine in [None, Some("low"), Some("max")] {
+            assert_eq!(
+                router.check_answer(&advice("claude", "claude-sonnet-5", fine), &sent),
+                Ok(RunnerKind::Claude),
+                "{fine:?}"
+            );
+        }
+        for unknown in ["turbo", "", "ultra"] {
+            assert!(
+                router
+                    .check_answer(&advice("claude", "claude-sonnet-5", Some(unknown)), &sent)
+                    .is_err(),
+                "{unknown}"
+            );
+        }
+        // The models file lists what `opus` takes, whether the router names it by id or by tier.
+        assert!(
+            router
+                .check_answer(&advice("claude", "opus", Some("high")), &sent)
+                .is_err()
+        );
+        let by_tier = RouteAdvice {
+            tier: Some("opus".into()),
+            ..advice("claude", "claude-opus-5", Some("xhigh"))
+        };
+        assert!(router.check_answer(&by_tier, &sent).is_err());
+        assert_eq!(
+            router.check_answer(&advice("claude", "opus", Some("medium")), &sent),
+            Ok(RunnerKind::Claude)
+        );
+    }
+
     #[test]
     fn globs_match_as_the_router_matches_them() {
         assert!(glob_match("claude-*", "Claude-Sonnet-5"));
@@ -1871,6 +1968,13 @@ mod tests {
         let (url, _rx) = stub_router(
             200,
             serde_json::json!({"decision_id": "rt_x", "runner": "ollama", "model": "qwen"}),
+        )
+        .await;
+        assert_falls_back(&url, Duration::from_secs(2)).await;
+        let (url, _rx) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_x", "runner": "claude",
+                               "model": "claude-opus-5", "effort": "turbo"}),
         )
         .await;
         assert_falls_back(&url, Duration::from_secs(2)).await;
