@@ -16,6 +16,7 @@
 //! them lands in `brief.rs` rather than here.
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
 
 /// How much of what is known a single node's prompt may carry.
@@ -866,6 +867,279 @@ fn clip(body: &str, width: usize) -> String {
     cut
 }
 
+/// The stable identity and short human label of one failed gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailureSignature {
+    pub fingerprint: String,
+    pub headline: String,
+}
+
+/// Turns the volatile output of a failed gate into the failure it describes.
+#[cfg_attr(not(test), allow(dead_code))] // Tests only until Task 6.2a; production goes through consolidate.rs.
+pub fn failure_signature(output: &str) -> Option<FailureSignature> {
+    if output.trim().is_empty() {
+        return None;
+    }
+
+    let normalised: Vec<String> = output
+        .lines()
+        .map(normalise_line)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if normalised.is_empty() {
+        return None;
+    }
+
+    let mut decisive = Vec::new();
+    for line in &normalised {
+        let lower = line.to_lowercase();
+        if [
+            "test result:",
+            "running ",
+            "finished ",
+            "compiling ",
+            "…[output truncated",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        {
+            continue;
+        }
+        if [
+            "error",
+            "failed",
+            "panicked",
+            "denied",
+            "acesso negado",
+            "cannot",
+            "could not",
+            "not found",
+            "assert",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        {
+            decisive.push(line.as_str());
+            if decisive.len() == 3 {
+                break;
+            }
+        }
+    }
+    if decisive.is_empty() {
+        decisive.push(normalised.last().expect("non-empty output has one line"));
+    }
+
+    let joined = decisive.join("\n");
+    Some(FailureSignature {
+        fingerprint: hex16(&Sha256::digest(joined.as_bytes())),
+        headline: clip(decisive[0], 160),
+    })
+}
+
+fn normalise_line(line: &str) -> String {
+    let line = replace_worktree_paths(line);
+    let line = replace_numbered_ids(&line);
+    let line = replace_line_columns(&line);
+    let line = replace_durations(&line);
+    collapse_horizontal_space(&line)
+}
+
+fn replace_worktree_paths(line: &str) -> String {
+    let mut normalised = line.to_owned();
+    let mut cursor = 0;
+    loop {
+        let bytes = normalised.as_bytes();
+        let mut found = None;
+        let mut at = cursor;
+        while at < bytes.len() {
+            let numbered = bytes[at..].starts_with(b"run-") || bytes[at..].starts_with(b"job-");
+            if numbered && at > 0 && matches!(bytes[at - 1], b'/' | b'\\') {
+                let mut end = at + 4;
+                let digit_start = end;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > digit_start && end < bytes.len() && matches!(bytes[end], b'/' | b'\\') {
+                    found = Some((at, end));
+                    break;
+                }
+            }
+            at += 1;
+        }
+        let Some((segment, end)) = found else {
+            break;
+        };
+
+        let mut start = segment;
+        while start > 0 && !is_path_token_delimiter(normalised.as_bytes()[start - 1]) {
+            start -= 1;
+        }
+        normalised.replace_range(start..end, "<worktree>");
+        let replacement_end = start + "<worktree>".len();
+        let mut token_end = replacement_end;
+        while token_end < normalised.len()
+            && !is_path_token_delimiter(normalised.as_bytes()[token_end])
+        {
+            token_end += 1;
+        }
+        let canonical_suffix = normalised[replacement_end..token_end].replace('\\', "/");
+        normalised.replace_range(replacement_end..token_end, &canonical_suffix);
+        cursor = replacement_end + canonical_suffix.len();
+    }
+    normalised
+}
+
+fn is_path_token_delimiter(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(byte, b'"' | b'\'' | b'(' | b')' | b'<' | b'>' | b'=' | b',')
+}
+
+fn replace_numbered_ids(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut normalised = String::with_capacity(line.len());
+    let mut copied_until = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        let label = if bytes[at..].starts_with(b"run-") {
+            Some("run-<n>")
+        } else if bytes[at..].starts_with(b"job-") {
+            Some("job-<n>")
+        } else {
+            None
+        };
+        let Some(label) = label else {
+            at += 1;
+            continue;
+        };
+        let mut end = at + 4;
+        let digit_start = end;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == digit_start {
+            at += 4;
+            continue;
+        }
+        normalised.push_str(&line[copied_until..at]);
+        normalised.push_str(label);
+        copied_until = end;
+        at = end;
+    }
+    normalised.push_str(&line[copied_until..]);
+    normalised
+}
+
+fn replace_line_columns(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut normalised = String::with_capacity(line.len());
+    let mut copied_until = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b':' {
+            at += 1;
+            continue;
+        }
+        let mut middle = at + 1;
+        while middle < bytes.len() && bytes[middle].is_ascii_digit() {
+            middle += 1;
+        }
+        if middle == at + 1 || middle == bytes.len() || bytes[middle] != b':' {
+            at += 1;
+            continue;
+        }
+        let mut end = middle + 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == middle + 1 {
+            at += 1;
+            continue;
+        }
+        normalised.push_str(&line[copied_until..at]);
+        normalised.push_str(":<l>:<c>");
+        copied_until = end;
+        at = end;
+    }
+    normalised.push_str(&line[copied_until..]);
+    normalised
+}
+
+fn replace_durations(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut normalised = String::with_capacity(line.len());
+    let mut copied_until = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if !bytes[at].is_ascii_digit() {
+            at += 1;
+            continue;
+        }
+        let mut end = at;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end < bytes.len()
+            && bytes[end] == b'.'
+            && end + 1 < bytes.len()
+            && bytes[end + 1].is_ascii_digit()
+        {
+            end += 1;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+        }
+        let suffix_end = if bytes[end..].starts_with(b"ms") {
+            end + 2
+        } else if bytes[end..].starts_with(b"s") {
+            end + 1
+        } else {
+            at = end;
+            continue;
+        };
+        if line[suffix_end..]
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric)
+        {
+            at = suffix_end;
+            continue;
+        }
+        normalised.push_str(&line[copied_until..at]);
+        normalised.push_str("<t>");
+        copied_until = suffix_end;
+        at = suffix_end;
+    }
+    normalised.push_str(&line[copied_until..]);
+    normalised
+}
+
+fn collapse_horizontal_space(line: &str) -> String {
+    let mut normalised = String::with_capacity(line.len());
+    let mut separating = false;
+    for character in line.trim().chars() {
+        if matches!(character, ' ' | '\t') {
+            separating = !normalised.is_empty();
+        } else {
+            if separating {
+                normalised.push(' ');
+                separating = false;
+            }
+            normalised.push(character);
+        }
+    }
+    normalised
+}
+
+fn hex16(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(16);
+    for byte in bytes.iter().take(8) {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 /// What a node in this scope is entitled to be told.
 ///
 /// The chain comes too, and that is the whole reason this takes a [`Scope`] rather than a project
@@ -1427,6 +1701,68 @@ async fn fetch(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Known>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guards that checkout location and worktree generation do not split one failure identity.
+    #[test]
+    fn the_same_failure_in_two_worktree_layouts_normalises_to_one_signature() {
+        let legacy = failure_signature(
+            r#"error: failed to remove file `C:\Projects\nucleos-worktrees\nucleos\run-900372\core\target\debug\nucleos-core.exe`: Acesso negado. (os error 5)"#,
+        )
+        .expect("a failure has a signature");
+        let nested = failure_signature(
+            r#"error: failed to remove file `C:\Projects\nucleos\.nucleos\worktrees\run-900446\core\target\debug\nucleos-core.exe`: Acesso negado. (os error 5)"#,
+        )
+        .expect("a failure has a signature");
+        let git_bash = failure_signature(
+            r#"error: failed to remove file `/c/Projects/nucleos/.nucleos/worktrees/run-900451/core/target/debug/nucleos-core.exe`: Acesso negado. (os error 5)"#,
+        )
+        .expect("a failure has a signature");
+
+        assert_eq!(legacy.fingerprint, nested.fingerprint);
+        assert_eq!(legacy.fingerprint, git_bash.fingerprint);
+    }
+
+    /// Guards that stable normalisation preserves the facts that distinguish real failures.
+    #[test]
+    fn two_genuinely_different_failures_do_not_collapse_into_one_signature() {
+        let access_denied = failure_signature(
+            r#"error: failed to remove file `C:\Projects\nucleos\.nucleos\worktrees\run-900446\core\target\debug\nucleos-core.exe`: Acesso negado. (os error 5)"#,
+        )
+        .expect("a failure has a signature");
+        let file_in_use = failure_signature(
+            r#"error: failed to remove file `C:\Projects\nucleos\.nucleos\worktrees\run-900446\core\target\debug\nucleos-core.exe`: Acesso negado. (os error 32)"#,
+        )
+        .expect("a failure has a signature");
+        let panic = failure_signature("thread 'x' panicked at src/a.rs:10:5:")
+            .expect("a failure has a signature");
+
+        assert_ne!(access_denied.fingerprint, file_in_use.fingerprint);
+        assert_ne!(access_denied.fingerprint, panic.fingerprint);
+        assert_ne!(file_in_use.fingerprint, panic.fingerprint);
+    }
+
+    /// Guards that volatile locations, timings, and run names do not change failure identity.
+    #[test]
+    fn a_failure_that_differs_only_in_line_numbers_durations_and_run_ids_is_the_same_failure() {
+        let first = failure_signature(
+            "thread 'a' panicked at src/a.rs:10:5: after 12.34s\nerror: branch nucleos/run-900372\nfinished in 12.34s",
+        )
+        .expect("a failure has a signature");
+        let second = failure_signature(
+            "thread 'a' panicked at src/a.rs:99:7: after 350ms\nerror: branch nucleos/run-900999\nfinished in 350ms",
+        )
+        .expect("a failure has a signature");
+
+        assert_eq!(first.fingerprint, second.fingerprint);
+    }
+
+    /// Guards that silence has no identity while non-empty unclassified output keeps a fallback.
+    #[test]
+    fn an_output_with_nothing_in_it_has_no_signature() {
+        assert!(failure_signature("").is_none());
+        assert!(failure_signature("   \n\t").is_none());
+        assert!(failure_signature("test result: ok. 3 passed").is_some());
+    }
 
     /// The last version of the schema that still had `refinements` in it.
     ///
