@@ -41,6 +41,7 @@ mod http;
 mod inspect;
 mod job;
 mod join;
+mod judge;
 mod knowledge;
 mod land;
 mod local_agent;
