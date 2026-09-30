@@ -255,6 +255,14 @@ pub async fn suggest(
         return Err("model advice is off for recruits".to_owned());
     }
     let runners: Vec<RunnerKind> = match runner {
+        // An engine the router does not hold has no globs, and a request without any is "any
+        // model" to the router: nothing is asked.
+        Some(kind) if router.available(kind).is_none() => {
+            return Err(format!(
+                "the model adviser does not know the {} engine here",
+                kind.as_str()
+            ));
+        }
         Some(kind) => vec![kind],
         None => std::iter::once(router.primary.kind)
             .chain(router.alternates.iter().map(|available| available.kind))
@@ -788,6 +796,22 @@ mod tests {
             None
         );
         assert_eq!(recruit_default(None, "claude", "s", "w", "p").await, None);
+    }
+
+    /// A recruit on an engine this router cannot launch has no globs to send, and an empty `models`
+    /// is "any model" to the router: no call is made and there is no suggestion.
+    #[tokio::test]
+    async fn a_recruit_on_an_engine_the_router_does_not_hold_asks_nothing() {
+        let (url, mut sent) = stub_router(200, answer("gpt-5.6-terra", "high")).await;
+        let apply = router(&url, &[("recruit", Mode::Apply)], 2500);
+
+        let refused = suggest(Some(Arc::clone(&apply)), Some(RunnerKind::Codex), "task").await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(
+            recruit_default(Some(apply), "codex", "s", "w", "p").await,
+            None
+        );
+        assert!(sent.try_recv().is_err(), "the router was asked");
     }
 
     // ---- outcomes ----

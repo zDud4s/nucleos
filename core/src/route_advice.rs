@@ -454,7 +454,12 @@ impl Router {
                 .iter()
                 .any(|glob| names.iter().any(|name| glob_match(glob, name)))
         };
-        if !sent.models.is_empty() && !matches(&sent.models) {
+        // An empty `models` is "any model" to the router, so a request that carried none held the
+        // answer to nothing and no answer to it can be shown to be one the daemon allows.
+        if sent.models.is_empty() {
+            return Err("the request carried no model globs to hold the answer to".to_owned());
+        }
+        if !matches(&sent.models) {
             return Err(format!(
                 "model {} matches none of the globs sent {:?}",
                 advice.model, sent.models
@@ -1653,6 +1658,23 @@ mod tests {
         assert_eq!(
             router.check_answer(&advice("claude", "opus", Some("medium")), &sent),
             Ok(RunnerKind::Claude)
+        );
+    }
+
+    /// A request that carried no globs held the answer to nothing, so no answer to it is usable.
+    #[test]
+    fn an_answer_to_a_request_with_no_globs_is_refused() {
+        let (runner, _) = routed(config(Mode::Shadow, DEFAULT_URL), Arc::new(Probe));
+        let router = runner.router().unwrap();
+        let unconstrained = RouteRequest {
+            models: Vec::new(),
+            ..router.build_request(&query(), &[RunnerKind::Claude])
+        };
+
+        assert!(
+            router
+                .check_answer(&advice("claude", "claude-opus-5", None), &unconstrained)
+                .is_err()
         );
     }
 
