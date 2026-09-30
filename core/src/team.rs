@@ -3154,8 +3154,8 @@ async fn spawn_agent(
     crate::runs::spawn_registered(state, run_id, async move {
         // Asked inside the task, so a slow adviser delays this seat and never the caller handing
         // out a round. `off` asks nothing and leaves the request as built above.
-        // Outcome (not reported yet): `route_decision_id` on this run's row; the item's done/failed
-        // is written by `ingest_landed_items` from this run's terminal status.
+        // Its outcome is reported by `ingest_landed_items`, against the `route_decision_id` this
+        // writes on the run's row, once the item lands.
         let mut request = request;
         let _decision =
             crate::seat_advice::route_team_seat(&pool, runner.router(), run_id, &mut request).await;
@@ -3364,6 +3364,7 @@ async fn ingest_landed_items(state: &AppState, run: &TeamRun) -> Result<(), sqlx
             .bind(ordinal)
             .execute(&state.pool)
             .await?;
+            crate::seat_advice::report_team_item(&state.pool, state.runner.router(), run_id).await;
             continue;
         }
 
@@ -3402,6 +3403,11 @@ async fn ingest_landed_items(state: &AppState, run: &TeamRun) -> Result<(), sqlx
                 .await?;
             }
         }
+        // The seat is reported on how its RUN ended, after the item's own state is written — so a
+        // pass that could not write it retries next tick and reports once, not twice. A completed
+        // run whose answer could not be filed is still `pass`: the model did the work, the daemon
+        // is what failed to keep it.
+        crate::seat_advice::report_team_item(&state.pool, state.runner.router(), run_id).await;
     }
     Ok(())
 }
@@ -8013,6 +8019,90 @@ mod tests {
         assert_eq!(states[1].1, "done");
         assert_eq!(states[1].2.as_deref(), Some("2-copywriter.md"));
         assert_eq!(fetch_run(&state, &id).await.state, "working");
+    }
+
+    /// A landed item tells the router how its seat went, against the decision on its run's row:
+    /// filed is `pass`, failed is `fail`, and an item launched unrouted reports nothing.
+    #[tokio::test]
+    async fn a_landed_item_reports_its_seats_outcome_to_the_router() {
+        let (mut state, _root) = state_with_root().await;
+        let (url, mut received) = crate::router_client::test_support::outcome_router(200).await;
+        let inner = state.runner.clone();
+        let router = std::sync::Arc::new(crate::route_advice::Router::new(
+            crate::route_advice::RouterConfig {
+                mode: crate::route_advice::Mode::Shadow,
+                url,
+                ..crate::route_advice::RouterConfig::off()
+            },
+            crate::route_advice::Available {
+                kind: crate::route_advice::RunnerKind::Claude,
+                runner: inner.clone(),
+                default_model: "claude-sonnet-5".into(),
+                models: vec!["claude-*".into()],
+            },
+            Vec::new(),
+        ));
+        state.runner = std::sync::Arc::new(crate::route_advice::RoutedRunner { inner, router });
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+
+        let mut items = Vec::new();
+        for (ordinal, status, decision) in [
+            (1, "failed", Some("rt_failed")),
+            (2, "completed", Some("rt_done")),
+            (3, "completed", None),
+        ] {
+            let (run_id, _) = open_run(&state, &id, "work", false).await.unwrap();
+            sqlx::query(
+                "UPDATE runs SET status = ?, stdout = 'the draft', route_decision_id = ?
+                 WHERE id = ?",
+            )
+            .bind(status)
+            .bind(decision)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            items.push((ordinal, run_id));
+        }
+        for (ordinal, run_id) in items {
+            sqlx::query(
+                "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state,
+                                         run_id)
+                 VALUES (?, ?, 0, 'copywriter', 'work', 'running', ?)",
+            )
+            .bind(&id)
+            .bind(ordinal)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let run = fetch_run(&state, &id).await;
+        ingest_landed_items(&state, &run).await.unwrap();
+        // A second pass finds nothing still running, so nothing is reported twice.
+        ingest_landed_items(&state, &run).await.unwrap();
+
+        let mut reports = Vec::new();
+        while let Ok(Some(report)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), received.recv()).await
+        {
+            reports.push(report);
+        }
+        reports.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            reports,
+            vec![
+                ("rt_done".to_owned(), serde_json::json!({"status": "pass"})),
+                (
+                    "rt_failed".to_owned(),
+                    serde_json::json!({"status": "fail"})
+                ),
+            ]
+        );
     }
 
     /// The core names the file, which is what makes a collision between two specialists impossible

@@ -1870,11 +1870,11 @@ impl Driver {
             // cancelled — the same mechanism, and the same reason, as every other guard here.
             let result_tx = result_tx;
             // Inside the task, so a cancel aborts a slow adviser along with the seat. Only the
-            // effort can move; `off` asks nothing. Outcome (not reported yet): the seat's
-            // `route_decision_id` is on this run's row, and its verdict is the `SeatOutcome`
-            // status below, written by `record` in `run_seat`.
+            // effort can move; `off` asks nothing. The decision is kept and reported below with
+            // this seat's final status: every stage opens its own run, so one decision is one seat
+            // turn and is reported once.
             let mut request = request;
-            let _decision = crate::seat_advice::route_council_seat(
+            let decision = crate::seat_advice::route_council_seat(
                 &pool,
                 runner.router(),
                 run_id,
@@ -1990,6 +1990,14 @@ impl Driver {
                     }
                 }
             };
+            // A cancel aborts this task before it gets here, which is why a cancelled seat is
+            // never reported.
+            crate::seat_advice::report_council_seat(
+                runner.router(),
+                decision,
+                seat_outcome.status,
+                &seat_outcome.answer,
+            );
             let _ = result_tx.send(seat_outcome);
         });
 
@@ -3548,6 +3556,112 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("the council never settled");
+    }
+
+    /// Every routed seat reports its outcome once, against its own decision: an answering seat is
+    /// `pass`, a seat that failed is `error`, and no decision is reported twice.
+    #[tokio::test]
+    async fn each_routed_seat_reports_its_outcome_once_to_the_router() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("the first answer".into()),
+            Scripted::Fails("the model refused".into()),
+            Scripted::Answers("the third answer".into()),
+        ]
+        .into();
+        *runner.stage2.lock().unwrap() = [
+            Scripted::Answers("A: 1\nB: 2".into()),
+            Scripted::Answers("A: 1\nB: 2".into()),
+        ]
+        .into();
+
+        // One stub for both endpoints: `/v1/route` mints a fresh decision per seat and echoes the
+        // seat's own `model_ref`, and every outcome lands on `received`.
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        let counter = asked.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/route",
+                axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "decision_id": format!("rt_{n}"),
+                            "runner": "claude",
+                            "model": request["models"][0],
+                            "effort": "low",
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/route/{id}/outcome",
+                axum::routing::post(
+                    move |axum::extract::Path(id): axum::extract::Path<String>,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let sent = sent.clone();
+                        async move {
+                            let status = body["status"].as_str().unwrap_or_default().to_owned();
+                            let _ = sent.send((id, status));
+                            axum::http::StatusCode::OK
+                        }
+                    },
+                ),
+            );
+        let url = crate::router_client::test_support::serve(app).await;
+        let inner: std::sync::Arc<dyn crate::runner::CommandRunner> = runner.clone();
+        let router = std::sync::Arc::new(crate::route_advice::Router::new(
+            crate::route_advice::RouterConfig {
+                mode: crate::route_advice::Mode::Off,
+                url,
+                surfaces: [("council", crate::route_advice::Mode::Shadow)]
+                    .into_iter()
+                    .collect(),
+                ..crate::route_advice::RouterConfig::off()
+            },
+            crate::route_advice::Available {
+                kind: crate::route_advice::RunnerKind::Claude,
+                runner: inner.clone(),
+                default_model: "claude-sonnet-5".into(),
+                models: vec!["claude-*".into()],
+            },
+            Vec::new(),
+        ));
+        let mut state = council_state(runner.clone(), Some(roster(3))).await;
+        state.runner = std::sync::Arc::new(crate::route_advice::RoutedRunner { inner, router });
+
+        let id = start(&state, "why?", None).await.unwrap();
+        assert_eq!(settled(&state, &id).await.status, STATUS_DONE);
+
+        let mut reports = Vec::new();
+        while let Ok(Some(report)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), received.recv()).await
+        {
+            reports.push(report);
+        }
+        let routed = asked.load(Ordering::SeqCst);
+        assert!(routed > 0, "no seat was routed");
+        assert_eq!(
+            reports.len(),
+            routed,
+            "one report per decision: {reports:?}"
+        );
+        let ids: std::collections::BTreeSet<&str> =
+            reports.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids.len(), reports.len(), "a decision was reported twice");
+        let errors = reports
+            .iter()
+            .filter(|(_, status)| status == "error")
+            .count();
+        assert_eq!(errors, 1, "{reports:?}");
+        assert!(
+            reports
+                .iter()
+                .all(|(_, status)| status == "pass" || status == "error"),
+            "{reports:?}"
+        );
     }
 
     /// A seat that failed is information about the model, not a reason to abandon the question.

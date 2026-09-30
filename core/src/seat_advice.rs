@@ -24,8 +24,8 @@ use std::sync::Arc;
 use sqlx::SqlitePool;
 
 use crate::route_advice::{
-    Mode, RouteQuery, Router, RunnerKind, Surface, clamp_effort, effort_ceiling, glob_match,
-    speed_of,
+    Mode, Outcome, RouteQuery, Router, RunnerKind, Surface, clamp_effort, effort_ceiling,
+    glob_match, outcome_of_run_end, report_detached, speed_of,
 };
 use crate::router_client::{RouteAdvice, RouteRequest};
 use crate::runner::RunRequest;
@@ -305,11 +305,91 @@ pub async fn recruit_default(
     .map(|advice| advice.model)
 }
 
+// ---- outcomes ----
+//
+// What became of a routed seat, told back to the router with P2's fire-and-forget report. A seat
+// reports only when its launch holds a decision id, once, against that one decision: every team
+// item and every council stage opens its own run, and so its own decision. Nothing here awaits the
+// network — a router that is down never costs a seat, a round or a council a second.
+
+/// The router's word for how a team item's run ended. `completed` is the item filed; `failed` is
+/// the specialist's own failure unless the run ended on a 429 or a transient API error, which says
+/// nothing about the model; `timed_out` is the wall clock, not the work. A cancelled or interrupted
+/// run was stopped from outside and is not reported.
+pub fn team_item_outcome(run_status: &str, stdout: &str) -> Option<Outcome> {
+    match run_status {
+        "completed" => Some(Outcome::Pass),
+        "failed" => Some(outcome_of_run_end(stdout).unwrap_or(Outcome::Fail)),
+        "timed_out" => Some(Outcome::Error),
+        _ => None,
+    }
+}
+
+/// The router's word for a council seat's `SeatOutcome` status. A council has no verdict on an
+/// answer's quality, so a seat that did not answer is `error` (or `rate_limited` on a 429), never
+/// `fail`; a cancelled seat — and a pending or skipped one — is not reported.
+pub fn council_seat_outcome(status: &str, stdout: &str) -> Option<Outcome> {
+    match status {
+        crate::council::SEAT_OK => Some(Outcome::Pass),
+        crate::council::SEAT_ERROR if crate::runner::failed_on_rate_limit(stdout) => {
+            Some(Outcome::RateLimited)
+        }
+        crate::council::SEAT_ERROR | crate::council::SEAT_TIMEOUT => Some(Outcome::Error),
+        _ => None,
+    }
+}
+
+/// Reports a landed team item against the decision on its run's row. One DB read and a spawn; an
+/// unreadable row only warns, and a row with no decision reports nothing.
+pub async fn report_team_item(pool: &SqlitePool, router: Option<Arc<Router>>, run_id: i64) {
+    let Some(router) = router else {
+        return;
+    };
+    let row: Option<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT status, stdout, route_decision_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(run_id, %error, "could not read a team item's route decision");
+                None
+            });
+    let Some((status, stdout, Some(decision_id))) = row else {
+        return;
+    };
+    if decision_id.is_empty() {
+        return;
+    }
+    if let Some(outcome) = team_item_outcome(&status, stdout.as_deref().unwrap_or_default()) {
+        report_detached(router, decision_id, outcome);
+    }
+}
+
+/// Reports a council seat's final status against the decision its launch was routed on.
+pub fn report_council_seat(
+    router: Option<Arc<Router>>,
+    decision_id: Option<String>,
+    status: &str,
+    stdout: &str,
+) {
+    let (Some(router), Some(decision_id)) = (router, decision_id) else {
+        return;
+    };
+    if decision_id.is_empty() {
+        return;
+    }
+    if let Some(outcome) = council_seat_outcome(status, stdout) {
+        report_detached(router, decision_id, outcome);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::route_advice::{Available, RouterConfig};
-    use crate::router_client::test_support::{dead_address, slow_router, stub_router};
+    use crate::router_client::test_support::{
+        dead_address, outcome_router, slow_router, stub_router,
+    };
 
     async fn pool() -> SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -652,5 +732,143 @@ mod tests {
             None
         );
         assert_eq!(recruit_default(None, "claude", "s", "w", "p").await, None);
+    }
+
+    // ---- outcomes ----
+
+    async fn seed_ended(
+        pool: &SqlitePool,
+        status: &str,
+        stdout: &str,
+        decision: Option<&str>,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at, stdout, route_decision_id)
+             VALUES ('x', ?, 'team', '2026-09-30T00:00:00Z', ?, ?)",
+        )
+        .bind(status)
+        .bind(stdout)
+        .bind(decision)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn reported(
+        received: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) -> (String, serde_json::Value) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), received.recv())
+            .await
+            .expect("reported within 2s")
+            .unwrap()
+    }
+
+    async fn nothing_reported(
+        received: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), received.recv())
+                .await
+                .is_err(),
+            "a report was sent"
+        );
+    }
+
+    fn ended_on_api_error(status: &str) -> String {
+        format!(
+            "{{\"type\":\"result\",\"is_error\":true,\"terminal_reason\":\"api_error\",\
+             \"api_error_status\":{status},\"result\":\"API Error\"}}"
+        )
+    }
+
+    #[test]
+    fn a_team_items_run_status_maps_to_a_router_outcome() {
+        assert_eq!(team_item_outcome("completed", ""), Some(Outcome::Pass));
+        assert_eq!(team_item_outcome("failed", "red"), Some(Outcome::Fail));
+        assert_eq!(
+            team_item_outcome("failed", &ended_on_api_error("429")),
+            Some(Outcome::RateLimited)
+        );
+        assert_eq!(
+            team_item_outcome("failed", &ended_on_api_error("529")),
+            Some(Outcome::Error)
+        );
+        assert_eq!(team_item_outcome("timed_out", ""), Some(Outcome::Error));
+        assert_eq!(team_item_outcome("cancelled", ""), None);
+        assert_eq!(team_item_outcome("interrupted", ""), None);
+        assert_eq!(team_item_outcome("running", ""), None);
+    }
+
+    #[test]
+    fn a_council_seats_status_maps_to_a_router_outcome() {
+        assert_eq!(council_seat_outcome("ok", ""), Some(Outcome::Pass));
+        assert_eq!(council_seat_outcome("error", "boom"), Some(Outcome::Error));
+        assert_eq!(
+            council_seat_outcome("error", &ended_on_api_error("429")),
+            Some(Outcome::RateLimited)
+        );
+        assert_eq!(council_seat_outcome("timeout", ""), Some(Outcome::Error));
+        assert_eq!(council_seat_outcome("cancelled", ""), None);
+        assert_eq!(council_seat_outcome("pending", ""), None);
+        assert_eq!(council_seat_outcome("skipped", ""), None);
+    }
+
+    #[tokio::test]
+    async fn a_done_team_item_reports_pass_and_a_failed_one_reports_fail() {
+        let pool = pool().await;
+        let (url, mut received) = outcome_router(200).await;
+        let router = router(&url, &[], 1000);
+
+        let done = seed_ended(&pool, "completed", "the draft", Some("rt_done")).await;
+        report_team_item(&pool, Some(Arc::clone(&router)), done).await;
+        let (id, body) = reported(&mut received).await;
+        assert_eq!(id, "rt_done");
+        assert_eq!(body, serde_json::json!({"status": "pass"}));
+
+        let failed = seed_ended(&pool, "failed", "red", Some("rt_failed")).await;
+        report_team_item(&pool, Some(router), failed).await;
+        let (id, body) = reported(&mut received).await;
+        assert_eq!(id, "rt_failed");
+        assert_eq!(body, serde_json::json!({"status": "fail"}));
+    }
+
+    /// No decision, no router, a cancelled run or a missing row: nothing is sent.
+    #[tokio::test]
+    async fn a_team_item_with_nothing_to_report_against_reports_nothing() {
+        let pool = pool().await;
+        let (url, mut received) = outcome_router(200).await;
+        let router = router(&url, &[], 1000);
+
+        let unrouted = seed_ended(&pool, "completed", "x", None).await;
+        report_team_item(&pool, Some(Arc::clone(&router)), unrouted).await;
+        let cancelled = seed_ended(&pool, "cancelled", "", Some("rt_c")).await;
+        report_team_item(&pool, Some(Arc::clone(&router)), cancelled).await;
+        report_team_item(&pool, Some(router), cancelled + 99).await;
+        let routed = seed_ended(&pool, "completed", "x", Some("rt_off")).await;
+        report_team_item(&pool, None, routed).await;
+
+        nothing_reported(&mut received).await;
+    }
+
+    #[tokio::test]
+    async fn an_ok_council_seat_reports_pass_and_one_without_a_decision_reports_nothing() {
+        let (url, mut received) = outcome_router(200).await;
+        let router = router(&url, &[], 1000);
+
+        report_council_seat(
+            Some(Arc::clone(&router)),
+            Some("rt_seat".into()),
+            "ok",
+            "the answer",
+        );
+        let (id, body) = reported(&mut received).await;
+        assert_eq!(id, "rt_seat");
+        assert_eq!(body, serde_json::json!({"status": "pass"}));
+
+        report_council_seat(Some(Arc::clone(&router)), None, "ok", "x");
+        report_council_seat(Some(router), Some("rt_x".into()), "cancelled", "");
+        report_council_seat(None, Some("rt_y".into()), "ok", "x");
+        nothing_reported(&mut received).await;
     }
 }
