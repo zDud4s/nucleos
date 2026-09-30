@@ -3917,22 +3917,12 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     /// misspelt key is a startup error like every other key in this file.
     #[test]
     fn a_projects_judge_thresholds_only_tighten() {
-        let absent = parse_schedule_rules(
-            "gate_command: \"true\"
-",
-        )
-        .unwrap();
+        let absent = parse_schedule_rules("gate_command: \"true\"\n").unwrap();
         assert_eq!(
             absent.judge_thresholds(),
             crate::judge::Thresholds::default()
         );
-        let tighter = parse_schedule_rules(
-            "judge:
-  allow_at: 0.9
-  deny_at: 0.05
-",
-        )
-        .unwrap();
+        let tighter = parse_schedule_rules("judge:\n  allow_at: 0.9\n  deny_at: 0.05\n").unwrap();
         assert_eq!(
             tighter.judge_thresholds(),
             crate::judge::Thresholds {
@@ -3940,13 +3930,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
                 deny_at: 0.05
             }
         );
-        let looser = parse_schedule_rules(
-            "judge:
-  allow_at: 0.5
-  deny_at: 0.6
-",
-        )
-        .unwrap();
+        let looser = parse_schedule_rules("judge:\n  allow_at: 0.5\n  deny_at: 0.6\n").unwrap();
         assert_eq!(
             looser.judge_thresholds(),
             crate::judge::Thresholds {
@@ -3954,14 +3938,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
                 deny_at: crate::judge::DENY_AT_CEILING,
             }
         );
-        assert!(
-            parse_schedule_rules(
-                "judge:
-  allow: 0.9
-"
-            )
-            .is_err()
-        );
+        assert!(parse_schedule_rules("judge:\n  allow: 0.9\n").is_err());
     }
 
     /// The brake a project never configured is ON, and the derived `Default` is exactly why this
