@@ -4,9 +4,9 @@
 # workflow core: `--workflow-package` reads a project's live `.ai/`, `.claude/`, `.agents/` trees
 # and writes a bundle into the library (`workflow_package.rs`); this file is the `owns:` list that
 # packaging step ships alongside the packaged files, in the one shape `workflows.rs` parses
-# (`ManifestFile`: `description`, `origin`, `owns`). `name` and `version` are NOT fields in this
-# file — they come from where the bundle sits in the library, `lib/<name>/<version>/bundle.yaml`
-# (`workflows::read_bundle`).
+# (`ManifestFile`: `description`, `origin`, `owns`, `agents_block`).
+# `name` and `version` are NOT fields in this file — they come from where the bundle sits in the
+# library, `lib/<name>/<version>/bundle.yaml` (`workflows::read_bundle`).
 #
 # `owns:` is the only thing this file's `owns` list is for: the set of PROJECT files this workflow
 # claims authorship of (`ownership.rs`, `workflow_materialize::owns_entries`). It is not a listing
@@ -65,6 +65,13 @@ description: >-
   their Claude Code and Codex cockpits, and the generic tooling (ledgers, test-catalog selection,
   cockpit/skill parity checks, speed resolution, worktree seeding) that runs them.
 origin: ai-dev-workflow-template
+
+# The managed block at the top of a project's AGENTS.md (between the `AI WORKFLOW MANAGED BLOCK`
+# markers) is this file verbatim, markers included, and only that region is written: the rest of
+# AGENTS.md is the project's own (`workflow_materialize.rs`, "The managed block in AGENTS.md").
+# It must sit under an `owns:` entry and carry both markers, or packaging refuses
+# (`workflow_package.rs`) — here, under `.ai/workflow/`.
+agents_block: .ai/workflow/agents-block.md
 
 owns:
   # ---- pipeline instructions and packet schemas -------------------------------------------
