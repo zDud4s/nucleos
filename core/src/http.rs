@@ -8514,21 +8514,61 @@ fn materialize_after_pin(
     }
 }
 
-/// Stop using a workflow. Never deletes an ejected copy — see `workflows::uninstall`.
+/// Stop using a workflow, and take back the files it placed in the project.
+///
+/// The pin goes first — a project that does not use `name` is refused before a file is touched —
+/// and then `workflow_materialize::unmaterialize` removes every file the record says this workflow
+/// wrote and that is still exactly what it wrote, the managed block in `AGENTS.md` included. An
+/// edited or missing file stays and is named under `kept`; what went is under `removed`.
+///
+/// **Only the project's own root is cleaned.** A worktree synced from it keeps its copies and its
+/// own record under `materialized/` until it is synced again or removed. Never deletes an ejected
+/// copy — see `workflows::uninstall`. A cleanup that could not run (an unreadable record) does not
+/// undo the decision: the pin stays gone, nothing is removed, and the answer carries `error`.
 async fn delete_project_workflow(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
-) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (_, pins, _) = workflow_write_root(&state, &id).await?;
-    let removed = name.clone();
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (root, pins, _) = workflow_write_root(&state, &id).await?;
+    let record = materialized_record(&state, &id)?;
+    let stopped = name.clone();
 
-    tokio::task::spawn_blocking(move || crate::workflows::uninstall(&pins, &name))
-        .await
-        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
-        .map_err(workflow_refusal)?;
+    let cleaned = tokio::task::spawn_blocking(move || {
+        crate::workflows::uninstall(&pins, &name)?;
+        Ok::<_, crate::workflows::Refused>(crate::workflow_materialize::unmaterialize(
+            &root, &record, &name,
+        ))
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
 
-    workflow_feed(&state, &id, &format!("{removed} is no longer used here")).await;
-    Ok(StatusCode::NO_CONTENT)
+    let (removal, error) = match cleaned {
+        Ok(removal) => (removal, None),
+        Err(error) => {
+            tracing::warn!(%error, workflow = %stopped, "a workflow was stopped and its files were not removed");
+            (Default::default(), Some(error))
+        }
+    };
+    let tail = match (&error, removal.removed.len(), removal.kept.len()) {
+        (Some(error), _, _) => format!("; its files were not removed: {error}"),
+        (None, 0, 0) => String::new(),
+        (None, removed, 0) => format!("; {removed} of its files removed"),
+        (None, removed, kept) => {
+            format!("; {removed} of its files removed, {kept} left in place")
+        }
+    };
+    workflow_feed(
+        &state,
+        &id,
+        &format!("{stopped} is no longer used here{tail}"),
+    )
+    .await;
+    Ok(Json(serde_json::json!({
+        "removed": removal.removed,
+        "kept": removal.kept,
+        "error": error,
+    })))
 }
 
 /// Take a copy, and stop receiving updates.
@@ -21858,6 +21898,63 @@ mod tests {
             None,
         )
         .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Stopping a workflow takes back the files it placed and left untouched, keeps an edited one,
+    /// and names both in the answer.
+    #[tokio::test]
+    async fn stopping_a_workflow_removes_its_untouched_files_and_keeps_edited_ones() {
+        let mut state = test_state().await;
+        let (_lib, library) = providing_library();
+        state.workflow_library = Some(library.clone());
+        let _home = with_project_home(&mut state);
+        let project = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let install = || {
+            workflow_call(
+                state.clone(),
+                "POST",
+                "/projects/alpha/workflows",
+                Some(serde_json::json!({ "name": "dev", "version": "1.0" })),
+            )
+        };
+        let placed = project.path().join(".ai/workflow/workflow.md");
+
+        assert_eq!(install().await.0, StatusCode::NO_CONTENT);
+        assert!(placed.is_file());
+        let (status, answer) = workflow_call(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/workflows/dev",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            answer["removed"],
+            serde_json::json!([".ai/workflow/workflow.md"])
+        );
+        assert_eq!(answer["kept"], serde_json::json!([]));
+        assert!(!placed.exists());
+        assert!(!project.path().join(".ai/workflow").exists());
+
+        assert_eq!(install().await.0, StatusCode::NO_CONTENT);
+        std::fs::write(&placed, "mine").unwrap();
+        let (status, answer) = workflow_call(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/workflows/dev",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer["removed"], serde_json::json!([]));
+        assert_eq!(answer["kept"][0]["path"], ".ai/workflow/workflow.md");
+        assert_eq!(answer["kept"][0]["reason"], "modified");
+        assert_eq!(std::fs::read_to_string(&placed).unwrap(), "mine");
+
+        let (status, _) =
+            workflow_call(state, "DELETE", "/projects/alpha/workflows/dev", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 

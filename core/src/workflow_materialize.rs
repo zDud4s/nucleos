@@ -410,6 +410,20 @@ fn region_hash(region: &str) -> String {
     workflows::hash_of(text.as_bytes())
 }
 
+/// `text` with the region at `range` taken out, or `None` when nothing would be left.
+///
+/// A block at the top was prepended with one blank line after it, and that line goes with it. A
+/// file that held nothing but the block was this module's to create, and goes whole.
+fn without_region(text: &str, range: std::ops::Range<usize>, eol: &str) -> Option<String> {
+    let head = &text[..range.start];
+    let mut rest = &text[range.end..];
+    if head.trim_start_matches('\u{feff}').is_empty() {
+        rest = rest.strip_prefix(eol).unwrap_or(rest);
+    }
+    let left = format!("{head}{rest}");
+    (!left.trim_start_matches('\u{feff}').is_empty()).then_some(left)
+}
+
 /// What one run does to `AGENTS.md`, decided before anything is written.
 struct BlockPlan {
     target: PathBuf,
@@ -557,17 +571,7 @@ fn plan_block(
                 let local = region_hash(&text[range.clone()]);
                 if recorded == Some(local.as_str()) {
                     report.deleted.push(key.clone());
-                    let head = &text[..range.start];
-                    let mut rest = &text[range.end..];
-                    // A block at the top was prepended with one blank line after it; take that too.
-                    if head.trim_start_matches('\u{feff}').is_empty() {
-                        rest = rest.strip_prefix(eol).unwrap_or(rest);
-                    }
-                    let left = format!("{head}{rest}");
-                    // A file that held nothing but the block was this module's to create, and goes.
-                    let contents =
-                        (!left.trim_start_matches('\u{feff}').is_empty()).then_some(left);
-                    plan.change = Some((contents, None));
+                    plan.change = Some((without_region(text, range, eol), None));
                 } else {
                     report.conflicts.push(conflict(edited, Some(local)));
                 }
@@ -857,6 +861,145 @@ pub fn materialize(
         }
     }
     outcome.map(|()| report)
+}
+
+/* ---------------------------------------------------------- unmaterialize -- */
+
+/// Why a recorded file was left where it is when its workflow stopped being used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeptReason {
+    /// Not what this module wrote: somebody edited it, and it is theirs now.
+    Modified,
+    /// Already gone — the file, or the markers of the managed block.
+    Missing,
+    /// The recorded path is not a relative path inside the checkout, or resolves out of it
+    /// through a link or a junction. Never touched.
+    Unsafe,
+    /// Something other than a file is there now: a directory, or a link.
+    NotAFile,
+    /// It was ours and unchanged, and removing it failed.
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Kept {
+    pub path: String,
+    pub reason: KeptReason,
+}
+
+/// What stopping a workflow took out of a checkout, and what it left.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Removal {
+    pub removed: Vec<String>,
+    pub kept: Vec<Kept>,
+}
+
+/// Take out of `checkout` what bundle `name` put there, by the record alone, and forget it.
+///
+/// Every file the record says this bundle wrote goes when it is still exactly what was written,
+/// and directories left empty by that go with it — never `checkout` itself, never a directory
+/// holding anything else. An edited file, a missing one, and a recorded path that is not a
+/// relative path inside the checkout (or that a link or junction carries out of it) are left
+/// alone and reported. The managed block in `AGENTS.md` is taken out, with the blank line that
+/// was put after it, when the region between the markers is unchanged; the file goes too when
+/// nothing else is left in it. Then the bundle's entries leave the record, kept ones included:
+/// the workflow is no longer used, and a kept file is the project's from now on.
+///
+/// **One checkout only.** The caller names the checkout and its record; stopping a workflow
+/// cleans the project's own root, and a worktree synced from it keeps its copies and its record
+/// until it is synced again or removed.
+///
+/// An unreadable record stops it before anything is touched, as it stops [`materialize`].
+pub fn unmaterialize(checkout: &Path, record_path: &Path, name: &str) -> Result<Removal, String> {
+    let mut record = read_record(record_path)?;
+    let Some(recorded) = record.bundles.remove(name) else {
+        return Ok(Removal::default());
+    };
+    let mut removal = Removal::default();
+    for (path, hash) in &recorded.files {
+        let outcome = if path == AGENTS_BLOCK_KEY {
+            remove_block(checkout, hash)
+        } else {
+            remove_file(checkout, path, hash)
+        };
+        match outcome {
+            None => removal.removed.push(path.clone()),
+            Some(reason) => removal.kept.push(Kept {
+                path: path.clone(),
+                reason,
+            }),
+        }
+    }
+    crate::project_state::write_atomically(record_path, &render_record(&record))
+        .map_err(|error| format!("{}: {error}", record_path.display()))?;
+    Ok(removal)
+}
+
+/// Remove one recorded file when it is still what was written. `None` when it went.
+fn remove_file(checkout: &Path, path: &str, recorded: &str) -> Option<KeptReason> {
+    // The record is a file on disk and can say anything: only the one spelling of a relative
+    // path inside the checkout is ever joined, and the daemon's own files are never a bundle's.
+    if crate::ownership::normalise(path).as_deref() != Some(path) || reserved(path) {
+        return Some(KeptReason::Unsafe);
+    }
+    let Ok(target) = crate::inspect::safe_write_target(checkout, path) else {
+        return Some(KeptReason::Unsafe);
+    };
+    match local_hash(&target) {
+        Ok(None) => Some(KeptReason::Missing),
+        Err(()) => Some(KeptReason::NotAFile),
+        Ok(Some(local)) if local != recorded => Some(KeptReason::Modified),
+        Ok(Some(_)) => match std::fs::remove_file(&target) {
+            Ok(()) => {
+                prune_empty_parents(checkout, &target);
+                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, path, "a workflow file could not be removed");
+                Some(KeptReason::Failed)
+            }
+        },
+    }
+}
+
+/// Take the managed block out of `AGENTS.md` when it is still what was written. `None` when it went.
+fn remove_block(checkout: &Path, recorded: &str) -> Option<KeptReason> {
+    let Ok(target) = crate::inspect::safe_write_target(checkout, AGENTS_FILE) else {
+        return Some(KeptReason::Unsafe);
+    };
+    match std::fs::symlink_metadata(&target) {
+        Err(_) => return Some(KeptReason::Missing),
+        Ok(meta) if !meta.is_file() => return Some(KeptReason::NotAFile),
+        Ok(_) => {}
+    }
+    // Not text: this module wrote text, so whatever is there now is somebody else's.
+    let Some(text) = std::fs::read(&target)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
+        return Some(KeptReason::Modified);
+    };
+    let range = match find_region(&text) {
+        Region::Absent => return Some(KeptReason::Missing),
+        Region::Unclosed => return Some(KeptReason::Modified),
+        Region::At(range) => range,
+    };
+    if region_hash(&text[range.clone()]) != recorded {
+        return Some(KeptReason::Modified);
+    }
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let applied = match without_region(&text, range, eol) {
+        Some(left) => crate::project_state::write_bytes_atomically(&target, left.as_bytes()),
+        None => std::fs::remove_file(&target),
+    };
+    match applied {
+        Ok(()) => None,
+        Err(error) => {
+            tracing::warn!(%error, "the managed block could not be taken out of AGENTS.md");
+            Some(KeptReason::Failed)
+        }
+    }
 }
 
 /* ------------------------------------------------------------------- pins -- */
@@ -1680,5 +1823,231 @@ mod tests {
         assert_eq!(report.written, vec!["a.md".to_string()]);
         assert!(report.conflicts.is_empty());
         assert_eq!(read(&checkout.join("AGENTS.md")), BLOCK);
+    }
+}
+
+#[cfg(test)]
+mod unmaterialize_tests {
+    use super::*;
+
+    fn checkout_with(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        for (path, contents) in files {
+            let target = checkout.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, contents).unwrap();
+        }
+        let record = temp.path().join("state").join("materialized.yaml");
+        (temp, checkout, record)
+    }
+
+    /// Record `files` as what bundle `dev` wrote, beside another bundle's entry.
+    fn record_as_written(record: &Path, files: &[(&str, String)]) {
+        let mut written = Record::default();
+        written.bundles.insert(
+            "dev".to_string(),
+            RecordedBundle {
+                version: "1.0".to_string(),
+                files: files
+                    .iter()
+                    .map(|(path, hash)| (path.to_string(), hash.clone()))
+                    .collect(),
+            },
+        );
+        written.bundles.insert(
+            "other".to_string(),
+            RecordedBundle {
+                version: "2.0".to_string(),
+                files: [("keep.md".to_string(), workflows::hash_of(b"k"))].into(),
+            },
+        );
+        crate::project_state::write_atomically(record, &render_record(&written)).unwrap();
+    }
+
+    fn hash(text: &str) -> String {
+        workflows::hash_of(text.as_bytes())
+    }
+
+    fn kept(removal: &Removal, path: &str) -> Option<KeptReason> {
+        removal
+            .kept
+            .iter()
+            .find(|kept| kept.path == path)
+            .map(|kept| kept.reason)
+    }
+
+    const BLOCK: &str =
+        "# >>> AI WORKFLOW MANAGED BLOCK >>>\n\nthe rules\n\n# <<< AI WORKFLOW MANAGED BLOCK <<<\n";
+
+    #[test]
+    fn untouched_files_go_edited_and_missing_ones_stay_and_empty_dirs_are_pruned() {
+        let (_temp, checkout, record) = checkout_with(&[
+            ("a/x.md", "x"),
+            ("a/y.md", "mine"),
+            ("b/deep/z.md", "z"),
+            ("c/w.md", "w"),
+            ("c/theirs.txt", "not ours"),
+        ]);
+        record_as_written(
+            &record,
+            &[
+                ("a/x.md", hash("x")),
+                ("a/y.md", hash("y")),
+                ("b/deep/z.md", hash("z")),
+                ("c/w.md", hash("w")),
+                ("d.md", hash("d")),
+            ],
+        );
+
+        let removal = unmaterialize(&checkout, &record, "dev").unwrap();
+
+        assert!(!checkout.join("a/x.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a/y.md")).unwrap(),
+            "mine"
+        );
+        assert!(
+            checkout.join("a").is_dir(),
+            "a directory still holding a file stays"
+        );
+        assert!(!checkout.join("b").exists(), "directories left empty go");
+        assert!(!checkout.join("c/w.md").exists());
+        assert!(checkout.join("c/theirs.txt").is_file());
+        assert!(checkout.is_dir(), "never the root");
+
+        assert_eq!(
+            removal.removed,
+            vec![
+                "a/x.md".to_string(),
+                "b/deep/z.md".to_string(),
+                "c/w.md".to_string()
+            ]
+        );
+        assert_eq!(kept(&removal, "a/y.md"), Some(KeptReason::Modified));
+        assert_eq!(kept(&removal, "d.md"), Some(KeptReason::Missing));
+        assert_eq!(removal.kept.len(), 2);
+
+        // The bundle's entries are gone, kept ones included; another bundle's are not.
+        let after = read_record(&record).unwrap();
+        assert!(!after.bundles.contains_key("dev"));
+        assert!(after.bundles.contains_key("other"));
+    }
+
+    #[test]
+    fn an_unchanged_block_goes_and_the_rest_of_agents_md_is_byte_identical() {
+        let rest = "## Project: mine\r\n\r\nits own notes\r\n";
+        let (_temp, checkout, record) = checkout_with(&[(
+            "AGENTS.md",
+            &format!("{}\r\n{rest}", BLOCK.replace('\n', "\r\n")),
+        )]);
+        record_as_written(&record, &[(AGENTS_BLOCK_KEY, hash(BLOCK))]);
+
+        let removal = unmaterialize(&checkout, &record, "dev").unwrap();
+
+        assert_eq!(removal.removed, vec![AGENTS_BLOCK_KEY.to_string()]);
+        assert!(removal.kept.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("AGENTS.md")).unwrap(),
+            rest
+        );
+    }
+
+    #[test]
+    fn an_agents_md_holding_only_the_block_is_deleted() {
+        let (_temp, checkout, record) = checkout_with(&[("AGENTS.md", BLOCK)]);
+        record_as_written(&record, &[(AGENTS_BLOCK_KEY, hash(BLOCK))]);
+
+        let removal = unmaterialize(&checkout, &record, "dev").unwrap();
+
+        assert_eq!(removal.removed, vec![AGENTS_BLOCK_KEY.to_string()]);
+        assert!(!checkout.join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn an_edited_block_is_kept_and_reported() {
+        let edited = format!("{}\nbelow\n", BLOCK.replace("the rules", "my rules"));
+        let (_temp, checkout, record) = checkout_with(&[("AGENTS.md", &edited)]);
+        record_as_written(&record, &[(AGENTS_BLOCK_KEY, hash(BLOCK))]);
+
+        let removal = unmaterialize(&checkout, &record, "dev").unwrap();
+
+        assert!(removal.removed.is_empty());
+        assert_eq!(kept(&removal, AGENTS_BLOCK_KEY), Some(KeptReason::Modified));
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("AGENTS.md")).unwrap(),
+            edited
+        );
+    }
+
+    #[test]
+    fn a_block_whose_markers_are_gone_is_reported_missing() {
+        let (_temp, checkout, record) = checkout_with(&[("AGENTS.md", "just notes\n")]);
+        record_as_written(&record, &[(AGENTS_BLOCK_KEY, hash(BLOCK))]);
+
+        let removal = unmaterialize(&checkout, &record, "dev").unwrap();
+
+        assert_eq!(kept(&removal, AGENTS_BLOCK_KEY), Some(KeptReason::Missing));
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("AGENTS.md")).unwrap(),
+            "just notes\n"
+        );
+    }
+
+    /// A record is a file on disk and can say anything; nothing outside the checkout is touched.
+    #[test]
+    fn a_record_path_escaping_the_checkout_is_refused_and_nothing_outside_is_touched() {
+        let (temp, checkout, record) = checkout_with(&[]);
+        let outside = temp.path().join("outside.md");
+        std::fs::write(&outside, "o").unwrap();
+        let absolute = outside.to_string_lossy().into_owned();
+        record_as_written(
+            &record,
+            &[
+                ("../outside.md", hash("o")),
+                ("a/../../outside.md", hash("o")),
+                (absolute.as_str(), hash("o")),
+            ],
+        );
+
+        let removal = unmaterialize(&checkout, &record, "dev").unwrap();
+
+        assert!(outside.is_file());
+        assert!(removal.removed.is_empty());
+        assert_eq!(removal.kept.len(), 3);
+        assert!(
+            removal
+                .kept
+                .iter()
+                .all(|kept| kept.reason == KeptReason::Unsafe)
+        );
+        assert!(!read_record(&record).unwrap().bundles.contains_key("dev"));
+    }
+
+    /// A link inside the checkout pointing out of it is never followed to delete what it names.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_out_of_the_checkout_is_never_followed() {
+        let (temp, checkout, record) = checkout_with(&[]);
+        let outside = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("f.md"), "f").unwrap();
+        std::os::unix::fs::symlink(&outside, checkout.join("linked")).unwrap();
+        record_as_written(&record, &[("linked/f.md", hash("f"))]);
+
+        let removal = unmaterialize(&checkout, &record, "dev").unwrap();
+
+        assert!(outside.join("f.md").is_file());
+        assert_eq!(kept(&removal, "linked/f.md"), Some(KeptReason::Unsafe));
+    }
+
+    #[test]
+    fn a_bundle_never_recorded_removes_nothing_and_writes_no_record() {
+        let (_temp, checkout, record) = checkout_with(&[("a.md", "a")]);
+        let removal = unmaterialize(&checkout, &record, "dev").unwrap();
+        assert!(removal.removed.is_empty() && removal.kept.is_empty());
+        assert!(!record.exists());
+        assert!(checkout.join("a.md").is_file());
     }
 }
