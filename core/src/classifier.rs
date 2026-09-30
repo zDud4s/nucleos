@@ -2490,12 +2490,16 @@ pub(crate) fn judge_guard(tool_name: &str, tool_input: &Value, cwd: &Path) -> Op
 }
 
 /// `>>~/.bashrc`, `2>err.log` and `<.env` name their target glued to the operator; a bare `>` is
-/// its own word and its target is the next word, which the loop above reads anyway.
+/// its own word and its target is the next word, which the loop above reads anyway. `&>`, `&>>`
+/// (both streams) and `>|` (force past `noclobber`) glue to their target the same way, and a
+/// target glued to one of those kept the operator's leftover character (`&>..`, `>|..`) as part of
+/// the path, which hid it from `normalize_path`'s `..` handling and from a sensitive-basename
+/// comparison.
 fn redirect_target(word: &str) -> &str {
     let digits = word.len() - word.trim_start_matches(|c: char| c.is_ascii_digit()).len();
     let rest = &word[digits..];
-    if rest.starts_with(['>', '<']) {
-        rest.trim_start_matches(['>', '<', '&'])
+    if rest.starts_with(['>', '<', '&']) {
+        rest.trim_start_matches(['>', '<', '&', '|'])
     } else {
         word
     }
@@ -2598,14 +2602,18 @@ fn is_irreversible(segment: &str, words: &[String]) -> bool {
     // spec says "DROP", not only the three a first draft listed. Broad on purpose: a commit message
     // like "drop unused import" trips it too, and the only effect is that the judge's approval
     // falls to the middle band (the classifier's own verdict), never a refusal.
-    let drops = text
+    let tokens = text
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|pair| pair[0] == "drop");
+        .collect::<Vec<_>>();
+    let drops = tokens.windows(2).any(|pair| pair[0] == "drop");
+    // Postgres makes `TABLE` optional in `TRUNCATE [TABLE] name`, so a bare `TRUNCATE` trips this
+    // too, wherever it sits — including inside a quoted SQL string passed to `psql -c` or
+    // `sqlite3`. Tokenised rather than substring-matched so `truncated` (a log line, a commit
+    // message) does not trip it. A false positive here only costs today's human approval.
+    let truncates = tokens.contains(&"truncate");
     if drops
-        || text.contains("truncate table")
+        || truncates
         || text
             .match_indices("delete from")
             .any(|(at, _)| !text[at..].contains(" where "))
@@ -2805,6 +2813,21 @@ mod tests {
         );
     }
 
+    /// Postgres makes `TABLE` optional in `TRUNCATE [TABLE] name`, so the bare form must trip G3
+    /// too, whatever quoting wraps it — but `truncated` (a different word) must not.
+    #[test]
+    fn a_bare_truncate_trips_the_irreversible_guard() {
+        assert_eq!(
+            guard("Bash", "psql -c \"TRUNCATE mytable\""),
+            Some(JudgeGuard::Irreversible)
+        );
+        assert_eq!(
+            guard("Bash", "sqlite3 db \"truncate t;\""),
+            Some(JudgeGuard::Irreversible)
+        );
+        assert_eq!(guard("Bash", "echo truncated"), None);
+    }
+
     /// A redirect's target is a destination like any other: it goes through G1 and G2.
     #[test]
     fn a_redirect_target_is_read_as_a_path() {
@@ -2824,6 +2847,42 @@ mod tests {
         assert_eq!(guard("Bash", "ls >/dev/null"), None);
         assert_eq!(guard("Bash", "ls > /dev/null"), None);
         assert_eq!(guard("Bash", "cargo test > target/log.txt"), None);
+    }
+
+    /// `&>`, `&>>` and `>|` are redirect operators too, and a real shell reads them glued to their
+    /// target exactly like `>`/`>>`/`<` — so the glued form must strip them the same way, not leave
+    /// the operator as part of the path.
+    #[test]
+    fn glued_amp_and_pipe_redirects_are_read_as_paths() {
+        assert_eq!(
+            guard("Bash", "echo x &>../../outside/leak.txt"),
+            Some(JudgeGuard::OutsideTheRun)
+        );
+        assert_eq!(
+            guard("Bash", "cat foo &>.env"),
+            Some(JudgeGuard::SensitiveSource)
+        );
+        assert_eq!(
+            guard("Bash", "echo x &>>../../outside/leak.txt"),
+            Some(JudgeGuard::OutsideTheRun)
+        );
+        assert_eq!(
+            guard("Bash", "echo x >|../../outside/leak.txt"),
+            Some(JudgeGuard::OutsideTheRun)
+        );
+        // The spaced forms must keep tripping too.
+        assert_eq!(
+            guard("Bash", "echo x &> ../../outside/leak.txt"),
+            Some(JudgeGuard::OutsideTheRun)
+        );
+        assert_eq!(
+            guard("Bash", "cat foo &> .env"),
+            Some(JudgeGuard::SensitiveSource)
+        );
+        assert_eq!(
+            guard("Bash", "echo x >| ../../outside/leak.txt"),
+            Some(JudgeGuard::OutsideTheRun)
+        );
     }
 
     #[test]
