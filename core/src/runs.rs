@@ -2438,6 +2438,7 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
     // therefore claims a slot, records a row and is charged disk for it. `None` — a standalone
     // run — brings one too.
     let owns_a_tree = provisioning.as_ref().is_none_or(Provisioning::owns_a_tree);
+    let standalone = provisioning.is_none();
     if mode == "worktree" && (project_id.is_none() || cwd.is_none()) {
         return Err(CreateRunError::Invalid(
             "worktree mode requires project_id and cwd (the project root)",
@@ -2875,6 +2876,29 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
         crate::runner::Permission::Bypass
     } else {
         crate::runner::Permission::Default
+    };
+    // Read here rather than in `spawn_run`: provisioned job nodes are already briefed, and that
+    // lower seam also launches handoff successors and approval resumes. Append to the prompt so
+    // Codex can receive it; its runner refuses an appended system prompt. Triage and provisioned
+    // runs stay untouched, while the row keeps the prompt exactly as the caller asked it.
+    let prompt = if standalone && mode != crate::email::TRIAGE_MODE {
+        let context = crate::knowledge::Context::for_project(project_id.as_deref());
+        match crate::brief::for_prompt(&state.pool, &context, &prompt, "run").await {
+            Some(briefing) => {
+                if let Err(error) =
+                    crate::brief::record(&state.pool, id, None, &briefing.trace).await
+                {
+                    tracing::warn!(run_id = id, %error, "could not record a run's briefing trace");
+                }
+                match briefing.block {
+                    Some(block) => format!("{prompt}{block}"),
+                    None => prompt,
+                }
+            }
+            None => prompt,
+        }
+    } else {
+        prompt
     };
     spawn_run(
         state,
@@ -4753,6 +4777,20 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             run_timeout,
         };
         (state, runner)
+    }
+
+    async fn seed_machine_knowledge(pool: &sqlx::SqlitePool, title: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'machine', NULL, 'owner', 'memory', ?, 'body', 'active',
+                     '2026-08-19T00:00:00+00:00')",
+        )
+        .bind(title)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
     }
 
     fn git_ok(dir: &FsPath, args: &[&OsStr]) -> bool {
@@ -8461,6 +8499,93 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             tool_policy_for_mode(crate::team::TEAM_MODE),
             None
         ));
+    }
+
+    #[tokio::test]
+    async fn a_standalone_run_reads_what_is_known_and_leaves_a_trace() {
+        let (state, runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        seed_machine_knowledge(&state.pool, "zanzibar house rule").await;
+
+        let id = create_run_inner(&state, "zanzibar work".into(), None, None, "real", false)
+            .await
+            .unwrap();
+        let (status, _) = poll_run(&state, id, "completed").await;
+
+        assert_eq!(status, "completed");
+        let prompt = runner.last_prompt.lock().unwrap().clone().unwrap();
+        assert!(prompt.starts_with("zanzibar work"));
+        assert!(prompt.contains("zanzibar house rule"));
+        let stored: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, "zanzibar work");
+        let shown: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM run_knowledge WHERE run_id = ? AND shown = 1",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(shown, 1);
+    }
+
+    #[tokio::test]
+    async fn a_triage_run_is_not_told_what_the_house_knows() {
+        let (state, runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        seed_machine_knowledge(&state.pool, "zanzibar house rule").await;
+
+        let id = create_run_inner(
+            &state,
+            "message body".into(),
+            None,
+            None,
+            crate::email::TRIAGE_MODE,
+            false,
+        )
+        .await
+        .unwrap();
+        let (status, _) = poll_run(&state, id, "completed").await;
+
+        assert_eq!(status, "completed");
+        assert_eq!(
+            runner.last_prompt.lock().unwrap().clone(),
+            Some("message body".into())
+        );
+        let traces: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM run_knowledge WHERE run_id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(traces, 0);
+    }
+
+    #[tokio::test]
+    async fn a_run_with_nothing_known_is_launched_with_its_prompt_untouched() {
+        let (state, runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+
+        let id = create_run_inner(&state, "plain work".into(), None, None, "real", false)
+            .await
+            .unwrap();
+        let (status, _) = poll_run(&state, id, "completed").await;
+
+        assert_eq!(status, "completed");
+        assert_eq!(
+            runner.last_prompt.lock().unwrap().clone(),
+            Some("plain work".into())
+        );
+        let traces: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM run_knowledge WHERE run_id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(traces, 0);
     }
 
     /// Selecting the local runner by mode keeps message bodies on-machine without accidentally

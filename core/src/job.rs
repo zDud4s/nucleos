@@ -14323,7 +14323,7 @@ mod tests {
         let root = tempfile::tempdir().expect("worktree root");
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
-        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
 
         let job_id = seed_job_in(
             &pool,
@@ -14389,6 +14389,26 @@ mod tests {
         assert_eq!(trace[0].1, Some(item_id));
         assert!(trace[0].2 > 0.0);
         assert_eq!(trace[0].3, None);
+
+        for _ in 0..250 {
+            if runner.last_prompt.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let launched = runner
+            .last_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the node's CLI launch should receive its prompt");
+        assert_eq!(
+            launched
+                .matches("Earlier work on this project left the notes below")
+                .count(),
+            1,
+            "a job node is briefed by spawn_node and must not be briefed again by create_run_with",
+        );
     }
 
     /// The one seam a job's words have to cross, driven end to end.
