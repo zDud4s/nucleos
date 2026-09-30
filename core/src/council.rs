@@ -1869,6 +1869,18 @@ impl Driver {
             // Captured, so an abort drops it and the awaiting driver learns the seat was
             // cancelled — the same mechanism, and the same reason, as every other guard here.
             let result_tx = result_tx;
+            // Inside the task, so a cancel aborts a slow adviser along with the seat. Only the
+            // effort can move; `off` asks nothing. Outcome (not reported yet): the seat's
+            // `route_decision_id` is on this run's row, and its verdict is the `SeatOutcome`
+            // status below, written by `record` in `run_seat`.
+            let mut request = request;
+            let _decision = crate::seat_advice::route_council_seat(
+                &pool,
+                runner.router(),
+                run_id,
+                &mut request,
+            )
+            .await;
             let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
             let outcome = tokio::time::timeout(

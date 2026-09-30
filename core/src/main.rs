@@ -92,6 +92,7 @@ mod runner;
 mod runs;
 mod scheduler;
 mod search;
+mod seat_advice;
 mod secrets;
 mod seed;
 mod sessions;
