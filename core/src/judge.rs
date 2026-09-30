@@ -304,12 +304,277 @@ pub struct StateParts<'a> {
     pub tool_input: &'a str,
 }
 
+/// What replaces a value the judge's state must not carry.
+const JUDGE_MARKER: &str = "[REDACTED]";
+
+/// Key-name fragments (lowercase, `-` folded to `_`) that mark an assignment's value as a secret.
+const SECRET_KEY_PARTS: [&str; 11] = [
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "api_key",
+    "apikey",
+    "auth",
+    "credential",
+    "private_key",
+    "access_key",
+];
+
+/// Authorization schemes that precede the opaque credential.
+const AUTH_SCHEMES: [&str; 7] = [
+    "bearer",
+    "basic",
+    "token",
+    "digest",
+    "negotiate",
+    "ntlm",
+    "apikey",
+];
+
+/// Spec A D9 (`2026-09-26-autopilot-modo-juiz-design.md`) asks for the state to be redacted.
+/// `redact_secrets` recognises issuer-shaped tokens only, and this is data leaving the machine, so
+/// the judge adds the shapes a shell line carries secrets in (named assignments, authorization
+/// headers, URL credentials) and the owner's home path. A false positive costs the judge some
+/// context, never a leak.
+fn redact_for_judge(text: &str) -> String {
+    let home = crate::commands::home();
+    redact_for_judge_with_home(text, home.as_deref())
+}
+
+/// `redact_for_judge` with the home directory handed in, so a test does not depend on the machine.
+fn redact_for_judge_with_home(text: &str, home: Option<&Path>) -> String {
+    let text = crate::redact::redact_secrets(text);
+    let text = match home {
+        Some(home) => redact_home(&text, home),
+        None => text,
+    };
+    let text = redact_url_userinfo(&text);
+    let text = redact_auth_headers(&text);
+    redact_assignments(&text)
+}
+
+fn is_key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
+/// The end of an unquoted value: whitespace, a quote, or a delimiter that closes it in JSON/shell.
+fn bare_value_end(chars: &[char], from: usize) -> usize {
+    let mut end = from;
+    while end < chars.len()
+        && !chars[end].is_whitespace()
+        && !matches!(chars[end], '"' | '\'' | ',' | ';' | '}' | ')' | '&')
+    {
+        end += 1;
+    }
+    end
+}
+
+/// The end (exclusive) of the value starting at `from`: a quoted string including its quotes, or a
+/// bare run.
+fn value_end(chars: &[char], from: usize) -> usize {
+    match chars.get(from) {
+        Some(&quote) if quote == '"' || quote == '\'' => {
+            let mut end = from + 1;
+            while end < chars.len() && chars[end] != quote {
+                end += 1;
+            }
+            (end + 1).min(chars.len())
+        }
+        _ => bare_value_end(chars, from),
+    }
+}
+
+fn skip_ws(chars: &[char], mut at: usize) -> usize {
+    while at < chars.len() && chars[at].is_whitespace() {
+        at += 1;
+    }
+    at
+}
+
+/// `KEY=v`, `KEY: v`, `"key": "v"`, `$env:KEY = 'v'` and `--key v` for a secret-named key.
+fn redact_assignments(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if !is_key_char(chars[i]) {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let key_start = i;
+        let mut key_end = i;
+        while key_end < chars.len() && is_key_char(chars[key_end]) {
+            key_end += 1;
+        }
+        let key: String = chars[i..key_end].iter().collect();
+        out.push_str(&key);
+        i = key_end;
+        let folded = key.to_ascii_lowercase().replace('-', "_");
+        // `[SECRET:github]` is a label `redact_secrets` already put there, not a key.
+        if key_start > 0 && chars[key_start - 1] == '[' {
+            continue;
+        }
+        // Headers are the next pass's business, and it keeps the scheme word readable.
+        if folded.contains("authorization")
+            || !SECRET_KEY_PARTS.iter().any(|part| folded.contains(part))
+        {
+            continue;
+        }
+        let mut at = i;
+        if matches!(chars.get(at), Some('"' | '\'')) {
+            at += 1;
+        }
+        let value_start = match chars.get(at) {
+            Some('=' | ':') => Some(skip_ws(&chars, at + 1)),
+            Some(c) if c.is_whitespace() => {
+                let next = skip_ws(&chars, at);
+                match chars.get(next) {
+                    Some('=') => Some(skip_ws(&chars, next + 1)),
+                    // `--token x`: a flag takes its value as the next word.
+                    Some(c) if key.starts_with("--") && *c != '-' => Some(next),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(start) = value_start else { continue };
+        let end = value_end(&chars, start);
+        if end == start {
+            continue;
+        }
+        out.extend(&chars[i..start]);
+        out.push_str(JUDGE_MARKER);
+        i = end;
+    }
+    out
+}
+
+/// `Authorization: Bearer x`, `Authorization: Basic x`, `-H "Authorization: token x"`: the scheme
+/// stays, the credential goes.
+fn redact_auth_headers(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let lower: Vec<char> = text.to_ascii_lowercase().chars().collect();
+    let name: Vec<char> = "authorization".chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if lower[i..].starts_with(&name) {
+            let mut at = i + name.len();
+            if matches!(chars.get(at), Some('"' | '\'')) {
+                at += 1;
+            }
+            at = skip_ws(&chars, at);
+            if matches!(chars.get(at), Some(':' | '=')) {
+                let word_start = skip_ws(&chars, at + 1);
+                let word_end = bare_value_end(&chars, word_start);
+                let word: String = chars[word_start..word_end].iter().collect();
+                let secret_start = if AUTH_SCHEMES.contains(&word.to_ascii_lowercase().as_str()) {
+                    skip_ws(&chars, word_end)
+                } else {
+                    word_start
+                };
+                let secret_end = bare_value_end(&chars, secret_start);
+                if secret_end > secret_start {
+                    out.extend(&chars[i..secret_start]);
+                    out.push_str(JUDGE_MARKER);
+                    i = secret_end;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// `https://user:pass@host/` becomes `https://[REDACTED]@host/`; a bare `user@` carries no secret.
+fn redact_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(found) = rest.find("://") {
+        let authority_start = found + 3;
+        out.push_str(&rest[..authority_start]);
+        rest = &rest[authority_start..];
+        let authority_end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\''))
+            .unwrap_or(rest.len());
+        let authority = &rest[..authority_end];
+        match authority.rfind('@') {
+            Some(at) if authority[..at].contains(':') => {
+                out.push_str(JUDGE_MARKER);
+                out.push_str(&authority[at..]);
+            }
+            _ => out.push_str(authority),
+        }
+        rest = &rest[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The home directory, in any spelling (`C:\Users\X`, `C:/Users/X`, `/c/Users/X`, JSON-escaped
+/// backslashes, any case), becomes `~`. A longer name sharing the prefix is left alone.
+fn redact_home(text: &str, home: &Path) -> String {
+    let raw = home.to_string_lossy().replace('\\', "/");
+    let raw = raw.trim_end_matches('/').to_ascii_lowercase();
+    if raw.chars().count() < 3 {
+        return text.to_owned();
+    }
+    let mut needles = vec![raw.chars().collect::<Vec<char>>()];
+    let bytes = raw.as_bytes();
+    if bytes.len() > 3 && bytes[1] == b':' && bytes[2] == b'/' && bytes[0].is_ascii_alphabetic() {
+        let msys = format!("/{}/{}", bytes[0] as char, &raw[3..]);
+        needles.push(msys.chars().collect());
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(end) = needles.iter().find_map(|n| match_path(&chars, i, n))
+            && !chars.get(end).is_some_and(|c| is_key_char(*c))
+        {
+            out.push('~');
+            i = end;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Matches `needle` (lowercase, `/` separators) at `at`, where `/` also accepts a run of `\`.
+fn match_path(chars: &[char], at: usize, needle: &[char]) -> Option<usize> {
+    let mut j = at;
+    for &c in needle {
+        if c == '/' {
+            match chars.get(j) {
+                Some('/') => j += 1,
+                Some('\\') => {
+                    while chars.get(j) == Some(&'\\') {
+                        j += 1;
+                    }
+                }
+                _ => return None,
+            }
+        } else if chars.get(j)?.to_ascii_lowercase() == c {
+            j += 1;
+        } else {
+            return None;
+        }
+    }
+    Some(j)
+}
+
 /// D9: `TASK`, `RECENT ACTIONS`, `ACTION`, in that order ("a task states its goal first"), every
-/// part through `redact::redact_secrets` — the function already used for traffic that leaves the
-/// machine — and the whole cut to `STATE_CAP_CHARS`. There is no classifier section: it told the
+/// part through `redact_for_judge` (`redact::redact_secrets` plus the judge's own shapes) — and the whole cut to `STATE_CAP_CHARS`. There is no classifier section: it told the
 /// Jev that unrecognized commands need approval and tilted it before it judged (V0 against V1).
 pub fn render_state(parts: &StateParts<'_>) -> String {
-    let redact = crate::redact::redact_secrets;
+    let redact = redact_for_judge;
     // Held to half the state before anything else: the goal first (two thirds of the head) and
     // its constraints last (the tail), with room left for the action it is judging.
     let task = trim_two_thirds(&redact(parts.task), TASK_CAP_CHARS);
@@ -366,6 +631,62 @@ pub fn render_state(parts: &StateParts<'_>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `redact_secrets` knows issuer-shaped tokens only; these are the shapes a shell line
+    /// carries a secret in, plus the owner's home path.
+    #[test]
+    fn the_state_redacts_what_redact_secrets_does_not() {
+        let state = render_state(&StateParts {
+            task: "deploy with API_KEY=abc123 and --password=hunter2",
+            recent: &[
+                (
+                    "Bash".to_owned(),
+                    "export GITHUB_TOKEN=\"ghsecret1\"".to_owned(),
+                ),
+                (
+                    "Bash".to_owned(),
+                    "$env:OPENAI_API_KEY = 'oaisecret2'".to_owned(),
+                ),
+                (
+                    "Bash".to_owned(),
+                    "tool --token tok3value --color=always".to_owned(),
+                ),
+            ],
+            tool_name: "Bash",
+            cwd: "/srv/app",
+            tool_input: "curl -H \"Authorization: Bearer opaque4\" -H 'Authorization: Basic YWJjOjEyMw=='                  https://bob:pw5secret@example.com/x {\"api_key\": \"json6\"} client_secret: yaml7                  RUST_LOG=debug",
+        });
+        for leaked in [
+            "abc123",
+            "hunter2",
+            "ghsecret1",
+            "oaisecret2",
+            "tok3value",
+            "opaque4",
+            "YWJjOjEyMw",
+            "pw5secret",
+            "json6",
+            "yaml7",
+        ] {
+            assert!(!state.contains(leaked), "{leaked} leaked: {state}");
+        }
+        assert!(state.contains("RUST_LOG=debug"), "{state}");
+        assert!(state.contains("--color=always"), "{state}");
+        assert!(state.contains("@example.com/x"), "{state}");
+        assert!(
+            state.contains("Authorization: Bearer [REDACTED]"),
+            "{state}"
+        );
+
+        let home = Path::new(r"C:\Users\Ana");
+        let out = redact_for_judge_with_home(
+            r"C:\Users\Ana\x c:/users/ana/y /c/Users/Ana/z C:\\Users\\Ana /c/Users/Anabel D:/other",
+            Some(home),
+        );
+        assert_eq!(out, r"~\x ~/y ~/z ~ /c/Users/Anabel D:/other");
+        let out = redact_for_judge_with_home("https://carol@host/p /opt/tool", Some(home));
+        assert_eq!(out, "https://carol@host/p /opt/tool");
+    }
 
     #[test]
     fn the_questions_are_the_measured_wording() {
