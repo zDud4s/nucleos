@@ -6041,29 +6041,28 @@ pub enum CancelOutcome {
 ///
 /// The proposal is closed FIRST, and that order is the point rather than tidiness: while it is
 /// pending, `/approve` is a working door into a node whose job is over — it would resume work
-/// nobody is waiting for, in a worktree the job no longer owns. `reject_proposal` also takes the run
-/// terminal through `worktree::release`, so the call after it is for the other case: a node parked
-/// with no pending proposal left to reject.
+/// nobody is waiting for, in a worktree the job no longer owns. `release` also takes the run
+/// terminal, so the call after it is for the other case: a node parked with no pending proposal
+/// left to expire.
 async fn cancel_parked_node(pool: &SqlitePool, run_id: i64) -> sqlx::Result<()> {
-    let pending: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM proposals
-         WHERE run_id = ? AND kind = 'action-approval' AND status = 'pending'",
+    // Expired, not rejected (spec A D14): cancelling the JOB says nothing about the action the
+    // node was asking about, and a rejection here is exactly the label that poisoned the first
+    // backtest. Closed FIRST for the reason this function always closed it first: while it is
+    // pending, `/approve` is a working door into a node whose job is over. Best effort, and the
+    // release below is why that is acceptable — a stale door is the lesser harm next to a
+    // project left blocked by a parked run.
+    if let Err(error) = crate::proposals::expire_for_run(
+        pool,
+        run_id,
+        "the job was cancelled before anybody answered",
     )
-    .bind(run_id)
-    .fetch_all(pool)
-    .await?;
-    for proposal_id in pending {
-        if let Err(error) = crate::proposals::reject_proposal(pool, proposal_id).await {
-            // Best effort, and the release below is why that is acceptable: a proposal that could
-            // not be rejected leaves a stale door, where a run that stayed parked would leave the
-            // whole project blocked. The worse of the two is the one this function must not skip.
-            tracing::warn!(
-                run_id,
-                proposal_id,
-                ?error,
-                "could not reject the parked node's proposal"
-            );
-        }
+    .await
+    {
+        tracing::warn!(
+            run_id,
+            ?error,
+            "could not expire the parked node's proposal"
+        );
     }
     crate::worktree::release(pool, run_id).await?;
     Ok(())
@@ -6196,6 +6195,47 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    /// Spec A D14: cancelling a job is not the owner saying "not this action", so the parked
+    /// node's question expires rather than being written down as a rejection.
+    #[tokio::test]
+    async fn cancelling_a_parked_node_expires_its_question() {
+        let pool = test_pool().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('p', 'x', 'awaiting_approval', 'worktree', '2026-09-27T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let proposal_id = crate::proposals::create_action_approval(
+            &pool,
+            run_id,
+            None,
+            Some("p"),
+            "Bash",
+            "why",
+            Some("git push"),
+        )
+        .await
+        .unwrap();
+
+        cancel_parked_node(&pool, run_id).await.unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "expired");
+        let run: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run, "cancelled");
     }
 
     async fn test_state(pool: sqlx::SqlitePool) -> AppState {

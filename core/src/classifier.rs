@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 17;
+pub const CLASSIFIER_VERSION: u32 = 19;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -22,7 +22,27 @@ pub const CLASSIFIER_VERSION: u32 = 17;
 /// this file's own changes were written under.
 ///
 /// `TodoWrite` writes the agent's task list, which lives in the session and not in the project.
-const READ_LOCAL_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Skill", "TodoWrite"];
+///
+/// `ToolSearch`, `ScheduleWakeup` and the `Task*` list tools joined on the judge spec's D13
+/// (2026-09-26-autopilot-modo-juiz-design.md). They are this same kind of thing: `ToolSearch`
+/// loads a tool's schema into the session (the tool itself still arrives here as its own call),
+/// `ScheduleWakeup` asks the CLI to resume the session later, and `TaskCreate`/`TaskUpdate`/
+/// `TaskList`/`TaskGet` are the CLI's newer spelling of `TodoWrite`'s list. Measured on the
+/// daemon's own ledger: 32 parked tool calls across 269 worktree runs, and in the last 30 days
+/// `ToolSearch` and `ScheduleWakeup` were the only tools still parking autonomous work.
+const READ_LOCAL_TOOLS: &[&str] = &[
+    "Read",
+    "Grep",
+    "Glob",
+    "Skill",
+    "TodoWrite",
+    "ToolSearch",
+    "ScheduleWakeup",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskList",
+    "TaskGet",
+];
 /// Tools that put bytes in a file the project keeps.
 ///
 /// **`NotebookEdit` joined this list on 2026-09-08, and it is a LOOSENING, deliberately.** Before
@@ -281,9 +301,11 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     // night. Its two destroying subcommands are refused next to the program instead, in
     // `uses_a_flag_its_program_makes_dangerous`.
     //
-    // `git stash list` and `git config --get` are NOT here, and their absence is the older decision
-    // rather than an oversight: `git_subcommands_that_can_mutate_stay_pending` pins both, arguing
-    // the porcelain and not the spelling. Neither cost a run, so neither is reversed here.
+    // `git config --get` is NOT here, and its absence is the older decision rather than an
+    // oversight: `git_subcommands_that_can_mutate_stay_pending` pins it, arguing the porcelain and
+    // not the spelling. `git stash list` WAS absent for the same reason until version 19, when the
+    // daemon's own ledger showed it parking autonomous runs (spec A D13); it is admitted below with
+    // `git stash show`, and bare `git stash` stays pending in that test.
     "git worktree list",
     "git show-ref",
     "git reflog",
@@ -381,6 +403,20 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     // `/usr/bin` first — and CLAUDE.md was corrected on 2026-08-30 so a run stops being told to
     // write it.
     "export",
+    // Spec A D13 (2026-09-26-autopilot-modo-juiz-design.md): reads measured parking autonomous
+    // runs on the daemon's ledger. `git stash list`/`show` print refs and diffs; `stash` itself,
+    // `pop`, `apply`, `push` and `drop` write, and are not prefixes of these.
+    "git stash list",
+    "git stash show",
+    // Converts a path spelling; touches no file.
+    "cygpath",
+    "which",
+    // Prints the global module directory.
+    "npm root",
+    // Two files in, a comparison out. Neither has an output-file flag; `--output` is refused by
+    // `writes_an_output_file` like everywhere else.
+    "diff",
+    "comm",
 ];
 /// Read-only commands whose safety lives in the EXACT form, so they get no argument tolerance: for
 /// `git branch` and `git remote` the listing spelling and the mutating spelling share a first token
@@ -411,6 +447,11 @@ const SAFE_EXACT_COMMANDS: &[&str] = &[
     // verbose flag with no subcommand, which prints the usage and does nothing else either.
     "cargo --version",
     "cargo -v",
+    // Exact: `tasklist /s <host>` queries another machine, so only the bare listing is admitted.
+    // A trailing `2>/dev/null` is stripped by `strip_fd_duplications` before this is consulted.
+    "tasklist",
+    "git --version",
+    "git version",
 ];
 
 pub struct Classification {
@@ -1014,6 +1055,11 @@ fn classify_segment(
     if is_safe_command(&normalized) {
         return Segment::ReadLocal;
     }
+    // Spec A D13: PowerShell's output shapers, and only under PowerShell — under Bash these names
+    // are unknown programs, and `ft`/`fl` are nothing at all.
+    if shell == crate::command_reader::Shell::PowerShell && shapes_output_only(&normalized) {
+        return Segment::ReadLocal;
+    }
     // Everything below WIDENS — a project's declared prefix, the owner's GitHub list, confinement to
     // the workspace — and none of them may widen a command onto this machine's own settings. A
     // compiled read above (`cat`, `grep`) still reads them; what cannot happen is a project that
@@ -1557,6 +1603,38 @@ fn is_safe_command(command: &str) -> bool {
             || matches_command_prefix(command, SAFE_COMMAND_PREFIXES)
             || checks_formatting_without_writing(command)
             || prints_lines_by_address(command))
+}
+
+/// PowerShell's output shapers — `Select-Object -First 100`, `Sort-Object CPU`, `Format-Table` —
+/// which is how a pipeline is cut and sorted there, the way `head` and `sort` are here.
+///
+/// Spec A D13. Refused as soon as a script block, a subexpression, a variable or a splat appears:
+/// `Select-Object @{e={...}}` and `Sort-Object { ... }` RUN the block for every row, which makes
+/// them `Invoke-Expression` in disguise. `Where-Object` is deliberately absent for the same
+/// reason — its whole grammar is a script block — and so is its alias `where`, which in cmd and
+/// Git bash is a harmless lookup and in PowerShell is that same filter.
+///
+/// Kept out of `is_safe_command` because that function serves the shell-agnostic lists, and a
+/// PowerShell-only rule there would force every caller to pass the shell. `sleep`/`Start-Sleep`
+/// are absent on purpose: an unbounded pause holds the run like a `tail -f`, which the classifier
+/// already refuses for the same reason.
+fn shapes_output_only(command: &str) -> bool {
+    const SHAPERS: &[&str] = &[
+        "select-object",
+        "sort-object",
+        "measure-object",
+        "format-table",
+        "format-list",
+        "format-wide",
+        "ft",
+        "fl",
+    ];
+    shell_form_is_readable(command)
+        && command
+            .split_whitespace()
+            .next()
+            .is_some_and(|program| SHAPERS.contains(&program))
+        && !command.contains(['{', '(', '$', '@'])
 }
 
 /// `sed -n` whose script only prints lines by their address — `'1,40p'`, `'5p'`, `'$p'`,
@@ -2771,12 +2849,90 @@ mod tests {
             // Mutates with two arguments, reads with one — the `git branch` problem again.
             "git symbolic-ref HEAD refs/heads/other",
             "git symbolic-ref HEAD",
-            // `git stash list` reads; bare `git stash` takes the working tree away.
+            // Bare git stash takes the working tree away; git stash list is a read since version 19.
             "git stash",
-            "git stash list",
         ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), None),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+    }
+
+    /// Spec A D13: shell reads that wrote nothing and still parked autonomous runs, each spelled
+    /// the way the daemon's ledger recorded it (classifier version 13, 2026-09-09..14).
+    #[test]
+    fn the_reads_that_parked_autonomous_runs_are_allowed() {
+        let workspace = Some(Path::new("C:/work/repo"));
+        for command in [
+            "git stash list",
+            "git stash list --format='%H %gs' | head -3",
+            "git stash show -p stash@{0}",
+            "tasklist 2>/dev/null | grep -i \"nucleos\\|cargo\\|rustc\" | head -20",
+            "cygpath -w /tmp/merge_head_runs.rs",
+            "which git",
+            "npm root -g 2>/dev/null",
+            "git --version",
+            "git version",
+            "diff -u a.rs b.rs",
+            "comm -23 used.txt defined.txt",
+            // D13's own example: a revision read, with no redirect, was already allowed.
+            "git show HEAD:core/src/runs.rs | sed -n '2300,2340p'",
+        ] {
+            let verdict = classify("Bash", &json!({ "command": command }), workspace);
+            assert_eq!(
+                verdict.decision.decision, "allow",
+                "{command}: {}",
+                verdict.reason
+            );
+        }
+        for command in [
+            "cargo fmt -p nucleos-core -- --check 2>&1 | Select-Object -First 100",
+            "git log --oneline -20 | Sort-Object | Format-Table -AutoSize",
+        ] {
+            let verdict = classify("PowerShell", &json!({ "command": command }), workspace);
+            assert_eq!(
+                verdict.decision.decision, "allow",
+                "{command}: {}",
+                verdict.reason
+            );
+        }
+    }
+
+    /// The writing siblings of every spelling admitted above stay where they were.
+    #[test]
+    fn the_writing_siblings_of_the_new_reads_still_ask() {
+        let workspace = Some(Path::new("C:/work/repo"));
+        for command in [
+            "git stash",
+            "git stash pop",
+            "git stash push -u -m tmp",
+            "git stash apply 5540893b",
+            "git stash list > stashes.txt",
+            "tasklist /s other-host",
+            "awk 'NR==1450,NR==1600' core/src/runs.rs",
+            "cargo metadata --no-deps --format-version 1",
+            "where npm",
+            "git config user.email test@x",
+            // A pause that never ends holds the run the way `tail -f` would.
+            "sleep 1",
+            // PowerShell's shapers are PowerShell's: under Bash these names are unknown programs.
+            "ls | Select-Object -First 5",
+            "ls | ft",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({ "command": command }), workspace),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+        for command in [
+            "git log --oneline | Select-Object @{n='x';e={Get-Content .env}}",
+            "git log --oneline | Where-Object { $_ -match 'fix' }",
+        ] {
+            assert_classification(
+                classify("PowerShell", &json!({ "command": command }), workspace),
                 "pending_approval",
                 "unrecognized",
             );
@@ -4782,7 +4938,16 @@ mod tests {
     /// agent writing its own is an agent onboarding itself — a tightening only. 17 adds the
     /// materialization record, `materialized.yaml`, and the per-worktree records under
     /// `materialized/`: rewriting one is how an agent would make the next materialization overwrite
-    /// a file a person edited — a tightening only.
+    /// a file a person edited — a tightening only. 18 (spec A D13, 2026-09-27) adds the agent's own
+    /// session tools — `ToolSearch`, `ScheduleWakeup`, `TaskCreate`/`TaskUpdate`/`TaskList`/
+    /// `TaskGet` — to `READ_LOCAL_TOOLS`: they change nothing outside the session, exactly like
+    /// `TodoWrite` beside them, and were parking autonomous runs. 19 (spec A D13, 2026-09-27) admits
+    /// the shell reads that still parked a run on the daemon's own ledger — `git stash list`/`show`,
+    /// `cygpath`, `which`, `npm root`, `diff`, `comm`, `tasklist`, `git --version`/`version` — and,
+    /// under PowerShell only, the output shapers `Select-Object`/`Sort-Object`/`Format-*`/`ft`/`fl`
+    /// with no script block, subexpression, variable or splat in them; `git stash list` was pinned
+    /// pending since the porcelain-not-spelling decision above and is reversed here, the one case in
+    /// this list that is a loosening on a name rather than a plain addition.
     /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
@@ -4797,7 +4962,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 17);
+        assert_eq!(CLASSIFIER_VERSION, 19);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
@@ -5765,6 +5930,35 @@ mod tests {
         }
         for tool_name in ["Edit", "Write", "Read", "Agent", "NotebookEdit"] {
             assert!(!reads_github_policy(tool_name), "{tool_name}");
+        }
+    }
+
+    /// Spec A D13 (2026-09-26-autopilot-modo-juiz-design.md): the agent's own bookkeeping tools
+    /// change nothing outside the session, exactly like `TodoWrite` beside them, and parked
+    /// autonomous runs on 15 of the last 30 days' refusals. What is left in `unrecognized-tool`
+    /// after this is genuinely external.
+    #[test]
+    fn the_agents_own_bookkeeping_tools_are_local() {
+        for tool in [
+            "ToolSearch",
+            "ScheduleWakeup",
+            "TaskCreate",
+            "TaskUpdate",
+            "TaskList",
+            "TaskGet",
+        ] {
+            assert_classification(
+                classify(tool, &json!({}), Some(Path::new("C:/work/repo"))),
+                "allow",
+                "read-local",
+            );
+        }
+        for tool in ["WebFetch", "WebSearch", "mcp__github__create_issue"] {
+            assert_classification(
+                classify(tool, &json!({}), Some(Path::new("C:/work/repo"))),
+                "pending_approval",
+                "unrecognized-tool",
+            );
         }
     }
 }

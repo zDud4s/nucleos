@@ -995,6 +995,17 @@ async fn main() {
         );
     }
 
+    // Spec A D14: heals rows a release or a job cancel left before `expire_for_run` existed, and
+    // does not `expect` — unlike the two reconciliations above, a pending approval holds no slot,
+    // so the daemon must not refuse to start over one.
+    match proposals::expire_orphaned_approvals(&pool).await {
+        Ok(0) => {}
+        Ok(expired) => tracing::warn!(
+            "expired {expired} approval(s) whose run had already stopped (spec A D14)"
+        ),
+        Err(error) => tracing::warn!(%error, "could not expire orphaned approvals at startup"),
+    }
+
     // After the run reconciliations, and for a reason worth stating: they mark every run left
     // `running` as `interrupted`, so by now no job has a live node under it — which means "has no
     // live run" is true of every job, including the ones that died in the gap between two nodes.
