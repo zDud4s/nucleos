@@ -875,7 +875,6 @@ pub struct FailureSignature {
 }
 
 /// Turns the volatile output of a failed gate into the failure it describes.
-#[cfg_attr(not(test), allow(dead_code))] // Tests only until Task 6.2a; production goes through consolidate.rs.
 pub fn failure_signature(output: &str) -> Option<FailureSignature> {
     if output.trim().is_empty() {
         return None;

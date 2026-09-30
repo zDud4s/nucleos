@@ -22,6 +22,7 @@ mod command_reader;
 mod commands;
 mod concurrency;
 mod config;
+mod consolidate;
 mod contacts;
 mod council;
 mod daemon_client;
