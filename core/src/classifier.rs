@@ -2465,7 +2465,7 @@ pub(crate) fn judge_guard(tool_name: &str, tool_input: &Value, cwd: &Path) -> Op
         .unwrap_or("");
     let shell = shell_for(tool_name);
     for segment in crate::command_reader::segments(command, shell) {
-        let words = shell_words(segment);
+        let words = guard_words(segment, shell);
         if is_irreversible(segment, &words) {
             return Some(JudgeGuard::Irreversible);
         }
@@ -2487,6 +2487,47 @@ pub(crate) fn judge_guard(tool_name: &str, tool_input: &Value, cwd: &Path) -> Op
         }
     }
     None
+}
+
+/// The words of one segment as G2 must see them. Under a POSIX shell a backslash inside double
+/// quotes escapes `"`, `\`, `$` and `` ` `` (and is kept literally before anything else), which
+/// `shell_words` does not model: `grep "\"a\"\|b"` came out as a word starting with `\`, which
+/// `normalize_path` turned into a leading `/` — an absolute path outside every run. Only the
+/// double-quoted case is taken: an unquoted backslash stays a Windows separator as `shell_words`
+/// reads it, and PowerShell, whose escape is the backtick, keeps `shell_words` whole.
+/// `shell_words` itself is left alone because `classify` reads it too (spec A D5: the guards
+/// change no verdict of `classify`).
+fn guard_words(segment: &str, shell: crate::command_reader::Shell) -> Vec<String> {
+    if shell != crate::command_reader::Shell::Posix {
+        return shell_words(segment);
+    }
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut characters = segment.chars().peekable();
+    while let Some(character) = characters.next() {
+        match (quote, character) {
+            (Some('"'), '\\')
+                if characters
+                    .peek()
+                    .is_some_and(|next| matches!(next, '"' | '\\' | '$' | '`')) =>
+            {
+                current.extend(characters.next());
+            }
+            (Some(active), value) if value == active => quote = None,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, value) if value.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(character),
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
 }
 
 /// `>>~/.bashrc`, `2>err.log` and `<.env` name their target glued to the operator; a bare `>` is
@@ -2883,6 +2924,26 @@ mod tests {
             guard("Bash", "echo x >| ../../outside/leak.txt"),
             Some(JudgeGuard::OutsideTheRun)
         );
+    }
+
+    #[test]
+    fn a_grep_pattern_with_escaped_alternation_is_a_read_inside_the_run() {
+        let command = r#"grep -rn "\"shadow\"\|\"worktree\"\|'shadow'\|'worktree'\|TRIAGE_MODE\|mode ==" ./core/src/*.rs | grep -v "^./core/src/triage.rs\|^./core/src/budget.rs" | head -80"#;
+        let cwd = Path::new("C:/Projects/nucleos-eval\\nucleos-worktrees\\T1-H3\\run-900323");
+        assert_eq!(judge_guard("Bash", &json!({"command": command}), cwd), None);
+        // The escape is read, not skipped: what it spells is still checked like any other word.
+        for command in [
+            r#"cat "a\"/../../x""#,
+            r#"cat "\$HOME/x""#,
+            r#"grep "\"a\"" > "\\tmp/x""#,
+            r#"cat "..\\x""#,
+        ] {
+            assert_eq!(
+                judge_guard("Bash", &json!({"command": command}), cwd),
+                Some(JudgeGuard::OutsideTheRun),
+                "{command}"
+            );
+        }
     }
 
     #[test]

@@ -2031,6 +2031,16 @@ pub struct RepoTrigger {
     pub prompt: String,
 }
 
+/// Spec A D7: the judge's thresholds for this project. Both absent means the measured defaults.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct JudgeConfig {
+    #[serde(default)]
+    pub allow_at: Option<f64>,
+    #[serde(default)]
+    pub deny_at: Option<f64>,
+}
+
 // `PartialEq` without `Eq`, transitively: a `ScheduleRule`'s `graph:` block holds a float now.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -2089,6 +2099,11 @@ pub struct AutopilotRules {
     /// autonomous node may move the worktree under a person who is working in it.
     #[serde(default)]
     pub attention_brake: Option<bool>,
+    /// Spec A D7: `judge: { allow_at, deny_at }`. Read through `judge_thresholds()` only, for the
+    /// reason `gate_retries()` gives: a caller reading the raw numbers would honour a loosening
+    /// the daemon promises never to honour.
+    #[serde(default)]
+    pub judge: JudgeConfig,
 }
 
 impl AutopilotRules {
@@ -2100,6 +2115,19 @@ impl AutopilotRules {
     /// somebody is typing.
     pub fn attention_brake(&self) -> bool {
         self.attention_brake.unwrap_or(true)
+    }
+
+    /// The thresholds the judge decides with, after D7's tightening, with a `warn` for every value
+    /// pulled back. Warned on every read and not once: it is read per consultation, and a loosened
+    /// safety threshold is the one line in this file that should keep being loud.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 5.1
+    pub fn judge_thresholds(&self) -> crate::judge::Thresholds {
+        let (thresholds, warnings) =
+            crate::judge::Thresholds::tightened(self.judge.allow_at, self.judge.deny_at);
+        for warning in warnings {
+            tracing::warn!(%warning, "autopilot.yaml: a judge threshold was pulled back to its limit");
+        }
+        thresholds
     }
 }
 
@@ -3883,6 +3911,34 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
             load_schedule_rules(Some(dir.path()), "p").unwrap(),
             AutopilotRules::default()
         );
+    }
+
+    /// Spec A D7: a project's judge thresholds are read, pulled to the measured limits, and a
+    /// misspelt key is a startup error like every other key in this file.
+    #[test]
+    fn a_projects_judge_thresholds_only_tighten() {
+        let absent = parse_schedule_rules("gate_command: \"true\"\n").unwrap();
+        assert_eq!(
+            absent.judge_thresholds(),
+            crate::judge::Thresholds::default()
+        );
+        let tighter = parse_schedule_rules("judge:\n  allow_at: 0.9\n  deny_at: 0.05\n").unwrap();
+        assert_eq!(
+            tighter.judge_thresholds(),
+            crate::judge::Thresholds {
+                allow_at: 0.9,
+                deny_at: 0.05
+            }
+        );
+        let looser = parse_schedule_rules("judge:\n  allow_at: 0.5\n  deny_at: 0.6\n").unwrap();
+        assert_eq!(
+            looser.judge_thresholds(),
+            crate::judge::Thresholds {
+                allow_at: crate::judge::ALLOW_AT_FLOOR,
+                deny_at: crate::judge::DENY_AT_CEILING,
+            }
+        );
+        assert!(parse_schedule_rules("judge:\n  allow: 0.9\n").is_err());
     }
 
     /// The brake a project never configured is ON, and the derived `Default` is exactly why this
