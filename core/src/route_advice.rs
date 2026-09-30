@@ -792,6 +792,14 @@ pub async fn resolve(
         resume: shape.resume || query.resume,
         ..shape
     };
+    // A resume continues a session the configured model and effort started, and switching either
+    // mid-session is not the router's call: it is asked and recorded, and never applied — the
+    // closest a resume comes to the handoff path, which is not routed at all.
+    let mode = if shape.resume && mode == Mode::Apply {
+        Mode::Shadow
+    } else {
+        mode
+    };
     let braked = braked_runners(pool).await;
     let runners: Vec<RunnerKind> = router
         .eligible(shape)
@@ -1817,6 +1825,55 @@ mod tests {
         assert_eq!(sent["runners"], serde_json::json!(["claude", "codex"]));
         assert_eq!(sent["models"], serde_json::json!(["claude-*", "gpt-*"]));
         assert_eq!(sent["task"], "implement the thing");
+    }
+
+    /// A resume continues a session the configured model and effort started: under `apply` it is
+    /// asked and recorded as `shadow`, and launches exactly as configured — whether the resume is
+    /// the query's (an approved run resumed) or the launch's own session id.
+    #[tokio::test]
+    async fn a_resume_under_apply_records_the_advice_and_launches_as_configured() {
+        for (query_resume, shape_resume) in [(true, false), (false, true)] {
+            let pool = pool().await;
+            let run_id = seed_run(&pool).await;
+            let (url, _received) = stub_router(
+                200,
+                serde_json::json!({"decision_id": "rt_r", "runner": "claude",
+                                   "model": "claude-opus-5", "effort": "low"}),
+            )
+            .await;
+            let (runner, _) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+
+            let resolved = resolve(
+                &pool,
+                run_id,
+                Arc::clone(&runner),
+                Some("claude-sonnet-5".into()),
+                Some("medium".into()),
+                Some(RouteQuery {
+                    resume: query_resume,
+                    ..query()
+                }),
+                RunShape {
+                    resume: shape_resume,
+                    ..shape()
+                },
+                Speed::Normal,
+            )
+            .await;
+
+            assert!(Arc::ptr_eq(&resolved.runner, &runner));
+            assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-5"));
+            assert_eq!(resolved.effort.as_deref(), Some("medium"));
+            let row = route_row(&pool, run_id).await;
+            assert_eq!(row.0.as_deref(), Some("claude-sonnet-5"));
+            assert_eq!(row.1.as_deref(), Some("medium"));
+            assert_eq!(row.3.as_deref(), Some("shadow"));
+            assert_eq!(
+                row.6.as_deref(),
+                Some("claude-opus-5"),
+                "the advice is recorded"
+            );
+        }
     }
 
     /// The advice launches on its own runner, its effort held under the speed's ceiling, and the

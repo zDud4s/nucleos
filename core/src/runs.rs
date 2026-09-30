@@ -3724,8 +3724,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // plan model rather than dropping back to the runner's own.
         state.runner.model_for_stage(stage.as_deref()),
         None,
-        // Routed like any launch, but as a resume: only the runner that holds the session is
-        // eligible, whatever the router would prefer.
+        // Asked like any launch, but as a resume: only the runner that holds the session is
+        // eligible, and the advice is recorded in shadow and never applied — the session keeps the
+        // model and effort it started with (`route_advice::resolve`).
         Some(crate::route_advice::RouteQuery {
             task: prompt_for_route,
             stage: stage.clone(),
