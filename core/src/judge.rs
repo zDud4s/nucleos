@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::classifier;
@@ -70,6 +71,7 @@ pub enum Band {
 }
 
 impl Band {
+    #[allow(dead_code)] // consumed by Task 5.1
     #[allow(dead_code)] // consumed by Task 5.1
     pub fn as_db_str(self) -> &'static str {
         match self {
@@ -627,6 +629,47 @@ pub fn render_state(parts: &StateParts<'_>) -> String {
     state.chars().take(STATE_CAP_CHARS).collect()
 }
 
+/// D2: the judge's setting for a project, photographed onto each run at launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JudgeMode {
+    Off,
+    Observe,
+    Enforce,
+}
+
+impl JudgeMode {
+    #[allow(dead_code)] // consumed by Task 5.1
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Observe => "observe",
+            Self::Enforce => "enforce",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "observe" => Some(Self::Observe),
+            "enforce" => Some(Self::Enforce),
+            _ => None,
+        }
+    }
+
+    /// D11: what a run's snapshot means for that run. A `shadow` run never acts, so `enforce`
+    /// there observes, which is what happens when the scheduler demotes an Active project's
+    /// catch-up to a shadow run (`scheduler.rs:648-655`). No other mode reaches the judge.
+    pub fn for_run(self, run_mode: &str) -> Self {
+        match (run_mode, self) {
+            ("worktree", mode) => mode,
+            ("shadow", Self::Off) => Self::Off,
+            ("shadow", _) => Self::Observe,
+            _ => Self::Off,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,6 +986,62 @@ mod tests {
             huge_task.contains("{\"command\":\"ls\"}\nTOOL_INPUT>>>"),
             "the action's input survives a long task"
         );
+    }
+
+    async fn pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    /// D2: every project and every run starts with the judge off, and the column refuses a mode
+    /// nobody defined.
+    #[tokio::test]
+    async fn the_judge_starts_off_everywhere() {
+        let pool = pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'worktree', '2026-09-27T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let project: String = sqlx::query_scalar("SELECT judge FROM autopilot_state")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let run: String = sqlx::query_scalar("SELECT judge FROM runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((project.as_str(), run.as_str()), ("off", "off"));
+        assert!(
+            sqlx::query("UPDATE runs SET judge = 'maybe'")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
+    /// D11: a shadow run never acts, so an `enforce` snapshot there observes; only a worktree run
+    /// can be enforced, and every other mode never reaches the judge.
+    #[test]
+    fn what_a_snapshot_means_for_a_run() {
+        assert_eq!(JudgeMode::Enforce.for_run("worktree"), JudgeMode::Enforce);
+        assert_eq!(JudgeMode::Enforce.for_run("shadow"), JudgeMode::Observe);
+        assert_eq!(JudgeMode::Observe.for_run("shadow"), JudgeMode::Observe);
+        assert_eq!(JudgeMode::Off.for_run("shadow"), JudgeMode::Off);
+        assert_eq!(JudgeMode::Enforce.for_run("real"), JudgeMode::Off);
+        assert_eq!(JudgeMode::from_db_str("observe"), Some(JudgeMode::Observe));
+        assert_eq!(JudgeMode::from_db_str("maybe"), None);
     }
 }
 
