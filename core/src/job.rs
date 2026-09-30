@@ -6058,7 +6058,11 @@ async fn cancel_parked_node(pool: &SqlitePool, run_id: i64) -> sqlx::Result<()> 
     )
     .await
     {
-        tracing::warn!(run_id, ?error, "could not expire the parked node's proposal");
+        tracing::warn!(
+            run_id,
+            ?error,
+            "could not expire the parked node's proposal"
+        );
     }
     crate::worktree::release(pool, run_id).await?;
     Ok(())
@@ -6207,7 +6211,13 @@ mod tests {
         .unwrap()
         .last_insert_rowid();
         let proposal_id = crate::proposals::create_action_approval(
-            &pool, run_id, None, Some("p"), "Bash", "why", Some("git push"),
+            &pool,
+            run_id,
+            None,
+            Some("p"),
+            "Bash",
+            "why",
+            Some("git push"),
         )
         .await
         .unwrap();

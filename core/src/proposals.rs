@@ -1181,7 +1181,10 @@ mod tests {
 
         reject_proposal(&pool, proposal_id).await.unwrap();
 
-        assert_eq!(get(&pool, proposal_id).await.unwrap().unwrap().status, "rejected");
+        assert_eq!(
+            get(&pool, proposal_id).await.unwrap().unwrap().status,
+            "rejected"
+        );
     }
 
     /// Rows left behind before this existed are healed at startup, and a run still waiting keeps
