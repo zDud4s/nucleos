@@ -84,7 +84,7 @@ struct Targets {
     targets: Vec<RouteTarget>,
 }
 
-/// Why no advice came back. Three variants because the router means three different things, and
+/// Why no advice came back. Four variants because each means something different, and
 /// the warning a person reads should say which one it was — though every one of them leads to the
 /// same place: the run launches exactly as it would have without a router.
 #[derive(Debug)]
@@ -93,8 +93,11 @@ pub enum RouterError {
     Invalid(String),
     /// 422: the request's filters left no tier. Honest, and expected while catalogues disagree.
     NoEligibleTier(String),
-    /// Not listening, too slow, any other status, or an answer that would not parse.
+    /// Not listening, too slow, or any other status.
     Unavailable(String),
+    /// A success status whose body is not the schema this client reads: the router is up and
+    /// speaking another version of the API.
+    Malformed(String),
 }
 
 impl std::fmt::Display for RouterError {
@@ -103,6 +106,7 @@ impl std::fmt::Display for RouterError {
             Self::Invalid(why) => write!(f, "llm-router refused the request: {why}"),
             Self::NoEligibleTier(why) => write!(f, "llm-router had no eligible tier: {why}"),
             Self::Unavailable(why) => write!(f, "llm-router unavailable: {why}"),
+            Self::Malformed(why) => write!(f, "llm-router answered in an unreadable shape: {why}"),
         }
     }
 }
@@ -157,10 +161,7 @@ impl RouterClient {
                 _ => RouterError::Unavailable(why),
             });
         }
-        response
-            .json::<RouteAdvice>()
-            .await
-            .map_err(|error| RouterError::Unavailable(error.to_string()))
+        response.json::<RouteAdvice>().await.map_err(body_error)
     }
 
     /// Every tier the router could tell a caller to run.
@@ -184,7 +185,17 @@ impl RouterClient {
             .json::<Targets>()
             .await
             .map(|targets| targets.targets)
-            .map_err(|error| RouterError::Unavailable(error.to_string()))
+            .map_err(body_error)
+    }
+}
+
+/// A body that failed to decode is `Malformed`; one that failed to arrive (a timeout mid-body, a
+/// dropped connection) is still `Unavailable`.
+fn body_error(error: reqwest::Error) -> RouterError {
+    if error.is_decode() {
+        RouterError::Malformed(error.to_string())
+    } else {
+        RouterError::Unavailable(error.to_string())
     }
 }
 
@@ -393,6 +404,24 @@ mod tests {
         assert!(
             matches!(empty, Err(RouterError::NoEligibleTier(_))),
             "{empty:?}"
+        );
+    }
+
+    /// An answer that arrives but does not parse is its own failure: the router is up and speaking
+    /// a different schema, which is a version mismatch to fix, not an outage to wait out.
+    #[tokio::test]
+    async fn an_answer_that_does_not_parse_is_told_apart_from_an_outage() {
+        let request = RouteRequest {
+            task: "t".into(),
+            ..RouteRequest::default()
+        };
+        let (url, _rx) = stub_router(200, serde_json::json!({"unexpected": true})).await;
+        let answer = RouterClient::new(&url, Duration::from_secs(2))
+            .route(&request)
+            .await;
+        assert!(
+            matches!(answer, Err(RouterError::Malformed(_))),
+            "{answer:?}"
         );
     }
 
