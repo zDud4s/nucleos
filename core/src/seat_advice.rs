@@ -313,12 +313,15 @@ pub async fn recruit_default(
 // network — a router that is down never costs a seat, a round or a council a second.
 
 /// The router's word for how a team item's run ended. `completed` is the item filed; `failed` is
-/// the specialist's own failure unless the run ended on a 429 or a transient API error, which says
-/// nothing about the model; `timed_out` is the wall clock, not the work. A cancelled or interrupted
+/// the specialist's own failure unless the run ended on a 429 or a transient API error, or never
+/// launched at all (no stdout), none of which says anything about the model; `timed_out` is the wall clock, not the work. A cancelled or interrupted
 /// run was stopped from outside and is not reported.
 pub fn team_item_outcome(run_status: &str, stdout: &str) -> Option<Outcome> {
     match run_status {
         "completed" => Some(Outcome::Pass),
+        // A run that wrote nothing never launched (a spawn failure lands its reason in stderr):
+        // infrastructure, as `runs.rs` reports a run's own launch failure, never the model's fail.
+        "failed" if stdout.trim().is_empty() => Some(Outcome::Error),
         "failed" => Some(outcome_of_run_end(stdout).unwrap_or(Outcome::Fail)),
         "timed_out" => Some(Outcome::Error),
         _ => None,
@@ -795,6 +798,10 @@ mod tests {
             Some(Outcome::Error)
         );
         assert_eq!(team_item_outcome("timed_out", ""), Some(Outcome::Error));
+        // A seat that never launched wrote no stdout at all: infrastructure, as a run's own
+        // launch failure is in `runs.rs`, and never the model's `fail`.
+        assert_eq!(team_item_outcome("failed", ""), Some(Outcome::Error));
+        assert_eq!(team_item_outcome("failed", " \n"), Some(Outcome::Error));
         assert_eq!(team_item_outcome("cancelled", ""), None);
         assert_eq!(team_item_outcome("interrupted", ""), None);
         assert_eq!(team_item_outcome("running", ""), None);
@@ -831,6 +838,34 @@ mod tests {
         let (id, body) = reported(&mut received).await;
         assert_eq!(id, "rt_failed");
         assert_eq!(body, serde_json::json!({"status": "fail"}));
+    }
+
+    /// A seat whose run never launched (failed, NULL stdout) reports `error`, and one that ended on
+    /// a 429 reports `rate_limited`: neither says anything about the model.
+    #[tokio::test]
+    async fn a_team_item_that_never_launched_or_hit_a_429_is_not_reported_as_a_fail() {
+        let pool = pool().await;
+        let (url, mut received) = outcome_router(200).await;
+        let router = router(&url, &[], 1000);
+
+        let never = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at, stderr, route_decision_id)
+             VALUES ('x', 'failed', 'team', '2026-09-30T00:00:00Z', 'spawn failed', 'rt_never')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        report_team_item(&pool, Some(Arc::clone(&router)), never).await;
+        let (id, body) = reported(&mut received).await;
+        assert_eq!(id, "rt_never");
+        assert_eq!(body, serde_json::json!({"status": "error"}));
+
+        let limited = seed_ended(&pool, "failed", &ended_on_api_error("429"), Some("rt_429")).await;
+        report_team_item(&pool, Some(router), limited).await;
+        let (id, body) = reported(&mut received).await;
+        assert_eq!(id, "rt_429");
+        assert_eq!(body, serde_json::json!({"status": "rate_limited"}));
     }
 
     /// No decision, no router, a cancelled run or a missing row: nothing is sent.
