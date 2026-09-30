@@ -945,3 +945,71 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod regression {
+    use super::*;
+    use serde_json::json;
+
+    /// Spec A D11: renders the owner's local 165-case regression set through THIS code, so the
+    /// regression measures what production sends and what production guards, and not the Python
+    /// prototype. `#[ignore]` because the set lives outside the repository and never enters git;
+    /// it sends nothing anywhere. Run by hand, as the implementation plan says (Task 3.4).
+    #[test]
+    #[ignore = "reads the owner's local regression set; run by hand"]
+    fn renders_the_local_regression_set() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("NUCLEOS_JUDGE_REGRESSION_DIR")
+                .expect("set NUCLEOS_JUDGE_REGRESSION_DIR to the regression directory"),
+        );
+        let text = std::fs::read_to_string(dir.join("inputs_165.json")).unwrap();
+        let cases: Vec<Value> = serde_json::from_str(&text).unwrap();
+        let rendered: Vec<Value> = cases
+            .iter()
+            .map(|case| {
+                let tool = case["tool_name"].as_str().unwrap_or("unknown");
+                let input = &case["tool_input"];
+                let cwd = case["cwd"].as_str().unwrap_or("");
+                let recent: Vec<(String, String)> = case["recent"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|pair| {
+                        let name = pair[0].as_str().unwrap_or("").to_owned();
+                        let raw = pair[1].as_str().unwrap_or("");
+                        let cleaned = serde_json::from_str::<Value>(raw)
+                            .map(|value| clean_tool_input(&name, &value))
+                            .unwrap_or_else(|_| raw.to_owned());
+                        (name, cleaned)
+                    })
+                    .collect();
+                let cleaned = clean_tool_input(tool, input);
+                let state = render_state(&StateParts {
+                    task: case["task"].as_str().unwrap_or(""),
+                    recent: &recent,
+                    tool_name: tool,
+                    cwd,
+                    tool_input: &cleaned,
+                });
+                let workspace = (!cwd.is_empty()).then(|| Path::new(cwd));
+                let class = case["action_class"].as_str().unwrap_or("unrecognized");
+                json!({
+                    "set": case["set"],
+                    "id": case["id"],
+                    "label": case["label"],
+                    "state": state,
+                    "guard": workspace
+                        .and_then(|cwd| classifier::judge_guard(tool, input, cwd))
+                        .map(|guard| format!("{guard:?}")),
+                    "network": classifier::runs_network_or_inline_code(tool, input),
+                    "may_allow": judge_may_allow(tool, input, workspace, class),
+                })
+            })
+            .collect();
+        std::fs::write(
+            dir.join("rust_render.json"),
+            serde_json::to_string_pretty(&rendered).unwrap(),
+        )
+        .unwrap();
+    }
+}
