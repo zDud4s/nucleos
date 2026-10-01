@@ -127,7 +127,7 @@ fn parse_answers(payload: &Value, questions: &[Question]) -> Result<Answers, Jud
     })
 }
 
-enum KeySource {
+pub(crate) enum KeySource {
     /// D3: the keyring, read per call with `spawn_blocking` (the keyring is synchronous), the way
     /// `github.rs` reads its token. `secrets.rs` refuses files and environment variables.
     Keyring,
@@ -152,7 +152,7 @@ impl JevJudge {
         Self::with(base_url, KeySource::Keyring, CLIENT_TIMEOUT)
     }
 
-    fn with(base_url: &str, key: KeySource, timeout: Duration) -> Self {
+    pub(crate) fn with(base_url: &str, key: KeySource, timeout: Duration) -> Self {
         Self {
             client: OnceLock::new(),
             timeout,
@@ -243,26 +243,44 @@ impl Judge for JevJudge {
 /// server instead.
 #[cfg(test)]
 pub(crate) struct ScriptedJudge {
-    reply: Result<(f64, f64), JudgeError>,
+    /// Every key's answer; a key not here is answered 0.5, as before.
+    reply: Result<BTreeMap<&'static str, f64>, JudgeError>,
     delay: Option<Duration>,
     calls: std::sync::atomic::AtomicUsize,
     pub(crate) last_state: std::sync::Mutex<Option<String>>,
+    /// Spec B: the keys of each call, in order - how a test proves a question was NOT asked.
+    asked: std::sync::Mutex<Vec<Vec<&'static str>>>,
 }
 
 #[cfg(test)]
 impl ScriptedJudge {
-    fn build(reply: Result<(f64, f64), JudgeError>, delay: Option<Duration>) -> Arc<Self> {
+    fn build(
+        reply: Result<BTreeMap<&'static str, f64>, JudgeError>,
+        delay: Option<Duration>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             reply,
             delay,
             calls: Default::default(),
             last_state: Default::default(),
+            asked: Default::default(),
         })
     }
 
     /// Answers A's two questions; any other question is answered 0.5.
     pub(crate) fn answering(p_in_scope: f64, p_safe: f64) -> Arc<Self> {
-        Self::build(Ok((p_in_scope, p_safe)), None)
+        Self::answering_keys(&[(super::IN_SCOPE, p_in_scope), (super::SAFE, p_safe)])
+    }
+
+    pub(crate) fn answering_keys(answers: &[(&'static str, f64)]) -> Arc<Self> {
+        Self::build(Ok(answers.iter().copied().collect()), None)
+    }
+
+    pub(crate) fn answering_keys_slowly(
+        delay: Duration,
+        answers: &[(&'static str, f64)],
+    ) -> Arc<Self> {
+        Self::build(Ok(answers.iter().copied().collect()), Some(delay))
     }
 
     pub(crate) fn failing(error: JudgeError) -> Arc<Self> {
@@ -270,11 +288,15 @@ impl ScriptedJudge {
     }
 
     pub(crate) fn slow(delay: Duration) -> Arc<Self> {
-        Self::build(Ok((0.99, 0.99)), Some(delay))
+        Self::answering_keys_slowly(delay, &[(super::IN_SCOPE, 0.99), (super::SAFE, 0.99)])
     }
 
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn asked_keys(&self) -> Vec<Vec<&'static str>> {
+        self.asked.lock().unwrap().clone()
     }
 }
 
@@ -288,21 +310,18 @@ impl Judge for ScriptedJudge {
     async fn ask(&self, state: &str, questions: &[Question]) -> Result<Answers, JudgeError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.last_state.lock().unwrap() = Some(state.to_owned());
+        self.asked
+            .lock()
+            .unwrap()
+            .push(questions.iter().map(|q| q.key).collect());
         if let Some(delay) = self.delay {
             tokio::time::sleep(delay).await;
         }
-        let (p_in_scope, p_safe) = self.reply.clone()?;
+        let map = self.reply.clone()?;
         Ok(Answers {
             probabilities: questions
                 .iter()
-                .map(|question| {
-                    let p = match question.key {
-                        super::IN_SCOPE => p_in_scope,
-                        super::SAFE => p_safe,
-                        _ => 0.5,
-                    };
-                    (question.key, p)
-                })
+                .map(|q| (q.key, *map.get(q.key).unwrap_or(&0.5)))
                 .collect(),
             input_tokens: Some(700),
             model: Some(JUDGE_MODEL.to_owned()),
@@ -317,6 +336,46 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// Spec B's tests need answers by key, a delay, and the keys each call asked.
+    #[tokio::test]
+    async fn the_scripted_judge_answers_by_key_and_remembers_what_it_was_asked() {
+        let judge = ScriptedJudge::answering_keys(&[("off_task", 0.9), ("needed", 0.2)]);
+        let questions = [
+            super::super::Question {
+                key: "off_task",
+                instructions: "x",
+            },
+            super::super::Question {
+                key: "needed",
+                instructions: "y",
+            },
+            super::super::Question {
+                key: "avoidable",
+                instructions: "z",
+            },
+        ];
+        let answers = judge.ask("s", &questions).await.unwrap();
+        assert_eq!(answers.probabilities["off_task"], 0.9);
+        assert_eq!(
+            answers.probabilities["avoidable"], 0.5,
+            "unscripted keys answer 0.5, as A's do"
+        );
+        assert_eq!(
+            judge.asked_keys(),
+            vec![vec!["off_task", "needed", "avoidable"]]
+        );
+        let a = ScriptedJudge::answering(0.97, 0.91);
+        let answers = a.ask("s", crate::judge::JUDGE_QUESTIONS).await.unwrap();
+        assert_eq!(
+            (
+                answers.probabilities["in_scope"],
+                answers.probabilities["safe"]
+            ),
+            (0.97, 0.91),
+            "A's constructor is unchanged"
+        );
+    }
 
     async fn serve(handler: axum::routing::MethodRouter) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
