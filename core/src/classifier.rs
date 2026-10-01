@@ -2351,7 +2351,6 @@ const INLINE_CODE_FLAGS: &[&str] = &["-c", "-e", "--eval", "-p", "-r", "-command
 /// contradicts it. What the predicate needs is to be able to enumerate the line's tokens, which
 /// `command_reader::read` answers (`Unreadable` for a command substitution, a heredoc it cannot
 /// bound, a lone `&`) together with an unterminated quote (`without_quoted_text` is `None`).
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 5.2
 pub(crate) fn runs_network_or_inline_code(tool_name: &str, tool_input: &Value) -> bool {
     if !reads_github_policy(tool_name) {
         return false;
@@ -2443,7 +2442,6 @@ pub(crate) enum JudgeGuard {
 /// comparison `writes_outside_cwd` makes, `with_git_bash_drive` for `/c/…` under Git's bash), and
 /// it is lexical: a link inside the worktree that points out of it passes. Closing that needs the
 /// disk at every call, which is the OS sandbox's job (`2026-09-14-sandbox-de-so-design.md`).
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 5.2
 pub(crate) fn judge_guard(tool_name: &str, tool_input: &Value, cwd: &Path) -> Option<JudgeGuard> {
     let workspace = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
     if WRITE_TOOLS.contains(&tool_name) {

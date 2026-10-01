@@ -6,9 +6,6 @@
 //! This file starts as the PURE half: what is asked, how the answer is read, what the judge may
 //! never approve, which calls it is asked about, and the text it is shown. The client, the rows
 //! and the review queue arrive with the plan's later chunks.
-// Nothing outside the tests consumes this until the hook is wired (plan Task 5.2); Task 6.4
-// removes this line.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -926,6 +923,15 @@ async fn thresholds_for(
     .map_err(|error| error.to_string())?
     .map(|rules| rules.judge_thresholds())
     .map_err(|error| error.to_string())
+}
+
+/// Review item G: why this project's thresholds cannot be read, if they cannot - the same read the
+/// hook makes, so the panel says exactly what the hook will do (fall back to the classifier).
+pub(crate) async fn rules_problem(
+    machine_root: Option<PathBuf>,
+    project_id: &str,
+) -> Option<String> {
+    thresholds_for(machine_root, Some(project_id)).await.err()
 }
 
 /// D9: the state for one call. The task is `runs.prompt` (NOT NULL) or, for a job node, its

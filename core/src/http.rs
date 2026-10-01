@@ -64,6 +64,10 @@ pub fn build_router(state: AppState) -> Router {
             get(get_autopilot_state).post(post_autopilot_state),
         )
         .route(
+            "/autopilot/judge",
+            get(get_autopilot_judge).post(post_autopilot_judge),
+        )
+        .route(
             "/autopilot/kill",
             get(get_autopilot_kill).post(post_autopilot_kill),
         )
@@ -3144,6 +3148,75 @@ async fn post_autopilot_state(
         project_id: body.project_id,
         mode,
     }))
+}
+
+#[derive(Deserialize)]
+struct AutopilotJudgeRequest {
+    project_id: String,
+    judge: String,
+}
+
+#[derive(Serialize)]
+struct AutopilotJudgeResponse {
+    project_id: String,
+    judge: crate::judge::JudgeMode,
+    /// Review item G: `Some` when this project's `autopilot.yaml` cannot be read, which leaves
+    /// the judge without effect (every call falls back to the classifier, D7/D10).
+    rules_error: Option<String>,
+}
+
+/// One project's judge, as both handlers answer it.
+async fn judge_status(
+    state: &AppState,
+    project_id: String,
+) -> Result<AutopilotJudgeResponse, StatusCode> {
+    let judge = autopilot::autopilot_judge_mode(&state.pool, &project_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rules_error =
+        crate::judge::rules_problem(state.machine_config_root.clone(), &project_id).await;
+    Ok(AutopilotJudgeResponse {
+        project_id,
+        judge,
+        rules_error,
+    })
+}
+
+/// Spec A: one project's judge setting. Its own route beside `/autopilot/state` rather than a
+/// field on the roster: the panel reads one project at a time, and a field on `ProjectSummary`
+/// would touch nine literals and the CLI's deserialiser for nothing the roster shows.
+///
+/// Admin-only, by appearing in no table in `auth.rs` (not in `READ_ONLY_ROUTES`): it reveals and
+/// changes what a model may decide for a project, and default-deny is the safe side of that.
+async fn get_autopilot_judge(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<AutopilotJudgeResponse>, StatusCode> {
+    judge_status(&state, query.project_id).await.map(Json)
+}
+
+async fn post_autopilot_judge(
+    State(state): State<AppState>,
+    Json(body): Json<AutopilotJudgeRequest>,
+) -> Result<Json<AutopilotJudgeResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let judge = crate::judge::JudgeMode::from_db_str(&body.judge)
+        .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "invalid"))?;
+    match autopilot::set_project_judge(&state.pool, &body.project_id, judge).await {
+        Ok(_) => judge_status(&state, body.project_id)
+            .await
+            .map(Json)
+            .map_err(|status| refusal(status, "internal")),
+        Err(autopilot::JudgeActivationError::UnknownProject) => {
+            Err(refusal(StatusCode::NOT_FOUND, "unknown_project"))
+        }
+        Err(autopilot::JudgeActivationError::EnforceUnavailable) => {
+            Err(refusal(StatusCode::CONFLICT, "enforce_unavailable"))
+        }
+        Err(autopilot::JudgeActivationError::Database(error)) => {
+            tracing::warn!(%error, "setting a project's judge failed");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
 }
 
 async fn get_autopilot_kill(
@@ -21949,6 +22022,80 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn a_projects_judge_is_read_and_set_over_http() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/judge",
+            Some(serde_json::json!({"project_id": "p", "judge": "observe"})),
+        )
+        .await;
+        assert_eq!(
+            (status, body["judge"].as_str()),
+            (StatusCode::OK, Some("observe"))
+        );
+        let (status, body) =
+            workflow_call(state.clone(), "GET", "/autopilot/judge?project_id=p", None).await;
+        assert_eq!(
+            (status, body["judge"].as_str()),
+            (StatusCode::OK, Some("observe"))
+        );
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/judge",
+            Some(serde_json::json!({"project_id": "p", "judge": "maybe"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/autopilot/judge",
+            Some(serde_json::json!({"project_id": "p", "judge": "enforce"})),
+        )
+        .await;
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::CONFLICT, Some("enforce_unavailable"))
+        );
+    }
+
+    /// Review item G: a rules file the judge cannot read leaves the judge without effect for that
+    /// project, and the panel has to be able to say so, not only the verdict rows.
+    #[tokio::test]
+    async fn a_projects_unreadable_rules_are_named_beside_its_judge() {
+        let mut state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("projects").join("p");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("autopilot.yaml"),
+            "judge: [not, a, map]
+",
+        )
+        .unwrap();
+        state.machine_config_root = Some(root.path().to_path_buf());
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) =
+            workflow_call(state, "GET", "/autopilot/judge?project_id=p", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["rules_error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty())
+        );
     }
 
     /// The library is listed, a pin records the hash, and a bundle edited under it reads as drift.

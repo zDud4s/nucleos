@@ -301,9 +301,83 @@ pub async fn project_spend(
 
     let rows = spend_rows(raw)?;
     Ok(crate::project_readings::Cost {
-        usd: compute_spend(&rows, now, &cfg),
+        usd: compute_spend(&rows, now, &cfg)
+            + judge_spend(
+                pool,
+                Some(since),
+                Some(now),
+                JudgeSpendScope::Project(project_id),
+            )
+            .await?,
         runs: rows.len() as i64,
     })
+}
+
+/// Whose judge calls a spend reader is asking about.
+pub enum JudgeSpendScope<'a> {
+    /// Every judge call. The judge is only consulted for `shadow` and `worktree` runs, both on the
+    /// autonomy list `autonomous_rows` spells out, so "all" IS the autonomous figure.
+    All,
+    Project(&'a str),
+    Job(i64),
+}
+
+/// Spec A D12: what the judge cost, summed on its own from `judge_verdicts.cost_usd` and never
+/// written into `runs.cost_usd` (that column is overwritten when a run terminates, and NULL there
+/// is the "approximate from the time" signal `compute_spend` reads). Every consultation counts,
+/// observation included: it costs money before the judge decides anything.
+///
+/// `since`/`until` bound `judge_verdicts.created_at`; a verdict is instantaneous, so there is no
+/// overlap question like `overlaps_window`'s. Three spelled-out queries rather than one assembled,
+/// for the reason `spend_rows` gives.
+pub async fn judge_spend(
+    pool: &SqlitePool,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    scope: JudgeSpendScope<'_>,
+) -> sqlx::Result<f64> {
+    let since = since.map(|at| at.to_rfc3339());
+    let until = until.map(|at| at.to_rfc3339());
+    match scope {
+        JudgeSpendScope::All => {
+            sqlx::query_scalar(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM judge_verdicts
+                 WHERE (?1 IS NULL OR created_at >= ?1) AND (?2 IS NULL OR created_at < ?2)",
+            )
+            .bind(since)
+            .bind(until)
+            .fetch_one(pool)
+            .await
+        }
+        JudgeSpendScope::Project(project_id) => {
+            sqlx::query_scalar(
+                "SELECT COALESCE(SUM(judge_verdicts.cost_usd), 0.0) FROM judge_verdicts
+                 JOIN runs ON runs.id = judge_verdicts.run_id
+                 WHERE runs.project_id = ?3
+                   AND (?1 IS NULL OR judge_verdicts.created_at >= ?1)
+                   AND (?2 IS NULL OR judge_verdicts.created_at < ?2)",
+            )
+            .bind(since)
+            .bind(until)
+            .bind(project_id)
+            .fetch_one(pool)
+            .await
+        }
+        JudgeSpendScope::Job(job_id) => {
+            sqlx::query_scalar(
+                "SELECT COALESCE(SUM(judge_verdicts.cost_usd), 0.0) FROM judge_verdicts
+                 JOIN runs ON runs.id = judge_verdicts.run_id
+                 WHERE runs.job_id = ?3
+                   AND (?1 IS NULL OR judge_verdicts.created_at >= ?1)
+                   AND (?2 IS NULL OR judge_verdicts.created_at < ?2)",
+            )
+            .bind(since)
+            .bind(until)
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+        }
+    }
 }
 
 /// Spelled out twice above rather than assembled, because sqlx refuses SQL built at runtime — a
@@ -354,7 +428,8 @@ fn spend_rows(raw: Vec<RawRow>) -> sqlx::Result<Vec<SpendRow>> {
 pub async fn job_spend(pool: &SqlitePool, job_id: i64, now: DateTime<Utc>) -> sqlx::Result<f64> {
     let cfg = load_budget_config(pool).await?;
     let rows = job_rows(pool, job_id).await?;
-    Ok(compute_spend(&rows, now, &cfg))
+    Ok(compute_spend(&rows, now, &cfg)
+        + judge_spend(pool, None, None, JudgeSpendScope::Job(job_id)).await?)
 }
 
 /// Total autonomous spend in the current budget window (calendar-anchored in UTC by the configured period).
@@ -366,7 +441,8 @@ pub async fn window_spend(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result
         .into_iter()
         .filter(|row| row.created_at >= since)
         .collect();
-    Ok(compute_spend(&rows, now, &cfg))
+    Ok(compute_spend(&rows, now, &cfg)
+        + judge_spend(pool, Some(since), None, JudgeSpendScope::All).await?)
 }
 
 /// PURE: whether a run was still spending at some point in `[since, now]`.
@@ -402,7 +478,8 @@ pub async fn hourly_spend(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result
             ..row
         })
         .collect();
-    Ok(compute_spend(&rows, now, &cfg))
+    Ok(compute_spend(&rows, now, &cfg)
+        + judge_spend(pool, Some(since), None, JudgeSpendScope::All).await?)
 }
 
 async fn evaluate_budget(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<BudgetDecision> {
@@ -1362,5 +1439,57 @@ mod tests {
             budget_permits_new_run(&pool, now).await,
             BudgetDecision::Pause { .. }
         ));
+    }
+
+    async fn insert_verdict(pool: &SqlitePool, run_id: i64, cost_usd: f64, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO judge_verdicts
+             (run_id, tool_name, tool_input_digest, action_class, classifier_decision, judge,
+              model, questions_version, final_decision, cost_usd, created_at)
+             VALUES (?, 'Bash', 'd', 'unrecognized', 'pending_approval', 'observe', 'jev-latest',
+                     1, 'pending_approval', ?, ?)",
+        )
+        .bind(run_id)
+        .bind(cost_usd)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Spec A D12: the judge's cost reaches all four spend readers, observation included, and the
+    /// run's own cost is never touched — `runs.cost_usd` is overwritten at termination, and NULL
+    /// there means "approximate from the time", which a judge's cents would hide.
+    #[tokio::test]
+    async fn the_judge_is_counted_apart_and_never_in_the_run_row() {
+        let pool = test_pool().await;
+        let now: DateTime<Utc> = "2026-09-27T12:00:00Z".parse().unwrap();
+        // `runs.job_id` references `jobs(id)` and the pool runs with foreign keys on.
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
+             VALUES (3, 'p', 'C:/work/repo', 'x', 'implementing', 5, 1, 1, '2026-09-27T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, job_id, prompt, status, mode, cost_usd, created_at, completed_at)
+             VALUES (7, 'p', 3, 'x', 'completed', 'worktree', 1.0, '2026-09-27T11:30:00+00:00', '2026-09-27T11:40:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_verdict(&pool, 7, 0.25, "2026-09-27T11:35:00+00:00").await;
+
+        assert!((window_spend(&pool, now).await.unwrap() - 1.25).abs() < 1e-9);
+        assert!((hourly_spend(&pool, now).await.unwrap() - 1.25).abs() < 1e-9);
+        assert!((job_spend(&pool, 3, now).await.unwrap() - 1.25).abs() < 1e-9);
+        let since = now - chrono::Duration::days(1);
+        assert!((project_spend(&pool, "p", since, now).await.unwrap().usd - 1.25).abs() < 1e-9);
+        let run_cost: f64 = sqlx::query_scalar("SELECT cost_usd FROM runs WHERE id = 7")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run_cost, 1.0);
     }
 }

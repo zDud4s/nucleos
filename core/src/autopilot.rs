@@ -6,6 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use crate::judge::JudgeMode;
 use crate::wip::{open_proposals_term, open_shadow_decisions_term};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +193,56 @@ pub async fn set_project_mode(
     .await?;
 
     Ok(())
+}
+
+#[derive(Debug)]
+pub enum JudgeActivationError {
+    UnknownProject,
+    /// Until the plan's Chunk 7 lands the bar of D11, `set_project_judge` refuses enforcement
+    /// outright; from then the route refuses it until Chunk 9 (review decision D).
+    EnforceUnavailable,
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for JudgeActivationError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+pub async fn autopilot_judge_mode(pool: &SqlitePool, project_id: &str) -> sqlx::Result<JudgeMode> {
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT judge FROM autopilot_state WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await?;
+    stored.map_or(Ok(JudgeMode::Off), |value| {
+        JudgeMode::from_db_str(&value).ok_or_else(|| {
+            sqlx::Error::Protocol(format!("invalid judge mode in database: {value}"))
+        })
+    })
+}
+
+/// Spec A D2/D11: the project's judge setting, photographed onto its next runs. `observe` is an
+/// opt-in because it is a new policy of sending data off the machine: with a key in the keyring,
+/// observing by default would send every project's non-trivial input to TypeSafe unasked.
+pub async fn set_project_judge(
+    pool: &SqlitePool,
+    project_id: &str,
+    judge: JudgeMode,
+) -> Result<JudgeMode, JudgeActivationError> {
+    if judge == JudgeMode::Enforce {
+        return Err(JudgeActivationError::EnforceUnavailable);
+    }
+    let updated = sqlx::query("UPDATE autopilot_state SET judge = ? WHERE project_id = ?")
+        .bind(judge.as_db_str())
+        .bind(project_id)
+        .execute(pool)
+        .await?;
+    if updated.rows_affected() == 0 {
+        return Err(JudgeActivationError::UnknownProject);
+    }
+    Ok(judge)
 }
 
 pub async fn autopilot_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, String, Mode)>> {
@@ -678,6 +729,37 @@ mod tests {
     }
     use std::fs;
     use tempfile::TempDir;
+
+    /// Spec A D11: observing is an opt-in per project; enforcing waits for the bar (plan Chunk 7)
+    /// and, at the route, for the shell's residual-risk warning (plan Chunk 9).
+    #[tokio::test]
+    async fn a_project_opts_into_observation_and_not_yet_into_enforcement() {
+        use crate::judge::JudgeMode;
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            autopilot_judge_mode(&pool, "p").await.unwrap(),
+            JudgeMode::Off
+        );
+        set_project_judge(&pool, "p", JudgeMode::Observe)
+            .await
+            .unwrap();
+        assert_eq!(
+            autopilot_judge_mode(&pool, "p").await.unwrap(),
+            JudgeMode::Observe
+        );
+        assert!(matches!(
+            set_project_judge(&pool, "p", JudgeMode::Enforce).await,
+            Err(JudgeActivationError::EnforceUnavailable)
+        ));
+        assert!(matches!(
+            set_project_judge(&pool, "nobody", JudgeMode::Observe).await,
+            Err(JudgeActivationError::UnknownProject)
+        ));
+    }
 
     async fn test_pool() -> SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
