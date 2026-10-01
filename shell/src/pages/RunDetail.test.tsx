@@ -1,6 +1,6 @@
 import { act } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { screen, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -12,7 +12,13 @@ vi.mock("../data/client", async (original) => ({
 
 import { ApiUnavailable } from "../data/client";
 import { keys } from "../data/keys";
-import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
+import type {
+  BriefingItem,
+  RunBriefing,
+  RunDetail,
+  RunStop,
+  RunTailChunk,
+} from "../data/runs";
 import { daemonFetch, daemonState, project, renderApp } from "../test/harness";
 
 beforeEach(() => {
@@ -66,6 +72,7 @@ function detailFetch(
   tail: (since: number) => RunTailChunk | undefined,
   asked: string[],
   stop?: RunStop,
+  briefing?: RunBriefing,
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   const shared = daemonFetch(daemonState({ projects: [project({ project_id: "alpha" })] }));
   return async (path, init) => {
@@ -78,6 +85,10 @@ function detailFetch(
     if (path === `/runs/${run.id}/stop`) {
       if (stop === undefined) throw new Error("no stop report for this run");
       return stop;
+    }
+    if (path === `/runs/${run.id}/knowledge`) {
+      if (briefing === undefined) throw new Error("no briefing for this run");
+      return briefing;
     }
     const cursor = new RegExp(`^/runs/${run.id}/tail\\?since=(\\d+)$`).exec(path);
     if (cursor !== null) {
@@ -117,6 +128,182 @@ function stopReport(overrides: Partial<RunStop> = {}): RunStop {
     ...overrides,
   };
 }
+
+function briefing(overrides: Partial<RunBriefing> = {}): RunBriefing {
+  return {
+    run_id: 5,
+    mode: "standalone",
+    traced: true,
+    reason: null,
+    items: [],
+    ...overrides,
+  };
+}
+
+function briefingItem(overrides: Partial<BriefingItem> = {}): BriefingItem {
+  return {
+    knowledge_id: 41,
+    shown: true,
+    s_fts: 0.81,
+    s_scope: 0.2,
+    s_structure: 0.55,
+    s_recency: 0.1,
+    s_use: 0.33,
+    at: "2026-09-30T10:00:00Z",
+    layer: "project",
+    kind: "instruction",
+    scope_kind: "project",
+    scope_id: "alpha",
+    source: "owner",
+    status: "approved",
+    observations: 3,
+    title: "Prefer the narrow gate",
+    body: "Run only the tests selected for this change.",
+    ...overrides,
+  };
+}
+
+/* ---------------------------------------------------------- run briefing -- */
+
+describe("RunDetail — what it was told", () => {
+  it("shows the lines a run was told with the five signals apart, and the lines that lost", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail(),
+        NO_TAIL,
+        [],
+        undefined,
+        briefing({
+          items: [
+            briefingItem(),
+            briefingItem({
+              knowledge_id: 42,
+              shown: false,
+              s_fts: 0.12,
+              s_scope: 0.44,
+              s_structure: 0.67,
+              s_recency: 0.23,
+              s_use: 0.91,
+              title: "Keep the wider suite for later",
+              body: "The full suite belongs to final verification.",
+            }),
+          ],
+        }),
+      ),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    const shownHeading = await screen.findByRole("heading", { name: "Shown to the run" });
+    const leftOutHeading = screen.getByRole("heading", { name: "Offered and left out" });
+    expect(
+      within(shownHeading.closest("section") as HTMLElement).getByText("Prefer the narrow gate"),
+    ).toBeDefined();
+    expect(
+      within(leftOutHeading.closest("section") as HTMLElement).getByText(
+        "Keep the wider suite for later",
+      ),
+    ).toBeDefined();
+
+    const shownItem = screen.getByText("Prefer the narrow gate").closest("li") as HTMLElement;
+    for (const label of ["text match", "scope", "structure", "recency", "use"]) {
+      expect(within(shownItem).getByText(label)).toBeDefined();
+    }
+    for (const value of ["0.81", "0.20", "0.55", "0.10", "0.33"]) {
+      expect(within(shownItem).getByText(value)).toBeDefined();
+    }
+    expect(screen.queryByText("1.99")).toBeNull();
+    expect(screen.queryByText("2.37")).toBeNull();
+  });
+
+  it("a run whose context leaves no trace says so rather than showing an empty list", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail(),
+        NO_TAIL,
+        [],
+        undefined,
+        briefing({ traced: false, reason: "no_trace_context" }),
+      ),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(
+      await screen.findByText(
+        "This kind of run is briefed without a trace, so there is nothing to show here. That is not an empty briefing.",
+      ),
+    ).toBeDefined();
+    expect(screen.queryByRole("heading", { name: "Shown to the run" })).toBeNull();
+  });
+
+  it("says when the trace is past its retention window", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail(),
+        NO_TAIL,
+        [],
+        undefined,
+        briefing({ traced: false, reason: "past_retention" }),
+      ),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(
+      await screen.findByText(
+        "The explanation of this briefing is past its retention window and has been deleted. What the run was told is not recoverable from here.",
+      ),
+    ).toBeDefined();
+  });
+
+  it("says when nothing was on offer", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail(),
+        NO_TAIL,
+        [],
+        undefined,
+        briefing({ traced: true, reason: "nothing_offered" }),
+      ),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(
+      await screen.findByText(
+        "Nothing was on offer for this run: no approved knowledge was in its scope when it started.",
+      ),
+    ).toBeDefined();
+  });
+
+  it("a briefing that cannot be read leaves the page as it was", async () => {
+    daemon.apiFetch.mockImplementation(detailFetch(detail(), NO_TAIL, []));
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(await screen.findByText("Gate")).toBeDefined();
+    await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/runs/5/knowledge"));
+    expect(screen.queryByText("What it was told")).toBeNull();
+  });
+
+  it("a body opens only when asked", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(detail(), NO_TAIL, [], undefined, briefing({ items: [briefingItem()] })),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    const title = await screen.findByText("Prefer the narrow gate");
+    const item = title.closest("li") as HTMLElement;
+    expect(within(item).queryByText("Run only the tests selected for this change.")).toBeNull();
+    const disclosure = within(item).getByRole("button", { name: "Show body" });
+    expect(disclosure.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(disclosure);
+    expect(within(item).getByText("Run only the tests selected for this change.")).toBeDefined();
+    expect(disclosure.getAttribute("aria-expanded")).toBe("true");
+  });
+});
 
 /* ----------------------------------------------------------------- gate -- */
 

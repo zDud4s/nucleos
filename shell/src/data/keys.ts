@@ -95,6 +95,8 @@ export const keys = {
      * answer about one run and not a projection of the first.
      */
     stop: (id: number) => ["runs", "stop", id] as const,
+    /** The trace: a second answer about what one run was told. */
+    briefing: (id: number) => ["runs", "briefing", id] as const,
     awaitingApproval: ["runs", "awaiting-approval"] as const,
   },
 

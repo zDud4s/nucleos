@@ -8,9 +8,11 @@ import {
   useEndTurns,
   useReleaseWorktree,
   useRun,
+  useRunBriefing,
   useRunStop,
   useRunTail,
   useSteerRun,
+  type BriefingItem,
   type RunDetail as Run,
   type RunTailChunk,
   type StopDecision,
@@ -110,6 +112,7 @@ function KnownRun({ id }: { id: number }) {
        on the way. */
     <StopBlock key="stop" id={id} alive={alive} />,
     <RunTail key="tail" id={id} alive={alive} recorded={detail.stdout} />,
+    <BriefingBlock key="briefing" id={id} />,
     <StdStreams key="streams" run={detail} />,
   ];
   /* While the run is going, what it is writing right now is the only block on this page
@@ -424,6 +427,86 @@ function StopBlock({ id, alive }: { id: number; alive: boolean }) {
         </>
       )}
     </Panel>
+  );
+}
+
+function BriefingBlock({ id }: { id: number }) {
+  const { data, isError } = useRunBriefing(id);
+
+  // Like the stop explanation, this is silent while loading or unreadable: it
+  // explains a run that is already visible and must not become a second error.
+  if (isError || !data || typeof data.traced !== "boolean") return null;
+
+  let explanation: string | null = null;
+  if (data.reason === "no_trace_context") {
+    explanation =
+      "This kind of run is briefed without a trace, so there is nothing to show here. That is not an empty briefing.";
+  } else if (data.reason === "past_retention") {
+    explanation =
+      "The explanation of this briefing is past its retention window and has been deleted. What the run was told is not recoverable from here.";
+  } else if (data.reason === "nothing_offered") {
+    explanation =
+      "Nothing was on offer for this run: no approved knowledge was in its scope when it started.";
+  }
+
+  return (
+    <Panel title="What it was told">
+      {explanation !== null ? (
+        <p className="runs-briefing-meta">{explanation}</p>
+      ) : data.traced ? (
+        <>
+          <BriefingList title="Shown to the run" items={data.items.filter((item) => item.shown)} />
+          <BriefingList
+            title="Offered and left out"
+            items={data.items.filter((item) => !item.shown)}
+          />
+        </>
+      ) : null}
+    </Panel>
+  );
+}
+
+function BriefingList({ title, items }: { title: string; items: BriefingItem[] }) {
+  return (
+    <section>
+      <h3>{title}</h3>
+      <ul>
+        {items.map((item) => (
+          <BriefingRow key={item.knowledge_id} item={item} />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function BriefingRow({ item }: { item: BriefingItem }) {
+  const [open, setOpen] = useState(false);
+  const scope = item.scope_id ?? item.scope_kind;
+  const signals = [
+    ["text match", item.s_fts],
+    ["scope", item.s_scope],
+    ["structure", item.s_structure],
+    ["recency", item.s_recency],
+    ["use", item.s_use],
+  ] as const;
+
+  return (
+    <li className="runs-briefing-item">
+      <p>{item.title}</p>
+      <p className="runs-briefing-meta">{`${item.layer} · ${item.source} · ${scope}`}</p>
+      <dl className="runs-briefing-signals">
+        {signals.map(([label, value]) => (
+          <div key={label}>
+            <dt>{label}</dt>
+            <dd>{value.toFixed(2)}</dd>
+          </div>
+        ))}
+      </dl>
+      <Button variant="quiet" aria-expanded={open} onClick={() => setOpen(!open)}>
+        {open ? "Hide body" : "Show body"}
+      </Button>
+      {open && <p>{item.body}</p>}
+    </li>
   );
 }
 
