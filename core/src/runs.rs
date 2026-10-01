@@ -203,6 +203,9 @@ pub enum ResumeError {
     ProposalNotFound,
     ProposalNotPending,
     NotResumable(&'static str),
+    /// Spec B D2/D12: only the action was to be refused, and the run is a job's node. Inside a
+    /// job every ending already has an owner — the job's policy — and a decline would go over it.
+    BelongsToAJob,
     Db(sqlx::Error),
 }
 
@@ -1343,21 +1346,51 @@ pub(crate) const CONTINUATION_COLUMNS: &[(&str, &str)] = &[
     ("lineage_root_id", "COALESCE(lineage_root_id, id)"),
 ];
 
-fn continuation_names() -> String {
-    CONTINUATION_COLUMNS
+/// Spec B D6.2: `denials` carries over ONLY on the B's own continuations — the correction and the
+/// "decline the action" resume. A conversation in which the agent has already been told no twice
+/// must not win three fresh attempts through a path the B opened. The approved resume and the
+/// handoff keep starting at 0: changing them is outside spec B, and would change what spec A
+/// measured about them.
+pub(crate) const CARRIED_DENIALS: &[(&str, &str)] = &[("denials", "denials")];
+
+fn names_of(columns: &[(&str, &str)]) -> String {
+    columns
         .iter()
         .map(|(column, _)| *column)
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn continuation_values() -> String {
-    CONTINUATION_COLUMNS
+fn values_of(columns: &[(&str, &str)]) -> String {
+    columns
         .iter()
         .map(|(_, expression)| *expression)
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+/// Spec B D12: the approved resume's INSERT, plus the denials the conversation already spent
+/// (D6.2). Same binds, same order, as `RESUME_INSERT`.
+static DECLINE_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "INSERT INTO runs (
+             project_id, cwd, prompt, status, mode, session_id, created_at, job_id, stage,
+             item_id, steerable, {}, {}
+         )
+         SELECT ?, ?, ?, 'running', 'worktree', ?, ?, ?, ?, ?, ?, {}, {}
+         FROM runs WHERE id = ?",
+        names_of(CONTINUATION_COLUMNS),
+        names_of(CARRIED_DENIALS),
+        values_of(CONTINUATION_COLUMNS),
+        values_of(CARRIED_DENIALS)
+    )
+});
+
+/// Spec B D5, word for word. The tone of the unattended refusal above `hooks.rs`'s
+/// `unrecognized-tool` branch, and of `resume_instruction`'s lesson (a run refused a more
+/// assertive note as an injection): it says what happened and what the agent may do, with no
+/// orders and no urgency. Said by the redirect of the judge (E3) and by a person's decline (D12).
+pub(crate) const CONTINUING_WITHOUT_IT: &str = "This action needs a person's approval, and this run is continuing without one. It was not run. Carry on with the task another way if there is one. If the task cannot be finished without it, finish what you can and say what is missing in your final message.";
 
 /// Built once from `CONTINUATION_COLUMNS`. A `LazyLock` behind a `static` hands sqlx a
 /// `&'static str`, the only SQL text it trusts without `AssertSqlSafe`, and no caller input ever
@@ -1370,8 +1403,8 @@ static HANDOFF_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
          )
          SELECT project_id, cwd, ?, 'running', mode, ?, ?, job_id, stage, item_id, steerable, {}
          FROM runs WHERE id = ?",
-        continuation_names(),
-        continuation_values()
+        names_of(CONTINUATION_COLUMNS),
+        values_of(CONTINUATION_COLUMNS)
     )
 });
 
@@ -1383,8 +1416,8 @@ static RESUME_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
          )
          SELECT ?, ?, ?, 'running', 'worktree', ?, ?, ?, ?, ?, ?, {}
          FROM runs WHERE id = ?",
-        continuation_names(),
-        continuation_values()
+        names_of(CONTINUATION_COLUMNS),
+        values_of(CONTINUATION_COLUMNS)
     )
 });
 
@@ -3197,7 +3230,40 @@ async fn recorded_tree_of(
     Ok((project_id, project_root, cwd))
 }
 
+/// Spec B D12: the two ways a person continues a run paused on an action.
+///
+/// One core behind two thin wrappers, not two functions. `resume_approved_run` is over five
+/// hundred lines, and two copies of it is exactly how spec B §1.3's drift happened — the handoff
+/// carried the taint and the resume did not, and nobody noticed. With one core, a step added for
+/// the approval reaches the decline without anybody remembering to. The two real differences — a
+/// grant, and the git queue with the owner's authority — are in `match how` below, in view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Continuation {
+    /// The action may happen: a grant for its class, or its declared git operation queued.
+    Approve,
+    /// Only the action is refused: no grant, nothing queued, the decline mark written.
+    Decline,
+}
+
 pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i64, ResumeError> {
+    continue_paused_run(state, proposal_id, Continuation::Approve).await
+}
+
+/// Spec B D12: `POST /proposals/{id}/decline-action`. Everything a resume does — supersede the
+/// paused run, hand over the tree, the slot and the conflict, continue the SAME session with the
+/// task under `RESUMED_TASK_HEADER` — except the two things that would let the refused action
+/// happen: it writes no `action_grants` row and sends nothing to `vcs::submit_on`.
+/// `resume_did_not_act` needs no care: it only fires from an unconsumed grant, and there is none.
+#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 2.2
+pub async fn decline_action(state: &AppState, proposal_id: i64) -> Result<i64, ResumeError> {
+    continue_paused_run(state, proposal_id, Continuation::Decline).await
+}
+
+async fn continue_paused_run(
+    state: &AppState,
+    proposal_id: i64,
+    how: Continuation,
+) -> Result<i64, ResumeError> {
     let proposal = crate::proposals::get(&state.pool, proposal_id)
         .await?
         .ok_or(ResumeError::ProposalNotFound)?;
@@ -3232,6 +3298,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
             .fetch_optional(&state.pool)
             .await?
             .unwrap_or((None, None, None, 0));
+    if how == Continuation::Decline && job_id.is_some() {
+        return Err(ResumeError::BelongsToAJob);
+    }
     // Read here, outside the transaction opened below, because `original_task` walks the run table
     // with its own connection and doing that while holding SQLite's write lock is a deadlock
     // waiting for a busy night. A resume that cannot recover the task is not a reason to refuse the
@@ -3280,7 +3349,13 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // once a human says yes, the yes IS the queueing. Resolved before the transaction opens, because
     // it runs git twice — reading the worktree's branch and identifying the repository — and holding
     // SQLite's write lock across a subprocess would stall every other writer in the daemon.
-    let queueable = queueable_operation(state, &proposal, &wt_project_id, &wt_path).await;
+    let queueable = match how {
+        Continuation::Approve => {
+            queueable_operation(state, &proposal, &wt_project_id, &wt_path).await
+        }
+        // A declined push must never reach the queue carrying the owner's authority (D12).
+        Continuation::Decline => None,
+    };
 
     // The class the grant will authorize, derived before the transaction opens so a parse cannot
     // hold SQLite's write lock. Re-derived here rather than carried on the proposal because
@@ -3351,55 +3426,62 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // machine default, which is the widest thing this can wrongly be — and the direction of that
     // error is a class recorded as `unrecognized` where the project had earned `github-read`. That
     // is a NARROWER grant than the person approved, which is the side of the line a label may err on.
-    let policy = state
-        .github
-        .policy_for_project(&state.pool, &wt_project_id)
-        .await;
-    let action_class = match crate::project_policy::shell_rules(&state.pool, &wt_project_id).await {
-        Ok(rules) => proposal
-            .tool_input
-            .as_deref()
-            .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
-            .map(|input| {
-                crate::classifier::classify(
-                    &tool_name,
-                    &input,
-                    Some(std::path::Path::new(&wt_path)),
-                    &policy,
-                    &rules,
-                    // Labelling an action a person has just approved, not deciding one. The strict
-                    // reading keeps the recorded class the same as the one that was shown to them.
-                    crate::classifier::Unrecognized::AsksAPerson,
-                )
-                .action_class
-            }),
-        // No class, which is what this path already does for input it cannot parse — and for the
-        // same reason, since the fault is the same one: a label derived from rules that are not
-        // this project's is not this project's label. It is deliberately NOT the hook's answer to
-        // an unreadable read. The hook is DECIDING, so it owes the safe direction and downgrades an
-        // allow to an approval prompt; this is LABELLING an action a person has already approved,
-        // where the only two outcomes available are a right label and a wrong one. A wrong one is
-        // worse than none: a class is what a later grant is scoped to, so a class recorded under
-        // the wrong rules would authorise a set of actions nobody agreed to.
-        Err(error) => {
-            tracing::warn!(
-                run_id = original_run_id,
-                project_id = %wt_project_id,
-                %error,
-                "resume: could not read the project's shell rules — recording no action class"
-            );
-            None
+    //
+    // Only an approval computes it: the class serves the grant alone, and a decline writes none.
+    let action_class = match how {
+        Continuation::Decline => None,
+        Continuation::Approve => {
+            let policy = state
+                .github
+                .policy_for_project(&state.pool, &wt_project_id)
+                .await;
+            match crate::project_policy::shell_rules(&state.pool, &wt_project_id).await {
+                Ok(rules) => proposal
+                    .tool_input
+                    .as_deref()
+                    .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
+                    .map(|input| {
+                        crate::classifier::classify(
+                            &tool_name,
+                            &input,
+                            Some(std::path::Path::new(&wt_path)),
+                            &policy,
+                            &rules,
+                            // Labelling an action a person has just approved, not deciding one. The strict
+                            // reading keeps the recorded class the same as the one that was shown to them.
+                            crate::classifier::Unrecognized::AsksAPerson,
+                        )
+                        .action_class
+                    }),
+                // No class, which is what this path already does for input it cannot parse — and for the
+                // same reason, since the fault is the same one: a label derived from rules that are not
+                // this project's is not this project's label. It is deliberately NOT the hook's answer to
+                // an unreadable read. The hook is DECIDING, so it owes the safe direction and downgrades an
+                // allow to an approval prompt; this is LABELLING an action a person has already approved,
+                // where the only two outcomes available are a right label and a wrong one. A wrong one is
+                // worse than none: a class is what a later grant is scoped to, so a class recorded under
+                // the wrong rules would authorise a set of actions nobody agreed to.
+                Err(error) => {
+                    tracing::warn!(
+                        run_id = original_run_id,
+                        project_id = %wt_project_id,
+                        %error,
+                        "resume: could not read the project's shell rules — recording no action class"
+                    );
+                    None
+                }
+            }
         }
     };
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = state.pool.begin().await?;
 
-    // Guarded on the state this resume was authorised from: the paused run was `awaiting_approval`
-    // when the proposal was read, and a release or a cancel can have finalised it since. No rows
-    // means one of those got there first, so the supersede is a no-op rather than a status this
-    // resume is entitled to overwrite — the live-worktree lookup above is what actually stops a
-    // resume onto a discarded worktree.
+    // Spec B D12: the supersede is a compare-and-set. The proposal was read before this transaction
+    // opened, and a release, a cancel or a failure can have ended the paused run since. Continuing
+    // a run that already ended is the same wrong for an approval and for a decline — a successor
+    // on a tree that was released, a conversation somebody stopped — so both refuse, and dropping
+    // `tx` rolls the whole continuation back.
     //
     // It used to say, here, that a run left `awaiting_approval` holds a slot which rejects the
     // INSERT below. That stopped being true at migration 0053, which dropped the index the claim was
@@ -3407,11 +3489,18 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // depends on the refusal — the slot is HANDED OVER further down rather than competed for — but
     // the sentence outlived the mechanism, which is how a guard comes to be believed in and not
     // written.
-    sqlx::query("UPDATE runs SET status='superseded', completed_at=? WHERE id=? AND status='awaiting_approval'")
-        .bind(&now)
-        .bind(original_run_id)
-        .execute(&mut *tx)
-        .await?;
+    let superseded = sqlx::query(
+        "UPDATE runs SET status='superseded', completed_at=? WHERE id=? AND status='awaiting_approval'",
+    )
+    .bind(&now)
+    .bind(original_run_id)
+    .execute(&mut *tx)
+    .await?;
+    if superseded.rows_affected() != 1 {
+        return Err(ResumeError::NotResumable(
+            "the paused run is no longer awaiting approval",
+        ));
+    }
     // Admitted inside this transaction, and that is the whole reason `submit_on` exists. Queue then
     // commit separately, either order, and one of two things can happen: a merge queued against an
     // approval that rolls back — an irreversible publication nobody authorised, with the proposal
@@ -3434,8 +3523,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // `kind()` rather than by the word "merge", which is what it said while merge was the only thing
     // the queue could do: a run told its *merge* was queued after asking for a push would read that
     // as the daemon having misunderstood it, and go looking for what it had misfiled.
-    let note = match (queued_request_id, &queueable) {
-        (Some(request_id), Some((_, op))) => {
+    let note = match (how, queued_request_id, &queueable) {
+        (Continuation::Decline, _, _) => CONTINUING_WITHOUT_IT.to_owned(),
+        (Continuation::Approve, Some(request_id), Some((_, op))) => {
             let kind = op.kind();
             format!(
                 "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. The {tool_name} action you attempted is NOT authorized for you to perform: the {kind} it asked for has been handed to the daemon's git queue as request #{request_id}, which serialises every git operation on this repository and will carry it out for you. Do not attempt it again. Continue with the rest of the task."
@@ -3446,7 +3536,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // has to be written out, and what it does is fall back to authorizing. A run told to proceed
         // is the safe half of this decision: the grant is single-use and the action is one a human
         // just approved.
-        _ => resume_instruction(proposal_id, &tool_name, proposal.tool_input.as_deref()),
+        (Continuation::Approve, _, _) => {
+            resume_instruction(proposal_id, &tool_name, proposal.tool_input.as_deref())
+        }
     };
 
     // The note is what CHANGED; the task is what the run is still for, and the row has to carry
@@ -3478,7 +3570,11 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // whatever the column. The continuation columns (`read_untrusted`, `permission_mode`,
     // `judge`) are copied for the reason the handoff successor copies them: this is the same
     // session, so its taint and its rules continue.
-    let result = sqlx::query(RESUME_INSERT.as_str())
+    let insert = match how {
+        Continuation::Approve => RESUME_INSERT.as_str(),
+        Continuation::Decline => DECLINE_INSERT.as_str(),
+    };
+    let result = sqlx::query(insert)
         .bind(&wt_project_id)
         .bind(&wt_path)
         .bind(&prompt)
@@ -3564,19 +3660,40 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // Written even when nothing is granted because the run has to be ABLE to be told. Without the
     // row, a resumed run that tried its merge again would be paused and would mint a second proposal
     // for a person to read — and approving that one would queue the merge twice.
-    sqlx::query(
-        "INSERT INTO action_grants (run_id, tool_name, tool_input, action_class, proposal_id, created_at, consumed_at, queued_request_id)
-         VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
-    )
-    .bind(resume_id)
-    .bind(&tool_name)
-    .bind(proposal.tool_input.as_deref())
-    .bind(action_class)
-    .bind(proposal_id)
-    .bind(&now)
-    .bind(queued_request_id)
-    .execute(&mut *tx)
-    .await?;
+    match how {
+        Continuation::Approve => {
+            sqlx::query(
+                "INSERT INTO action_grants (run_id, tool_name, tool_input, action_class, proposal_id, created_at, consumed_at, queued_request_id)
+                 VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+            )
+            .bind(resume_id)
+            .bind(&tool_name)
+            .bind(proposal.tool_input.as_deref())
+            .bind(action_class)
+            .bind(proposal_id)
+            .bind(&now)
+            .bind(queued_request_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // Spec B D12: no grant, and the refusal is remembered instead — keyed by the lineage root,
+        // read INSIDE the transaction so the mark and the successor agree on whose lineage it is.
+        Continuation::Decline => {
+            let root: i64 =
+                sqlx::query_scalar("SELECT COALESCE(lineage_root_id, id) FROM runs WHERE id = ?")
+                    .bind(original_run_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            crate::proposals::record_declined_action_on(
+                &mut tx,
+                root,
+                &tool_name,
+                proposal.tool_input.as_deref(),
+                proposal_id,
+            )
+            .await?;
+        }
+    }
     // Compare-and-set on the state this resume was authorised from, like every other writer of a
     // proposal decision (`proposals::transition`, `worktree::release`). The `status != "pending"`
     // check at the top of this function reads OUTSIDE the transaction, so a reject arriving in
@@ -3588,9 +3705,16 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // after this transaction opens but before it takes SQLite's write lock, and once that lock is
     // held a second writer blocks rather than races — a hand-driven poll test for it only ever
     // reproduced the busy timeout. The guard costs one clause; a flaky test would cost more.
+    let decided = match how {
+        Continuation::Approve => "approved",
+        // Spec B D12: a new status, and a decision rather than an expiry (spec A D14).
+        // `proposals.status` has no CHECK (migration 0010), so it enters only here.
+        Continuation::Decline => "declined",
+    };
     let approved = sqlx::query(
-        "UPDATE proposals SET status='approved', decided_at=? WHERE id=? AND status='pending'",
+        "UPDATE proposals SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
     )
+    .bind(decided)
     .bind(&now)
     .bind(proposal_id)
     .execute(&mut *tx)
@@ -3602,19 +3726,24 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     }
     // The queued request id belongs in the audit trail, not only in the resumed run's prompt: this
     // row is where somebody reconstructs what an approval actually did, and "approved" alone no
-    // longer says whether the action was authorised or taken over.
-    let note = match (queued_request_id, &queueable) {
-        (Some(request_id), Some((_, op))) => {
+    // longer says whether the action was authorised or taken over. Spec B D12: a decline says so
+    // here too, because "declined" alone does not say the run went on.
+    let note = match (how, queued_request_id, &queueable) {
+        (Continuation::Decline, _, _) => {
+            format!("declined the action only; the run continues as run {resume_id}")
+        }
+        (Continuation::Approve, Some(request_id), Some((_, op))) => {
             let kind = op.kind();
             format!("approved; {kind} queued as vcs request {request_id}; resume run {resume_id}")
         }
-        _ => format!("approved; resume run {resume_id}"),
+        (Continuation::Approve, _, _) => format!("approved; resume run {resume_id}"),
     };
     sqlx::query(
         "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
-         VALUES (?, 'pending', 'approved', ?, ?)",
+         VALUES (?, 'pending', ?, ?, ?)",
     )
     .bind(proposal_id)
+    .bind(decided)
     .bind(&note)
     .bind(&now)
     .execute(&mut *tx)
@@ -9057,6 +9186,252 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             .unwrap();
         let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
         assert_continued(&state.pool, paused, resume_id).await;
+
+        // The decline (spec B D12).
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        let paused: i64 =
+            sqlx::query_scalar("SELECT id FROM runs WHERE status = 'awaiting_approval'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE runs SET {set_all} WHERE id = {paused}")))
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let declined = decline_action(&state, proposal_id).await.unwrap();
+        assert_continued(&state.pool, paused, declined).await;
+    }
+
+    async fn count(pool: &sqlx::SqlitePool, sql: &'static str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    async fn text_of(pool: &sqlx::SqlitePool, sql: &'static str, id: i64) -> String {
+        sqlx::query_scalar(sql).bind(id).fetch_one(pool).await.unwrap()
+    }
+
+    const PAUSED: &str = "SELECT id FROM runs WHERE status = 'awaiting_approval'";
+    const RUN_STATUS: &str = "SELECT status FROM runs WHERE id = ?";
+    const PROPOSAL_STATUS: &str = "SELECT status FROM proposals WHERE id = ?";
+
+    /// Spec B D12: declining only the action continues the same conversation in the same tree,
+    /// with no grant and nothing queued — even for a push, which an approval WOULD queue with the
+    /// owner's authority.
+    #[tokio::test]
+    async fn declining_an_action_continues_the_run_without_it() {
+        let (state, runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, branch, _container) =
+            seed_real_worktree_approval(&state, "git push origin HEAD").await;
+        let paused = count(&state.pool, PAUSED).await;
+        sqlx::query(
+            "INSERT INTO project_slots (project_id, slot, owner_kind, owner_id, claimed_at)
+             VALUES ('proj', 0, 'run', ?, '2026-09-27T00:00:00Z')",
+        )
+        .bind(paused)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let next = decline_action(&state, proposal_id).await.unwrap();
+
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM action_grants").await, 0);
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM vcs_requests").await, 0, "{branch}");
+        assert_eq!(text_of(&state.pool, RUN_STATUS, paused).await, "superseded");
+        let tree_owner =
+            count(&state.pool, "SELECT owner_id FROM worktrees WHERE owner_kind = 'run'").await;
+        let slot_owner = count(&state.pool, "SELECT owner_id FROM project_slots").await;
+        assert_eq!((tree_owner, slot_owner), (next, next));
+        let last_event = text_of(
+            &state.pool,
+            "SELECT to_status FROM proposal_events WHERE proposal_id = ? ORDER BY id DESC LIMIT 1",
+            proposal_id,
+        )
+        .await;
+        assert_eq!(text_of(&state.pool, PROPOSAL_STATUS, proposal_id).await, "declined");
+        assert_eq!(last_event, "declined");
+        let hash = crate::proposals::action_hash(
+            "Bash",
+            &serde_json::json!({ "command": "git push origin HEAD" }).to_string(),
+        );
+        let mark: (i64, String, i64) = sqlx::query_as(
+            "SELECT lineage_root_id, tool_input_hash, proposal_id FROM declined_actions",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(mark, (paused, hash, proposal_id));
+        let (prompt, lineage): (String, Option<i64>) =
+            sqlx::query_as("SELECT prompt, lineage_root_id FROM runs WHERE id = ?")
+                .bind(next)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(prompt.starts_with(CONTINUING_WITHOUT_IT));
+        assert!(prompt.contains(RESUMED_TASK_HEADER));
+        assert_eq!(lineage, Some(paused));
+        for _ in 0..500 {
+            if runner.last_resume.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(runner.last_resume.lock().unwrap().is_some(), "the same session is resumed");
+    }
+
+    /// Spec B D2/D12: a job's node belongs to the job's policy, and the decline refuses it.
+    #[tokio::test]
+    async fn a_job_nodes_action_cannot_be_declined() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
+             VALUES (9, 'proj', 'C:/x', 'x', 'implementing', 5, 1, 1, '2026-09-27T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE runs SET job_id = 9 WHERE status = 'awaiting_approval'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            decline_action(&state, proposal_id).await,
+            Err(ResumeError::BelongsToAJob)
+        ));
+        assert_eq!(text_of(&state.pool, PROPOSAL_STATUS, proposal_id).await, "pending");
+    }
+
+    /// Spec B D6.2: the decline carries `denials` over; the approved resume does not, as today.
+    #[tokio::test]
+    async fn only_the_decline_carries_the_denials() {
+        for (declined, expected) in [(true, 2), (false, 0)] {
+            let (state, _runner) =
+                test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600))
+                    .await;
+            let (proposal_id, _branch, _container) =
+                seed_real_worktree_approval(&state, "cargo build").await;
+            sqlx::query("UPDATE runs SET denials = 2 WHERE status = 'awaiting_approval'")
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            let next = if declined {
+                decline_action(&state, proposal_id).await.unwrap()
+            } else {
+                resume_approved_run(&state, proposal_id).await.unwrap()
+            };
+            let denials: i64 = sqlx::query_scalar("SELECT denials FROM runs WHERE id = ?")
+                .bind(next)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            assert_eq!(denials, expected, "declined: {declined}");
+        }
+    }
+
+    /// Spec B D12: the conflict follows its resolver across a decline, as across a resume.
+    #[tokio::test]
+    async fn a_declined_resolution_keeps_the_conflict_it_was_minted_for() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        let paused = count(&state.pool, PAUSED).await;
+        sqlx::query(
+            "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, created_at, resolution_run_id)
+             VALUES ('merge', '{}', 'proj', 'C:/x', 'human', 'escalated', '2026-09-27T00:00:00Z', ?)",
+        )
+        .bind(paused)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let next = decline_action(&state, proposal_id).await.unwrap();
+
+        assert_eq!(count(&state.pool, "SELECT resolution_run_id FROM vcs_requests").await, next);
+    }
+
+    /// Spec B D6.2: with the origin row gone, the decline inserts nothing and fails; the proposal
+    /// stays pending (the transaction rolled back). The row vanishes INSIDE the decline's own
+    /// transaction, by the same `vanish` trigger spec A's
+    /// `a_resume_whose_origin_vanished_inserts_nothing_and_rolls_back` uses (A 6.1): deleting the
+    /// runs before the call would fail at the first read, far from the path under test.
+    #[tokio::test]
+    async fn a_decline_whose_origin_vanished_inserts_nothing() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        sqlx::query(
+            "CREATE TRIGGER vanish AFTER UPDATE OF status ON runs
+             WHEN NEW.status = 'superseded'
+             BEGIN DELETE FROM runs WHERE id = NEW.id; END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let before = count(&state.pool, "SELECT COUNT(*) FROM runs").await;
+
+        // The supersede still changed one row (a trigger's own changes are not counted), so the
+        // CAS passes; `DECLINE_INSERT … SELECT` then finds no origin and the
+        // `rows_affected() != 1` answers `RowNotFound`, which `ResumeError` wraps as `Db`.
+        assert!(matches!(
+            decline_action(&state, proposal_id).await,
+            Err(ResumeError::Db(sqlx::Error::RowNotFound))
+        ));
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM runs").await, before, "rolled back");
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM declined_actions").await, 0);
+        assert_eq!(
+            text_of(&state.pool, PROPOSAL_STATUS, proposal_id).await,
+            "pending",
+            "the decline did not land"
+        );
+    }
+
+    /// Plan review 2026-09-27: the supersede is a compare-and-set for BOTH continuations. A paused
+    /// run that ended (cancelled here) between the read of the proposal and the transaction is not
+    /// continued — `master` approved and continued it. One test per path, below.
+    async fn a_continuation_of_a_run_that_already_ended(declined: bool) {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        sqlx::query("UPDATE runs SET status = 'cancelled' WHERE status = 'awaiting_approval'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let before = count(&state.pool, "SELECT COUNT(*) FROM runs").await;
+
+        let result = if declined {
+            decline_action(&state, proposal_id).await
+        } else {
+            resume_approved_run(&state, proposal_id).await
+        };
+
+        assert!(matches!(
+            result,
+            Err(ResumeError::NotResumable("the paused run is no longer awaiting approval"))
+        ));
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM runs").await, before, "no successor");
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM action_grants").await, 0);
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM declined_actions").await, 0);
+        assert_eq!(text_of(&state.pool, PROPOSAL_STATUS, proposal_id).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn an_approval_of_a_run_that_already_ended_continues_nothing() {
+        a_continuation_of_a_run_that_already_ended(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_decline_of_a_run_that_already_ended_continues_nothing() {
+        a_continuation_of_a_run_that_already_ended(true).await;
     }
 
     async fn assert_continued(pool: &sqlx::SqlitePool, origin: i64, continuation: i64) {

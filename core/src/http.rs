@@ -14238,6 +14238,13 @@ async fn post_proposal_approve(
                 format!("this approval cannot resume the run: {reason}"),
             ))
         }
+        // The approval never returns this, but the `match` is exhaustive. Its own answer is the
+        // decline door's: two different replies for the owner (spec B D12).
+        Err(crate::runs::ResumeError::BelongsToAJob) => Err((
+            StatusCode::CONFLICT,
+            "this run is a job's node, and the job's own policy decides what happens to it"
+                .to_owned(),
+        )),
         Err(crate::runs::ResumeError::Db(error)) => {
             tracing::warn!(proposal_id = id, %error, "approving a proposal failed");
             Err((
