@@ -47,7 +47,6 @@ pub const NEEDED_BLOCKS_EXPLAIN_AT: f64 = 0.5;
 #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.1
 pub const REDIRECTS_PER_LINEAGE: i64 = 2;
 /// D6: corrections per project in a rolling day.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 7.1
 pub const CORRECTIONS_PER_PROJECT_PER_DAY: i64 = 3;
 /// D6/D10: how much of the gate's output reaches the Jev and the correction's prompt.
 pub const GATE_TAIL_CHARS: usize = 2000;
@@ -58,7 +57,6 @@ pub const GATE_TAIL_CHARS: usize = 2000;
 pub enum Event {
     HardDeny,
     Park,
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 7.1
     GateFailed,
 }
 
@@ -338,7 +336,6 @@ pub fn applied_park(opinion: Outcome, may_redirect: bool) -> Outcome {
 }
 
 /// D7: the fixed phrase the judge's line carries, e.g. `judge: stopped — off_task p=0.91`.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.2
 pub fn phrase(outcome: Outcome, p: Probabilities) -> String {
     let (word, question, value) = match outcome {
         Outcome::Stop => ("stopped", "off_task", p.off_task),
@@ -368,8 +365,10 @@ pub(crate) enum Subject {
         cwd: String,
         action_class: &'static str,
     },
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.2
-    Gate { exit_code: i32, output: String },
+    Gate {
+        exit_code: i32,
+        output: String,
+    },
 }
 
 /// One block put to the judge. Owned, so an observation can outlive the hook's request.
@@ -602,7 +601,7 @@ pub(crate) async fn ask(pool: &SqlitePool, runtime: &JudgeRuntime, asked: &Asked
     row
 }
 
-async fn record(pool: &SqlitePool, row: &ResolutionRow) -> sqlx::Result<i64> {
+pub(crate) async fn record(pool: &SqlitePool, row: &ResolutionRow) -> sqlx::Result<i64> {
     sqlx::query(
         "INSERT INTO judge_resolutions
          (run_id, lineage_root_id, event, event_ref, tool_input_digest, p_off_task, p_needed,

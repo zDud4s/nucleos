@@ -6,6 +6,10 @@
 
 use sqlx::{SqliteConnection, SqlitePool};
 
+use crate::judge::JudgeMode;
+use crate::judge::resolve::{self, Asked, Event, Outcome, Subject};
+use crate::state::AppState;
+
 /// Spec D6, condition 2 (S2): any trace in the WHOLE lineage of an approved risky action or of
 /// git, as the reason a correction goes to the owner, or `None`.
 ///
@@ -21,7 +25,6 @@ use sqlx::{SqliteConnection, SqlitePool};
 ///
 /// On a connection, because it is asked twice: before the transaction (fast refusal) and inside
 /// it, after the correction row took the write lock, where it can no longer change until commit.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 6.4 and Task 7.1
 pub(crate) async fn lineage_trace_on(
     conn: &mut SqliteConnection,
     root: i64,
@@ -66,7 +69,6 @@ pub(crate) async fn lineage_trace_on(
 /// worktree run consults the mark today (spec §1.2), so the judge consults it itself: an
 /// automatic continuation, with nobody watching, of a session that may have read a stranger is
 /// exactly the case to hand to the owner.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 6.4 and Task 7.1
 pub(crate) async fn lineage_read_untrusted(pool: &SqlitePool, root: i64) -> sqlx::Result<bool> {
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM runs WHERE (id = ?1 OR lineage_root_id = ?1) AND read_untrusted = 1)",
@@ -79,7 +81,6 @@ pub(crate) async fn lineage_read_untrusted(pool: &SqlitePool, root: i64) -> sqlx
 /// Spec D6, condition 7: the project's corrections in the last 24 hours. A rolling day rather
 /// than a calendar one: no timezone to choose, and no midnight at which six can happen in an
 /// hour.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 6.4 and Task 7.1
 pub(crate) async fn corrections_in_last_day_on(
     conn: &mut SqliteConnection,
     project_id: &str,
@@ -92,6 +93,237 @@ pub(crate) async fn corrections_in_last_day_on(
     .bind((now - chrono::Duration::hours(24)).to_rfc3339())
     .fetch_one(&mut *conn)
     .await
+}
+
+/// The E4's `judge_resolutions` row, written INLINE and not by `record_later`: the E4 is already
+/// detached, there is no hook response to keep fast, and a reader right after it finds the row.
+async fn settle(pool: &SqlitePool, row: resolve::ResolutionRow) {
+    if let Err(error) = resolve::record(pool, &row).await {
+        tracing::warn!(run_id = row.run_id, %error, "judge: could not record a resolution");
+    }
+}
+
+/// Spec D7: the resolver's own line when a failed gate goes to the owner. Never an edit of
+/// `worktree_gate_failed`, which went out before the E4 existed and which Telegram may already
+/// have forwarded.
+async fn needs_owner(pool: &SqlitePool, project_id: &str, run_id: i64, reason: &str) {
+    let _ = crate::feed::append(
+        pool,
+        Some(project_id),
+        "judge_needs_owner",
+        &format!("run {run_id}'s gate failed and it comes back to you: {reason}"),
+        Some(run_id),
+        Some(&crate::feed::run_subject(pool, run_id).await),
+    )
+    .await;
+}
+
+/// Spec D6, conditions 2 and 5 to 8, read AFTER the judge answered (S3): they read state that
+/// changes (the queue, the brakes, the switches, the ceiling), and reading them after a call that
+/// may take 10 s shortens the window between reading and acting. `None` when all hold.
+async fn refusal_before_the_transaction(
+    state: &AppState,
+    project_id: &str,
+    root: i64,
+    branch: Option<&str>,
+) -> Option<String> {
+    let pool = &state.pool;
+    // 5: Active NOW. The E4 may fire hours after the launch, and launching work on a project the
+    // owner took out of Active would be less cautious than today.
+    if !matches!(
+        crate::autopilot::project_mode(pool, project_id).await,
+        Ok(crate::autopilot::Mode::Active)
+    ) {
+        return Some("the project is not in Active".to_owned());
+    }
+    // 5: the scheduler's own door, budget then quota. A correction is a launch.
+    if let crate::budget::BudgetDecision::Pause { reason, .. } =
+        crate::quota::permits_new_run(state, chrono::Utc::now()).await
+    {
+        return Some(format!("the brake on new runs is on: {reason}"));
+    }
+    // 6 (B1): both switches, and an unreadable one counts as engaged, as the scheduler reads them.
+    if crate::autopilot::kill_switch_engaged(pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Some("the kill switch is engaged".to_owned());
+    }
+    if crate::autopilot::scoped_kill_engaged(pool, "project", project_id)
+        .await
+        .unwrap_or(true)
+    {
+        return Some("the project's kill switch is engaged".to_owned());
+    }
+    let Ok(mut conn) = pool.acquire().await else {
+        return Some("the lineage could not be read".to_owned());
+    };
+    // 2
+    match lineage_trace_on(&mut conn, root, branch).await {
+        Ok(Some(trace)) => return Some(trace),
+        Ok(None) => {}
+        Err(_) => return Some("the lineage could not be read".to_owned()),
+    }
+    // 7: this correction would be one more.
+    match corrections_in_last_day_on(&mut conn, project_id, chrono::Utc::now()).await {
+        Ok(count) if count >= resolve::CORRECTIONS_PER_PROJECT_PER_DAY => {
+            return Some(format!(
+                "the project reached {} corrections in the last day",
+                resolve::CORRECTIONS_PER_PROJECT_PER_DAY
+            ));
+        }
+        Ok(_) => {}
+        Err(_) => return Some("the day's corrections could not be counted".to_owned()),
+    }
+    drop(conn);
+    // 8
+    match lineage_read_untrusted(pool, root).await {
+        Ok(false) => None,
+        _ => Some("a run of this task read text from outside the project".to_owned()),
+    }
+}
+
+/// Spec E4 (D6). Spawned by `spawn_run` after `observe_run`, only on the arm where the terminal
+/// write won with `completed` and the gate `failed` (not `errored`: that is the gate that did not
+/// run, not the code). Every way out is today's behaviour (the `worktree_gate_failed` line already
+/// out) plus, in enforce, one line of the resolver's own. Any failure falls back to the owner.
+pub(crate) async fn after_gate_failed(state: AppState, run_id: i64, exit_code: i32) {
+    let pool = &state.pool;
+    let row: Option<(
+        String,
+        Option<i64>,
+        Option<String>,
+        i64,
+        Option<String>,
+        Option<i64>,
+    )> = sqlx::query_as(
+        "SELECT mode, job_id, project_id, COALESCE(lineage_root_id, id), gate_output, successor_run_id
+         FROM runs WHERE id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    // 1. D2's static checks: a worktree run, outside jobs and outside the resolver's lineages
+    // (which is also condition 3: a finished run cannot join a resolution's lineage later).
+    let Some((mode, None, Some(project_id), root, gate_output, successor)) = row else {
+        return;
+    };
+    if mode != "worktree" || resolve::is_resolution_lineage(pool, root).await {
+        return;
+    }
+    // The resolver's setting NOW, not the launch snapshot (S7): the snapshot exists so a run's
+    // rules do not change halfway through; here the run is over, and a correction is a new launch
+    // that may come hours later. An unreadable setting is `off`.
+    let now = crate::autopilot::autopilot_judge_resolve_mode(pool, &project_id)
+        .await
+        .unwrap_or(JudgeMode::Off);
+    if now == JudgeMode::Off {
+        return;
+    }
+    // Conditions 1 and 4 before the judge, because they are MONOTONE (a successor is never unset,
+    // a correction is never undone), so asking the judge first could only spend. Both are checked
+    // again inside the transaction (`resume_for_correction`).
+    let already_corrected: sqlx::Result<bool> =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM judge_corrections WHERE root_run_id = ?)")
+            .bind(root)
+            .fetch_one(pool)
+            .await;
+    // Fail closed on a failed read (no correction), but say so: "already corrected" would be a
+    // claim about the lineage that nobody checked.
+    let held_back = match (successor.is_some(), already_corrected) {
+        (true, _) => Some("the run handed off to a successor, which is working in its tree"),
+        (false, Ok(true)) => {
+            Some("this task was already corrected once, and a lineage is corrected at most once")
+        }
+        (false, Err(_)) => Some(
+            "whether this task was already corrected could not be read, so it is not corrected",
+        ),
+        (false, Ok(false)) => None,
+    };
+    if let Some(reason) = held_back {
+        if now == JudgeMode::Enforce {
+            needs_owner(pool, &project_id, run_id, reason).await;
+        }
+        return;
+    }
+    // 2. The judge, first (S3).
+    let asked = Asked {
+        run_id,
+        lineage_root_id: root,
+        event: Event::GateFailed,
+        event_ref: None,
+        project_id: Some(project_id.clone()),
+        machine_root: state.machine_config_root.clone(),
+        subject: Subject::Gate {
+            exit_code,
+            output: gate_output.unwrap_or_default(),
+        },
+    };
+    let row = resolve::ask(pool, &state.judge, &asked).await;
+    let opinion = row.judge_outcome;
+    if now == JudgeMode::Observe {
+        settle(pool, row.settled(Outcome::Owner, false)).await;
+        return;
+    }
+    match opinion {
+        Some(Outcome::Correction) => {}
+        // D1: no answer is today's outcome, and today says nothing more than the gate's line.
+        None => {
+            settle(pool, row.settled(Outcome::Owner, false)).await;
+            return;
+        }
+        Some(_) => {
+            needs_owner(
+                pool,
+                &project_id,
+                run_id,
+                &resolve::phrase(Outcome::Owner, row.p),
+            )
+            .await;
+            settle(pool, row.settled(Outcome::Owner, false)).await;
+            return;
+        }
+    }
+    // 3. Conditions 2 and 5 to 8, outside any transaction; failing one opens none.
+    let branch: Option<String> = sqlx::query_scalar(
+        "SELECT branch FROM worktrees WHERE owner_kind = 'run' AND owner_id = ? AND removed_at IS NULL",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    if let Some(reason) =
+        refusal_before_the_transaction(&state, &project_id, root, branch.as_deref()).await
+    {
+        needs_owner(pool, &project_id, run_id, &reason).await;
+        settle(pool, row.settled(Outcome::Owner, false)).await;
+        return;
+    }
+    // 4. The transaction, whose first write is the correction row.
+    match crate::runs::resume_for_correction(&state, run_id, exit_code).await {
+        Ok(correction) => {
+            let phrase = resolve::phrase(Outcome::Correction, row.p);
+            let mut settled = row.settled(Outcome::Correction, true);
+            settled.correction_run_id = Some(correction);
+            settle(pool, settled).await;
+            let _ = crate::feed::append(
+                pool,
+                Some(&project_id),
+                "judge_correction_started",
+                &format!("correcting run {run_id}'s failed gate as run {correction} ({phrase})"),
+                Some(correction),
+                Some(&crate::feed::run_subject(pool, correction).await),
+            )
+            .await;
+        }
+        Err(refusal) => {
+            needs_owner(pool, &project_id, run_id, &refusal.reason()).await;
+            settle(pool, row.settled(Outcome::Owner, false)).await;
+        }
+    }
 }
 
 #[cfg(test)]

@@ -2064,6 +2064,13 @@ fn spawn_run(
                             outcome,
                         );
                     }
+                    // Taken before `gate_outcome` is consumed by the feed `match` below.
+                    let gate_failed_exit = match &gate_outcome {
+                        Some(crate::gate::GateOutcome::Failed { exit_code, .. }) => {
+                            Some(*exit_code)
+                        }
+                        _ => None,
+                    };
                     // A progress deadline kills the CLI before it can report what it spent, so the
                     // write above just recorded that NULL as final. The wall-clock arm approximates
                     // such a run from its duration; one cut by its own runner's deadline arrives
@@ -2186,6 +2193,24 @@ fn spawn_run(
                         // detector that goes quiet without saying so is indistinguishable from one
                         // that has nothing to report.
                         tracing::warn!(%error, run_id = id, "token efficiency not observed");
+                    }
+                    // Spec E4, detached, and AFTER everything above. After the handoff, so a run
+                    // that handed off reads its `successor_run_id` (condition 1) and two agents
+                    // never share a tree. After `worktree_gate_failed`, which goes out exactly as
+                    // today (D1): the resolver's own line follows it. After `observe_run`, which
+                    // stays the last work done INLINE on this arm: a spawn runs nothing inline,
+                    // so a panic in the E4 cannot cost the observation, and an E4 that is never
+                    // born is today's outcome. Only a gate that FAILED: `errored` is the gate
+                    // that did not run, not the code.
+                    if terminal_status == "completed"
+                        && terminal_write_won
+                        && let Some(exit_code) = gate_failed_exit
+                    {
+                        tokio::spawn(crate::judge::correction::after_gate_failed(
+                            handoff_state.clone(),
+                            id,
+                            exit_code,
+                        ));
                     }
                     break;
                 }
@@ -3467,7 +3492,6 @@ impl From<sqlx::Error> for CorrectionRefusal {
 
 impl CorrectionRefusal {
     /// The line the owner reads (spec B D7, `judge_needs_owner`).
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 7.1
     pub(crate) fn reason(&self) -> String {
         match self {
             Self::AlreadyCorrected => {
@@ -3526,7 +3550,6 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 /// origin's `steerable`, and a NEW worktree clock. The correction happens at most once per
 /// lineage, so it widens a lineage by one worktree clock at most, and it needs the time to build
 /// and run the gate; what was left of the origin's clock may be nothing.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 7.1
 pub(crate) async fn resume_for_correction(
     state: &AppState,
     origin: i64,
@@ -10232,6 +10255,381 @@ error: {token}
         .await
         .unwrap();
         (run_id, branch, container)
+    }
+
+    fn fixable(p: f64) -> std::sync::Arc<crate::judge::ScriptedJudge> {
+        crate::judge::ScriptedJudge::answering_keys(&[("fixable", p)])
+    }
+
+    async fn feed_kinds(pool: &sqlx::SqlitePool) -> Vec<(String, String, Option<i64>)> {
+        sqlx::query_as("SELECT kind, summary, run_id FROM feed ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Spec D6/D7: in enforce, a gate the judge calls fixable is corrected, the row says so, and
+    /// the resolver's own line names the correction run.
+    #[tokio::test]
+    async fn a_failed_gate_the_judge_calls_fixable_is_corrected() {
+        let (mut state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        state.judge = Arc::new(crate::judge::JudgeRuntime::with(fixable(0.95)));
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+
+        crate::judge::correction::after_gate_failed(state.clone(), origin, 7).await;
+
+        let correction: i64 = sqlx::query_scalar("SELECT correction_run_id FROM judge_corrections")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let (outcome, final_outcome, enforced, linked): (Option<String>, String, i64, Option<i64>) =
+            sqlx::query_as(
+                "SELECT judge_outcome, final_outcome, enforced, correction_run_id FROM judge_resolutions",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            (outcome.as_deref(), final_outcome.as_str(), enforced, linked),
+            (Some("correction"), "correction", 1, Some(correction))
+        );
+        let (kind, summary, run_id) = feed_kinds(&state.pool).await.pop().unwrap();
+        assert_eq!(
+            (kind.as_str(), run_id),
+            ("judge_correction_started", Some(correction))
+        );
+        assert!(summary.contains("judge: correcting — fixable p=0.95"));
+    }
+
+    /// Spec D6 (S7): the E4 reads the project's `judge_resolve` NOW, not the run's snapshot. In
+    /// observe it asks and writes, and nothing reaches `judge_corrections`; off, it does not ask.
+    #[tokio::test]
+    async fn the_e4_obeys_the_projects_setting_now_and_not_the_snapshot() {
+        for (now, calls) in [("observe", 1), ("off", 0)] {
+            let judge = fixable(0.99);
+            let (mut state, _runner) =
+                test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600))
+                    .await;
+            state.judge = Arc::new(crate::judge::JudgeRuntime::with(judge.clone()));
+            let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+            sqlx::query("UPDATE runs SET judge_resolve = 'enforce' WHERE id = ?")
+                .bind(origin)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE autopilot_state SET judge_resolve = ?")
+                .bind(now)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+
+            crate::judge::correction::after_gate_failed(state.clone(), origin, 7).await;
+
+            assert_eq!(judge.calls(), calls, "{now}");
+            assert_eq!(
+                count(&state.pool, "SELECT COUNT(*) FROM judge_corrections").await,
+                0,
+                "{now}"
+            );
+            assert!(
+                feed_kinds(&state.pool)
+                    .await
+                    .iter()
+                    .all(|(kind, _, _)| !kind.starts_with("judge_")),
+                "{now}"
+            );
+        }
+    }
+
+    /// Spec D6 + B1: every failed condition goes to the owner, with the reason in the resolver's
+    /// own line, and nothing is corrected.
+    #[tokio::test]
+    async fn every_failed_condition_goes_to_the_owner_with_its_reason() {
+        // No `futures` crate in `core/Cargo.toml`; a boxed future spelled out does the same job.
+        type Setup =
+            fn(AppState, i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+        let cases: Vec<(&str, Setup)> = vec![
+            ("not in Active", |state, _| {
+                Box::pin(async move {
+                    sqlx::query("UPDATE autopilot_state SET mode = 'shadow'")
+                        .execute(&state.pool)
+                        .await
+                        .unwrap();
+                })
+            }),
+            ("kill switch", |state, _| {
+                Box::pin(async move {
+                    crate::autopilot::set_kill_switch(&state.pool, true)
+                        .await
+                        .unwrap();
+                })
+            }),
+            ("project's kill switch", |state, _| {
+                Box::pin(async move {
+                    crate::autopilot::set_scoped_kill(&state.pool, "project", "proj", true)
+                        .await
+                        .unwrap();
+                })
+            }),
+            // An unreadable project switch counts as engaged (B1).
+            ("project's kill switch", |state, _| {
+                Box::pin(async move {
+                    sqlx::query("DROP TABLE scoped_kill_switches")
+                        .execute(&state.pool)
+                        .await
+                        .unwrap();
+                })
+            }),
+            ("read text from outside", |state, origin| {
+                Box::pin(async move {
+                    sqlx::query("UPDATE runs SET read_untrusted = 1 WHERE id = ?")
+                        .bind(origin)
+                        .execute(&state.pool)
+                        .await
+                        .unwrap();
+                })
+            }),
+            ("approved in this lineage", |state, origin| {
+                Box::pin(async move {
+                    sqlx::query("INSERT INTO action_grants (run_id, tool_name, action_class, proposal_id, created_at) VALUES (?, 'Bash', 'read-local', 3, '2026-09-27T00:00:00Z')")
+                        .bind(origin)
+                        .execute(&state.pool)
+                        .await
+                        .unwrap();
+                })
+            }),
+            ("handed off", |state, origin| {
+                Box::pin(async move {
+                    sqlx::query("UPDATE runs SET successor_run_id = 999 WHERE id = ?")
+                        .bind(origin)
+                        .execute(&state.pool)
+                        .await
+                        .unwrap();
+                })
+            }),
+            ("corrected once", |state, origin| {
+                Box::pin(async move {
+                    sqlx::query("INSERT INTO judge_corrections (root_run_id, origin_run_id, project_id, created_at) VALUES (?, ?, 'proj', '2026-09-27T00:00:00Z')")
+                        .bind(origin)
+                        .bind(origin)
+                        .execute(&state.pool)
+                        .await
+                        .unwrap();
+                })
+            }),
+            ("corrections in the last day", |state, _| {
+                Box::pin(async move {
+                    let recent = chrono::Utc::now().to_rfc3339();
+                    for root in [9001, 9002, 9003] {
+                        sqlx::query("INSERT INTO judge_corrections (root_run_id, origin_run_id, project_id, created_at) VALUES (?, ?, 'proj', ?)")
+                            .bind(root)
+                            .bind(root)
+                            .bind(&recent)
+                            .execute(&state.pool)
+                            .await
+                            .unwrap();
+                    }
+                })
+            }),
+        ];
+        for (reason, setup) in cases {
+            let (mut state, _runner) =
+                test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600))
+                    .await;
+            state.judge = Arc::new(crate::judge::JudgeRuntime::with(fixable(0.99)));
+            let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+            setup(state.clone(), origin).await;
+
+            crate::judge::correction::after_gate_failed(state.clone(), origin, 7).await;
+
+            let (kind, summary, _) = feed_kinds(&state.pool).await.pop().expect(reason);
+            assert_eq!(kind, "judge_needs_owner", "{reason}");
+            assert!(summary.contains(reason), "{reason}: {summary}");
+            // No correction was born: no row of the table points at a run.
+            assert_eq!(
+                count(
+                    &state.pool,
+                    "SELECT COUNT(*) FROM judge_corrections WHERE correction_run_id IS NOT NULL"
+                )
+                .await,
+                0,
+                "{reason}"
+            );
+        }
+    }
+
+    /// Spec D6 condition 5: a budget or quota brake that is not `Allow` goes to the owner. No spend
+    /// is needed: the 0.5 reserve alone is past the 0.1 limit.
+    #[tokio::test]
+    async fn a_brake_on_new_runs_goes_to_the_owner() {
+        let (mut state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        state.judge = Arc::new(crate::judge::JudgeRuntime::with(fixable(0.99)));
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+        let brake = crate::budget::BudgetConfig {
+            limit_usd: Some(0.1),
+            period: crate::budget::BudgetPeriod::Monthly,
+            hourly_limit_usd: None,
+            per_run_reserve_usd: 0.5,
+            time_cost_per_hour_usd: 3.0,
+        };
+        crate::budget::set_budget_config(&state.pool, &brake)
+            .await
+            .unwrap();
+
+        crate::judge::correction::after_gate_failed(state.clone(), origin, 7).await;
+
+        let (kind, summary, _) = feed_kinds(&state.pool)
+            .await
+            .pop()
+            .expect("the resolver's line");
+        assert_eq!(kind, "judge_needs_owner");
+        assert!(summary.contains("brake"), "{summary}");
+        assert_eq!(
+            count(&state.pool, "SELECT COUNT(*) FROM judge_corrections").await,
+            0
+        );
+    }
+
+    /// Spec D6 (S3): the judge is asked BEFORE conditions 2 and 5 to 8, here the kill switch.
+    #[tokio::test]
+    async fn the_judge_is_asked_before_the_changing_conditions() {
+        let judge = fixable(0.99);
+        let (mut state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        state.judge = Arc::new(crate::judge::JudgeRuntime::with(judge.clone()));
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        crate::judge::correction::after_gate_failed(state.clone(), origin, 7).await;
+
+        assert_eq!(judge.calls(), 1);
+    }
+
+    /// Spec D6/D7 (S6), end to end: the run's own `worktree_gate_failed` line goes out as today,
+    /// and the resolver's line follows it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_gate_line_goes_out_as_today_and_the_resolvers_follows() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (repo_container, repo) = init_contained_repo("nucleos-runs-e4-");
+        let home = repo_container.path().join("nucleos-home");
+        configure_gate(&home, r#"sh -c "exit 7""#);
+        let (mut state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        state.machine_config_root = Some(home);
+        state.judge = Arc::new(crate::judge::JudgeRuntime::with(fixable(0.2)));
+        let project_root = repo.to_string_lossy().into_owned();
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root, judge_resolve) VALUES ('proj', 'active', ?, 'enforce')")
+            .bind(&project_root)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
+        let mut kinds = Vec::new();
+        for _ in 0..500 {
+            kinds = feed_kinds(&state.pool)
+                .await
+                .into_iter()
+                .filter(|(_, _, run)| *run == Some(id))
+                .map(|(kind, _, _)| kind)
+                .collect();
+            if kinds.iter().any(|kind| kind == "judge_needs_owner") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let gate = kinds
+            .iter()
+            .position(|kind| kind == "worktree_gate_failed")
+            .expect("today's line");
+        let owner = kinds
+            .iter()
+            .position(|kind| kind == "judge_needs_owner")
+            .expect("the resolver's line");
+        assert!(gate < owner);
+    }
+
+    /// Spec D6: `errored` is the gate that did not run, not the code: never asked, never
+    /// corrected. Holds before the E4 exists too, and must stay so.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_errored_gate_is_never_put_to_the_judge() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (repo_container, repo) = init_contained_repo("nucleos-runs-e4-errored-");
+        let home = repo_container.path().join("nucleos-home");
+        configure_unreadable_gate(&home);
+        let judge = fixable(0.99);
+        let (mut state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        state.machine_config_root = Some(home);
+        state.judge = Arc::new(crate::judge::JudgeRuntime::with(judge.clone()));
+        let project_root = repo.to_string_lossy().into_owned();
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root, judge_resolve) VALUES ('proj', 'active', ?, 'enforce')")
+            .bind(&project_root)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
+        for _ in 0..300 {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(judge.calls(), 0);
+    }
+
+    /// Spec D8: a run stopped from the hook loses the terminal CAS, so no E4 is born. Holds before
+    /// the E4 exists too, and must stay so once it does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_run_stopped_from_the_hook_never_reaches_the_e4() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (repo_container, repo) = init_contained_repo("nucleos-runs-e4-stopped-");
+        let home = repo_container.path().join("nucleos-home");
+        configure_gate(&home, r#"sh -c "exit 7""#);
+        let judge = fixable(0.99);
+        let (mut state, _runner) = test_state_with_runner(
+            Some(Duration::from_millis(300)),
+            crate::state::DEFAULT_RUN_TIMEOUT,
+        )
+        .await;
+        state.machine_config_root = Some(home);
+        state.judge = Arc::new(crate::judge::JudgeRuntime::with(judge.clone()));
+        let project_root = repo.to_string_lossy().into_owned();
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root, judge_resolve) VALUES ('proj', 'active', ?, 'enforce')")
+            .bind(&project_root)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
+        assert!(finalize_termination(&state, id, "failed").await);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(judge.calls(), 0);
+        assert_eq!(
+            count(&state.pool, "SELECT COUNT(*) FROM judge_resolutions").await,
+            0
+        );
     }
 
     /// Spec B D6: the correction continues the SAME session in the SAME tree, takes the origin's
