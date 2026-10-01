@@ -17,7 +17,10 @@ const waitPastTheDwell = () => new Promise((resolve) => setTimeout(resolve, 350)
 
 const noReadiness = { reviewed: 0, agree: 0, less_cautious: 0, ready: false };
 
-beforeEach(() => daemon.apiFetch.mockReset());
+// Braces matter: a beforeEach that returns a function has it run as cleanup, and mockReset returns the mock itself.
+beforeEach(() => {
+  daemon.apiFetch.mockReset();
+});
 
 describe("the resolver's switch", () => {
   it("says what leaves the machine before it can be turned on, and turns observe on", async () => {
@@ -26,7 +29,7 @@ describe("the resolver's switch", () => {
         ? { project_id: "alpha", judge_resolve: "off", readiness: noReadiness }
         : { project_id: "alpha", judge_resolve: "observe", readiness: noReadiness },
     );
-    renderWithRouter(<ResolvePanel projectId="alpha" project={project({ mode: "active" })} />, { initialPath: "/autopilot" });
+    await renderWithRouter(<ResolvePanel projectId="alpha" project={project({ mode: "active" })} />, { initialPath: "/autopilot" });
 
     expect(await screen.findByText(RESOLVE_DATA_WARNING)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Observe how blocks would be resolved" }));
@@ -41,8 +44,8 @@ describe("the resolver's switch", () => {
     );
   });
 
-  it("asks for a project before it offers anything, and never asks the núcleo about none", () => {
-    renderWithRouter(<ResolvePanel projectId={null} project={undefined} />, { initialPath: "/autopilot" });
+  it("asks for a project before it offers anything, and never asks the núcleo about none", async () => {
+    await renderWithRouter(<ResolvePanel projectId={null} project={undefined} />, { initialPath: "/autopilot" });
     expect(screen.getByText("choose a project above.")).toBeTruthy();
     expect(screen.queryByRole("button")).toBeNull();
     expect(daemon.apiFetch).not.toHaveBeenCalled();
@@ -60,7 +63,7 @@ describe("the resolver's readiness, queue and enforce", () => {
     daemon.apiFetch.mockImplementation(async (path: string) =>
       path.startsWith("/judge-resolutions/") ? [] : observing(),
     );
-    renderWithRouter(panel("active"), { initialPath: "/autopilot" });
+    await renderWithRouter(panel("active"), { initialPath: "/autopilot" });
 
     expect(await screen.findByText(RESOLVE_ENFORCE_RISK)).toBeTruthy();
     expect(screen.getByText("10 reviewed, 10 agree — ready")).toBeTruthy();
@@ -79,7 +82,7 @@ describe("the resolver's readiness, queue and enforce", () => {
     daemon.apiFetch.mockImplementation(async (path: string) =>
       path.startsWith("/judge-resolutions/") ? [] : observing(),
     );
-    const { unmount } = renderWithRouter(panel("shadow"), { initialPath: "/autopilot" });
+    const { unmount } = await renderWithRouter(panel("shadow"), { initialPath: "/autopilot" });
     await screen.findByText(RESOLVE_ENFORCE_RISK);
     expect((screen.getByRole("button", { name: "Let the resolver decide" }) as HTMLButtonElement).disabled).toBe(true);
     unmount();
@@ -88,7 +91,7 @@ describe("the resolver's readiness, queue and enforce", () => {
         ? []
         : observing({ reviewed: 10, agree: 8, less_cautious: 0, ready: false }),
     );
-    renderWithRouter(panel("active"), { initialPath: "/autopilot" });
+    await renderWithRouter(panel("active"), { initialPath: "/autopilot" });
     expect(await screen.findByText("8 of 10 agree — under 90%")).toBeTruthy();
     expect((screen.getByRole("button", { name: "Let the resolver decide" }) as HTMLButtonElement).disabled).toBe(true);
   });
@@ -98,7 +101,7 @@ describe("the resolver's readiness, queue and enforce", () => {
       if (init?.method === "POST") throw new ApiRefusal(409, "not_active", "not_active");
       return path.startsWith("/judge-resolutions/") ? [] : observing();
     });
-    renderWithRouter(panel("active"), { initialPath: "/autopilot" });
+    await renderWithRouter(panel("active"), { initialPath: "/autopilot" });
 
     fireEvent.click(await screen.findByRole("button", { name: "Let the resolver decide" }));
     await waitPastTheDwell();
@@ -121,7 +124,7 @@ describe("the resolver's readiness, queue and enforce", () => {
       }
       return observing({ reviewed: 0, agree: 0, less_cautious: 0, ready: false });
     });
-    renderWithRouter(panel("active"), { initialPath: "/autopilot" });
+    await renderWithRouter(panel("active"), { initialPath: "/autopilot" });
 
     expect(await screen.findByText("FAILED core::x")).toBeTruthy();
     expect(screen.getByText("fixable")).toBeTruthy();
