@@ -3167,14 +3167,20 @@ struct AutopilotJudgeResponse {
     /// Review item G: `Some` when this project's `autopilot.yaml` cannot be read, which leaves
     /// the judge without effect (every call falls back to the classifier, D7/D10).
     rules_error: Option<String>,
+    /// D11: how far the project is from being allowed to enforce, with the classes beside it.
+    readiness: crate::judge::JudgeReadiness,
 }
 
-/// One project's judge, as both handlers answer it.
+/// One project's judge, as both handlers answer it. A readiness that cannot be read is a 500, like
+/// the mode: a panel shown a made-up zero would read "nothing reviewed yet".
 async fn judge_status(
     state: &AppState,
     project_id: String,
 ) -> Result<AutopilotJudgeResponse, StatusCode> {
     let judge = autopilot::autopilot_judge_mode(&state.pool, &project_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let readiness = crate::judge::readiness(&state.pool, &project_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let rules_error =
@@ -3183,6 +3189,7 @@ async fn judge_status(
         project_id,
         judge,
         rules_error,
+        readiness,
     })
 }
 
@@ -22018,6 +22025,8 @@ mod tests {
             (status, body["judge"].as_str()),
             (StatusCode::OK, Some("observe"))
         );
+        assert_eq!(body["readiness"]["reviewed"], 0);
+        assert_eq!(body["readiness"]["ready"], false);
         let (status, _) = workflow_call(
             state.clone(),
             "POST",

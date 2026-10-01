@@ -47,7 +47,7 @@ mod review;
 #[cfg(test)]
 pub(crate) use client::ScriptedJudge;
 pub use client::{Answers, JevJudge, Judge, JudgeError, TYPESAFE_KEY};
-pub use review::{JudgeVerdictView, list_unreviewed, set_verdict};
+pub use review::{JudgeReadiness, JudgeVerdictView, list_unreviewed, readiness, set_verdict};
 
 /// D11: at most four calls in flight across the machine; without a permit, the call is skipped
 /// and written down.
