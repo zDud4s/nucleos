@@ -701,6 +701,7 @@ struct Finished {
     branch: String,
     base_sha: Option<String>,
     completed_at: Option<String>,
+    gate_status: Option<String>,
 }
 
 /// How long a completed run is left alone before its worktree is read, so a run that is about to
@@ -732,7 +733,7 @@ async fn land_finished(
     }
     let finished: Vec<Finished> = match sqlx::query_as(
         "SELECT c.id, c.op, c.args, c.project_id, w.path AS worktree_path, w.branch,
-                w.base_sha, r.completed_at
+                w.base_sha, r.completed_at, r.gate_status
            FROM vcs_requests AS c
            JOIN runs AS r ON r.id = c.resolution_run_id
            JOIN worktrees AS w
@@ -793,6 +794,32 @@ async fn land_finished(
                     %error,
                     "resolver: could not check whether a finished resolution is already queued"
                 );
+                continue;
+            }
+        }
+        // `completed` says the agent stopped, not that the project's gate passed; the queue's land
+        // builds nothing, so a resolution that broke the tests would be published unseen.
+        match row.gate_status.as_deref() {
+            None | Some("passed") => {}
+            Some(gate) => {
+                refused.insert((row.id, head));
+                let summary = format!(
+                    "{}'s conflict resolution on {} is merged but its run's gate {gate}; \
+                     it was not handed to the queue and needs a person",
+                    row.project_id, row.branch
+                );
+                if let Err(error) = crate::notify::deliver_or_defer(
+                    pool,
+                    crate::land::RESOLUTION_FAILED_KIND,
+                    &summary,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        %error,
+                        "resolver: could not notify about a resolution whose gate did not pass"
+                    );
+                }
                 continue;
             }
         }
@@ -1680,6 +1707,81 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(linked, None);
+    }
+
+    async fn gate(pool: &sqlx::SqlitePool, status: &str) {
+        sqlx::query("UPDATE runs SET gate_status = ? WHERE id = 7")
+            .bind(status)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// `completed` says the agent stopped, not that the project's gate passed, and the queue's land
+    /// builds nothing: a resolution whose gate failed is announced once and never handed over.
+    #[tokio::test]
+    async fn a_resolution_whose_gate_did_not_pass_is_never_handed_over() {
+        for status in ["failed", "errored"] {
+            let pool = test_pool().await;
+            let scenario = resolution_scenario(
+                &pool,
+                "nucleos-resolver-gate-",
+                "completed",
+                Progress::Committed,
+            )
+            .await;
+            gate(&pool, status).await;
+
+            let mut refused = Default::default();
+            land_finished(&pool, &mut refused).await;
+            land_finished(&pool, &mut refused).await;
+
+            assert!(
+                admitted_resolutions(&pool, &scenario).await.is_empty(),
+                "a gate that {status} keeps the resolution from the queue"
+            );
+            let linked: Option<i64> =
+                sqlx::query_scalar("SELECT resolved_by FROM vcs_requests WHERE id = ?")
+                    .bind(scenario.request)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(linked, None);
+            let summaries: Vec<String> =
+                sqlx::query_scalar("SELECT summary FROM feed WHERE kind = ?")
+                    .bind(crate::land::RESOLUTION_FAILED_KIND)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(summaries.len(), 1, "announced once, not every tick");
+            assert!(summaries[0].contains(status), "{}", summaries[0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resolution_whose_gate_passed_is_handed_over() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-gate-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+        gate(&pool, "passed").await;
+
+        let mut refused = Default::default();
+        land_finished(&pool, &mut refused).await;
+
+        let admitted = admitted_resolutions(&pool, &scenario).await;
+        assert_eq!(admitted.len(), 1, "a passed gate is handed over");
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT resolved_by FROM vcs_requests WHERE id = ?")
+                .bind(scenario.request)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, Some(admitted[0]));
     }
 
     /// **AC4.** A resolution that paused for approval resumes under a new run id: the escalation's

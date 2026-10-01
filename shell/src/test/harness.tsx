@@ -497,6 +497,8 @@ export function slot(overrides: Partial<HeldSlot> = {}): HeldSlot {
     job_id: null,
     ordinal: null,
     item_status: null,
+    wave_id: null,
+    lease_renewed_at: null,
     ...overrides,
   };
 }

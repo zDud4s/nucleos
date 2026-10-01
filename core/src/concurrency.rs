@@ -336,6 +336,16 @@ pub struct HeldSlot {
     /// that cannot tell those apart cannot answer the question it exists for: is this slot busy or
     /// is it stuck.
     pub item_status: Option<String>,
+    /// The wave a WAVE's worker belongs to, and `None` for every other kind of owner.
+    ///
+    /// `owner_id` for a wave is `wave_workers.id`, one row per worker: a screen that named the
+    /// slot by it would show as many waves as there are workers.
+    pub wave_id: Option<i64>,
+    /// When that wave last renewed its lease (`waves.renewed_at`). `None` for every other kind.
+    ///
+    /// The slot lives until `wave::LEASE_SECONDS` after this, so it is what tells a live wave from
+    /// a controller that died and whose slots the next sweep takes.
+    pub lease_renewed_at: Option<String>,
 }
 
 /// Every slot taken right now, in project and number order.
@@ -348,10 +358,14 @@ pub async fn held_slots(pool: &SqlitePool) -> sqlx::Result<Vec<HeldSlot>> {
         "SELECT project_slots.project_id, project_slots.slot, project_slots.owner_kind,
                 project_slots.owner_id, project_slots.claimed_at,
                 job_items.job_id AS job_id, job_items.ordinal AS ordinal,
-                job_items.status AS item_status
+                job_items.status AS item_status,
+                wave_workers.wave_id AS wave_id, waves.renewed_at AS lease_renewed_at
          FROM project_slots
          LEFT JOIN job_items
            ON project_slots.owner_kind = 'item' AND job_items.id = project_slots.owner_id
+         LEFT JOIN wave_workers
+           ON project_slots.owner_kind = 'wave' AND wave_workers.id = project_slots.owner_id
+         LEFT JOIN waves ON waves.id = wave_workers.wave_id
          ORDER BY project_slots.project_id, project_slots.slot",
     )
     .fetch_all(pool)
@@ -579,6 +593,60 @@ mod tests {
         assert_eq!(of_job.job_id, None, "a job is not a step of anything");
         assert_eq!(of_job.ordinal, None);
         assert_eq!(of_job.item_status, None);
+    }
+
+    /// A wave's slot says which wave it is and when that wave last renewed its lease.
+    ///
+    /// `owner_id` for a wave is `wave_workers.id`, one per worker, so a screen that named the slot
+    /// by it would show three waves where there is one; and `renewed_at` is what tells a live wave
+    /// from a controller that died and whose slots the next sweep takes.
+    #[tokio::test]
+    async fn a_slot_held_by_a_wave_says_which_wave_and_when_its_lease_was_renewed() {
+        let pool = test_pool().await;
+        set_limits(&pool, 5, 9).await;
+        let renewed = chrono::DateTime::parse_from_rfc3339("2026-09-29T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // Wave 1 gets two workers first, so the worker we claim for (wave 2) has a different
+        // number from its wave: a join that read `owner_id` for the wave could not pass.
+        let first = seed_wave_worker(&pool, renewed, false).await;
+        sqlx::query(
+            "INSERT INTO wave_workers (wave_id) SELECT wave_id FROM wave_workers WHERE id = ?",
+        )
+        .bind(first)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let worker = seed_wave_worker(&pool, renewed, false).await;
+        let wave: i64 = sqlx::query_scalar("SELECT wave_id FROM wave_workers WHERE id = ?")
+            .bind(worker)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_ne!(wave, worker, "the fixture must tell a wave from its worker");
+        let job = seed_job(&pool, "project-a", "implementing").await;
+        claim(&pool, "project-a", Owner::Wave(worker))
+            .await
+            .unwrap();
+        claim(&pool, "project-a", Owner::Job(job)).await.unwrap();
+
+        let held = held_slots(&pool).await.unwrap();
+
+        let of_wave = held
+            .iter()
+            .find(|slot| slot.owner_kind == "wave")
+            .expect("the wave's slot is in the readout");
+        assert_eq!(of_wave.wave_id, Some(wave));
+        assert_eq!(
+            of_wave.lease_renewed_at.as_deref(),
+            Some(crate::wave::stamp(renewed).as_str())
+        );
+        let of_job = held
+            .iter()
+            .find(|slot| slot.owner_kind == "job")
+            .expect("the job's slot did not survive the joins");
+        assert_eq!(of_job.wave_id, None, "a job is not a worker of anything");
+        assert_eq!(of_job.lease_renewed_at, None);
     }
 
     /// The numbers start at zero and go up, which is the whole mechanism: the second claimant does
