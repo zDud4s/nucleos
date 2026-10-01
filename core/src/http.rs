@@ -3214,6 +3214,7 @@ struct JudgeResolveRequest {
 struct JudgeResolveResponse {
     project_id: String,
     judge_resolve: crate::judge::JudgeMode,
+    readiness: crate::judge::resolve_review::ResolveReadiness,
 }
 
 /// Spec B D11: one project's resolver setting. Admin-only like `/autopilot/judge`, by appearing
@@ -3225,9 +3226,13 @@ async fn get_autopilot_judge_resolve(
     let judge_resolve = autopilot::autopilot_judge_resolve_mode(&state.pool, &query.project_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let readiness = crate::judge::resolve_review::readiness(&state.pool, &query.project_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(JudgeResolveResponse {
         project_id: query.project_id,
         judge_resolve,
+        readiness,
     }))
 }
 
@@ -3237,16 +3242,37 @@ async fn post_autopilot_judge_resolve(
 ) -> Result<Json<JudgeResolveResponse>, (StatusCode, Json<serde_json::Value>)> {
     let mode = crate::judge::JudgeMode::from_db_str(&body.judge_resolve)
         .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "invalid"))?;
+    // As spec A's route did until its warning was on screen: `enforce` is not accepted over HTTP
+    // until the resolver's own warning is (the shell's residual-risk notice removes these lines).
+    // The bar itself is enforced below, by `set_project_judge_resolve`, whatever door asks.
+    if mode == crate::judge::JudgeMode::Enforce {
+        return Err(refusal(StatusCode::CONFLICT, "enforce_unavailable"));
+    }
     match autopilot::set_project_judge_resolve(&state.pool, &body.project_id, mode).await {
-        Ok(judge_resolve) => Ok(Json(JudgeResolveResponse {
-            project_id: body.project_id,
-            judge_resolve,
-        })),
+        Ok(judge_resolve) => {
+            let readiness = crate::judge::resolve_review::readiness(&state.pool, &body.project_id)
+                .await
+                .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+            Ok(Json(JudgeResolveResponse {
+                project_id: body.project_id,
+                judge_resolve,
+                readiness,
+            }))
+        }
         Err(autopilot::ResolveActivationError::UnknownProject) => {
             Err(refusal(StatusCode::NOT_FOUND, "unknown_project"))
         }
-        Err(autopilot::ResolveActivationError::EnforceUnavailable) => {
-            Err(refusal(StatusCode::CONFLICT, "enforce_unavailable"))
+        Err(autopilot::ResolveActivationError::NotActive) => {
+            Err(refusal(StatusCode::CONFLICT, "not_active"))
+        }
+        Err(autopilot::ResolveActivationError::NotReady(readiness)) => {
+            tracing::info!(
+                reviewed = readiness.reviewed,
+                agree = readiness.agree,
+                less_cautious = readiness.less_cautious,
+                "enforce refused: the resolver's bar is not met"
+            );
+            Err(refusal(StatusCode::CONFLICT, "not_ready"))
         }
         Err(autopilot::ResolveActivationError::Database(error)) => {
             tracing::error!(%error, project_id = %body.project_id, "setting judge_resolve failed");
@@ -14967,9 +14993,20 @@ async fn post_judge_resolution_outcome(
     Path(id): Path<i64>,
     Json(body): Json<OutcomeRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    // The review and the demotion it may cause are ONE write: a review is what moves readiness, so
+    // it is where the bar is held, as `post_judge_verdict` does for spec A.
     let recorded = async {
-        let mut conn = state.pool.acquire().await?;
-        crate::judge::resolve_review::set_outcome(&mut conn, id, &body.outcome).await
+        let mut tx = state.pool.begin().await?;
+        if !crate::judge::resolve_review::set_outcome(&mut tx, id, &body.outcome).await? {
+            return Ok(false);
+        }
+        if let Some(project_id) =
+            crate::judge::resolve_review::project_of_resolution(&mut tx, id).await?
+        {
+            autopilot::hold_judge_resolve_to_the_bar(&mut tx, &project_id).await?;
+        }
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(true)
     }
     .await;
     match recorded {

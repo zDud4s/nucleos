@@ -124,6 +124,7 @@ pub fn label_of(decision: PersonsDecision) -> Option<Outcome> {
 /// resolver was asked about that park and nobody has labelled it yet. Answers whether a row was
 /// labelled. Best-effort: a decision that could not also become a label is still the decision.
 ///
+/// A label moves readiness exactly as a review does, so the bar is held in the same write.
 pub async fn label_from_decision(
     pool: &SqlitePool,
     run_id: i64,
@@ -153,6 +154,17 @@ pub async fn label_from_decision(
         .await?
         .rows_affected()
             > 0;
+        if done {
+            let project: Option<String> =
+                sqlx::query_scalar("SELECT project_id FROM runs WHERE id = ?")
+                    .bind(run_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .flatten();
+            if let Some(project_id) = project {
+                crate::autopilot::hold_judge_resolve_to_the_bar(&mut tx, &project_id).await?;
+            }
+        }
         tx.commit().await?;
         Ok::<_, sqlx::Error>(done)
     }
@@ -164,6 +176,88 @@ pub async fn label_from_decision(
             false
         }
     }
+}
+
+/// D11's bar. Starting values, like every number in spec B.
+pub const RESOLVE_MIN_REVIEWED: i64 = 10;
+pub const RESOLVE_MIN_AGREE_PERCENT: i64 = 90;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResolveReadiness {
+    pub reviewed: i64,
+    pub agree: i64,
+    /// Units where the judge chose a LESS cautious outcome than the person, on D4's order.
+    pub less_cautious: i64,
+    pub ready: bool,
+}
+
+/// PURE: D11's bar. 90% and not spec A's 95%: several outcomes are harder to agree on than a yes
+/// or no. Zero tolerance where the risk is.
+pub fn ready(reviewed: i64, agree: i64, less_cautious: i64) -> bool {
+    reviewed >= RESOLVE_MIN_REVIEWED
+        && agree * 100 >= RESOLVE_MIN_AGREE_PERCENT * reviewed
+        && less_cautious == 0
+}
+
+pub async fn readiness(pool: &SqlitePool, project_id: &str) -> sqlx::Result<ResolveReadiness> {
+    readiness_on(pool.acquire().await?.as_mut(), project_id).await
+}
+
+/// D11: per unit, "agrees" means every reviewed row of the unit has the judge's outcome equal to
+/// the person's; "less cautious" means any row where it was below it. Folded in Rust rather than
+/// SQL, because the caution order lives in `Outcome::caution` and must not be restated. Against a
+/// caller-supplied connection, so a caller that must decide on it atomically with a write can read
+/// it inside its own transaction (as spec A's `readiness_on`).
+pub async fn readiness_on(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> sqlx::Result<ResolveReadiness> {
+    let rows: Vec<(i64, String, String, String, String)> = sqlx::query_as(
+        "SELECT jr.lineage_root_id, jr.event, jr.tool_input_digest, jr.judge_outcome, jr.human_outcome
+         FROM judge_resolutions jr JOIN runs r ON r.id = jr.run_id
+         WHERE r.project_id = ? AND jr.judge_outcome IS NOT NULL AND jr.human_outcome IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_all(conn)
+    .await?;
+    let mut units: std::collections::BTreeMap<(i64, String, String), (bool, bool)> =
+        Default::default();
+    for (lineage, event, digest, judge, human) in rows {
+        let (Some(judge), Some(human)) =
+            (Outcome::from_db_str(&judge), Outcome::from_db_str(&human))
+        else {
+            continue;
+        };
+        let unit = units
+            .entry((lineage, event, digest))
+            .or_insert((true, false));
+        unit.0 &= judge == human;
+        unit.1 |= judge.caution() < human.caution();
+    }
+    let reviewed = units.len() as i64;
+    let agree = units.values().filter(|(agrees, _)| *agrees).count() as i64;
+    let less_cautious = units.values().filter(|(_, less)| *less).count() as i64;
+    Ok(ResolveReadiness {
+        reviewed,
+        agree,
+        less_cautious,
+        ready: ready(reviewed, agree, less_cautious),
+    })
+}
+
+/// The project a resolution's run belongs to — spec A's `project_of_verdict`, for this table.
+pub async fn project_of_resolution(
+    conn: &mut SqliteConnection,
+    id: i64,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT runs.project_id FROM judge_resolutions
+         JOIN runs ON runs.id = judge_resolutions.run_id WHERE judge_resolutions.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(conn)
+    .await
+    .map(Option::flatten)
 }
 
 #[cfg(test)]
@@ -289,6 +383,61 @@ mod tests {
             label(pool.clone()).await.as_deref(),
             Some("explain"),
             "the first answer stands"
+        );
+    }
+
+    async fn reviewed(pool: &SqlitePool, lineage: i64, opinion: &str, human: &str) {
+        let id = resolved(
+            pool,
+            lineage,
+            "park",
+            &format!("d{lineage}"),
+            Some(opinion),
+            "park",
+        )
+        .await;
+        sqlx::query("UPDATE judge_resolutions SET human_outcome = ? WHERE id = ?")
+            .bind(human)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// D11: at least 10 units, at least 90% agreeing, and zero where the judge was LESS cautious
+    /// than the person (D4's order).
+    #[tokio::test]
+    async fn the_bar_is_ten_units_ninety_percent_and_nothing_less_cautious() {
+        let pool = pool().await;
+        for lineage in 0..9 {
+            reviewed(&pool, lineage, "park", "park").await;
+        }
+        assert_eq!(
+            readiness(&pool, "p").await.unwrap(),
+            ResolveReadiness {
+                reviewed: 9,
+                agree: 9,
+                less_cautious: 0,
+                ready: false
+            }
+        );
+        // More cautious than the person: allowed.
+        reviewed(&pool, 9, "stop", "park").await;
+        assert_eq!(
+            readiness(&pool, "p").await.unwrap(),
+            ResolveReadiness {
+                reviewed: 10,
+                agree: 9,
+                less_cautious: 0,
+                ready: true
+            }
+        );
+        // Less cautious: never allowed.
+        reviewed(&pool, 10, "explain", "park").await;
+        let r = readiness(&pool, "p").await.unwrap();
+        assert_eq!(
+            (r.reviewed, r.agree, r.less_cautious, r.ready),
+            (11, 9, 1, false)
         );
     }
 }

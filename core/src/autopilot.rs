@@ -181,8 +181,9 @@ pub async fn set_project_mode(
     };
 
     // Spec A section 3: `enforce` was authorised on top of Active; leaving Active withdraws that
-    // authorisation and keeps measuring (`observe`), in the same write, so the two columns are
-    // never out of step. `off` stays `off`.
+    // authorisation and keeps measuring (`observe`), in the same write, so the columns are never
+    // out of step. Spec B D11 gives the resolver's `judge_resolve` the same rule, in this same
+    // statement. `off` stays `off`.
     sqlx::query(
         "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, ?, ?)
          ON CONFLICT(project_id) DO UPDATE SET
@@ -190,7 +191,10 @@ pub async fn set_project_mode(
              project_root = excluded.project_root,
              judge = CASE
                  WHEN excluded.mode <> 'active' AND autopilot_state.judge = 'enforce'
-                 THEN 'observe' ELSE autopilot_state.judge END",
+                 THEN 'observe' ELSE autopilot_state.judge END,
+             judge_resolve = CASE
+                 WHEN excluded.mode <> 'active' AND autopilot_state.judge_resolve = 'enforce'
+                 THEN 'observe' ELSE autopilot_state.judge_resolve END",
     )
     .bind(project_id)
     .bind(mode.as_db_str())
@@ -293,8 +297,11 @@ pub async fn set_project_judge(
 #[derive(Debug)]
 pub enum ResolveActivationError {
     UnknownProject,
-    /// Until the resolver's own warning is on screen, `enforce` cannot be set.
-    EnforceUnavailable,
+    /// D11: the resolver only decides on top of Active.
+    NotActive,
+    /// D11: under the bar — fewer than `RESOLVE_MIN_REVIEWED` units, under
+    /// `RESOLVE_MIN_AGREE_PERCENT`, or any unit where the judge was less cautious.
+    NotReady(crate::judge::resolve_review::ResolveReadiness),
     Database(sqlx::Error),
 }
 
@@ -321,14 +328,44 @@ pub async fn autopilot_judge_resolve_mode(
 }
 
 /// Spec B D11: the resolver's setting, photographed onto the project's next worktree runs (and
-/// read live by the E4). An opt-in because it sends TypeSafe what spec A never sends.
+/// read live by the E4). `enforce` needs Active and the bar, whatever door asks; the other settings
+/// are an opt-in because they send TypeSafe what spec A never sends.
 pub async fn set_project_judge_resolve(
     pool: &SqlitePool,
     project_id: &str,
     mode: JudgeMode,
 ) -> Result<JudgeMode, ResolveActivationError> {
     if mode == JudgeMode::Enforce {
-        return Err(ResolveActivationError::EnforceUnavailable);
+        // As `set_project_judge`: one transaction, the guarded write first, so the mode check and
+        // the readiness read cannot be overtaken by another writer between check and write.
+        let mut tx = pool.begin().await?;
+        let enforced = sqlx::query(
+            "UPDATE autopilot_state SET judge_resolve = 'enforce' WHERE project_id = ? AND mode = 'active'",
+        )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if enforced == 0 {
+            let known: Option<String> =
+                sqlx::query_scalar("SELECT mode FROM autopilot_state WHERE project_id = ?")
+                    .bind(project_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            tx.rollback().await?;
+            return Err(if known.is_some() {
+                ResolveActivationError::NotActive
+            } else {
+                ResolveActivationError::UnknownProject
+            });
+        }
+        let readiness = crate::judge::resolve_review::readiness_on(&mut tx, project_id).await?;
+        if !readiness.ready {
+            tx.rollback().await?;
+            return Err(ResolveActivationError::NotReady(readiness));
+        }
+        tx.commit().await?;
+        return Ok(mode);
     }
     let updated = sqlx::query("UPDATE autopilot_state SET judge_resolve = ? WHERE project_id = ?")
         .bind(mode.as_db_str())
@@ -370,6 +407,43 @@ pub async fn hold_judge_to_the_bar(
             &format!(
                 "the judge went back to observing {project_id}: {} of {} reviewed actions agreed, under the bar",
                 readiness.agree, readiness.reviewed
+            ),
+            None,
+            None,
+        )
+        .await?;
+    }
+    Ok(dropped)
+}
+
+/// Spec B D11, as `hold_judge_to_the_bar` does for spec A: a resolver in `enforce` that no longer
+/// clears the bar drops to `observe`, with a feed line; answers whether it dropped. Its own
+/// function: the readiness is the resolver's, and spec A's tests read that `bool` as "spec A's judge
+/// dropped". Guarded on `enforce` in the write, so a concurrent change keeps the last word.
+pub async fn hold_judge_resolve_to_the_bar(
+    conn: &mut sqlx::SqliteConnection,
+    project_id: &str,
+) -> sqlx::Result<bool> {
+    let readiness = crate::judge::resolve_review::readiness_on(&mut *conn, project_id).await?;
+    if readiness.ready {
+        return Ok(false);
+    }
+    let dropped = sqlx::query(
+        "UPDATE autopilot_state SET judge_resolve = 'observe' WHERE project_id = ? AND judge_resolve = 'enforce'",
+    )
+    .bind(project_id)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected()
+        == 1;
+    if dropped {
+        crate::feed::append_on(
+            conn,
+            Some(project_id),
+            "judge_resolve_demoted",
+            &format!(
+                "the resolver went back to observing {project_id}: {} of {} reviewed blocks agreed, {} less cautious, under the bar",
+                readiness.agree, readiness.reviewed, readiness.less_cautious
             ),
             None,
             None,
@@ -865,7 +939,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// Spec B D11: observing is an opt-in per project, independent of spec A's; enforcing is
-    /// refused until the resolver's warning is on screen.
+    /// refused until the project clears the bar.
     #[tokio::test]
     async fn a_project_opts_into_the_resolver_observing() {
         use crate::judge::JudgeMode;
@@ -892,12 +966,104 @@ mod tests {
         );
         assert!(matches!(
             set_project_judge_resolve(&pool, "p", JudgeMode::Enforce).await,
-            Err(ResolveActivationError::EnforceUnavailable)
+            Err(ResolveActivationError::NotReady(_))
         ));
         assert!(matches!(
             set_project_judge_resolve(&pool, "nobody", JudgeMode::Observe).await,
             Err(ResolveActivationError::UnknownProject)
         ));
+    }
+
+    /// Spec B D11: `enforce` only on an Active project that cleared the resolver's bar; leaving
+    /// Active drops the resolver's `enforce` to `observe` in the same write as spec A's `judge`.
+    #[tokio::test]
+    async fn the_resolvers_enforce_needs_active_and_the_bar_and_leaves_with_active() {
+        use crate::judge::JudgeMode;
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode) VALUES ('a', 'active'), ('s', 'shadow')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            set_project_judge_resolve(&pool, "a", JudgeMode::Enforce).await,
+            Err(ResolveActivationError::NotReady(_))
+        ));
+        assert!(matches!(
+            set_project_judge_resolve(&pool, "s", JudgeMode::Enforce).await,
+            Err(ResolveActivationError::NotActive)
+        ));
+        sqlx::query(
+            "UPDATE autopilot_state SET judge_resolve = 'enforce', judge = 'enforce' WHERE project_id = 'a'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        set_project_mode(&pool, None, "a", Mode::Off, None)
+            .await
+            .unwrap();
+        let (judge, resolve): (String, String) = sqlx::query_as(
+            "SELECT judge, judge_resolve FROM autopilot_state WHERE project_id = 'a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((judge.as_str(), resolve.as_str()), ("observe", "observe"));
+    }
+
+    /// As spec A's `hold_judge_to_the_bar`, for the resolver: once in enforce, a review that drops
+    /// the project below the bar drops it to observe, with a line saying so.
+    #[tokio::test]
+    async fn a_review_below_the_bar_drops_the_resolver_to_observe() {
+        use crate::judge::JudgeMode;
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, judge_resolve) VALUES ('p', 'active', 'enforce')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at) VALUES ('p', 'x', 'completed', 'worktree', '2026-09-27T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let id = sqlx::query(
+            "INSERT INTO judge_resolutions (run_id, lineage_root_id, event, tool_input_digest, default_outcome, judge_outcome, final_outcome, created_at)
+             VALUES (?, ?, 'park', 'd', 'park', 'explain', 'explain', '2026-09-27T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        assert!(
+            crate::judge::resolve_review::set_outcome(
+                pool.acquire().await.unwrap().as_mut(),
+                id,
+                "park"
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            hold_judge_resolve_to_the_bar(pool.acquire().await.unwrap().as_mut(), "p")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            autopilot_judge_resolve_mode(&pool, "p").await.unwrap(),
+            JudgeMode::Observe
+        );
+        let kind: String = sqlx::query_scalar("SELECT kind FROM feed ORDER BY id DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kind, "judge_resolve_demoted");
     }
 
     /// Spec A D11: observing is an opt-in per project; enforcing waits for the bar (plan Chunk 7)
