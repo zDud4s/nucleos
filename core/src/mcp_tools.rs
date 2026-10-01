@@ -2,43 +2,60 @@ use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Serialize;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpBox {
+    All,
+    Errand(i64),
+    JobNode(i64),
+}
+
+impl McpBox {
+    fn from_errand(errand: Option<i64>) -> Self {
+        match errand {
+            None => Self::All,
+            Some(id) => Self::Errand(id),
+        }
+    }
+}
+
 pub struct NucleosTools {
     client: crate::daemon_client::DaemonClient,
     #[expect(dead_code, reason = "tool_handler macro accesses this router field")]
     tool_router: ToolRouter<Self>,
-    /// Which errand this instance serves, and `None` for the whole tool set.
+    /// Which box this instance serves, including the scope id needed to answer its tools.
     ///
     /// The id lives HERE, on the server, and is never a tool argument. The stdio process is launched
-    /// already serving one errand; if the model could say which folder it meant, one errand would
-    /// name another's by asking, and the only defence left would be the model not trying — which is
-    /// a hope rather than a fence. `o_id_do_assunto_nao_vem_do_modelo` holds the schemas to that.
+    /// already serving one scope; if the model could say which folder or job it meant, one scope
+    /// could name another's by asking, and the only defence left would be the model not trying —
+    /// which is a hope rather than a fence. `o_id_do_assunto_nao_vem_do_modelo` holds the errand
+    /// schemas to that.
     ///
-    /// It is also the box: `Some(id)` serves `ERRAND_TOOLS` and nothing else, `None` serves
-    /// everything. One field rather than two, because an errand's box and an errand's folder are the
-    /// same fact — a server narrowed to `ERRAND_TOOLS` with no errand behind it would advertise four
-    /// tools that cannot answer.
-    errand: Option<i64>,
+    /// It is also the box: `Errand(id)` and `JobNode(id)` each serve their named surface, while
+    /// `All` serves everything except the tools that require a job. One field rather than two,
+    /// because a box and the scope it serves are the same fact — a narrowed server with no scope
+    /// behind it would advertise tools that cannot answer.
+    served: McpBox,
 }
 
 impl NucleosTools {
-    /// The server for one box: `None` is everything this server has, `Some(id)` is `ERRAND_TOOLS`
-    /// served for that errand.
+    /// The server for one box, carrying the scope id needed to answer that box's tools.
     ///
-    /// **`None` must keep meaning "everything".** `run_stdio` serves the cloud assistant and the
-    /// council today and neither passes a box; a default that quietly filtered would take tools away
-    /// from both with nothing failing loudly, and the symptom — half the app going silent — reads as
-    /// the model behaving oddly. `sem_caixa_o_servidor_serve_tudo` is that guard.
-    pub fn for_box(client: crate::daemon_client::DaemonClient, errand: Option<i64>) -> Self {
+    /// **`All` must keep meaning "everything except the named job-node tools".** `run_stdio` serves
+    /// the cloud assistant and council today and neither passes a box; a default that quietly
+    /// filtered further would take tools away with nothing failing loudly, and the symptom — half
+    /// the app going silent — reads as the model behaving oddly. `sem_caixa_o_servidor_serve_tudo`
+    /// is that guard.
+    pub fn for_box(client: crate::daemon_client::DaemonClient, served: McpBox) -> Self {
         Self {
             client,
             tool_router: Self::tool_router(),
-            errand,
+            served,
         }
     }
 
     /// Whether this instance will announce and dispatch one name.
     fn serves(&self, tool: &str) -> bool {
-        served_in_box(self.errand, tool)
+        served_in_box(self.served, tool)
     }
 
     /// What this server ANNOUNCES for one box, in characters of JSON.
@@ -69,7 +86,7 @@ impl NucleosTools {
         Self::tool_router()
             .list_all()
             .into_iter()
-            .filter(|tool| served_in_box(errand, &tool.name))
+            .filter(|tool| served_in_box(McpBox::from_errand(errand), &tool.name))
             .filter_map(|tool| serde_json::to_string(&tool).ok())
             .map(|json| json.len())
             .sum()
@@ -82,8 +99,10 @@ impl NucleosTools {
     /// static list — so an unboxed server advertises them too and has to answer somehow. It answers
     /// that it has no folder, rather than picking one.
     fn serving(&self) -> Result<i64, String> {
-        self.errand
-            .ok_or_else(|| "this server is not serving an errand, so it has no folder".to_owned())
+        match self.served {
+            McpBox::Errand(id) => Ok(id),
+            _ => Err("this server is not serving an errand, so it has no folder".to_owned()),
+        }
     }
 }
 
@@ -344,6 +363,22 @@ struct RecallParams {
     query: String,
     /// Optionally narrow the answer to `semantic`, `episodic` or `procedural` knowledge.
     layer: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct FindingParams {
+    /// One fact the next node of this job can check.
+    fact: String,
+    /// Concrete records that support the fact; the daemon validates their shape and existence.
+    evidence: Vec<EvidenceRef>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct EvidenceRef {
+    /// One of run, job_item, proposal, knowledge, project, command or gate.
+    t: String,
+    /// The referenced record's identifier, whose JSON shape depends on its type.
+    id: serde_json::Value,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -909,6 +944,28 @@ impl NucleosTools {
         Parameters(RecallParams { query, layer }): Parameters<RecallParams>,
     ) -> String {
         json_result(self.client.recall(&query, layer.as_deref()).await)
+    }
+
+    #[tool(
+        description = "Leave the next node of THIS job one fact another part of the system can \
+                       check: a command and its exit code, a test and the line it failed with, a \
+                       file that had to be touched for something to pass. `evidence` is required: \
+                       a list of {\"t\": ..., \"id\": ...} with `t` one of run, job_item, \
+                       proposal, knowledge, project, command, gate. The daemon checks that \
+                       evidence exists and is well formed; it does not check that your sentence \
+                       is true. Later nodes of this job will see it labelled as said by a run and \
+                       not approved, and it is discarded when the job ends. You cannot choose \
+                       where it goes."
+    )]
+    async fn note_finding(
+        &self,
+        Parameters(FindingParams { fact, evidence }): Parameters<FindingParams>,
+    ) -> String {
+        let evidence: Vec<serde_json::Value> = evidence
+            .into_iter()
+            .map(|evidence| serde_json::json!({"t": evidence.t, "id": evidence.id}))
+            .collect();
+        json_result(self.client.note_finding(&fact, &evidence).await)
     }
 
     #[tool(
@@ -1515,10 +1572,15 @@ impl ServerHandler for NucleosTools {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         if !self.serves(&request.name) {
+            let box_name = if matches!(self.served, McpBox::Errand(_)) {
+                "errand"
+            } else {
+                "box"
+            };
             return Ok(rmcp::model::CallToolResult::error(vec![
                 rmcp::model::ContentBlock::text(format!(
-                    "{} is not a tool this errand can use",
-                    request.name
+                    "{} is not a tool this {box_name} can use",
+                    request.name,
                 )),
             ]));
         }
@@ -1987,17 +2049,25 @@ pub const ERRAND_TOOLS: &[&str] = &[
     "web_search",
 ];
 
-/// Whether a box announces and dispatches one name. `None` is the whole server.
+/// The tools only a job node can answer, kept out of both the chats' door and an errand's box.
+///
+/// A finding belongs to one running job node. Offering it through `LOCAL_TOOLS` or
+/// `ERRAND_TOOLS` would either give a chat that authority or give the tool no job to name.
+pub const JOB_NODE_TOOLS: &[&str] = &["note_finding"];
+
+/// Whether a box announces and dispatches one name. `McpBox::All` is the whole server except the
+/// named job-node tools.
 ///
 /// Lifted out of `NucleosTools::serves` when a second caller appeared that has no instance to ask:
 /// `advertised_schema_chars` prices what a box WOULD announce, from a launch site that never builds
 /// a server. Two copies of this three-line match is how the price and the surface would come to
 /// disagree — and the disagreement would be silent in both directions, because neither side has any
 /// way to observe the other.
-fn served_in_box(errand: Option<i64>, tool: &str) -> bool {
-    match errand {
-        None => true,
-        Some(_) => ERRAND_TOOLS.contains(&tool),
+fn served_in_box(served: McpBox, tool: &str) -> bool {
+    match served {
+        McpBox::All => !JOB_NODE_TOOLS.contains(&tool),
+        McpBox::Errand(_) => ERRAND_TOOLS.contains(&tool),
+        McpBox::JobNode(_) => JOB_NODE_TOOLS.contains(&tool),
     }
 }
 
@@ -2229,6 +2299,12 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // in the Teams tab, so there is no path by which a stranger's text arrives in this answer and
     // therefore nothing for `effect_of_call` to second-guess by argument.
     ("list_teams", ToolEffect::ReadsOwn),
+    // A finding writes into this job's own state, and only later nodes of the SAME job read it,
+    // like `send_team_note`. As `Acts`, the node's own first read of third-party text would shut it
+    // off and the feature would work only for a node that read nothing. What pays for the write is
+    // at the receiving end: the label, the floor of one evidence item, the same-job fence, and death
+    // with the job. This grade does not validate the content of the fact.
+    ("note_finding", ToolEffect::WritesOwn),
     // The four project reads, and this is the weakest line on this page, so it is argued rather
     // than asserted. `ReadsUntrusted` would kill the feature at birth: the turn would read the
     // repository and from that moment every `Acts` tool is refused — including `create_run` and
@@ -2453,12 +2529,12 @@ impl LocalToolBox {
             allowed: TEAM_TOOLS,
             // Not an errand box. `allowed` is what narrows a department, and it narrows the LAUNCH;
             // `errand` narrows what the SERVER announces at all, which is a fence built for a
-            // Telegram topic anybody can post to. A department is not that, and passing `Some` here
-            // would serve it four errand tools it has no folder for.
+            // Telegram topic anybody can post to. A department is not that, and passing
+            // `McpBox::Errand` here would serve it four errand tools it has no folder for.
             errand: None,
             tools: NucleosTools::for_box(
                 crate::daemon_client::DaemonClient::as_run(base_url, token, run_id),
-                None,
+                McpBox::All,
             ),
         }
     }
@@ -2474,11 +2550,10 @@ impl LocalToolBox {
             pool,
             allowed,
             errand,
-            tools: NucleosTools {
-                client: crate::daemon_client::DaemonClient::new(base_url, token),
-                tool_router: NucleosTools::tool_router(),
-                errand,
-            },
+            tools: NucleosTools::for_box(
+                crate::daemon_client::DaemonClient::new(base_url, token),
+                McpBox::from_errand(errand),
+            ),
         }
     }
 }
@@ -2508,7 +2583,10 @@ impl crate::local_agent::ToolBox for LocalToolBox {
 
     fn for_run(&self, run_id: i64) -> Option<Box<dyn crate::local_agent::ToolBox>> {
         Some(Box::new(LocalToolBox {
-            tools: NucleosTools::for_box(self.tools.client.for_run(run_id), self.tools.errand),
+            tools: NucleosTools::for_box(
+                self.tools.client.for_run(run_id),
+                McpBox::from_errand(self.errand),
+            ),
             pool: self.pool.clone(),
             allowed: self.allowed,
             errand: self.errand,
@@ -2971,29 +3049,40 @@ fn bounded_matches(matches: serde_json::Value) -> serde_json::Value {
     })
 }
 
-/// Which box this process was launched to serve, read from `--box errand --errand <id>`.
+/// Which box this process was launched to serve, read from either
+/// `--box errand --errand <id>` or `--box job-node --job <id>`.
 ///
-/// No `--box` is the whole server, which is what the cloud assistant and the council are launched
-/// with today and must keep getting.
+/// No `--box` is the broad server, excluding only the tools that require a job. That is what the
+/// cloud assistant and council are launched with today and must keep getting.
 ///
 /// A `--box` value this server does not know is a STARTUP ERROR and never a quiet fall back to the
 /// full list. A launcher that misspells the box would otherwise put `create_run`, `vcs_request` and
 /// `set_kill` in a Telegram topic anybody in the group can post to, and nothing anywhere would say
 /// so — the failure would be invisible until it was expensive.
-pub fn box_from_args(args: &[String]) -> Result<Option<i64>, String> {
+pub fn box_from_args(args: &[String]) -> Result<McpBox, String> {
     let Some(kind) = flag_value(args, "--box") else {
-        return Ok(None);
+        return Ok(McpBox::All);
     };
-    if kind != "errand" {
-        return Err(format!(
-            "--box {kind} is not a box this server knows; the only box is `errand`"
-        ));
+    match kind {
+        "errand" => {
+            let id = flag_value(args, "--errand")
+                .ok_or_else(|| "--box errand needs --errand <id> to say which errand".to_owned())?;
+            id.parse::<i64>()
+                .map(McpBox::Errand)
+                .map_err(|error| format!("--errand {id} is not an errand id: {error}"))
+        }
+        "job-node" => {
+            let id = flag_value(args, "--job")
+                .ok_or_else(|| "--box job-node needs --job <id> to say which job".to_owned())?;
+            id.parse::<i64>()
+                .map(McpBox::JobNode)
+                .map_err(|error| format!("--job {id} is not a job id: {error}"))
+        }
+        _ => Err(format!(
+            "--box {kind} is not a box this server knows; the known boxes are `errand` and \
+             `job-node`"
+        )),
     }
-    let id = flag_value(args, "--errand")
-        .ok_or_else(|| "--box errand needs --errand <id> to say which errand".to_owned())?;
-    id.parse::<i64>()
-        .map(Some)
-        .map_err(|error| format!("--errand {id} is not an errand id: {error}"))
 }
 
 /// The argument after `flag`, if the flag is there and something follows it.
@@ -3006,10 +3095,11 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 /// Serves this process's stdin/stdout as the NucleOS MCP server.
 ///
-/// `errand` is the box, and `None` — everything — is what `--mcp-tools` alone means. See
-/// `NucleosTools::for_box` for why the default must stay that way.
-pub async fn run_stdio(errand: Option<i64>) -> Result<(), String> {
-    let tools = NucleosTools::for_box(crate::daemon_client::DaemonClient::from_env()?, errand);
+/// `served` is the box and its scope, and `McpBox::All` — everything except the named job-node
+/// tools — is what `--mcp-tools` alone means. See `NucleosTools::for_box` for why the default must
+/// stay broad.
+pub async fn run_stdio(served: McpBox) -> Result<(), String> {
+    let tools = NucleosTools::for_box(crate::daemon_client::DaemonClient::from_env()?, served);
     let service = tools
         .serve((tokio::io::stdin(), tokio::io::stdout()))
         .await
@@ -3021,6 +3111,81 @@ pub async fn run_stdio(errand: Option<i64>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a job node may write a finding; every other box must keep that door absent.
+    #[test]
+    fn only_a_job_node_is_offered_the_tool_that_writes_a_finding() {
+        assert!(served_in_box(McpBox::JobNode(1), "note_finding"));
+        assert!(!served_in_box(McpBox::Errand(1), "note_finding"));
+        assert!(!served_in_box(McpBox::All, "note_finding"));
+
+        for name in ["create_run", "web_read", "recall", "approve_proposal"] {
+            assert!(
+                !served_in_box(McpBox::JobNode(1), name),
+                "a job node was offered {name}"
+            );
+        }
+        for tools in [
+            ERRAND_TOOLS,
+            LOCAL_TOOLS,
+            TEAM_TOOLS,
+            COUNCIL_TOOLS,
+            HOSTED_TOOLS,
+        ] {
+            for name in tools {
+                assert!(
+                    !served_in_box(McpBox::JobNode(1), name),
+                    "a job node was offered {name}"
+                );
+            }
+        }
+    }
+
+    /// A tool that can only be answered inside a job would answer "no job" to the cloud assistant
+    /// and council, which is worse than never offering it; every other name remains unboxed.
+    #[test]
+    fn a_server_with_no_box_still_serves_everything_except_the_one_tool_that_needs_a_job() {
+        let registered = every_tool_name();
+        for name in registered
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once("future_tool_nobody_has_written"))
+        {
+            assert_eq!(
+                served_in_box(McpBox::All, name),
+                !JOB_NODE_TOOLS.contains(&name),
+                "the unboxed server classified {name} incorrectly"
+            );
+        }
+    }
+
+    /// Launch arguments name a box explicitly; missing, malformed, and unknown values are not
+    /// guessed into a job-node identity.
+    #[test]
+    fn the_job_node_box_is_read_from_the_launch_arguments_and_nothing_else_is_guessed() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(box_from_args(&args(&[])), Ok(McpBox::All));
+        assert_eq!(
+            box_from_args(&args(&["--mcp-tools", "--box", "errand", "--errand", "7",])),
+            Ok(McpBox::Errand(7))
+        );
+        assert_eq!(
+            box_from_args(&args(&["--mcp-tools", "--box", "job-node", "--job", "9",])),
+            Ok(McpBox::JobNode(9))
+        );
+        assert!(box_from_args(&args(&["--box", "job-node"])).is_err());
+        assert!(box_from_args(&args(&["--box", "job-node", "--job", "x"])).is_err());
+
+        let unknown = box_from_args(&args(&["--box", "telegram"])).unwrap_err();
+        assert!(unknown.contains("errand"), "unknown-box error: {unknown}");
+        assert!(unknown.contains("job-node"), "unknown-box error: {unknown}");
+    }
     use sqlx::SqlitePool;
     use tower::ServiceExt as TowerServiceExt;
 
@@ -3454,7 +3619,7 @@ mod tests {
                 "http://127.0.0.1:1".to_string(),
                 String::new(),
             ),
-            None,
+            McpBox::All,
         );
 
         let info = ServerHandler::get_info(&tools);
@@ -3598,6 +3763,7 @@ mod tests {
                 "list_projects",
                 "list_proposals",
                 "list_teams",
+                "note_finding",
                 "project_cat",
                 "project_diff",
                 "project_grep",
@@ -3979,6 +4145,263 @@ mod tests {
             serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
         });
         (status, body)
+    }
+
+    async fn finding_at_door(
+        pool: &SqlitePool,
+        scope: crate::auth::Scope,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let response = axum::Router::new()
+            .route(
+                "/knowledge/findings",
+                axum::routing::post(crate::http::post_finding),
+            )
+            .layer(axum::Extension(scope))
+            .with_state(declaration_test_state(pool.clone()))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/knowledge/findings")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+        });
+        (status, body)
+    }
+
+    async fn seed_job_run(pool: &SqlitePool, job_status: &str) -> (i64, i64) {
+        let job_id: i64 = sqlx::query_scalar(
+            "INSERT INTO jobs
+               (project_id, project_root, status, max_items, gate_retries, created_at)
+             VALUES ('nucleos', 'C:/tmp', ?, 1, 0, '2026-10-01T00:00:00Z')
+             RETURNING id",
+        )
+        .bind(job_status)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at, job_id, stage)
+             VALUES ('nucleos', 'leave a finding', 'running', 'worktree',
+                     '2026-10-01T00:00:00Z', ?, 'execute')
+             RETURNING id",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (job_id, run_id)
+    }
+
+    #[tokio::test]
+    async fn a_finding_with_no_evidence_is_refused_at_the_door() {
+        let pool = test_pool().await;
+        let (_, run_id) = seed_job_run(&pool, "implementing").await;
+        for (body, expected) in [
+            (
+                serde_json::json!({"fact": "the build needs the GNU host"}),
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!({"fact": "the build needs the GNU host", "evidence": []}),
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"fact": "the build needs the GNU host", "evidence": "run:1"}),
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"fact": "the build needs the GNU host", "evidence": [{}]}),
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let (status, _) = finding_at_door(&pool, crate::auth::Scope::Run(run_id), body).await;
+            assert_eq!(status, expected);
+            let written: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE layer = 'working'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(written, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_evidence_of_nothing_but_unknown_tags_is_no_evidence() {
+        let pool = test_pool().await;
+        let (_, run_id) = seed_job_run(&pool, "implementing").await;
+        for evidence in [
+            serde_json::json!([{"t": "vibes", "id": 1}]),
+            serde_json::json!([{"t": "run"}]),
+            serde_json::json!([{"t": "run", "id": 0}]),
+        ] {
+            let (status, _) = finding_at_door(
+                &pool,
+                crate::auth::Scope::Run(run_id),
+                serde_json::json!({"fact": "the build needs the GNU host", "evidence": evidence}),
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        let (status, _) = finding_at_door(
+            &pool,
+            crate::auth::Scope::Run(run_id),
+            serde_json::json!({
+                "fact": "the build needs the GNU host",
+                "evidence": [{"t": "vibes", "id": 1}, {"t": "run", "id": 5}],
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        let stored: String =
+            sqlx::query_scalar("SELECT evidence FROM knowledge WHERE layer = 'working'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, r#"[{"t":"run","id":5}]"#);
+    }
+
+    #[tokio::test]
+    async fn a_run_can_never_write_the_measurement_column() {
+        let pool = test_pool().await;
+        let (job_id, run_id) = seed_job_run(&pool, "implementing").await;
+        let (status, _) = finding_at_door(
+            &pool,
+            crate::auth::Scope::Run(run_id),
+            serde_json::json!({
+                "fact": "the build needs the GNU host",
+                "evidence": [{"t": "run", "id": run_id}],
+                "observations": 5,
+            }),
+        )
+        .await;
+        assert!(status.is_client_error());
+        let written: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE layer = 'working'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(written, 0);
+
+        let (status, _) = finding_at_door(
+            &pool,
+            crate::auth::Scope::Run(run_id),
+            serde_json::json!({
+                "fact": "the build needs the GNU host",
+                "evidence": [{"t": "run", "id": run_id}],
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        let row: (
+            Option<i64>,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<i64>,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT observations, layer, status, scope_kind, scope_id, source,
+                        proposal_id, origin_run_id
+                   FROM knowledge WHERE layer = 'working'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                None,
+                "working".to_owned(),
+                "live".to_owned(),
+                "job".to_owned(),
+                job_id.to_string(),
+                "run".to_owned(),
+                None,
+                run_id,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn the_door_answers_only_to_a_run_that_belongs_to_a_live_job() {
+        let pool = test_pool().await;
+        let evidence = serde_json::json!([{"t": "run", "id": 1}]);
+        let body =
+            serde_json::json!({"fact": "the build needs the GNU host", "evidence": evidence});
+        for scope in [
+            crate::auth::Scope::Control,
+            crate::auth::Scope::ApiToken(crate::auth::ApiTokenLevel::RunCreating),
+            crate::auth::Scope::TeamRun("t".into()),
+        ] {
+            let (status, _) = finding_at_door(&pool, scope, body.clone()).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        }
+
+        let run_without_job: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('nucleos', 'no job', 'running', 'real', '2026-10-01T00:00:00Z')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (status, _) = finding_at_door(
+            &pool,
+            crate::auth::Scope::Run(run_without_job),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+
+        for status in crate::job::TERMINAL_STATUSES {
+            let (_, run_id) = seed_job_run(&pool, status).await;
+            let (answer, _) =
+                finding_at_door(&pool, crate::auth::Scope::Run(run_id), body.clone()).await;
+            assert_eq!(answer, axum::http::StatusCode::CONFLICT, "{status}");
+        }
+
+        let (_, run_id) = seed_job_run(&pool, "implementing").await;
+        for fact in ["".to_owned(), "x".repeat(601)] {
+            let (status, _) = finding_at_door(
+                &pool,
+                crate::auth::Scope::Run(run_id),
+                serde_json::json!({"fact": fact, "evidence": [{"t": "run", "id": run_id}]}),
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        for number in 1..=21 {
+            let (status, _) = finding_at_door(
+                &pool,
+                crate::auth::Scope::Run(run_id),
+                serde_json::json!({
+                    "fact": format!("finding {number}"),
+                    "evidence": [{"t": "run", "id": run_id}],
+                }),
+            )
+            .await;
+            let expected = if number <= 20 {
+                axum::http::StatusCode::CREATED
+            } else {
+                axum::http::StatusCode::TOO_MANY_REQUESTS
+            };
+            assert_eq!(status, expected, "finding {number}");
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4699,7 +5122,7 @@ mod tests {
                 "http://127.0.0.1:1".to_string(),
                 "unused".to_string(),
             ),
-            None,
+            McpBox::All,
         )
     }
 
@@ -4709,7 +5132,17 @@ mod tests {
                 "http://127.0.0.1:1".to_string(),
                 "unused".to_string(),
             ),
-            Some(errand_id),
+            McpBox::Errand(errand_id),
+        )
+    }
+
+    fn job_node_server(job_id: i64) -> NucleosTools {
+        NucleosTools::for_box(
+            crate::daemon_client::DaemonClient::new(
+                "http://127.0.0.1:1".to_string(),
+                "unused".to_string(),
+            ),
+            McpBox::JobNode(job_id),
         )
     }
 
@@ -4721,6 +5154,151 @@ mod tests {
             .collect();
         names.sort_unstable();
         names
+    }
+
+    #[tokio::test]
+    async fn a_job_node_server_announces_only_the_finding_tool() {
+        let (_running, context) = served_request_context().await;
+
+        let job_node = job_node_server(9)
+            .list_tools(None, context.clone())
+            .await
+            .unwrap();
+        assert_eq!(advertised(&job_node), ["note_finding"]);
+
+        let unboxed = unboxed_server()
+            .list_tools(None, context.clone())
+            .await
+            .unwrap();
+        assert!(
+            !advertised(&unboxed)
+                .iter()
+                .any(|name| name == "note_finding")
+        );
+
+        let errand = errand_server(1).list_tools(None, context).await.unwrap();
+        assert!(
+            !advertised(&errand)
+                .iter()
+                .any(|name| name == "note_finding")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finding_called_outside_a_job_node_box_is_refused_before_it_runs() {
+        let (_running, context) = served_request_context().await;
+        let request = || {
+            rmcp::model::CallToolRequestParams::new("note_finding").with_arguments(
+                serde_json::json!({
+                    "fact": "the gate failed on the formatter",
+                    "evidence": [{"t": "run", "id": 1}]
+                })
+                .as_object()
+                .expect("the fixture is an object")
+                .clone(),
+            )
+        };
+        let reached_the_daemon = |answer: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>| {
+            answer.as_ref().is_ok_and(|result| {
+                result.content.iter().any(|block| {
+                    matches!(block, rmcp::model::ContentBlock::Text(text)
+                        if text.text.contains("error sending request"))
+                })
+            })
+        };
+
+        for (box_name, answer) in [
+            (
+                "the unboxed server",
+                unboxed_server().call_tool(request(), context.clone()).await,
+            ),
+            (
+                "the errand server",
+                errand_server(1).call_tool(request(), context.clone()).await,
+            ),
+        ] {
+            assert!(
+                !reached_the_daemon(&answer),
+                "{box_name} dispatched note_finding and only the dead port stopped it: {answer:?}"
+            );
+            let refusal_is_visible = match &answer {
+                Err(error) => error.message.contains("note_finding"),
+                Ok(result) => {
+                    result.is_error == Some(true)
+                        && result.content.iter().any(|block| {
+                            matches!(block, rmcp::model::ContentBlock::Text(text)
+                                if text.text.contains("note_finding"))
+                        })
+                }
+            };
+            assert!(
+                refusal_is_visible,
+                "{box_name} refused the call without naming note_finding: {answer:?}"
+            );
+        }
+
+        let control = job_node_server(9).call_tool(request(), context).await;
+        assert!(
+            reached_the_daemon(&control),
+            "the job-node control never dispatched, so the refusals prove nothing: {control:?}"
+        );
+    }
+
+    #[test]
+    fn note_finding_reaches_no_other_box() {
+        for (list, name) in [
+            (LOCAL_TOOLS, "LOCAL_TOOLS"),
+            (COUNCIL_TOOLS, "COUNCIL_TOOLS"),
+            (TEAM_TOOLS, "TEAM_TOOLS"),
+            (ERRAND_TOOLS, "ERRAND_TOOLS"),
+            (HOSTED_TOOLS, "HOSTED_TOOLS"),
+        ] {
+            assert!(
+                !list.contains(&"note_finding"),
+                "note_finding must stay off {name}"
+            );
+        }
+        assert_eq!(tool_effect("note_finding"), ToolEffect::WritesOwn);
+    }
+
+    #[test]
+    fn the_finding_parameters_carry_no_scope_and_no_measurement() {
+        let tool = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "note_finding")
+            .expect("note_finding is registered");
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("note_finding publishes its parameters");
+        let names: Vec<_> = properties.keys().map(String::as_str).collect();
+        for name in names {
+            let lowered = name.to_lowercase();
+            for forbidden in [
+                "project",
+                "scope",
+                "run",
+                "job",
+                "errand",
+                "observations",
+                "layer",
+                "status",
+            ] {
+                assert!(!lowered.contains(forbidden), "note_finding takes {name}");
+            }
+        }
+
+        let required: Vec<&str> = tool
+            .input_schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("note_finding publishes which parameters are required")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(required.contains(&"evidence"), "required: {required:?}");
     }
 
     /// §6.1 of the design, and the reason the injection barrier costs an errand nothing.
@@ -4910,7 +5488,7 @@ mod tests {
             let announced: Vec<String> = NucleosTools::tool_router()
                 .list_all()
                 .into_iter()
-                .filter(|tool| served_in_box(errand, &tool.name))
+                .filter(|tool| served_in_box(McpBox::from_errand(errand), &tool.name))
                 .map(|tool| tool.name.into_owned())
                 .collect();
             let expected: usize = announced.len();
@@ -4918,7 +5496,11 @@ mod tests {
             assert_eq!(
                 expected,
                 match errand {
-                    None => NucleosTools::tool_router().list_all().len(),
+                    None => NucleosTools::tool_router()
+                        .list_all()
+                        .into_iter()
+                        .filter(|tool| !JOB_NODE_TOOLS.contains(&tool.name.as_ref()))
+                        .count(),
                     Some(_) => ERRAND_TOOLS.len(),
                 },
                 "the box {errand:?} announced {announced:?}"
@@ -5172,13 +5754,14 @@ mod tests {
         }
     }
 
-    /// The default has to stay "everything", and this is the test that says so out loud.
+    /// The default has to stay "everything except the named job-node tools", and this test says so.
     ///
     /// `run_stdio` serves the cloud assistant and the council today, and neither passes a box. A
     /// default that quietly filtered would take tools away from both of them with nothing failing
     /// loudly — half the app going silent, diagnosed as the model behaving oddly. So the omission
-    /// must narrow nothing at all, and the comparison is against the router's own list rather than
-    /// against a number written here, which would go stale the next time a tool is added.
+    /// must narrow nothing else. A tool that can only be answered inside a job would answer "no job"
+    /// to the cloud assistant and council, which is worse than never offering it. The comparison is
+    /// against the router's own list rather than a number that would go stale when a tool is added.
     #[tokio::test]
     async fn sem_caixa_o_servidor_serve_tudo() {
         let (_running, context) = served_request_context().await;
@@ -5188,13 +5771,14 @@ mod tests {
         let mut everything: Vec<String> = NucleosTools::tool_router()
             .list_all()
             .into_iter()
+            .filter(|tool| !JOB_NODE_TOOLS.contains(&tool.name.as_ref()))
             .map(|tool| tool.name.into_owned())
             .collect();
         everything.sort_unstable();
         assert_eq!(
             advertised(&listed),
             everything,
-            "a server with no box narrowed what it serves"
+            "a server with no box narrowed what it serves except the named job-node tools"
         );
     }
 

@@ -66,9 +66,10 @@ pub enum Scope {
     /// own environment. That is the property that makes it safe, not the mode's name.
     Control,
     /// One autonomous run's key. Minted when the run is created, dead the moment the run stops
-    /// running, and good for exactly three routes, all of them one conversation about its own tool
-    /// calls: asking the safety gate beforehand, waiting for a person's answer when the gate cannot
-    /// decide alone, and reporting back what actually happened.
+    /// running, and good for exactly four routes: three are one conversation about its own tool
+    /// calls — asking the safety gate beforehand, waiting for a person's answer when the gate
+    /// cannot decide alone, and reporting back what actually happened — and the fourth leaves one
+    /// evidenced finding for the next node of its own job.
     ///
     /// Nothing is lost by keeping it that narrow — only orchestrator turns are given an
     /// `--mcp-config`, so a `worktree`, `shadow` or triage run has no daemon tool to call in the
@@ -143,6 +144,10 @@ const ASK_WAIT_ROUTE: &str = "/hooks/ask-wait";
 /// own for the same reason they do: this is still one run asking about one tool call of its own,
 /// now completing the loop instead of opening it.
 const POSTTOOLUSE_ROUTE: &str = "/hooks/posttooluse";
+
+/// The only knowledge route a run's key reaches; it writes a working-layer row in the caller's own
+/// job and nothing else.
+const FINDING_ROUTE: &str = "/knowledge/findings";
 
 /// The email sidecar's whole daemon surface: report what it fetched, and ask where it got to.
 ///
@@ -391,10 +396,10 @@ const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/runs"),
     // A job is several runs over one worktree, so it belongs to the scope that buys runs rather
     // than to a scope of its own. What matters more is where it is NOT: `Scope::Run` reaches only
-    // `HOOK_ROUTE`, so an autonomous run cannot ask for a job — and it must never be able to. Each
-    // job starts runs, and a run that could start jobs would be a self-replication machine that no
-    // brake in this house counts, because none of them counts recursion. That is the same escape
-    // `runs.rs` describes closing for `POST /runs`.
+    // its four named routes, so an autonomous run cannot ask for a job — and it must never be able
+    // to. Each job starts runs, and a run that could start jobs would be a self-replication machine
+    // that no brake in this house counts, because none of them counts recursion. That is the same
+    // escape `runs.rs` describes closing for `POST /runs`.
     (Method::POST, "/jobs"),
     (Method::POST, "/webhooks/push"),
     (Method::POST, "/presets/{id}/run"),
@@ -418,7 +423,10 @@ pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
         Scope::Control => true,
         Scope::Run(_) => {
             method == Method::POST
-                && (path == HOOK_ROUTE || path == ASK_WAIT_ROUTE || path == POSTTOOLUSE_ROUTE)
+                && (path == HOOK_ROUTE
+                    || path == ASK_WAIT_ROUTE
+                    || path == POSTTOOLUSE_ROUTE
+                    || path == FINDING_ROUTE)
         }
         Scope::Service(Service::Email) => route_is_listed(EMAIL_ROUTES, method, path),
         Scope::Service(Service::Council) => route_is_listed(COUNCIL_ROUTES, method, path),
@@ -934,6 +942,7 @@ mod tests {
             .route(HOOK_ROUTE, post(|| async { "decided" }))
             .route(ASK_WAIT_ROUTE, post(|| async { "waited" }))
             .route(POSTTOOLUSE_ROUTE, post(|| async { "recorded" }))
+            .route(FINDING_ROUTE, post(|| async { "noted" }))
             .route("/proposals/{id}/approve", post(|| async {}))
             .route("/worktrees/{run_id}/release", post(|| async {}))
             // All three, because the point of the test below is that they are graded differently:
@@ -1218,8 +1227,8 @@ mod tests {
 
     /// The whole point of the scope. A `worktree` or `shadow` run has a Bash tool and the classifier
     /// permits `echo $NUCLEOS_DAEMON_TOKEN`, so whatever is in its environment must be assumed
-    /// published. What it opens is three routes, all of them the same conversation about its own
-    /// tool calls.
+    /// published. What it opens is four routes: three are the same conversation about its own tool
+    /// calls, and the fourth leaves one evidenced fact inside its own job.
     #[tokio::test]
     async fn a_run_token_opens_the_gate_route_and_nothing_else() {
         let state = test_state("control-token").await;
@@ -1245,6 +1254,11 @@ mod tests {
             StatusCode::OK,
             "a run must be able to report the outcome of its own tool call"
         );
+        assert_eq!(
+            status_of(&app, "POST", FINDING_ROUTE, &run_token).await,
+            StatusCode::OK,
+            "a run must be able to leave a finding for its own job"
+        );
         // 403, not 401: it authenticated. It is simply not allowed to approve anything.
         assert_eq!(
             status_of(&app, "POST", "/proposals/7/approve", &run_token).await,
@@ -1264,11 +1278,11 @@ mod tests {
     ///
     /// **Honest note on what this test is worth.** It passes before `POST /jobs` was added to any
     /// table as well as after, because `permits` gives `Scope::Run` a small, named list of routes
-    /// (`HOOK_ROUTE`, `ASK_WAIT_ROUTE`, `POSTTOOLUSE_ROUTE`) and everything else is refused by
-    /// construction. So it did not drive the change and it is not evidence the change works — it
-    /// is a pin, and its value is the day somebody widens `Scope::Run` further and has to decide,
-    /// in front of this assertion, whether jobs are on the list. The test that DID have to fail
-    /// first is the one below it.
+    /// (`HOOK_ROUTE`, `ASK_WAIT_ROUTE`, `POSTTOOLUSE_ROUTE`, `FINDING_ROUTE`) and everything else is
+    /// refused by construction. So it did not drive the change and it is not evidence the change
+    /// works — it is a pin, and its value is the day somebody widens `Scope::Run` further and has
+    /// to decide, in front of this assertion, whether jobs are on the list. The test that DID have
+    /// to fail first is the one below it.
     #[tokio::test]
     async fn a_run_token_cannot_ask_for_a_job() {
         let state = test_state("control-token").await;
@@ -2294,9 +2308,9 @@ mod tests {
         }
     }
 
-    /// The pin that says this scope did not widen the run token beyond its three named routes.
+    /// The pin that says this scope did not widen the run token beyond its four named routes.
     ///
-    /// `Scope::Run`'s doc claims it is "good for exactly three routes", and other comments in this
+    /// `Scope::Run`'s doc claims it is "good for exactly four routes", and other comments in this
     /// file lean on that being true. A new scope is exactly the change that makes somebody widen
     /// the old one by accident.
     #[test]
@@ -2305,6 +2319,7 @@ mod tests {
         assert!(permits(&run, &Method::POST, HOOK_ROUTE));
         assert!(permits(&run, &Method::POST, ASK_WAIT_ROUTE));
         assert!(permits(&run, &Method::POST, POSTTOOLUSE_ROUTE));
+        assert!(permits(&run, &Method::POST, FINDING_ROUTE));
 
         for (method, pattern) in TEAM_ROUTES {
             assert!(
@@ -2314,6 +2329,55 @@ mod tests {
         }
         for (method, pattern) in READ_ONLY_ROUTES {
             assert!(!permits(&run, method, pattern));
+        }
+    }
+
+    #[test]
+    fn a_run_key_reaches_the_findings_door_and_no_other_knowledge_route() {
+        let run = Scope::Run(7);
+        assert!(permits(&run, &Method::POST, "/knowledge/findings"));
+        for (method, path) in [
+            (Method::GET, "/knowledge/findings"),
+            (Method::POST, "/knowledge"),
+            (Method::POST, "/knowledge/recall"),
+            (Method::GET, "/knowledge"),
+        ] {
+            assert!(!permits(&run, &method, path), "{method} {path}");
+        }
+        for scope in [
+            Scope::TeamRun("team-1".to_owned()),
+            Scope::Service(Service::Council),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(!permits(&scope, &Method::POST, "/knowledge/findings"));
+        }
+        assert!(permits(
+            &Scope::Control,
+            &Method::POST,
+            "/knowledge/findings"
+        ));
+    }
+
+    /// This route is owner-only by omission from every scoped route table; this test holds that
+    /// omission in place.
+    #[test]
+    fn the_run_trace_is_the_owners_alone() {
+        let route = "/runs/7/knowledge";
+
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+            Scope::Service(Service::Email),
+            Scope::Service(Service::Council),
+            Scope::TeamRun("team-1".to_owned()),
+        ] {
+            assert!(!permits(&scope, &Method::GET, route), "{scope:?}");
+        }
+
+        for scope in [Scope::Control, Scope::ApiToken(ApiTokenLevel::Admin)] {
+            assert!(permits(&scope, &Method::GET, route), "{scope:?}");
         }
     }
 

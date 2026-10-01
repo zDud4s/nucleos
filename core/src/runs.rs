@@ -4223,14 +4223,16 @@ const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3
 
 /// Retention for everything finished work leaves behind: a run's transcript and events, its
 /// entries in the activity feed, councils that are over, queued VCS output tails, and briefing
-/// traces.
+/// traces. The sixth sweep consolidates durable gate and refused-action histories on its own
+/// six-hour interval.
 ///
-/// One loop rather than five, because they are the same sweep at different windows and splitting
-/// them would mean five tasks waking on the same hour to take the same write lock. Every failure
+/// One loop rather than six, because they are the same sweep at different windows and splitting
+/// them would mean six tasks waking on the same hour to take the same write lock. Every failure
 /// is best-effort and logged: a sweep that could not run is a fuller disk later, not a reason to
 /// take a daemon down now.
 pub async fn run_retention_loop(state: AppState) {
     let mut ticker = tokio::time::interval(RETENTION_INTERVAL);
+    let mut last_consolidated: Option<std::time::Instant> = None;
     loop {
         ticker.tick().await;
         let now = chrono::Utc::now();
@@ -4277,6 +4279,27 @@ pub async fn run_retention_loop(state: AppState) {
                 )
             }
             Err(error) => tracing::warn!(%error, "knowledge: trace retention sweep failed"),
+        }
+        match crate::knowledge::close_orphaned_working(&state.pool).await {
+            Ok(0) => {}
+            Ok(closed) => tracing::info!(closed, "knowledge: orphaned working findings closed"),
+            Err(error) => tracing::warn!(%error, "knowledge: orphaned finding sweep failed"),
+        }
+        if crate::consolidate::due(last_consolidated, std::time::Instant::now()) {
+            last_consolidated = Some(std::time::Instant::now());
+            match crate::consolidate::run_pass(&state.pool, now).await {
+                Ok(report) if report.is_quiet() => {}
+                Ok(report) => tracing::info!(
+                    created = report.created,
+                    remeasured = report.remeasured,
+                    pending = report.pending,
+                    refused = report.refused,
+                    successors = report.successors,
+                    skipped_busy = report.skipped_busy,
+                    "consolidate: pass finished"
+                ),
+                Err(error) => tracing::warn!(%error, "consolidate: pass failed"),
+            }
         }
     }
 }
@@ -4713,6 +4736,66 @@ mod tests {
             prune_transcripts(&pool, 30, now).await.unwrap(),
             PrunedTranscripts::default()
         );
+    }
+
+    #[tokio::test]
+    async fn the_hourly_loop_runs_the_net() {
+        let state = test_state().await;
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "orphaned-finding",
+                project_root: "/project/orphaned-finding",
+                rule_name: None,
+                prompt: "test the retention net",
+                max_items: 1,
+                gate_each: true,
+                review: false,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET status = 'failed' WHERE id = ?")
+            .bind(job_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let finding = sqlx::query(
+            r#"INSERT INTO knowledge
+                 (layer, scope_kind, scope_id, source, evidence, kind, title, body, status, created_at)
+               VALUES ('working', 'job', ?, 'run', '[{"t":"run","id":1}]', 'memory',
+                       'orphaned', 'b', 'live', '2026-09-20T00:00:00+00:00')"#,
+        )
+        .bind(job_id.to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let loop_task = tokio::spawn(run_retention_loop(state.clone()));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status: String = sqlx::query_scalar("SELECT status FROM knowledge WHERE id = ?")
+                .bind(finding)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status == "closed" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                loop_task.abort();
+                panic!("the immediate retention pass left an orphaned finding live");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        loop_task.abort();
+        let _ = loop_task.await;
     }
 
     async fn test_state_with_runner(

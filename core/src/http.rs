@@ -507,6 +507,7 @@ pub fn build_router(state: AppState) -> Router {
         // `.ai/specs/2026-08-29-porque-parou-design.md` §4, §7). Read-only front to back — see
         // `run_stop.rs`.
         .route("/runs/{id}/stop", get(crate::runs::get_run_stop))
+        .route("/runs/{id}/knowledge", get(get_run_knowledge))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route(
             "/runs/{id}/message",
@@ -524,13 +525,13 @@ pub fn build_router(state: AppState) -> Router {
         // What earlier work learned, and the two things a person does with it. Owner-scoped like
         // the notes above and for a stronger reason: this is the layer that decides what every
         // later run is told, so a token that could write here could rewrite the agent's mind for
-        // every project on the machine. **How a RUN declares one is deliberately not here** — that
-        // is an agent writing into what agents are told, which is the governance question
-        // `notes.rs` refuses in its own words, and it is the owner's to answer rather than mine.
+        // every project on the machine. A run has one narrower door below: one evidenced row in the
+        // working layer of the caller's own job, read only there and closed when that job ends.
         .route("/knowledge", get(list_knowledge).post(post_knowledge))
         // Like `/runs/awaiting-approval` above, this literal coexists with `/{id}` because static
         // segments win in matchit.
         .route("/knowledge/recall", post(recall_knowledge))
+        .route("/knowledge/findings", post(post_finding))
         .route("/knowledge/{id}", get(get_knowledge))
         .route("/knowledge/{id}/revert", post(revert_knowledge))
         .route("/assistant/message", post(post_assistant_message))
@@ -14658,6 +14659,53 @@ pub(crate) struct RecallRequest {
     layer: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FindingRequest {
+    fact: String,
+    evidence: serde_json::Value,
+}
+
+/// The run-key-only door for one evidenced working fact in the caller's own live job.
+pub(crate) async fn post_finding(
+    State(state): State<AppState>,
+    Extension(scope): Extension<crate::auth::Scope>,
+    Json(request): Json<FindingRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), axum::response::Response> {
+    let crate::auth::Scope::Run(run_id) = scope else {
+        return Err((StatusCode::FORBIDDEN, "only a run may leave a finding").into_response());
+    };
+    let knowledge_id =
+        crate::knowledge::note_finding(&state.pool, run_id, &request.fact, &request.evidence)
+            .await
+            .map_err(|error| match error {
+                crate::knowledge::FindingError::EmptyFact
+                | crate::knowledge::FindingError::FactTooLong
+                | crate::knowledge::FindingError::NoEvidence => {
+                    (StatusCode::BAD_REQUEST, error.to_string()).into_response()
+                }
+                crate::knowledge::FindingError::NoJob
+                | crate::knowledge::FindingError::JobEnded => {
+                    (StatusCode::CONFLICT, error.to_string()).into_response()
+                }
+                crate::knowledge::FindingError::TooMany => {
+                    (StatusCode::TOO_MANY_REQUESTS, error.to_string()).into_response()
+                }
+                crate::knowledge::FindingError::Db(error) => {
+                    tracing::warn!(%error, run_id, "writing a finding failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "the finding could not be written",
+                    )
+                        .into_response()
+                }
+            })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({"knowledge_id": knowledge_id})),
+    ))
+}
+
 /// The one door a run declares through.
 ///
 /// It still goes through the proposal, rather than inserting an `active` row: the review trail is
@@ -14835,6 +14883,20 @@ async fn list_knowledge(
             tracing::warn!(%error, "listing refinements failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+async fn get_run_knowledge(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::brief::RunTrace>, StatusCode> {
+    match crate::brief::trace_of(&state.pool, id).await {
+        Ok(Some(trace)) => Ok(Json(trace)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(run_id = id, %error, "reading what a run was told failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// One refinement, read the way a person decides about it: the text, every decision it has been
@@ -35103,6 +35165,83 @@ mod tests {
             accepting.asked.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "picking a model must ask can_serve before storing it, not store it unconditionally"
         );
+    }
+
+    #[tokio::test]
+    async fn the_run_trace_route_answers_the_trace_and_404s_an_unknown_run() {
+        let state = test_state().await;
+        let loser = sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'machine', 'owner', 'memory', 'the loser', 'lost body',
+                     'active', '2026-09-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let shown = sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, source, kind, title, body, status, created_at)
+             VALUES ('procedural', 'machine', 'owner', 'prompt', 'the winner', 'shown body',
+                     'active', '2026-09-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('p', 'completed', 'real', '2026-09-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        crate::brief::record(
+            &state.pool,
+            run_id,
+            None,
+            &[
+                crate::knowledge::Scored {
+                    knowledge_id: loser,
+                    shown: false,
+                    s_fts: 0.91,
+                    s_scope: 0.82,
+                    s_structure: 0.73,
+                    s_recency: 0.64,
+                    s_use: 0.55,
+                    score: 0.0,
+                },
+                crate::knowledge::Scored {
+                    knowledge_id: shown,
+                    shown: true,
+                    s_fts: 0.14,
+                    s_scope: 0.25,
+                    s_structure: 0.36,
+                    s_recency: 0.47,
+                    s_use: 0.58,
+                    score: 0.0,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/runs/{run_id}/knowledge"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["traced"], true);
+        assert_eq!(body["items"][0]["shown"], true);
+        assert_eq!(body["items"][0]["s_fts"], 0.14);
+
+        let (status, _) = call(state, "GET", "/runs/999999/knowledge", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// A run that declares a lesson is recorded as the run that taught it.
