@@ -52,7 +52,8 @@ pub(crate) async fn lineage_trace_on(
                             WHERE (r.id = ?1 OR r.lineage_root_id = ?1)
                               AND g.queued_request_id IS NOT NULL)
                 OR (?2 IS NOT NULL
-                    AND EXISTS (SELECT 1 FROM json_each(v.args) WHERE json_each.value = ?2)))
+                    AND EXISTS (SELECT 1 FROM json_each(v.args)
+                                WHERE instr(json_each.value, ?2) > 0)))
          ORDER BY v.id
          LIMIT 1",
     )
@@ -118,68 +119,97 @@ async fn needs_owner(pool: &SqlitePool, project_id: &str, run_id: i64, reason: &
     .await;
 }
 
+/// Why `refusal_before_the_transaction` stopped a correction.
+#[derive(Debug)]
+pub(crate) enum Refusal {
+    /// A condition failed: the owner is told, with the reason.
+    Owner(String),
+    /// The resolver is no longer in enforce: nothing is corrected and no owner line is written
+    /// (spec D11), as in observe.
+    Silent,
+}
+
 /// Spec D6, conditions 2 and 5 to 8, read AFTER the judge answered (S3): they read state that
 /// changes (the queue, the brakes, the switches, the ceiling), and reading them after a call that
 /// may take 10 s shortens the window between reading and acting. `None` when all hold.
-async fn refusal_before_the_transaction(
+pub(crate) async fn refusal_before_the_transaction(
     state: &AppState,
     project_id: &str,
     root: i64,
     branch: Option<&str>,
-) -> Option<String> {
+) -> Option<Refusal> {
     let pool = &state.pool;
+    // The resolver's setting once more: it was read before the judge, which may take 10 s, and the
+    // owner may have moved it to observe or off meanwhile. Anything but enforce corrects nothing
+    // and writes no owner line, as the observe path does (spec D11).
+    if !matches!(
+        crate::autopilot::autopilot_judge_resolve_mode(pool, project_id).await,
+        Ok(JudgeMode::Enforce)
+    ) {
+        return Some(Refusal::Silent);
+    }
     // 5: Active NOW. The E4 may fire hours after the launch, and launching work on a project the
     // owner took out of Active would be less cautious than today.
     if !matches!(
         crate::autopilot::project_mode(pool, project_id).await,
         Ok(crate::autopilot::Mode::Active)
     ) {
-        return Some("the project is not in Active".to_owned());
+        return Some(Refusal::Owner("the project is not in Active".to_owned()));
     }
     // 5: the scheduler's own door, budget then quota. A correction is a launch.
     if let crate::budget::BudgetDecision::Pause { reason, .. } =
         crate::quota::permits_new_run(state, chrono::Utc::now()).await
     {
-        return Some(format!("the brake on new runs is on: {reason}"));
+        return Some(Refusal::Owner(format!(
+            "the brake on new runs is on: {reason}"
+        )));
     }
     // 6 (B1): both switches, and an unreadable one counts as engaged, as the scheduler reads them.
     if crate::autopilot::kill_switch_engaged(pool)
         .await
         .unwrap_or(true)
     {
-        return Some("the kill switch is engaged".to_owned());
+        return Some(Refusal::Owner("the kill switch is engaged".to_owned()));
     }
     if crate::autopilot::scoped_kill_engaged(pool, "project", project_id)
         .await
         .unwrap_or(true)
     {
-        return Some("the project's kill switch is engaged".to_owned());
+        return Some(Refusal::Owner(
+            "the project's kill switch is engaged".to_owned(),
+        ));
     }
     let Ok(mut conn) = pool.acquire().await else {
-        return Some("the lineage could not be read".to_owned());
+        return Some(Refusal::Owner("the lineage could not be read".to_owned()));
     };
     // 2
     match lineage_trace_on(&mut conn, root, branch).await {
-        Ok(Some(trace)) => return Some(trace),
+        Ok(Some(trace)) => return Some(Refusal::Owner(trace)),
         Ok(None) => {}
-        Err(_) => return Some("the lineage could not be read".to_owned()),
+        Err(_) => return Some(Refusal::Owner("the lineage could not be read".to_owned())),
     }
     // 7: this correction would be one more.
     match corrections_in_last_day_on(&mut conn, project_id, chrono::Utc::now()).await {
         Ok(count) if count >= resolve::CORRECTIONS_PER_PROJECT_PER_DAY => {
-            return Some(format!(
+            return Some(Refusal::Owner(format!(
                 "the project reached {} corrections in the last day",
                 resolve::CORRECTIONS_PER_PROJECT_PER_DAY
-            ));
+            )));
         }
         Ok(_) => {}
-        Err(_) => return Some("the day's corrections could not be counted".to_owned()),
+        Err(_) => {
+            return Some(Refusal::Owner(
+                "the day's corrections could not be counted".to_owned(),
+            ));
+        }
     }
     drop(conn);
     // 8
     match lineage_read_untrusted(pool, root).await {
         Ok(false) => None,
-        _ => Some("a run of this task read text from outside the project".to_owned()),
+        _ => Some(Refusal::Owner(
+            "a run of this task read text from outside the project".to_owned(),
+        )),
     }
 }
 
@@ -295,12 +325,17 @@ pub(crate) async fn after_gate_failed(state: AppState, run_id: i64, exit_code: i
     .await
     .ok()
     .flatten();
-    if let Some(reason) =
-        refusal_before_the_transaction(&state, &project_id, root, branch.as_deref()).await
-    {
-        needs_owner(pool, &project_id, run_id, &reason).await;
-        settle(pool, row.settled(Outcome::Owner, false)).await;
-        return;
+    match refusal_before_the_transaction(&state, &project_id, root, branch.as_deref()).await {
+        None => {}
+        Some(Refusal::Owner(reason)) => {
+            needs_owner(pool, &project_id, run_id, &reason).await;
+            settle(pool, row.settled(Outcome::Owner, false)).await;
+            return;
+        }
+        Some(Refusal::Silent) => {
+            settle(pool, row.settled(Outcome::Owner, false)).await;
+            return;
+        }
     }
     // 4. The transaction, whose first write is the correction row.
     match crate::runs::resume_for_correction(&state, run_id, exit_code).await {
@@ -326,6 +361,18 @@ pub(crate) async fn after_gate_failed(state: AppState, run_id: i64, exit_code: i
     }
 }
 
+/// How long a `completed` correction run may still be handing off to a successor, before the sweep
+/// takes it as the end of the chain (spec D6/D7). Every other terminal status is final at once.
+const COMPLETED_GRACE: chrono::Duration = chrono::Duration::seconds(60);
+
+/// Whether a run completed so recently that its handoff may not have written the successor yet.
+/// A missing or unreadable `completed_at` is not recent: the sweep cannot wait on it forever.
+fn completed_within_grace(completed_at: Option<&str>) -> bool {
+    completed_at
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|at| chrono::Utc::now() - at.with_timezone(&chrono::Utc) < COMPLETED_GRACE)
+}
+
 /// Spec D6/D7: says, once, every correction whose chain ended any way but `completed`. The owner
 /// has to know the automatic turn did not finish, whatever the reason. The chain's LATEST run
 /// decides: a parked correction goes on in its resume, a handed-off one in its successor, and both
@@ -333,8 +380,8 @@ pub(crate) async fn after_gate_failed(state: AppState, run_id: i64, exit_code: i
 /// `worktree_gate_failed` line and is never corrected again (condition 4); it is marked without a
 /// line, so the sweep never reads it again.
 pub(crate) async fn report_ended_corrections(pool: &SqlitePool) {
-    let open: Vec<(i64, i64, String, i64, String)> = match sqlx::query_as(
-        "SELECT c.id, c.origin_run_id, c.project_id, r.id, r.status
+    let open: Vec<(i64, i64, String, i64, String, Option<String>)> = match sqlx::query_as(
+        "SELECT c.id, c.origin_run_id, c.project_id, r.id, r.status, r.completed_at
          FROM judge_corrections c
          JOIN runs r ON r.id = (SELECT MAX(id) FROM runs
                                 WHERE (id = c.root_run_id OR lineage_root_id = c.root_run_id)
@@ -350,8 +397,12 @@ pub(crate) async fn report_ended_corrections(pool: &SqlitePool) {
             return;
         }
     };
-    for (id, origin, project_id, latest, status) in open {
+    for (id, origin, project_id, latest, status, completed_at) in open {
         let failed = match status.as_str() {
+            // `completed` is only final once `spawn_handoff_if_needed` has had time to set the
+            // successor: read at the instant of completion, the chain's latest run is still this
+            // one, and a successor that fails afterwards would never be reported (spec D6/D7).
+            "completed" if completed_within_grace(completed_at.as_deref()) => continue,
             "completed" => false,
             "failed" | "timed_out" | "cancelled" | "interrupted" => true,
             // Still going: running, parked, or superseded with its resume not yet visible.
@@ -531,6 +582,19 @@ mod tests {
             trace(&pool, root).await.is_some(),
             "a human request naming the tree's branch"
         );
+        // A refspec or a remote-qualified name carries the branch without being equal to it.
+        for arg in ["nucleos/run-1:main", "origin/nucleos/run-1"] {
+            let pool = pool().await;
+            let (root, _) = lineage(&pool).await;
+            request(
+                &pool,
+                None,
+                "queued",
+                &format!("{{\"op\":\"push\",\"refspec\":\"{arg}\"}}"),
+            )
+            .await;
+            assert!(trace(&pool, root).await.is_some(), "{arg}");
+        }
     }
 
     /// Condition 8 (S8): any run of the lineage that read a stranger's words.
@@ -636,6 +700,63 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    /// Spec D6/D7: a correction run that has only just completed may still be handing off, so the
+    /// sweep leaves it; once the grace has passed with no successor, the chain is over and is
+    /// marked without a line.
+    #[tokio::test]
+    async fn a_correction_that_just_completed_is_not_read_as_finished() {
+        let pool = pool().await;
+        let mut ids = Vec::new();
+        for (root, completed_at) in [
+            (2000_i64, chrono::Utc::now()),
+            (2001_i64, chrono::Utc::now() - chrono::Duration::minutes(2)),
+        ] {
+            let correction = sqlx::query(
+                "INSERT INTO runs (project_id, prompt, status, mode, lineage_root_id, created_at, completed_at)
+                 VALUES ('p', 'x', 'completed', 'worktree', ?, '2026-09-27T00:00:00Z', ?)",
+            )
+            .bind(root)
+            .bind(completed_at.to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            let id = sqlx::query(
+                "INSERT INTO judge_corrections (root_run_id, origin_run_id, correction_run_id, project_id, created_at)
+                 VALUES (?, ?, ?, 'p', '2026-09-27T00:00:00Z')",
+            )
+            .bind(root)
+            .bind(root)
+            .bind(correction)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            ids.push(id);
+        }
+
+        report_ended_corrections(&pool).await;
+
+        let mut reported = Vec::new();
+        for id in &ids {
+            let at: Option<String> =
+                sqlx::query_scalar("SELECT end_reported_at FROM judge_corrections WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            reported.push(at);
+        }
+        assert!(reported[0].is_none(), "just completed");
+        assert!(reported[1].is_some(), "completed 2 minutes ago");
+        let lines: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'judge_correction_failed'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lines, 0);
     }
 
     /// Spec D6: a correction parked and resumed goes on in a later run of its lineage; the sweep
