@@ -1131,6 +1131,25 @@ pub async fn record_declined_action_on(
     Ok(())
 }
 
+/// Spec B D12: whether a person already declined this exact action in this lineage. One read by
+/// the unique index, on the hook's path. The same `action_hash` as the decline, so a retry whose
+/// `description` changed is still the same action.
+pub async fn declined_in_lineage(
+    pool: &SqlitePool,
+    lineage_root_id: i64,
+    tool_name: &str,
+    tool_input: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM declined_actions
+                        WHERE lineage_root_id = ? AND tool_input_hash = ?)",
+    )
+    .bind(lineage_root_id)
+    .bind(action_hash(tool_name, tool_input))
+    .fetch_one(pool)
+    .await
+}
+
 /// The queued request that already has this action, if the approval handed it to the queue instead
 /// of back to the run (migration 0054).
 ///
