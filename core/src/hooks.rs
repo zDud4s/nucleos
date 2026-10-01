@@ -4,6 +4,7 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::auth::Scope;
 use crate::classifier;
@@ -416,10 +417,42 @@ async fn github_policy_of<'a>(
     }
 }
 
+/// What `core/hooks/ask_daemon.py` gives the daemon for the whole call (its `urlopen(..., timeout=5)`
+/// on `/hooks/pretooluse-decision`); past it the hook refuses, "failing closed", and whatever the
+/// daemon decided afterwards is never delivered. Keep in step with that file.
+const HOOK_BUDGET: Duration = Duration::from_secs(5);
+
+/// What still has to happen after the judge returns: pausing for approval, recording, answering.
+const AFTER_JUDGE_MARGIN: Duration = Duration::from_secs(1);
+
+/// Under this much remaining budget the judge is not asked to rule at all: it only observes
+/// (detached) and the classifier decides. A wait that short buys no answer worth the risk.
+const JUDGE_FLOOR: Duration = Duration::from_millis(500);
+
+/// How long the judge may be waited for, given when the hook's request began: `JUDGE_DEADLINE` at
+/// most, less whatever the git probes before it already spent, and `None` below `JUDGE_FLOOR`.
+fn judge_wait(started: Instant) -> Option<Duration> {
+    let remaining = HOOK_BUDGET
+        .saturating_sub(started.elapsed())
+        .saturating_sub(AFTER_JUDGE_MARGIN);
+    (remaining >= JUDGE_FLOOR).then(|| remaining.min(crate::judge::JUDGE_DEADLINE))
+}
+
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
-    Json(mut payload): Json<PreToolUsePayload>,
+    Json(payload): Json<PreToolUsePayload>,
+) -> Json<Decision> {
+    pretooluse_decision_from(state, scope, payload, Instant::now()).await
+}
+
+/// `pretooluse_decision` with the moment the request began taken as a parameter, so the budget the
+/// judge may spend (`judge_wait`) can be tested without sleeping through the probes that use it up.
+async fn pretooluse_decision_from(
+    state: AppState,
+    scope: Scope,
+    mut payload: PreToolUsePayload,
+    started: Instant,
 ) -> Json<Decision> {
     // `run_id` arrives in the body, which makes it a claim the caller makes about itself, and every
     // branch below reads `mode` from it. A scoped key names its own run, and the daemon resolved
@@ -936,7 +969,10 @@ pub async fn pretooluse_decision(
     // - After the queued request, the declared git operation and the grants: each is an explicit
     //   human decision or already returned its own verdict, and a judge ahead of them could refuse
     //   what a person approved and spend that person's denial allowance. It also means the
-    //   judge's 2 s are never added to the declared-git branch's up-to-300 s.
+    //   judge is NOT free of the declared-git branch: that branch's git probes (each allowed
+    //   up to 300 s) run first and can return `None`, and the judge's wait then follows them.
+    //   Both sit inside the 5 s the hook's caller allows, so the judge is given only what
+    //   `judge_wait(started)` says is left, and below that it merely observes.
     // - OUTSIDE the `pending && in_flight` block above, because a classifier `allow` never enters
     //   it, and D6 sends writes the classifier allowed to the judge.
     // - Before the unattended conversions and the pause below, which only ever see what the judge
@@ -985,6 +1021,23 @@ pub async fn pretooluse_decision(
                     ),
                 )
             }
+            // Out of budget: the hook's caller gives up at `HOOK_BUDGET`, and a ruling that arrives
+            // after it is recorded and never delivered. Observe only; the classifier decides.
+            crate::judge::JudgeMode::Enforce if judge_wait(started).is_none() => {
+                crate::judge::observe_if_asked(
+                    &state.pool,
+                    &state.judge,
+                    judge_asked(
+                        &state,
+                        run_id,
+                        shadow_decision_id,
+                        project_id.as_deref(),
+                        cwd,
+                        &payload,
+                        &classification,
+                    ),
+                )
+            }
             crate::judge::JudgeMode::Enforce => {
                 match crate::judge::enforce_if_asked(
                     &state.pool,
@@ -998,6 +1051,8 @@ pub async fn pretooluse_decision(
                         &payload,
                         &classification,
                     ),
+                    // Read again at the call: the budget only shrinks, and the guard above held a moment ago.
+                    judge_wait(started).unwrap_or(JUDGE_FLOOR),
                 )
                 .await
                 {
@@ -3696,6 +3751,58 @@ mod tests {
 
         assert_eq!(decision.decision, "pending_approval");
         assert!(started.elapsed() < crate::judge::JUDGE_DEADLINE + Duration::from_secs(1));
+    }
+
+    async fn decide_started(state: &AppState, run_id: i64, started: Instant) -> Decision {
+        let Json(decision) = pretooluse_decision_from(
+            state.clone(),
+            Scope::Run(run_id),
+            PreToolUsePayload {
+                run_id,
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+            },
+            started,
+        )
+        .await;
+        decision
+    }
+
+    /// Finding A: the hook has 5 s in all. With too little of it left, the judge is not consulted
+    /// to rule (an enforced allow could be recorded and never delivered); it only observes.
+    #[tokio::test]
+    async fn with_the_budget_spent_the_judge_does_not_rule_and_the_classifier_decides() {
+        let judge = VerdictJudge::answering(0.99, 0.99);
+        let state = judged_state(judge.clone()).await;
+        let run_id = judged_run(&state, "worktree", "enforce").await;
+        let started = Instant::now() - Duration::from_millis(4_200);
+
+        let decision = decide_started(&state, run_id, started).await;
+
+        assert_eq!(decision.decision, "pending_approval", "{}", decision.reason);
+        let rows = verdict_rows(&state.pool, 1).await;
+        assert_eq!(rows[0].0, "observe");
+        assert_eq!(rows[0].3, 0, "nothing was enforced");
+    }
+
+    /// Finding A: what remains of the budget bounds the wait, below `JUDGE_DEADLINE`.
+    #[tokio::test]
+    async fn the_judge_wait_is_bounded_by_what_remains_of_the_hook_budget() {
+        let state = judged_state(VerdictJudge::slow(Duration::from_secs(10))).await;
+        let run_id = judged_run(&state, "worktree", "enforce").await;
+        // 5 s - 2.9 s - 1 s margin = 1.1 s left, under the 2 s cap.
+        let started = Instant::now() - Duration::from_millis(2_900);
+        let waited = Instant::now();
+
+        let decision = decide_started(&state, run_id, started).await;
+
+        assert_eq!(decision.decision, "pending_approval");
+        assert!(
+            waited.elapsed() < Duration::from_millis(1_100 + 700),
+            "{:?}",
+            waited.elapsed()
+        );
+        assert!(waited.elapsed() < crate::judge::JUDGE_DEADLINE - Duration::from_millis(300));
     }
 
     /// D11: in `observe` the judge is asked, its answer is written down tied to the decision, and
