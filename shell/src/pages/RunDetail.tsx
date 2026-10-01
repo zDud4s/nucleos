@@ -256,6 +256,19 @@ function FactsPanel({ run }: { run: Run }) {
   );
 }
 
+/** The `route_failed` JSON array as `a, b`; null when absent, empty or unreadable. */
+function failedAttempts(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string" || raw === "") return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    const labels = parsed.filter((label): label is string => typeof label === "string" && label !== "");
+    return labels.length === 0 ? null : labels.join(", ");
+  } catch {
+    return null;
+  }
+}
+
 /** `runner · model · effort`, skipping what is unknown; null when nothing is known. */
 function routeTriple(parts: Array<string | null | undefined>): string | null {
   const known = parts.filter((part): part is string => typeof part === "string" && part !== "");
@@ -274,13 +287,11 @@ function RouteBlock({ run }: { run: Run }) {
   const ran = routeTriple([run.runner, run.model, run.effort]);
   const advised = routeTriple([run.advised_runner, run.advised_model, run.advised_effort]);
   const mode = run.route_mode === "shadow" || run.route_mode === "apply" ? run.route_mode : null;
-  const failed =
-    typeof run.route_failed === "string" && run.route_failed !== ""
-      ? run.route_failed
-      : run.route_failed === true
-        ? "reason not recorded"
-        : null;
-  if (ran === null && advised === null && failed === null) return null;
+  const failed = failedAttempts(run.route_failed);
+  // A mode with no decision is the router having given nothing usable: down, slow, refused, or an
+  // answer outside what was asked. The run launched as it would have without it.
+  const unadvised = mode !== null && !run.route_decision_id && advised === null;
+  if (ran === null && advised === null && failed === null && !unadvised) return null;
 
   const matched =
     mode === "shadow" &&
@@ -305,7 +316,8 @@ function RouteBlock({ run }: { run: Run }) {
           )}
         </p>
       )}
-      {failed !== null && <p className="runs-successor">{`Router could not advise: ${failed}`}</p>}
+      {unadvised && <p className="runs-successor">The router gave no usable advice; the run launched as configured.</p>}
+      {failed !== null && <p className="runs-successor">{`Already failed on this item: ${failed}`}</p>}
     </div>
   );
 }

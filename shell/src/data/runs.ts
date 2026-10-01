@@ -110,12 +110,16 @@ export interface RunDetail {
   runner?: string | null;
   /** `off` | `shadow` | `apply`; null for a run from before the router. */
   route_mode?: string | null;
-  route_decision_id?: number | null;
+  route_decision_id?: string | null;
   advised_runner?: string | null;
   advised_model?: string | null;
   advised_effort?: string | null;
-  /** Why the router could not advise. Read defensively: string, boolean or null. */
-  route_failed?: string | boolean | null;
+  /**
+   * A JSON array of `model[@effort]` that had already failed this run's item
+   * when it was routed, as text (the column is TEXT). Not a failure of the
+   * router: an absent `route_decision_id` under a mode is that.
+   */
+  route_failed?: string | null;
 }
 
 /** What a run has written since a byte offset, while it is still writing. */

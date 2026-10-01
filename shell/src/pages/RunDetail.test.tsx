@@ -346,12 +346,17 @@ describe("RunDetail — the gate", () => {
     expect(await screen.findByText("matched what ran")).toBeDefined();
   });
 
-  it("shows a router failure muted, and nothing at all for a run without a trail", async () => {
+  it("says when the router gave no usable advice, and lists what had already failed", async () => {
     daemon.apiFetch.mockImplementation(
-      detailFetch(detail({ route_mode: "shadow", route_failed: "router timed out" }), NO_TAIL, []),
+      detailFetch(
+        detail({ route_mode: "shadow", route_decision_id: null, route_failed: '["sonnet@low","opus"]' }),
+        NO_TAIL,
+        [],
+      ),
     );
     const first = await renderApp({ initialPath: "/runs/5" });
-    expect(await screen.findByText("Router could not advise: router timed out")).toBeDefined();
+    expect(await screen.findByText("The router gave no usable advice; the run launched as configured.")).toBeDefined();
+    expect(screen.getByText("Already failed on this item: sonnet@low, opus")).toBeDefined();
     expect(screen.queryByText("Router advised")).toBeNull();
     first.unmount?.();
   });

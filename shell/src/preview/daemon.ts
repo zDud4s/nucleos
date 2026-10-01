@@ -1814,7 +1814,7 @@ const RUN_DETAIL = {
   model: "sonnet",
   effort: "high",
   route_mode: "shadow",
-  route_decision_id: 7,
+  route_decision_id: "7",
   advised_runner: "claude",
   advised_model: "haiku",
   advised_effort: "low",
