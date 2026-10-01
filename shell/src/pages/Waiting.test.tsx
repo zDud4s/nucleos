@@ -1108,3 +1108,26 @@ describe("Waiting - a project in the location", () => {
     );
   });
 });
+
+describe("Waiting - declining only the action", () => {
+  it("offers a third door that refuses the action and keeps the run going", async () => {
+    const approval = proposal({ id: 41, kind: "action-approval", run_id: 7, tool_name: "Bash" });
+    const base = waitingFetch(waitingWorld({ approvals: [approval] }));
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/proposals/41/decline-action" && init?.method === "POST"
+        ? { resume_run_id: 8 }
+        : base(path, init),
+    );
+    await renderWaiting();
+
+    const decline = await screen.findByRole("button", { name: "Decline only the action #41" });
+    fireEvent.click(decline);
+    // The control has a real 300 ms dwell; a confirm click inside it is swallowed.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    fireEvent.click(await screen.findByRole("button", { name: /keep the run going/i }));
+
+    await waitFor(() =>
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/proposals/41/decline-action", { method: "POST" }),
+    );
+  });
+});

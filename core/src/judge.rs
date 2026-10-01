@@ -43,6 +43,7 @@ pub const JUDGE_QUESTIONS: &[Question] = &[
 ];
 
 mod client;
+pub(crate) mod resolve;
 mod review;
 #[cfg(test)]
 pub(crate) use client::ScriptedJudge;
@@ -56,20 +57,37 @@ pub use review::{
 /// and written down.
 pub const JUDGE_MAX_IN_FLIGHT: usize = 4;
 
+/// Spec B D10: the E4's question is detached from any hook and may take 10 s.
+pub const GATE_JUDGE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The judge as the daemon holds it: the occupant and the permits. One per process, in
 /// `AppState`, like `quota::QuotaRuntime`.
 pub struct JudgeRuntime {
     pub(crate) occupant: Arc<dyn Judge>,
+    /// Spec B D10: the same Jev with a 10 s client, for questions no hook is waiting on.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 4.1
+    pub(crate) background: Arc<dyn Judge>,
     pub(crate) permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl JudgeRuntime {
     pub fn jev() -> Self {
-        Self::with(Arc::new(JevJudge::new(client::JEV_BASE_URL)))
+        Self {
+            occupant: Arc::new(JevJudge::new(client::JEV_BASE_URL)),
+            background: Arc::new(JevJudge::with(
+                client::JEV_BASE_URL,
+                client::KeySource::Keyring,
+                GATE_JUDGE_TIMEOUT,
+            )),
+            permits: Arc::new(tokio::sync::Semaphore::new(JUDGE_MAX_IN_FLIGHT)),
+        }
     }
 
+    /// One occupant in both chairs; `jev()` no longer goes through it, so only tests do.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 4.1
     pub fn with(occupant: Arc<dyn Judge>) -> Self {
         Self {
+            background: occupant.clone(),
             occupant,
             permits: Arc::new(tokio::sync::Semaphore::new(JUDGE_MAX_IN_FLIGHT)),
         }
@@ -78,6 +96,7 @@ impl JudgeRuntime {
     #[cfg(test)]
     pub fn with_permits(occupant: Arc<dyn Judge>, permits: usize) -> Self {
         Self {
+            background: occupant.clone(),
             occupant,
             permits: Arc::new(tokio::sync::Semaphore::new(permits)),
         }
@@ -1019,6 +1038,20 @@ pub(crate) async fn ask(
     runtime.occupant.ask(state, questions).await
 }
 
+/// Spec B D10: `ask`, through the background occupant. The same permits: four calls in flight
+/// across the machine, whoever makes them.
+#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 4.1
+pub(crate) async fn ask_in_background(
+    runtime: &JudgeRuntime,
+    state: &str,
+    questions: &[Question],
+) -> Result<Answers, JudgeError> {
+    let Ok(_permit) = runtime.permits.clone().try_acquire_owned() else {
+        return Err(JudgeError::Busy);
+    };
+    runtime.background.ask(state, questions).await
+}
+
 /// D12: written off the response path, so the row can never add to what the hook waits for.
 fn record_later(pool: &SqlitePool, row: VerdictRow) {
     let pool = pool.clone();
@@ -1230,6 +1263,30 @@ mod tests {
     use super::test_support::{pool, running_run};
     use super::*;
     use serde_json::json;
+
+    /// Spec B D10: the E4 is asked through an occupant with a 10 s client, sharing the four permits;
+    /// a runtime built for tests seats the same occupant in both chairs.
+    #[tokio::test]
+    async fn the_background_occupant_shares_the_permits() {
+        let judge = ScriptedJudge::answering_keys(&[("fixable", 0.9)]);
+        let runtime = JudgeRuntime::with(judge.clone());
+        assert!(Arc::ptr_eq(&runtime.occupant, &runtime.background));
+        assert_eq!(GATE_JUDGE_TIMEOUT, Duration::from_secs(10));
+        let busy = JudgeRuntime::with_permits(judge, 0);
+        assert_eq!(
+            ask_in_background(
+                &busy,
+                "s",
+                &[Question {
+                    key: "fixable",
+                    instructions: "f"
+                }]
+            )
+            .await
+            .unwrap_err(),
+            JudgeError::Busy
+        );
+    }
 
     /// `redact_secrets` knows issuer-shaped tokens only; these are the shapes a shell line
     /// carries a secret in, plus the owner's home path.

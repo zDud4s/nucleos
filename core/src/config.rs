@@ -2041,6 +2041,20 @@ pub struct JudgeConfig {
     pub deny_at: Option<f64>,
 }
 
+/// Spec B D4: the resolver's thresholds for this project. All absent means 0.85 everywhere.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct JudgeResolveConfig {
+    #[serde(default)]
+    pub off_task_at: Option<f64>,
+    #[serde(default)]
+    pub needed_at: Option<f64>,
+    #[serde(default)]
+    pub avoidable_at: Option<f64>,
+    #[serde(default)]
+    pub fixable_at: Option<f64>,
+}
+
 // `PartialEq` without `Eq`, transitively: a `ScheduleRule`'s `graph:` block holds a float now.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -2104,6 +2118,10 @@ pub struct AutopilotRules {
     /// the daemon promises never to honour.
     #[serde(default)]
     pub judge: JudgeConfig,
+    /// Spec B D4: read through `resolve_thresholds()` only, for the reason `judge_thresholds()`
+    /// gives: a caller reading the raw numbers would honour a loosening the daemon never honours.
+    #[serde(default)]
+    pub judge_resolve: JudgeResolveConfig,
 }
 
 impl AutopilotRules {
@@ -2125,6 +2143,21 @@ impl AutopilotRules {
             crate::judge::Thresholds::tightened(self.judge.allow_at, self.judge.deny_at);
         for warning in warnings {
             tracing::warn!(%warning, "autopilot.yaml: a judge threshold was pulled back to its limit");
+        }
+        thresholds
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 4.1
+    pub fn resolve_thresholds(&self) -> crate::judge::resolve::ResolveThresholds {
+        let c = &self.judge_resolve;
+        let (thresholds, warnings) = crate::judge::resolve::ResolveThresholds::toward_caution(
+            c.off_task_at,
+            c.needed_at,
+            c.avoidable_at,
+            c.fixable_at,
+        );
+        for warning in warnings {
+            tracing::warn!(%warning, "autopilot.yaml: a resolver threshold was pulled toward caution");
         }
         thresholds
     }
@@ -3938,6 +3971,23 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
             }
         );
         assert!(parse_schedule_rules("judge:\n  allow: 0.9\n").is_err());
+    }
+
+    /// Spec B D4: a project's resolver thresholds are read, pulled toward caution, and a misspelt
+    /// key is a startup error like every other key in this file.
+    #[test]
+    fn a_projects_resolver_thresholds_only_move_toward_caution() {
+        use crate::judge::resolve::ResolveThresholds;
+        let absent = parse_schedule_rules("gate_command: \"true\"\n").unwrap();
+        assert_eq!(absent.resolve_thresholds(), ResolveThresholds::default());
+        let careful =
+            parse_schedule_rules("judge_resolve:\n  off_task_at: 0.7\n  fixable_at: 0.95\n")
+                .unwrap();
+        assert_eq!(careful.resolve_thresholds().off_task_at, 0.7);
+        assert_eq!(careful.resolve_thresholds().fixable_at, 0.95);
+        let loose = parse_schedule_rules("judge_resolve:\n  avoidable_at: 0.5\n").unwrap();
+        assert_eq!(loose.resolve_thresholds().avoidable_at, 0.85);
+        assert!(parse_schedule_rules("judge_resolve:\n  offtask: 0.7\n").is_err());
     }
 
     /// The brake a project never configured is ON, and the derived `Default` is exactly why this

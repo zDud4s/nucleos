@@ -512,7 +512,9 @@ async fn pretooluse_decision_from(
     // `judge` rides along for the sentence `permission_mode` gives above: it is the SNAPSHOT the
     // run was launched with (spec A D2), so changing a project's judge while a run is working
     // does not change the rules underneath it. `off` when the row is gone.
-    let (cwd, mode, project_id, permission, judge_snapshot) = match sqlx::query_as::<
+    // Spec B D6.1: the lineage root rides along for D12's mark. NULL means this run is its own
+    // root, hence the COALESCE; an absent row is its own root too, with nothing to match.
+    let (cwd, mode, project_id, permission, judge_snapshot, lineage_root) = match sqlx::query_as::<
         _,
         (
             Option<String>,
@@ -520,15 +522,17 @@ async fn pretooluse_decision_from(
             Option<String>,
             Option<String>,
             String,
+            i64,
         ),
     >(
-        "SELECT cwd, mode, project_id, permission_mode, judge FROM runs WHERE id = ?",
+        "SELECT cwd, mode, project_id, permission_mode, judge, COALESCE(lineage_root_id, id)
+         FROM runs WHERE id = ?",
     )
     .bind(run_id)
     .fetch_optional(&state.pool)
     .await
     {
-        Ok(Some((cwd, mode, project_id, permission, judge))) => (
+        Ok(Some((cwd, mode, project_id, permission, judge, lineage_root))) => (
             is_in_flight.then_some(cwd).flatten(),
             mode,
             project_id,
@@ -537,6 +541,7 @@ async fn pretooluse_decision_from(
                 crate::chats::PermissionMode::from_wire,
             ),
             crate::judge::JudgeMode::from_db_str(&judge).unwrap_or(crate::judge::JudgeMode::Off),
+            lineage_root,
         ),
         Ok(None) => (
             None,
@@ -544,6 +549,7 @@ async fn pretooluse_decision_from(
             None,
             crate::chats::PermissionMode::Auto,
             crate::judge::JudgeMode::Off,
+            run_id,
         ),
         // `mode` decides WHICH set of rules applies, so an unreadable one cannot resolve to the
         // most permissive of them. `Ok(None)` above can safely default to `real` because the row is
@@ -766,6 +772,49 @@ async fn pretooluse_decision_from(
         None
     };
 
+    // **Spec B D12: a person already declined this exact action in this lineage.**
+    //
+    // Answered with the same no, without waking anybody: the answer was already given, and
+    // without this the agent could ask again at once and put the same proposal back in front of
+    // the owner, so the owner's no would stop meaning anything. Exact equality on the hashed
+    // input, never "similar": deciding that two actions are the same by resemblance is a
+    // judgement, and nothing here is a judge. A variant parks as it does today.
+    //
+    // HERE, ahead of spec A's judge and not just before the pause as spec B places it: a person's
+    // decision comes before the judge, and with spec A in `enforce` a mark placed any later would
+    // let the judge approve the very action the owner declined. And ahead of the grants below: a
+    // grant covers a whole CLASS, a decline names one concrete action, and the specific refusal
+    // wins over the general permission.
+    //
+    // Counted (D9): repeating what the owner refused is what the prober's brake exists for. And it
+    // holds whatever `judge_resolve` says, `off` included: it is the owner's decision, not the
+    // judge's.
+    if classification.decision.decision == "pending_approval" && is_in_flight {
+        match crate::proposals::declined_in_lineage(
+            &state.pool,
+            lineage_root,
+            &payload.tool_name,
+            &payload.tool_input.to_string(),
+        )
+        .await
+        {
+            Ok(true) => {
+                let _ = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: A_PERSON_DECLINED_THIS.to_owned(),
+                });
+            }
+            Ok(false) => {}
+            // Falling through is the direction that asks a person again, which is today.
+            Err(error) => tracing::warn!(
+                run_id,
+                %error,
+                "pretooluse-decision: could not read the declined actions; asking as usual"
+            ),
+        }
+    }
+
     // Class-scoped authorization (spec §8.4 step 6): once a human has approved an action, every
     // later action of that CLASS is allowed for the rest of the resume run, overriding the
     // pending_approval. Only a pending_approval is ever lifted — a `deny` (destructive) never
@@ -800,7 +849,7 @@ async fn pretooluse_decision_from(
                     request_id,
                     "pretooluse-decision: the action is already queued — refusing the retry"
                 );
-                count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
+                let _ = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
                 return Json(Decision {
                     decision: "deny".to_owned(),
                     reason: format!(
@@ -1066,8 +1115,9 @@ async fn pretooluse_decision_from(
                     // the classifier said, so the generic counter below never sees this refusal.
                     crate::judge::Ruling::Deny { reason, counts } => {
                         if counts {
-                            count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name)
-                                .await;
+                            let _ =
+                                count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name)
+                                    .await;
                         }
                         return Json(Decision {
                             decision: "deny".to_owned(),
@@ -1086,7 +1136,8 @@ async fn pretooluse_decision_from(
     // verdicts were also the wrong way round in cost: `pending_approval` stopped the run and
     // fetched a human, while `deny` — the harsher judgement — cost the run nothing at all.
     if classification.decision.decision == "deny" && is_in_flight {
-        count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
+        // Spec B D9: the hard refusal's outcome is read by the resolver (plan Chunk 4).
+        let _counted = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
     }
 
     // **An unrecognized tool is refused, not parked, and the two are not the same verdict.**
@@ -1830,6 +1881,9 @@ const BYPASS_STILL_ASKS: &str =
 /// it — this is APPENDED to a reason, never used alone.
 const DONT_ASK_CLAUSE: &str = " — and this conversation asks nobody";
 
+/// Spec B D12, word for word: a person already answered this exact action for this task.
+pub(crate) const A_PERSON_DECLINED_THIS: &str = "A person already declined this exact action for this task. It was not run. Do not try it again. Carry on with the task another way if there is one, or finish what you can and say what is missing in your final message.";
+
 /// Which of the classifier's `allow`s survive this rung.
 ///
 /// The ladder is the CLI's own, and what separates its steps is not what the classifier DECIDED but
@@ -2535,13 +2589,30 @@ async fn get_run_names_a_council_run(state: &AppState, tool_input: &Value) -> bo
 /// and a retry, and far too little to search a grammar with.
 const DENIAL_LIMIT: i64 = 3;
 
+/// Spec B D9: what `count_denial_and_stop_a_prober` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenialCount {
+    /// Counted, and the run is still below `DENIAL_LIMIT` — the only case spec B's E1 may ask the
+    /// judge about: the judge may stop a run BEFORE the limit, never after it.
+    Counted(i64),
+    /// The allowance is spent. Returned whenever `denials >= DENIAL_LIMIT`, even when
+    /// `finalize_termination` lost its race to another terminator.
+    Stopped,
+    /// The count could not be written (the SQLITE_BUSY arm). The action is still refused.
+    NotCounted,
+}
+
 /// Records a denied attempt and, once a run has spent its allowance, stops it.
 ///
 /// Terminated to `failed` rather than `awaiting_approval`: a denied action is destructive by
 /// classification, and the pause path exists to make an action approvable. Offering a human an
 /// "approve" button here would launder precisely the verdict that is supposed to be final — the
 /// class-scoped grant deliberately only ever lifts a `pending_approval`.
-async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name: &str) {
+async fn count_denial_and_stop_a_prober(
+    state: &AppState,
+    run_id: i64,
+    tool_name: &str,
+) -> DenialCount {
     let denials: i64 = match sqlx::query_scalar(
         "UPDATE runs SET denials = denials + 1 WHERE id = ? RETURNING denials",
     )
@@ -2557,7 +2628,7 @@ async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name
         // indistinguishable from an attack.
         Err(error) => {
             tracing::warn!(run_id, %error, "could not count a denied action against the run");
-            return;
+            return DenialCount::NotCounted;
         }
     };
 
@@ -2568,7 +2639,7 @@ async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name
         "pretooluse-decision: denied action {denials}/{DENIAL_LIMIT} for this run"
     );
     if denials < DENIAL_LIMIT {
-        return;
+        return DenialCount::Counted(denials);
     }
 
     // Spawned and then awaited, for the same reason `pause_for_approval` is: terminating the run
@@ -2591,6 +2662,7 @@ async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name
         .await;
     })
     .await;
+    DenialCount::Stopped
 }
 
 /// The whole `pending_approval` act: terminate the run, then record the proposal that makes the
@@ -3391,6 +3463,37 @@ mod tests {
     /// the row's id, making that run look in-flight to `pretooluse_decision` the same way a real
     /// governed run does. `project_id`, `cwd`, and `session_id` are `None` for tests that don't
     /// care about them; `created_at` is a fixed placeholder since no test ever asserts on it.
+    /// Spec B D9: the counter says what it did. Below the limit it counted, and says how many; at
+    /// or above it the run is stopped — `Stopped` even when another terminator won the race, so
+    /// nothing downstream mistakes a spent allowance for one with room; a count it could not write
+    /// is `NotCounted`.
+    #[tokio::test]
+    async fn the_denial_counter_says_what_it_did() {
+        let state = test_state().await;
+        let run_id =
+            in_flight_run(&state, "worktree", Some("p"), Some(r"C:\work\repo"), None).await;
+
+        assert_eq!(
+            count_denial_and_stop_a_prober(&state, run_id, "Bash").await,
+            DenialCount::Counted(1)
+        );
+        assert_eq!(
+            count_denial_and_stop_a_prober(&state, run_id, "Bash").await,
+            DenialCount::Counted(2)
+        );
+        crate::runs::finalize_termination(&state, run_id, "cancelled").await;
+        assert_eq!(
+            count_denial_and_stop_a_prober(&state, run_id, "Bash").await,
+            DenialCount::Stopped,
+            "the terminator lost the race, and the allowance is still spent"
+        );
+        assert_eq!(
+            count_denial_and_stop_a_prober(&state, 999_999, "Bash").await,
+            DenialCount::NotCounted,
+            "no row, no count — the SQLITE_BUSY arm's shape"
+        );
+    }
+
     async fn in_flight_run(
         state: &AppState,
         mode: &str,
@@ -3420,6 +3523,167 @@ mod tests {
             .insert(run_id, task.abort_handle());
 
         run_id
+    }
+
+    /// A command the classifier parks in a worktree run (a pipe into `tee`).
+    const PARKED: &str = "cargo test --workspace | tee t.log";
+
+    async fn declined(state: &AppState, root: i64, command: &str) {
+        let input = serde_json::json!({ "command": command }).to_string();
+        sqlx::query(
+            "INSERT INTO declined_actions (lineage_root_id, tool_input_hash, proposal_id, created_at)
+             VALUES (?, ?, 1, '2026-09-27T00:00:00Z')",
+        )
+        .bind(root)
+        .bind(crate::proposals::action_hash("Bash", &input))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    fn bash(run_id: i64, command: &str) -> String {
+        serde_json::json!({"run_id": run_id, "tool_name": "Bash", "tool_input": {"command": command}}).to_string()
+    }
+
+    /// Spec B D12: whatever the B setting, the exact action a person declined in this lineage is
+    /// refused with the fixed sentence, without parking, without a new proposal, and counted.
+    #[tokio::test]
+    async fn a_declined_action_is_refused_again_without_asking_anybody() {
+        for resolve in ["off", "observe", "enforce"] {
+            let state = test_state().await;
+            let run_id =
+                in_flight_run(&state, "worktree", Some("p"), Some("C:\\work\\repo"), None).await;
+            sqlx::query("UPDATE runs SET judge_resolve = ?, lineage_root_id = 900 WHERE id = ?")
+                .bind(resolve)
+                .bind(run_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            declined(&state, 900, PARKED).await;
+            let app = test_router(state.clone());
+
+            let decision = decide(&app, &bash(run_id, PARKED)).await;
+
+            assert_eq!(decision.decision, "deny", "{resolve}");
+            assert_eq!(decision.reason, A_PERSON_DECLINED_THIS);
+            assert!(
+                state.run_handles.lock().unwrap().contains_key(&run_id),
+                "not parked"
+            );
+            let (proposals, denials): (i64, i64) = sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM proposals WHERE kind = 'action-approval'),
+                        (SELECT denials FROM runs WHERE id = ?)",
+            )
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+            assert_eq!((proposals, denials), (0, 1), "{resolve}");
+        }
+    }
+
+    /// Spec B D12 + D9: the repeat counts, so the third one stops the run.
+    #[tokio::test]
+    async fn the_third_repeat_of_a_declined_action_stops_the_run() {
+        let state = test_state().await;
+        let run_id =
+            in_flight_run(&state, "worktree", Some("p"), Some("C:\\work\\repo"), None).await;
+        declined(&state, run_id, PARKED).await;
+        let app = test_router(state.clone());
+        for _ in 0..3 {
+            decide(&app, &bash(run_id, PARKED)).await;
+        }
+        let mut status = String::new();
+        for _ in 0..200 {
+            status = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status == "failed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(status, "failed");
+    }
+
+    /// Spec B D12: exact equality; a variant parks as today, and the mark does not cross to
+    /// another lineage.
+    #[tokio::test]
+    async fn a_variant_or_another_lineage_still_parks() {
+        let state = test_state().await;
+        let marked =
+            in_flight_run(&state, "worktree", Some("p"), Some("C:\\work\\repo"), None).await;
+        let other =
+            in_flight_run(&state, "worktree", Some("p"), Some("C:\\work\\repo"), None).await;
+        declined(&state, marked, PARKED).await;
+        let app = test_router(state.clone());
+
+        let variant = decide(&app, &bash(marked, "cargo test --workspace | tee u.log")).await;
+        let elsewhere = decide(&app, &bash(other, PARKED)).await;
+
+        assert_eq!(variant.decision, "pending_approval");
+        assert_eq!(elsewhere.decision, "pending_approval");
+    }
+
+    /// Spec B D12: the specific refusal wins over the class-wide permission, and the grant is not
+    /// consumed by it.
+    #[tokio::test]
+    async fn a_grant_for_the_class_does_not_let_a_declined_action_through() {
+        let state = test_state().await;
+        let run_id =
+            in_flight_run(&state, "worktree", Some("p"), Some("C:\\work\\repo"), None).await;
+        let class = classifier::classify(
+            "Bash",
+            &serde_json::json!({ "command": PARKED }),
+            Some(Path::new("C:\\work\\repo")),
+            &crate::github::Policy::empty(),
+            &crate::project_policy::ShellRules::default(),
+            classifier::Unrecognized::AsksAPerson,
+        )
+        .action_class;
+        sqlx::query(
+            "INSERT INTO action_grants (run_id, tool_name, tool_input, action_class, proposal_id, created_at)
+             VALUES (?, 'Bash', '{}', ?, 2, '2026-09-27T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(class)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        declined(&state, run_id, PARKED).await;
+        let app = test_router(state.clone());
+
+        let decision = decide(&app, &bash(run_id, PARKED)).await;
+
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, A_PERSON_DECLINED_THIS);
+        let consumed: Option<String> =
+            sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(consumed, None, "the grant was never reached");
+    }
+
+    /// The agent rewrites `description` on every attempt; the mark holds.
+    #[tokio::test]
+    async fn a_declined_action_with_another_description_is_still_refused() {
+        let state = test_state().await;
+        let run_id =
+            in_flight_run(&state, "worktree", Some("p"), Some("C:\\work\\repo"), None).await;
+        declined(&state, run_id, PARKED).await;
+        let app = test_router(state.clone());
+        let retry = serde_json::json!({ "run_id": run_id, "tool_name": "Bash",
+            "tool_input": { "command": PARKED, "description": "Run the tests again and keep a log" } })
+        .to_string();
+
+        let decision = decide(&app, &retry).await;
+
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, A_PERSON_DECLINED_THIS);
     }
 
     // This module already has its own `ScriptedJudge` (the local-chat one), so the spec A judge's

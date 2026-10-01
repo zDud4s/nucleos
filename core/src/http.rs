@@ -667,6 +667,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/proposals/refused-actions", get(get_refused_actions))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
         .route("/proposals/{id}/reject", post(post_proposal_reject))
+        .route(
+            "/proposals/{id}/decline-action",
+            post(post_proposal_decline_action),
+        )
         .route("/proposals/{id}/dismiss", post(post_proposal_dismiss))
         .route(
             "/vcs/requests",
@@ -13793,6 +13797,13 @@ async fn post_proposal_approve(
                 format!("this approval cannot resume the run: {reason}"),
             ))
         }
+        // The approval never returns this, but the `match` is exhaustive. Its own answer is the
+        // decline door's: two different replies for the owner (spec B D12).
+        Err(crate::runs::ResumeError::BelongsToAJob) => Err((
+            StatusCode::CONFLICT,
+            "this run is a job's node, and the job's own policy decides what happens to it"
+                .to_owned(),
+        )),
         Err(crate::runs::ResumeError::Db(error)) => {
             tracing::warn!(proposal_id = id, %error, "approving a proposal failed");
             Err((
@@ -13899,6 +13910,44 @@ async fn reject_browser_wheel(state: AppState, id: i64) -> Result<StatusCode, St
         tracing::warn!(session = session_id, error = %error, "closing a refused wheel's session failed");
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Spec B D12: refuse only the action and let the run continue without it. Only for a pending
+/// `action-approval` of a run outside a job; uncancellable for `post_proposal_approve`'s reason —
+/// it commits a transaction and only then launches the continued run.
+async fn post_proposal_decline_action(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    match uncancellable(async move { crate::runs::decline_action(&state, id).await })
+        .await
+        .map_err(|status| (status, "the decline task did not finish".to_owned()))?
+    {
+        Ok(run_id) => Ok(Json(serde_json::json!({ "resume_run_id": run_id }))),
+        Err(crate::runs::ResumeError::ProposalNotFound) => {
+            Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+        }
+        Err(crate::runs::ResumeError::ProposalNotPending) => Err((
+            StatusCode::CONFLICT,
+            "this proposal has already been decided".to_owned(),
+        )),
+        Err(crate::runs::ResumeError::BelongsToAJob) => Err((
+            StatusCode::CONFLICT,
+            "this run is a job's node; approve or reject it, and the job's own policy decides the rest"
+                .to_owned(),
+        )),
+        Err(crate::runs::ResumeError::NotResumable(reason)) => Err((
+            StatusCode::CONFLICT,
+            format!("this run cannot continue: {reason}"),
+        )),
+        Err(crate::runs::ResumeError::Db(error)) => {
+            tracing::warn!(proposal_id = id, %error, "declining an action failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the decline could not be recorded".to_owned(),
+            ))
+        }
+    }
 }
 
 async fn post_proposal_reject(
@@ -17024,6 +17073,67 @@ mod tests {
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             ..state
         }
+    }
+
+    /// Spec B D12: the decline door refuses a job's node with 409, an unknown proposal with 404,
+    /// and a proposal someone already decided with 409.
+    #[tokio::test]
+    async fn the_decline_door_refuses_what_it_may_not_decline() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
+             VALUES (9, 'proj', 'C:/x', 'x', 'implementing', 5, 1, 1, '2026-09-27T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, job_id, created_at)
+             VALUES ('proj', 'C:/x', 'x', 'awaiting_approval', 's', 'worktree', 9, '2026-09-27T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let proposal_id = crate::proposals::create_action_approval(
+            &state.pool,
+            run_id,
+            Some("s"),
+            Some("proj"),
+            "Bash",
+            "needs approval",
+            Some("{\"command\":\"cargo build\"}"),
+        )
+        .await
+        .unwrap();
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/proposals/{proposal_id}/decline-action"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/proposals/999999/decline-action",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        crate::proposals::reject_proposal(&state.pool, proposal_id)
+            .await
+            .unwrap();
+        let (status, _) = call(
+            state,
+            "POST",
+            &format!("/proposals/{proposal_id}/decline-action"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     async fn call(

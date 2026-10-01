@@ -42,6 +42,11 @@ const PROJECT_SCOPED: &[&str] = &[
     "feed",
     "fleet_exclusions",
     "jobs",
+    // One row per lineage that got its correction (spec B D6). It is the guard that makes a lineage's
+    // correction happen once, so it is part of the project's run history and goes with it: a project
+    // forgotten and added back starts with no lineage, and a stale guard would only point at runs
+    // that no longer exist.
+    "judge_corrections",
     "map_decisions",
     "project_commands",
     // The same species as its neighbours, and the resurrection argument below bites hardest here:
