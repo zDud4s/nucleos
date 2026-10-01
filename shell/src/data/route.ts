@@ -36,6 +36,8 @@ export interface RouteReport {
   shadow: number;
   apply: number;
   advised: number;
+  /** Shadow runs with usable advice — the match rate's denominator. */
+  shadow_advised: number;
   matched: number;
   pairs: RoutePair[];
 }

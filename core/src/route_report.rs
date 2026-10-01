@@ -41,6 +41,10 @@ pub struct Report {
     pub shadow: i64,
     pub apply: i64,
     pub advised: i64,
+    /// Shadow runs that got usable advice: the only runs `matched` is counted among, so the
+    /// match rate is `matched / shadow_advised`. Dividing by `advised` would mix in apply runs,
+    /// whose advice is what launched and so cannot disagree with it.
+    pub shadow_advised: i64,
     pub matched: i64,
     pub pairs: Vec<Pair>,
 }
@@ -61,21 +65,24 @@ pub async fn report(
 ) -> sqlx::Result<Report> {
     let since = (now - chrono::Duration::days(days)).to_rfc3339();
 
-    let (runs, shadow, apply, advised, matched): (i64, i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*),
+    let (runs, shadow, apply, advised, shadow_advised, matched): (i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT COUNT(*),
                 COALESCE(SUM(route_mode = 'shadow'), 0),
                 COALESCE(SUM(route_mode = 'apply'), 0),
                 COALESCE(SUM(route_decision_id IS NOT NULL), 0),
+                COALESCE(SUM(route_mode = 'shadow' AND route_decision_id IS NOT NULL), 0),
                 COALESCE(SUM(route_mode = 'shadow'
+                             AND route_decision_id IS NOT NULL
                              AND advised_runner IS runner
                              AND advised_model IS model
                              AND advised_effort IS effort), 0)
          FROM runs
          WHERE route_mode IS NOT NULL AND created_at >= ?",
-    )
-    .bind(&since)
-    .fetch_one(pool)
-    .await?;
+        )
+        .bind(&since)
+        .fetch_one(pool)
+        .await?;
 
     let pairs = sqlx::query_as::<_, Pair>(
         "SELECT runner, model, effort, advised_runner, advised_model, advised_effort,
@@ -99,6 +106,7 @@ pub async fn report(
         shadow,
         apply,
         advised,
+        shadow_advised,
         matched,
         pairs,
     })
@@ -181,6 +189,7 @@ mod tests {
                 shadow: 0,
                 apply: 0,
                 advised: 0,
+                shadow_advised: 0,
                 matched: 0,
                 pairs: vec![]
             }
@@ -253,7 +262,9 @@ mod tests {
 
         let r = report(&pool, 30, now()).await.unwrap();
         assert_eq!((r.runs, r.shadow, r.apply, r.advised), (6, 5, 1, 5));
-        // d1, d2, d3 and the no-advice row (whose recorded columns also agree) match.
+        // d1..d4 are the shadow runs with advice; d1, d2 and d3 match it. The no-advice row's
+        // recorded columns also agree, and still does not count: there was no advice to match.
+        assert_eq!(r.shadow_advised, 4);
         assert_eq!(r.matched, 3);
         assert_eq!(r.pairs.len(), 3);
         let first = &r.pairs[0];

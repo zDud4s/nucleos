@@ -1836,6 +1836,7 @@ const ROUTE_REPORT = {
   shadow: 36,
   apply: 6,
   advised: 33,
+  shadow_advised: 28,
   matched: 21,
   pairs: [
     { runner: "claude", model: "sonnet", effort: "high", advised_runner: "claude", advised_model: "haiku", advised_effort: "low", runs: 9, passed: 8, failed: 1 },

@@ -485,7 +485,8 @@ function RouterPanel() {
   const report = useRouteReport();
   const data = report.data;
   if (report.isError || data === undefined || data.runs <= 0) return null;
-  const shadowAdvised = data.advised;
+  // Among shadow runs with advice only: an apply run launched its advice and cannot disagree.
+  const shadowAdvised = data.shadow_advised;
   const rate = shadowAdvised > 0 ? `${Math.round((data.matched / shadowAdvised) * 100)}%` : "n/a";
   const pairs: RoutePair[] = data.pairs.slice(0, 5);
   return (

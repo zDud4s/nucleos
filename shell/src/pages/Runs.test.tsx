@@ -772,7 +772,8 @@ describe("Runs - presets", () => {
       runs: 12,
       shadow: 10,
       apply: 2,
-      advised: 8,
+      advised: 10,
+      shadow_advised: 8,
       matched: 6,
       pairs: [
         {
