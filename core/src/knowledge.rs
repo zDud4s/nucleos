@@ -1343,6 +1343,8 @@ impl From<sqlx::Error> for ProposeError {
 /// from the project id, and the source from whether a run is behind the request. It is what keeps
 /// this phase a move rather than a change — the door writes what it wrote. Deriving the scope from
 /// the run instead of from the caller is a later decision, with its own reasons.
+/// The fingerprint is derived from the body with the consolidator's own function, so
+/// `consolidate::blocked_outcome` sees a pending, rejected, or reverted proposal.
 pub async fn propose(
     pool: &SqlitePool,
     declaration: Declaration<'_>,
@@ -1359,6 +1361,8 @@ pub async fn propose(
 
     let scope = Scope::of_project(project_id);
     let (scope_kind, scope_id) = scope.columns();
+    let fingerprint =
+        failure_signature(body).map(|signature| format!("gate:{}", signature.fingerprint));
 
     // Checked before anything is written, and checked here rather than left to the foreign key:
     // SQLite would accept a link to another scope's row without a word, and the failure would
@@ -1380,9 +1384,9 @@ pub async fn propose(
 
     let knowledge_id = sqlx::query(
         "INSERT INTO knowledge
-           (layer, scope_kind, scope_id, source, kind, title, body, status, supersedes,
+           (layer, scope_kind, scope_id, source, kind, title, body, fingerprint, status, supersedes,
             origin_run_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?)",
     )
     .bind(kind.layer().as_str())
     .bind(scope_kind)
@@ -1397,6 +1401,7 @@ pub async fn propose(
     .bind(kind.as_str())
     .bind(title)
     .bind(body)
+    .bind(fingerprint.as_deref())
     .bind(supersedes)
     .bind(origin_run_id)
     .bind(&now)
@@ -1854,6 +1859,7 @@ pub enum FindingError {
     EmptyFact,
     FactTooLong,
     NoEvidence,
+    EvidenceTooLong,
     NoJob,
     JobEnded,
     TooMany,
@@ -1869,6 +1875,10 @@ impl std::fmt::Display for FindingError {
                 "a finding may be at most {PER_ITEM_CHARS} characters"
             ),
             FindingError::NoEvidence => write!(formatter, "a finding needs tagged evidence"),
+            FindingError::EvidenceTooLong => write!(
+                formatter,
+                "a finding's evidence may be at most {MAX_EVIDENCE_CHARS} characters"
+            ),
             FindingError::NoJob => write!(formatter, "the run does not belong to a job"),
             FindingError::JobEnded => write!(formatter, "the run's job has ended"),
             FindingError::TooMany => write!(
@@ -1889,6 +1899,10 @@ impl From<sqlx::Error> for FindingError {
 }
 
 const MAX_LIVE_FINDINGS_PER_JOB: i64 = 20;
+/// About 3.3x the 600-character fact cap, leaving room for dozens of
+/// `{"t":"run","id":N}` referents whose ids are already capped at 120 characters. Measured on
+/// the normalised form because that is what is stored.
+pub const MAX_EVIDENCE_CHARS: usize = 2_000;
 
 /// Leave one evidenced fact for the next node of the caller's own live job.
 pub async fn note_finding(
@@ -1904,6 +1918,9 @@ pub async fn note_finding(
         return Err(FindingError::FactTooLong);
     }
     let evidence = tagged_evidence(evidence).ok_or(FindingError::NoEvidence)?;
+    if evidence.chars().count() > MAX_EVIDENCE_CHARS {
+        return Err(FindingError::EvidenceTooLong);
+    }
 
     let Some((job_id, _project_id)) = sqlx::query_as::<_, (Option<i64>, Option<String>)>(
         "SELECT job_id, project_id FROM runs WHERE id = ?",
@@ -2083,6 +2100,48 @@ mod tests {
         .await
         .unwrap()
         .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn note_finding_refuses_evidence_over_the_cap() {
+        let pool = test_pool().await;
+        let job_id = insert_job(&pool, "p", "running").await;
+        let run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (project_id, prompt, status, job_id, created_at)
+             VALUES ('p', 'test run', 'running', ?, '2026-10-01T00:00:00+00:00')
+             RETURNING id",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let evidence = serde_json::Value::Array(
+            (1..=200)
+                .map(|id| serde_json::json!({"t": "run", "id": id}))
+                .collect(),
+        );
+
+        assert!(matches!(
+            note_finding(&pool, run_id, "too much evidence", &evidence).await,
+            Err(FindingError::EvidenceTooLong)
+        ));
+        let written: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE layer = 'working'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(written, 0);
+
+        assert!(
+            note_finding(
+                &pool,
+                run_id,
+                "small evidence",
+                &serde_json::json!([{"t": "run", "id": run_id}]),
+            )
+            .await
+            .is_ok()
+        );
     }
 
     #[tokio::test]
