@@ -1172,7 +1172,7 @@ const RESUMED_TASK_HEADER: &str = "--- THE TASK THIS RUN IS CONTINUING ---";
 /// launched with `proposal #7 authorizes Agent...` as its entire brief. It had no idea what it was
 /// supposed to be building, and the 1016 lines its predecessor had written survived only because a
 /// person committed them by hand.
-fn task_to_carry(prompt: &str) -> &str {
+pub(crate) fn task_to_carry(prompt: &str) -> &str {
     match prompt.split_once(RESUMED_TASK_HEADER) {
         Some((_, task)) => task.trim_start(),
         None => prompt,
