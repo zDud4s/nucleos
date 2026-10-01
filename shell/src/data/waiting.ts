@@ -346,6 +346,19 @@ export function useRejectProposal() {
 }
 
 /**
+ * Refuse only the action (spec B D12): the run continues in the same conversation without it.
+ *
+ * Nothing is granted and nothing is queued: a declined push never reaches the git queue. The
+ * same action asked again in this task is refused without asking anybody. A job's node answers
+ * 409: inside a job, the job's own policy decides. Answers what the approval answers for a resume.
+ */
+export function useDeclineAction() {
+  return useDecision((id: number) =>
+    apiFetch<ApprovalOutcome>(`/proposals/${id}/decline-action`, { method: "POST" }),
+  );
+}
+
+/**
  * Put a read record away.
  *
  * **Never pointed at `/reject`.** `DISMISSABLE_KINDS` is `["skipped-item",

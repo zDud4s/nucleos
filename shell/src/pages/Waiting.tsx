@@ -24,6 +24,7 @@ import {
   useOpenTeamActions,
   useRecruitProposals,
   useRefusedActions,
+  useDeclineAction,
   useRejectProposal,
   useSkippedItems,
   useTeamActionProposals,
@@ -788,6 +789,7 @@ function subjectFor(ids: number[]): string {
 function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
   const approve = useApproveProposal();
   const reject = useRejectProposal();
+  const decline = useDeclineAction();
   /**
    * A second pair of doors for the batch, deliberately.
    *
@@ -870,7 +872,9 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
         <DecisionNotes
           outcome={approve.data}
           approveError={approve.isError ? approve.error : null}
-          refuseError={reject.isError ? reject.error : null}
+          refuseError={
+            reject.isError ? reject.error : decline.isError ? decline.error : null
+          }
         />
       }
     >
@@ -977,6 +981,15 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
                   disabled={approve.isPending}
                   onArmedChange={onArmedChange}
                   onConfirm={() => approve.mutate(proposal.id)}
+                />
+                <ConfirmButton
+                  label={`Decline only the action #${proposal.id}`}
+                  confirmLabel="Refuse this action, keep the run going"
+                  subject={`#${proposal.id}`}
+                  variant="ghost"
+                  disabled={decline.isPending}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() => decline.mutate(proposal.id)}
                 />
                 <ConfirmButton
                   label={`Reject #${proposal.id}`}
