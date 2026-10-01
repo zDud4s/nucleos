@@ -96,6 +96,8 @@ function slot(overrides: Partial<HeldSlot> = {}): HeldSlot {
     job_id: null,
     ordinal: null,
     item_status: null,
+    wave_id: null,
+    lease_renewed_at: null,
     ...overrides,
   };
 }
@@ -363,6 +365,36 @@ describe("Fleet — columns", () => {
     expect(beta.closest("li")!.textContent).toContain("0 of 3 slots held, room for 3");
   });
 
+  it("draws a wave's slot as a worker of its wave, with when its lease was renewed and no cancel", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 5, held: 1 },
+            projects: [
+              column({
+                project_id: "alpha",
+                limit: 2,
+                slots: [
+                  slot({ slot: 1, owner_kind: "wave", owner_id: 7, wave_id: 3, lease_renewed_at: "2026-09-29T10:00:00Z" }),
+                ],
+              }),
+            ],
+          },
+          jobs: [job()],
+          runs: [run()],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+
+    const alpha = await screen.findByRole("region", { name: "alpha column" });
+    const held = within(alpha).getByRole("article", { name: "slot 1 — worker of wave 3" });
+    expect(within(held).getByText(/lease renewed/)).toBeDefined();
+    expect(within(held).queryByRole("button", { name: /cancel/i })).toBeNull();
+  });
+
   it("orders the columns by what is wrong in them before how busy they are", async () => {
     daemon.apiFetch.mockImplementation(
       fleetFetch(
@@ -555,15 +587,23 @@ describe("Fleet — columns", () => {
     expect(slotDetail(gone, [job({ id: 41 })], undefined, 50).kind).toBe("orphaned");
   });
 
-  it("never takes a wave's slot for the run that shares its number, nor offers to cancel it", () => {
-    // A wave's worker is a controller's process, and `owner_id` for it is
-    // `wave_workers.id`. Looked up among the runs it would carry an unrelated
-    // run's description, and the cancel button would send
-    // `POST /runs/<that number>/cancel` — stopping work the wave never owned.
+  it("names a wave's slot by its wave, never by the run that shares its number, and offers no cancel", () => {
+    // `owner_id` is `wave_workers.id`. Among the runs it would take run 7's description; the
+    // wave it belongs to is what the readout joins in for it.
+    const wave = slot({
+      slot: 1, owner_kind: "wave", owner_id: 7, wave_id: 3, lease_renewed_at: "2026-09-29T10:00:00Z",
+    });
+
+    expect(slotDetail(wave, [job()], [run({ id: 7 })])).toEqual({
+      kind: "wave", waveId: 3, renewedAt: "2026-09-29T10:00:00Z",
+    });
+    expect(cancellableOwner(wave)).toBeNull();
+  });
+
+  it("says it cannot describe a wave's slot whose worker the daemon no longer has", () => {
     const wave = slot({ slot: 1, owner_kind: "wave", owner_id: 7 });
 
     expect(slotDetail(wave, [job()], [run({ id: 7 })]).kind).toBe("unknown");
-    expect(cancellableOwner(wave)).toBeNull();
   });
 
   it("shows an item's card its own collision, and no cancel it has no route for", async () => {

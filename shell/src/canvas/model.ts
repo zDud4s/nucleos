@@ -61,6 +61,7 @@ export type SlotDetail =
   | { kind: "run"; run: RunSearchResult }
   /** One item of a job a team directs, named by the job it belongs to. */
   | { kind: "item"; job: Job; ordinal: number; status: string }
+  | { kind: "wave"; waveId: number; renewedAt: string }
   | { kind: "unknown" }
   | { kind: "orphaned" };
 
@@ -105,9 +106,13 @@ export function slotDetail(
     if (found !== undefined) return { kind: "item", job: found, ordinal, status };
     return jobs.length >= limit ? { kind: "unknown" } : { kind: "orphaned" };
   }
-  // A wave's worker is a controller's process and `owner_id` is `wave_workers.id`:
-  // among the runs it would take the description of whichever shares its number.
-  if (slot.owner_kind === "wave") return { kind: "unknown" };
+  // A wave's worker is a controller's process and `owner_id` is `wave_workers.id`: it is named by
+  // the wave the readout joins in, never looked up among the runs, where it would take the
+  // description of whichever shares its number.
+  if (slot.owner_kind === "wave") {
+    const { wave_id: wave, lease_renewed_at: renewedAt } = slot;
+    return wave === null || renewedAt === null ? { kind: "unknown" } : { kind: "wave", waveId: wave, renewedAt };
+  }
   if (runs === undefined) return { kind: "unknown" };
   const found = runs.find((run) => run.id === slot.owner_id);
   if (found !== undefined) return { kind: "run", run: found };

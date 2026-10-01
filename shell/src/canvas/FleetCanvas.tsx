@@ -28,7 +28,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { cancellableOwner, useJob, type JobItem, type SlotOwner } from "../data/fleet";
 import { JobProgressGraph, JobProgressLine } from "./JobProgressGraph";
-import { Button, ConfirmButton, Field, StateBadge } from "../ui";
+import { Button, ConfirmButton, Field, RelativeTime, StateBadge } from "../ui";
 import {
   clamped,
   isValidConnection as endsMayJoin,
@@ -203,7 +203,9 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
   const owner =
     detail.kind === "item"
       ? `item ${detail.ordinal + 1} of job ${detail.job.id}`
-      : `${slot.owner_kind} ${slot.owner_id}`;
+      : detail.kind === "wave"
+        ? `worker of wave ${detail.waveId}`
+        : `${slot.owner_kind} ${slot.owner_id}`;
 
   return (
     <article
@@ -302,6 +304,13 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
       {/* The listing said nothing about this owner, and the two reasons for that
           are a different kind of news: one is ordinary, the other is a leaked
           slot nothing is working in. */}
+      {/* A controller's wave: a local process the daemon lent a slot to and cannot stop, so there
+          is no cancel. What there is to know is whether the controller is still renewing. */}
+      {detail.kind === "wave" && (
+        <p className="fleet-card-line">
+          lease renewed <RelativeTime at={detail.renewedAt} />
+        </p>
+      )}
       {(detail.kind === "unknown" || detail.kind === "orphaned") && (
         <p className="fleet-card-line">
           <StateBadge {...slotReading(detail)} />

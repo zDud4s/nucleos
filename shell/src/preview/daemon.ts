@@ -2035,6 +2035,8 @@ export function answer(path: string, init?: RequestInit): unknown {
               job_id: null,
               ordinal: null,
               item_status: null,
+              wave_id: null,
+              lease_renewed_at: null,
             },
           ],
           collision: {
