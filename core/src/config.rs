@@ -2120,7 +2120,6 @@ impl AutopilotRules {
     /// The thresholds the judge decides with, after D7's tightening, with a `warn` for every value
     /// pulled back. Warned on every read and not once: it is read per consultation, and a loosened
     /// safety threshold is the one line in this file that should keep being loud.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 5.1
     pub fn judge_thresholds(&self) -> crate::judge::Thresholds {
         let (thresholds, warnings) =
             crate::judge::Thresholds::tightened(self.judge.allow_at, self.judge.deny_at);

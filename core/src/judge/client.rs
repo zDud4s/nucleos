@@ -24,7 +24,6 @@ pub const TYPESAFE_KEY: &str = "typesafe-api-key";
 /// which bounds this call and everything around it.
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// $0.042 per million input tokens; the output is free.
-#[allow(dead_code)] // consumed by Task 5.1 (unread in the test build too)
 pub const PRICE_PER_MILLION_INPUT_TOKENS_USD: f64 = 0.042;
 
 /// D1: the post. Handed a `state` and the questions, it answers each question's probability by
@@ -33,7 +32,6 @@ pub const PRICE_PER_MILLION_INPUT_TOKENS_USD: f64 = 0.042;
 #[async_trait::async_trait]
 pub trait Judge: Send + Sync {
     /// Recorded on a verdict when the answer does not name its own model.
-    #[allow(dead_code)] // consumed by Task 5.1
     fn model(&self) -> &str;
     async fn ask(&self, state: &str, questions: &[Question]) -> Result<Answers, JudgeError>;
 }
@@ -44,7 +42,6 @@ pub trait Judge: Send + Sync {
 pub struct Answers {
     pub probabilities: BTreeMap<&'static str, f64>,
     pub input_tokens: Option<i64>,
-    #[allow(dead_code)] // consumed by Task 5.1
     pub model: Option<String>,
 }
 
@@ -54,7 +51,6 @@ pub enum JudgeError {
     /// No key in the credential store, or the store could not be read.
     NoKey(String),
     /// D11: every permit is in flight; the call was never made.
-    #[allow(dead_code)] // consumed by Task 5.1
     Busy,
     Timeout,
     Http(u16),
@@ -83,7 +79,6 @@ impl std::fmt::Display for JudgeError {
 impl JudgeError {
     /// Whether the request may have reached TypeSafe, and may be billed. A missing key and a
     /// missing permit are certain not to have; every other failure happened on or after the wire.
-    #[allow(dead_code)] // consumed by Task 5.1
     pub(crate) fn may_have_been_billed(&self) -> bool {
         !matches!(self, Self::NoKey(_) | Self::Busy)
     }
@@ -251,7 +246,6 @@ pub(crate) struct ScriptedJudge {
     reply: Result<(f64, f64), JudgeError>,
     delay: Option<Duration>,
     calls: std::sync::atomic::AtomicUsize,
-    #[allow(dead_code)] // consumed by Task 5.1
     pub(crate) last_state: std::sync::Mutex<Option<String>>,
 }
 
@@ -267,7 +261,6 @@ impl ScriptedJudge {
     }
 
     /// Answers A's two questions; any other question is answered 0.5.
-    #[allow(dead_code)] // consumed by Task 5.1
     pub(crate) fn answering(p_in_scope: f64, p_safe: f64) -> Arc<Self> {
         Self::build(Ok((p_in_scope, p_safe)), None)
     }
@@ -276,12 +269,10 @@ impl ScriptedJudge {
         Self::build(Err(error), None)
     }
 
-    #[allow(dead_code)] // consumed by Task 5.1
     pub(crate) fn slow(delay: Duration) -> Arc<Self> {
         Self::build(Ok((0.99, 0.99)), Some(delay))
     }
 
-    #[allow(dead_code)] // consumed by Task 5.1
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
