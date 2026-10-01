@@ -205,6 +205,30 @@ pub async fn session_git_decision(
     }
 }
 
+/// Spec A: the one call this hook puts to the judge, built once from what the hook already holds.
+/// Owned, because an observation outlives the request that started it.
+fn judge_asked(
+    state: &AppState,
+    run_id: i64,
+    shadow_decision_id: Option<i64>,
+    project_id: Option<&str>,
+    cwd: &str,
+    payload: &PreToolUsePayload,
+    classification: &classifier::Classification,
+) -> crate::judge::Asked {
+    crate::judge::Asked {
+        run_id,
+        shadow_decision_id,
+        project_id: project_id.map(str::to_owned),
+        machine_root: state.machine_config_root.clone(),
+        tool_name: payload.tool_name.clone(),
+        tool_input: payload.tool_input.clone(),
+        cwd: cwd.to_owned(),
+        action_class: classification.action_class,
+        classifier_decision: classification.decision.decision.clone(),
+    }
+}
+
 /// A refusal that never becomes an approval, however its caller fails.
 fn deny_with(reason: &str) -> Decision {
     Decision {
@@ -452,47 +476,60 @@ pub async fn pretooluse_decision(
     // autopilot run, and every turn the local brain answered — and reads as `Auto`, which is what a
     // rooted conversation did before the column existed. One more column on a query that already
     // ran, so the reach costs nothing.
-    let (cwd, mode, project_id, permission) =
-        match sqlx::query_as::<_, (Option<String>, String, Option<String>, Option<String>)>(
-            "SELECT cwd, mode, project_id, permission_mode FROM runs WHERE id = ?",
-        )
-        .bind(run_id)
-        .fetch_optional(&state.pool)
-        .await
-        {
-            Ok(Some((cwd, mode, project_id, permission))) => (
-                is_in_flight.then_some(cwd).flatten(),
-                mode,
-                project_id,
-                permission.as_deref().map_or(
-                    crate::chats::PermissionMode::Auto,
-                    crate::chats::PermissionMode::from_wire,
-                ),
-            ),
-            Ok(None) => (
-                None,
-                "real".to_owned(),
-                None,
+    // `judge` rides along for the sentence `permission_mode` gives above: it is the SNAPSHOT the
+    // run was launched with (spec A D2), so changing a project's judge while a run is working
+    // does not change the rules underneath it. `off` when the row is gone.
+    let (cwd, mode, project_id, permission, judge_snapshot) = match sqlx::query_as::<
+        _,
+        (
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        ),
+    >(
+        "SELECT cwd, mode, project_id, permission_mode, judge FROM runs WHERE id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some((cwd, mode, project_id, permission, judge))) => (
+            is_in_flight.then_some(cwd).flatten(),
+            mode,
+            project_id,
+            permission.as_deref().map_or(
                 crate::chats::PermissionMode::Auto,
+                crate::chats::PermissionMode::from_wire,
             ),
-            // `mode` decides WHICH set of rules applies, so an unreadable one cannot resolve to the
-            // most permissive of them. `Ok(None)` above can safely default to `real` because the row is
-            // genuinely absent — there is no run whose rules we are guessing at. An `Err` is different:
-            // the run may well be a triage or shadow run whose barrier we would be stepping over, and
-            // the pool this reads through is shared with feed appends and run-status writes, so
-            // SQLITE_BUSY under contention is an ordinary event rather than a theoretical one.
-            Err(error) => {
-                tracing::warn!(
-                    run_id = run_id,
-                    %error,
-                    "pretooluse-decision: failed to resolve the run's mode — failing closed"
-                );
-                return Json(Decision {
-                    decision: "deny".to_owned(),
-                    reason: "could not resolve the run's mode — failing closed".to_owned(),
-                });
-            }
-        };
+            crate::judge::JudgeMode::from_db_str(&judge).unwrap_or(crate::judge::JudgeMode::Off),
+        ),
+        Ok(None) => (
+            None,
+            "real".to_owned(),
+            None,
+            crate::chats::PermissionMode::Auto,
+            crate::judge::JudgeMode::Off,
+        ),
+        // `mode` decides WHICH set of rules applies, so an unreadable one cannot resolve to the
+        // most permissive of them. `Ok(None)` above can safely default to `real` because the row is
+        // genuinely absent — there is no run whose rules we are guessing at. An `Err` is different:
+        // the run may well be a triage or shadow run whose barrier we would be stepping over, and
+        // the pool this reads through is shared with feed appends and run-status writes, so
+        // SQLITE_BUSY under contention is an ordinary event rather than a theoretical one.
+        Err(error) => {
+            tracing::warn!(
+                run_id = run_id,
+                %error,
+                "pretooluse-decision: failed to resolve the run's mode — failing closed"
+            );
+            return Json(Decision {
+                decision: "deny".to_owned(),
+                reason: "could not resolve the run's mode — failing closed".to_owned(),
+            });
+        }
+    };
 
     // Barrier 2 of spec §5.5. A triage run is launched with no tools at all (barrier 1), so a tool
     // call arriving here means barrier 1 is not in force — which is the entire reason this branch
@@ -618,8 +655,8 @@ pub async fn pretooluse_decision(
         // records a decision and this is the policy the decision was taken under. Recording the
         // machine's label beside a verdict a project's declaration produced would put the wrong
         // configuration on the evidence, which is the one thing this column exists to prevent.
-        if is_in_flight
-            && let Err(error) = shadow::record_decision(
+        if is_in_flight {
+            match shadow::record_decision(
                 &state.pool,
                 run_id,
                 &payload.tool_name,
@@ -628,12 +665,32 @@ pub async fn pretooluse_decision(
                 policy.digest(),
             )
             .await
-        {
-            tracing::warn!(
-                run_id = run_id,
-                %error,
-                "pretooluse-decision: failed to record shadow decision"
-            );
+            {
+                Ok(decision_id) => {
+                    if judge_snapshot.for_run(&mode) != crate::judge::JudgeMode::Off
+                        && let Some(cwd) = cwd.as_deref()
+                    {
+                        crate::judge::observe_if_asked(
+                            &state.pool,
+                            &state.judge,
+                            judge_asked(
+                                &state,
+                                run_id,
+                                Some(decision_id),
+                                project_id.as_deref(),
+                                cwd,
+                                &payload,
+                                &classification,
+                            ),
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    run_id = run_id,
+                    %error,
+                    "pretooluse-decision: failed to record shadow decision"
+                ),
+            }
         }
 
         let read_only = matches!(payload.tool_name.as_str(), "Read" | "Grep" | "Glob")
@@ -651,9 +708,8 @@ pub async fn pretooluse_decision(
         };
     }
 
-    if mode == "worktree"
-        && is_in_flight
-        && let Err(error) = shadow::record_decision(
+    let shadow_decision_id = if mode == "worktree" && is_in_flight {
+        match shadow::record_decision(
             &state.pool,
             run_id,
             &payload.tool_name,
@@ -662,13 +718,20 @@ pub async fn pretooluse_decision(
             policy.digest(),
         )
         .await
-    {
-        tracing::warn!(
-            run_id = run_id,
-            %error,
-            "pretooluse-decision: failed to record shadow decision"
-        );
-    }
+        {
+            Ok(decision_id) => Some(decision_id),
+            Err(error) => {
+                tracing::warn!(
+                    run_id = run_id,
+                    %error,
+                    "pretooluse-decision: failed to record shadow decision"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Class-scoped authorization (spec §8.4 step 6): once a human has approved an action, every
     // later action of that CLASS is allowed for the rest of the resume run, overriding the
@@ -864,6 +927,47 @@ pub async fn pretooluse_decision(
                         "pretooluse-decision: grant lookup failed; falling back to the classifier decision"
                     );
                 }
+            }
+        }
+    }
+
+    // **The judge's point (spec A D4), and why it is exactly here.**
+    //
+    // - After the queued request, the declared git operation and the grants: each is an explicit
+    //   human decision or already returned its own verdict, and a judge ahead of them could refuse
+    //   what a person approved and spend that person's denial allowance. It also means the
+    //   judge's 2 s are never added to the declared-git branch's up-to-300 s.
+    // - OUTSIDE the `pending && in_flight` block above, because a classifier `allow` never enters
+    //   it, and D6 sends writes the classifier allowed to the judge.
+    // - Before the unattended conversions and the pause below, which only ever see what the judge
+    //   left alone.
+    // - In flight only: without it there is no cwd, no task and no run to charge.
+    //
+    // Observe (this chunk) changes nothing and waits for nothing. The judge NEVER rewrites
+    // `classification`: the generic counter below counts every `deny` of a run in flight, and a
+    // judge's refusal must be counted by D7's rule and not by that one.
+    if mode == "worktree"
+        && is_in_flight
+        && let Some(cwd) = cwd.as_deref()
+    {
+        match judge_snapshot.for_run(&mode) {
+            crate::judge::JudgeMode::Off => {}
+            // `enforce` is not acted on until a later chunk; a snapshot that says it anyway
+            // observes.
+            crate::judge::JudgeMode::Observe | crate::judge::JudgeMode::Enforce => {
+                crate::judge::observe_if_asked(
+                    &state.pool,
+                    &state.judge,
+                    judge_asked(
+                        &state,
+                        run_id,
+                        shadow_decision_id,
+                        project_id.as_deref(),
+                        cwd,
+                        &payload,
+                        &classification,
+                    ),
+                )
             }
         }
     }
@@ -3313,6 +3417,278 @@ mod tests {
             .insert(run_id, task.abort_handle());
 
         run_id
+    }
+
+    // This module already has its own `ScriptedJudge` (the local-chat one), so the spec A judge's
+    // double comes in under another name.
+    use crate::judge::JudgeRuntime;
+    use crate::judge::ScriptedJudge as VerdictJudge;
+
+    /// A worktree run in flight in project `p`, with the judge photographed as `judge`.
+    async fn judged_run(state: &AppState, mode: &str, judge: &str) -> i64 {
+        let run_id = in_flight_run(state, mode, Some("p"), Some("C:\\work\\repo"), None).await;
+        sqlx::query("UPDATE runs SET judge = ?, prompt = 'Fix the build' WHERE id = ?")
+            .bind(judge)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        run_id
+    }
+
+    async fn judged_state(judge: std::sync::Arc<VerdictJudge>) -> AppState {
+        let mut state = test_state().await;
+        state.judge = std::sync::Arc::new(JudgeRuntime::with(judge));
+        state
+    }
+
+    fn call(run_id: i64, tool: &str, input: serde_json::Value) -> String {
+        serde_json::json!({"run_id": run_id, "tool_name": tool, "tool_input": input}).to_string()
+    }
+
+    type VerdictRow = (String, Option<String>, String, i64, Option<i64>);
+
+    /// Observations are detached; this waits for `n` rows, or fails after five seconds.
+    async fn verdict_rows(pool: &sqlx::SqlitePool, n: usize) -> Vec<VerdictRow> {
+        for _ in 0..500 {
+            let rows: Vec<VerdictRow> = sqlx::query_as(
+                "SELECT judge, band, final_decision, enforced, shadow_decision_id FROM judge_verdicts ORDER BY id",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            if rows.len() >= n {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the judge never wrote {n} verdict(s)");
+    }
+
+    /// A call the judge must NOT be asked about has had time to be asked, if it were going to be.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    /// D11: in `observe` the judge is asked, its answer is written down tied to the decision, and
+    /// the verdict is the classifier's, however sure the judge was.
+    #[tokio::test]
+    async fn a_worktree_run_in_observe_asks_and_changes_nothing() {
+        let judge = VerdictJudge::answering(0.02, 0.02);
+        let state = judged_state(judge.clone()).await;
+        let run_id = judged_run(&state, "worktree", "observe").await;
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &call(
+                run_id,
+                "Bash",
+                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+            ),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "pending_approval");
+        let rows = verdict_rows(&state.pool, 1).await;
+        assert_eq!(
+            (
+                rows[0].0.as_str(),
+                rows[0].1.as_deref(),
+                rows[0].2.as_str(),
+                rows[0].3
+            ),
+            ("observe", Some("deny"), "pending_approval", 0)
+        );
+        assert!(
+            rows[0].4.is_some(),
+            "the verdict is tied to the shadow decision it judged"
+        );
+    }
+
+    /// D2: the run's snapshot decides, not the project's setting now.
+    #[tokio::test]
+    async fn the_snapshot_decides_and_not_the_projects_setting_now() {
+        let judge = VerdictJudge::answering(0.5, 0.5);
+        let state = judged_state(judge.clone()).await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, judge) VALUES ('p', 'active', 'observe')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let off_run = judged_run(&state, "worktree", "off").await;
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &call(
+                off_run,
+                "Write",
+                serde_json::json!({"file_path": "C:\\work\\repo\\a.rs", "content": "x"}),
+            ),
+        )
+        .await;
+        settle().await;
+        assert_eq!(
+            judge.calls(),
+            0,
+            "a run launched with the judge off is never asked"
+        );
+
+        let observed = judged_run(&state, "worktree", "observe").await;
+        sqlx::query("UPDATE autopilot_state SET judge = 'off'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        decide(
+            &app,
+            &call(
+                observed,
+                "Write",
+                serde_json::json!({"file_path": "C:\\work\\repo\\a.rs", "content": "x"}),
+            ),
+        )
+        .await;
+        verdict_rows(&state.pool, 1).await;
+    }
+
+    /// D11: a shadow run observes where it records, and an `enforce` snapshot there observes too.
+    #[tokio::test]
+    async fn a_shadow_run_observes_even_under_an_enforce_snapshot() {
+        let judge = VerdictJudge::answering(0.99, 0.99);
+        let state = judged_state(judge).await;
+        let run_id = judged_run(&state, "shadow", "enforce").await;
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &call(
+                run_id,
+                "Bash",
+                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            decision.decision, "deny",
+            "shadow mode still blocks what is not a read"
+        );
+        let rows = verdict_rows(&state.pool, 1).await;
+        assert_eq!((rows[0].0.as_str(), rows[0].3), ("observe", 0));
+    }
+
+    /// D4/D6: reads and hard refusals never reach the judge; a write always does.
+    #[tokio::test]
+    async fn reads_and_hard_refusals_never_reach_the_judge_and_writes_always_do() {
+        let judge = VerdictJudge::answering(0.5, 0.5);
+        let state = judged_state(judge.clone()).await;
+        let run_id = judged_run(&state, "worktree", "observe").await;
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &call(
+                run_id,
+                "Read",
+                serde_json::json!({"file_path": "C:\\work\\repo\\a.rs"}),
+            ),
+        )
+        .await;
+        decide(
+            &app,
+            &call(run_id, "Bash", serde_json::json!({"command": "ls"})),
+        )
+        .await;
+        decide(
+            &app,
+            &call(run_id, "Bash", serde_json::json!({"command": "rm -rf /"})),
+        )
+        .await;
+        settle().await;
+        assert_eq!(judge.calls(), 0);
+
+        decide(
+            &app,
+            &call(run_id, "Edit", serde_json::json!({"file_path": "C:\\work\\repo\\a.rs", "old_string": "a", "new_string": "b"})),
+        )
+        .await;
+        verdict_rows(&state.pool, 1).await;
+        assert_eq!(judge.calls(), 1);
+    }
+
+    /// D4: a human's grant and a project's declared git operation answer first; the judge never
+    /// sees what they decided.
+    #[tokio::test]
+    async fn a_grant_or_a_declared_git_op_answers_before_the_judge() {
+        let judge = VerdictJudge::answering(0.01, 0.01);
+        let state = judged_state(judge.clone()).await;
+        let run_id = judged_run(&state, "worktree", "observe").await;
+        proposals::grant_action(&state.pool, run_id, "Bash", Some("push-merge-deploy"), 1)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+        let granted = decide(
+            &app,
+            &call(
+                run_id,
+                "Bash",
+                serde_json::json!({"command": "git push origin main"}),
+            ),
+        )
+        .await;
+        assert_eq!(granted.decision, "allow");
+
+        let repo = rostered_repo(&state, "hook-judge-declared-push").await;
+        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+            .await
+            .unwrap();
+        let declared_run = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            repo.path().to_str(),
+            Some("judge-declared"),
+        )
+        .await;
+        sqlx::query("UPDATE runs SET judge = 'observe' WHERE id = ?")
+            .bind(declared_run)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let queued = run_git_decision(&app, declared_run, "git push origin feature").await;
+        assert_eq!(queued.decision, "deny");
+        assert!(queued.reason.contains("request"));
+
+        settle().await;
+        assert_eq!(judge.calls(), 0);
+    }
+
+    /// D4: a run that is not in flight has no cwd, no task to judge against and no run to charge.
+    #[tokio::test]
+    async fn a_run_out_of_flight_never_calls_the_judge() {
+        let judge = VerdictJudge::answering(0.5, 0.5);
+        let state = judged_state(judge.clone()).await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, project_id, cwd, judge, created_at)
+             VALUES ('x', 'running', 'worktree', 'p', 'C:\\work\\repo', 'observe', '2026-09-27T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &call(
+                run_id,
+                "Write",
+                serde_json::json!({"file_path": "C:\\work\\repo\\a.rs", "content": "x"}),
+            ),
+        )
+        .await;
+        settle().await;
+        assert_eq!(judge.calls(), 0);
     }
 
     /// A live implement node of a live job: the job row, one `running` item, the run that owns it,

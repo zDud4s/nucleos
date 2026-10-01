@@ -1053,7 +1053,6 @@ pub(crate) async fn judge_call(
 
 /// D11: asks in parallel and changes nothing. Detached, so the hook never waits for it — "não se
 /// acrescenta latência nenhuma".
-#[allow(dead_code)] // consumed by Task 5.2
 pub(crate) fn observe_if_asked(pool: &SqlitePool, runtime: &Arc<JudgeRuntime>, asked: Asked) {
     if !judge_is_asked(
         &asked.tool_name,
