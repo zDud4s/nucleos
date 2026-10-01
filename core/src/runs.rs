@@ -1335,6 +1335,12 @@ pub(crate) const CONTINUATION_COLUMNS: &[(&str, &str)] = &[
     ("read_untrusted", "read_untrusted"),
     ("permission_mode", "permission_mode"),
     ("judge", "judge"),
+    // Spec B D11: the B's snapshot travels like spec A's.
+    ("judge_resolve", "judge_resolve"),
+    // Spec B D6.1: COMPUTED, not copied. A root's own id is only known after its INSERT, so a root
+    // reads NULL, and what continues it records that id; copying the NULL would make every
+    // continuation a new root, and "one correction per lineage" would escape through a handoff.
+    ("lineage_root_id", "COALESCE(lineage_root_id, id)"),
 ];
 
 fn continuation_names() -> String {
@@ -8997,6 +9003,9 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             ("read_untrusted", "1"),
             ("permission_mode", "'dont_ask'"),
             ("judge", "'observe'"),
+            // Spec B D11 and D6.1. A lineage already rooted elsewhere must travel as it is.
+            ("judge_resolve", "'observe'"),
+            ("lineage_root_id", "777"),
         ];
         for (column, _) in CONTINUATION_COLUMNS {
             assert!(
@@ -9051,9 +9060,9 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     }
 
     async fn assert_continued(pool: &sqlx::SqlitePool, origin: i64, continuation: i64) {
-        for (column, _) in CONTINUATION_COLUMNS {
+        for (column, expression) in CONTINUATION_COLUMNS {
             let same: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                "SELECT (SELECT {column} FROM runs WHERE id = ?1) IS (SELECT {column} FROM runs WHERE id = ?2)"
+                "SELECT (SELECT {expression} FROM runs WHERE id = ?1) IS (SELECT {column} FROM runs WHERE id = ?2)"
             )))
             .bind(origin)
             .bind(continuation)
@@ -9062,6 +9071,28 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             .unwrap();
             assert!(same, "{column} did not travel from run {origin} to run {continuation}");
         }
+    }
+
+    /// Spec B D6.1: a root (`lineage_root_id` NULL) hands its OWN id to what continues it. Copying
+    /// the NULL as it is would make every successor a new root, and depth 1 would be lost.
+    #[tokio::test]
+    async fn a_root_hands_its_own_id_to_its_continuation() {
+        let pool = retention_pool().await;
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, mode, context_fill, created_at)
+             VALUES (43302, 'p', 'the task', 'running', 'worktree', ?, '2026-09-27T00:00:00Z')",
+        )
+        .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let successor = prepare_handoff_successor(&pool, 43302).await.unwrap().unwrap();
+        let root: Option<i64> = sqlx::query_scalar("SELECT lineage_root_id FROM runs WHERE id = ?")
+            .bind(successor.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(root, Some(43302));
     }
 
     /// Spec B D6.2's fail-closed path, taken here because the resume becomes `INSERT ... SELECT`:
