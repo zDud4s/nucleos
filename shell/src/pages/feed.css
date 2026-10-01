@@ -1164,8 +1164,7 @@
 /**
  * The owner, as a control rather than a link.
  *
- * It narrows this feed, which is the honest thing the row's ids can do — there is no errand detail
- * route and no job page to send anyone to. Styled as text with a dotted underline so it does not
+ * It narrows this feed, which is the honest thing the row's ids can do — there is no job page to send anyone to. Styled as text with a dotted underline so it does not
  * read as a navigation.
  */
 .feed-line-owner {

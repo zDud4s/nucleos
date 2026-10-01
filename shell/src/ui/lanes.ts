@@ -11,12 +11,12 @@ import { readState } from "./state-map";
  *
  * **Lanes are subsystems, not severities.** Six, in the order a reader goes looking: the work the
  * núcleo was asked for (jobs), the processes doing it (runs and their worktrees), what reached the
- * repository (git), the multi-agent pillars (teams and the council), the outside world (errands,
- * schedules, mail and the web), and the machine and its projects' own settings. A lane is where a
+ * repository (git), the multi-agent pillars (teams and the council), the outside world (schedules,
+ * mail and the web), and the machine and its projects' own settings. A lane is where a
  * line came FROM; its gravity is what the tone already says.
  */
 
-export type FeedLane = "jobs" | "runs" | "git" | "teams" | "errands" | "machine";
+export type FeedLane = "jobs" | "runs" | "git" | "teams" | "mail" | "machine";
 
 export interface FeedLaneInfo {
   id: FeedLane;
@@ -29,7 +29,7 @@ export const FEED_LANES: readonly FeedLaneInfo[] = [
   { id: "runs", label: "Runs & worktrees" },
   { id: "git", label: "Git" },
   { id: "teams", label: "Teams & council" },
-  { id: "errands", label: "Errands & mail" },
+  { id: "mail", label: "Mail & web" },
   { id: "machine", label: "Projects & machine" },
 ];
 
@@ -45,7 +45,7 @@ export const FEED_LANES: readonly FeedLaneInfo[] = [
  * - `token_efficiency` names runs but judges a project's prompts over many of them; it is advice
  *   about configuration, so the machine lane, and not runs.
  * - `land_resolution_failed` is git: what failed was landing a resolution on the branch.
- * - `schedule_rule_invalid` sits with errands, because schedules are the rules errands fire from.
+ * - `schedule_rule_invalid` sits in the mail lane, with the other lines about the outside world.
  * - `promotion_ready` is a project earning the next autopilot mode — the machine lane.
  */
 const LANE_OF: Record<string, FeedLane> = {
@@ -99,19 +99,15 @@ const LANE_OF: Record<string, FeedLane> = {
   council_stage: "teams",
   council_finished: "teams",
 
-  schedule_rule_invalid: "errands",
-  errand_rule_fired: "errands",
-  errand_rule_failed: "errands",
-  errand_investigation_done: "errands",
-  errand_investigation_failed: "errands",
-  email_digest: "errands",
-  email_urgent: "errands",
-  email_triage_failed: "errands",
-  email_triage_paused: "errands",
-  email_triage_stalled: "errands",
-  email_fetch_skipped: "errands",
-  email_sent_mailbox_foreign: "errands",
-  "web.read": "errands",
+  schedule_rule_invalid: "mail",
+  email_digest: "mail",
+  email_urgent: "mail",
+  email_triage_failed: "mail",
+  email_triage_paused: "mail",
+  email_triage_stalled: "mail",
+  email_fetch_skipped: "mail",
+  email_sent_mailbox_foreign: "mail",
+  "web.read": "mail",
 
   config_written: "machine",
   project_onboarded: "machine",
@@ -148,7 +144,7 @@ export function feedLaneKinds(): string[] {
 export function feedLaneOf(kind: string): FeedLane {
   const named = LANE_OF[kind];
   if (named !== undefined) return named;
-  if (kind.startsWith("email_") || kind.startsWith("web.")) return "errands";
+  if (kind.startsWith("email_") || kind.startsWith("web.")) return "mail";
   return "machine";
 }
 

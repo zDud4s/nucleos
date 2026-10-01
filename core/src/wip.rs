@@ -402,7 +402,6 @@ mod tests {
                 pool,
                 run_id,
                 None,
-                None,
                 "Bash",
                 "the classifier did not recognise this command",
                 Some(r#"{"command":"cargo fmt --all"}"#),

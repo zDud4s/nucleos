@@ -3,7 +3,7 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
@@ -649,37 +649,6 @@ pub fn build_router(state: AppState) -> Router {
         // A turn in flight, as words. The literal is a segment deeper than `{turn_id}` above, so
         // the two cannot shadow each other whatever a turn id looks like.
         .route("/assistant/{turn_id}/live", get(get_assistant_live))
-        // An errand is standing work on a Telegram topic, and these are the four moves the chat
-        // routes above already make: open one, list them, change one, end it. DELETE ends the
-        // asking and removes nothing — `errands::close` says why.
-        .route("/errands", get(list_errands).post(create_errand))
-        .route("/errands/{id}", patch(patch_errand).delete(close_errand))
-        // The errand's folder and its notebook, over HTTP because that is the only door the MCP
-        // process has: it runs beside the daemon and never touches the pool.
-        //
-        // `{*path}` is a wildcard and not a `{name}` because a note may sit in a subdirectory of the
-        // folder, and a segment parameter stops at the first slash. Nothing here joins that path
-        // itself — every one of the three goes through `errands::file_path`, which is what puts a
-        // path chosen by a model that has been reading the open web through
-        // `files::resolve_within`, the one function in the daemon that decides what is reachable.
-        .route("/errands/{id}/files", get(list_errand_files))
-        .route(
-            "/errands/{id}/files/{*path}",
-            get(read_errand_file).put(write_errand_file),
-        )
-        .route("/errands/{id}/notebook", get(read_errand_notebook))
-        // What makes an errand STANDING work rather than a topic somebody has to keep typing into.
-        // A project keeps its schedule in `~/.nucleos/projects/<id>/autopilot.yaml`; an errand has
-        // no repository, so the rules live in the database and this is the only door to them.
-        //
-        // The rule id is scoped under the errand id on purpose. Both come out of the path, so
-        // nothing about a request pairs them correctly — `errands::delete_rule` keys on both, and a
-        // mismatched pair matches no row instead of reaching another errand's schedule.
-        .route(
-            "/errands/{id}/rules",
-            get(list_errand_rules).post(create_errand_rule),
-        )
-        .route("/errands/{id}/rules/{rule_id}", delete(delete_errand_rule))
         .route("/proposals", get(get_proposals))
         // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
         // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
@@ -1190,10 +1159,6 @@ struct ProjectQuery {
 #[derive(Deserialize)]
 struct FeedQuery {
     project_id: Option<String>,
-    /// The other owner a feed line can have. Beside `project_id` and never combined with it: an
-    /// errand has no project, so a request carrying both is asking for rows that cannot exist —
-    /// `get_feed` takes the errand as the narrower fact and says so there.
-    errand_id: Option<i64>,
     scope: Option<String>,
     q: Option<String>,
     kind: Option<String>,
@@ -2445,7 +2410,7 @@ async fn post_email_requeue(
 /// A slug and not the sentence, for the reason `assistant.rs` records around `NO_LOCAL_MODEL`: a
 /// refusal recognised by its prose stops being recognised the day somebody improves the wording,
 /// and it fails silently — a deliberate refusal starts reading as a crash. And the sentence is not
-/// this crate's to write anyway. What undoes a paused errand is `/retomar`, a Telegram command; the
+/// this crate's to write anyway. What undoes a pause is `/retomar`, a Telegram command; the
 /// núcleo says which refusal happened and whoever is talking to the person says what to do about
 /// it, in the language they are being spoken to in.
 fn refusal(status: StatusCode, name: &'static str) -> (StatusCode, Json<serde_json::Value>) {
@@ -2528,22 +2493,6 @@ async fn post_assistant_message(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_openrouter_key",
         )),
-        // Also not a 500, and for the same reason: the topic has an errand somebody paused or
-        // closed. That is a state this request conflicts with, which is what 409 already means here
-        // for a chat that is mid-turn — and it is what lets the sidecar answer "that topic is on
-        // hold" instead of reporting a fault that did not happen. The slug is what keeps it from
-        // being READ as the other 409: this one never clears on its own.
-        Err(msg) if msg.starts_with(crate::assistant::ERRAND_NOT_ANSWERING) => {
-            Err(refusal(StatusCode::CONFLICT, "errand_not_answering"))
-        }
-        // 423 and not a third 409, because 409 already carries two meanings on this route — a chat
-        // mid-turn and an errand on hold — and this is a third with a different undoing. A topic
-        // that has gone quiet is answered with `/retomar` when it is paused and `/kill off` when it
-        // is this, and one number for both leaves the sidecar to guess. Locked is the accurate word:
-        // the errand is active and conflicts with nothing; a decision taken elsewhere holds it shut.
-        Err(msg) if msg == crate::assistant::KILL_ENGAGED => {
-            Err(refusal(StatusCode::LOCKED, "kill_switch"))
-        }
         Err(_) => Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")),
     }
 }
@@ -2635,7 +2584,7 @@ async fn sending_turn_of(
 /// see `Refusal`'s own doc for what each means. 409 for the four the gate actually DECIDED (the
 /// destination is gone or archived, the sender is Telegram, the chain refuses the hop, the owner is
 /// away): a caller can read the slug and know why, the same way `post_assistant_message` already
-/// answers 409 for a chat mid-turn or an errand on hold. 500 for `Unreadable` alone, because that
+/// answers 409 for a chat mid-turn. 500 for `Unreadable` alone, because that
 /// variant is not a decision about the relay — the gate could not read enough to make one — and
 /// there is nothing about THIS relay for a caller to act on differently next time.
 fn relay_refusal_response(cause: crate::relay::Refusal) -> (StatusCode, Json<serde_json::Value>) {
@@ -2671,8 +2620,7 @@ fn relay_refusal_response(cause: crate::relay::Refusal) -> (StatusCode, Json<ser
 /// `assistant::send_relayed_message`'s refusals, mapped the same way `post_assistant_message` above
 /// already maps `send_message_with`'s — the two share every constant because a relayed turn is
 /// refused by the same brakes an ordinary one is (a chat mid-turn, neither route configured, an
-/// OpenRouter key missing, an errand on
-/// hold, the kill switch). Kept as its own small match rather than a shared function with that
+/// OpenRouter key missing, the kill switch). Kept as its own small match rather than a shared function with that
 /// route's: the two bodies are one line apart today, and a shared helper here would be reaching
 /// into `post_assistant_message` for four string constants it would have imported anyway.
 fn relayed_send_refusal(msg: String) -> (StatusCode, Json<serde_json::Value>) {
@@ -2689,10 +2637,6 @@ fn relayed_send_refusal(msg: String) -> (StatusCode, Json<serde_json::Value>) {
         _ if msg == crate::assistants::HOSTED_KEY_MISSING => {
             refusal(StatusCode::SERVICE_UNAVAILABLE, "no_openrouter_key")
         }
-        _ if msg.starts_with(crate::assistant::ERRAND_NOT_ANSWERING) => {
-            refusal(StatusCode::CONFLICT, "errand_not_answering")
-        }
-        _ if msg == crate::assistant::KILL_ENGAGED => refusal(StatusCode::LOCKED, "kill_switch"),
         _ => refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
 }
@@ -9420,8 +9364,6 @@ async fn get_feed(
     if !has_search_filters {
         let entries = if query.scope.as_deref() == Some("all") {
             feed::list_all(&state.pool, 50).await
-        } else if let Some(errand_id) = query.errand_id {
-            feed::list_errand_feed(&state.pool, errand_id, 50).await
         } else {
             feed::list_feed(&state.pool, query.project_id.as_deref(), 50).await
         };
@@ -9430,15 +9372,8 @@ async fn get_feed(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // The errand is read before the project on purpose. They are two different owners and a row has
-    // at most one, so a request naming both is asking for rows that cannot exist; taking the errand
-    // gives that request the answer nearest to what it asked for instead of the empty list an `AND`
-    // of the two would produce. Both branches fall through to `Global`, which since the errand
-    // arrived means the machine's own lines and nothing else's.
     let scope = if query.scope.as_deref() == Some("all") {
         feed::FeedScope::All
-    } else if let Some(errand_id) = query.errand_id {
-        feed::FeedScope::Errand(errand_id)
     } else if let Some(project_id) = query.project_id {
         feed::FeedScope::Project(project_id)
     } else {
@@ -13277,389 +13212,6 @@ async fn delete_chat(
         })
 }
 
-/// The errands, newest first, and the closed ones with them.
-///
-/// Unlike `list_chats`, which hides what was archived. Closing an errand is not archiving it: the
-/// row is the record of work already done, and this list is read to find that work again as much as
-/// to find what is still moving.
-async fn list_errands(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<crate::errands::Errand>>, StatusCode> {
-    crate::errands::list(&state.pool)
-        .await
-        .map(Json)
-        .map_err(|error| {
-            tracing::warn!(%error, "listing errands failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
-}
-
-#[derive(serde::Deserialize)]
-struct CreateErrandRequest {
-    name: String,
-    /// `<chat_id>:<thread_id>`, composed by the sidecar. Opaque here and never parsed — this route
-    /// knows a chat key the way `errands.rs` does: as a string it was handed.
-    chat_key: String,
-}
-
-/// Opens an errand on a topic, and answers with the id it was given.
-///
-/// The id is why there is a body at all: the folder is minted from it and every other route here is
-/// keyed by it. The folder itself is not created — `errands::folder_path` makes it on first use, so
-/// an errand nothing was ever written into leaves no empty directory behind.
-async fn create_errand(
-    State(state): State<AppState>,
-    Json(body): Json<CreateErrandRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    crate::errands::create(&state.pool, &body.name, &body.chat_key)
-        .await
-        .map(|errand_id| Json(serde_json::json!({ "errand_id": errand_id })))
-        .map_err(|error| {
-            // One topic holds one errand: `chat_key` is UNIQUE, and `errands::create` leans on that
-            // rather than reading first, so a second POST on a topic that already has one arrives
-            // here as a constraint violation. 500 would tell the caller this daemon is broken and
-            // invite a retry that can never work; 409 names the one thing that is actually wrong.
-            //
-            // Asked of the typed database error, the way `presets.rs` asks it — never of the
-            // message's text, which belongs to the driver and changes with it.
-            if error
-                .as_database_error()
-                .is_some_and(|database_error| database_error.is_unique_violation())
-            {
-                return StatusCode::CONFLICT;
-            }
-            tracing::warn!(%error, "opening an errand failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
-}
-
-/// The errand this id names, or the refusal every route keyed by one owes its caller.
-///
-/// Written once because six routes need the same two steps: the row, and a 404 when there is no
-/// row. The `Errand` it hands back is not a formality — `read_file`, `write_file`, `list_files` and
-/// `read_notebook` all take one, and the folder they resolve against comes from it. So this is also
-/// the only place a route learns which directory it is allowed to touch.
-async fn errand_by_id(state: &AppState, id: i64) -> Result<crate::errands::Errand, StatusCode> {
-    crate::errands::get(&state.pool, id)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, id, "reading an errand failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .ok_or(StatusCode::NOT_FOUND)
-}
-
-#[derive(serde::Deserialize)]
-struct PatchErrandRequest {
-    status: Option<String>,
-    brain: Option<String>,
-    /// When this errand is finished, in the owner's words, and how many turns it may take on its
-    /// own getting there. Both or neither: see `errands::set_investigation` for why they are one
-    /// decision and not two fields.
-    done_when: Option<String>,
-    windows: Option<i64>,
-}
-
-/// Pauses or resumes an errand, moves it between the local model and the cloud, or both at once —
-/// the shape `patch_chat` has a few blocks up.
-///
-/// Both fields go through `from_wire`, which cannot fail: a spelling nobody recognises becomes the
-/// conservative value — `paused`, which does not act, and `local`, which does not spend — rather
-/// than a 400. No string from this body reaches SQL; what reaches it is an enum, which is the only
-/// thing the column's CHECK constraint accepts.
-async fn patch_errand(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(body): Json<PatchErrandRequest>,
-) -> Result<StatusCode, StatusCode> {
-    // Answered before anything is written, for the reason `patch_chat` gives further up: `204` over
-    // an UPDATE that matched no row is the API saying "done" about something it did not do, and a
-    // client that believes it carries on with an errand that was never there.
-    //
-    // Kept, not discarded, because the criterion below is a field this request may leave out while
-    // changing the windows beside it — "give it three more goes at the same thing" — and answering
-    // that needs the criterion it already has.
-    let errand = errand_by_id(&state, id).await?;
-
-    if let Some(status) = body.status.as_deref() {
-        crate::errands::set_status(&state.pool, id, crate::errands::Status::from_wire(status))
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "pausing or resuming an errand failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
-
-    if let Some(brain) = body.brain.as_deref() {
-        crate::errands::set_brain(&state.pool, id, crate::errands::Brain::from_wire(brain))
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "changing an errand's model failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
-
-    // Written together, and only when at least one of them was asked for, so a PATCH that merely
-    // pauses an errand does not silently call off an investigation it never mentioned. `windows`
-    // alone means "give it more of the same criterion"; `done_when` alone means "this, once", which
-    // is one window and not zero — zero would store a criterion nothing will ever act on.
-    if body.done_when.is_some() || body.windows.is_some() {
-        let criterion = body.done_when.as_deref().or(errand.done_when.as_deref());
-        let windows = body.windows.unwrap_or(1);
-        crate::errands::set_investigation(&state.pool, id, criterion, windows)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "setting an errand's criterion failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Ends an errand, and deletes nothing.
-///
-/// DELETE is the verb a client already has for "I am done with this", and here it means what `/fim`
-/// means in the topic: the asking stops, the row stays, and the folder keeps what was found. The
-/// neighbouring `delete_chat` archives for the same reason — the record of work already done is not
-/// the client's to destroy by asking for a shorter list.
-async fn close_errand(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<StatusCode, StatusCode> {
-    // Checked first for the reason `patch_errand` gives, and it applies harder to this one: closing
-    // is the move a client makes once and then stops watching, so a `204` about an errand that does
-    // not exist is a report nobody ever goes back to check.
-    errand_by_id(&state, id).await?;
-
-    crate::errands::close(&state.pool, id)
-        .await
-        .map(|()| StatusCode::NO_CONTENT)
-        .map_err(|error| {
-            tracing::warn!(%error, "closing an errand failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
-}
-
-/// This errand's standing instructions, by name.
-///
-/// The errand is looked up first even though the query would answer an empty list on its own: an
-/// empty list about an errand that does not exist reads as "this errand has no rules", and a caller
-/// that mistyped an id would go on believing it disarmed something.
-async fn list_errand_rules(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<Json<Vec<crate::errands::Rule>>, StatusCode> {
-    errand_by_id(&state, id).await?;
-
-    crate::errands::list_rules(&state.pool, id)
-        .await
-        .map(Json)
-        .map_err(|error| {
-            tracing::warn!(%error, id, "listing an errand's rules failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
-}
-
-#[derive(serde::Deserialize)]
-struct CreateRuleRequest {
-    name: String,
-    cron: String,
-    prompt: String,
-    /// Absent means UTC, the same as `ScheduleRule.timezone`. A name nobody recognises is refused
-    /// rather than read as UTC — `scheduler.rs:62-67` gives the reason and it does not change here.
-    timezone: Option<String>,
-}
-
-/// Arms a standing instruction on this errand, answering with the id it was given.
-///
-/// Three refusals, and they are three different sentences on purpose. `404`: no such errand. `400`:
-/// the rule as written will never fire, and the body carries the reason. `409`: this errand already
-/// has a rule of that name.
-///
-/// The `400` is what an errand's rules have that a project's do not. `scheduler.rs` meets a project
-/// rule long after whoever wrote the YAML has gone, so an unreadable one is armed anyway and
-/// announced once to the feed; this one arrives with somebody still at the keyboard, and telling
-/// them now costs a status code.
-///
-/// The reason goes out as free text under `error` rather than as one of the `refusal` slugs the
-/// assistant route uses. A slug exists so a client can look up a sentence it already knows, and the
-/// set of ways a cron can be wrong is not a set anybody can enumerate in advance — here the reason
-/// IS the sentence, and it names the word that was wrong.
-async fn create_errand_rule(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(body): Json<CreateRuleRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let status_only = |status: StatusCode| (status, Json(serde_json::json!({})));
-
-    errand_by_id(&state, id).await.map_err(status_only)?;
-
-    match crate::errands::create_rule(
-        &state.pool,
-        id,
-        &body.name,
-        &body.cron,
-        &body.prompt,
-        body.timezone.as_deref(),
-        chrono::Utc::now(),
-    )
-    .await
-    {
-        Ok(rule_id) => Ok(Json(serde_json::json!({ "rule_id": rule_id }))),
-        Err(crate::errands::RuleError::Unreadable(reason)) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": reason })),
-        )),
-        Err(crate::errands::RuleError::Duplicate) => Err(status_only(StatusCode::CONFLICT)),
-        Err(error) => {
-            tracing::warn!(%error, id, "arming an errand's rule failed");
-            Err(status_only(StatusCode::INTERNAL_SERVER_ERROR))
-        }
-    }
-}
-
-/// Disarms one rule of this errand.
-///
-/// `404` when nothing matched, which covers both an unknown rule and one belonging to a different
-/// errand — and the two are deliberately the same answer, because distinguishing them would confirm
-/// to a caller that some other errand holds that id. A `204` over a delete that matched nothing is
-/// the worse failure by far: it is the daemon agreeing that a rule is disarmed while it goes on
-/// firing.
-async fn delete_errand_rule(
-    State(state): State<AppState>,
-    Path((id, rule_id)): Path<(i64, i64)>,
-) -> Result<StatusCode, StatusCode> {
-    errand_by_id(&state, id).await?;
-
-    match crate::errands::delete_rule(&state.pool, id, rule_id).await {
-        Ok(true) => Ok(StatusCode::NO_CONTENT),
-        Ok(false) => Err(StatusCode::NOT_FOUND),
-        Err(error) => {
-            tracing::warn!(%error, id, rule_id, "disarming an errand's rule failed");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
-}
-
-/// What the errand's file surface answers when a path is refused or missing.
-///
-/// `InvalidInput` is the kind that carries the decision: `errands::file_path` wraps every refusal
-/// from `files::resolve_within` in it, so a path naming somewhere outside this errand's folder
-/// arrives here and leaves as `400` — the caller's mistake, said to the caller. A `500` would blame
-/// the daemon for it and invite the same request again.
-///
-/// `NotFound` is a file that is not there, which is a different sentence and a different fix.
-/// Everything else is this machine's problem: a disk that would not read, a name the platform
-/// refused. The path itself is never echoed back — it came from whoever wrote it.
-fn errand_file_status(error: &std::io::Error) -> StatusCode {
-    match error.kind() {
-        std::io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
-        std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
-/// What is in this errand's folder, and nothing else's.
-///
-/// The scoping is `errands::list_files`'s and is deliberately not restated here: there is one files
-/// root and many errands under it, so a listing taken at the root would hand every errand every
-/// other errand's investigation.
-async fn list_errand_files(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<Json<Vec<String>>, StatusCode> {
-    let root = files_root(&state)?.to_path_buf();
-    let errand = errand_by_id(&state, id).await?;
-
-    crate::errands::list_files(&root, &errand)
-        .map(Json)
-        .map_err(|error| {
-            tracing::warn!(%error, id, "listing an errand's folder failed");
-            errand_file_status(&error)
-        })
-}
-
-/// One file of this errand, read back by name.
-///
-/// The name arrives from a model that has been reading the open web, so `..` in it is the expected
-/// request and not a hypothetical one. Nothing is joined here: `errands::read_file` resolves it
-/// through `files::resolve_within`, which refuses a `..` component before any canonicalisation
-/// happens. A path built in this handler would inherit none of that.
-async fn read_errand_file(
-    State(state): State<AppState>,
-    Path((id, path)): Path<(i64, String)>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let root = files_root(&state)?.to_path_buf();
-    let errand = errand_by_id(&state, id).await?;
-
-    crate::errands::read_file(&root, &errand, &path)
-        .map(|contents| Json(serde_json::json!({ "contents": contents })))
-        .map_err(|error| {
-            tracing::warn!(%error, id, "reading an errand's file failed");
-            errand_file_status(&error)
-        })
-}
-
-#[derive(serde::Deserialize)]
-struct WriteErrandFileRequest {
-    contents: String,
-}
-
-/// Writes a file into this errand's folder, and marks it in the same breath.
-///
-/// The mark is `errands::write_file`'s to make and cannot be forgotten here, which is why the write
-/// goes through it rather than through `std::fs`. It is recorded as TAINTED, and that is not
-/// pessimism about the caller: this route is how the MCP process writes, the MCP process is driven
-/// by a model that reads the open web, and nothing in this request says what that model had read
-/// before it composed these bytes. `artifact_tainted` treats "cannot say" as tainted already — a
-/// route claiming otherwise would be vouching for something it cannot see.
-async fn write_errand_file(
-    State(state): State<AppState>,
-    Path((id, path)): Path<(i64, String)>,
-    Json(body): Json<WriteErrandFileRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let root = files_root(&state)?.to_path_buf();
-    let errand = errand_by_id(&state, id).await?;
-
-    crate::errands::write_file(
-        &state.pool,
-        &root,
-        &errand,
-        &path,
-        &body.contents,
-        true,
-        None,
-    )
-    .await
-    .map(|()| StatusCode::NO_CONTENT)
-    .map_err(|error| {
-        tracing::warn!(%error, id, "writing an errand's file failed");
-        errand_file_status(&error)
-    })
-}
-
-/// The errand's notebook, which is its memory across turns.
-///
-/// A notebook that has never been written reads back as `200` with an empty string, because
-/// `errands::read_notebook` answers a missing file that way and this route does not put a `404` on
-/// top of it. The two say different things to a client: "this errand is not there" would send it
-/// looking for a bug, when what happened is that nothing has been written yet.
-async fn read_errand_notebook(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let root = files_root(&state)?.to_path_buf();
-    let errand = errand_by_id(&state, id).await?;
-
-    crate::errands::read_notebook(&root, &errand)
-        .map(|contents| Json(serde_json::json!({ "contents": contents })))
-        .map_err(|error| {
-            tracing::warn!(%error, id, "reading an errand's notebook failed");
-            errand_file_status(&error)
-        })
-}
-
 async fn get_proposals(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
@@ -13693,7 +13245,7 @@ async fn get_skipped_items(
 /// The same shape as the listing above and for the same reason: neither kind can be approved into
 /// happening, so neither belongs on `/proposals`, whose two buttons answer 409 for anything but an
 /// `action-approval`. Its own route rather than sharing `/proposals/skipped-items`, because those
-/// are a job's items and the shell renders them inside a job graph — an errand's refused email has
+/// are a job's items and the shell renders them inside a job graph — a refused email has
 /// no graph to sit in and would arrive there as an orphan.
 async fn get_refused_actions(
     State(state): State<AppState>,
@@ -25971,7 +25523,7 @@ mod tests {
         );
     }
 
-    /// The half that matched is named, because the two are different errands.
+    /// The half that matched is named, because the two are different halves.
     #[tokio::test]
     async fn a_search_says_which_half_of_the_exchange_matched() {
         let state = test_state().await;
@@ -27063,31 +26615,6 @@ mod tests {
         );
     }
 
-    /// A paused errand is a decision somebody made, not a daemon that broke. The sidecar has to be
-    /// able to say "that topic is on hold" rather than "something went wrong", and a 500 is exactly
-    /// the answer that sends a reader looking for a crash that did not happen.
-    #[tokio::test]
-    async fn a_message_to_a_paused_errand_is_refused_without_looking_like_a_fault() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = with_files_root(test_state().await, dir.path().to_path_buf());
-        let errand = crate::errands::create(&state.pool, "carros", "-1:99")
-            .await
-            .unwrap();
-        crate::errands::set_status(&state.pool, errand, crate::errands::Status::Paused)
-            .await
-            .unwrap();
-
-        let (status, _) = call(
-            state,
-            "POST",
-            "/assistant/message",
-            Some(serde_json::json!({"chat_id": "-1:99", "text": "procura", "origin": "telegram"})),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CONFLICT);
-    }
-
     /// A record nobody can reach is the same as no record. This is the door.
     ///
     /// Dismiss and not approve or reject: nothing is held, so there is nothing to release and
@@ -27099,7 +26626,6 @@ mod tests {
         let id = crate::proposals::create_refused_action(
             &state.pool,
             7,
-            None,
             None,
             "send_email",
             "this turn has read third-party content and can no longer act",
@@ -27148,92 +26674,6 @@ mod tests {
         let (status, _) = call(state, "POST", &format!("/proposals/{id}/dismiss"), None).await;
 
         assert_eq!(status, StatusCode::CONFLICT);
-    }
-
-    /// The emergency stop gets a code of its own, and 409 is why. A topic that has gone quiet has
-    /// two undoings — `/retomar` for a pause, `/kill off` for the stop — and both refusals arriving
-    /// as the same number leaves the sidecar guessing which sentence to say. 423 because the errand
-    /// is not in conflict with anything: it exists, it is active, and it is locked by a decision
-    /// taken elsewhere.
-    #[tokio::test]
-    async fn the_emergency_stop_is_not_the_same_refusal_as_a_pause() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = with_files_root(test_state().await, dir.path().to_path_buf());
-        crate::errands::create(&state.pool, "carros", "-1:98")
-            .await
-            .unwrap();
-        crate::autopilot::set_kill_switch(&state.pool, true)
-            .await
-            .unwrap();
-
-        let (status, body) = call(
-            state,
-            "POST",
-            "/assistant/message",
-            Some(serde_json::json!({"chat_id": "-1:98", "text": "procura", "origin": "telegram"})),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::LOCKED);
-        assert_eq!(body["refusal"], "kill_switch");
-    }
-
-    /// The two 409s on this route are not one answer, and the caller cannot tell them apart.
-    ///
-    /// A chat mid-turn clears by waiting. A paused errand clears by somebody resuming it, and never
-    /// on its own — so a sidecar that guesses "still working, hold on" leaves a topic silent
-    /// forever with an explanation that was never true. The status code cannot carry the
-    /// difference: this route now has four refusals and HTTP has three honest codes for them, with
-    /// 403 already spent by `auth.rs` on token level. So the body names which refusal it was.
-    ///
-    /// A slug and not the sentence, for the reason `NO_LOCAL_MODEL` already records one file over:
-    /// prose stops being recognised the day somebody improves it, silently. And the sentence is not
-    /// the núcleo's to write — the remedy is `/retomar`, a Telegram command this crate must not
-    /// know.
-    #[tokio::test]
-    async fn the_two_conflicts_on_this_route_do_not_read_the_same() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = with_files_root(test_state().await, dir.path().to_path_buf());
-        state.runner = Arc::new(ParkedRunner);
-        let errand = crate::errands::create(&state.pool, "carros", "-1:97")
-            .await
-            .unwrap();
-        crate::errands::set_status(&state.pool, errand, crate::errands::Status::Paused)
-            .await
-            .unwrap();
-
-        let (paused_status, paused) = call(
-            state.clone(),
-            "POST",
-            "/assistant/message",
-            Some(serde_json::json!({"chat_id": "-1:97", "text": "procura", "origin": "telegram"})),
-        )
-        .await;
-
-        // A chat whose turn is genuinely still running, which is the other 409.
-        let chat = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
-            .await
-            .unwrap();
-        crate::assistant::send_message(
-            &state,
-            &chat,
-            "take your time",
-            crate::assistant::Origin::Shell,
-        )
-        .await
-        .unwrap();
-        let (busy_status, busy) = call(
-            state,
-            "POST",
-            "/assistant/message",
-            Some(serde_json::json!({"chat_id": chat, "text": "again", "origin": "shell"})),
-        )
-        .await;
-
-        assert_eq!(paused_status, StatusCode::CONFLICT);
-        assert_eq!(busy_status, StatusCode::CONFLICT);
-        assert_eq!(paused["refusal"], "errand_not_answering");
-        assert_eq!(busy["refusal"], "turn_in_progress");
     }
 
     #[tokio::test]
@@ -32860,7 +32300,7 @@ mod tests {
         )
     }
 
-    /// The route the redesigned feed page reads its day from: every owner's lines, oldest first,
+    /// The route the redesigned feed page reads its day from: every scope's lines, oldest first,
     /// wrapped in an object that can say it was cut. The entry is the shape `/feed` already hands
     /// out, field for field, so the page has one entry type and not two.
     #[tokio::test]
@@ -32881,9 +32321,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let errand = crate::feed::append_for_errand(&pool, 9, "errand_rule_fired", "errand", None)
-            .await
-            .unwrap();
         let app = build_router(state);
         let since = urlencoding(&since.to_rfc3339());
 
@@ -32897,7 +32334,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry["id"].as_i64().unwrap())
                 .collect::<Vec<_>>(),
-            [machine, project, errand]
+            [machine, project]
         );
         let mut keys = entries[1]
             .as_object()
@@ -32910,7 +32347,6 @@ mod tests {
             keys,
             [
                 "created_at",
-                "errand_id",
                 "id",
                 "kind",
                 "project_id",
@@ -32922,8 +32358,6 @@ mod tests {
         assert_eq!(entries[1]["project_id"], "alpha");
         assert_eq!(entries[1]["run_id"], 3);
         assert_eq!(entries[1]["subject"], "run:3");
-        assert_eq!(entries[2]["errand_id"], 9);
-        assert_eq!(entries[2]["subject"], "errand:9");
         // Present and null, not absent: the page tells "no subject" from "an older daemon" by it.
         assert!(entries[0].as_object().unwrap().contains_key("subject"));
         assert!(entries[0]["subject"].is_null());
@@ -32931,13 +32365,13 @@ mod tests {
         let (status, body) = feed_request(
             &app,
             "GET",
-            &format!("/feed/timeline?since={since}&after_id={project}"),
+            &format!("/feed/timeline?since={since}&after_id={machine}"),
             None,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["entries"].as_array().unwrap().len(), 1);
-        assert_eq!(body["entries"][0]["id"], errand);
+        assert_eq!(body["entries"][0]["id"], project);
     }
 
     /// Every way to ask for a window that is not one. A 400 and not an empty list, because an empty
@@ -33948,660 +33382,6 @@ mod tests {
         assert_eq!(post_verdict(state, last).await, StatusCode::NO_CONTENT);
 
         assert_eq!(promotion_feed_rows(&pool).await, 0);
-    }
-
-    /// A state with somewhere for an errand's folder to be, which the chat routes never needed: a
-    /// chat is rows and an errand is rows plus a directory.
-    ///
-    /// The root comes from `files::ensure_root` rather than from `tempdir()` directly, for the
-    /// reason that function's own comment gives — it canonicalises, and every containment check
-    /// downstream compares against the root it was handed. The `TempDir` is returned rather than
-    /// dropped here, because dropping it takes the directory with it.
-    async fn errand_state() -> (AppState, tempfile::TempDir) {
-        let temp = tempfile::tempdir().unwrap();
-        let root = crate::files::ensure_root(temp.path()).unwrap();
-        (with_files_root(test_state().await, root), temp)
-    }
-
-    /// The id comes back from the POST because there is no other way for the caller to learn it:
-    /// the folder is minted from it and every later route is keyed by it. Resolving by the chat key
-    /// afterwards is the half that matters — a row that exists but does not answer to its topic is
-    /// an errand nobody in Telegram can reach.
-    #[tokio::test]
-    async fn posting_an_errand_creates_one_that_its_topic_then_resolves() {
-        let (state, _temp) = errand_state().await;
-
-        let (status, body) = call(
-            state.clone(),
-            "POST",
-            "/errands",
-            Some(serde_json::json!({
-                "name": "carros para importar",
-                "chat_key": "-1001234:7"
-            })),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        let errand_id = body["errand_id"]
-            .as_i64()
-            .unwrap_or_else(|| panic!("the route did not answer with an id: {body}"));
-        let found = crate::errands::resolve(&state.pool, "-1001234:7")
-            .await
-            .unwrap()
-            .expect("the errand the route created does not resolve by its topic");
-        assert_eq!(found.id, errand_id);
-    }
-
-    /// A rule written through the route comes back through the route.
-    ///
-    /// The round trip is the whole of piece 4's first half: a project keeps its schedule in a file
-    /// inside its repository and an errand has no repository, so if this does not survive a POST and
-    /// a GET there is nowhere for an errand's standing work to live.
-    #[tokio::test]
-    async fn a_rule_posted_to_an_errand_comes_back_in_its_list() {
-        let (state, _temp) = errand_state().await;
-        let errand = an_errand(&state, "carros", "-1001234:7").await.id;
-
-        let (status, created) = call(
-            state.clone(),
-            "POST",
-            &format!("/errands/{errand}/rules"),
-            Some(serde_json::json!({
-                "name": "manhã",
-                "cron": "0 8 * * *",
-                "prompt": "vê se apareceram anúncios novos",
-                "timezone": "Europe/Lisbon"
-            })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{created}");
-
-        let (status, listed) = call(state, "GET", &format!("/errands/{errand}/rules"), None).await;
-
-        assert_eq!(status, StatusCode::OK);
-        let rules = listed.as_array().expect("the list is an array");
-        assert_eq!(rules.len(), 1, "{listed}");
-        assert_eq!(rules[0]["name"], "manhã");
-        assert_eq!(rules[0]["cron"], "0 8 * * *");
-        assert_eq!(rules[0]["prompt"], "vê se apareceram anúncios novos");
-        assert_eq!(rules[0]["timezone"], "Europe/Lisbon");
-    }
-
-    /// A cron nobody can read is the caller's mistake, said to the caller.
-    ///
-    /// `400` and not `500`, and the reason travels in the body. This is the one advantage an
-    /// errand's rules have over a project's: the project's `autopilot.yaml` is read long after
-    /// whoever wrote
-    /// it walked away, so `scheduler.rs` arms the broken rule and announces it once to the feed. A
-    /// rule arriving over a route can be refused to somebody's face, and a refusal that does not
-    /// quote the word that was wrong cannot be acted on from a phone.
-    #[tokio::test]
-    async fn a_cron_nobody_can_read_is_the_callers_mistake_and_not_the_daemons() {
-        let (state, _temp) = errand_state().await;
-        let errand = an_errand(&state, "carros", "-1001234:7").await.id;
-
-        let (status, body) = call(
-            state.clone(),
-            "POST",
-            &format!("/errands/{errand}/rules"),
-            Some(serde_json::json!({
-                "name": "manhã",
-                "cron": "todas as manhãs",
-                "prompt": "vê os anúncios"
-            })),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            body["error"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("todas as manhãs")),
-            "the refusal has to quote what was written: {body}"
-        );
-
-        let (_, listed) = call(state, "GET", &format!("/errands/{errand}/rules"), None).await;
-        assert!(listed.as_array().is_some_and(|rules| rules.is_empty()));
-    }
-
-    /// A name already in use is a conflict, not a fault.
-    ///
-    /// `409` is the same answer `POST /errands` gives a topic that already has one, and it means the
-    /// same thing: nothing is broken, the caller is asking for a state that is already occupied and
-    /// can pick another name. A `500` would invite them to retry the request unchanged, for ever.
-    #[tokio::test]
-    async fn a_second_rule_of_one_name_is_a_conflict_and_not_a_fault() {
-        let (state, _temp) = errand_state().await;
-        let errand = an_errand(&state, "carros", "-1001234:7").await.id;
-        let rule = serde_json::json!({
-            "name": "manhã",
-            "cron": "0 8 * * *",
-            "prompt": "vê os anúncios"
-        });
-
-        let (first, _) = call(
-            state.clone(),
-            "POST",
-            &format!("/errands/{errand}/rules"),
-            Some(rule.clone()),
-        )
-        .await;
-        assert_eq!(first, StatusCode::OK);
-
-        let (second, _) = call(
-            state,
-            "POST",
-            &format!("/errands/{errand}/rules"),
-            Some(rule),
-        )
-        .await;
-
-        assert_eq!(second, StatusCode::CONFLICT);
-    }
-
-    /// A rule for an errand that does not exist is a `404`, and no row is written.
-    ///
-    /// The errand id arrives in the path, so nothing about the request proves the errand is there.
-    /// Without this check the insert would decide it — and with foreign keys on it would decide it
-    /// as a `500`, blaming the daemon for a path the caller made up.
-    ///
-    /// The same body goes to a real errand first, and that half is not decoration: an unrouted path
-    /// answers `404` all by itself, so without it this test passes against a daemon that has no such
-    /// route at all.
-    #[tokio::test]
-    async fn a_rule_for_an_errand_that_is_not_there_is_a_404() {
-        let (state, _temp) = errand_state().await;
-        let errand = an_errand(&state, "carros", "-1001234:7").await.id;
-        let rule = serde_json::json!({
-            "name": "manhã",
-            "cron": "0 8 * * *",
-            "prompt": "vê os anúncios"
-        });
-
-        let (real, _) = call(
-            state.clone(),
-            "POST",
-            &format!("/errands/{errand}/rules"),
-            Some(rule.clone()),
-        )
-        .await;
-        assert_eq!(real, StatusCode::OK, "the route itself has to exist");
-
-        let (invented, _) = call(state, "POST", "/errands/4321/rules", Some(rule)).await;
-
-        assert_eq!(invented, StatusCode::NOT_FOUND);
-    }
-
-    /// Deleting a rule that is not this errand's deletes nothing and says so.
-    ///
-    /// Both ids come out of the path, so a caller can pair any errand with any rule. `errands::
-    /// delete_rule` keys on both and the route turns "no row matched" into a `404` — the difference
-    /// between that and a `204` is the difference between finding out your rule is still armed and
-    /// believing you disarmed it.
-    #[tokio::test]
-    async fn deleting_another_errands_rule_deletes_nothing_and_says_so() {
-        let (state, _temp) = errand_state().await;
-        let carros = an_errand(&state, "carros", "-1001234:7").await.id;
-        let casa = an_errand(&state, "casa", "-1001234:9").await.id;
-
-        let (_, created) = call(
-            state.clone(),
-            "POST",
-            &format!("/errands/{carros}/rules"),
-            Some(serde_json::json!({
-                "name": "manhã",
-                "cron": "0 8 * * *",
-                "prompt": "vê os anúncios"
-            })),
-        )
-        .await;
-        let rule = created["rule_id"].as_i64().unwrap();
-
-        let (status, _) = call(
-            state.clone(),
-            "DELETE",
-            &format!("/errands/{casa}/rules/{rule}"),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-
-        let (_, still_there) = call(
-            state.clone(),
-            "GET",
-            &format!("/errands/{carros}/rules"),
-            None,
-        )
-        .await;
-        assert_eq!(still_there.as_array().unwrap().len(), 1);
-
-        let (status, _) = call(
-            state,
-            "DELETE",
-            &format!("/errands/{carros}/rules/{rule}"),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-    }
-
-    /// The list is what `/assuntos` reads. An errand appears in it from the moment it is opened and
-    /// not from its first turn — the same property `posting_a_chat_creates_one_the_list_then_returns`
-    /// asserts one route over, and for the same reason: a thing you opened and cannot see listed
-    /// looks like a thing that was not opened.
-    #[tokio::test]
-    async fn listing_errands_returns_what_was_created() {
-        let (state, _temp) = errand_state().await;
-        call(
-            state.clone(),
-            "POST",
-            "/errands",
-            Some(serde_json::json!({
-                "name": "carros para importar",
-                "chat_key": "-1001234:7"
-            })),
-        )
-        .await;
-
-        let (status, listed) = call(state, "GET", "/errands", None).await;
-
-        assert_eq!(status, StatusCode::OK);
-        // An array, and the errand is in it under the name a person typed — `folder` is the
-        // núcleo's derivation of that name and is not what a list is read for.
-        let names: Vec<&str> = listed
-            .as_array()
-            .expect("the list route did not answer with an array")
-            .iter()
-            .map(|errand| errand["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, vec!["carros para importar"]);
-    }
-
-    /// The two fields a client may move, in one PATCH, the way `patch_chat` takes a title and a
-    /// brain together. Both are asserted through `resolve` rather than through the response,
-    /// because the response says what the route thinks it did and the row says what happened.
-    #[tokio::test]
-    async fn patching_an_errand_moves_its_status_and_its_model() {
-        let (state, _temp) = errand_state().await;
-        let id = crate::errands::create(&state.pool, "carros para importar", "-1001234:7")
-            .await
-            .unwrap();
-
-        let (status, _) = call(
-            state.clone(),
-            "PATCH",
-            &format!("/errands/{id}"),
-            Some(serde_json::json!({"status": "paused", "brain": "cloud"})),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        let found = crate::errands::resolve(&state.pool, "-1001234:7")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(found.status, crate::errands::Status::Paused);
-        assert_eq!(found.brain, crate::errands::Brain::Cloud);
-    }
-
-    /// Closing over HTTP is `/fim` by another door, and it removes nothing — the row stays, and so
-    /// does the folder with what the errand found in it. `delete_chat` archives for the neighbouring
-    /// reason: the record of work already done is not the client's to destroy by asking for a
-    /// cleaner list. So the closed errand is still listed, and still says it is done.
-    #[tokio::test]
-    async fn closing_an_errand_over_http_leaves_it_findable() {
-        let (state, _temp) = errand_state().await;
-        let id = crate::errands::create(&state.pool, "carros para importar", "-1001234:7")
-            .await
-            .unwrap();
-
-        let (status, _) = call(state.clone(), "DELETE", &format!("/errands/{id}"), None).await;
-
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        let found = crate::errands::resolve(&state.pool, "-1001234:7")
-            .await
-            .unwrap()
-            .expect("closing an errand over HTTP removed the row");
-        assert_eq!(found.status, crate::errands::Status::Done);
-
-        let (_, listed) = call(state, "GET", "/errands", None).await;
-        assert_eq!(listed.as_array().unwrap()[0]["status"], "done");
-    }
-
-    /// The errand as the domain functions want it, which is not what the routes hand out: a route
-    /// answers with an id and `read_file`, `list_files` and `append_notebook` all take an `Errand`.
-    /// Written once because every file and notebook test below needs both halves of that.
-    async fn an_errand(state: &AppState, name: &str, chat_key: &str) -> crate::errands::Errand {
-        crate::errands::create(&state.pool, name, chat_key)
-            .await
-            .unwrap();
-        crate::errands::resolve(&state.pool, chat_key)
-            .await
-            .unwrap()
-            .expect("the errand that was just created does not resolve by its topic")
-    }
-
-    /// A file read straight off the wire, because `call` parses the body as JSON and falls back to
-    /// `Null` — which would turn "the body did not carry the secret" into a claim about a value that
-    /// was thrown away before the assertion could look at it. The path goes in exactly as given, so
-    /// a caller can hand this an escape spelling of its own.
-    async fn get_errand_file(state: AppState, id: i64, path: &str) -> (StatusCode, String) {
-        let response = raw(
-            state,
-            "GET",
-            &format!("/errands/{id}/files/{path}"),
-            Body::empty(),
-        )
-        .await;
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
-            .await
-            .unwrap();
-        (status, String::from_utf8_lossy(&bytes).into_owned())
-    }
-
-    /// The MCP tools in the stdio process reach the folder over HTTP and by no other door — they
-    /// never touch the pool. So a file the domain can write and the wire cannot read is a file the
-    /// model cannot use, however well `errands::read_file` works in isolation.
-    #[tokio::test]
-    async fn reading_an_errand_file_over_http_returns_its_contents() {
-        let (state, _temp) = errand_state().await;
-        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
-        crate::errands::write_file(
-            &state.pool,
-            state.files_root.as_deref().unwrap(),
-            &errand,
-            "nota.txt",
-            "215 cv, 2019, 84 mil km",
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let (status, body) = get_errand_file(state, errand.id, "nota.txt").await;
-
-        assert_eq!(status, StatusCode::OK);
-        // `contains` and not `==`: what is asserted is that the bytes reached the caller, which
-        // holds whether the route hands the text back raw or wrapped in a JSON envelope.
-        assert!(
-            body.contains("215 cv, 2019, 84 mil km"),
-            "the file's contents did not come back: {body}"
-        );
-    }
-
-    /// The other direction, and the one that matters more: an errand that can only read is an
-    /// errand that cannot record what it found. Asserted through the domain rather than through a
-    /// second HTTP read, because a route that stored the bytes somewhere only it knows about would
-    /// pass a round trip through itself and still have written to the wrong place.
-    #[tokio::test]
-    async fn writing_an_errand_file_over_http_lands_it_in_the_folder() {
-        let (state, _temp) = errand_state().await;
-        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
-
-        let (status, _) = call(
-            state.clone(),
-            "PUT",
-            &format!("/errands/{}/files/nota.txt", errand.id),
-            Some(serde_json::json!({ "contents": "215 cv, 2019, 84 mil km" })),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        assert_eq!(
-            crate::errands::read_file(state.files_root.as_deref().unwrap(), &errand, "nota.txt")
-                .unwrap(),
-            "215 cv, 2019, 84 mil km"
-        );
-    }
-
-    /// There is one files root and many errands under it, so a listing taken at the root instead of
-    /// at the folder would hand every errand every other errand's investigation. That is the mistake
-    /// this route is in a position to make, and the only one worth a test here — which is why the
-    /// assertion is about the neighbour's file being absent as much as about this one's being there.
-    #[tokio::test]
-    async fn listing_an_errand_files_over_http_names_only_its_own() {
-        let (state, _temp) = errand_state().await;
-        let mine = an_errand(&state, "carros para importar", "-1001234:7").await;
-        let neighbour = an_errand(&state, "obras na casa", "-1001234:9").await;
-        for (errand, name) in [(&mine, "carros.md"), (&neighbour, "casa.md")] {
-            crate::errands::write_file(
-                &state.pool,
-                state.files_root.as_deref().unwrap(),
-                errand,
-                name,
-                "o que foi encontrado",
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-        }
-
-        let (status, listed) =
-            call(state, "GET", &format!("/errands/{}/files", mine.id), None).await;
-
-        assert_eq!(status, StatusCode::OK);
-        let names: Vec<&str> = listed
-            .as_array()
-            .unwrap_or_else(|| panic!("the listing route did not answer with an array: {listed}"))
-            .iter()
-            .map(|entry| {
-                entry
-                    .as_str()
-                    .unwrap_or_else(|| panic!("a listed path is not a string: {entry}"))
-            })
-            .collect();
-        assert!(names.contains(&"carros.md"), "got: {names:?}");
-        assert!(
-            !names.contains(&"casa.md"),
-            "the listing leaked the neighbouring errand's file: {names:?}"
-        );
-    }
-
-    /// The path arrives from a model that has been reading the open web, so `..` in it is the
-    /// expected attack and not a hypothetical one.
-    ///
-    /// The escape target is created first and holds real text: a refusal that is only a refusal
-    /// because the file was not there proves nothing about the guard. It sits at the files root —
-    /// outside this errand's FOLDER, which is what `errands::file_path` resolves within, and the
-    /// neighbouring errands' folders are its siblings.
-    ///
-    /// The legitimate read at the top is the control. Without it a route that does not exist answers
-    /// 404 to everything, and 404 is a client error, so the whole test would pass against nothing.
-    #[tokio::test]
-    async fn an_errand_file_path_that_escapes_is_refused() {
-        let (state, _temp) = errand_state().await;
-        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
-        crate::errands::write_file(
-            &state.pool,
-            state.files_root.as_deref().unwrap(),
-            &errand,
-            "nota.txt",
-            "215 cv, 2019, 84 mil km",
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-        std::fs::write(
-            state.files_root.as_deref().unwrap().join("segredo.txt"),
-            "a senha do wifi e batatas",
-        )
-        .unwrap();
-
-        let (status, body) = get_errand_file(state.clone(), errand.id, "nota.txt").await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "the control read failed, so nothing below is evidence about escapes: {body}"
-        );
-        assert!(body.contains("215 cv, 2019, 84 mil km"), "got: {body}");
-
-        // Both spellings, because the wildcard segment is percent-decoded on its way to the handler
-        // and a guard applied on the wrong side of that decoding sees only one of them.
-        for escape in ["../segredo.txt", &urlencode("../segredo.txt")] {
-            let (status, body) = get_errand_file(state.clone(), errand.id, escape).await;
-            assert!(
-                status.is_client_error(),
-                "{escape:?} was not refused: {status}"
-            );
-            assert!(
-                !body.contains("a senha do wifi e batatas"),
-                "{escape:?} handed back a file outside the errand's folder: {body}"
-            );
-        }
-    }
-
-    /// A file on disk with no row reads back as `None` from `artifact_tainted` — "cannot say", which
-    /// every caller treats as tainted. So a route that writes the bytes and forgets the mark does not
-    /// fail loudly: it quietly makes everything the model wrote through HTTP indistinguishable from a
-    /// file somebody dropped in the folder by hand, and the taint barrier stops carrying information.
-    #[tokio::test]
-    async fn writing_an_errand_file_over_http_records_its_artifact() {
-        let (state, _temp) = errand_state().await;
-        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
-
-        let (status, _) = call(
-            state.clone(),
-            "PUT",
-            &format!("/errands/{}/files/nota.txt", errand.id),
-            Some(serde_json::json!({ "contents": "215 cv, 2019, 84 mil km" })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-
-        // `Some(_)` and not `Some(false)`: whether the route calls this write tainted is its own
-        // decision, and what is asserted is that it made one at all.
-        assert!(
-            crate::errands::artifact_tainted(&state.pool, errand.id, "nota.txt")
-                .await
-                .is_some(),
-            "the write left no mark, so the file reads back as unknown"
-        );
-    }
-
-    /// The notebook is the errand's memory across turns, and the model reads it back through this
-    /// route before it decides anything. A notebook the núcleo can append to and the wire cannot read
-    /// is an errand that writes its memory down and never consults it.
-    #[tokio::test]
-    async fn reading_the_notebook_over_http_returns_it() {
-        let (state, _temp) = errand_state().await;
-        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
-        crate::errands::append_notebook(
-            state.files_root.as_deref().unwrap(),
-            &errand,
-            42,
-            "encontrei tres anuncios abaixo de 12 mil",
-        )
-        .unwrap();
-
-        let (status, body) = call(
-            state,
-            "GET",
-            &format!("/errands/{}/notebook", errand.id),
-            None,
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        let contents = body["contents"]
-            .as_str()
-            .unwrap_or_else(|| panic!("the notebook route did not answer with contents: {body}"));
-        assert!(
-            contents.contains("encontrei tres anuncios abaixo de 12 mil"),
-            "got: {contents}"
-        );
-    }
-
-    /// A freshly opened errand has never answered anything, and that is the normal case rather than
-    /// an error — `read_notebook` says so already, and this asserts the route did not put a 404 back
-    /// on top of it. The difference matters to the caller: 404 reads as "this errand is not there",
-    /// which would send a client looking for a bug in the errand instead of writing the first entry.
-    #[tokio::test]
-    async fn the_notebook_of_a_fresh_errand_is_empty_not_missing() {
-        let (state, _temp) = errand_state().await;
-        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
-
-        let (status, body) = call(
-            state,
-            "GET",
-            &format!("/errands/{}/notebook", errand.id),
-            None,
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["contents"], "");
-    }
-
-    /// `patch_chat` a few blocks up checks existence before it writes, and its comment says why: 204
-    /// over an UPDATE that matched no row is the API saying "done" about something it did not do.
-    /// Both errand routes take an id straight into an UPDATE, so both can say it, and a client that
-    /// believes them carries on with an errand that was never there.
-    #[tokio::test]
-    async fn patching_an_errand_that_does_not_exist_is_a_404() {
-        let (state, _temp) = errand_state().await;
-        // No errand was ever created, so no id is real — 4242 least of all.
-        let missing = 4242;
-
-        let (patched, _) = call(
-            state.clone(),
-            "PATCH",
-            &format!("/errands/{missing}"),
-            Some(serde_json::json!({"status": "paused", "brain": "cloud"})),
-        )
-        .await;
-        assert_eq!(patched, StatusCode::NOT_FOUND);
-
-        let (deleted, _) = call(state, "DELETE", &format!("/errands/{missing}"), None).await;
-        assert_eq!(deleted, StatusCode::NOT_FOUND);
-    }
-
-    /// One topic holds one errand — `chat_key` is UNIQUE, and `errands::create` leans on that instead
-    /// of reading first, so two callers racing lose on the key rather than on a read that was true a
-    /// moment ago. What the route does with that loss is the question here: 500 tells the caller the
-    /// daemon is broken and invites a retry that cannot ever work, while 409 names the one thing that
-    /// is actually wrong. `presets.rs` maps the same violation the same way.
-    ///
-    /// The first errand is checked afterwards because the failure that matters is not the status
-    /// code: a second `create` that half-applied would have moved the name out from under a running
-    /// errand.
-    #[tokio::test]
-    async fn posting_a_second_errand_on_one_topic_is_a_409() {
-        let (state, _temp) = errand_state().await;
-        let (first, body) = call(
-            state.clone(),
-            "POST",
-            "/errands",
-            Some(serde_json::json!({
-                "name": "carros para importar",
-                "chat_key": "-1001234:7"
-            })),
-        )
-        .await;
-        assert_eq!(first, StatusCode::OK);
-        let errand_id = body["errand_id"].as_i64().unwrap();
-
-        let (second, _) = call(
-            state.clone(),
-            "POST",
-            "/errands",
-            Some(serde_json::json!({
-                "name": "obras na casa",
-                "chat_key": "-1001234:7"
-            })),
-        )
-        .await;
-
-        assert_eq!(second, StatusCode::CONFLICT);
-        let found = crate::errands::resolve(&state.pool, "-1001234:7")
-            .await
-            .unwrap()
-            .expect("the refused second POST took the first errand with it");
-        assert_eq!(found.id, errand_id);
-        assert_eq!(found.name, "carros para importar");
     }
     /// The sentence an owner would leave, kept in one place so both note tests say the same thing.
     const A_NOTE: &str = "when you get to item 3, update the docs too";

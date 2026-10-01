@@ -286,7 +286,7 @@ async fn launch_once(state: &AppState) -> Option<i64> {
     //
     // **The WIP limit and the attention brake are deliberately NOT consulted here**, and the
     // difference is worth stating because they sit next to the budget in every other loop. Both pace
-    // work the daemon is proposing to START — a scheduled rule, a repo trigger, an errand. A
+    // work the daemon is proposing to START — a scheduled rule, a repo trigger. A
     // resolution starts nothing: it finishes something already in flight, whose branch is written,
     // whose merge was asked for, and which is stuck until somebody clears the conflict. Deferring it
     // for a busy project would leave that work stranded precisely when the project is busy enough

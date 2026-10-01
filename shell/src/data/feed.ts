@@ -17,21 +17,16 @@ import { readState, statesOf, type StateReading } from "../ui/state-map";
  * {@link feedIsSearching}.
  *
  * The scope is the other half. `list_feed(None)` and `FeedScope::Global` both
- * mean *the machine's own lines* — `project_id IS NULL AND errand_id IS NULL` —
+ * mean *the machine's own lines* — `project_id IS NULL` —
  * and not "everything". A feed page that sent no scope would therefore show a
  * fraction of the feed and look broken, so `scope=all` is sent whenever nothing
- * narrower was asked for. It is **not** sent alongside a project or an errand:
- * `all` short-circuits the scope chain in both branches of the route, and
- * sending both would silently ignore the narrower one.
+ * narrower was asked for. It is **not** sent alongside a project:
+ * `all` short-circuits the scope chain, and sending both would silently
+ * ignore the narrower one.
  */
 
 /**
  * One line of the feed, exactly as `feed::FeedEntry` serialises.
- *
- * `errand_id` is real and is in every `SELECT` in `core/src/feed.rs` — an
- * errand and a project are two different owners and a row has at most one of
- * them, so a shell that only knew about `project_id` would read every errand's
- * line as the machine's own.
  */
 export interface FeedEntry {
   id: number;
@@ -40,11 +35,9 @@ export interface FeedEntry {
   summary: string;
   /** The run this line is about, when it is about one. */
   run_id: number | null;
-  /** The errand this line belongs to. Never set together with `project_id`. */
-  errand_id: number | null;
   /**
    * What the line is about, when the núcleo knows: `job:<id>`, `run:<id>`, `council:<id>`,
-   * `team_run:<id>`, `vcs:<id>` or `errand:<id>`. Every line about one subject is one sequence on
+   * `team_run:<id>` or `vcs:<id>`. Every line about one subject is one sequence on
    * the Feed's trace — a job's start, its failed gate and its finish are one row, not three.
    */
   subject: string | null;
@@ -70,7 +63,7 @@ export interface PendingNotification {
 /**
  * The filters the page accepts, named as a person reads them.
  *
- * `project` becomes `project_id` and `errand` becomes `errand_id` in the query
+ * `project` becomes `project_id` in the query
  * string; the translation happens once, below, rather than at each caller.
  * Everything is a string because these come out of the location, where there
  * are no numbers.
@@ -80,7 +73,6 @@ export interface FeedFilters {
   q?: string;
   kind?: string;
   project?: string;
-  errand?: string;
   /** RFC 3339, or the daemon answers 400 (`parse_time_bound`). */
   since?: string;
   until?: string;
@@ -116,7 +108,6 @@ export function feedFilterFields(filters: FeedFilters): Record<string, string | 
     q: blankToUndefined(filters.q),
     kind: blankToUndefined(filters.kind),
     project: blankToUndefined(filters.project),
-    errand: blankToUndefined(filters.errand),
     since: blankToUndefined(filters.since),
     until: blankToUndefined(filters.until),
     limit: blankToUndefined(filters.limit),
@@ -127,7 +118,7 @@ export function feedFilterFields(filters: FeedFilters): Record<string, string | 
  * Has the caller turned the route from a listing into a search?
  *
  * The five fields are the daemon's own `has_search_filters`, copied field for
- * field. `project` and `errand` are deliberately **not** among them: they narrow
+ * field. `project` is deliberately **not** among them: it narrows
  * a listing, which still polls, and treating them as a search would freeze the
  * page for someone who only picked a project out of a select.
  */
@@ -159,7 +150,6 @@ export function feedQueryString(filters: FeedFilters): string {
   const params = new URLSearchParams();
 
   if (fields.project !== undefined) params.set("project_id", fields.project);
-  else if (fields.errand !== undefined) params.set("errand_id", fields.errand);
   else params.set("scope", "all");
 
   if (fields.q !== undefined) params.set("q", fields.q);
@@ -592,8 +582,8 @@ export interface FamilyRow {
  *
  * One family is exactly one prefix. Two prefixes under one label would make a
  * single switch write two rules, make a state where the two disagree reachable,
- * and force the UI to draw "half on" — which is why `errand_` and `schedule_`
- * are two families and not one "errands and agenda".
+ * and force the UI to draw "half on" — which is why `email_` and `web.`
+ * are two families and not one "mail and web".
  */
 export const NOTIFY_FAMILIES: { selector: string; label: string }[] = [
   { selector: "job_", label: "jobs" },
@@ -601,7 +591,6 @@ export const NOTIFY_FAMILIES: { selector: string; label: string }[] = [
   { selector: "worktree_", label: "worktrees" },
   { selector: "vcs_", label: "git queue" },
   { selector: "council_", label: "council" },
-  { selector: "errand_", label: "errands" },
   { selector: "schedule_", label: "agenda" },
   { selector: "email_", label: "e-mail" },
   { selector: "team_", label: "team" },

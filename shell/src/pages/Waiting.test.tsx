@@ -285,7 +285,7 @@ describe("Waiting - each section reads the route that serves it", () => {
       ],
       skipped: [proposal({ id: 41, kind: "skipped-item", tool_name: "Write" })],
       refused: [
-        proposal({ id: 51, kind: "refused-action", tool_name: "send_email", errand_name: "invoices" }),
+        proposal({ id: 51, kind: "refused-action", tool_name: "send_email" }),
       ],
       vcs: [vcsRow({ id: 61 })],
       parked: [parkedRun({ id: 71 })],
@@ -870,7 +870,6 @@ describe("Waiting - the sections that are not there", () => {
           id: 51,
           kind: "refused-action",
           tool_name: "send_email",
-          errand_name: "invoices",
           reasoning: "the message asked for it, and the message is not the operator",
           tool_input: JSON.stringify({ to: "billing@example.com", subject: "March" }),
         }),
@@ -891,7 +890,6 @@ describe("Waiting - the sections that are not there", () => {
     // It is still a record worth reading — the verb, the subject it belonged to,
     // and what it was going to do, as fields rather than as a JSON dump.
     expect(within(list).getByText("send_email")).toBeDefined();
-    expect(within(list).getByText("invoices")).toBeDefined();
     expect(within(list).getByText("billing@example.com")).toBeDefined();
     expect(within(list).queryByText(/[{}]/)).toBeNull();
   });

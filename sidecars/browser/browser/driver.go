@@ -328,10 +328,8 @@ const (
 	// # Why it carries contents rather than a path, which is the whole design
 	//
 	// The obvious version takes a filename and reads it from some folder. That folder then has to be
-	// bounded, and every bound anybody could name here is either unreachable or wrong. The one the
-	// design wanted — the errand's own folder — does not exist on a browsing turn: no browser tool is
-	// in `ERRAND_TOOLS`, so the turns that can browse and the turns that have a folder are disjoint
-	// sets. The one that is reachable — the files folder, where the owner's uploads and filed mail
+	// bounded, and every bound anybody could name here is either unreachable or wrong. The one that
+	// is reachable — the files folder, where the owner's uploads and filed mail
 	// live — is measurably worse than it looks: nothing on this surface can READ a file from it
 	// (`list_files` returns names), so an upload from there would let an agent send out the contents
 	// of files it cannot itself see, chosen by a name a sender may have picked.
@@ -342,8 +340,8 @@ const (
 	// ActionType. Upload is genuinely the type of files.
 	//
 	// What it does not do is attach a file the owner already has. That is a real limitation and not
-	// a step on the way here: it needs a folder a browsing turn can reach, which is a decision about
-	// what an errand may do, not about this verb.
+	// a step on the way here: it needs a folder a browsing turn can reach, which is a separate
+	// decision, not one about this verb.
 	ActionUpload ActionKind = "upload"
 )
 

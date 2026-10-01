@@ -21,9 +21,9 @@ describe("wrap", () => {
   });
 
   it("splits a method at the colons, where a reader's eye already breaks it", () => {
-    expect(wrap("NucleosTools::errand_files_list")).toEqual([
+    expect(wrap("NucleosTools::web_read")).toEqual([
       "NucleosTools::",
-      "errand_files_list",
+      "web_read",
     ]);
   });
 

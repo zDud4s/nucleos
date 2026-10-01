@@ -107,7 +107,7 @@
 //! prompt the baseline used — **24, 25, 25**, agreeing on 21. Settled, with the second pass:
 //! **27, 27, 28**, agreeing on **26**. The rule is 28/28 across three runs, so this is a **NO-GO**:
 //! nothing was swept and no file was annotated. Both misses were **abstentions and never wrong
-//! slugs** — `errands.rs`, which has not one neighbour inside the 28 to hear from, and `map_join.rs`
+//! slugs** — a since-removed module, which had not one neighbour inside the 28 to hear from, and `map_join.rs`
 //! once, declining to place itself through both passes.
 //!
 //! Within a run, where the sampling is held still, the signal did what it was built to do:
@@ -152,8 +152,8 @@
 // is reached yet: it is the proposal half of §8's disambiguation, and the task that gives it a
 // caller is the NEXT one — Task 3 of the slice-6 plan, which runs it over this repository and
 // writes the proposal down. One line rather than an attribute on each of a dozen public items and
-// their fields, which is the argument `errands.rs` makes about the same suppression and the reason
-// this is spelled the same way. The instruction, not a description: DELETE THIS LINE with the
+// their fields, which is the argument a since-removed module made about the same suppression and the
+// reason this is spelled the same way. The instruction, not a description: DELETE THIS LINE with the
 // change that gives this module a production caller.
 //
 // Scoped to the non-test build, so it silences only the absence of that caller. Under `cfg(test)`
@@ -3219,10 +3219,6 @@ mod tests {
         ("core/src/github.rs", "2026-08-19-modulo-de-github-design"),
         ("core/src/job.rs", "2026-07-29-autopilot-job-graph-design"),
         (
-            "core/src/errands.rs",
-            "2026-08-15-assuntos-fora-de-codigo-design",
-        ),
-        (
             "core/src/map_intent.rs",
             "2026-08-24-mapa-do-projeto-design",
         ),
@@ -3302,7 +3298,7 @@ mod tests {
         // whose header was written BY HAND has to name the document this table already said it
         // does. That is the only independent check such a header ever gets, and this table is
         // older than every one of them.
-        assert_eq!(GROUND_TRUTH.len(), 28);
+        assert_eq!(GROUND_TRUTH.len(), 27);
 
         let root = repository_root();
         let specs = catalogue(&root);
@@ -4149,8 +4145,8 @@ mod tests {
             "the_gate_measured_a_thinner_signal_than_this_run_uses":
                 "The 28-pair gate scored 27, 27 and 28 of 28, agreeing on 26. It shows a file only \
                  the neighbours that were themselves asked about, and inside 28 files most \
-                 neighbourhoods are nearly empty — `core/src/errands.rs` has six neighbours in this \
-                 repository and none inside the gate, and it is one of the two files the gate \
+                 neighbourhoods are nearly empty — a since-removed module had six neighbours in this \
+                 repository and none inside the gate, and it was one of the two files the gate \
                  missed. This sweep gives every module its real neighbourhood, so its accuracy is \
                  PLAUSIBLY better than 26 of 28. That is an expectation and not a measurement: \
                  nothing has scored the sweep, and nothing can without a ground truth of its own.",

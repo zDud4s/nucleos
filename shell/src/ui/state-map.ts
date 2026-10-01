@@ -34,7 +34,6 @@ export type StateDomain =
   | "vcs"
   | "council"
   | "council_seat"
-  | "errand"
   | "email_class"
   | "voice_cleanup"
   | "web_trust"
@@ -137,7 +136,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * Every `kind` the núcleo writes into the feed, mapped to a reading.
    *
    * The enumeration is not this file's claim any more: `state-map-completeness.test.ts` reads the
-   * kind argument at every call of `feed::append` / `append_on` / `append_for_errand` and of the
+   * kind argument at every call of `feed::append` / `append_on` and of the
    * two wrappers that forward a caller's kind (`job.rs::say`, `notify.rs::deliver_or_defer`)
    * across `core/src`, outside the test modules, and fails on a difference in either direction.
    * It went in at 46 rows and found eighteen kinds the núcleo writes and this table did not read —
@@ -231,12 +230,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     council_started: { tone: "info", label: "council started" },
     council_stage: { tone: "info", label: "council stage" },
     council_finished: { tone: "info", label: "council settled" },
-    // Schedules and errands.
+    // Schedules.
     schedule_rule_invalid: { tone: "danger", label: "schedule rule invalid" },
-    errand_rule_fired: { tone: "info", label: "errand rule fired" },
-    errand_rule_failed: { tone: "danger", label: "errand rule failed" },
-    errand_investigation_done: { tone: "info", label: "errand investigation done" },
-    errand_investigation_failed: { tone: "danger", label: "errand investigation failed" },
     // Mail.
     email_digest: { tone: "info", label: "e-mail digest" },
     email_urgent: { tone: "pending", label: "urgent e-mail" },
@@ -594,21 +589,6 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     error: { tone: "danger", label: "failed" },
     cancelled: { tone: "off", label: "cancelled" },
     skipped: { tone: "off", label: "not asked" },
-  },
-
-  /**
-   * An errand's status — `core/src/errands.rs`, `Status::as_str`.
-   *
-   * `done` is a closed errand: the asking stopped, the row and its folder
-   * stay. It takes neither the failure tone nor the completion tone, because
-   * closing is an ending and not a verdict — an errand can be closed the
-   * moment it starts and closed after months of real work, and both are the
-   * same status. Closing is a decision to stop asking, so it remains `off`.
-   */
-  errand: {
-    active: { tone: "active", label: "answering" },
-    paused: { tone: "paused", label: "paused" },
-    done: { tone: "off", label: "closed" },
   },
 
   /**

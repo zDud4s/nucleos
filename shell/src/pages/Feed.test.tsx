@@ -50,7 +50,6 @@ function entry(overrides: Partial<FeedEntry> & { minutesAgo?: number } = {}): Fe
     kind: "job_started",
     summary: "job 1 started",
     run_id: null,
-    errand_id: null,
     subject: null,
     created_at: new Date(Date.now() - minutesAgo * MINUTE).toISOString(),
     ...rest,
@@ -588,7 +587,6 @@ describe("Feed - a search freezes the list and Back to live resumes it", () => {
     // five are `has_search_filters` in `core/src/http.rs`, field for field.
     expect(feedIsSearching({})).toBe(false);
     expect(feedIsSearching({ project: "alpha" })).toBe(false);
-    expect(feedIsSearching({ errand: "7" })).toBe(false);
     for (const filters of [
       { q: "gate" },
       { kind: "job_failed" },
@@ -679,7 +677,7 @@ describe("Feed - a kind this shell has no reading for", () => {
     expect(unknown.className).toContain("ui-state-unmapped");
     expect(unknown.className).toContain("ui-badge-off");
     // Still drawn in the mail lane: the family is known even where the class is not.
-    expect(screen.getByRole("button", { name: "Errands & mail, 1 line" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Mail & web, 1 line" })).toBeDefined();
   });
 
   it("reads the kinds the Teams pillar writes most, instead of showing them as words it has never heard", async () => {

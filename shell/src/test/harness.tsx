@@ -685,8 +685,6 @@ export function proposal(overrides: Partial<Proposal> = {}): Proposal {
     run_id: null,
     session_id: null,
     project_id: null,
-    errand_id: null,
-    errand_name: null,
     tool_name: null,
     reasoning: "",
     tool_input: null,

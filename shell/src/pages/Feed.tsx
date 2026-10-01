@@ -71,7 +71,7 @@ import "./feed.css";
  *
  * Four layers, each an answer at a different depth. The verdict under the title names the window
  * and how many lines went wrong, were held or ask for you. The trace (`FeedTrace.tsx`) shows WHAT
- * RAN AND HOW IT ENDED: a row per job, run, council or errand under its lane, a bar from its first
+ * RAN AND HOW IT ENDED: a row per job, run or council under its lane, a bar from its first
  * line to its last, and a replay that walks the window back. The sequence selected in it opens
  * underneath, its own lines in order. The list at the bottom is the record — every line, grouped
  * by day, routine folded, every exception a full row.
@@ -84,8 +84,8 @@ import "./feed.css";
  *
  * The filters still live in the **route**, like the run index's, and a search still freezes the
  * page: with any of `q` / `kind` / `since` / `until` / `limit` set the núcleo is answering about
- * the past, the poll stops, and the page says so. `project` and `errand` narrow the live view
- * without freezing it, as they always did.
+ * the past, the poll stops, and the page says so. `project` narrows the live view
+ * without freezing it, as it always did.
  */
 
 /** The seven filters, as the route spells them. */
@@ -93,7 +93,6 @@ export interface FeedSearch {
   q?: string;
   kind?: string;
   project?: string;
-  errand?: string;
   since?: string;
   until?: string;
   limit?: string;
@@ -114,7 +113,6 @@ export function validateFeedSearch(search: Record<string, unknown>): FeedSearch 
     q: searchText(search.q),
     kind: searchText(search.kind),
     project: searchText(search.project),
-    errand: searchDigits(search.errand),
     since: searchInstant(search.since),
     until: searchInstant(search.until),
     limit: searchLimit(search.limit),
@@ -125,13 +123,6 @@ function searchText(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   return trimmed === "" ? undefined : trimmed;
-}
-
-/** An errand id is a row id, so anything that is not one is not a filter. */
-function searchDigits(value: unknown): string | undefined {
-  const text = searchText(typeof value === "number" ? String(value) : value);
-  if (text === undefined) return undefined;
-  return /^\d+$/.test(text) ? text : undefined;
 }
 
 function searchInstant(value: unknown): string | undefined {
@@ -168,7 +159,6 @@ export function Feed() {
     q: search.q,
     kind: search.kind,
     project: search.project,
-    errand: search.errand,
     since: search.since,
     until: search.until,
     limit: search.limit,
@@ -227,10 +217,10 @@ export function Feed() {
     [timeline.data, rangeStart],
   );
 
-  const ownerFiltered = search.project !== undefined || search.errand !== undefined;
+  const ownerFiltered = search.project !== undefined;
   const entries = useMemo(
-    () => allEntries.filter((entry) => ownsLine(entry, search.project, search.errand)),
-    [allEntries, search.project, search.errand],
+    () => allEntries.filter((entry) => ownsLine(entry, search.project)),
+    [allEntries, search.project],
   );
 
   /* ---------------------------------------- marking seen on the way out -- */
@@ -425,9 +415,9 @@ export function Feed() {
           lookedAt={lookedAt}
           seenThrough={snapshot?.through ?? null}
           ownerFiltered={ownerFiltered}
-          owner={search.project ?? (search.errand !== undefined ? `errand ${search.errand}` : null)}
+          owner={search.project ?? null}
           onFilter={applyFilters}
-          onEveryScope={() => applyFilters({ project: undefined, errand: undefined })}
+          onEveryScope={() => applyFilters({ project: undefined })}
           onWiden={preset === "week" ? null : () => choosePreset("week")}
         />
       )}
@@ -575,7 +565,6 @@ function FeedSearchForm({
   const carries =
     filters.kind !== undefined ||
     filters.project !== undefined ||
-    filters.errand !== undefined ||
     filters.since !== undefined ||
     filters.until !== undefined ||
     filters.limit !== undefined;
@@ -591,7 +580,7 @@ function FeedSearchForm({
           const value = form.get(name);
           return typeof value === "string" ? value : undefined;
         };
-        onChange({ q: read("q"), kind: read("kind"), errand: read("errand"), limit: read("limit") });
+        onChange({ q: read("q"), kind: read("kind"), limit: read("limit") });
       }}
     >
       <div className="feed-search-bar" role="search" aria-label="Search the feed">
@@ -642,9 +631,7 @@ function FeedSearchForm({
           <select
             value={filters.project ?? ""}
             aria-label="Filter by project"
-            /* The two owners are exclusive in the núcleo and in the route: a
-               request naming both asks for rows that cannot exist. */
-            onChange={(event) => onChange({ project: event.target.value, errand: undefined })}
+            onChange={(event) => onChange({ project: event.target.value })}
           >
             <option value="">every scope</option>
             {(projects ?? []).map((project) => (
@@ -653,19 +640,6 @@ function FeedSearchForm({
               </option>
             ))}
           </select>
-        </label>
-
-        <label className="feed-filter feed-filter-narrow">
-          <span>Errand</span>
-          <input
-            name="errand"
-            type="number"
-            min={1}
-            defaultValue={filters.errand ?? ""}
-            key={filters.errand ?? ""}
-            placeholder="id"
-            aria-label="Filter by errand id"
-          />
         </label>
 
         <label className="feed-filter">
@@ -886,7 +860,7 @@ function LiveView(props: LiveViewProps) {
           action={props.onWiden === null ? undefined : <Button variant="quiet" onClick={props.onWiden}>Widen to 7 days</Button>}
         >
           <p>
-            A job, a run or an errand would appear here as a row of its own, drawn from its first line to
+            A job, a run or a council would appear here as a row of its own, drawn from its first line to
             its last; a failure, held work or something that asks for you as a solid mark on it and a
             full row in the list below.
           </p>
@@ -1260,14 +1234,13 @@ export function KindBadge({ kind }: { kind: string }) {
  * Whose line this is, and a way to see only theirs.
  *
  * A filter and not a link, because that is what the row's ids can honestly
- * carry: `errand_id` and `project_id` narrow *this* feed through the route,
- * while a deep link would have to invent a destination — the shell has no
- * errand detail route and no job page at all. `run_id` is the exception and it
- * *is* a link: `/runs/{id}` exists.
+ * carry: `project_id` narrows *this* feed through the route, while a deep
+ * link would have to invent a destination — the shell has no job page at all.
+ * `run_id` is the exception and it *is* a link: `/runs/{id}` exists.
  *
- * Neither owner set is the machine acting by itself (`Global` in the núcleo:
- * `project_id IS NULL AND errand_id IS NULL`), which is a fact worth stating
- * rather than an empty cell.
+ * No project set is the machine acting by itself (`Global` in the núcleo:
+ * `project_id IS NULL`), which is a fact worth stating rather than an empty
+ * cell.
  */
 function Owner({
   entry,
@@ -1282,21 +1255,9 @@ function Owner({
         type="button"
         className="feed-line-owner"
         aria-label={`Show only ${entry.project_id}`}
-        onClick={() => onFilter({ project: entry.project_id ?? undefined, errand: undefined })}
+        onClick={() => onFilter({ project: entry.project_id ?? undefined })}
       >
         {entry.project_id}
-      </button>
-    );
-  }
-  if (entry.errand_id !== null) {
-    return (
-      <button
-        type="button"
-        className="feed-line-owner"
-        aria-label={`Show only errand ${entry.errand_id}`}
-        onClick={() => onFilter({ errand: String(entry.errand_id), project: undefined })}
-      >
-        errand {entry.errand_id}
       </button>
     );
   }
@@ -1329,9 +1290,8 @@ function spokenSpan(ms: number): string {
   return /h \d\d$/.test(said) ? `${said} min` : said;
 }
 
-function ownsLine(entry: FeedEntry, project: string | undefined, errand: string | undefined): boolean {
+function ownsLine(entry: FeedEntry, project: string | undefined): boolean {
   if (project !== undefined) return entry.project_id === project;
-  if (errand !== undefined) return entry.errand_id !== null && String(entry.errand_id) === errand;
   return true;
 }
 

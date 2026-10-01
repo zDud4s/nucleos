@@ -587,9 +587,8 @@ pub(crate) async fn mark_untrusted_context(pool: &sqlx::SqlitePool, id: i64) -> 
 /// `arguments` is the call's arguments verbatim. Not prettied into a source string: `browser_open`
 /// and `web_read` both carry the url that decides the question, and a per-tool extractor would be a
 /// second per-tool table beside `TOOL_EFFECTS` for someone to keep in step by hand. `None` is for
-/// the entries that come from no call at all — an errand turn carries its notebook in before it
-/// spawns — and `tool` there names the source in words rather than borrowing a tool name for a call
-/// that never happened.
+/// the entries that come from no call at all, where `tool` names the source in words rather than
+/// borrowing a tool name for a call that never happened.
 pub(crate) async fn record_untrusted_read(
     pool: &sqlx::SqlitePool,
     id: i64,
@@ -1677,7 +1676,6 @@ fn spawn_run(
                 // than left to a default, because the two fields are only ever true together: a box
                 // named here would describe tools this run is never offered, and `authored_prompt`
                 // would charge it for them.
-                mcp_box: None,
                 tool_policy,
                 progress_timeout: Some(progress_timeout),
                 // The brake that was missing. These are the runs nobody is watching, and the
@@ -11251,7 +11249,6 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             permission: crate::runner::Permission::Default,
             resume_session_id: None,
             mcp_config: None,
-            mcp_box: None,
             tool_policy: crate::runner::ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,

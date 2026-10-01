@@ -234,8 +234,7 @@ export function useSkippedItems() {
 /**
  * §9 — what the injection barrier refused.
  *
- * The one listing that joins an errand's name in (`proposals::list_refused_actions`),
- * because "send_email" without the errand is the verb with the subject missing.
+ * Each row carries the tool the barrier refused and the input it was given.
  */
 export function useRefusedActions() {
   return useQuery({

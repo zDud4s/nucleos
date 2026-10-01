@@ -13,8 +13,7 @@ import { feedGravityOf, feedMarkTone, type FeedGravity, type FeedLane } from "..
 /**
  * The Feed's trace: the window replayed, one row per thing the machine did.
  *
- * Each row is a sequence (`lib/sequences.ts`) — a job, a run and its attempts, a council, an
- * errand — under the lane it belongs to, drawn as a bar from its first line to its last with a
+ * Each row is a sequence (`lib/sequences.ts`) — a job, a run and its attempts, or a council — under the lane it belongs to, drawn as a bar from its first line to its last with a
  * mark for every line in between. A sequence still going runs a dashed ghost to now. The column
  * on the right says how each one ended and how long it took, so the night reads down that column
  * before any bar is looked at.

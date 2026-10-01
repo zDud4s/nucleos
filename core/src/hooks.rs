@@ -938,14 +938,7 @@ pub async fn pretooluse_decision(
             action_class = classification.action_class,
             "pretooluse-decision: refused rather than parked — a park here would only end the item"
         );
-        record_refused_action(
-            &state,
-            &payload,
-            &payload.tool_name,
-            None,
-            &classification.reason,
-        )
-        .await;
+        record_refused_action(&state, &payload, &payload.tool_name, &classification.reason).await;
         return Json(Decision {
             decision: "deny".to_owned(),
             reason: format!("{} {A_PARK_HERE_WOULD_END_THE_ITEM}", classification.reason),
@@ -995,14 +988,7 @@ pub async fn pretooluse_decision(
             action_class = classification.action_class,
             "pretooluse-decision: refused rather than parked — this run asks nobody"
         );
-        record_refused_action(
-            &state,
-            &payload,
-            &payload.tool_name,
-            None,
-            &classification.reason,
-        )
-        .await;
+        record_refused_action(&state, &payload, &payload.tool_name, &classification.reason).await;
         return Json(Decision {
             decision: "deny".to_owned(),
             reason: format!("{}{DONT_ASK_CLAUSE}", classification.reason),
@@ -1106,16 +1092,6 @@ pub async fn posttooluse_outcome(
 /// "the turn had read a stranger's words" apart from "the tool was not ours".
 pub const UNTRUSTED_CONTEXT_DENY_REASON: &str =
     "this turn has read third-party content and can no longer act";
-
-/// The reason an errand's turn is refused a tool that would act.
-///
-/// Its own constant beside `UNTRUSTED_CONTEXT_DENY_REASON` and not a reuse of it, because the two
-/// say different things to the model and only one of them is true here. "You have read third-party
-/// content" is a statement about this turn that a clean first message would find simply false, and
-/// a model told something false about itself will try to work around it. This one is a standing
-/// rule it cannot satisfy by behaving differently, which is what stops it trying.
-pub const ERRAND_MAY_NOT_ACT: &str =
-    "an errand does not act on its own; this was written down for a person to decide on";
 
 /// The orchestrator turn's decision, and the only barrier standing between a mail body and the
 /// daemon's controls.
@@ -1957,14 +1933,7 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
     // The `get_run`-names-a-triage-run rule lives in `mcp_tools::effect_of_call` rather than here,
     // because a second dispatcher needed the same answer and got a different one from the bare
     // table. One implementation is the only way two callers cannot disagree.
-    //
-    // The errand is passed rather than read out of `tool_input`, so a call cannot say whose folder
-    // it is asking about; `errand_of_run` answers `None` for every run that has none and for every
-    // resolution that fails, which `effect_of_call` reads as "cannot say" and classifies as a
-    // stranger's words.
-    let errand = errand_of_run(&state.pool, payload.run_id).await;
-    let effect =
-        crate::mcp_tools::effect_of_call(&state.pool, tool, &payload.tool_input, errand).await;
+    let effect = crate::mcp_tools::effect_of_call(&state.pool, tool, &payload.tool_input).await;
 
     match effect {
         crate::mcp_tools::ToolEffect::ReadsUntrusted => {
@@ -2014,32 +1983,6 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
             })
         }
         crate::mcp_tools::ToolEffect::Acts => {
-            // An errand never acts on its own, and this is asked BEFORE the barrier because it is a
-            // different rule: the barrier is about what the turn has READ, and this is about whose
-            // work it is. An errand is a Telegram topic. Its first message is a turn that has read
-            // nothing, so the barrier would allow it — and the acting tools are the daemon's
-            // controls and, one day, an email nobody can unsend.
-            //
-            // What this buys is that the errand's box is safe to widen. Until now the box was safe
-            // because it happened to contain nothing that acts, and that property leaves the moment
-            // somebody adds a tool. This one does not.
-            if errand.is_some() {
-                tracing::warn!(
-                    run_id = payload.run_id,
-                    tool,
-                    "pretooluse-decision: an errand may not act without a person"
-                );
-                // The reason the errand is GIVEN, not the untrusted-context one this used to
-                // record. They are different statements and only one of them is true here: a clean
-                // errand has read nobody's words, and the file's own argument for keeping the two
-                // constants apart — "a model told something false about itself will try to work
-                // around it" — applies to the record a person reads as much as to the reply.
-                record_refused_action(state, payload, tool, errand, ERRAND_MAY_NOT_ACT).await;
-                return Json(Decision {
-                    decision: "deny".to_owned(),
-                    reason: ERRAND_MAY_NOT_ACT.to_owned(),
-                });
-            }
             match crate::runs::read_untrusted_context(&state.pool, payload.run_id).await {
                 Ok(false) => Json(Decision {
                     decision: "allow".to_owned(),
@@ -2055,18 +1998,8 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
                         tool,
                         "pretooluse-decision: refused an action in a turn that has read third-party content"
                     );
-                    // The errand this arm already resolved, rather than a second walk: the two
-                    // could disagree only by being asked at different moments, and a record naming
-                    // a different errand than the one the barrier judged is worse than an unnamed
-                    // one.
-                    record_refused_action(
-                        state,
-                        payload,
-                        tool,
-                        errand,
-                        UNTRUSTED_CONTEXT_DENY_REASON,
-                    )
-                    .await;
+                    record_refused_action(state, payload, tool, UNTRUSTED_CONTEXT_DENY_REASON)
+                        .await;
                     Json(Decision {
                         decision: "deny".to_owned(),
                         reason: UNTRUSTED_CONTEXT_DENY_REASON.to_owned(),
@@ -2088,11 +2021,10 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
             }
         }
         // `WritesOwn` sits with `ReadsOwn` and not with `Acts`, which is the entire reason the
-        // variant exists. An errand reads the web first and writes down what it found afterwards, so
-        // its every turn is already past the barrier by the time it records anything; refusing the
-        // write here would mean an errand that never records anything at all. It reaches no network,
-        // starts no work and lifts no approval, and the file it writes is marked with what the
-        // writing turn had read — so the words do not launder by passing through the disk.
+        // variant exists. A turn that read the web first and writes down what it found afterwards
+        // is already past the barrier by the time it records anything; refusing the write here
+        // would mean it never records anything at all. It reaches no network, starts no work and
+        // lifts no approval.
         crate::mcp_tools::ToolEffect::ReadsOwn | crate::mcp_tools::ToolEffect::WritesOwn => {
             Json(Decision {
                 decision: "allow".to_owned(),
@@ -2113,13 +2045,12 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
 ///
 /// The reasoning is the same sentence the model was given, because the person reading this in the
 /// morning is answering a different question from the model's: not "may I", but "should I do this
-/// myself". The tool input travels with it for the same reason — an errand asking to email a dealer
-/// is a decision nobody can take from the tool name alone.
+/// myself". The tool input travels with it for the same reason — a request to email a dealer is a
+/// decision nobody can take from the tool name alone.
 async fn record_refused_action(
     state: &AppState,
     payload: &PreToolUsePayload,
     tool: &str,
-    errand: Option<i64>,
     reason: &str,
 ) {
     let session_id =
@@ -2143,7 +2074,6 @@ async fn record_refused_action(
         &state.pool,
         payload.run_id,
         session_id.as_deref(),
-        errand,
         tool,
         reason,
         Some(&payload.tool_input.to_string()),
@@ -2164,31 +2094,6 @@ async fn record_refused_action(
             "pretooluse-decision: this run already has a refused action on record, or it could not be written"
         ),
     }
-}
-
-/// The errand behind the run making this call, or `None`.
-///
-/// A run records the chat it answers in `chat_id`, and an errand's `chat_key` IS that same string —
-/// `errands::resolve` is keyed by it. Nothing guesses an errand from the shape of a chat key; the
-/// row is the answer, and its absence is the common one, because almost no run is an errand's.
-///
-/// Every failure — a run with no chat, a chat with no errand, a database that will not answer —
-/// answers `None`, which `effect_of_call` treats as "cannot say" and classifies as a stranger's
-/// words. That is the fail-closed direction: the alternative would let an unresolvable errand make
-/// an unrecorded file read as the owner's own notes.
-async fn errand_of_run(pool: &sqlx::SqlitePool, run_id: i64) -> Option<i64> {
-    let chat_id = sqlx::query_scalar::<_, Option<String>>("SELECT chat_id FROM runs WHERE id = ?")
-        .bind(run_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-        .flatten()?;
-    crate::errands::resolve(pool, &chat_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|errand| errand.id)
 }
 
 /// What a council seat may call: the named list, and nothing else.
@@ -2301,11 +2206,7 @@ async fn team_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<De
         });
     };
 
-    // `None` rather than a walk: `errand_of_run` resolves an errand from a run's `chat_id`, and a
-    // team run has none — `team::open_run` writes no `chat_id` at all. Passing `None` says so
-    // outright instead of paying a query to be told it.
-    let effect =
-        crate::mcp_tools::effect_of_call(&state.pool, tool, &payload.tool_input, None).await;
+    let effect = crate::mcp_tools::effect_of_call(&state.pool, tool, &payload.tool_input).await;
 
     match effect {
         crate::mcp_tools::ToolEffect::ReadsUntrusted => {
@@ -2352,14 +2253,8 @@ async fn team_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<De
                     // Written down for the reason the orchestrator's is: the alçada exists so a
                     // person reads a queue, and a refusal that leaves no trace is a department that
                     // quietly stopped asking with nothing anywhere saying why.
-                    record_refused_action(
-                        state,
-                        payload,
-                        tool,
-                        None,
-                        UNTRUSTED_CONTEXT_DENY_REASON,
-                    )
-                    .await;
+                    record_refused_action(state, payload, tool, UNTRUSTED_CONTEXT_DENY_REASON)
+                        .await;
                     Json(Decision {
                         decision: "deny".to_owned(),
                         reason: UNTRUSTED_CONTEXT_DENY_REASON.to_owned(),
@@ -7172,17 +7067,10 @@ mod tests {
         }
     }
 
-    /// An assistant run answering an errand's topic: the errand row, and a run whose `chat_id` is
-    /// the key that row is registered under.
+    /// An assistant run answering one chat: a run whose `chat_id` is the given key.
     ///
-    /// Nothing on the run says "errand" — the join is the chat key and only the chat key, which is
-    /// the walk `errand_of_run` has to make on every single tool call an errand's turn produces.
-    ///
-    /// Returns `(errand_id, run_id)`.
-    async fn errand_bound_run(state: &AppState, chat_key: &str) -> (i64, i64) {
-        let errand_id = crate::errands::create(&state.pool, "carros", chat_key)
-            .await
-            .unwrap();
+    /// Returns the run id.
+    async fn chat_bound_run(state: &AppState, chat_key: &str) -> i64 {
         let run_id = in_flight_run(state, "assistant", None, None, None).await;
         sqlx::query("UPDATE runs SET chat_id = ? WHERE id = ?")
             .bind(chat_key)
@@ -7190,139 +7078,21 @@ mod tests {
             .execute(&state.pool)
             .await
             .unwrap();
-        (errand_id, run_id)
-    }
-
-    /// `WritesOwn` on the far side of the barrier, which is the whole reason the variant exists.
-    ///
-    /// The order here is the order every errand actually runs in: read its own notes, read the open
-    /// web, write down what it found. The web read drops the barrier — `create_run` at the end
-    /// proves the barrier is genuinely down and not merely untested — and the write still has to go
-    /// through, because an errand that researches and can never record is not an errand.
-    ///
-    /// If `errand_files_write` were ever moved to `Acts`, or the `WritesOwn` arm folded into the
-    /// `Acts` arm, this test is what says so: the third assertion flips and nothing else does.
-    #[tokio::test]
-    async fn an_errand_still_writes_its_own_notes_after_reading_the_web() {
-        let state = test_state().await;
-        let (errand_id, run_id) = errand_bound_run(&state, "-1002003004:7").await;
-        let app = test_router(state.clone());
-
-        // A file this errand recorded, written by a turn that had read nothing third-party: the one
-        // shape `errand_file_read_effect` lets back as own.
-        crate::errands::record_artifact(&state.pool, errand_id, "notas.md", false, None)
-            .await
-            .unwrap();
-        let own = orchestrator_tool(
-            &app,
-            run_id,
-            "errand_files_read",
-            serde_json::json!({"path": "notas.md"}),
-        )
-        .await;
-        assert_eq!(own.decision, "allow");
-        assert!(
-            !crate::runs::read_untrusted_context(&state.pool, run_id)
-                .await
-                .unwrap(),
-            "reading back a file this errand itself wrote clean is not reading a stranger"
-        );
-
-        let web = orchestrator_tool(
-            &app,
-            run_id,
-            "web_read",
-            serde_json::json!({"url": "https://stand.example/anuncio"}),
-        )
-        .await;
-        assert_eq!(
-            web.decision, "allow",
-            "reading the web is what an errand is for"
-        );
-        assert!(
-            crate::runs::read_untrusted_context(&state.pool, run_id)
-                .await
-                .unwrap(),
-            "the turn now has a stranger's words in it and must be on record as having them"
-        );
-
-        let write = orchestrator_tool(
-            &app,
-            run_id,
-            "errand_files_write",
-            serde_json::json!({"path": "notas.md", "content": "1998 Golf, 3200 EUR"}),
-        )
-        .await;
-        assert_eq!(
-            write.decision, "allow",
-            "an errand that cannot record what it found is not an errand"
-        );
-
-        let act = orchestrator_tool(
-            &app,
-            run_id,
-            "create_run",
-            serde_json::json!({"project_id": "proj", "prompt": "x"}),
-        )
-        .await;
-        assert_eq!(
-            act.decision, "deny",
-            "the allow above must be WritesOwn passing the barrier, not a barrier that never closed"
-        );
-    }
-
-    /// A run with no chat has no errand, and `errand_of_run` says so rather than guessing.
-    ///
-    /// The path asked for is a real one, recorded clean under a real errand — so if this walk ever
-    /// answered `Some` for a run that names no chat, the read would come back `ReadsOwn` and the
-    /// turn would stay unmarked. That is the laundering direction: one errand's marks vouching for
-    /// a turn that was never that errand's. `None` is read as "cannot say", and cannot-say is a
-    /// stranger.
-    #[tokio::test]
-    async fn a_run_with_no_chat_borrows_no_errands_marks() {
-        let state = test_state().await;
-        let errand_id = crate::errands::create(&state.pool, "carros", "-1002003004:7")
-            .await
-            .unwrap();
-        crate::errands::record_artifact(&state.pool, errand_id, "notas.md", false, None)
-            .await
-            .unwrap();
-
-        // Same mode, same tool, same path as the test above — the only difference is the missing
-        // `chat_id`, so that is the only thing the different outcome can be attributed to.
-        let run_id = in_flight_run(&state, "assistant", None, None, None).await;
-        let app = test_router(state.clone());
-
-        let read = orchestrator_tool(
-            &app,
-            run_id,
-            "errand_files_read",
-            serde_json::json!({"path": "notas.md"}),
-        )
-        .await;
-        assert_eq!(read.decision, "allow", "the read itself is not the refusal");
-        assert!(
-            crate::runs::read_untrusted_context(&state.pool, run_id)
-                .await
-                .unwrap(),
-            "a file classified against an errand this run does not belong to must count as a stranger's words"
-        );
+        run_id
     }
 
     /// The barrier gets a door, and the door is a person.
     ///
-    /// §6 refuses an action once a turn has read a stranger's words, and for an errand that is
-    /// every turn that did any research — which is all of them. Until now the refusal was the end
-    /// of the line: the model was stopped and the owner never learned what it had wanted to do. So
-    /// the errand that spends an afternoon finding the right car cannot tell anyone it found it.
+    /// §6 refuses an action once a turn has read a stranger's words, which is every turn that did
+    /// any research. Until now the refusal was the end of the line: the model was stopped and the
+    /// owner never learned what it had wanted to do.
     ///
     /// The refusal does not move. What changes is that it is written down where somebody can read
-    /// it, decide, and act — or ask the errand again in a fresh turn, which starts clean and may
-    /// act. That is the whole of piece 5: the refusal keeps a record instead of a silence.
+    /// it, decide, and act — or ask again in a fresh turn, which starts clean and may act. That is the whole of piece 5: the refusal keeps a record instead of a silence.
     #[tokio::test]
     async fn an_action_refused_after_the_web_is_written_down_for_a_person() {
         let state = test_state().await;
-        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:8").await;
+        let run_id = chat_bound_run(&state, "-1002003004:8").await;
         let app = test_router(state.clone());
 
         orchestrator_tool(
@@ -7357,43 +7127,6 @@ mod tests {
         );
     }
 
-    /// A record that does not say which errand it came from is a record nobody can decide on.
-    ///
-    /// "Approve: send_email" tells a person the verb and nothing else. Approving it anyway is what
-    /// turns an approval step into a formality, which is the worst thing an approval step can be —
-    /// it costs the interruption and buys none of the safety. The errand is the missing half: what
-    /// this is about, and therefore whether the answer is yes.
-    ///
-    /// The name and not only the id, because an id is a thing to go and look up, and a step that
-    /// requires a lookup before it can be answered is a step that gets answered without one.
-    #[tokio::test]
-    async fn a_refused_action_says_which_errand_wanted_it() {
-        let state = test_state().await;
-        let (errand_id, run_id) = errand_bound_run(&state, "-1002003004:11").await;
-        let app = test_router(state.clone());
-
-        orchestrator_tool(
-            &app,
-            run_id,
-            "web_read",
-            serde_json::json!({"url": "https://stand.example/anuncio"}),
-        )
-        .await;
-        orchestrator_tool(
-            &app,
-            run_id,
-            "create_run",
-            serde_json::json!({"project_id": "proj", "prompt": "encomendar o Golf"}),
-        )
-        .await;
-
-        let refused = crate::proposals::list_refused_actions(&state.pool)
-            .await
-            .unwrap();
-        assert_eq!(refused[0].errand_id, Some(errand_id));
-        assert_eq!(refused[0].errand_name.as_deref(), Some("carros"));
-    }
-
     /// The record says what the turn was going to do; this says where the idea came from.
     ///
     /// Those are different questions and only the second one decides. "Send an email to accounts
@@ -7402,7 +7135,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_action_says_which_stranger_put_the_idea_there() {
         let state = test_state().await;
-        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:12").await;
+        let run_id = chat_bound_run(&state, "-1002003004:12").await;
         let app = test_router(state.clone());
 
         orchestrator_tool(
@@ -7445,7 +7178,7 @@ mod tests {
     #[tokio::test]
     async fn every_stranger_the_turn_read_is_listed_and_not_just_the_first() {
         let state = test_state().await;
-        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:13").await;
+        let run_id = chat_bound_run(&state, "-1002003004:13").await;
         let app = test_router(state.clone());
 
         for url in [
@@ -7472,42 +7205,10 @@ mod tests {
         );
     }
 
-    /// An absent provenance is a legitimate answer, and the case that proves it is the OTHER
-    /// refusal this kind carries.
-    ///
-    /// `ERRAND_MAY_NOT_ACT` fires on whose work it is, not on what was read — an errand's first
-    /// message has read nothing at all. A reader that treats `None` as "contaminated by something
-    /// we failed to log" would show a warning about a turn that was clean.
-    #[tokio::test]
-    async fn an_errand_refused_for_whose_work_it_is_carries_no_provenance() {
-        let state = test_state().await;
-        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:14").await;
-        let app = test_router(state.clone());
-
-        let act = orchestrator_tool(
-            &app,
-            run_id,
-            "create_run",
-            serde_json::json!({"project_id": "proj", "prompt": "x"}),
-        )
-        .await;
-
-        assert_eq!(act.decision, "deny");
-        assert_eq!(act.reason, ERRAND_MAY_NOT_ACT, "a different rule fired");
-        let refused = crate::proposals::list_refused_actions(&state.pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            refused[0].read_from, None,
-            "this turn read nothing, and the row must not imply it did"
-        );
-    }
-
     /// The guard. If this fails, piece 5 has put a human step in front of everything that worked
     /// before it — which is the failure mode of every approval mechanism ever added to anything.
     ///
-    /// On a run that is NOT an errand's, which is the population this protects. An ordinary
-    /// orchestrator turn asked to start a run starts it, exactly as before errands existed.
+    /// An ordinary orchestrator turn that has read nothing and is asked to start a run starts it.
     #[tokio::test]
     async fn an_action_in_an_ordinary_clean_turn_still_goes_straight_through() {
         let state = test_state().await;
@@ -7532,47 +7233,6 @@ mod tests {
         );
     }
 
-    /// An errand never acts on its own, whatever is in its box and whatever it has read.
-    ///
-    /// Until now the refusal came from the injection barrier, which is a rule about ORDER: read a
-    /// stranger's words and the acting tools shut. That made the errand's box safe by coincidence —
-    /// nothing in it acts, so the barrier never had to bite — and it left one gap that the day
-    /// somebody widens the box walks straight into: a turn that has read nothing yet is clean, and
-    /// a clean turn acts unconditionally. The first message in a topic is exactly that turn.
-    ///
-    /// So the rule here is about WHOSE work it is rather than what it has read. An errand is a
-    /// Telegram topic; the acting tools are the daemon's controls and, one day, an email nobody can
-    /// unsend. A person is between them, always, and the record from piece 5 is how they hear about
-    /// it. That is what makes the box safe to widen — the safety stops depending on the box being
-    /// empty of actions.
-    #[tokio::test]
-    async fn an_errand_cannot_act_even_in_a_turn_that_has_read_nothing() {
-        let state = test_state().await;
-        let (errand_id, run_id) = errand_bound_run(&state, "-1002003004:12").await;
-        let app = test_router(state.clone());
-
-        assert!(
-            !crate::runs::read_untrusted_context(&state.pool, run_id)
-                .await
-                .unwrap(),
-            "this turn has read nothing, which is the whole point of the test"
-        );
-        let act = orchestrator_tool(
-            &app,
-            run_id,
-            "create_run",
-            serde_json::json!({"project_id": "proj", "prompt": "encomendar o Golf"}),
-        )
-        .await;
-
-        assert_eq!(act.decision, "deny");
-        let refused = crate::proposals::list_refused_actions(&state.pool)
-            .await
-            .unwrap();
-        assert_eq!(refused.len(), 1, "and the person hears about it");
-        assert_eq!(refused[0].errand_id, Some(errand_id));
-    }
-
     /// A turn that keeps reaching leaves ONE record, not one per attempt.
     ///
     /// The same shape the git queue already uses for the same problem: a model told no will often
@@ -7582,7 +7242,7 @@ mod tests {
     #[tokio::test]
     async fn a_turn_that_keeps_reaching_leaves_one_record_not_many() {
         let state = test_state().await;
-        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:10").await;
+        let run_id = chat_bound_run(&state, "-1002003004:10").await;
         let app = test_router(state.clone());
 
         orchestrator_tool(

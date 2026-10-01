@@ -20,7 +20,6 @@ const SENTENCES: Record<string, string> = {
   kill_switch: "the kill switch is engaged — nothing autonomous starts until it is released",
   turn_in_progress: "this conversation already has a turn in flight; it clears on its own",
   no_local_model: "no local model is available, and this asked for one",
-  errand_not_answering: "that errand is not answering",
   internal: "the núcleo hit an error of its own handling this",
 
   // Derived from the status, for routes that refused without a name.

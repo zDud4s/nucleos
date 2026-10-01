@@ -11,35 +11,17 @@ pub struct Proposal {
     pub run_id: Option<i64>,
     pub session_id: Option<String>,
     pub project_id: Option<String>,
-    /// The errand this came from, when it came from one — which is almost never.
-    ///
-    /// Not derivable from `project_id`: an errand HAS no project, so an errand's proposal and a
-    /// machine-wide one both carry `project_id IS NULL` and nothing else in the row tells them
-    /// apart.
-    pub errand_id: Option<i64>,
-    /// The errand's name, joined in by the queries whose readers need it and `NULL` in the rest.
-    ///
-    /// Carried on the same struct rather than in a second type, because the alternative was a
-    /// near-copy of eleven fields that would drift the first time one of them changed. The `NULL AS
-    /// errand_name` in the other queries is what keeps that honest: a reader that gets `None` is
-    /// being told this query did not ask, and the id is still there to ask with.
-    pub errand_name: Option<String>,
     pub tool_name: Option<String>,
     pub reasoning: String,
     pub tool_input: Option<String>,
     /// What the turn had read when it reached for this, as JSON, copied off `run_untrusted_reads`
     /// at the moment the refusal was written.
     ///
-    /// Selected by every query rather than by the ones that care, which is the opposite of what
-    /// `errand_name` above does — and deliberately. `errand_name` is a join, so `NULL AS
-    /// errand_name` honestly means "this query did not ask" and the id is still there to ask with.
-    /// This is a column; `NULL` in it already means "nothing was recorded", and there is nothing to
-    /// ask with afterwards because the run may have been pruned. A second meaning for the same
-    /// `NULL` would make an unasked question indistinguishable from an answered one.
+    /// Selected by every query. It is a column, and `NULL` in it means "nothing was recorded";
+    /// there is nothing to ask with afterwards because the run may have been pruned.
     ///
-    /// `None` is a legitimate state and not a defect: `ERRAND_MAY_NOT_ACT` refuses on whose work it
-    /// is rather than on what the turn read, and an errand's first message has read nothing at all.
-    /// A reader must not present its absence as contamination.
+    /// `None` is a legitimate state and not a defect. A reader must not present its absence as
+    /// contamination.
     pub read_from: Option<String>,
     pub created_at: String,
     pub decided_at: Option<String>,
@@ -107,19 +89,19 @@ pub async fn create_action_approval(
 /// An action the injection barrier refused, kept where a person can read it.
 ///
 /// The fifth `kind`, and it exists because of what `approve` means. §6 closes acting tools once a
-/// turn has read a stranger's words — which, for an errand, is every turn that did any research.
+/// turn has read a stranger's words — which is every turn that did any research.
 /// Until this row existed the refusal was the end of the line: the model was stopped and the owner
-/// never learned what it had wanted to do, so an errand could spend an afternoon finding the right
-/// car and have no way to say so.
+/// never learned what it had wanted to do, so a turn could spend an afternoon finding the right
+/// answer and have no way to say so.
 ///
 /// **Not `action-approval`, and the reason is mechanical rather than aesthetic.** Approving one of
 /// those calls `runs::resume_approved_run`, which looks up a live worktree for the paused run and
-/// answers `NotResumable` without one. An errand turn has no worktree and was never paused — it was
+/// answers `NotResumable` without one. A chat turn has no worktree and was never paused — it was
 /// denied and carried on. Filed as an action approval, this would appear under a button that cannot
 /// work, which is worse than appearing under none.
 ///
 /// So nothing resumes here either, exactly as for [`create_skipped_item`]. What the record buys is
-/// that somebody finds out: they do the thing themselves, or they ask the errand again, and the new
+/// that somebody finds out: they do the thing themselves, or they ask again, and the new
 /// turn starts clean and may act. The door is a person, not a button.
 ///
 /// **`read_from` is what makes that door usable rather than merely open.** Deciding whether to do
@@ -127,26 +109,21 @@ pub async fn create_action_approval(
 /// could not answer that: it said what was going to happen and never where it came from. An email
 /// to accounts asking for the bank details to change reads identically either way. It is a copy and
 /// not a join because `runs` rows are pruned, and `None` means nothing was recorded — which is the
-/// normal state for the OTHER refusal this kind carries, where an errand was stopped for whose work
+/// normal state for the OTHER refusal this kind carries, where a turn was stopped for whose work
 /// it is rather than for anything it read.
 ///
 /// **`project_id` is the run's, read inside the INSERT.** Until 2026-09-14 the row carried none,
 /// although every refusal names its run and a run knows its project: job 26 on 2026-09-13 left six
 /// of them, job 27 the next day one, and nothing could say which project any of them belonged to.
 /// A subquery rather than a ninth argument, because every caller holds the run id and nothing else,
-/// and an argument is one more thing a caller can get wrong. A run with no project — a chat, an
-/// errand, a department — leaves it NULL, which is the truth about it. Carrying a project is what
+/// and an argument is one more thing a caller can get wrong. A run with no project — a chat, a
+/// department — leaves it NULL, which is the truth about it. Carrying a project is what
 /// put this kind in reach of the per-project WIP brake, which is why `wip::open_proposals_term` now
 /// names it among the kinds it does not count.
-// Eight, and the eighth is `read_from`. Bundling them into a struct to satisfy the lint would put a
-// type between the caller and a row it is spelling out field by field, which is what the sibling
-// constructors above all do; the shape stays consistent with them rather than with the count.
-#[allow(clippy::too_many_arguments)]
 pub async fn create_refused_action(
     pool: &SqlitePool,
     run_id: i64,
     session_id: Option<&str>,
-    errand_id: Option<i64>,
     tool_name: &str,
     reasoning: &str,
     tool_input: Option<&str>,
@@ -156,13 +133,12 @@ pub async fn create_refused_action(
     let mut transaction = pool.begin().await?;
     let result = sqlx::query(
         "INSERT INTO proposals
-         (kind, status, run_id, session_id, project_id, errand_id, tool_name, reasoning, tool_input, read_from, created_at, decided_at)
-         VALUES ('refused-action', 'pending', ?, ?, (SELECT project_id FROM runs WHERE id = ?), ?, ?, ?, ?, ?, ?, NULL)",
+         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, read_from, created_at, decided_at)
+         VALUES ('refused-action', 'pending', ?, ?, (SELECT project_id FROM runs WHERE id = ?), ?, ?, ?, ?, ?, NULL)",
     )
     .bind(run_id)
     .bind(session_id)
     .bind(run_id)
-    .bind(errand_id)
     .bind(tool_name)
     .bind(reasoning)
     .bind(tool_input)
@@ -192,16 +168,10 @@ pub async fn create_refused_action(
 /// for anything that is not an `action-approval`.
 pub async fn list_refused_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        // The one query that joins. A person reading this list is deciding whether to do the thing
-        // themselves, and "send_email" without the errand is not a decidable question — it is the
-        // verb with the subject missing. LEFT, so a refused action with no errand (an ordinary chat
-        // that read its mail and then reached for a control) still appears, unnamed.
-        "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.errand_id,
-                e.name AS errand_name, p.tool_name, p.reasoning,
-                p.tool_input, p.read_from, p.created_at, p.decided_at,
+        "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.tool_name,
+                p.reasoning, p.tool_input, p.read_from, p.created_at, p.decided_at,
                 NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
          FROM proposals p
-         LEFT JOIN errands e ON e.id = p.errand_id
          WHERE p.status = 'pending' AND p.kind = 'refused-action'
          ORDER BY p.id ASC",
     )
@@ -626,12 +596,7 @@ pub async fn list_pending_recruits(
     team_run_id: Option<&str>,
 ) -> sqlx::Result<Vec<Proposal>> {
     let rows = sqlx::query_as::<_, Proposal>(
-        // `errand_id` and `NULL AS errand_name` in master's own shape. A department has no errand
-        // and never will, so the id is always NULL here -- but the column has to be SELECTED all
-        // the same, because `Proposal` grew both fields and `query_as` hydrates by name. Missing
-        // one is not a compile error; it is a row that fails to decode at runtime.
-        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
-                NULL AS errand_name, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
                 tool_input, read_from, created_at, decided_at,
                 NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
          FROM proposals
@@ -672,12 +637,7 @@ pub async fn list_pending_recruits(
 /// and the run that asked has usually finished by then.
 pub async fn list_pending_team_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        // `errand_id` and `NULL AS errand_name` in master's own shape. A department has no errand
-        // and never will, so the id is always NULL here -- but the column has to be SELECTED all
-        // the same, because `Proposal` grew both fields and `query_as` hydrates by name. Missing
-        // one is not a compile error; it is a row that fails to decode at runtime.
-        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
-                NULL AS errand_name, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
                 tool_input, read_from, created_at, decided_at,
                 NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
          FROM proposals
@@ -707,8 +667,7 @@ pub async fn calendar_proposal_pending_for(pool: &SqlitePool, email_id: i64) -> 
 
 pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
-                NULL AS errand_name, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
                 tool_input, read_from, created_at, decided_at,
                 NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
          FROM proposals WHERE id = ?",
@@ -720,8 +679,7 @@ pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
 
 pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
-                NULL AS errand_name, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
                 tool_input, read_from, created_at, decided_at,
                 NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
          FROM proposals
@@ -747,8 +705,7 @@ pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
 pub async fn list_skipped_items(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
         // LEFT so a pruned run still lists; the subquery keeps one run from duplicating a row.
-        "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.errand_id,
-                NULL AS errand_name, p.tool_name, p.reasoning, p.tool_input, p.read_from,
+        "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.tool_name, p.reasoning, p.tool_input, p.read_from,
                 p.created_at, p.decided_at, COALESCE(i.job_id, r.job_id) AS job_id,
                 r.stage AS run_stage, i.ordinal AS item_ordinal, i.description AS item_description
          FROM proposals p
@@ -1205,7 +1162,7 @@ mod tests {
     ///
     /// Both runs end `completed` with exit 0, and no field on `runs` separates them. This one does,
     /// and it was already being written — `grant_covers_class` stamps `consumed_at` on the first
-    /// attempt, so a grant still NULL at the end is a resume that never carried out its errand.
+    /// attempt, so a grant still NULL at the end is a resume that never carried out its work.
     #[tokio::test]
     async fn a_grant_the_resumed_run_never_used_is_reported_and_one_it_used_is_not() {
         let pool = test_pool().await;
@@ -1232,7 +1189,7 @@ mod tests {
         assert_eq!(
             unconsumed_grant(&pool, 902).await.unwrap(),
             None,
-            "a run that was never resumed has no errand to have skipped"
+            "a run that was never resumed has no work to have skipped"
         );
     }
 
@@ -1545,7 +1502,6 @@ mod tests {
             &pool,
             in_a_project,
             None,
-            None,
             "Bash",
             "the classifier did not recognise this command",
             Some(r#"{"command":"cargo fmt --all"}"#),
@@ -1556,7 +1512,6 @@ mod tests {
         let unattributed = create_refused_action(
             &pool,
             in_no_project,
-            None,
             None,
             "send_email",
             "this turn has read third-party content and can no longer act",

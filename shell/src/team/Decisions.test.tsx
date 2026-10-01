@@ -110,8 +110,6 @@ function recruit(teamId: string, overrides: Partial<Proposal> = {}): Proposal {
     run_id: null,
     session_id: null,
     project_id: null,
-    errand_id: null,
-    errand_name: null,
     tool_name: "tax-analyst",
     reasoning: "nobody here can read a VAT return",
     tool_input: JSON.stringify({

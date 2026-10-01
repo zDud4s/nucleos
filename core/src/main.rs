@@ -27,7 +27,6 @@ mod council;
 mod daemon_client;
 mod detect;
 mod email;
-mod errands;
 mod exclusion;
 mod feed;
 mod files;
@@ -795,18 +794,14 @@ async fn main() {
     }
 
     if std::env::args().any(|a| a == "--mcp-tools") {
-        // `--box errand --errand <id>` narrows what this process serves. Refused rather than
-        // ignored when the box is not one this server knows: a launcher that misspells it would
-        // otherwise get the FULL tool set, in a Telegram topic, with nothing saying so.
+        // `--box` used to narrow what this process serves. A stale launcher still passing it is
+        // refused rather than ignored, or it would silently get the full tool list.
         let args: Vec<String> = std::env::args().collect();
-        let served = match mcp_tools::box_from_args(&args) {
-            Ok(served) => served,
-            Err(e) => {
-                eprintln!("mcp-tools failed: {e}");
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = mcp_tools::run_stdio(served).await {
+        if let Err(e) = mcp_tools::refuse_box_flag(&args) {
+            eprintln!("mcp-tools failed: {e}");
+            std::process::exit(1);
+        }
+        if let Err(e) = mcp_tools::run_stdio().await {
             eprintln!("mcp-tools failed: {e}");
             std::process::exit(1);
         }

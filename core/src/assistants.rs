@@ -21,8 +21,7 @@
 //! `ConfiguredAssistants` at startup and has no singletons left, and the trait is reached from both
 //! call sites in `assistant.rs`'s send path, from `council.rs` (a seat's local availability, twice —
 //! the roster and the override), from `team.rs` (a local member's availability), and from
-//! `http.rs` (`get_local_model`, `post_chat_title`) and `scheduler.rs` (an errand's own-criterion
-//! check). This module sits on every chat turn, not beside it.
+//! `http.rs` (`get_local_model`, `post_chat_title`). This module sits on every chat turn, not beside it.
 
 /// The sentence `Refusal::HostedModelNamedButNoKey` renders as.
 ///

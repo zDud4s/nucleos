@@ -126,8 +126,8 @@ pub async fn record(
 /// Six of the nine are `TEXT` in one tuple, so a `SELECT` that reordered two of them would still
 /// typecheck and the mistake would surface as a decision whose section is somehow the name of a
 /// brain. This alias and the `SELECT`s below are one thing written three times; changing any of
-/// them without the others is what it exists to make visible. The house shape — see `ErrandRow` in
-/// `errands.rs` and `Row` in `project_commands.rs`, both a row of this size read the same way.
+/// them without the others is what it exists to make visible. The house shape — see `Row` in
+/// `project_commands.rs`, a row of this size read the same way.
 ///
 /// `approved_at` is the one column a reorder cannot swallow, being the only nullable one and so the
 /// only `Option<String>` in the tuple. That is luck rather than design, and it is worth saying

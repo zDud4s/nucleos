@@ -16,12 +16,10 @@
  * party reached over OpenRouter's API, distinct from both the cloud agent CLI and the model running
  * on this machine.
  *
- * There are two OTHER `Brain` declarations in this codebase — `data/errands.ts` and
- * `data/project-map.ts` — and both stay `"cloud" | "local"` ON PURPOSE. Do not "fix" them to match
- * this one: an errand cannot take the hosted route at all (the daemon's own `errands::Brain` has no
- * such variant, and its table carries two foreign keys into it, which makes that migration
- * dangerous for no benefit anyone asked for), and the project map's `read_brain` only ever yields
- * `cloud` or `local` in the daemon. A third value here says nothing about either of those.
+ * There is one OTHER `Brain` declaration in this codebase — `data/project-map.ts` — and it stays
+ * `"cloud" | "local"` ON PURPOSE. Do not "fix" it to match this one: the project map's
+ * `read_brain` only ever yields `cloud` or `local` in the daemon. A third value here says nothing
+ * about that.
  */
 export type Brain = "cloud" | "local" | "openrouter";
 

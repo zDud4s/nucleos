@@ -134,16 +134,6 @@ pub enum Scope {
     /// The house. `scope_id` is NULL, and only here.
     Machine,
     Project(String),
-    /// An errand, which is the crooked case — see [`Scope::chain`].
-    ///
-    /// **Nothing writes an errand-scoped row, and that is the design rather than an omission**: the
-    /// owner writes `project` or `machine`, a run does the same, and the consolidator runs per
-    /// project. It is a vocabulary value with an inheritance rule of its own and no writer, kept
-    /// because reading an errand still has to know what it inherits — which is nothing but the
-    /// house. `cfg_attr` and not a bare `allow`, so the day something does construct one the test
-    /// build still says the attribute is stale.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Errand(String),
     /// A job, and the project it belongs to when the caller knows it.
     ///
     /// Read by nothing outside the tests until the working layer exists to put rows here.
@@ -160,7 +150,6 @@ impl Scope {
         match (kind, id) {
             ("machine", None) => Some(Scope::Machine),
             ("project", Some(id)) => Some(Scope::Project(id.to_owned())),
-            ("errand", Some(id)) => Some(Scope::Errand(id.to_owned())),
             ("job", Some(id)) => Some(Scope::Job {
                 id: id.parse().ok()?,
                 project: None,
@@ -172,16 +161,12 @@ impl Scope {
     /// The scopes a reader in this one is entitled to, most general first.
     ///
     /// `machine` → `project` → `job` inherits downwards, and the most specific wins where they
-    /// contradict. **`errand` does not hang off `project`**: `0074_errands.sql:19` gives an errand
-    /// no `project_id` at all — it has `chat_key`, `brain`, `folder` — so an errand scope inherits
-    /// from `machine` alone. Said here rather than left implicit, because the natural query is the
-    /// wrong one and nothing about its result looks wrong.
+    /// contradict.
     fn chain(&self) -> Vec<(&'static str, Option<String>)> {
         let mut chain = vec![("machine", None)];
         match self {
             Scope::Machine => {}
             Scope::Project(id) => chain.push(("project", Some(id.clone()))),
-            Scope::Errand(id) => chain.push(("errand", Some(id.clone()))),
             Scope::Job { id, project } => {
                 if let Some(project) = project {
                     chain.push(("project", Some(project.clone())));
@@ -197,7 +182,6 @@ impl Scope {
         match self {
             Scope::Machine => ("machine", None),
             Scope::Project(id) => ("project", Some(id.clone())),
-            Scope::Errand(id) => ("errand", Some(id.clone())),
             Scope::Job { id, .. } => ("job", Some(id.to_string())),
         }
     }
@@ -268,7 +252,7 @@ pub enum NodeKind {
 
 /// What the work is, as far as the selection is allowed to know it.
 pub struct Context {
-    /// The scope and its chain (machine -> project -> job; an errand inherits from machine alone).
+    /// The scope and its chain (machine -> project -> job).
     pub chain: Vec<Scope>,
     /// The files the worktree touched, or the ones the item declares.
     pub files: Vec<String>,
@@ -590,7 +574,6 @@ fn scope_heading(scope: &Scope) -> String {
     match scope {
         Scope::Machine => "\n\nHouse-wide knowledge:".into(),
         Scope::Project(id) => format!("\n\nKnowledge about project {id}:"),
-        Scope::Errand(id) => format!("\n\nKnowledge about errand {id}:"),
         Scope::Job { id, .. } => format!("\n\nKnowledge about job {id}:"),
     }
 }
@@ -1713,29 +1696,7 @@ mod tests {
         );
     }
 
-    /// An errand inherits from the house and from nothing else, which is the one place where the
-    /// obvious query is the wrong one: `errands` has no `project_id` (`0074_errands.sql:19`), so
-    /// there is no project for an errand to inherit from, and a chain that reached for one would be
-    /// picking a project at random.
-    #[tokio::test]
-    async fn an_errand_reads_the_house_and_no_projects_lessons() {
-        let pool = test_pool().await;
-        seed(&pool, None, "active", "house-wide").await;
-        seed(&pool, Some("mine"), "active", "a project's").await;
-
-        let read = for_scope(&pool, &Scope::Errand("chat-7".into()))
-            .await
-            .unwrap();
-        let titles: Vec<&str> = read.iter().map(|r| r.title.as_str()).collect();
-        assert_eq!(
-            titles,
-            vec!["house-wide"],
-            "an errand read something no errand inherits: {titles:?}"
-        );
-    }
-
-    /// A job reads all three links of the chain, and the straight case is worth asserting beside
-    /// the crooked one above: `machine` -> `project` -> `job`, where the errand has only the first.
+    /// A job reads all three links of the chain: `machine` -> `project` -> `job`.
     ///
     /// The project arrives beside the job id rather than being looked up, because `scope_id` is a
     /// polymorphic TEXT column with no foreign key — there is nothing for a join to follow, and a

@@ -23,8 +23,7 @@ const restartDelay = 5 * time.Second
 //
 // The key is `ChatKey`'s and not a chat id, which is what makes two topics of one group two
 // conversations here. Keyed on the chat, a group's topics would queue behind each other for no
-// reason the núcleo has — it holds a slot per chat KEY — and the whole point of an errand per topic
-// is that two of them can be working at once.
+// reason the núcleo has — it holds a slot per chat KEY.
 type Dispatcher struct {
 	mu     sync.Mutex
 	queues map[string]chan func()

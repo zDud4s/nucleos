@@ -42,7 +42,7 @@ func main() {
 		// command path with it, silently.
 		go pipe.Supervise("notifier", func() {
 			// The bare chat and no topic: what the notifier announces — a new proposal, the kill
-			// switch, a budget alert — is about the machine and not about any one errand, so it
+			// switch, a budget alert — is about the machine and not about any one topic, so it
 			// belongs where the whole room sees it rather than buried in whichever topic was open.
 			pipe.RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: cfg.AllowedChatID}, cfg.PollInterval)
 		})

@@ -1241,7 +1241,7 @@ pub async fn start(
         .map_err(|error| StartError::Unavailable(error.to_string()))?;
     crate::storage::write_atomic(
         &mcp_path,
-        &serde_json::to_vec(&crate::assistant::build_mcp_config(&exe, None))
+        &serde_json::to_vec(&crate::assistant::build_mcp_config(&exe))
             .map_err(|error| StartError::Unavailable(error.to_string()))?,
     )
     .map_err(|error| StartError::Unavailable(error.to_string()))?;
@@ -1822,12 +1822,9 @@ impl Driver {
             permission: crate::runner::Permission::Default,
             resume_session_id: None,
             mcp_config: with_tools.then(|| mcp_config_path(&self.id)),
-            // Unboxed, and said out loud rather than left to a default. The council writes its
-            // config with `build_mcp_config(&exe, None)` above, so a seat that is given tools is
-            // offered the whole surface and pays for the whole surface. Spelling it here is what
-            // puts the pairing on the page: the line above says a server exists, this one says
-            // what it announces, and the two are read together by `runner::authored_prompt`.
-            mcp_box: None,
+            // The council writes its config with `build_mcp_config(&exe)` above, so a seat that is
+            // given tools is offered the whole surface and pays for the whole surface, which
+            // `runner::authored_prompt` reads off the line above.
             tool_policy: if with_tools {
                 crate::runner::ToolPolicy::McpOnly
             } else {

@@ -32,7 +32,7 @@ describe("the nav table", () => {
       "home", "fleet", "autopilot", "waiting", "runs", "feed", "learned",
     ]);
     expect(byId.work.items.map((item) => item.id)).toEqual([
-      "chats", "errands", "teams", "agents", "council",
+      "chats", "teams", "agents", "council",
     ]);
     expect(byId.pillars.items.map((item) => item.id)).toEqual([
       "mail", "contacts", "calendar", "voice", "web", "browser", "files",
@@ -87,7 +87,6 @@ describe("the nav table", () => {
   it("lists Work exactly as the design draws it", () => {
     expect(NAV[2].items.map((item) => item.label)).toEqual([
       "Chats",
-      "Errands",
       "Teams",
       "Agents",
       "Council",
@@ -161,5 +160,10 @@ describe("the nav table", () => {
 
   it("answers with nothing for a path it does not own", () => {
     expect(navItemForPath("/runs/412")).toBeUndefined();
+  });
+
+  it("no nav entry points at /errands", () => {
+    const paths = [...NAV.flatMap((group) => group.items), ...NAV_ITEMS].map((item) => item.path);
+    expect(paths.filter((path) => path.startsWith("/errands"))).toEqual([]);
   });
 });

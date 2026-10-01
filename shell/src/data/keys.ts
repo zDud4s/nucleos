@@ -327,7 +327,7 @@ export const keys = {
   },
 
   /**
-   * The Work namespace — chats, council, errands, agents — landing together
+   * The Work namespace — chats, council, agents — landing together
    * ahead of the pages that read most of it, for the reason at the top of this
    * file: a namespace four pages edit in sequence is a namespace where the
    * fifth quietly spells its own key.
@@ -413,10 +413,6 @@ export const keys = {
 
   council: {
     all: ["council"] as const,
-  },
-
-  errands: {
-    all: ["errands"] as const,
   },
 
   agents: {

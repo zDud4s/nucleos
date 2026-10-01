@@ -15,11 +15,15 @@ describe("the Feed's lanes", () => {
     for (const kind of placed) expect(lanes.has(feedLaneOf(kind)), kind).toBe(true);
   });
 
-  it("sends a kind nobody classified to the machine lane, except mail and the web by family", () => {
+  it("sends a kind nobody classified to the machine lane", () => {
     expect(feedLaneOf("map_stamp_recorded")).toBe("machine");
     expect(feedLaneOf("sidecar_restarted")).toBe("machine");
-    expect(feedLaneOf("email_shopping")).toBe("errands");
-    expect(feedLaneOf("web.fetch")).toBe("errands");
+  });
+
+  it("email and web lines land in the mail lane", () => {
+    expect(feedLaneOf("email_shopping")).toBe("mail");
+    expect(feedLaneOf("web.fetch")).toBe("mail");
+    expect(FEED_LANES.find((lane) => lane.id === "mail")?.label).toBe("Mail & web");
   });
 
   it("uses every lane, so none is drawn empty by construction", () => {
