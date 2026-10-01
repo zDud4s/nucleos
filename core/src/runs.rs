@@ -4401,15 +4401,16 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
                     .unwrap_or_default();
                 record_the_cut_stream(&state.pool, id, &seen).await;
             }
-            // A routed run the user cancelled tells the router `error` (`route_advice::
-            // report_cancelled` argues why not `fail`). Only after this write won: the aborted
-            // body's own run-end report needs the same CAS, so exactly one of the two speaks. Only
-            // a cancel — a pause resumes, and the run's later end reports for it.
+            // A routed run something stopped — the user's cancel, or the daemon's hook ending a run
+            // that kept probing denied actions (`failed`) — tells the router `error`
+            // (`route_advice::report_stopped` argues why not `fail`). Only after this write won: the
+            // aborted body's own run-end report needs the same CAS, so exactly one of the two
+            // speaks. Only an ending — a pause resumes, and the run's later end reports for it.
             if won
-                && status == "cancelled"
+                && ends_the_run(status)
                 && let Some(router) = state.runner.router()
             {
-                crate::route_advice::report_cancelled(&state.pool, router, id).await;
+                crate::route_advice::report_stopped(&state.pool, router, id).await;
             }
             // The run is over; anything it queued and never started goes with it (spec §7). After
             // the status write, because this is a consequence of the run ending — and best-effort,
@@ -11351,6 +11352,32 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 .await
                 .is_err(),
             "a cancelled run is reported exactly once"
+        );
+    }
+
+    /// The daemon's hook stopping a run that kept probing denied actions writes `failed` through
+    /// the same terminator, and that is not a verdict on the work either: `error`, once.
+    #[tokio::test]
+    async fn a_routed_run_the_hook_stops_reports_error() {
+        let mut state = test_state().await;
+        let (url, mut received) = crate::router_client::test_support::outcome_router(200).await;
+        front_with_shadow_router(&mut state, &url);
+        let id = seed_routed_running(&state.pool, Some("rt_probe")).await;
+        spawn_registered(&state, id, std::future::pending::<()>());
+
+        assert!(finalize_termination(&state, id, "failed").await);
+
+        let (decision, body) = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .expect("reported within 2s")
+            .unwrap();
+        assert_eq!(decision, "rt_probe");
+        assert_eq!(body, serde_json::json!({"status": "error"}));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), received.recv())
+                .await
+                .is_err(),
+            "a stopped run is reported exactly once"
         );
     }
 
