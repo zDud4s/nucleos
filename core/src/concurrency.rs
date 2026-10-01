@@ -151,7 +151,6 @@ pub async fn claim(
 /// Everything `claim`'s own comment says still holds: idempotent per owner, the per-project number
 /// held by the primary key, the house number advisory. A unique violation inside a SQLite
 /// transaction aborts only the statement, so the next number is tried as before.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 6.4 and Task 7.x
 pub async fn claim_on(
     conn: &mut SqliteConnection,
     project_id: &str,
