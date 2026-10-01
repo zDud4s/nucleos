@@ -1015,7 +1015,7 @@ pub fn branch_delete_from_command(command: &str) -> Option<Op> {
 /// and the asymmetry was a hole rather than a tidiness problem — `git -C <path> merge <branch>` put
 /// `<path>` where the verb scan looks, matched no arm, and was ALLOWED by a function whose whole
 /// job is to refuse that merge.
-const GIT_FLAGS_WITH_VALUES: &[&str] = &[
+pub(crate) const GIT_FLAGS_WITH_VALUES: &[&str] = &[
     "-C",
     "-c",
     "--git-dir",

@@ -684,6 +684,56 @@ impl DaemonClient {
         response.json().await.map_err(|e| e.to_string())
     }
 
+    /// Ask for approved knowledge in the calling run's scope.
+    ///
+    /// Scope is not a parameter: the daemon reads it from `RUN_ID_HEADER`, which `request` sets
+    /// from the run this client represents.
+    pub async fn recall(&self, query: &str, layer: Option<&str>) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/knowledge/recall")
+            .json(&serde_json::json!({ "query": query, "layer": layer }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let said = response.text().await.unwrap_or_default();
+            return Err(if said.trim().is_empty() {
+                format!("the core refused: {status}")
+            } else {
+                said
+            });
+        }
+        response.json().await.map_err(|e| e.to_string())
+    }
+
+    /// Leave a finding in the calling job's scope for its next node.
+    ///
+    /// The run id in `RUN_ID_HEADER` identifies the sender; the daemon resolves the job from its
+    /// scoped key rather than accepting a scope in this body.
+    pub async fn note_finding(
+        &self,
+        fact: &str,
+        evidence: &[serde_json::Value],
+    ) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/knowledge/findings")
+            .json(&serde_json::json!({ "fact": fact, "evidence": evidence }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let said = response.text().await.unwrap_or_default();
+            return Err(if said.trim().is_empty() {
+                format!("the core refused: {status}")
+            } else {
+                said
+            });
+        }
+        response.json().await.map_err(|e| e.to_string())
+    }
+
     /// Convene a council, and hand back the id it will be readable by.
     ///
     /// The id and not the answer, because there is no answer yet: `POST /council` is a `202` and

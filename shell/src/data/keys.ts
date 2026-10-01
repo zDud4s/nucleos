@@ -55,6 +55,15 @@ export const keys = {
     quotaBrake: ["autopilot", "quota-brake"] as const,
     scoreboard: (projectId: string) => ["autopilot", "scoreboard", projectId] as const,
     shadowDecisions: ["autopilot", "shadow-decisions"] as const,
+    /** One project's judge setting and readiness (`GET /autopilot/judge`). */
+    judge: (projectId: string) => ["autopilot", "judge", projectId] as const,
+    /** The judge's latest word on these shadow decisions (`GET /judge-verdicts/by-decision`). */
+    judgeOpinions: (ids: readonly number[]) => ["autopilot", "judge-opinions", ids.join(",")] as const,
+    /** Every verdict of one run (`GET /runs/{id}/judge-verdicts`). */
+    runJudgeOpinions: (runId: number) => ["autopilot", "run-judge-opinions", runId] as const,
+    /** The judge's own review queue — NOT under `shadowDecisions`: they are two queues. */
+    judgeVerdictsAll: ["autopilot", "judge-verdicts"] as const,
+    judgeVerdicts: (projectId: string) => ["autopilot", "judge-verdicts", projectId] as const,
   },
 
   /**
@@ -96,6 +105,8 @@ export const keys = {
      * answer about one run and not a projection of the first.
      */
     stop: (id: number) => ["runs", "stop", id] as const,
+    /** The trace: a second answer about what one run was told. */
+    briefing: (id: number) => ["runs", "briefing", id] as const,
     awaitingApproval: ["runs", "awaiting-approval"] as const,
   },
 

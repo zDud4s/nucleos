@@ -2,8 +2,9 @@
 //!
 //! `knowledge.rs` makes the selection decision with zero I/O; this module fetches candidates,
 //! gives them SQLite's FTS rank, and hands them to that pure selector. It also persists the
-//! selector's trace once a run exists. A briefing for work that never becomes a run leaves no
-//! trace: `run_knowledge.run_id` is deliberately NOT NULL and references `runs` (D15).
+//! selector's trace once a run exists, and `trace_of` reads that decision for one run. A briefing
+//! for work that never becomes a run leaves no trace: `run_knowledge.run_id` is deliberately NOT
+//! NULL and references `runs` (D15).
 
 use std::collections::HashMap;
 
@@ -13,6 +14,24 @@ use crate::knowledge::{self, Brief, Budget, Context, Scope, Scored};
 
 /// Bound the query expression; `knowledge::MAX_READ` separately bounds candidates and rank reads.
 const MAX_QUERY_TERMS: usize = 64;
+
+/// The most knowledge rows one explicit recall returns.
+pub const RECALL_LIMIT: usize = 10;
+
+/// One approved answer returned by explicit recall.
+#[derive(serde::Serialize)]
+pub struct Recalled {
+    pub id: i64,
+    pub layer: String,
+    pub kind: String,
+    pub scope_kind: String,
+    pub scope_id: Option<String>,
+    pub source: String,
+    pub observations: Option<i64>,
+    pub evidence: Option<String>,
+    pub title: String,
+    pub body: String,
+}
 
 /// At the 30-second job tick, 64 units of each kind is 7,680 per hour, well above the rate at
 /// which CLI-backed items and runs can finish. Each unit touches at most `knowledge::MAX_READ`
@@ -37,6 +56,13 @@ const FINAL_ITEM_STATUSES: [&str; 7] = [
 /// section 13.6 is not the volume of one run: the consolidator grows the store by itself, so
 /// candidates times runs grows quadratically.
 pub const DEFAULT_KNOWLEDGE_TRACE_RETENTION_DAYS: i64 = 90;
+
+const UNTRACED_MODES: [&str; 4] = [
+    "assistant",
+    crate::council::COUNCIL_MODE,
+    crate::team::TEAM_MODE,
+    crate::email::TRIAGE_MODE,
+];
 
 /// The trace window, overridable independently from the other hourly retention sweeps.
 pub(crate) fn retention_days() -> i64 {
@@ -123,6 +149,54 @@ async fn fts_ranks(
     Ok(rows.into_iter().collect())
 }
 
+/// Recall only D12-approved (`active`) knowledge in the daemon-selected scope.
+///
+/// `live` rows arrive ONLY through the automatic briefing, with a floor of one item in the last
+/// scope group, so if node 1 leaves five facts, node 2 is guaranteed one and may not see the
+/// others. That is deliberate. Errors propagate here because the HTTP handler decides how they are
+/// reported.
+pub async fn recall(
+    pool: &SqlitePool,
+    scope: &Scope,
+    query: &str,
+    layer: Option<knowledge::Layer>,
+) -> sqlx::Result<Vec<Recalled>> {
+    let Some(expression) = match_expression(query) else {
+        return Ok(Vec::new());
+    };
+    let mut known = knowledge::for_scope(pool, scope).await?;
+    known.retain(|row| {
+        row.layer != knowledge::Layer::Working.as_str()
+            && layer.is_none_or(|layer| row.layer == layer.as_str())
+            && knowledge::approved(row)
+    });
+    let candidate_ids: Vec<i64> = known.iter().map(|row| row.id).collect();
+    let ranks = fts_ranks(pool, &expression, &candidate_ids).await?;
+    known.retain(|row| ranks.contains_key(&row.id));
+    known.sort_by(|left, right| {
+        ranks[&left.id]
+            .total_cmp(&ranks[&right.id])
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    Ok(known
+        .into_iter()
+        .take(RECALL_LIMIT)
+        .map(|row| Recalled {
+            id: row.id,
+            layer: row.layer,
+            kind: row.kind,
+            scope_kind: row.scope_kind,
+            scope_id: row.scope_id,
+            source: row.source,
+            observations: row.observations,
+            evidence: row.evidence,
+            title: row.title,
+            body: row.body,
+        })
+        .collect())
+}
+
 /// Fetch the context's candidates, add their query-local FTS signal, and select without writing.
 pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Result<Brief> {
     let scope = context.chain.last().unwrap_or(&Scope::Machine);
@@ -149,6 +223,23 @@ pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Resu
         candidate.s_fts = s_fts;
     }
     Ok(knowledge::select(&known, context, &Budget::default()))
+}
+
+/// A layer that cannot be read is a reason to say so, never a reason to refuse to start the node.
+/// Every context outside `spawn_node` reads through this one best-effort helper.
+pub async fn for_prompt(
+    pool: &SqlitePool,
+    context: &Context,
+    query: &str,
+    site: &'static str,
+) -> Option<Brief> {
+    match of(pool, context, query).await {
+        Ok(briefing) => Some(briefing),
+        Err(error) => {
+            tracing::warn!(site, %error, "could not read what is known; continuing without it");
+            None
+        }
+    }
 }
 
 /// Persist every candidate, shown or not, so the trace answers why a row lost.
@@ -210,6 +301,89 @@ pub async fn prune(
         .execute(pool)
         .await?
         .rows_affected())
+}
+
+/// The trace and its context for one run.
+#[derive(serde::Serialize)]
+pub struct RunTrace {
+    pub run_id: i64,
+    pub mode: Option<String>,
+    pub traced: bool,
+    pub reason: Option<&'static str>,
+    pub items: Vec<TraceItem>,
+}
+
+/// One candidate the briefing considered, with each election signal kept separate.
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct TraceItem {
+    pub knowledge_id: i64,
+    pub shown: bool,
+    pub s_fts: f64,
+    pub s_scope: f64,
+    pub s_structure: f64,
+    pub s_recency: f64,
+    pub s_use: f64,
+    pub at: String,
+    pub layer: String,
+    pub kind: String,
+    pub scope_kind: String,
+    pub scope_id: Option<String>,
+    pub source: String,
+    pub status: String,
+    pub observations: Option<i64>,
+    pub title: String,
+    pub body: String,
+}
+
+/// Read the briefing decision for one run, naming why an existing run has no retained trace.
+pub async fn trace_of(pool: &SqlitePool, run_id: i64) -> sqlx::Result<Option<RunTrace>> {
+    let Some((mode, created_at)) = sqlx::query_as::<_, (Option<String>, String)>(
+        "SELECT mode, created_at FROM runs WHERE id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let items = sqlx::query_as::<_, TraceItem>(
+        "SELECT rk.knowledge_id, rk.shown, rk.s_fts, rk.s_scope, rk.s_structure,
+                rk.s_recency, rk.s_use, rk.at, k.layer, k.kind, k.scope_kind, k.scope_id,
+                k.source, k.status, k.observations, k.title, k.body
+           FROM run_knowledge rk
+           JOIN knowledge k ON k.id = rk.knowledge_id
+          WHERE rk.run_id = ?
+          ORDER BY rk.shown DESC, rk.knowledge_id ASC",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+
+    let traced = !items.is_empty();
+    let reason = if traced {
+        None
+    } else if mode
+        .as_deref()
+        .is_some_and(|mode| UNTRACED_MODES.contains(&mode))
+    {
+        Some("no_trace_context")
+    } else if chrono::DateTime::parse_from_rfc3339(&created_at).is_ok_and(|created_at| {
+        created_at.with_timezone(&chrono::Utc)
+            < chrono::Utc::now() - chrono::Duration::days(retention_days())
+    }) {
+        Some("past_retention")
+    } else {
+        Some("nothing_offered")
+    };
+
+    Ok(Some(RunTrace {
+        run_id,
+        mode,
+        traced,
+        reason,
+        items,
+    }))
 }
 
 /// What the work that received a briefing ultimately proved.
@@ -558,7 +732,7 @@ pub(crate) async fn sweep(pool: &SqlitePool) -> sqlx::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, fs, path::Path};
 
     use chrono::DateTime;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -566,10 +740,17 @@ mod tests {
 
     use super::{
         SWEEP_BATCH, Verdict, credit_item, credit_run, fts_ranks, item_verdict, match_expression,
-        normalise_fts, of, prune, record, run_verdict, sweep, sweep_at_most,
+        normalise_fts, of, prune, record, run_verdict, sweep, sweep_at_most, trace_of,
     };
     use crate::job::ItemState;
     use crate::knowledge::{Context, Scope, Scored};
+
+    const BRIEFED_CONTEXTS: &[&str] =
+        &["assistant.rs", "council.rs", "job.rs", "runs.rs", "team.rs"];
+    const UNBRIEFED_LAUNCHERS: &[(&str, &str)] = &[(
+        "map_intent.rs",
+        "map derivation is deliberately unbriefed because it creates the map that later scopes briefing",
+    )];
 
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -889,6 +1070,127 @@ mod tests {
         }
         let machine_scope = machine_scope.expect("the machine row is traced");
         assert!(project_scopes.iter().all(|scope| machine_scope < *scope));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_trace_carries_the_five_signals_apart_and_the_lines_that_lost() -> sqlx::Result<()>
+    {
+        let pool = test_pool().await;
+        let loser = seed(&pool, "machine", None, "the line that lost").await?;
+        let shown = seed(&pool, "project", Some("p1"), "the line that was shown").await?;
+        let run_id = seed_run(&pool, "completed", Some(0), Some("passed"), None).await?;
+        let trace = [
+            Scored {
+                knowledge_id: loser,
+                shown: false,
+                s_fts: 0.61,
+                s_scope: 0.72,
+                s_structure: 0.83,
+                s_recency: 0.94,
+                s_use: 0.15,
+                score: 0.0,
+            },
+            Scored {
+                knowledge_id: shown,
+                shown: true,
+                s_fts: 0.11,
+                s_scope: 0.22,
+                s_structure: 0.33,
+                s_recency: 0.44,
+                s_use: 0.55,
+                score: 0.0,
+            },
+        ];
+        record(&pool, run_id, None, &trace).await?;
+
+        let answer = trace_of(&pool, run_id)
+            .await?
+            .expect("the run exists, so its trace has an answer");
+        assert_eq!(answer.run_id, run_id);
+        assert_eq!(answer.mode.as_deref(), Some("worktree"));
+        assert!(answer.traced);
+        assert_eq!(answer.reason, None);
+        assert_eq!(answer.items.len(), 2);
+
+        let winner = &answer.items[0];
+        assert_eq!(winner.knowledge_id, shown);
+        assert!(winner.shown);
+        assert_eq!(winner.s_fts, 0.11);
+        assert_eq!(winner.s_scope, 0.22);
+        assert_eq!(winner.s_structure, 0.33);
+        assert_eq!(winner.s_recency, 0.44);
+        assert_eq!(winner.s_use, 0.55);
+        assert_eq!(winner.title, "the line that was shown");
+        assert_eq!(winner.layer, "semantic");
+        assert_eq!(winner.source, "owner");
+
+        let lost = &answer.items[1];
+        assert_eq!(lost.knowledge_id, loser);
+        assert!(!lost.shown);
+        assert_eq!(lost.s_fts, 0.61);
+        assert_eq!(lost.s_scope, 0.72);
+        assert_eq!(lost.s_structure, 0.83);
+        assert_eq!(lost.s_recency, 0.94);
+        assert_eq!(lost.s_use, 0.15);
+        assert_eq!(lost.title, "the line that lost");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_in_a_context_that_leaves_no_trace_says_so_instead_of_answering_empty()
+    -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let assistant = seed_run(&pool, "completed", Some(0), None, None).await?;
+        let council = seed_run(&pool, "completed", Some(0), None, None).await?;
+
+        for (run_id, mode) in [
+            (assistant, "assistant"),
+            (council, crate::council::COUNCIL_MODE),
+        ] {
+            sqlx::query("UPDATE runs SET mode = ? WHERE id = ?")
+                .bind(mode)
+                .bind(run_id)
+                .execute(&pool)
+                .await?;
+            let answer = trace_of(&pool, run_id).await?.expect("the run exists");
+            assert!(!answer.traced);
+            assert_eq!(answer.reason, Some("no_trace_context"));
+            assert!(answer.items.is_empty());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_past_the_retention_window_says_its_trace_is_gone() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let old = seed_run(&pool, "completed", Some(0), None, None).await?;
+        let today = seed_run(&pool, "completed", Some(0), None, None).await?;
+        let old_at = (chrono::Utc::now() - chrono::Duration::days(200)).to_rfc3339();
+        sqlx::query("UPDATE runs SET mode = 'real', created_at = ? WHERE id = ?")
+            .bind(old_at)
+            .bind(old)
+            .execute(&pool)
+            .await?;
+        sqlx::query("UPDATE runs SET mode = 'real' WHERE id = ?")
+            .bind(today)
+            .execute(&pool)
+            .await?;
+
+        let old_answer = trace_of(&pool, old).await?.expect("the old run exists");
+        assert!(!old_answer.traced);
+        assert_eq!(old_answer.reason, Some("past_retention"));
+
+        let today_answer = trace_of(&pool, today).await?.expect("today's run exists");
+        assert!(!today_answer.traced);
+        assert_eq!(today_answer.reason, Some("nothing_offered"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_nobody_knows_has_no_trace_at_all() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        assert!(trace_of(&pool, 999_999).await?.is_none());
         Ok(())
     }
 
@@ -1500,5 +1802,123 @@ mod tests {
             );
         }
         assert_eq!(item_verdict(ItemState::Conflicted, None, false, None), None);
+    }
+
+    /// `BRIEFED_CONTEXTS` is a constant: this test fails the day a new context appears outside
+    /// it. It is a list rather than discovery because the limits below make discovery incomplete.
+    ///
+    /// Launches do have a marker, `crate::runner::RunRequest {`, so this scan can find them. The
+    /// append channel has no marker at all because it is ordinary `String` concatenation. The
+    /// house gives that channel a marker by making `brief` the only module that produces the block:
+    /// only `brief.rs` calls `knowledge::select`, and only `knowledge.rs` writes `PREAMBLE`. Without
+    /// that decision this test is blind in exactly the direction from which `spawn_node` came.
+    ///
+    /// Its limits are deliberate and named. (a) Its granularity is the file, so a second launcher
+    /// inside an already listed file is invisible. That is true today of `council::run_local_seat`,
+    /// team's `local_agent::run_turn` branch, and `assistant::spawn_local_turn`/`errand_turn`: they
+    /// build prompts and are deliberately not briefed. (b) It reads only `core/src/*.rs`, not
+    /// subdirectories or other crates such as `shell/src-tauri` and `sidecars/`. (c) A launcher that
+    /// does not spell `crate::runner::RunRequest {` (for example, imported `RunRequest {` or a
+    /// builder) is invisible. (d) `map_seam.rs` is the nearest relative and a warning, not a
+    /// precedent: it enforces the inverse direction. It derives `Seam::uncalled` on every read but
+    /// never asserts it, because "Served routes no call here reaches -- and no screen is not
+    /// nothing." A static scan does not see who calls over HTTP.
+    #[test]
+    fn no_context_builds_a_prompt_for_an_agent_without_going_through_the_one_producer() {
+        let built_in = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let running_in = std::env::current_dir().expect("the working directory must be readable");
+        assert_eq!(
+            built_in,
+            running_in.as_path(),
+            "this test binary was compiled in {} and is running in {} -- a shared target directory \
+             handed this checkout a binary built somewhere else, so this scan would read the other \
+             checkout's sources. Touch this file to force a rebuild.",
+            built_in.display(),
+            running_in.display(),
+        );
+
+        let mut sources = fs::read_dir(running_in.join("src"))
+            .expect("core source directory must be readable")
+            .map(|entry| entry.expect("core source entry must be readable").path())
+            .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("rs"))
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("core source file names must be UTF-8")
+                    .to_owned();
+                let source = fs::read_to_string(&path).expect("core source file must be readable");
+                let source = source.replace("\r\n", "\n");
+                let production = source
+                    .split_once("\n#[cfg(test)]\nmod ")
+                    .map_or(source.as_str(), |(production, _)| production)
+                    .to_owned();
+                (name, production)
+            })
+            .collect::<Vec<_>>();
+        sources.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let expected = BRIEFED_CONTEXTS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<BTreeSet<_>>();
+        let callers = sources
+            .iter()
+            .filter(|(name, source)| {
+                name != "brief.rs"
+                    && (source.contains("brief::of(") || source.contains("brief::for_prompt("))
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(file) = callers.difference(&expected).next() {
+            panic!(
+                "{file} calls brief::of/brief::for_prompt but is absent from BRIEFED_CONTEXTS; add the context to the constant"
+            );
+        }
+        if let Some(file) = expected.difference(&callers).next() {
+            panic!(
+                "{file} is in BRIEFED_CONTEXTS but no longer calls brief::of/brief::for_prompt; remove the stale entry or restore briefing"
+            );
+        }
+
+        let launchers = sources
+            .iter()
+            .filter(|(_, source)| source.contains("crate::runner::RunRequest {"))
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>();
+        let unbriefed = UNBRIEFED_LAUNCHERS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect::<BTreeSet<_>>();
+        for file in &launchers {
+            if !expected.contains(file) && !unbriefed.contains(file) {
+                panic!(
+                    "{file} builds a RunRequest and is in neither BRIEFED_CONTEXTS nor UNBRIEFED_LAUNCHERS: brief it through brief::for_prompt, or list it as unbriefed with the reason"
+                );
+            }
+        }
+        for (file, reason) in UNBRIEFED_LAUNCHERS {
+            assert!(
+                launchers.contains(*file),
+                "{file} is stale in UNBRIEFED_LAUNCHERS ({reason}); remove it or restore the RunRequest launcher"
+            );
+        }
+
+        for (file, source) in &sources {
+            if file != "brief.rs"
+                && (source.contains("knowledge::select(") || source.contains("knowledge::render("))
+            {
+                panic!(
+                    "{file} produces a knowledge block outside brief.rs; route it through brief::of or brief::for_prompt"
+                );
+            }
+            if file != "knowledge.rs"
+                && source.contains("Earlier work on this project left the notes below")
+            {
+                panic!(
+                    "{file} writes the knowledge preamble outside knowledge.rs; keep PREAMBLE's only definition in knowledge.rs"
+                );
+            }
+        }
     }
 }

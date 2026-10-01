@@ -351,6 +351,47 @@ export interface RunStop {
   successor_run_id: number | null;
 }
 
+export interface RunBriefing {
+  run_id: number;
+  mode: string | null;
+  traced: boolean;
+  reason: "no_trace_context" | "past_retention" | "nothing_offered" | null;
+  items: BriefingItem[];
+}
+
+export interface BriefingItem {
+  knowledge_id: number;
+  shown: boolean;
+  s_fts: number;
+  s_scope: number;
+  s_structure: number;
+  s_recency: number;
+  s_use: number;
+  at: string;
+  layer: string;
+  kind: string;
+  scope_kind: string;
+  scope_id: string | null;
+  source: string;
+  status: string;
+  observations: number | null;
+  title: string;
+  body: string;
+}
+
+/**
+ * What this run was told, and the selection trace behind it.
+ *
+ * No poll: the briefing is written once before the run starts and never
+ * changes afterwards.
+ */
+export function useRunBriefing(id: number) {
+  return useQuery({
+    queryKey: keys.runs.briefing(id),
+    queryFn: () => apiFetch<RunBriefing>(`/runs/${id}/knowledge`),
+  });
+}
+
 /**
  * Why this run stopped, for the block on the run page.
  *

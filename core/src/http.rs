@@ -64,6 +64,10 @@ pub fn build_router(state: AppState) -> Router {
             get(get_autopilot_state).post(post_autopilot_state),
         )
         .route(
+            "/autopilot/judge",
+            get(get_autopilot_judge).post(post_autopilot_judge),
+        )
+        .route(
             "/autopilot/kill",
             get(get_autopilot_kill).post(post_autopilot_kill),
         )
@@ -507,6 +511,7 @@ pub fn build_router(state: AppState) -> Router {
         // `.ai/specs/2026-08-29-porque-parou-design.md` §4, §7). Read-only front to back — see
         // `run_stop.rs`.
         .route("/runs/{id}/stop", get(crate::runs::get_run_stop))
+        .route("/runs/{id}/knowledge", get(get_run_knowledge))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route(
             "/runs/{id}/message",
@@ -524,10 +529,13 @@ pub fn build_router(state: AppState) -> Router {
         // What earlier work learned, and the two things a person does with it. Owner-scoped like
         // the notes above and for a stronger reason: this is the layer that decides what every
         // later run is told, so a token that could write here could rewrite the agent's mind for
-        // every project on the machine. **How a RUN declares one is deliberately not here** — that
-        // is an agent writing into what agents are told, which is the governance question
-        // `notes.rs` refuses in its own words, and it is the owner's to answer rather than mine.
+        // every project on the machine. A run has one narrower door below: one evidenced row in the
+        // working layer of the caller's own job, read only there and closed when that job ends.
         .route("/knowledge", get(list_knowledge).post(post_knowledge))
+        // Like `/runs/awaiting-approval` above, this literal coexists with `/{id}` because static
+        // segments win in matchit.
+        .route("/knowledge/recall", post(recall_knowledge))
+        .route("/knowledge/findings", post(post_finding))
         .route("/knowledge/{id}", get(get_knowledge))
         .route("/knowledge/{id}/revert", post(revert_knowledge))
         .route("/assistant/message", post(post_assistant_message))
@@ -751,6 +759,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/worktrees/{run_id}/release", post(post_worktree_release))
         .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
+        .route(
+            "/judge-verdicts/unreviewed",
+            get(get_unreviewed_judge_verdicts),
+        )
+        .route("/judge-verdicts/{id}/verdict", post(post_judge_verdict))
+        .route(
+            "/judge-verdicts/by-decision",
+            get(get_judge_opinions_by_decision),
+        )
+        .route("/runs/{id}/judge-verdicts", get(get_judge_opinions_of_run))
         .route("/scoreboard", get(get_scoreboard))
         .route("/email/cursor", get(get_email_cursor))
         .route("/email/triage", post(post_email_triage))
@@ -3140,6 +3158,90 @@ async fn post_autopilot_state(
         project_id: body.project_id,
         mode,
     }))
+}
+
+#[derive(Deserialize)]
+struct AutopilotJudgeRequest {
+    project_id: String,
+    judge: String,
+}
+
+#[derive(Serialize)]
+struct AutopilotJudgeResponse {
+    project_id: String,
+    judge: crate::judge::JudgeMode,
+    /// Review item G: `Some` when this project's `autopilot.yaml` cannot be read, which leaves
+    /// the judge without effect (every call falls back to the classifier, D7/D10).
+    rules_error: Option<String>,
+    /// D11: how far the project is from being allowed to enforce, with the classes beside it.
+    readiness: crate::judge::JudgeReadiness,
+}
+
+/// One project's judge, as both handlers answer it. A readiness that cannot be read is a 500, like
+/// the mode: a panel shown a made-up zero would read "nothing reviewed yet".
+async fn judge_status(
+    state: &AppState,
+    project_id: String,
+) -> Result<AutopilotJudgeResponse, StatusCode> {
+    let judge = autopilot::autopilot_judge_mode(&state.pool, &project_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let readiness = crate::judge::readiness(&state.pool, &project_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rules_error =
+        crate::judge::rules_problem(state.machine_config_root.clone(), &project_id).await;
+    Ok(AutopilotJudgeResponse {
+        project_id,
+        judge,
+        rules_error,
+        readiness,
+    })
+}
+
+/// Spec A: one project's judge setting. Its own route beside `/autopilot/state` rather than a
+/// field on the roster: the panel reads one project at a time, and a field on `ProjectSummary`
+/// would touch nine literals and the CLI's deserialiser for nothing the roster shows.
+///
+/// Admin-only, by appearing in no table in `auth.rs` (not in `READ_ONLY_ROUTES`): it reveals and
+/// changes what a model may decide for a project, and default-deny is the safe side of that.
+async fn get_autopilot_judge(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<AutopilotJudgeResponse>, StatusCode> {
+    judge_status(&state, query.project_id).await.map(Json)
+}
+
+async fn post_autopilot_judge(
+    State(state): State<AppState>,
+    Json(body): Json<AutopilotJudgeRequest>,
+) -> Result<Json<AutopilotJudgeResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let judge = crate::judge::JudgeMode::from_db_str(&body.judge)
+        .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "invalid"))?;
+    match autopilot::set_project_judge(&state.pool, &body.project_id, judge).await {
+        Ok(_) => judge_status(&state, body.project_id)
+            .await
+            .map(Json)
+            .map_err(|status| refusal(status, "internal")),
+        Err(autopilot::JudgeActivationError::UnknownProject) => {
+            Err(refusal(StatusCode::NOT_FOUND, "unknown_project"))
+        }
+        Err(autopilot::JudgeActivationError::NotActive) => {
+            Err(refusal(StatusCode::CONFLICT, "not_active"))
+        }
+        Err(autopilot::JudgeActivationError::NotReady { reviewed, agree }) => {
+            tracing::info!(
+                reviewed,
+                agree,
+                "enforce refused: the judge's bar is not met"
+            );
+            Err(refusal(StatusCode::CONFLICT, "not_ready"))
+        }
+        Err(autopilot::JudgeActivationError::Database(error)) => {
+            tracing::warn!(%error, "setting a project's judge failed");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
 }
 
 async fn get_autopilot_kill(
@@ -8514,21 +8616,61 @@ fn materialize_after_pin(
     }
 }
 
-/// Stop using a workflow. Never deletes an ejected copy — see `workflows::uninstall`.
+/// Stop using a workflow, and take back the files it placed in the project.
+///
+/// The pin goes first — a project that does not use `name` is refused before a file is touched —
+/// and then `workflow_materialize::unmaterialize` removes every file the record says this workflow
+/// wrote and that is still exactly what it wrote, the managed block in `AGENTS.md` included. An
+/// edited or missing file stays and is named under `kept`; what went is under `removed`.
+///
+/// **Only the project's own root is cleaned.** A worktree synced from it keeps its copies and its
+/// own record under `materialized/` until it is synced again or removed. Never deletes an ejected
+/// copy — see `workflows::uninstall`. A cleanup that could not run (an unreadable record) does not
+/// undo the decision: the pin stays gone, nothing is removed, and the answer carries `error`.
 async fn delete_project_workflow(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
-) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (_, pins, _) = workflow_write_root(&state, &id).await?;
-    let removed = name.clone();
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (root, pins, _) = workflow_write_root(&state, &id).await?;
+    let record = materialized_record(&state, &id)?;
+    let stopped = name.clone();
 
-    tokio::task::spawn_blocking(move || crate::workflows::uninstall(&pins, &name))
-        .await
-        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
-        .map_err(workflow_refusal)?;
+    let cleaned = tokio::task::spawn_blocking(move || {
+        crate::workflows::uninstall(&pins, &name)?;
+        Ok::<_, crate::workflows::Refused>(crate::workflow_materialize::unmaterialize(
+            &root, &record, &name,
+        ))
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
 
-    workflow_feed(&state, &id, &format!("{removed} is no longer used here")).await;
-    Ok(StatusCode::NO_CONTENT)
+    let (removal, error) = match cleaned {
+        Ok(removal) => (removal, None),
+        Err(error) => {
+            tracing::warn!(%error, workflow = %stopped, "a workflow was stopped and its files were not removed");
+            (Default::default(), Some(error))
+        }
+    };
+    let tail = match (&error, removal.removed.len(), removal.kept.len()) {
+        (Some(error), _, _) => format!("; its files were not removed: {error}"),
+        (None, 0, 0) => String::new(),
+        (None, removed, 0) => format!("; {removed} of its files removed"),
+        (None, removed, kept) => {
+            format!("; {removed} of its files removed, {kept} left in place")
+        }
+    };
+    workflow_feed(
+        &state,
+        &id,
+        &format!("{stopped} is no longer used here{tail}"),
+    )
+    .await;
+    Ok(Json(serde_json::json!({
+        "removed": removal.removed,
+        "kept": removal.kept,
+        "error": error,
+    })))
 }
 
 /// Take a copy, and stop receiving updates.
@@ -9028,6 +9170,10 @@ async fn post_project_workflow_materialize(
 struct WorkflowSyncRequest {
     /// The checkout, absolute. `nucleos-core --workflow-sync` sends its argument or its cwd.
     path: String,
+    /// Which project, when more than one rostered project points at the checkout's repository.
+    /// Only ever a choice among those: a project the repository does not match is refused.
+    #[serde(default)]
+    project_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -9040,8 +9186,13 @@ struct WorkflowSyncAnswer {
 ///
 /// **Which project is decided by the repository, not by the caller.** The checkout's git common
 /// directory (`git_exec::repo_key`) is compared against every rostered root's; the one that shares
-/// it is the project. A caller naming the project would be a caller able to put one project's
-/// workflow into another's checkout, and the path already says which it is.
+/// it is the project. A caller naming a project the repository does not match would be a caller
+/// able to put one project's workflow into another's checkout, so `project_id` is refused (400,
+/// `project_not_a_match`) unless it is one of the matches.
+///
+/// **More than one match is not guessed.** Two rostered projects can point at one repository, and
+/// the first row is not an answer: without a `project_id` the sync is refused with 409
+/// `ambiguous_project`, naming every candidate (id and root), and nothing is written.
 ///
 /// A worktree gets its own record under `~/.nucleos/projects/<id>/materialized/`, so a file edited
 /// in it is protected exactly as one edited in the main checkout; the main checkout itself, named
@@ -9078,17 +9229,41 @@ async fn post_workflow_sync(
             .fetch_all(&state.pool)
             .await
             .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
-    let mut found = None;
+    let mut matches = Vec::new();
     for (project_id, root) in rows {
         let Some(root) = root else { continue };
         let root = std::path::PathBuf::from(root);
         if crate::git_exec::repo_key(&root, deadline).await.as_ref() == Ok(&key) {
-            found = Some((project_id, root));
-            break;
+            matches.push((project_id, root));
         }
     }
-    let Some((project_id, root)) = found else {
+    if matches.is_empty() {
         return Err(refusal(StatusCode::NOT_FOUND, "no_project"));
+    }
+    let (project_id, root) = match body.project_id.as_deref() {
+        Some(named) => matches
+            .into_iter()
+            .find(|(project_id, _)| project_id == named)
+            .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "project_not_a_match"))?,
+        None if matches.len() > 1 => {
+            let candidates: Vec<serde_json::Value> = matches
+                .iter()
+                .map(|(project_id, root)| {
+                    serde_json::json!({
+                        "project_id": project_id,
+                        "project_root": root.to_string_lossy(),
+                    })
+                })
+                .collect();
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "refusal": "ambiguous_project",
+                    "candidates": candidates,
+                })),
+            ));
+        }
+        None => matches.remove(0),
     };
     if crate::autopilot::scoped_kill_engaged(&state.pool, "project", &project_id)
         .await
@@ -14576,6 +14751,59 @@ pub(crate) struct ProposeKnowledgeRequest {
     supersedes: Option<i64>,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct RecallRequest {
+    query: String,
+    layer: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FindingRequest {
+    fact: String,
+    evidence: serde_json::Value,
+}
+
+/// The run-key-only door for one evidenced working fact in the caller's own live job.
+pub(crate) async fn post_finding(
+    State(state): State<AppState>,
+    Extension(scope): Extension<crate::auth::Scope>,
+    Json(request): Json<FindingRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), axum::response::Response> {
+    let crate::auth::Scope::Run(run_id) = scope else {
+        return Err((StatusCode::FORBIDDEN, "only a run may leave a finding").into_response());
+    };
+    let knowledge_id =
+        crate::knowledge::note_finding(&state.pool, run_id, &request.fact, &request.evidence)
+            .await
+            .map_err(|error| match error {
+                crate::knowledge::FindingError::EmptyFact
+                | crate::knowledge::FindingError::FactTooLong
+                | crate::knowledge::FindingError::NoEvidence => {
+                    (StatusCode::BAD_REQUEST, error.to_string()).into_response()
+                }
+                crate::knowledge::FindingError::NoJob
+                | crate::knowledge::FindingError::JobEnded => {
+                    (StatusCode::CONFLICT, error.to_string()).into_response()
+                }
+                crate::knowledge::FindingError::TooMany => {
+                    (StatusCode::TOO_MANY_REQUESTS, error.to_string()).into_response()
+                }
+                crate::knowledge::FindingError::Db(error) => {
+                    tracing::warn!(%error, run_id, "writing a finding failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "the finding could not be written",
+                    )
+                        .into_response()
+                }
+            })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({"knowledge_id": knowledge_id})),
+    ))
+}
+
 /// The one door a run declares through.
 ///
 /// It still goes through the proposal, rather than inserting an `active` row: the review trail is
@@ -14670,6 +14898,75 @@ pub(crate) async fn post_knowledge(
     ))
 }
 
+pub(crate) async fn recall_knowledge(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<RecallRequest>,
+) -> Result<Json<Vec<crate::brief::Recalled>>, axum::response::Response> {
+    let query = request.query.trim();
+    if query.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "recall needs a query").into_response());
+    }
+    let layer = match request.layer.as_deref().map(str::trim) {
+        None => None,
+        Some(layer) => match crate::knowledge::Layer::parse(layer) {
+            Some(layer) => Some(layer),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "layer must be one of semantic, episodic, procedural",
+                )
+                    .into_response());
+            }
+        },
+    };
+    if layer == Some(crate::knowledge::Layer::Working) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the working layer is never recalled: it reaches a node only through its briefing",
+        )
+            .into_response());
+    }
+
+    let scope = match sending_run_id_of(&headers) {
+        None => crate::knowledge::Scope::Machine,
+        Some(run_id) => {
+            let project_id =
+                sqlx::query_scalar::<_, Option<String>>("SELECT project_id FROM runs WHERE id = ?")
+                    .bind(run_id)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(%error, run_id, "reading a recall's run scope failed");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "recall's scope could not be determined",
+                        )
+                            .into_response()
+                    })?
+                    .ok_or_else(|| {
+                        refusal(StatusCode::BAD_REQUEST, "unknown_sender").into_response()
+                    })?;
+            project_id.map_or(
+                crate::knowledge::Scope::Machine,
+                crate::knowledge::Scope::Project,
+            )
+        }
+    };
+
+    crate::brief::recall(&state.pool, &scope, query, layer)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "recalling approved knowledge failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "known facts could not be recalled",
+            )
+                .into_response()
+        })
+}
+
 /// Everything the layer holds, in every status.
 ///
 /// Not filtered to `active`, deliberately: the reviewable history IS the feature, and a screen that
@@ -14684,6 +14981,20 @@ async fn list_knowledge(
             tracing::warn!(%error, "listing refinements failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+async fn get_run_knowledge(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::brief::RunTrace>, StatusCode> {
+    match crate::brief::trace_of(&state.pool, id).await {
+        Ok(Some(trace)) => Ok(Json(trace)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(run_id = id, %error, "reading what a run was told failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// One refinement, read the way a person decides about it: the text, every decision it has been
@@ -14855,6 +15166,84 @@ async fn post_shadow_verdict(
     .await?
 }
 
+async fn get_unreviewed_judge_verdicts(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<Vec<crate::judge::JudgeVerdictView>>, StatusCode> {
+    crate::judge::list_unreviewed(&state.pool, &query.project_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct DecisionIdsQuery {
+    /// Comma-separated `shadow_decisions.id`s - the page's own rows.
+    ids: String,
+}
+
+/// Admin-only like the rest of the judge's routes (in no table in `auth.rs`).
+async fn get_judge_opinions_by_decision(
+    State(state): State<AppState>,
+    Query(query): Query<DecisionIdsQuery>,
+) -> Result<Json<Vec<crate::judge::JudgeOpinion>>, StatusCode> {
+    let ids = query
+        .ids
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.trim().parse::<i64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    crate::judge::opinions_for_decisions(&state.pool, &ids)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_judge_opinions_of_run(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::judge::JudgeOpinion>>, StatusCode> {
+    crate::judge::opinions_for_run(&state.pool, id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Accepts `approve|reject` once, like `post_shadow_verdict`: 400 for any other word, 404 for an
+/// unknown id, a verdict already given, or a verdict that was not in a deciding band.
+async fn post_judge_verdict(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<VerdictRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if !matches!(body.verdict.as_str(), "approve" | "reject") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // The verdict and the demotion it may cause are ONE write: a verdict is the only thing that
+    // moves readiness, so it is where the bar is held, and a failure anywhere records nothing.
+    let recorded = async {
+        let mut tx = state.pool.begin().await?;
+        if !crate::judge::set_verdict(&mut tx, id, &body.verdict).await? {
+            return Ok(false);
+        }
+        if let Some(project_id) = crate::judge::project_of_verdict(&mut tx, id).await? {
+            autopilot::hold_judge_to_the_bar(&mut tx, &project_id).await?;
+        }
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(true)
+    }
+    .await;
+    match recorded {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, id, "could not record the judge verdict");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 /// The §8.2 promotion nudge: a feed entry the moment a project's last outstanding action class
 /// clears the bar. Without it the gate solves promotion-by-impatience but leaves the opposite
 /// failure — a project that quietly became promotable and nobody noticed.
@@ -14944,6 +15333,7 @@ mod tests {
                 github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
                 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
                 quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
+                judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
                 calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
@@ -15852,6 +16242,7 @@ mod tests {
             github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
+            judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
@@ -21710,6 +22101,35 @@ mod tests {
     /// A bundle with a real graph in it, for the canvas routes.
     const TWO_NODE_GRAPH: &str = "nodes:\n  - {id: plan, type: agent, model: opus}\n  - {id: gate, type: command, command: cargo test}\nedges:\n  - {from: plan, to: gate}\n";
 
+    #[tokio::test]
+    async fn the_judges_opinions_are_served_by_decision_and_by_run() {
+        let state = test_state().await;
+        let (status, body) = workflow_call(
+            state.clone(),
+            "GET",
+            "/judge-verdicts/by-decision?ids=1,2",
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_array().map(Vec::len)),
+            (StatusCode::OK, Some(0))
+        );
+        let (status, _) = workflow_call(
+            state.clone(),
+            "GET",
+            "/judge-verdicts/by-decision?ids=x",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = workflow_call(state, "GET", "/runs/7/judge-verdicts", None).await;
+        assert_eq!(
+            (status, body.as_array().map(Vec::len)),
+            (StatusCode::OK, Some(0))
+        );
+    }
+
     async fn workflow_call(
         state: AppState,
         method: &str,
@@ -21734,6 +22154,82 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn a_projects_judge_is_read_and_set_over_http() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/judge",
+            Some(serde_json::json!({"project_id": "p", "judge": "observe"})),
+        )
+        .await;
+        assert_eq!(
+            (status, body["judge"].as_str()),
+            (StatusCode::OK, Some("observe"))
+        );
+        let (status, body) =
+            workflow_call(state.clone(), "GET", "/autopilot/judge?project_id=p", None).await;
+        assert_eq!(
+            (status, body["judge"].as_str()),
+            (StatusCode::OK, Some("observe"))
+        );
+        assert_eq!(body["readiness"]["reviewed"], 0);
+        assert_eq!(body["readiness"]["ready"], false);
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/judge",
+            Some(serde_json::json!({"project_id": "p", "judge": "maybe"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/autopilot/judge",
+            Some(serde_json::json!({"project_id": "p", "judge": "enforce"})),
+        )
+        .await;
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::CONFLICT, Some("not_ready"))
+        );
+    }
+
+    /// Review item G: a rules file the judge cannot read leaves the judge without effect for that
+    /// project, and the panel has to be able to say so, not only the verdict rows.
+    #[tokio::test]
+    async fn a_projects_unreadable_rules_are_named_beside_its_judge() {
+        let mut state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("projects").join("p");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("autopilot.yaml"),
+            "judge: [not, a, map]
+",
+        )
+        .unwrap();
+        state.machine_config_root = Some(root.path().to_path_buf());
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) =
+            workflow_call(state, "GET", "/autopilot/judge?project_id=p", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["rules_error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty())
+        );
     }
 
     /// The library is listed, a pin records the hash, and a bundle edited under it reads as drift.
@@ -21858,6 +22354,63 @@ mod tests {
             None,
         )
         .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Stopping a workflow takes back the files it placed and left untouched, keeps an edited one,
+    /// and names both in the answer.
+    #[tokio::test]
+    async fn stopping_a_workflow_removes_its_untouched_files_and_keeps_edited_ones() {
+        let mut state = test_state().await;
+        let (_lib, library) = providing_library();
+        state.workflow_library = Some(library.clone());
+        let _home = with_project_home(&mut state);
+        let project = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let install = || {
+            workflow_call(
+                state.clone(),
+                "POST",
+                "/projects/alpha/workflows",
+                Some(serde_json::json!({ "name": "dev", "version": "1.0" })),
+            )
+        };
+        let placed = project.path().join(".ai/workflow/workflow.md");
+
+        assert_eq!(install().await.0, StatusCode::NO_CONTENT);
+        assert!(placed.is_file());
+        let (status, answer) = workflow_call(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/workflows/dev",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            answer["removed"],
+            serde_json::json!([".ai/workflow/workflow.md"])
+        );
+        assert_eq!(answer["kept"], serde_json::json!([]));
+        assert!(!placed.exists());
+        assert!(!project.path().join(".ai/workflow").exists());
+
+        assert_eq!(install().await.0, StatusCode::NO_CONTENT);
+        std::fs::write(&placed, "mine").unwrap();
+        let (status, answer) = workflow_call(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/workflows/dev",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer["removed"], serde_json::json!([]));
+        assert_eq!(answer["kept"][0]["path"], ".ai/workflow/workflow.md");
+        assert_eq!(answer["kept"][0]["reason"], "modified");
+        assert_eq!(std::fs::read_to_string(&placed).unwrap(), "mine");
+
+        let (status, _) =
+            workflow_call(state, "DELETE", "/projects/alpha/workflows/dev", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -21986,6 +22539,139 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(answer["refusal"], "not_a_checkout");
+    }
+
+    /// Two rostered projects on one repository, both pinning the providing bundle: the setup the
+    /// ambiguity tests share. Returns the guards and the main checkout both projects point at.
+    async fn two_projects_on_one_repository(
+        state: &mut AppState,
+    ) -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        let (lib, library) = providing_library();
+        state.workflow_library = Some(library.clone());
+        let home = with_project_home(state);
+        let project = project_with_rules(state, "alpha", "gate_command: cargo test\n").await;
+        git(project.path(), &["init", "--quiet"]);
+        std::fs::write(project.path().join("README.md"), "x").unwrap();
+        git(project.path(), &["add", "README.md"]);
+        git(project.path(), &["commit", "--quiet", "-m", "init"]);
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('beta', 'shadow', ?)",
+        )
+        .bind(project.path().to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        for id in ["alpha", "beta"] {
+            crate::workflows::install(
+                &home
+                    .path()
+                    .join("projects")
+                    .join(id)
+                    .join(crate::project_state::PINS_FILE),
+                &crate::workflows::read_bundle(&library.join("dev/1.0"), "dev", "1.0")
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        (lib, home, project)
+    }
+
+    /// Two projects sharing the repository is a question only the caller can answer: the sync
+    /// refuses, names both, and writes nothing, rather than picking whichever row came first.
+    #[tokio::test]
+    async fn a_repository_two_projects_share_is_refused_with_both_named() {
+        let mut state = test_state().await;
+        let (_lib, home, project) = two_projects_on_one_repository(&mut state).await;
+
+        let (status, answer) = workflow_call(
+            state,
+            "POST",
+            "/workflows/sync",
+            Some(serde_json::json!({ "path": project.path().to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+        assert_eq!(answer["refusal"], "ambiguous_project");
+        let mut named: Vec<&str> = answer["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate["project_id"].as_str().unwrap())
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, ["alpha", "beta"]);
+        assert!(answer["candidates"][0]["project_root"].is_string());
+        assert!(!project.path().join(".ai/workflow/workflow.md").exists());
+        for id in ["alpha", "beta"] {
+            assert!(
+                !home
+                    .path()
+                    .join("projects")
+                    .join(id)
+                    .join(crate::project_state::MATERIALIZED_FILE)
+                    .exists()
+            );
+        }
+    }
+
+    /// Naming one of the projects the repository matches settles it; naming one it does not is
+    /// refused, so the choice can never put one project's workflow into another's checkout.
+    #[tokio::test]
+    async fn a_named_project_settles_the_choice_only_among_the_matches() {
+        let mut state = test_state().await;
+        let (_lib, home, project) = two_projects_on_one_repository(&mut state).await;
+        let _stranger = project_with_rules(&state, "gamma", "gate_command: cargo test\n").await;
+
+        let (status, answer) = workflow_call(
+            state.clone(),
+            "POST",
+            "/workflows/sync",
+            Some(serde_json::json!({
+                "path": project.path().to_string_lossy(),
+                "project_id": "gamma",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(answer["refusal"], "project_not_a_match");
+        assert!(!project.path().join(".ai/workflow/workflow.md").exists());
+
+        let (status, answer) = workflow_call(
+            state,
+            "POST",
+            "/workflows/sync",
+            Some(serde_json::json!({
+                "path": project.path().to_string_lossy(),
+                "project_id": "beta",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["project_id"], "beta");
+        assert_eq!(
+            std::fs::read_to_string(project.path().join(".ai/workflow/workflow.md")).unwrap(),
+            "the pipeline"
+        );
+        let record = |id: &str| {
+            home.path()
+                .join("projects")
+                .join(id)
+                .join(crate::project_state::MATERIALIZED_FILE)
+        };
+        assert!(record("beta").is_file());
+        assert!(!record("alpha").exists());
     }
 
     /// A credential goes in, and only its presence ever comes back.
@@ -30322,6 +31008,7 @@ mod tests {
             github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
+            judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
@@ -34761,6 +35448,83 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_run_trace_route_answers_the_trace_and_404s_an_unknown_run() {
+        let state = test_state().await;
+        let loser = sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'machine', 'owner', 'memory', 'the loser', 'lost body',
+                     'active', '2026-09-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let shown = sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, source, kind, title, body, status, created_at)
+             VALUES ('procedural', 'machine', 'owner', 'prompt', 'the winner', 'shown body',
+                     'active', '2026-09-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('p', 'completed', 'real', '2026-09-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        crate::brief::record(
+            &state.pool,
+            run_id,
+            None,
+            &[
+                crate::knowledge::Scored {
+                    knowledge_id: loser,
+                    shown: false,
+                    s_fts: 0.91,
+                    s_scope: 0.82,
+                    s_structure: 0.73,
+                    s_recency: 0.64,
+                    s_use: 0.55,
+                    score: 0.0,
+                },
+                crate::knowledge::Scored {
+                    knowledge_id: shown,
+                    shown: true,
+                    s_fts: 0.14,
+                    s_scope: 0.25,
+                    s_structure: 0.36,
+                    s_recency: 0.47,
+                    s_use: 0.58,
+                    score: 0.0,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/runs/{run_id}/knowledge"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["traced"], true);
+        assert_eq!(body["items"][0]["shown"], true);
+        assert_eq!(body["items"][0]["s_fts"], 0.14);
+
+        let (status, _) = call(state, "GET", "/runs/999999/knowledge", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
     /// A run that declares a lesson is recorded as the run that taught it.
     ///
     /// `origin_run_id` is what lets a refinement be read against the work that produced it, and the
@@ -35111,5 +35875,107 @@ mod tests {
                 "kinds": [{"selector": "job_failed", "enabled": true}]
             })
         );
+    }
+
+    /// Seeds a project enforcing the judge with ten approved allows and one pending allow, so that
+    /// rejecting the pending one takes agreement to 10/11 (under the bar). Returns its verdict id.
+    async fn enforcing_project_with_a_pending_allow(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, judge) VALUES ('a', 'active', 'enforce')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut last = 0;
+        for index in 0..11 {
+            let run_id = sqlx::query(
+                "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+                 VALUES ('a', 'x', 'completed', 'worktree', '2026-09-27T00:00:00Z')",
+            )
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            let human = if index < 10 { Some("approve") } else { None };
+            last = sqlx::query(
+                "INSERT INTO judge_verdicts
+                 (run_id, tool_name, tool_input_digest, action_class, classifier_decision, judge,
+                  model, questions_version, band, final_decision, human_verdict, created_at)
+                 VALUES (?, 'Bash', ?, 'unrecognized', 'pending_approval', 'enforce', 'jev-latest',
+                         1, 'allow', 'allow', ?, '2026-09-27T00:00:00Z')",
+            )
+            .bind(run_id)
+            .bind(format!("digest-{index}"))
+            .bind(human)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        }
+        last
+    }
+
+    async fn post_judge_verdict_status(state: AppState, id: i64, verdict: &str) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/judge-verdicts/{id}/verdict"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "verdict": verdict })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_judge_verdict_that_breaks_the_bar_demotes_in_the_same_write() {
+        let state = test_state().await;
+        let id = enforcing_project_with_a_pending_allow(&state.pool).await;
+        let status = post_judge_verdict_status(state.clone(), id, "reject").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let judge: String =
+            sqlx::query_scalar("SELECT judge FROM autopilot_state WHERE project_id = 'a'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(judge, "observe");
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM feed WHERE project_id = 'a'")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(kinds, vec!["judge_demoted".to_owned()]);
+    }
+
+    /// The verdict and the demotion are one write: when holding the bar fails, nothing is recorded.
+    #[tokio::test]
+    async fn a_judge_verdict_is_not_recorded_when_holding_the_bar_fails() {
+        let state = test_state().await;
+        let id = enforcing_project_with_a_pending_allow(&state.pool).await;
+        // The demotion's feed line cannot be written, so the demotion fails as a whole.
+        sqlx::query("DROP TABLE feed")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let status = post_judge_verdict_status(state.clone(), id, "reject").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let human: Option<String> =
+            sqlx::query_scalar("SELECT human_verdict FROM judge_verdicts WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(human, None);
+        let judge: String =
+            sqlx::query_scalar("SELECT judge FROM autopilot_state WHERE project_id = 'a'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(judge, "enforce");
     }
 }

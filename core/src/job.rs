@@ -1788,10 +1788,10 @@ pub const TERMINAL_STATUSES: [&str; 8] = [
 /// Clears `wait_reason` on the way out: a finished job is not waiting for anything, and a stale
 /// reason left on the row is the sort of thing a feed renders forever.
 ///
-/// Gives the concurrency slot back too, and this is the one place that does it for jobs — every
-/// ending funnels here, from `finish` to `cancel` to the startup reconciliation, so a new ending
-/// added later cannot forget. The sweep on the job tick is a backstop, not the mechanism: it frees
-/// what a crash left held, within a tick, rather than what this function forgot.
+/// Closes the job's live working findings and gives the concurrency slot back too. This is the one
+/// place that does both for jobs — every ending funnels here, from `finish` to `cancel` to the
+/// startup reconciliation, so a new ending added later cannot forget. The sweeps are backstops, not
+/// the mechanism: they repair what a crash left behind rather than what this function forgot.
 pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Result<()> {
     if !TERMINAL_STATUSES.contains(&status) {
         // Written anyway. A job left live would hold the project's exclusivity slot forever and
@@ -1812,6 +1812,11 @@ pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Resul
     .bind(job_id)
     .execute(pool)
     .await?;
+    if let Err(error) = crate::knowledge::close_working_for_job(pool, job_id).await {
+        // A job left live holds the project's exclusivity slot forever, which is worse than a
+        // finding the hourly retention net will close later. Retirement therefore continues.
+        tracing::warn!(job_id, %error, "job: failed to close working findings");
+    }
     crate::concurrency::release(pool, crate::worktree::Owner::Job(job_id)).await?;
     Ok(())
 }
@@ -6291,6 +6296,7 @@ mod tests {
             github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
+            judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             run_tails: Default::default(),
@@ -14329,7 +14335,7 @@ mod tests {
         let root = tempfile::tempdir().expect("worktree root");
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
-        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
 
         let job_id = seed_job_in(
             &pool,
@@ -14395,6 +14401,26 @@ mod tests {
         assert_eq!(trace[0].1, Some(item_id));
         assert!(trace[0].2 > 0.0);
         assert_eq!(trace[0].3, None);
+
+        for _ in 0..250 {
+            if runner.last_prompt.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let launched = runner
+            .last_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the node's CLI launch should receive its prompt");
+        assert_eq!(
+            launched
+                .matches("Earlier work on this project left the notes below")
+                .count(),
+            1,
+            "a job node is briefed by spawn_node and must not be briefed again by create_run_with",
+        );
     }
 
     /// The one seam a job's words have to cross, driven end to end.
