@@ -315,6 +315,20 @@ pub struct RunStatusResponse {
     #[serde(skip)]
     #[sqlx(default)]
     pub cache_creation_tokens: Option<i64>,
+    // What the run was launched on and what the local llm-router advised for it, exactly as
+    // `route_advice::resolve` wrote them (migration 0151). Flat and nullable, every one: NULL is
+    // "not recorded" — routing off, a triage run, a handoff successor, a run older than the column —
+    // never "none". Always serialised, so the shell reads an explicit `null` rather than a gap.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub runner: Option<String>,
+    pub route_mode: Option<String>,
+    pub route_decision_id: Option<String>,
+    pub advised_runner: Option<String>,
+    pub advised_model: Option<String>,
+    pub advised_effort: Option<String>,
+    /// A JSON array of `model[@effort]`, as TEXT: handed over as the column holds it, not parsed.
+    pub route_failed: Option<String>,
 }
 
 impl RunStatusResponse {
@@ -3873,7 +3887,8 @@ pub async fn get_run(
         "SELECT id, project_id, status, gate_status, gate_exit_code, gate_output, exit_code, stdout,
                 stderr, session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens,
                 num_turns, context_fill, steerable, successor_run_id, cache_creation_tokens,
-                authored_prompt_chars
+                authored_prompt_chars, model, effort, runner, route_mode, route_decision_id,
+                advised_runner, advised_model, advised_effort, route_failed
          FROM runs WHERE id = ?",
     )
     .bind(id)
@@ -5696,6 +5711,72 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         let (status, _) = stop_report(&app, "/runs/424242/stop").await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The nine columns `route_advice::resolve` writes are answered flat on `GET /runs/{id}`, under
+    /// their column names, so the shell can show what a run was launched on and what the router
+    /// advised beside it.
+    #[tokio::test]
+    async fn the_run_detail_answers_what_the_run_was_launched_on_and_what_was_advised() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let id = seed_run_row(&pool, "completed", "worktree", "2026-10-01T00:00:00Z", None).await;
+        sqlx::query(
+            "UPDATE runs SET model = 'claude-sonnet-5', effort = 'high', runner = 'claude',
+                             route_mode = 'shadow', route_decision_id = 'd-1',
+                             advised_runner = 'codex', advised_model = 'gpt-6',
+                             advised_effort = 'medium', route_failed = '[\"m@low\"]'
+              WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (status, body) = stop_report(&app, &format!("/runs/{id}")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        for (key, value) in [
+            ("model", "claude-sonnet-5"),
+            ("effort", "high"),
+            ("runner", "claude"),
+            ("route_mode", "shadow"),
+            ("route_decision_id", "d-1"),
+            ("advised_runner", "codex"),
+            ("advised_model", "gpt-6"),
+            ("advised_effort", "medium"),
+            ("route_failed", "[\"m@low\"]"),
+        ] {
+            assert_eq!(body[key], serde_json::json!(value), "{key}");
+        }
+    }
+
+    /// An unrouted run answers every one of the nine as an explicit `null`, never an absent key:
+    /// NULL is "not recorded", and the shell reads it as such.
+    #[tokio::test]
+    async fn an_unrouted_run_answers_the_route_fields_as_null() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let id = seed_run_row(&pool, "completed", "worktree", "2026-10-01T00:00:00Z", None).await;
+
+        let (_, body) = stop_report(&app, &format!("/runs/{id}")).await;
+
+        let object = body.as_object().unwrap();
+        for key in [
+            "model",
+            "effort",
+            "runner",
+            "route_mode",
+            "route_decision_id",
+            "advised_runner",
+            "advised_model",
+            "advised_effort",
+            "route_failed",
+        ] {
+            assert_eq!(object.get(key), Some(&serde_json::Value::Null), "{key}");
+        }
     }
 
     /// §11 item 7. The window has a default, and an over-large one is CLAMPED rather than refused.
@@ -12036,6 +12117,15 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             cli_own_estimate: None,
             authored_prompt_chars: Some(44_000),
             cache_creation_tokens: Some(9_000),
+            model: None,
+            effort: None,
+            runner: None,
+            route_mode: None,
+            route_decision_id: None,
+            advised_runner: None,
+            advised_model: None,
+            advised_effort: None,
+            route_failed: None,
         }
         .with_prompt_budget();
 
