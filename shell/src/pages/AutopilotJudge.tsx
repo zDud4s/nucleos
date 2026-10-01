@@ -30,8 +30,8 @@ const MODES: { mode: JudgeMode; label: string; confirm: string }[] = [
   { mode: "off", label: "Off", confirm: "Stop asking the judge" },
   // D11: observing is opt-in because it sends each judged call off this machine.
   { mode: "observe", label: "Observe", confirm: "Send each judged call to TypeSafe" },
-  { mode: "enforce", label: "Enforce", confirm: "Let the judge decide — I accept the risk above" },
 ];
+const ENFORCE = { label: "Enforce", confirm: "Let the judge decide — I accept the risk above" };
 
 export function JudgePanel({
   projectId,
@@ -108,12 +108,20 @@ export function JudgePanel({
             key={mode}
             label={label}
             confirmLabel={confirm}
-            variant={mode === "enforce" ? "danger" : "ghost"}
-            describedBy={mode === "enforce" ? "judge-residual-risk" : undefined}
-            disabled={setJudge.isPending || current === mode || (mode === "enforce" && enforceShut)}
+            variant="ghost"
+            disabled={setJudge.isPending || current === mode}
             onConfirm={() => setJudge.mutate({ project_id: projectId, judge: mode })}
           />
         ))}
+        {/* Enforce is its own button so its danger is written where it is drawn. */}
+        <ConfirmButton
+          label={ENFORCE.label}
+          confirmLabel={ENFORCE.confirm}
+          variant="danger"
+          describedBy="judge-residual-risk"
+          disabled={setJudge.isPending || current === "enforce" || enforceShut}
+          onConfirm={() => setJudge.mutate({ project_id: projectId, judge: "enforce" })}
+        />
       </div>
       {setJudge.isError && <JudgeRefusal error={setJudge.error} />}
     </Panel>
