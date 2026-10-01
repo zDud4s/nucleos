@@ -1343,6 +1343,8 @@ impl From<sqlx::Error> for ProposeError {
 /// from the project id, and the source from whether a run is behind the request. It is what keeps
 /// this phase a move rather than a change — the door writes what it wrote. Deriving the scope from
 /// the run instead of from the caller is a later decision, with its own reasons.
+/// The fingerprint is derived from the body with the consolidator's own function, so
+/// `consolidate::blocked_outcome` sees a pending, rejected, or reverted proposal.
 pub async fn propose(
     pool: &SqlitePool,
     declaration: Declaration<'_>,
@@ -1359,6 +1361,8 @@ pub async fn propose(
 
     let scope = Scope::of_project(project_id);
     let (scope_kind, scope_id) = scope.columns();
+    let fingerprint =
+        failure_signature(body).map(|signature| format!("gate:{}", signature.fingerprint));
 
     // Checked before anything is written, and checked here rather than left to the foreign key:
     // SQLite would accept a link to another scope's row without a word, and the failure would
@@ -1380,9 +1384,9 @@ pub async fn propose(
 
     let knowledge_id = sqlx::query(
         "INSERT INTO knowledge
-           (layer, scope_kind, scope_id, source, kind, title, body, status, supersedes,
+           (layer, scope_kind, scope_id, source, kind, title, body, fingerprint, status, supersedes,
             origin_run_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?)",
     )
     .bind(kind.layer().as_str())
     .bind(scope_kind)
@@ -1397,6 +1401,7 @@ pub async fn propose(
     .bind(kind.as_str())
     .bind(title)
     .bind(body)
+    .bind(fingerprint.as_deref())
     .bind(supersedes)
     .bind(origin_run_id)
     .bind(&now)

@@ -897,7 +897,9 @@ mod tests {
     use sqlx::{Row, SqlitePool};
 
     use super::{CONSOLIDATION_INTERVAL, due, merge_duplicates, promote_to_machine, run_pass};
-    use crate::knowledge::{Known, Scope, approved, failure_signature, for_scope};
+    use crate::knowledge::{
+        Declaration, Kind, Known, Scope, approved, failure_signature, for_scope, propose,
+    };
 
     const PROJECT: &str = "nucleos";
     const FAILURE: &str = "error: build failed because the linker refused output.exe";
@@ -1227,6 +1229,51 @@ mod tests {
             None,
         )
         .await;
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+
+        let report = run_pass(&pool, at(1)).await.unwrap();
+
+        assert_eq!(report.pending, 1);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'project' AND scope_id = ? AND fingerprint = ?",
+        )
+        .bind(PROJECT)
+        .bind(fingerprint)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// The public proposal door writes the same fence the consolidator reads.
+    #[tokio::test]
+    async fn a_proposal_written_by_propose_is_never_proposed_again() {
+        let pool = test_pool().await;
+        let fingerprint = gate_fingerprint(FAILURE);
+        let (knowledge_id, _) = propose(
+            &pool,
+            Declaration {
+                project_id: Some(PROJECT),
+                origin_run_id: None,
+                kind: Kind::Memory,
+                title: "linker",
+                body: FAILURE,
+                reasoning: "seen twice",
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT fingerprint FROM knowledge WHERE id = ?")
+                .bind(knowledge_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.as_deref(), Some(fingerprint.as_str()));
+
         seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
         seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
 
