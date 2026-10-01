@@ -3217,11 +3217,6 @@ async fn post_autopilot_judge(
 ) -> Result<Json<AutopilotJudgeResponse>, (StatusCode, Json<serde_json::Value>)> {
     let judge = crate::judge::JudgeMode::from_db_str(&body.judge)
         .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "invalid"))?;
-    // Until the shell shows the residual risk beside the control, nothing accepts `enforce`
-    // (spec A review decision D); the bar below `set_project_judge` is already in force.
-    if judge == crate::judge::JudgeMode::Enforce {
-        return Err(refusal(StatusCode::CONFLICT, "enforce_unavailable"));
-    }
     match autopilot::set_project_judge(&state.pool, &body.project_id, judge).await {
         Ok(_) => judge_status(&state, body.project_id)
             .await
@@ -22142,7 +22137,7 @@ mod tests {
         .await;
         assert_eq!(
             (status, body["refusal"].as_str()),
-            (StatusCode::CONFLICT, Some("enforce_unavailable"))
+            (StatusCode::CONFLICT, Some("not_ready"))
         );
     }
 
