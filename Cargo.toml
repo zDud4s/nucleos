@@ -9,8 +9,12 @@ members = ["core"]
 exclude = ["shell/src-tauri"]
 
 [profile.dev]
-# Full DWARF is what made `target/` grow past 20 GB on this machine, and nothing
-# here reads it: backtraces only need file:line, which `line-tables-only` keeps.
-# Restore `debug = true` if you ever need to inspect variables in a debugger.
-# `profile.test` inherits this, so `cargo test` gets the same saving.
-debug = "line-tables-only"
+# No debuginfo at all. Full DWARF made `target/` grow past 20 GB on this machine, and
+# with any debuginfo on (even `line-tables-only`) sccache's cache key includes the cargo
+# target-dir path, so every `.cargo-target-<branch>` misses and recompiles the ~290
+# dependencies. Measured 2026-10-01 with sccache 0.18: `line-tables-only` / `1` missed
+# across two target dirs, `debug = 0` hit.
+# Lost: line numbers in panic backtraces (function names stay). To restore them, or to
+# inspect variables in a debugger, set `debug = "line-tables-only"` or `debug = true`.
+# `profile.test` inherits this, so `cargo test` gets the same behaviour.
+debug = 0
