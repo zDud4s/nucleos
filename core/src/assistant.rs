@@ -4573,10 +4573,15 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
 
-        let relayed_id =
-            send_relayed_message(&state, "relay-destination-chat", "onward", Origin::Shell, 7)
-                .await
-                .unwrap();
+        let relayed_id = send_relayed_message(
+            &state,
+            "relay-origin-destination-chat",
+            "onward",
+            Origin::Shell,
+            7,
+        )
+        .await
+        .unwrap();
         let from_relay: Option<i64> =
             sqlx::query_scalar("SELECT from_relay_id FROM runs WHERE id = ?")
                 .bind(relayed_id)
@@ -6675,11 +6680,16 @@ mod tests {
     #[tokio::test]
     async fn a_relay_learns_which_turn_answered_it() {
         let state = test_state().await;
-        let relay_id = seed_relay(&state.pool, "sender-chat", "relay-destination-chat").await;
+        let relay_id = seed_relay(
+            &state.pool,
+            "sender-chat",
+            "relay-delivered-destination-chat",
+        )
+        .await;
 
         let turn_id = send_relayed_message(
             &state,
-            "relay-destination-chat",
+            "relay-delivered-destination-chat",
             "onward",
             Origin::Shell,
             relay_id,
