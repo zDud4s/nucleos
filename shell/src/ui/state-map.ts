@@ -211,6 +211,14 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     worktree_branch_kept: { tone: "info", label: "unmerged branch kept" },
     worktree_removed: { tone: "off", label: "worktree removed" },
     worktree_gc_failed: { tone: "danger", label: "worktree cleanup failed" },
+    // The resolver (spec .ai/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md, D7). Its
+    // own lines, after today's: `worktree_gate_failed` is never edited. `judge_needs_owner` waits
+    // on a hand — the reader decides what the failed gate or the refused action needs — so it is
+    // Awaiting-You Amber; a correction started is a fact; a correction that did not finish is a
+    // failure of the automatic turn.
+    judge_needs_owner: { tone: "pending", label: "the judge hands this to you" },
+    judge_correction_started: { tone: "info", label: "correction started" },
+    judge_correction_failed: { tone: "danger", label: "correction did not finish" },
     // Git.
     vcs_request_finished: { tone: "info", label: "git request settled" },
     vcs_request_cancelled: { tone: "off", label: "git request cancelled" },

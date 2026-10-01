@@ -80,6 +80,9 @@ const LANE_OF: Record<string, FeedLane> = {
   worktree_branch_kept: "runs",
   worktree_removed: "runs",
   worktree_gc_failed: "runs",
+  judge_needs_owner: "runs",
+  judge_correction_started: "runs",
+  judge_correction_failed: "runs",
 
   vcs_request_finished: "git",
   vcs_request_cancelled: "git",
@@ -196,6 +199,8 @@ export function feedGravityTone(gravity: Exclude<FeedGravity, "routine">): Badge
  * - The starts and middles — a job started, planned or replanned, a team run or a council
  *   started, a council stage, a conflict resolution started — are open only because nothing has
  *   been written after them yet; the next line from the same subject closes or continues them.
+ * - a correction started (`judge_correction_started`) is open until its own run ends it —
+ *   `worktree_run_completed` or `judge_correction_failed` (spec .ai/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md, D7).
  */
 const OPEN_KINDS: ReadonlySet<string> = new Set([
   "job_started",
@@ -208,6 +213,7 @@ const OPEN_KINDS: ReadonlySet<string> = new Set([
   "council_started",
   "council_stage",
   "vcs_resolution_started",
+  "judge_correction_started",
 ]);
 
 /** The kinds {@link feedKindLeavesOpen} names. For the completeness test. */

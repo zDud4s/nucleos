@@ -192,6 +192,10 @@ describe("groupKinds", () => {
  * sharing a prefix would silently make two switches fight over one rule.
  */
 describe("NOTIFY_FAMILIES", () => {
+  it("declares the judge's family, which no run_ or worktree_ rule catches (spec D7)", () => {
+    expect(NOTIFY_FAMILIES.map((f) => f.selector)).toContain("judge_");
+  });
+
   it("has one entry per prefix, and no blank ones", () => {
     const selectors = NOTIFY_FAMILIES.map((f) => f.selector);
     expect(new Set(selectors).size).toBe(selectors.length);
