@@ -584,7 +584,7 @@ mod tests {
         );
         // A refspec or a remote-qualified name carries the branch without being equal to it.
         for arg in ["nucleos/run-1:main", "origin/nucleos/run-1"] {
-            let pool = pool().await;
+            let pool = self::pool().await;
             let (root, _) = lineage(&pool).await;
             request(
                 &pool,
