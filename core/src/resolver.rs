@@ -24,20 +24,23 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Looks for conflicts to resolve, forever. Spawned once by `main.rs`.
 ///
-/// Three passes on one tick, and they are separate because they are about different rows at
-/// different moments: one stops a resolution nobody needs any more, one starts a resolution, and
-/// one says what an already-published one cost. Sharing a tick is all they share — the last runs
-/// even when the others have been stopped, which is deliberate and argued at `record_discards`.
+/// Four passes on one tick, and they are separate because they are about different rows at
+/// different moments: one stops a resolution nobody needs any more, one starts a resolution, one
+/// hands a finished resolution to the queue (`land_finished`), and one says what an
+/// already-published one cost. Sharing a tick is all they share — the last runs even when the
+/// others have been stopped, which is deliberate and argued at `record_discards`.
 ///
 /// Stopping comes before starting, and the order is the point rather than a preference: a tick that
 /// minted before it cancelled would be a tick that could spend on a project already at its ceiling
 /// because of work that is about to be cancelled for being pointless.
 pub async fn run_resolution_loop(state: AppState) {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
+    let mut refused = std::collections::HashSet::new();
     loop {
         interval.tick().await;
         cancel_settled(&state).await;
         launch_once(&state).await;
+        land_finished(&state.pool, &mut refused).await;
         record_discards(&state.pool).await;
     }
 }
@@ -549,8 +552,8 @@ fn resolution_prompt(source: &str, target: &str, output_tail: Option<&str>) -> S
          resolution's whole job is that neither side's work is lost.\n\
          2. `git add` what you resolved and `git commit`. Committing on top of what is staged \
          produces the merge commit by itself; you do not have to do anything special to get it.\n\
-         3. Run `nucleos-core --land` from this worktree. That asks the queue to publish the result. \
-         The queue decides when.\n\
+         3. Stop. You do not land anything: once this run has finished, the daemon hands your merge \
+         commit to the queue itself, and the queue decides when it is published.\n\
          \n\
          Rules that are not negotiable:\n\
          \n\
@@ -562,6 +565,9 @@ fn resolution_prompt(source: &str, target: &str, output_tail: Option<&str>) -> S
          read at all — because a flattened resolution is exactly what looks perfect.\n\
          - Do not merge, push, pull, or delete branches. Those go to the queue, and the queue is what \
          asked you for this.\n\
+         - Never assign PATH, RUSTUP_HOME or CARGO_HOME, and do not go looking for tools. `cargo` and \
+         `git` are already on PATH; an assignment to one of those variables is held for a person to \
+         approve, and a resolution that stops there is one nobody gets the benefit of.\n\
          - Run ONE shell command at a time. No `&&` chains, no pipes, no `$(...)` — the classifier \
          holds compound shell for a person to approve, and a resolution that stops to be approved \
          for a `git log` is one nobody gets the benefit of. This costs you a few extra calls and \
@@ -593,6 +599,12 @@ fn resolution_prompt(source: &str, target: &str, output_tail: Option<&str>) -> S
 /// collecting the tree: the question is what PRODUCED this branch, and that does not stop being true
 /// when the directory goes away.
 ///
+/// **The run the branch names is not always the run the escalation records.** A resolution that
+/// paused for approval resumes as a successor (`runs.rs` moves `resolution_run_id` and the worktree
+/// row to it) while the branch keeps the ORIGINAL run's name, so the lookup also matches the run
+/// that currently owns the worktree on this branch. Without that arm every resumed resolution
+/// landed unverified and unlinked.
+///
 /// Scoped to the project, or two projects' branch names would decide each other's.
 pub(crate) async fn landing_is_a_resolution(
     pool: &sqlx::SqlitePool,
@@ -607,11 +619,13 @@ pub(crate) async fn landing_is_a_resolution(
     let found: sqlx::Result<bool> = sqlx::query_scalar(
         "SELECT EXISTS (
              SELECT 1 FROM vcs_requests
-              WHERE project_id = ? AND resolution_run_id = ?
+              WHERE project_id = ? AND (resolution_run_id = ? OR resolution_run_id IN (
+                        SELECT owner_id FROM worktrees WHERE owner_kind = 'run' AND branch = ?))
          )",
     )
     .bind(project_id)
     .bind(run)
+    .bind(branch)
     .fetch_one(pool)
     .await;
     match found {
@@ -651,10 +665,15 @@ pub(crate) async fn escalated_request_id(
 ) -> Option<i64> {
     let run = crate::worktree::run_behind_branch(branch)?;
     let found: sqlx::Result<Option<i64>> = sqlx::query_scalar(
-        "SELECT id FROM vcs_requests WHERE project_id = ? AND resolution_run_id = ?",
+        "SELECT id FROM vcs_requests
+          WHERE project_id = ? AND (resolution_run_id = ? OR resolution_run_id IN (
+                    SELECT owner_id FROM worktrees WHERE owner_kind = 'run' AND branch = ?))
+          ORDER BY id
+          LIMIT 1",
     )
     .bind(project_id)
     .bind(run)
+    .bind(branch)
     .fetch_optional(pool)
     .await;
     match found {
@@ -669,6 +688,216 @@ pub(crate) async fn escalated_request_id(
             None
         }
     }
+}
+
+/// One finished resolution, as `land_finished` reads it.
+#[derive(sqlx::FromRow)]
+struct Finished {
+    id: i64,
+    op: String,
+    args: String,
+    project_id: String,
+    worktree_path: String,
+    branch: String,
+    base_sha: Option<String>,
+    completed_at: Option<String>,
+}
+
+/// How long a completed run is left alone before its worktree is read, so a run that is about to
+/// hand off to a successor (which then owns the tree) is not mistaken for a finished one.
+const HANDOFF_GRACE: chrono::Duration = chrono::Duration::minutes(2);
+
+/// Hands a finished conflict resolution to the queue, so the agent never has to.
+///
+/// The agent resolves and commits and stops; `nucleos-core --land` is held by the classifier on every
+/// call and is not on its PATH anyway. This pass does what that command would have: `land::submit`
+/// with the escalation's own target, which still routes the branch through `verify_resolution`
+/// (`landing_is_a_resolution`) and links the escalation to the new row.
+///
+/// A resolution counts as finished when its run `completed` (not failed, not cancelled), has no
+/// successor and ended more than `HANDOFF_GRACE` ago, and its worktree holds a committed merge: no
+/// `MERGE_HEAD`, a second parent, and a HEAD that is not the base it was opened on. Idempotent from
+/// existing rows alone: `resolved_by IS NULL` is the brake, and a refusal is remembered in memory
+/// per (request, head) so it is reported once instead of every tick. Fails closed under the kill
+/// switch.
+async fn land_finished(
+    pool: &sqlx::SqlitePool,
+    refused: &mut std::collections::HashSet<(i64, String)>,
+) {
+    if crate::autopilot::kill_switch_engaged(pool)
+        .await
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let finished: Vec<Finished> = match sqlx::query_as(
+        "SELECT c.id, c.op, c.args, c.project_id, w.path AS worktree_path, w.branch,
+                w.base_sha, r.completed_at
+           FROM vcs_requests AS c
+           JOIN runs AS r ON r.id = c.resolution_run_id
+           JOIN worktrees AS w
+             ON w.owner_kind = 'run' AND w.owner_id = r.id AND w.removed_at IS NULL
+          WHERE c.status = 'escalated'
+            AND c.op = 'merge'
+            AND c.from_resolution = 0
+            AND c.resolved_by IS NULL
+            AND r.status = 'completed'
+            AND r.successor_run_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM vcs_requests s
+                             WHERE s.project_id = c.project_id AND s.args = c.args
+                               AND s.status = 'succeeded' AND s.id > c.id)
+          ORDER BY c.id",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "resolver: could not look for finished resolutions");
+            return;
+        }
+    };
+
+    for row in finished {
+        let old_enough = row
+            .completed_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| chrono::Utc::now() - at.with_timezone(&chrono::Utc) > HANDOFF_GRACE);
+        if !old_enough {
+            continue;
+        }
+        let Some(head) = finished_merge_head(
+            std::path::Path::new(&row.worktree_path),
+            row.base_sha.as_deref(),
+        )
+        .await
+        else {
+            continue;
+        };
+        if refused.contains(&(row.id, head.clone())) {
+            continue;
+        }
+        let target = match crate::vcs::Op::from_stored(&row.op, &row.args) {
+            Ok(crate::vcs::Op::Merge { target, .. }) => target,
+            _ => continue,
+        };
+        // The `resolved_by` link is written best-effort by `land::submit`; if it was lost, the
+        // queue still holds the row this branch was admitted as. Fail toward not submitting.
+        match branch_already_queued(pool, &row.project_id, &row.branch).await {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    vcs_request_id = row.id,
+                    %error,
+                    "resolver: could not check whether a finished resolution is already queued"
+                );
+                continue;
+            }
+        }
+        let repo = match crate::vcs::resolve_repo(pool, &row.project_id).await {
+            Ok(repo) => repo,
+            Err(error) => {
+                tracing::warn!(
+                    vcs_request_id = row.id,
+                    ?error,
+                    "resolver: could not resolve the repository of a finished resolution"
+                );
+                continue;
+            }
+        };
+        let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+        let project_root = std::path::PathBuf::from(repo.root());
+        let outcome = crate::land::submit(
+            pool,
+            &repo,
+            &project_root,
+            &row.branch,
+            Some(target.as_str()),
+            deadline,
+        )
+        .await;
+        match outcome {
+            Ok(landing) => tracing::info!(
+                vcs_request_id = row.id,
+                landing,
+                "resolver: handed a finished resolution to the queue"
+            ),
+            Err(refusal) => {
+                refused.insert((row.id, head));
+                // `NotAdmitted` was already announced by `land::submit` itself.
+                if !matches!(refusal, crate::land::LandRefusal::NotAdmitted(_)) {
+                    let summary = format!(
+                        "{}'s conflict resolution on {} was not handed to the queue: {}",
+                        row.project_id,
+                        row.branch,
+                        refusal.message()
+                    );
+                    if let Err(error) = crate::notify::deliver_or_defer(
+                        pool,
+                        crate::land::RESOLUTION_FAILED_KIND,
+                        &summary,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, "resolver: could not notify about a refused resolution");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether the project's queue already holds a merge whose source is `branch`, in any status.
+///
+/// `args` is JSON, so the substring filter only narrows the rows; the parse decides.
+async fn branch_already_queued(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    branch: &str,
+) -> sqlx::Result<bool> {
+    let stored: Vec<String> = sqlx::query_scalar(
+        "SELECT args FROM vcs_requests
+          WHERE project_id = ? AND op = 'merge' AND instr(args, ?) > 0",
+    )
+    .bind(project_id)
+    .bind(branch)
+    .fetch_all(pool)
+    .await?;
+    Ok(stored.iter().any(|args| {
+        matches!(
+            crate::vcs::Op::from_stored("merge", args),
+            Ok(crate::vcs::Op::Merge { source, .. }) if source.as_str() == branch
+        )
+    }))
+}
+
+/// The HEAD of a worktree that holds a finished merge: no `MERGE_HEAD`, a second parent, and not
+/// the base the tree was opened on. `None` for anything else, including a git that would not run.
+async fn finished_merge_head(path: &std::path::Path, base_sha: Option<&str>) -> Option<String> {
+    async fn rev_parse(path: &std::path::Path, revision: &str) -> Option<String> {
+        let output = crate::worktree::git()
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "-q", "--verify", revision])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+    if rev_parse(path, "MERGE_HEAD").await.is_some() {
+        return None;
+    }
+    rev_parse(path, "HEAD^2").await?;
+    let head = rev_parse(path, "HEAD").await?;
+    if base_sha == Some(head.as_str()) {
+        return None;
+    }
+    Some(head)
 }
 
 #[cfg(test)]
@@ -1126,10 +1355,6 @@ mod tests {
             "the agent should know why a flattened resolution is refused before it makes one"
         );
         assert!(
-            prompt.contains("nucleos-core --land"),
-            "a resolution nobody can publish is not one"
-        );
-        assert!(
             prompt.contains("ALREADY STAGED"),
             "an agent told to merge would go to the queue that refused this merge, and circle"
         );
@@ -1145,6 +1370,359 @@ mod tests {
         assert!(
             prompt.contains("CONFLICT (content): seed.txt"),
             "git's own account of the conflict is the one thing here nobody has to guess at"
+        );
+    }
+
+    /// The agent resolves, commits and stops: handing the commit to the queue is the daemon's job.
+    /// `nucleos-core --land` is held by the classifier on every call and the binary is not on the
+    /// agent's PATH anyway, so a prompt that asks for it produces improvisation instead of a landing.
+    #[test]
+    fn the_prompt_never_asks_the_agent_to_land_or_touch_path() {
+        for output in [Some("CONFLICT (content): seed.txt"), None] {
+            let prompt = resolution_prompt("feat/x", "master", output);
+            assert!(
+                !prompt.contains("--land"),
+                "the agent is not the one who lands: {prompt}"
+            );
+            assert!(
+                !prompt.contains("nucleos-core"),
+                "the agent has no such binary to run: {prompt}"
+            );
+            assert!(
+                prompt.contains("queue"),
+                "the agent should be told where its commit goes once it stops"
+            );
+            for variable in ["PATH", "RUSTUP_HOME", "CARGO_HOME"] {
+                assert!(
+                    prompt.contains(variable),
+                    "assigning {variable} is what stalled the earlier resolutions, so it is named"
+                );
+            }
+            assert!(
+                prompt.to_lowercase().contains("already on path"),
+                "cargo needs no setup, and saying so is what stops the improvising"
+            );
+        }
+    }
+
+    fn git_at(dir: &std::path::Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git should start")
+            .success()
+    }
+
+    /// How far the resolver's worktree got before its run ended.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Progress {
+        /// Conflicts resolved and the merge committed: a 2-parent HEAD, no `MERGE_HEAD`.
+        Committed,
+        /// The merge is still staged and uncommitted: `MERGE_HEAD` exists.
+        MidMerge,
+        /// Nothing was done: HEAD is still the base the worktree was opened on.
+        Untouched,
+    }
+
+    struct Scenario {
+        _container: tempfile::TempDir,
+        request: i64,
+        branch: String,
+    }
+
+    /// A real repository where `feat/x` and `master` conflict, a worktree on `nucleos/run-7` opened at
+    /// `master` and taken to `progress`, and the rows the daemon would hold for it: the escalation
+    /// (project root pointed at the real repository), its run recorded as `run_status`, finished long
+    /// enough ago to be past any grace, and the worktree row owned by run 7.
+    async fn resolution_scenario(
+        pool: &sqlx::SqlitePool,
+        prefix: &str,
+        run_status: &str,
+        progress: Progress,
+    ) -> Scenario {
+        let container = crate::git_exec::tests::space_free_tempdir(prefix);
+        let repo = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&repo);
+        assert!(git_at(&repo, &["branch", "-M", "master"]));
+        assert!(git_at(&repo, &["checkout", "-q", "-b", "feat/x"]));
+        std::fs::write(repo.join("seed.txt"), "theirs\n").unwrap();
+        assert!(git_at(&repo, &["commit", "-am", "theirs"]));
+        assert!(git_at(&repo, &["checkout", "-q", "master"]));
+        std::fs::write(repo.join("seed.txt"), "ours\n").unwrap();
+        assert!(git_at(&repo, &["commit", "-am", "ours"]));
+        let base = crate::git_exec::tests::sha_of(&repo, "master");
+
+        let branch = crate::worktree::Owner::Run(7).branch_name();
+        let tree = container.path().join("run-7");
+        assert!(git_at(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                &tree.to_string_lossy(),
+                "master"
+            ]
+        ));
+        if progress != Progress::Untouched {
+            // Conflicts, so this exits non-zero by design; the staged state is what is wanted.
+            let _ = git_at(&tree, &["merge", "--no-ff", "--no-commit", "feat/x"]);
+            std::fs::write(tree.join("seed.txt"), "both\n").unwrap();
+            assert!(git_at(&tree, &["add", "-A"]));
+            if progress == Progress::Committed {
+                assert!(git_at(&tree, &["commit", "-q", "-m", "resolved"]));
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root, integration_branch)
+             VALUES ('proj', 'active', ?, 'master')",
+        )
+        .bind(repo.to_string_lossy().into_owned())
+        .execute(pool)
+        .await
+        .expect("seed the project's roster row");
+
+        let request = escalated_merge_of(pool, "feat/x", false).await;
+        sqlx::query("UPDATE vcs_requests SET project_root = ? WHERE id = ?")
+            .bind(repo.to_string_lossy().into_owned())
+            .bind(request)
+            .execute(pool)
+            .await
+            .unwrap();
+        resolving(pool, request, 7).await;
+
+        insert_run(pool, 7, run_status).await;
+        sqlx::query("UPDATE runs SET completed_at = ? WHERE id = 7")
+            .bind((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339())
+            .execute(pool)
+            .await
+            .unwrap();
+        crate::worktree::record(
+            pool,
+            crate::worktree::Owner::Run(7),
+            "proj",
+            &repo.to_string_lossy(),
+            &tree.to_string_lossy(),
+            &branch,
+            Some(&base),
+        )
+        .await
+        .unwrap();
+
+        Scenario {
+            _container: container,
+            request,
+            branch,
+        }
+    }
+
+    /// Rows other than the escalation itself that were admitted as a resolution of `branch`.
+    async fn admitted_resolutions(pool: &sqlx::SqlitePool, scenario: &Scenario) -> Vec<i64> {
+        sqlx::query_scalar(
+            "SELECT id FROM vcs_requests
+              WHERE from_resolution = 1 AND id != ? AND args LIKE ?
+              ORDER BY id",
+        )
+        .bind(scenario.request)
+        .bind(format!("%{}%", scenario.branch))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// **AC2.** The agent stops after committing and the daemon hands the commit over, once, and
+    /// linked: the escalation points at the new row, the new row carries the resolution flag so
+    /// `verify_resolution` still gates publication, and a later tick admits nothing more.
+    #[tokio::test]
+    async fn a_finished_resolution_is_handed_to_the_queue_exactly_once() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-land-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+
+        let mut refused = Default::default();
+        land_finished(&pool, &mut refused).await;
+
+        let admitted = admitted_resolutions(&pool, &scenario).await;
+        assert_eq!(admitted.len(), 1, "one landing for one finished resolution");
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT resolved_by FROM vcs_requests WHERE id = ?")
+                .bind(scenario.request)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            linked,
+            Some(admitted[0]),
+            "the session still waiting on the escalation follows this link to the landing"
+        );
+
+        land_finished(&pool, &mut refused).await;
+        assert_eq!(
+            admitted_resolutions(&pool, &scenario).await,
+            admitted,
+            "a second pass over the same finished resolution admits nothing"
+        );
+    }
+
+    /// **AC3.** Each of these leaves something a person or the agent still owns, or nothing to land.
+    #[tokio::test]
+    async fn a_resolution_without_a_finished_merge_is_never_handed_over() {
+        for (status, progress, why) in [
+            (
+                "failed",
+                Progress::Committed,
+                "a failed run's commit is not a finished resolution",
+            ),
+            (
+                "cancelled",
+                Progress::Committed,
+                "a cancelled run was stopped, not finished",
+            ),
+            (
+                "completed",
+                Progress::MidMerge,
+                "MERGE_HEAD is still there, so the merge is unfinished",
+            ),
+            (
+                "completed",
+                Progress::Untouched,
+                "HEAD is still the base, so nothing was resolved",
+            ),
+        ] {
+            let pool = test_pool().await;
+            let scenario =
+                resolution_scenario(&pool, "nucleos-resolver-nolanding-", status, progress).await;
+
+            let mut refused = Default::default();
+            land_finished(&pool, &mut refused).await;
+
+            assert!(
+                admitted_resolutions(&pool, &scenario).await.is_empty(),
+                "{why}"
+            );
+            let linked: Option<i64> =
+                sqlx::query_scalar("SELECT resolved_by FROM vcs_requests WHERE id = ?")
+                    .bind(scenario.request)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(linked, None, "{why}");
+        }
+    }
+
+    /// A conflict that a later merge of the same two branches already published is settled, and
+    /// handing its resolution over would re-admit a stale one.
+    #[tokio::test]
+    async fn a_conflict_settled_by_a_later_merge_is_never_handed_over() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-settled-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+        let later = succeeded_merge_of(&pool, "feat/x", false).await;
+        assert!(later > scenario.request, "the settling merge came later");
+
+        let mut refused = Default::default();
+        land_finished(&pool, &mut refused).await;
+
+        assert!(
+            admitted_resolutions(&pool, &scenario).await.is_empty(),
+            "a conflict settled by a different merge is not re-admitted"
+        );
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT resolved_by FROM vcs_requests WHERE id = ?")
+                .bind(scenario.request)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, None);
+    }
+
+    /// The `resolved_by` link is best-effort, so the pass cannot lean on it alone: a branch the
+    /// queue already holds a merge of is not submitted a second time.
+    #[tokio::test]
+    async fn a_branch_already_in_the_queue_is_not_submitted_again() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-queued-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+        // The row an earlier tick admitted, whose link back to the escalation was never written.
+        escalated_merge_of(&pool, &scenario.branch, false).await;
+
+        let mut refused = Default::default();
+        land_finished(&pool, &mut refused).await;
+
+        assert!(
+            admitted_resolutions(&pool, &scenario).await.is_empty(),
+            "nothing new is admitted for a branch the queue already holds"
+        );
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT resolved_by FROM vcs_requests WHERE id = ?")
+                .bind(scenario.request)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, None);
+    }
+
+    /// **AC4.** A resolution that paused for approval resumes under a new run id: the escalation's
+    /// `resolution_run_id` and the worktree row both move to the successor while the branch keeps
+    /// naming the original run. Both lookups have to follow the run that owns the tree, or the
+    /// landing is published unverified and unlinked — which is what every resumed one did.
+    #[tokio::test]
+    async fn a_resumed_resolution_is_still_recognised_and_linked() {
+        let pool = test_pool().await;
+        let request = escalated_merge(&pool, false).await;
+        resolving(&pool, request, 9).await;
+        crate::worktree::record(
+            &pool,
+            crate::worktree::Owner::Run(9),
+            "proj",
+            "C:/repo",
+            "C:/wt/run-7",
+            "nucleos/run-7",
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            landing_is_a_resolution(&pool, "proj", "nucleos/run-7").await,
+            "the branch names run 7 but the escalation now records 9, which owns the tree"
+        );
+        assert_eq!(
+            escalated_request_id(&pool, "proj", "nucleos/run-7").await,
+            Some(request),
+            "the link has to be written for the successor's landing too"
+        );
+        assert!(
+            !landing_is_a_resolution(&pool, "other", "nucleos/run-7").await,
+            "still scoped to the project"
+        );
+        assert!(
+            !landing_is_a_resolution(&pool, "proj", "nucleos/run-8").await,
+            "a branch whose tree belongs to nobody the escalation names is not a resolution"
+        );
+        assert_eq!(
+            escalated_request_id(&pool, "proj", "nucleos/run-8").await,
+            None
         );
     }
 
