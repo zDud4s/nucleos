@@ -3242,12 +3242,8 @@ async fn post_autopilot_judge_resolve(
 ) -> Result<Json<JudgeResolveResponse>, (StatusCode, Json<serde_json::Value>)> {
     let mode = crate::judge::JudgeMode::from_db_str(&body.judge_resolve)
         .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "invalid"))?;
-    // As spec A's route did until its warning was on screen: `enforce` is not accepted over HTTP
-    // until the resolver's own warning is (the shell's residual-risk notice removes these lines).
-    // The bar itself is enforced below, by `set_project_judge_resolve`, whatever door asks.
-    if mode == crate::judge::JudgeMode::Enforce {
-        return Err(refusal(StatusCode::CONFLICT, "enforce_unavailable"));
-    }
+    // `enforce` is accepted now that the shell shows its residual risk (spec D11). The bar is
+    // enforced by `set_project_judge_resolve`, whatever door asks.
     match autopilot::set_project_judge_resolve(&state.pool, &body.project_id, mode).await {
         Ok(judge_resolve) => {
             let readiness = crate::judge::resolve_review::readiness(&state.pool, &body.project_id)
@@ -22131,7 +22127,7 @@ mod tests {
         .await;
         assert_eq!(
             (status, body["refusal"].as_str()),
-            (StatusCode::CONFLICT, Some("enforce_unavailable"))
+            (StatusCode::CONFLICT, Some("not_ready"))
         );
     }
 
