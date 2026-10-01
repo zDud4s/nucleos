@@ -76,6 +76,23 @@ export type KnownStatus =
   | "expired"
   | "live";
 
+export const EVIDENCE_TAGS = [
+  "run",
+  "job_item",
+  "proposal",
+  "knowledge",
+  "project",
+  "command",
+  "gate",
+] as const;
+
+export type EvidenceTag = (typeof EVIDENCE_TAGS)[number];
+
+export interface EvidenceRef {
+  t: EvidenceTag;
+  id: number | string;
+}
+
 /** One thing the agent knows, as `knowledge::Known` serialises. */
 export interface Known {
   id: number;
@@ -85,6 +102,7 @@ export interface Known {
   scope_id: string | null;
   /** Who knocked at the door — never read from the body. */
   source: "owner" | "run" | "consolidator";
+  generator: string | null;
   kind: KnownKind;
   title: string;
   body: string;
@@ -94,9 +112,80 @@ export interface Known {
   /** The row this one replaces, ended when this one was approved. */
   supersedes: number | null;
   origin_run_id: number | null;
+  evidence: string | null;
+  observations: number | null;
+  fingerprint: string | null;
+  expires_after_runs: number | null;
+  last_confirmed_at: string | null;
+  shown_count: number;
+  outcome_count: number;
+  green_count: number;
+  last_shown_at: string | null;
   created_at: string;
   activated_at: string | null;
   ended_at: string | null;
+}
+
+/**
+ * Read the tagged evidence JSON without letting a stale or future tag invent a
+ * destination in the shell. Malformed JSON is absence; known entries survive
+ * independently of malformed neighbours.
+ */
+export function parseEvidence(raw: string | null): EvidenceRef[] {
+  if (raw === null) return [];
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+
+  const tags: ReadonlySet<string> = new Set(EVIDENCE_TAGS);
+  return parsed.flatMap((item): EvidenceRef[] => {
+    if (typeof item !== "object" || item === null) return [];
+    const candidate = item as { t?: unknown; id?: unknown };
+    if (typeof candidate.t !== "string" || !tags.has(candidate.t)) return [];
+    if (typeof candidate.id !== "string" && typeof candidate.id !== "number") return [];
+    return [{ t: candidate.t as EvidenceTag, id: candidate.id }];
+  });
+}
+
+export interface MeasuredScope {
+  scope: string;
+  total: number;
+  byGenerator: { generator: string; count: number }[];
+}
+
+/** Active measurements, grouped into the number spec 13.1 asks a person to watch. */
+export function measuredByGenerator(rows: Known[]): MeasuredScope[] {
+  const scopes = new Map<string, Map<string, number>>();
+
+  for (const row of rows) {
+    if (
+      row.status !== "active" ||
+      row.layer !== "episodic" ||
+      row.source !== "consolidator"
+    ) {
+      continue;
+    }
+    const scope = row.scope_id ?? "this machine";
+    const generator = row.generator ?? "unknown";
+    const counts = scopes.get(scope) ?? new Map<string, number>();
+    counts.set(generator, (counts.get(generator) ?? 0) + 1);
+    scopes.set(scope, counts);
+  }
+
+  return [...scopes.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([scope, counts]) => ({
+      scope,
+      total: [...counts.values()].reduce((sum, count) => sum + count, 0),
+      byGenerator: [...counts.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([generator, count]) => ({ generator, count })),
+    }));
 }
 
 /** One decision in a row's life — `knowledge::Event`. */

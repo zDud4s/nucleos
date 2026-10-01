@@ -1,6 +1,9 @@
 import { useState, type ReactNode } from "react";
+import { Link } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
+  measuredByGenerator,
+  parseEvidence,
   useApproveKnowledge,
   useKnowledge,
   useKnowledgeHistory,
@@ -8,6 +11,7 @@ import {
   useRevertKnowledge,
   type Known,
   type KnownKind,
+  type KnownLayer,
   type KnownStatus,
 } from "../data/knowledge";
 import {
@@ -39,12 +43,13 @@ import "./learned.css";
  * where nothing is ever decided, and what was waiting to be decided here is
  * what every later run gets told.
  *
- * **Three lists and not one, in this order.** What is proposed comes
+ * **Four lists and not one, in this order.** What is proposed comes
  * first because it is the only part that is a task. What is in force comes
- * second because it is the answer to "why did the agent do that". What is over
- * comes last and is read rarely — but it is never deleted, because "what did it
- * say before I changed it" is the question a person asks at the exact moment
- * they are considering changing it again.
+ * second because it is the answer to "why did the agent do that". What is live
+ * inside a job comes third because it reaches only that job. What is over comes
+ * last and is read rarely — but it is never deleted, because "what did it say
+ * before I changed it" is the question a person asks at the exact moment they
+ * are considering changing it again.
  *
  * The chain behind a row is fetched only when somebody opens it. Forty rows
  * would otherwise be forty-one requests to answer a question nobody asked.
@@ -55,10 +60,25 @@ export function Learned() {
   const reject = useRejectKnowledge();
   const revert = useRevertKnowledge();
 
+  const [layer, setLayer] = useState<KnownLayer | "all">("all");
+  const [scope, setScope] = useState("all");
+
   const rows = knowledge.data;
-  const waiting = rows?.filter((row) => row.status === "proposed") ?? [];
-  const inForce = rows?.filter((row) => row.status === "active") ?? [];
-  const over = rows?.filter((row) => OVER.has(row.status)) ?? [];
+  const scopes = scopeOptions(rows ?? []);
+  const scoped = rows?.filter((row) =>
+    scope === "all"
+      ? true
+      : scope === "machine"
+        ? row.scope_kind === "machine"
+        : row.scope_id === scope,
+  );
+  const filtered = scoped?.filter((row) => layer === "all" || row.layer === layer);
+  const waiting = filtered?.filter((row) => row.status === "proposed") ?? [];
+  const inForce = filtered?.filter((row) => row.status === "active") ?? [];
+  const live = filtered?.filter((row) => row.status === "live") ?? [];
+  const over = filtered?.filter((row) => OVER.has(row.status)) ?? [];
+  const measured = measuredByGenerator(scoped ?? []);
+  const measuredTotal = measured.reduce((sum, group) => sum + group.total, 0);
 
   // The three mutations share one error slot on purpose: they are three answers
   // to the same question, only one is ever in flight, and a refusal from any of
@@ -67,7 +87,7 @@ export function Learned() {
 
   return (
     <>
-      <PageHeader title="Learned" headline={headline(rows)} />
+      <PageHeader title="Learned" headline={headline(filtered)} />
 
       {knowledge.isError && (
         <ErrorNote>
@@ -84,6 +104,38 @@ export function Learned() {
           so an empty layer means the agent is running on its standing brief
           alone.
         </Teach>
+      )}
+
+      {rows !== undefined && rows.length > 0 && (
+        <div className="learned-filters">
+          <div role="group" aria-label="Layer">
+            {LAYER_FILTERS.map(([value, label]) => (
+              <Button
+                key={value}
+                variant="quiet"
+                aria-pressed={layer === value}
+                onClick={() => setLayer(value)}
+              >
+                {label}
+              </Button>
+            ))}
+          </div>
+          <label>
+            Scope{" "}
+            <select
+              aria-label="Scope"
+              value={scope}
+              onChange={(event) => setScope(event.target.value)}
+            >
+              <option value="all">All scopes</option>
+              {scopes.map((option) => (
+                <option key={option.key} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
       )}
 
       {waiting.length > 0 && (
@@ -165,6 +217,20 @@ export function Learned() {
         </Panel>
       )}
 
+      {live.length > 0 && (
+        <Panel title="Live in a job" aside={<Count n={live.length} />}>
+          <p className="learned-lede">
+            Facts a run left for the rest of its own job. They reach only that
+            job&apos;s later nodes and are closed when it ends.
+          </p>
+          <Rows label="Live in a job">
+            {[...live].sort(byKindThenId).map((row) => (
+              <KnownRow key={row.id} row={row} />
+            ))}
+          </Rows>
+        </Panel>
+      )}
+
       {over.length > 0 && (
         <Panel title="No longer in force" aside={<Count n={over.length} />}>
           <p className="learned-lede">
@@ -180,15 +246,43 @@ export function Learned() {
           </Rows>
         </Panel>
       )}
+
+      {measured.length > 0 && (
+        <Panel title="Measured, by generator" aside={<Count n={measuredTotal} />}>
+          <Rows label="Measured, by generator">
+            {measured.map((group) => (
+              <Row key={group.scope} className="learned-measured-row">
+                <span className="learned-scope">{group.scope}</span>
+                {group.byGenerator.map((entry) => (
+                  <span key={entry.generator}>
+                    {entry.generator}: {entry.count}
+                  </span>
+                ))}
+              </Row>
+            ))}
+          </Rows>
+        </Panel>
+      )}
     </>
   );
 }
 
-/** The three statuses that mean "was decided, and is not applying now". */
+const LAYER_FILTERS: readonly (readonly [KnownLayer | "all", string])[] = [
+  ["all", "All"],
+  ["semantic", "Facts"],
+  ["episodic", "Measured"],
+  ["procedural", "How-to"],
+  ["working", "Working"],
+];
+
+/** The statuses that mean "was decided, and is not applying now". */
 const OVER: ReadonlySet<KnownStatus> = new Set<KnownStatus>([
   "rejected",
   "reverted",
   "superseded",
+  "archived",
+  "closed",
+  "expired",
 ]);
 
 /**
@@ -199,7 +293,8 @@ const OVER: ReadonlySet<KnownStatus> = new Set<KnownStatus>([
  * is waiting, revert what is in force, and do nothing at all to what is over.
  */
 function KnownRow({ row, decisions }: { row: Known; decisions?: ReactNode }) {
-  const [open, setOpen] = useState(false);
+  const [chainId, setChainId] = useState<number | null>(null);
+  const evidence = parseEvidence(row.evidence);
 
   return (
     <Row className="learned-row">
@@ -208,6 +303,13 @@ function KnownRow({ row, decisions }: { row: Known; decisions?: ReactNode }) {
         <span className="learned-scope">
           {row.scope_id ?? "this machine"}
         </span>
+        <span className="learned-layer">{row.layer}</span>
+        <span className="learned-source">{row.source}</span>
+        {row.observations !== null && (
+          <span className="learned-count">
+            measured {row.observations} time{row.observations === 1 ? "" : "s"}
+          </span>
+        )}
         <span className="learned-when">
           <RelativeTime at={row.activated_at ?? row.created_at} />
         </span>
@@ -216,20 +318,54 @@ function KnownRow({ row, decisions }: { row: Known; decisions?: ReactNode }) {
       <p className="learned-title">{row.title}</p>
       <p className="learned-body">{row.body}</p>
 
+      {evidence.length > 0 && (
+        <ul className="learned-evidence">
+          {evidence.map((ref, index) => (
+            <li key={`${ref.t}-${String(ref.id)}-${index}`}>
+              {ref.t === "run" ? (
+                <Link to="/runs/$runId" params={{ runId: String(ref.id) }}>
+                  run {ref.id}
+                </Link>
+              ) : ref.t === "knowledge" && knowledgeId(ref.id) !== null ? (
+                <Button
+                  variant="quiet"
+                  aria-expanded={chainId === knowledgeId(ref.id)}
+                  onClick={() => {
+                    const id = knowledgeId(ref.id);
+                    if (id !== null) setChainId(chainId === id ? null : id);
+                  }}
+                >
+                  knowledge {ref.id}
+                </Button>
+              ) : (
+                <span>
+                  {ref.t} {ref.id}
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+
       <div className="learned-foot">
         <Button
           variant="quiet"
-          aria-expanded={open}
-          onClick={() => setOpen(!open)}
+          aria-expanded={chainId === row.id}
+          onClick={() => setChainId(chainId === row.id ? null : row.id)}
         >
           {row.supersedes === null ? "History" : "What it replaced"}
         </Button>
         {decisions}
       </div>
 
-      {open && <Chain id={row.id} />}
+      {chainId !== null && <Chain id={chainId} />}
     </Row>
   );
+}
+
+function knowledgeId(id: number | string): number | null {
+  const numeric = typeof id === "number" ? id : Number(id);
+  return Number.isFinite(numeric) ? numeric : null;
 }
 
 /**
@@ -308,6 +444,24 @@ function byKindThenId(left: Known, right: Known): number {
   return order !== 0 ? order : left.id - right.id;
 }
 
+function scopeOptions(rows: Known[]) {
+  const options = new Map<
+    string,
+    { key: string; value: string; label: string }
+  >();
+  for (const row of rows) {
+    const key = `${row.scope_kind}:${row.scope_id ?? ""}`;
+    options.set(key, {
+      key,
+      value: row.scope_kind === "machine" ? "machine" : (row.scope_id ?? "machine"),
+      label: row.scope_id ?? "this machine",
+    });
+  }
+  return [...options.values()].sort(
+    (left, right) => left.label.localeCompare(right.label) || left.key.localeCompare(right.key),
+  );
+}
+
 /** `refine::Kind`'s own order: an instruction changes what a node does, a fact what it believes. */
 const KIND_ORDER: Record<KnownKind, number> = {
   prompt: 0,
@@ -354,15 +508,26 @@ function headline(rows: Known[] | undefined): string | undefined {
   if (rows === undefined) return undefined;
   const waiting = rows.filter((row) => row.status === "proposed").length;
   const inForce = rows.filter((row) => row.status === "active").length;
+  const measured = rows.filter(
+    (row) =>
+      row.status === "active" &&
+      row.layer === "episodic" &&
+      row.source === "consolidator",
+  ).length;
 
   if (rows.length === 0)
     return "the agent is running on its standing brief alone";
   const held =
     inForce === 1 ? "one note is in force" : `${inForce} notes are in force`;
-  if (waiting === 0) return `${held}; nothing proposed`;
+  const proposed =
+    waiting === 0
+      ? "nothing proposed"
+      : `${waiting} note${waiting === 1 ? "" : "s"} proposed`;
+  const base = `${held}; ${proposed}`;
+  if (measured > 0) return `${base}; ${measured} measured`;
   // "note", which is the word the clause before it already uses. The store is
   // called knowledge and the page is called Learned; neither is a word to count
   // out loud, and "3 refinements proposed" is the old table's name surviving in
   // the one place a person reads it.
-  return `${held}; ${waiting} note${waiting === 1 ? "" : "s"} proposed`;
+  return base;
 }
