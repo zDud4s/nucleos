@@ -36,7 +36,7 @@ use crate::vcs::{Branch, Op, Origin, ResolvedRepo};
 /// Decision #7's feed kind: a conflict resolution the agent could not produce, or that admission
 /// otherwise refused. Named so it reads as this module's own line among `vcs_request_finished` and
 /// the rest, rather than blending into them.
-const RESOLUTION_FAILED_KIND: &str = "land_resolution_failed";
+pub(crate) const RESOLUTION_FAILED_KIND: &str = "land_resolution_failed";
 
 /// Why a landing could not be submitted.
 ///
