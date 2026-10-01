@@ -13738,7 +13738,8 @@ pub(crate) async fn post_finding(
             .map_err(|error| match error {
                 crate::knowledge::FindingError::EmptyFact
                 | crate::knowledge::FindingError::FactTooLong
-                | crate::knowledge::FindingError::NoEvidence => {
+                | crate::knowledge::FindingError::NoEvidence
+                | crate::knowledge::FindingError::EvidenceTooLong => {
                     (StatusCode::BAD_REQUEST, error.to_string()).into_response()
                 }
                 crate::knowledge::FindingError::NoJob

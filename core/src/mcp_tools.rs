@@ -4222,6 +4222,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_oversize_evidence_is_refused_at_the_door() {
+        let pool = test_pool().await;
+        let (_, run_id) = seed_job_run(&pool, "implementing").await;
+        let evidence = serde_json::Value::Array(
+            (1..=200)
+                .map(|id| serde_json::json!({"t": "run", "id": id}))
+                .collect(),
+        );
+
+        let (status, _) = finding_at_door(
+            &pool,
+            crate::auth::Scope::Run(run_id),
+            serde_json::json!({"fact": "too much evidence", "evidence": evidence}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let written: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE layer = 'working'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(written, 0);
+
+        let (status, _) = finding_at_door(
+            &pool,
+            crate::auth::Scope::Run(run_id),
+            serde_json::json!({
+                "fact": "small evidence",
+                "evidence": [{"t": "run", "id": run_id}],
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+    }
+
+    #[tokio::test]
     async fn an_evidence_of_nothing_but_unknown_tags_is_no_evidence() {
         let pool = test_pool().await;
         let (_, run_id) = seed_job_run(&pool, "implementing").await;
