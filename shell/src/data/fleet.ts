@@ -233,6 +233,20 @@ export interface RunSearchResult {
   completed_at: string | null;
   cost_usd: number | null;
   prompt_excerpt: string;
+  /**
+   * The route trail, flat and nullable — what ran (`model`, `effort`, `runner`) and what the local
+   * llm-router advised (`advised_*`). All null on a run from before the router, or from an older
+   * daemon. See `RunDetail` for the full semantics.
+   */
+  model?: string | null;
+  effort?: string | null;
+  runner?: string | null;
+  route_mode?: string | null;
+  route_decision_id?: string | null;
+  advised_runner?: string | null;
+  advised_model?: string | null;
+  advised_effort?: string | null;
+  route_failed?: string | null;
 }
 
 /**

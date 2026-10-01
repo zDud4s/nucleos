@@ -1817,7 +1817,7 @@ const RUN_DETAIL = {
  */
 const RUN_INDEX: RunSearchResult[] = [
   { id: 1, project_id: "alpha", status: "completed", mode: "real", created_at: ago(5 * 60_000), completed_at: ago(60_000), cost_usd: 0.0412, prompt_excerpt: "Check the changed files, run the selected gate, and summarise the result for the release note." },
-  { id: 2, project_id: "bravo", status: "running", mode: "real", created_at: ago(10 * 60_000), completed_at: null, cost_usd: null, prompt_excerpt: "Trace the approval queue delay and prepare a small, reversible fix." },
+  { id: 2, project_id: "bravo", status: "running", mode: "real", created_at: ago(10 * 60_000), completed_at: null, cost_usd: null, prompt_excerpt: "Trace the approval queue delay and prepare a small, reversible fix.", runner: "claude", model: "sonnet", effort: "high", route_mode: "shadow", route_decision_id: "7", advised_runner: "claude", advised_model: "haiku", advised_effort: "low", route_failed: null },
   { id: 3, project_id: "charlie", status: "awaiting_approval", mode: "shadow", created_at: ago(18 * 60_000), completed_at: null, cost_usd: null, prompt_excerpt: "Review the proposed dependency update before it changes the build image." },
   { id: 4, project_id: "delta", status: "superseded", mode: "worktree", created_at: ago(32 * 60_000), completed_at: ago(30 * 60_000), cost_usd: 0.0084, prompt_excerpt: "Map the incoming request to the owning team and queue the first safe step." },
   { id: 5, project_id: null, status: "failed", mode: "real", created_at: ago(3 * 3_600_000), completed_at: ago(2 * 3_600_000), cost_usd: 0.0167, prompt_excerpt: "Reproduce the sidecar handshake failure with the production-shaped configuration." },
@@ -1829,6 +1829,19 @@ const RUN_INDEX: RunSearchResult[] = [
   { id: 11, project_id: "delta", status: "interrupted", mode: "worktree", created_at: ago(4 * DAY), completed_at: ago(95 * 3_600_000), cost_usd: null, prompt_excerpt: "Refine the dashboard hierarchy so the queue state remains legible when several teams are blocked at once and the operator needs the cause before the chronology." },
   { id: 12, project_id: null, status: "completed", mode: "real", created_at: ago(5 * DAY), completed_at: ago(119 * 3_600_000), cost_usd: 0.0528, prompt_excerpt: "Document the observed retry pattern, including the handoff signals that distinguish a delayed worker from a run that has silently stopped making progress." },
 ];
+
+const ROUTE_REPORT = {
+  days: 30,
+  runs: 42,
+  shadow: 36,
+  apply: 6,
+  advised: 33,
+  matched: 21,
+  pairs: [
+    { runner: "claude", model: "sonnet", effort: "high", advised_runner: "claude", advised_model: "haiku", advised_effort: "low", runs: 9, passed: 8, failed: 1 },
+    { runner: "claude", model: "opus", effort: "high", advised_runner: "claude", advised_model: "sonnet", advised_effort: "medium", runs: 3, passed: 3, failed: 0 },
+  ],
+};
 
 const RUN_STOP = {
   run_id: 1,
@@ -2048,6 +2061,7 @@ export function answer(path: string, init?: RequestInit): unknown {
 
   if (path === "/jobs" || path.startsWith("/jobs?")) return [JOB];
   if (/^\/jobs\/\d+$/.test(path)) return JOB_VIEW;
+  if (path === "/route/report" || path.startsWith("/route/report?")) return ROUTE_REPORT;
   if (/^\/runs\/\d+\/stop$/.test(path)) return RUN_STOP;
   if (/^\/runs\/\d+\/tail/.test(path)) return RUN_TAIL;
   if ((path === "/runs" || path.startsWith("/runs?")) && init?.method === undefined) {

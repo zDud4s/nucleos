@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { routeTriple } from "../data/route";
 import {
   RECORDED,
   runIsAlive,
@@ -267,12 +268,6 @@ function failedAttempts(raw: string | null | undefined): string | null {
   } catch {
     return null;
   }
-}
-
-/** `runner · model · effort`, skipping what is unknown; null when nothing is known. */
-function routeTriple(parts: Array<string | null | undefined>): string | null {
-  const known = parts.filter((part): part is string => typeof part === "string" && part !== "");
-  return known.length === 0 ? null : known.join(" · ");
 }
 
 /**
