@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED } from "../data/autopilot";
-import { FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOW, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
+import { judgeResolveFixture, FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOW, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
 import { readEfficiencySignal, readFeedKind, waitReasonFromSummary } from "../data/feed";
 import { LANE_FOLD_ABOVE, buildSequences, traceLanes } from "../lib/sequences";
 import { quietGaps } from "../lib/timeline";
@@ -151,6 +151,11 @@ describe("the preview fixtures", () => {
     expect(verdicts.filter((verdict) => verdict.band === "allow" && !verdict.capped)).toHaveLength(1);
     expect(verdicts.filter((verdict) => verdict.band === "allow" && verdict.capped)).toHaveLength(1);
     expect(verdicts.filter((verdict) => verdict.band === "deny")).toHaveLength(1);
+  });
+
+  it("the resolver is off for every project until somebody turns it on", () => {
+    expect(judgeResolveFixture("alpha")).toEqual({ project_id: "alpha", judge_resolve: "off" });
+    expect(judgeResolveFixture("nobody").judge_resolve).toBe("off");
   });
 
   it("alpha's scoreboard agrees with its roster figures", () => {

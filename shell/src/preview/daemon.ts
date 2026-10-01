@@ -1,5 +1,5 @@
 import type { Agent } from "../data/agents";
-import type { ClassTally, JudgeStatus, JudgeVerdict } from "../data/autopilot";
+import type { ClassTally, JudgeResolveStatus, JudgeStatus, JudgeVerdict } from "../data/autopilot";
 import type { Concurrency, Job, JobDetail, JobItem, RunSearchResult } from "../data/fleet";
 import type { MapImport, MapModule, ProjectMap } from "../data/project-map";
 import type {
@@ -820,6 +820,11 @@ export const SCOREBOARD: Record<string, ClassTally[]> = {
 };
 
 /** Alpha observes, six distinct actions reviewed, two classes — the panel's half-way state. */
+/** Spec B D11: the resolver is an opt-in, so the preview shows every project off. */
+export function judgeResolveFixture(project: string) {
+  return { project_id: project, judge_resolve: "off" } satisfies JudgeResolveStatus;
+}
+
 export const JUDGE_STATUS: Record<string, JudgeStatus> = {
   alpha: {
     project_id: "alpha",
@@ -2445,6 +2450,9 @@ export function answer(path: string, init?: RequestInit): unknown {
         readiness: { reviewed: 0, agree: 0, ready: false, by_class: [] },
       }
     );
+  }
+  if (splitQuery(path)[0] === "/autopilot/judge-resolve") {
+    return judgeResolveFixture(splitQuery(path)[1].get("project_id") ?? "");
   }
   if (splitQuery(path)[0] === "/judge-verdicts/unreviewed") {
     return JUDGE_VERDICTS[splitQuery(path)[1].get("project_id") ?? ""] ?? [];

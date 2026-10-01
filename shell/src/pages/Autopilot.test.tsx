@@ -164,6 +164,10 @@ function cockpitFetch(world: CockpitWorld): (path: string, init?: RequestInit) =
     if (path.startsWith("/shadow-decisions")) return world.decisions;
     if (path.startsWith("/jobs")) return world.jobs;
     if (path.startsWith("/feed")) return world.feed;
+    if (path.startsWith("/autopilot/judge-resolve")) {
+      const project = new URLSearchParams(path.split("?")[1] ?? "").get("project_id") ?? "";
+      return { project_id: project, judge_resolve: "off" };
+    }
     return undefined;
   };
 }

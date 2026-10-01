@@ -389,6 +389,52 @@ export function useSetProjectJudge() {
   });
 }
 
+/* ------------------------------------------------------------ the resolver -- */
+
+/**
+ * Spec B D11 (`.ai/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md`), in the words
+ * the owner reads BEFORE turning it on. The resolver sends TypeSafe what the judge alone never
+ * sends; the switch is an opt-in because of this sentence.
+ */
+export const RESOLVE_DATA_WARNING =
+  "Resolving blocks sends TypeSafe what the judge alone never sends: the commands this project's " +
+  "runs were refused as destructive, and the last 2000 characters of the project's gate output " +
+  "when a finished run fails its gate. Observing changes nothing a run does — it asks, and writes " +
+  "the answer down for you to review.";
+
+export interface JudgeResolveStatus {
+  project_id: string;
+  judge_resolve: JudgeMode;
+}
+
+export function useJudgeResolveStatus(projectId: string | null) {
+  return useQuery({
+    queryKey: keys.autopilot.judgeResolve(projectId ?? ""),
+    queryFn: () =>
+      apiFetch<JudgeResolveStatus>(
+        `/autopilot/judge-resolve?project_id=${encodeURIComponent(projectId ?? "")}`,
+      ),
+    enabled: projectId !== null,
+    refetchInterval: POLL.queue,
+  });
+}
+
+/** No optimistic write, for `useSetProjectJudge`'s reason. */
+export function useSetProjectJudgeResolve() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (change: { project_id: string; judge_resolve: JudgeMode }) =>
+      apiFetch<JudgeResolveStatus>("/autopilot/judge-resolve", {
+        method: "POST",
+        body: JSON.stringify(change),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.all });
+    },
+  });
+}
+
 /** 204, like the shadow verdict. Moves the readiness, so the status is invalidated beside the queue. */
 export function useSetJudgeVerdict() {
   const queryClient = useQueryClient();
