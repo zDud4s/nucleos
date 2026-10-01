@@ -44,7 +44,6 @@ pub const DEFAULT_AT: f64 = 0.85;
 /// D4: in a park, "explain" also needs the task NOT to need the action (needed < 0.5).
 pub const NEEDED_BLOCKS_EXPLAIN_AT: f64 = 0.5;
 /// D5: redirects per lineage, counting only applied ones. A soft ceiling (D5 says why).
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.1
 pub const REDIRECTS_PER_LINEAGE: i64 = 2;
 /// D6: corrections per project in a rolling day.
 pub const CORRECTIONS_PER_PROJECT_PER_DAY: i64 = 3;
@@ -322,7 +321,6 @@ pub fn rule(event: Event, p: Probabilities, t: ResolveThresholds) -> Option<Outc
 /// the network/inline-code line and the guards G1-G3), and the project's rules having been read
 /// (the hook's `rules.were_read()`, the gate spec A's enforce keeps), and the lineage under
 /// `REDIRECTS_PER_LINEAGE`.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.1
 pub fn applied_park(opinion: Outcome, may_redirect: bool) -> Outcome {
     match opinion {
         Outcome::Explain if !may_redirect => Outcome::Park,
@@ -681,6 +679,60 @@ pub(crate) async fn is_resolution_lineage(pool: &SqlitePool, root: i64) -> bool 
     .fetch_one(pool)
     .await
     .unwrap_or(true)
+}
+
+/// D5: redirects APPLIED in this lineage — a per-run count would restart at every resume or
+/// handoff, which is what happens to `denials`. Soft: count, then write, with no lock around it
+/// (D5 says why that is acceptable), and the write is off the response path. A read that fails
+/// counts as the ceiling spent, and the run parks: today's direction.
+pub(crate) async fn redirects_in_lineage(pool: &SqlitePool, root: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM judge_resolutions
+         WHERE lineage_root_id = ? AND event = 'park' AND final_outcome = 'explain' AND enforced = 1",
+    )
+    .bind(root)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(REDIRECTS_PER_LINEAGE)
+}
+
+/// Spec B D13: a resolver answer taken at spec A's point and carried to the E3 point. If the hook
+/// returns in between, the question was paid for and no park happened: dropping this records the
+/// row as `moot`, so its cost still counts and it never enters the review queue.
+pub(crate) struct PendingPark {
+    pool: SqlitePool,
+    row: Option<ResolutionRow>,
+}
+
+impl PendingPark {
+    pub(crate) fn new(pool: &SqlitePool, row: ResolutionRow) -> Self {
+        Self {
+            pool: pool.clone(),
+            row: Some(row),
+        }
+    }
+
+    /// The answer, for the E3 point, which records it itself.
+    pub(crate) fn take(mut self) -> Option<ResolutionRow> {
+        self.row.take()
+    }
+}
+
+impl Drop for PendingPark {
+    fn drop(&mut self) {
+        if let Some(row) = self.row.take() {
+            // `record_later` spawns; outside a runtime that would panic inside a drop. The hook
+            // always runs inside one, so this is a guard, not a path.
+            if tokio::runtime::Handle::try_current().is_err() {
+                tracing::warn!(
+                    run_id = row.run_id,
+                    "judge: a carried resolution was dropped outside a runtime"
+                );
+                return;
+            }
+            record_later(&self.pool, row.settled(Outcome::Moot, false));
+        }
+    }
 }
 
 /// Spec B D10, in enforce: whether the resolver may speak at all (D2/S1: never in a lineage that
@@ -1539,5 +1591,74 @@ mod tests {
         );
         assert_eq!(row.judge_outcome, None);
         assert_eq!(row.final_outcome, Outcome::Deny);
+    }
+
+    /// D13: an answer carried from spec A's point that never reaches the E3 point (the hook
+    /// returned in between) is recorded as `moot` — its cost counted, never reviewed.
+    #[tokio::test]
+    async fn a_carried_answer_dropped_before_the_park_is_recorded_moot() {
+        let pool = pool().await;
+        let run_id = running_run(&pool).await;
+        let row = ResolutionRow::new(&asked(
+            run_id,
+            Event::Park,
+            "cargo test | tee t.log",
+            "unrecognized",
+        ));
+        drop(PendingPark::new(&pool, row));
+        for _ in 0..500 {
+            let finals: Vec<String> =
+                sqlx::query_scalar("SELECT final_outcome FROM judge_resolutions")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            if !finals.is_empty() {
+                assert_eq!(finals, vec!["moot".to_owned()]);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("a dropped answer was never recorded");
+    }
+
+    /// D13: an answer the E3 point takes is the E3 point's to record; nothing is written for it
+    /// as `moot`.
+    #[tokio::test]
+    async fn a_carried_answer_taken_at_the_park_is_not_recorded_moot() {
+        let pool = pool().await;
+        let run_id = running_run(&pool).await;
+        let row = ResolutionRow::new(&asked(
+            run_id,
+            Event::Park,
+            "cargo test | tee t.log",
+            "unrecognized",
+        ));
+        assert!(PendingPark::new(&pool, row).take().is_some());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(recorded_runs(&pool).await.is_empty());
+    }
+
+    /// D5: only redirects APPLIED at a park count toward the lineage's ceiling, and a successor's
+    /// count is its root's.
+    #[tokio::test]
+    async fn only_applied_redirects_count_toward_the_lineage_ceiling() {
+        let pool = pool().await;
+        let root = running_run(&pool).await;
+        let question = asked(root, Event::Park, "cargo test | tee t.log", "unrecognized");
+        for (outcome, enforced) in [
+            (Outcome::Explain, true),
+            (Outcome::Explain, false),
+            (Outcome::Park, true),
+            (Outcome::Moot, false),
+        ] {
+            record(
+                &pool,
+                &ResolutionRow::new(&question).settled(outcome, enforced),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(redirects_in_lineage(&pool, root).await, 1);
+        assert_eq!(redirects_in_lineage(&pool, root + 1000).await, 0);
     }
 }

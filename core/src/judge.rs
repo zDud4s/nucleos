@@ -779,12 +779,15 @@ impl JudgeMode {
     }
 }
 
-/// D10: the whole of the judge's work in the hook — reading the thresholds and the state, the
-/// permit, the key, the call — inside one budget. 2 s is D10's figure and the most the hook ever
-/// waits; the hook shrinks it to what is left of its own 5 s budget after the declared-git probes
-/// (`hooks::judge_wait`), or skips the wait. Spec B (D10) raises this one constant to 3 s when its
-/// questions join.
-pub const JUDGE_DEADLINE: Duration = Duration::from_secs(2);
+/// D10 of both specs: the whole of the judge's work in the hook — reading the thresholds and the
+/// state, the permit, the key, the call, and spec B's lineage read — inside one budget, and the
+/// most the hook ever waits. Spec A's figure was 2 s; spec B's D10 makes it 3 s for all judge
+/// work in the hook once its questions join, which still leaves 2 s of the hook's 5 s
+/// (`ask_daemon.py`) for everything else, and spec A's and spec B's separate calls run IN
+/// PARALLEL under it. The hook shrinks it to what is left of its own budget after the
+/// declared-git probes (`hooks::judge_wait`), or skips the wait. `JevJudge`'s own client stays at
+/// `CLIENT_TIMEOUT`.
+pub const JUDGE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// One call put to the judge, owned so an observation can outlive the hook's request.
 #[derive(Debug, Clone)]
