@@ -270,6 +270,41 @@ pub async fn set_project_judge(
     Ok(judge)
 }
 
+/// Review item E(ii): a project in `enforce` whose readiness no longer clears D11's bar drops to
+/// `observe`, with a feed line saying so. Answers whether it dropped. Guarded on `enforce` in the
+/// write, so a concurrent change of the setting keeps the last word; it only ever lowers `enforce`
+/// to `observe` and never raises anything. Runs already in flight keep the snapshot they launched
+/// with (D2): that is the snapshot's point, and the panel says it.
+pub async fn hold_judge_to_the_bar(pool: &SqlitePool, project_id: &str) -> sqlx::Result<bool> {
+    let readiness = crate::judge::readiness(pool, project_id).await?;
+    if readiness.ready {
+        return Ok(false);
+    }
+    let dropped = sqlx::query(
+        "UPDATE autopilot_state SET judge = 'observe' WHERE project_id = ? AND judge = 'enforce'",
+    )
+    .bind(project_id)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1;
+    if dropped {
+        crate::feed::append(
+            pool,
+            Some(project_id),
+            "judge_demoted",
+            &format!(
+                "the judge went back to observing {project_id}: {} of {} reviewed actions agreed, under the bar",
+                readiness.agree, readiness.reviewed
+            ),
+            None,
+            None,
+        )
+        .await?;
+    }
+    Ok(dropped)
+}
+
 pub async fn autopilot_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, String, Mode)>> {
     let projects: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT project_id, project_root, mode
@@ -869,6 +904,69 @@ mod tests {
         assert_eq!(
             autopilot_judge_mode(&pool, "o").await.unwrap(),
             JudgeMode::Off
+        );
+    }
+
+    /// Review item E(ii): enforcing is held to the bar, not only switched on by it. A review that
+    /// takes the agreement under 95% drops the project back to observing, with a feed line.
+    #[tokio::test]
+    async fn a_bar_no_longer_met_drops_enforce_to_observe_and_says_so() {
+        use crate::judge::JudgeMode;
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, judge) VALUES ('a', 'active', 'enforce')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        agreed_reviews(&pool, "a", 10).await;
+        assert!(
+            !hold_judge_to_the_bar(&pool, "a").await.unwrap(),
+            "10/10 holds"
+        );
+        assert_eq!(
+            autopilot_judge_mode(&pool, "a").await.unwrap(),
+            JudgeMode::Enforce
+        );
+
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('a', 'x', 'completed', 'worktree', '2026-09-27T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO judge_verdicts
+             (run_id, tool_name, tool_input_digest, action_class, classifier_decision, judge, model,
+              questions_version, band, final_decision, human_verdict, created_at)
+             VALUES (?, 'Bash', 'wrong', 'unrecognized', 'pending_approval', 'enforce', 'jev-latest',
+                     1, 'allow', 'allow', 'reject', '2026-09-27T00:00:00Z')",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            hold_judge_to_the_bar(&pool, "a").await.unwrap(),
+            "10/11 is under 95%"
+        );
+        assert_eq!(
+            autopilot_judge_mode(&pool, "a").await.unwrap(),
+            JudgeMode::Observe
+        );
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM feed WHERE project_id = 'a'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kinds, vec!["judge_demoted".to_owned()]);
+        // Never the other way: a project already observing is not touched, and nothing re-enables.
+        assert!(!hold_judge_to_the_bar(&pool, "a").await.unwrap());
+        assert_eq!(
+            autopilot_judge_mode(&pool, "a").await.unwrap(),
+            JudgeMode::Observe
         );
     }
 

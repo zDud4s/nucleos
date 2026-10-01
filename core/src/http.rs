@@ -15125,7 +15125,16 @@ async fn post_judge_verdict(
         return Err(StatusCode::BAD_REQUEST);
     }
     match crate::judge::set_verdict(&state.pool, id, &body.verdict).await {
-        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(true) => {
+            // A verdict is the only thing that moves readiness, so it is where the bar is checked.
+            // Best-effort: the verdict is recorded either way, and the next verdict checks again.
+            if let Ok(Some(project_id)) = crate::judge::project_of_verdict(&state.pool, id).await
+                && let Err(error) = autopilot::hold_judge_to_the_bar(&state.pool, &project_id).await
+            {
+                tracing::warn!(%error, %project_id, "could not hold the judge to its bar");
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }

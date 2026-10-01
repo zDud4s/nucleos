@@ -116,6 +116,18 @@ const READINESS_SELECT: &str =
            THEN jv.tool_name || char(31) || jv.tool_input_digest
        END) AS agree";
 
+/// The project a verdict's run belongs to, or `None` for a verdict that does not exist.
+pub async fn project_of_verdict(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT runs.project_id FROM judge_verdicts
+         JOIN runs ON runs.id = judge_verdicts.run_id WHERE judge_verdicts.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map(Option::flatten)
+}
+
 pub async fn readiness(pool: &SqlitePool, project_id: &str) -> sqlx::Result<JudgeReadiness> {
     // `AssertSqlSafe`, as in `shadow.rs`: the only interpolated fragment is a private constant,
     // and `project_id` stays a bound parameter.
