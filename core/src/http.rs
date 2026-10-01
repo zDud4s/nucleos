@@ -475,6 +475,7 @@ pub fn build_router(state: AppState) -> Router {
         // `.ai/specs/2026-08-29-porque-parou-design.md` §4, §7). Read-only front to back — see
         // `run_stop.rs`.
         .route("/runs/{id}/stop", get(crate::runs::get_run_stop))
+        .route("/runs/{id}/knowledge", get(get_run_knowledge))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route(
             "/runs/{id}/message",
@@ -13939,6 +13940,20 @@ async fn list_knowledge(
             tracing::warn!(%error, "listing refinements failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+async fn get_run_knowledge(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::brief::RunTrace>, StatusCode> {
+    match crate::brief::trace_of(&state.pool, id).await {
+        Ok(Some(trace)) => Ok(Json(trace)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(run_id = id, %error, "reading what a run was told failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// One refinement, read the way a person decides about it: the text, every decision it has been
@@ -33167,6 +33182,83 @@ mod tests {
             accepting.asked.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "picking a model must ask can_serve before storing it, not store it unconditionally"
         );
+    }
+
+    #[tokio::test]
+    async fn the_run_trace_route_answers_the_trace_and_404s_an_unknown_run() {
+        let state = test_state().await;
+        let loser = sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'machine', 'owner', 'memory', 'the loser', 'lost body',
+                     'active', '2026-09-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let shown = sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, source, kind, title, body, status, created_at)
+             VALUES ('procedural', 'machine', 'owner', 'prompt', 'the winner', 'shown body',
+                     'active', '2026-09-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('p', 'completed', 'real', '2026-09-20T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        crate::brief::record(
+            &state.pool,
+            run_id,
+            None,
+            &[
+                crate::knowledge::Scored {
+                    knowledge_id: loser,
+                    shown: false,
+                    s_fts: 0.91,
+                    s_scope: 0.82,
+                    s_structure: 0.73,
+                    s_recency: 0.64,
+                    s_use: 0.55,
+                    score: 0.0,
+                },
+                crate::knowledge::Scored {
+                    knowledge_id: shown,
+                    shown: true,
+                    s_fts: 0.14,
+                    s_scope: 0.25,
+                    s_structure: 0.36,
+                    s_recency: 0.47,
+                    s_use: 0.58,
+                    score: 0.0,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/runs/{run_id}/knowledge"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["traced"], true);
+        assert_eq!(body["items"][0]["shown"], true);
+        assert_eq!(body["items"][0]["s_fts"], 0.14);
+
+        let (status, _) = call(state, "GET", "/runs/999999/knowledge", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// A run that declares a lesson is recorded as the run that taught it.

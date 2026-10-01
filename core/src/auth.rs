@@ -2358,6 +2358,28 @@ mod tests {
         ));
     }
 
+    /// This route is owner-only by omission from every scoped route table; this test holds that
+    /// omission in place.
+    #[test]
+    fn the_run_trace_is_the_owners_alone() {
+        let route = "/runs/7/knowledge";
+
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+            Scope::Service(Service::Email),
+            Scope::Service(Service::Council),
+            Scope::TeamRun("team-1".to_owned()),
+        ] {
+            assert!(!permits(&scope, &Method::GET, route), "{scope:?}");
+        }
+
+        for scope in [Scope::Control, Scope::ApiToken(ApiTokenLevel::Admin)] {
+            assert!(permits(&scope, &Method::GET, route), "{scope:?}");
+        }
+    }
+
     /// Writing a project's own rules is the owner's, and nobody else's.
     ///
     /// The file behind this route is `.ai/autopilot.yaml`, and it carries `gate_command` — the
