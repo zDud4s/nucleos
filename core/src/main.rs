@@ -22,6 +22,7 @@ mod command_reader;
 mod commands;
 mod concurrency;
 mod config;
+mod consolidate;
 mod contacts;
 mod council;
 mod daemon_client;
@@ -40,6 +41,7 @@ mod http;
 mod inspect;
 mod job;
 mod join;
+mod judge;
 mod knowledge;
 mod land;
 mod local_agent;
@@ -486,17 +488,24 @@ fn land_target_from(args: &[String]) -> Option<String> {
         .cloned()
 }
 
-/// The checkout `--workflow-sync` names: the argument after the flag, or the working directory.
-/// Absolute either way, because the daemon resolving it runs somewhere else.
+/// The checkout `--workflow-sync` names: the first word after the flag that is neither a flag nor
+/// `--project`'s value, or the working directory. Absolute either way, because the daemon
+/// resolving it runs somewhere else.
 fn workflow_sync_target(args: &[String]) -> Result<String, String> {
     let at = args
         .iter()
         .position(|arg| arg == "--workflow-sync")
         .ok_or("--workflow-sync was not given")?;
-    let named = args
-        .get(at + 1)
-        .filter(|value| !value.starts_with("--"))
-        .map(std::path::PathBuf::from);
+    let mut rest = args[at + 1..].iter();
+    let mut named = None;
+    while let Some(word) = rest.next() {
+        if word == "--project" {
+            rest.next();
+        } else if !word.starts_with("--") {
+            named = Some(std::path::PathBuf::from(word));
+            break;
+        }
+    }
     let path = match named {
         Some(path) => path,
         None => std::env::current_dir().map_err(|error| error.to_string())?,
@@ -504,6 +513,37 @@ fn workflow_sync_target(args: &[String]) -> Result<String, String> {
     std::path::absolute(&path)
         .map(|path| path.to_string_lossy().into_owned())
         .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The project `--workflow-sync --project <id>` names, for a repository more than one rostered
+/// project points at. `None` when the flag is absent; a flag with no value is refused rather than
+/// read as absent, because absent means "let the daemon decide" and that is not what was typed.
+fn workflow_sync_project(args: &[String]) -> Result<Option<String>, String> {
+    let Some(at) = args.iter().position(|arg| arg == "--project") else {
+        return Ok(None);
+    };
+    args.get(at + 1)
+        .filter(|value| !value.starts_with("--") && !value.trim().is_empty())
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| "--project needs a project id".to_string())
+}
+
+/// The daemon's `ambiguous_project` refusal, written as the choice it is: one candidate per line,
+/// with the flag that picks it. `None` for any other body, which is printed as it came.
+fn ambiguous_sync_message(body: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    if body["refusal"] != "ambiguous_project" {
+        return None;
+    }
+    let mut said =
+        String::from("more than one project uses this repository; pick one with --project <id>:\n");
+    for candidate in body["candidates"].as_array()? {
+        let id = candidate["project_id"].as_str().unwrap_or("?");
+        let root = candidate["project_root"].as_str().unwrap_or("?");
+        said.push_str(&format!("  {id}  ({root})\n"));
+    }
+    Some(said)
 }
 
 /// `--workflow-package <name> <version> --from <project> --manifest <bundle.yaml>`, all required.
@@ -794,33 +834,44 @@ async fn main() {
     }
 
     if std::env::args().any(|a| a == "--mcp-tools") {
-        // `--box` used to narrow what this process serves. A stale launcher still passing it is
-        // refused rather than ignored, or it would silently get the full tool list.
+        // `--box job-node --job <id>` narrows what this process serves. Refused rather than
+        // ignored when the box is not one this server knows: a launcher that misspells it would
+        // otherwise get the broad tool set, with nothing saying so.
         let args: Vec<String> = std::env::args().collect();
-        if let Err(e) = mcp_tools::refuse_box_flag(&args) {
-            eprintln!("mcp-tools failed: {e}");
-            std::process::exit(1);
-        }
-        if let Err(e) = mcp_tools::run_stdio().await {
+        let served = match mcp_tools::box_from_args(&args) {
+            Ok(served) => served,
+            Err(e) => {
+                eprintln!("mcp-tools failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = mcp_tools::run_stdio(served).await {
             eprintln!("mcp-tools failed: {e}");
             std::process::exit(1);
         }
         return;
     }
 
-    // `nucleos-core --workflow-sync [<checkout>]`: put the project's pinned workflows into a
-    // worktree made by hand. A thin client, for `--land`'s reason: which project the checkout
-    // belongs to is answered from the roster, and the roster is the running daemon's database. The
-    // daemon also holds the kill switch this write must respect.
+    // `nucleos-core --workflow-sync [<checkout>] [--project <id>]`: put the project's pinned
+    // workflows into a worktree made by hand. A thin client, for `--land`'s reason: which project
+    // the checkout belongs to is answered from the roster, and the roster is the running daemon's
+    // database. The daemon also holds the kill switch this write must respect. `--project` only
+    // chooses among the projects the repository already matches, when there is more than one.
     if std::env::args().any(|a| a == "--workflow-sync") {
         let args: Vec<String> = std::env::args().collect();
-        let path = match workflow_sync_target(&args) {
-            Ok(path) => path,
+        let (path, project) = match workflow_sync_target(&args)
+            .and_then(|path| Ok((path, workflow_sync_project(&args)?)))
+        {
+            Ok(parsed) => parsed,
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
         };
+        let mut body = serde_json::json!({ "path": path });
+        if let Some(project) = project {
+            body["project_id"] = serde_json::Value::String(project);
+        }
         let token = match secrets::load_secret(TOKEN_KEY) {
             Ok(Some(token)) => token,
             _ => {
@@ -831,13 +882,17 @@ async fn main() {
         let response = reqwest::Client::new()
             .post(format!("{}/workflows/sync", daemon_client::daemon_url()))
             .bearer_auth(token)
-            .json(&serde_json::json!({ "path": path }))
+            .json(&body)
             .send()
             .await;
         match response {
             Ok(response) => {
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
+                if let Some(choice) = ambiguous_sync_message(&text) {
+                    eprint!("{choice}");
+                    std::process::exit(1);
+                }
                 if !status.is_success() {
                     eprintln!("the daemon refused: {text}");
                     std::process::exit(1);
@@ -1643,6 +1698,7 @@ async fn main() {
             quota_client::QuotaClient::new(sidecar::QUOTA_ADDR, quota_sidecar_token.clone()),
             models_config.active_runner().to_string(),
         )),
+        judge: Arc::new(judge::JudgeRuntime::jev()),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_tails: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -2235,5 +2291,75 @@ mod tests {
             std::path::PathBuf::from(bare),
             std::path::absolute(std::env::current_dir().unwrap()).unwrap()
         );
+    }
+
+    /// `--project` names which of several projects on one repository the sync is for; absent, the
+    /// daemon decides alone, and a flag with no value is refused rather than read as absent.
+    #[test]
+    fn workflow_sync_passes_the_named_project_through() {
+        let line = "nucleos-core --workflow-sync some/tree --project beta";
+        assert_eq!(
+            workflow_sync_project(&words(line)).unwrap().as_deref(),
+            Some("beta")
+        );
+        assert!(
+            workflow_sync_target(&words(line))
+                .unwrap()
+                .replace('\\', "/")
+                .ends_with("some/tree")
+        );
+
+        // The flag right after `--workflow-sync` is not mistaken for the checkout, and a checkout
+        // after it is still found.
+        let before = "nucleos-core --workflow-sync --project beta some/tree";
+        assert!(
+            workflow_sync_target(&words(before))
+                .unwrap()
+                .replace('\\', "/")
+                .ends_with("some/tree")
+        );
+        let bare = "nucleos-core --workflow-sync --project beta";
+        assert_eq!(
+            std::path::PathBuf::from(workflow_sync_target(&words(bare)).unwrap()),
+            std::path::absolute(std::env::current_dir().unwrap()).unwrap()
+        );
+        assert_eq!(
+            workflow_sync_project(&words(bare)).unwrap().as_deref(),
+            Some("beta")
+        );
+
+        assert_eq!(
+            workflow_sync_project(&words("nucleos-core --workflow-sync some/tree")).unwrap(),
+            None
+        );
+        for line in [
+            "nucleos-core --workflow-sync some/tree --project",
+            "nucleos-core --workflow-sync --project --other",
+        ] {
+            assert!(workflow_sync_project(&words(line)).is_err(), "{line}");
+        }
+    }
+
+    /// The daemon's ambiguity refusal is printed as the choice it is, one candidate per line with
+    /// the flag that picks it; any other body is not this refusal.
+    #[test]
+    fn an_ambiguous_sync_is_printed_as_a_choice() {
+        let body = serde_json::json!({
+            "refusal": "ambiguous_project",
+            "candidates": [
+                { "project_id": "alpha", "project_root": "C:/repo" },
+                { "project_id": "beta", "project_root": "C:/repo" },
+            ],
+        });
+        let said = ambiguous_sync_message(&body.to_string()).unwrap();
+        assert!(said.contains("alpha") && said.contains("beta"), "{said}");
+        assert!(said.contains("--project"), "{said}");
+        assert_eq!(
+            said.lines().filter(|line| line.contains("C:/repo")).count(),
+            2
+        );
+
+        assert!(ambiguous_sync_message(r#"{"refusal":"no_project"}"#).is_none());
+        assert!(ambiguous_sync_message("not json").is_none());
     }
 }

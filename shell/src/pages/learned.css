@@ -1,5 +1,5 @@
 /**
- * The Learned slice: the three lists of the knowledge store, the row they are
+ * The Learned slice: the four lists of the knowledge store, the row they are
  * all made of, and the chain that unfolds under one. `learned-` throughout, as
  * `waiting-` is for the decision queue and `runs-` for the run index.
  *
@@ -25,6 +25,32 @@
  * — the prose measure's value, borrowed by a note. What the note explains is the
  * prose, and the rows below are the wider of the two.
  */
+.learned-filters {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.learned-filters > div {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.learned-filters select {
+  margin-left: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+  background: var(--surface);
+}
+
 .learned-lede {
   margin: 0 0 var(--space-4);
   max-width: var(--measure);
@@ -33,15 +59,35 @@
   color: var(--text-muted);
 }
 
+.learned-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.learned-group + .learned-group {
+  margin-top: var(--space-4);
+}
+
+.learned-group-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
 .learned-row {
   gap: var(--space-2);
 }
 
-/* Kind, scope and age on one line: the three facts that decide whether the text
-   below is worth reading now. */
+/* Kind, scope, layer, source, measurement and age: the facts that decide whether
+   the text below is worth reading now. They wrap together on a narrow window. */
 .learned-head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: var(--space-2);
   font-size: var(--text-xs);
   color: var(--text-faint);
@@ -49,6 +95,19 @@
 
 .learned-scope {
   font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+.learned-layer {
+  color: var(--text-muted);
+}
+
+.learned-source {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+.learned-count {
   color: var(--text-muted);
 }
 
@@ -83,10 +142,42 @@
   white-space: pre-wrap;
 }
 
+.learned-evidence {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.learned-evidence li {
+  display: flex;
+  align-items: center;
+}
+
 .learned-foot {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+}
+
+.learned-measured-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.learned-measured-row .learned-scope {
+  margin-right: auto;
 }
 
 /* ----------------------------------------------------------------- chain -- */

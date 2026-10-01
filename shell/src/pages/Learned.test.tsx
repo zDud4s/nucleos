@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { Learned } from "./Learned";
 import type { Known, KnowledgeHistory } from "../data/knowledge";
+import { ApiRefusal } from "../data/client";
 import { renderWithRouter } from "../test/harness";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -23,6 +24,7 @@ function known(over: Partial<Known> = {}): Known {
     scope_kind: "project",
     scope_id: "nucleos",
     source: "run",
+    generator: null,
     kind: "memory",
     title: "The suite needs Git's usr/bin on PATH",
     body: "Nine tests spawn echo as a program.",
@@ -30,6 +32,15 @@ function known(over: Partial<Known> = {}): Known {
     proposal_id: 7,
     supersedes: null,
     origin_run_id: 900001,
+    evidence: null,
+    observations: null,
+    fingerprint: null,
+    expires_after_runs: null,
+    last_confirmed_at: null,
+    shown_count: 0,
+    outcome_count: 0,
+    green_count: 0,
+    last_shown_at: null,
     created_at: "2026-08-19T09:00:00+00:00",
     activated_at: "2026-08-19T09:05:00+00:00",
     ended_at: null,
@@ -106,6 +117,153 @@ describe("Learned", () => {
     expect(within(force).queryByText("taken back")).toBeNull();
 
     expect(within(await panelFor("No longer in force")).getByText("taken back")).toBeDefined();
+  });
+
+  it("the waiting queue is grouped by scope and source with a count per group", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({ id: 4, status: "proposed", scope_id: "beta", source: "run", title: "beta run" }),
+        known({ id: 1, status: "proposed", scope_id: "alpha", source: "owner", title: "alpha owner one" }),
+        known({ id: 3, status: "proposed", scope_id: "alpha", source: "run", title: "alpha run" }),
+        known({ id: 2, status: "proposed", scope_id: "alpha", source: "owner", title: "alpha owner two" }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+    const panel = await panelFor("Waiting for you");
+    const groups = panel.querySelectorAll(".learned-group");
+
+    expect(groups).toHaveLength(3);
+    expect(groups[0].textContent).toContain("alpha");
+    expect(groups[0].textContent).toContain("owner");
+    expect(groups[0].textContent).toContain("2");
+    expect(groups[0].textContent).toContain("alpha owner one");
+    expect(groups[0].textContent).toContain("alpha owner two");
+    expect(groups[1].textContent).toContain("alpha run");
+    expect(groups[2].textContent).toContain("beta run");
+  });
+
+  it("approve all sends one approve per proposal in ascending order, one at a time", async () => {
+    const rows = [
+      known({ id: 3, status: "proposed", proposal_id: 30, title: "third" }),
+      known({ id: 1, status: "proposed", proposal_id: 10, title: "first" }),
+      known({ id: 2, status: "proposed", proposal_id: 20, title: "second" }),
+    ];
+    const read = daemonWith(rows);
+    const releases: Array<() => void> = [];
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return new Promise((resolve) => releases.push(() => resolve({ refinement_id: 1 })));
+      }
+      return read(path);
+    });
+
+    await renderWithRouter(<Learned />);
+    fireEvent.click(await screen.findByRole("button", { name: "Approve all 3" }));
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    fireEvent.click(screen.getByRole("button", { name: "Let all 3 into every later prompt" }));
+
+    await waitFor(() => {
+      const posts = daemon.apiFetch.mock.calls.filter(([, init]) => init?.method === "POST");
+      expect(posts.map(([path]) => path)).toEqual(["/proposals/10/approve"]);
+    });
+    releases[0]();
+    await waitFor(() => {
+      const posts = daemon.apiFetch.mock.calls.filter(([, init]) => init?.method === "POST");
+      expect(posts.map(([path]) => path)).toEqual([
+        "/proposals/10/approve",
+        "/proposals/20/approve",
+      ]);
+    });
+    releases[1]();
+    await waitFor(() => {
+      const posts = daemon.apiFetch.mock.calls.filter(([, init]) => init?.method === "POST");
+      expect(posts.map(([path]) => path)).toEqual([
+        "/proposals/10/approve",
+        "/proposals/20/approve",
+        "/proposals/30/approve",
+      ]);
+    });
+    releases[2]();
+    await waitFor(() =>
+      expect(screen.getAllByRole("button", { name: "Approve" })[0].hasAttribute("disabled")).toBe(
+        false,
+      ),
+    );
+  });
+
+  it("approve all asks for a second click first", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({ id: 1, status: "proposed", proposal_id: 10 }),
+        known({ id: 2, status: "proposed", proposal_id: 20 }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+    fireEvent.click(await screen.findByRole("button", { name: "Approve all 2" }));
+
+    expect(daemon.apiFetch.mock.calls.filter(([, init]) => init?.method === "POST")).toEqual([]);
+    expect(
+      screen.getByRole("button", { name: "Let all 2 into every later prompt" }),
+    ).toBeDefined();
+  });
+
+  it("refuse all sends one reject per proposal", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({ id: 2, status: "proposed", proposal_id: 22 }),
+        known({ id: 1, status: "proposed", proposal_id: 11 }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+    fireEvent.click(await screen.findByRole("button", { name: "Refuse all 2" }));
+
+    await waitFor(() => {
+      const posts = daemon.apiFetch.mock.calls.filter(([, init]) => init?.method === "POST");
+      expect(posts.map(([path]) => path)).toEqual([
+        "/proposals/11/reject",
+        "/proposals/22/reject",
+      ]);
+    });
+  });
+
+  it("a batch that partly fails says how many were decided and keeps going", async () => {
+    const rows = [
+      known({ id: 1, status: "proposed", proposal_id: 11 }),
+      known({ id: 2, status: "proposed", proposal_id: 22 }),
+      known({ id: 3, status: "proposed", proposal_id: 33 }),
+    ];
+    const read = daemonWith(rows);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method !== "POST") return read(path);
+      if (path === "/proposals/22/reject") throw new ApiRefusal(409, "conflict", "");
+      return undefined;
+    });
+
+    await renderWithRouter(<Learned />);
+    fireEvent.click(await screen.findByRole("button", { name: "Refuse all 3" }));
+
+    expect(await screen.findByText(/2 decided; 1 could not be/)).toBeDefined();
+    const posts = daemon.apiFetch.mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(posts.map(([path]) => path)).toEqual([
+      "/proposals/11/reject",
+      "/proposals/22/reject",
+      "/proposals/33/reject",
+    ]);
+  });
+
+  it("a group of one has no batch buttons", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([known({ id: 1, status: "proposed", proposal_id: 11 })]),
+    );
+
+    await renderWithRouter(<Learned />);
+    await screen.findByRole("button", { name: "Approve" });
+
+    expect(screen.queryByRole("button", { name: /Approve all/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Refuse all/ })).toBeNull();
   });
 
   it("sends the two answers to the proposal and the revert to the row", async () => {
@@ -215,5 +373,155 @@ describe("Learned", () => {
     expect((await screen.findByText(/nothing proposed/)).textContent).toBe(
       "one note is in force; nothing proposed",
     );
+  });
+
+  it("shows the four layers, each row naming its layer and its source", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({ id: 1, layer: "semantic", status: "proposed", source: "owner", title: "a fact" }),
+        known({ id: 2, layer: "episodic", status: "active", source: "consolidator", title: "a measurement" }),
+        known({ id: 3, layer: "working", status: "live", source: "run", title: "job context" }),
+        known({ id: 4, layer: "procedural", status: "rejected", source: "owner", title: "a method" }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+
+    for (const [title, layer, source] of [
+      ["a fact", "semantic", "owner"],
+      ["a measurement", "episodic", "consolidator"],
+      ["job context", "working", "run"],
+      ["a method", "procedural", "owner"],
+    ] as const) {
+      const row = (await screen.findByText(title)).closest(".learned-row");
+      expect(row).not.toBeNull();
+      expect(within(row as HTMLElement).getByText(layer)).toBeDefined();
+      expect(within(row as HTMLElement).getByText(source)).toBeDefined();
+    }
+  });
+
+  it("a measured row says how many times it was measured", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([known({ layer: "episodic", source: "consolidator", observations: 3 })]),
+    );
+
+    await renderWithRouter(<Learned />);
+
+    expect(await screen.findByText("measured 3 times")).toBeDefined();
+  });
+
+  it("the layer filter narrows every list and the headline", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({ id: 1, layer: "semantic", status: "active", title: "semantic active" }),
+        known({ id: 2, layer: "episodic", status: "active", source: "consolidator", title: "measured active" }),
+        known({ id: 3, layer: "episodic", status: "proposed", title: "measured proposal" }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+    fireEvent.click(await screen.findByRole("button", { name: "Measured" }));
+
+    expect(screen.queryByText("semantic active")).toBeNull();
+    expect(screen.getByText("measured active")).toBeDefined();
+    expect(screen.getByText("measured proposal")).toBeDefined();
+    expect(screen.getByText("one note is in force; 1 note proposed; 1 measured")).toBeDefined();
+  });
+
+  it("the scope filter offers every scope even after one is chosen", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({ id: 1, scope_id: "alpha", title: "alpha fact" }),
+        known({ id: 2, scope_id: "beta", title: "beta fact" }),
+        known({ id: 3, scope_kind: "machine", scope_id: null, title: "machine fact" }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+    const select = await screen.findByRole("combobox", { name: "Scope" });
+    fireEvent.change(select, { target: { value: "alpha" } });
+
+    expect(screen.getByText("alpha fact")).toBeDefined();
+    expect(screen.queryByText("beta fact")).toBeNull();
+    expect(within(select).getByRole("option", { name: "beta" })).toBeDefined();
+    expect(within(select).getByRole("option", { name: "this machine" })).toBeDefined();
+  });
+
+  it("a working fact appears under Live in a job and nowhere else", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({ id: 1, status: "proposed", title: "question" }),
+        known({ id: 2, status: "active", title: "fact" }),
+        known({ id: 3, layer: "working", status: "live", title: "only this job" }),
+        known({ id: 4, status: "closed", title: "finished" }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+
+    expect(within(await panelFor("Live in a job")).getByText("only this job")).toBeDefined();
+    for (const panel of ["Waiting for you", "In force", "No longer in force"]) {
+      expect(within(await panelFor(panel)).queryByText("only this job")).toBeNull();
+    }
+  });
+
+  it("counts measured rows per project and per generator", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({ id: 1, layer: "episodic", source: "consolidator", scope_id: "alpha", generator: "gate" }),
+        known({ id: 2, layer: "episodic", source: "consolidator", scope_id: "alpha", generator: "gate" }),
+        known({ id: 3, layer: "episodic", source: "consolidator", scope_id: "alpha", generator: "refused-action" }),
+        known({ id: 4, layer: "episodic", source: "consolidator", scope_kind: "machine", scope_id: null, generator: null }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+    const panel = await panelFor("Measured, by generator");
+    const project = within(panel).getByText("alpha").closest(".learned-measured-row");
+    const machine = within(panel).getByText("this machine").closest(".learned-measured-row");
+
+    expect(project).not.toBeNull();
+    expect(within(project as HTMLElement).getByText("gate: 2")).toBeDefined();
+    expect(within(project as HTMLElement).getByText("refused-action: 1")).toBeDefined();
+    expect(machine).not.toBeNull();
+    expect(within(machine as HTMLElement).getByText("unknown: 1")).toBeDefined();
+  });
+
+  it("evidence for a run is a link to that run and an unknown tag draws nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({
+          id: 1,
+          evidence: JSON.stringify([
+            { t: "run", id: 900449 },
+            { t: "unknown", id: 2 },
+          ]),
+        }),
+      ]),
+    );
+
+    await renderWithRouter(<Learned />);
+    const link = await screen.findByRole("link", { name: "run 900449" });
+
+    expect(link.getAttribute("href")).toContain("/runs/900449");
+    expect(screen.queryByText("unknown 2")).toBeNull();
+  });
+
+  it("knowledge evidence opens that row's history", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith(
+        [
+          known({ id: 1, evidence: JSON.stringify([{ t: "knowledge", id: 2 }]) }),
+          known({ id: 2, title: "the evidence row" }),
+        ],
+        { replaced: [known({ id: 8, title: "older evidence" })] },
+      ),
+    );
+
+    await renderWithRouter(<Learned />);
+    fireEvent.click(await screen.findByRole("button", { name: "knowledge 2" }));
+
+    expect(await screen.findByText("older evidence")).toBeDefined();
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/knowledge/2");
   });
 });

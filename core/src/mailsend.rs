@@ -332,6 +332,7 @@ mod tests {
             github: Arc::new(crate::github::GithubRuntime::default()),
             web: Arc::new(crate::web::WebRuntime::disabled()),
             quota: Arc::new(crate::quota::QuotaRuntime::disabled()),
+            judge: Arc::new(crate::judge::JudgeRuntime::disabled()),
             calendar: Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,

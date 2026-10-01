@@ -16,6 +16,7 @@
 //! them lands in `brief.rs` rather than here.
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
 
 /// How much of what is known a single node's prompt may carry.
@@ -54,7 +55,7 @@ pub enum Layer {
     Episodic,
     /// How work is done here.
     Procedural,
-    /// What one job knows while it is still running, and only for as long as it runs.
+    /// What one job knows while it is still running. Closes with the job.
     Working,
 }
 
@@ -135,8 +136,6 @@ pub enum Scope {
     Machine,
     Project(String),
     /// A job, and the project it belongs to when the caller knows it.
-    ///
-    /// Read by nothing outside the tests until the working layer exists to put rows here.
     #[cfg_attr(not(test), allow(dead_code))]
     Job {
         id: i64,
@@ -588,9 +587,14 @@ fn cut_notice(omitted: usize) -> String {
 
 fn item_piece(row: &Known, width: usize) -> String {
     let layer = Layer::parse(&row.layer).expect("selection only carries recognised layers");
+    let provenance = match layer {
+        Layer::Working => "(said by a run of this job, not approved) ",
+        _ => "",
+    };
     format!(
-        "\n- [{}] {}: {}",
+        "\n- [{}] {}{}: {}",
         layer.as_str(),
+        provenance,
         row.title,
         clip(&row.body, width)
     )
@@ -711,7 +715,8 @@ fn select_pass<'a>(
 ///
 /// Consolidator measurements count only when they have both their episodic shape and a measured
 /// observation count. `recall` shares this rule with briefing admission rather than inventing a
-/// second meaning for `active`.
+/// second meaning for `active`. The other named exception is not approval: `admitted` separately
+/// requires a same-job working row with well-tagged evidence.
 pub(crate) fn approved(row: &Known) -> bool {
     match row.status.as_str() {
         "active" if row.source == "consolidator" => {
@@ -725,18 +730,16 @@ pub(crate) fn approved(row: &Known) -> bool {
 // Only what a person approved. Filtered here rather than trusted from the caller's query:
 // `select` is the last thing between a `proposed` row and a node's prompt, and something that
 // reaches a prompt unapproved makes the approval decorative, which is the entire mechanism.
-// The only named exceptions are a measured consolidator observation and an evidenced working
-// fact read inside the same job; spelling their complete shapes here keeps a third one out.
+// The only named exceptions are a measured consolidator observation and a working fact with
+// well-tagged evidence read inside the same job; spelling their complete shapes here keeps a third
+// one out.
 fn admitted(row: &Known, context: &Context) -> bool {
     match row.status.as_str() {
         "active" => approved(row),
         "live" => {
             row.source == "run"
                 && row.layer == "working"
-                && row
-                    .evidence
-                    .as_deref()
-                    .is_some_and(|evidence| !evidence.trim().is_empty())
+                && row.evidence.as_deref().is_some_and(evidence_is_tagged)
                 && context
                     .chain
                     .iter()
@@ -749,8 +752,8 @@ fn admitted(row: &Known, context: &Context) -> bool {
 /// Select a bounded briefing without doing I/O.
 ///
 /// Admission applies spec §4.5 first: approved rows plus the two named exceptions, measured
-/// consolidator observations and evidenced same-job working facts. Structure then owns its bytes
-/// first. Populated layers claim their item floors, and candidates left over compete in
+/// consolidator observations and same-job working facts with well-tagged evidence. Structure then
+/// owns its bytes first. Populated layers claim their item floors, and candidates left over compete in
 /// [`ordered_candidates`] order. The first pass discovers which scope groups are cut; the second
 /// reserves those notices before choosing rows and accounts for any cut it exposes at the
 /// boundary. The trace covers every admitted candidate.
@@ -849,6 +852,345 @@ fn clip(body: &str, width: usize) -> String {
     cut
 }
 
+/// The stable identity and short human label of one failed gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailureSignature {
+    pub fingerprint: String,
+    pub headline: String,
+}
+
+/// Turns the volatile output of a failed gate into the failure it describes.
+pub fn failure_signature(output: &str) -> Option<FailureSignature> {
+    if output.trim().is_empty() {
+        return None;
+    }
+
+    let normalised: Vec<String> = output
+        .lines()
+        .map(normalise_line)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if normalised.is_empty() {
+        return None;
+    }
+
+    let mut decisive = Vec::new();
+    for line in &normalised {
+        let lower = line.to_lowercase();
+        if [
+            "test result:",
+            "running ",
+            "finished ",
+            "compiling ",
+            "…[output truncated",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        {
+            continue;
+        }
+        if [
+            "error",
+            "failed",
+            "panicked",
+            "denied",
+            "acesso negado",
+            "cannot",
+            "could not",
+            "not found",
+            "assert",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        {
+            decisive.push(line.as_str());
+            if decisive.len() == 3 {
+                break;
+            }
+        }
+    }
+    if decisive.is_empty() {
+        decisive.push(normalised.last().expect("non-empty output has one line"));
+    }
+
+    let joined = decisive.join("\n");
+    Some(FailureSignature {
+        fingerprint: hex16(&Sha256::digest(joined.as_bytes())),
+        headline: clip(decisive[0], 160),
+    })
+}
+
+fn normalise_line(line: &str) -> String {
+    let line = replace_worktree_paths(line);
+    let line = replace_numbered_ids(&line);
+    let line = replace_line_columns(&line);
+    let line = replace_durations(&line);
+    collapse_horizontal_space(&line)
+}
+
+fn replace_worktree_paths(line: &str) -> String {
+    let mut normalised = line.to_owned();
+    let mut cursor = 0;
+    loop {
+        let bytes = normalised.as_bytes();
+        let mut found = None;
+        let mut at = cursor;
+        while at < bytes.len() {
+            let numbered = bytes[at..].starts_with(b"run-") || bytes[at..].starts_with(b"job-");
+            if numbered && at > 0 && matches!(bytes[at - 1], b'/' | b'\\') {
+                let mut end = at + 4;
+                let digit_start = end;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > digit_start && end < bytes.len() && matches!(bytes[end], b'/' | b'\\') {
+                    found = Some((at, end));
+                    break;
+                }
+            }
+            at += 1;
+        }
+        let Some((segment, end)) = found else {
+            break;
+        };
+
+        let mut start = segment;
+        while start > 0 && !is_path_token_delimiter(normalised.as_bytes()[start - 1]) {
+            start -= 1;
+        }
+        normalised.replace_range(start..end, "<worktree>");
+        let replacement_end = start + "<worktree>".len();
+        let mut token_end = replacement_end;
+        while token_end < normalised.len()
+            && !is_path_token_delimiter(normalised.as_bytes()[token_end])
+        {
+            token_end += 1;
+        }
+        let canonical_suffix = normalised[replacement_end..token_end].replace('\\', "/");
+        normalised.replace_range(replacement_end..token_end, &canonical_suffix);
+        cursor = replacement_end + canonical_suffix.len();
+    }
+    normalised
+}
+
+fn is_path_token_delimiter(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(byte, b'"' | b'\'' | b'(' | b')' | b'<' | b'>' | b'=' | b',')
+}
+
+fn replace_numbered_ids(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut normalised = String::with_capacity(line.len());
+    let mut copied_until = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        let label = if bytes[at..].starts_with(b"run-") {
+            Some("run-<n>")
+        } else if bytes[at..].starts_with(b"job-") {
+            Some("job-<n>")
+        } else {
+            None
+        };
+        let Some(label) = label else {
+            at += 1;
+            continue;
+        };
+        let mut end = at + 4;
+        let digit_start = end;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == digit_start {
+            at += 4;
+            continue;
+        }
+        normalised.push_str(&line[copied_until..at]);
+        normalised.push_str(label);
+        copied_until = end;
+        at = end;
+    }
+    normalised.push_str(&line[copied_until..]);
+    normalised
+}
+
+fn replace_line_columns(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut normalised = String::with_capacity(line.len());
+    let mut copied_until = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b':' {
+            at += 1;
+            continue;
+        }
+        let mut middle = at + 1;
+        while middle < bytes.len() && bytes[middle].is_ascii_digit() {
+            middle += 1;
+        }
+        if middle == at + 1 || middle == bytes.len() || bytes[middle] != b':' {
+            at += 1;
+            continue;
+        }
+        let mut end = middle + 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == middle + 1 {
+            at += 1;
+            continue;
+        }
+        normalised.push_str(&line[copied_until..at]);
+        normalised.push_str(":<l>:<c>");
+        copied_until = end;
+        at = end;
+    }
+    normalised.push_str(&line[copied_until..]);
+    normalised
+}
+
+fn replace_durations(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut normalised = String::with_capacity(line.len());
+    let mut copied_until = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if !bytes[at].is_ascii_digit() {
+            at += 1;
+            continue;
+        }
+        let mut end = at;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end < bytes.len()
+            && bytes[end] == b'.'
+            && end + 1 < bytes.len()
+            && bytes[end + 1].is_ascii_digit()
+        {
+            end += 1;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+        }
+        let suffix_end = if bytes[end..].starts_with(b"ms") {
+            end + 2
+        } else if bytes[end..].starts_with(b"s") {
+            end + 1
+        } else {
+            at = end;
+            continue;
+        };
+        if line[suffix_end..]
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric)
+        {
+            at = suffix_end;
+            continue;
+        }
+        normalised.push_str(&line[copied_until..at]);
+        normalised.push_str("<t>");
+        copied_until = suffix_end;
+        at = suffix_end;
+    }
+    normalised.push_str(&line[copied_until..]);
+    normalised
+}
+
+fn collapse_horizontal_space(line: &str) -> String {
+    let mut normalised = String::with_capacity(line.len());
+    let mut separating = false;
+    for character in line.trim().chars() {
+        if matches!(character, ' ' | '\t') {
+            separating = !normalised.is_empty();
+        } else {
+            if separating {
+                normalised.push(' ');
+                separating = false;
+            }
+            normalised.push(character);
+        }
+    }
+    normalised
+}
+
+fn hex16(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(16);
+    for byte in bytes.iter().take(8) {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+/// Closes every live working finding owned by one job, preserving the transition as history.
+pub async fn close_working_for_job(pool: &SqlitePool, job_id: i64) -> sqlx::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let at = chrono::Utc::now().to_rfc3339();
+    let scope_id = job_id.to_string();
+    sqlx::query(
+        "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+         SELECT id, 'live', 'closed', 'the job ended', ?
+           FROM knowledge
+          WHERE layer = 'working' AND scope_kind = 'job' AND scope_id = ? AND status = 'live'",
+    )
+    .bind(&at)
+    .bind(&scope_id)
+    .execute(&mut *tx)
+    .await?;
+    let closed = sqlx::query(
+        "UPDATE knowledge SET status = 'closed', ended_at = ?
+          WHERE layer = 'working' AND scope_kind = 'job' AND scope_id = ? AND status = 'live'",
+    )
+    .bind(&at)
+    .bind(&scope_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(closed)
+}
+
+/// Closes live working findings whose job has ended or no longer exists.
+pub async fn close_orphaned_working(pool: &SqlitePool) -> sqlx::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let at = chrono::Utc::now().to_rfc3339();
+    let placeholders = vec!["?"; crate::job::TERMINAL_STATUSES.len()].join(", ");
+    let predicate = format!(
+        "layer = 'working' AND scope_kind = 'job' AND status = 'live'
+         AND NOT EXISTS (
+             SELECT 1 FROM jobs j
+              WHERE CAST(j.id AS TEXT) = knowledge.scope_id
+                AND j.status NOT IN ({placeholders})
+         )"
+    );
+
+    // `AssertSqlSafe`, audited: the only interpolation is one `?` per status in the fixed
+    // `TERMINAL_STATUSES` list. Every status is bound below.
+    let mut events = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+         SELECT id, 'live', 'closed', 'the job ended', ? FROM knowledge WHERE {predicate}"
+    )))
+    .bind(&at);
+    for status in crate::job::TERMINAL_STATUSES {
+        events = events.bind(status);
+    }
+    events.execute(&mut *tx).await?;
+
+    // Same audit as above; `ended_at` is bound before the fixed status list.
+    let mut update = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE knowledge SET status = 'closed', ended_at = ? WHERE {predicate}"
+    )))
+    .bind(&at);
+    for status in crate::job::TERMINAL_STATUSES {
+        update = update.bind(status);
+    }
+    let closed = update.execute(&mut *tx).await?.rows_affected();
+    tx.commit().await?;
+    Ok(closed)
+}
+
 /// What a node in this scope is entitled to be told.
 ///
 /// The chain comes too, and that is the whole reason this takes a [`Scope`] rather than a project
@@ -856,6 +1198,10 @@ fn clip(body: &str, width: usize) -> String {
 /// project's lesson become another's lie. `scope_id IS ?` rather than `=`, because the machine
 /// scope's id is NULL and `= NULL` is never true — the bug would be a briefing silently missing
 /// everything known about the house.
+///
+/// Approved rows are fetched across the whole chain. A `live` row is fetched only when its stored
+/// shape is a job-scoped working finding; [`select`] and its [`admitted`] gate still decide whether
+/// that row belongs to this exact job and is evidenced enough to reach the prompt.
 ///
 /// Ordered here as well as in [`render`], so a caller that skips the renderer still gets a stable
 /// list, and so the LIMIT below cuts the tail rather than an arbitrary middle.
@@ -868,7 +1214,9 @@ pub async fn for_scope(pool: &SqlitePool, scope: &Scope) -> sqlx::Result<Vec<Kno
     let sql = format!(
         "SELECT {COLUMNS}
            FROM knowledge
-          WHERE status = 'active' AND ({})
+          WHERE (status = 'active'
+                 OR (status = 'live' AND layer = 'working' AND scope_kind = 'job'))
+            AND ({})
           ORDER BY id
           LIMIT ?",
         terms.join(" OR ")
@@ -1407,9 +1755,257 @@ async fn fetch(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Known>> {
     .await
 }
 
+/// The complete vocabulary a run may use to point at the source of a finding.
+pub(crate) const EVIDENCE_TAGS: [&str; 7] = [
+    "run",
+    "job_item",
+    "proposal",
+    "knowledge",
+    "project",
+    "command",
+    "gate",
+];
+
+fn known_element(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let Some(tag) = object.get("t").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    if !EVIDENCE_TAGS.contains(&tag) {
+        return false;
+    }
+    match object.get("id") {
+        Some(serde_json::Value::Number(id)) => id.as_u64().is_some_and(|id| id > 0),
+        Some(serde_json::Value::String(id)) => !id.is_empty() && id.chars().count() <= 120,
+        _ => false,
+    }
+}
+
+/// Keep only shaped, known referents and serialise them in the daemon's own JSON form.
+pub(crate) fn tagged_evidence(raw: &serde_json::Value) -> Option<String> {
+    struct Tagged<'a>(&'a serde_json::Map<String, serde_json::Value>);
+
+    impl Serialize for Tagged<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+
+            let mut clean = serializer.serialize_map(Some(self.0.len()))?;
+            clean.serialize_entry("t", self.0.get("t").expect("known element has a tag"))?;
+            clean.serialize_entry("id", self.0.get("id").expect("known element has an id"))?;
+            for (key, value) in self.0 {
+                if key != "t" && key != "id" {
+                    clean.serialize_entry(key, value)?;
+                }
+            }
+            clean.end()
+        }
+    }
+
+    let kept: Vec<_> = raw
+        .as_array()?
+        .iter()
+        .filter(|element| known_element(element))
+        .filter_map(|element| {
+            let object = element.as_object()?;
+            Some(Tagged(object))
+        })
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let normalised = serde_json::to_string(&kept).ok()?;
+    debug_assert!(evidence_is_tagged(&normalised));
+    Some(normalised)
+}
+
+/// Whether stored evidence still has at least one shaped, known referent.
+pub(crate) fn evidence_is_tagged(stored: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(stored)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .is_some_and(|elements| elements.iter().any(known_element))
+}
+
+/// Why a run's attempted working-layer finding was refused.
+#[derive(Debug)]
+pub enum FindingError {
+    EmptyFact,
+    FactTooLong,
+    NoEvidence,
+    NoJob,
+    JobEnded,
+    TooMany,
+    Db(sqlx::Error),
+}
+
+impl std::fmt::Display for FindingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FindingError::EmptyFact => write!(formatter, "a finding needs a fact"),
+            FindingError::FactTooLong => write!(
+                formatter,
+                "a finding may be at most {PER_ITEM_CHARS} characters"
+            ),
+            FindingError::NoEvidence => write!(formatter, "a finding needs tagged evidence"),
+            FindingError::NoJob => write!(formatter, "the run does not belong to a job"),
+            FindingError::JobEnded => write!(formatter, "the run's job has ended"),
+            FindingError::TooMany => write!(
+                formatter,
+                "the job already has {MAX_LIVE_FINDINGS_PER_JOB} live findings"
+            ),
+            FindingError::Db(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for FindingError {}
+
+impl From<sqlx::Error> for FindingError {
+    fn from(error: sqlx::Error) -> Self {
+        FindingError::Db(error)
+    }
+}
+
+const MAX_LIVE_FINDINGS_PER_JOB: i64 = 20;
+
+/// Leave one evidenced fact for the next node of the caller's own live job.
+pub async fn note_finding(
+    pool: &SqlitePool,
+    run_id: i64,
+    fact: &str,
+    evidence: &serde_json::Value,
+) -> Result<i64, FindingError> {
+    if fact.trim().is_empty() {
+        return Err(FindingError::EmptyFact);
+    }
+    if fact.chars().count() > PER_ITEM_CHARS {
+        return Err(FindingError::FactTooLong);
+    }
+    let evidence = tagged_evidence(evidence).ok_or(FindingError::NoEvidence)?;
+
+    let Some((job_id, _project_id)) = sqlx::query_as::<_, (Option<i64>, Option<String>)>(
+        "SELECT job_id, project_id FROM runs WHERE id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Err(FindingError::NoJob);
+    };
+    let Some(job_id) = job_id else {
+        return Err(FindingError::NoJob);
+    };
+    let Some(job_status) = sqlx::query_scalar::<_, String>("SELECT status FROM jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Err(FindingError::JobEnded);
+    };
+    if crate::job::TERMINAL_STATUSES.contains(&job_status.as_str()) {
+        return Err(FindingError::JobEnded);
+    }
+
+    let title = clip(fact.lines().next().unwrap_or_default(), 80);
+    let now = chrono::Utc::now().to_rfc3339();
+    let job_scope = job_id.to_string();
+    let inserted = sqlx::query(
+        "INSERT INTO knowledge
+           (layer, status, scope_kind, scope_id, source, generator, evidence, observations,
+            fingerprint, kind, title, body, proposal_id, origin_run_id, created_at, activated_at)
+         SELECT
+           'working', 'live', 'job', ?, 'run', NULL, ?, NULL,
+           NULL, 'memory', ?, ?, NULL, ?, ?, NULL
+          WHERE (SELECT COUNT(*) FROM knowledge
+                  WHERE scope_kind = 'job' AND scope_id = ? AND status = 'live') < ?",
+    )
+    .bind(&job_scope)
+    .bind(evidence)
+    .bind(title)
+    .bind(fact)
+    .bind(run_id)
+    .bind(now)
+    .bind(&job_scope)
+    .bind(MAX_LIVE_FINDINGS_PER_JOB)
+    .execute(pool)
+    .await?;
+    if inserted.rows_affected() == 0 {
+        Err(FindingError::TooMany)
+    } else {
+        Ok(inserted.last_insert_rowid())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guards that checkout location and worktree generation do not split one failure identity.
+    #[test]
+    fn the_same_failure_in_two_worktree_layouts_normalises_to_one_signature() {
+        let legacy = failure_signature(
+            r#"error: failed to remove file `C:\Projects\nucleos-worktrees\nucleos\run-900372\core\target\debug\nucleos-core.exe`: Acesso negado. (os error 5)"#,
+        )
+        .expect("a failure has a signature");
+        let nested = failure_signature(
+            r#"error: failed to remove file `C:\Projects\nucleos\.nucleos\worktrees\run-900446\core\target\debug\nucleos-core.exe`: Acesso negado. (os error 5)"#,
+        )
+        .expect("a failure has a signature");
+        let git_bash = failure_signature(
+            r#"error: failed to remove file `/c/Projects/nucleos/.nucleos/worktrees/run-900451/core/target/debug/nucleos-core.exe`: Acesso negado. (os error 5)"#,
+        )
+        .expect("a failure has a signature");
+
+        assert_eq!(legacy.fingerprint, nested.fingerprint);
+        assert_eq!(legacy.fingerprint, git_bash.fingerprint);
+    }
+
+    /// Guards that stable normalisation preserves the facts that distinguish real failures.
+    #[test]
+    fn two_genuinely_different_failures_do_not_collapse_into_one_signature() {
+        let access_denied = failure_signature(
+            r#"error: failed to remove file `C:\Projects\nucleos\.nucleos\worktrees\run-900446\core\target\debug\nucleos-core.exe`: Acesso negado. (os error 5)"#,
+        )
+        .expect("a failure has a signature");
+        let file_in_use = failure_signature(
+            r#"error: failed to remove file `C:\Projects\nucleos\.nucleos\worktrees\run-900446\core\target\debug\nucleos-core.exe`: Acesso negado. (os error 32)"#,
+        )
+        .expect("a failure has a signature");
+        let panic = failure_signature("thread 'x' panicked at src/a.rs:10:5:")
+            .expect("a failure has a signature");
+
+        assert_ne!(access_denied.fingerprint, file_in_use.fingerprint);
+        assert_ne!(access_denied.fingerprint, panic.fingerprint);
+        assert_ne!(file_in_use.fingerprint, panic.fingerprint);
+    }
+
+    /// Guards that volatile locations, timings, and run names do not change failure identity.
+    #[test]
+    fn a_failure_that_differs_only_in_line_numbers_durations_and_run_ids_is_the_same_failure() {
+        let first = failure_signature(
+            "thread 'a' panicked at src/a.rs:10:5: after 12.34s\nerror: branch nucleos/run-900372\nfinished in 12.34s",
+        )
+        .expect("a failure has a signature");
+        let second = failure_signature(
+            "thread 'a' panicked at src/a.rs:99:7: after 350ms\nerror: branch nucleos/run-900999\nfinished in 350ms",
+        )
+        .expect("a failure has a signature");
+
+        assert_eq!(first.fingerprint, second.fingerprint);
+    }
+
+    /// Guards that silence has no identity while non-empty unclassified output keeps a fallback.
+    #[test]
+    fn an_output_with_nothing_in_it_has_no_signature() {
+        assert!(failure_signature("").is_none());
+        assert!(failure_signature("   \n\t").is_none());
+        assert!(failure_signature("test result: ok. 3 passed").is_some());
+    }
 
     /// The last version of the schema that still had `refinements` in it.
     ///
@@ -1430,6 +2026,182 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    async fn insert_job(pool: &SqlitePool, project_id: &str, status: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO jobs
+               (project_id, project_root, rule_name, prompt, status, max_items, gate_each, review,
+                gate_retries, head_sha, max_rounds, budget_usd, created_at, team_id)
+             VALUES (?, ?, NULL, 'test job', ?, 1, 1, 0, 0, NULL, NULL, NULL,
+                     '2026-09-20T00:00:00+00:00', NULL)",
+        )
+        .bind(project_id)
+        .bind(format!("/project/{project_id}"))
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn insert_job_knowledge(
+        pool: &SqlitePool,
+        job_id: i64,
+        layer: &str,
+        status: &str,
+        title: &str,
+    ) -> i64 {
+        sqlx::query(
+            r#"INSERT INTO knowledge
+                 (layer, scope_kind, scope_id, source, evidence, kind, title, body, status, created_at)
+               VALUES (?, 'job', ?, 'run', '[{"t":"run","id":1}]', 'memory', ?, 'b', ?,
+                       '2026-09-20T00:00:00+00:00')"#,
+        )
+        .bind(layer)
+        .bind(job_id.to_string())
+        .bind(title)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn a_finding_closes_with_its_job_through_the_one_place_that_ends_a_job() {
+        assert_eq!(
+            crate::job::TERMINAL_STATUSES.len(),
+            8,
+            "a ninth ending needs a deliberate finding-lifetime decision"
+        );
+        let pool = test_pool().await;
+
+        for (index, terminal) in crate::job::TERMINAL_STATUSES.iter().enumerate() {
+            let job_id = insert_job(&pool, &format!("retired-{index}"), "running").await;
+            let other_job_id = insert_job(&pool, &format!("running-{index}"), "running").await;
+            let finding = insert_job_knowledge(
+                &pool,
+                job_id,
+                "working",
+                "live",
+                &format!("finding-{index}"),
+            )
+            .await;
+            let other = insert_job_knowledge(
+                &pool,
+                other_job_id,
+                "working",
+                "live",
+                &format!("other-{index}"),
+            )
+            .await;
+            let approved = insert_job_knowledge(
+                &pool,
+                job_id,
+                "semantic",
+                "active",
+                &format!("approved-{index}"),
+            )
+            .await;
+
+            crate::job::retire(&pool, job_id, terminal).await.unwrap();
+
+            let (status, ended_at): (String, Option<String>) =
+                sqlx::query_as("SELECT status, ended_at FROM knowledge WHERE id = ?")
+                    .bind(finding)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                status, "closed",
+                "the `{terminal}` ending left its finding live"
+            );
+            assert!(ended_at.is_some(), "the closed finding has no ending time");
+            let event: (String, String, String) = sqlx::query_as(
+                "SELECT from_status, to_status, note FROM knowledge_events WHERE knowledge_id = ?",
+            )
+            .bind(finding)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                event,
+                ("live".into(), "closed".into(), "the job ended".into())
+            );
+            let event_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_events WHERE knowledge_id = ?")
+                    .bind(finding)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(event_count, 1, "retiring wrote more than one closing event");
+
+            let other_status: String =
+                sqlx::query_scalar("SELECT status FROM knowledge WHERE id = ?")
+                    .bind(other)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(other_status, "live", "another running job lost its finding");
+            let approved_row: (String, Option<String>) =
+                sqlx::query_as("SELECT status, ended_at FROM knowledge WHERE id = ?")
+                    .bind(approved)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(approved_row, ("active".into(), None));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_finding_is_closed_by_the_hourly_pass() {
+        let pool = test_pool().await;
+        let ended_job = insert_job(&pool, "ended", "running").await;
+        sqlx::query("UPDATE jobs SET status = 'failed' WHERE id = ?")
+            .bind(ended_job)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let running_job = insert_job(&pool, "running", "running").await;
+        let ended = insert_job_knowledge(&pool, ended_job, "working", "live", "ended").await;
+        let missing = insert_job_knowledge(&pool, 9_999_999, "working", "live", "missing").await;
+        let running = insert_job_knowledge(&pool, running_job, "working", "live", "running").await;
+
+        assert_eq!(close_orphaned_working(&pool).await.unwrap(), 2);
+        let statuses: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, status FROM knowledge WHERE id IN (?, ?, ?) ORDER BY id")
+                .bind(ended)
+                .bind(missing)
+                .bind(running)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            statuses,
+            vec![
+                (ended, "closed".into()),
+                (missing, "closed".into()),
+                (running, "live".into()),
+            ]
+        );
+        assert_eq!(close_orphaned_working(&pool).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn the_consolidator_has_no_path_to_the_working_layer() {
+        let production = include_str!("consolidate.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the consolidator has a test boundary")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !production.contains("working"),
+            "the consolidator became a second writer for the working layer"
+        );
     }
 
     /// One row of 0088's table, written while that table still exists.
@@ -1742,6 +2514,128 @@ mod tests {
             vec!["house-wide", "the project's", "this job's own"],
             "a job did not read its whole chain, or read past the end of it: {titles:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_live_finding_is_read_by_its_own_job_and_no_other_job() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, evidence, kind, title, body, status, created_at)
+             VALUES
+               ('working', 'job', '41', 'run', '[{\"t\":\"run\",\"id\":1}]', 'memory',
+                'forty-one finding', 'body', 'live', '2026-09-20T00:00:00+00:00'),
+               ('working', 'job', '42', 'run', '[{\"t\":\"run\",\"id\":1}]', 'memory',
+                'forty-two finding', 'body', 'live', '2026-09-20T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let scope = Scope::Job {
+            id: 41,
+            project: Some("p".into()),
+        };
+        let rows = for_scope(&pool, &scope).await.unwrap();
+        assert!(rows.iter().any(|row| row.title == "forty-one finding"));
+        assert!(!rows.iter().any(|row| row.title == "forty-two finding"));
+
+        let brief = crate::brief::of(&pool, &job_context(41), "q")
+            .await
+            .unwrap();
+        let block = brief.block.expect("the finding reaches its own job");
+        assert!(block.contains("forty-one finding"));
+        assert!(!block.contains("forty-two finding"));
+    }
+
+    #[tokio::test]
+    async fn a_live_row_outside_the_job_scope_is_never_fetched() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, evidence, kind, title, body, status, created_at)
+             VALUES
+               ('working', 'project', 'p', 'run', '[{\"t\":\"run\",\"id\":1}]', 'memory',
+                'project live row', 'body', 'live', '2026-09-20T00:00:00+00:00'),
+               ('semantic', 'job', '41', 'run', '[{\"t\":\"run\",\"id\":1}]', 'memory',
+                'semantic live row', 'body', 'live', '2026-09-20T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows = for_scope(
+            &pool,
+            &Scope::Job {
+                id: 41,
+                project: Some("p".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            rows.is_empty(),
+            "ineligible live rows were fetched: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_finding_is_labelled_as_said_by_a_run_and_not_approved() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, evidence, kind, title, body, status, created_at)
+             VALUES
+               ('working', 'job', '41', 'run', '[{\"t\":\"run\",\"id\":1}]', 'memory',
+                'forty-one finding', 'body', 'live', '2026-09-20T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let brief = crate::brief::of(&pool, &job_context(41), "q")
+            .await
+            .unwrap();
+        let block = brief.block.expect("the finding renders");
+        assert!(block.contains("said by a run of this job, not approved"));
+
+        let approved = select(
+            &[one(1, "memory", "approved semantic", "body")],
+            &project_context(),
+            &Budget::default(),
+        )
+        .block
+        .expect("the approved semantic row renders");
+        assert!(!approved.contains("said by a run of this job, not approved"));
+    }
+
+    #[tokio::test]
+    async fn recall_never_answers_a_live_row() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, evidence, kind, title, body, status, created_at)
+             VALUES
+               ('working', 'job', '41', 'run', '[{\"t\":\"run\",\"id\":1}]', 'memory',
+                'live finding', 'the recallword is here', 'live',
+                '2026-09-20T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let recalled = crate::brief::recall(
+            &pool,
+            &Scope::Job {
+                id: 41,
+                project: Some("p".into()),
+            },
+            "recallword",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(recalled.is_empty(), "recall answered a live row");
     }
 
     /// The whole mechanism, end to end and in the order it happens: a run declares, nothing reaches
@@ -2472,7 +3366,7 @@ mod tests {
     /// The admission rule is asserted on `select`, the seam every caller passes through. Active
     /// rows still represent approval. The only rows that may bypass it are (a) an `active`
     /// consolidator `episodic` row with observations and (b) a `live` run `working` row with
-    /// non-empty evidence, read only inside the job that wrote it. Enumerating the surrounding
+    /// well-tagged evidence, read only inside the job that wrote it. Enumerating the surrounding
     /// status/source/layer space makes a third exception fail here rather than reach a prompt.
     #[test]
     fn nothing_that_a_person_has_not_approved_reaches_a_node() {
@@ -2499,7 +3393,7 @@ mod tests {
                     if status == "live" {
                         row.scope_kind = "job".into();
                         row.scope_id = Some("77".into());
-                        row.evidence = Some("run:900001".into());
+                        row.evidence = Some(r#"[{"t":"run","id":900001}]"#.into());
                     }
 
                     let measured_exception = status == "active"
@@ -2509,10 +3403,7 @@ mod tests {
                     let working_exception = status == "live"
                         && source == "run"
                         && layer == "working"
-                        && row
-                            .evidence
-                            .as_deref()
-                            .is_some_and(|value| !value.is_empty());
+                        && row.evidence.as_deref().is_some_and(evidence_is_tagged);
                     let approved = status == "active" && source != "consolidator";
                     assert_eq!(
                         select(std::slice::from_ref(&row), &context, &Budget::default(),)
@@ -2551,7 +3442,17 @@ mod tests {
         another_jobs_working_fact.id = 102;
         another_jobs_working_fact.title = "another job's".into();
         another_jobs_working_fact.scope_id = Some("78".into());
-        another_jobs_working_fact.evidence = Some("run:900002".into());
+        another_jobs_working_fact.evidence = Some(r#"[{"t":"run","id":900002}]"#.into());
+
+        let mut working_with_unknown_tag = working_without_evidence.clone();
+        working_with_unknown_tag.id = 103;
+        working_with_unknown_tag.title = "unknown evidence tag".into();
+        working_with_unknown_tag.evidence = Some(r#"[{"t":"vibes","id":1}]"#.into());
+
+        let mut working_with_untagged_evidence = working_without_evidence.clone();
+        working_with_untagged_evidence.id = 104;
+        working_with_untagged_evidence.title = "untagged evidence".into();
+        working_with_untagged_evidence.evidence = Some("run:900001".into());
 
         assert!(
             select(
@@ -2559,6 +3460,8 @@ mod tests {
                     measurement_without_observations,
                     working_without_evidence,
                     another_jobs_working_fact,
+                    working_with_unknown_tag,
+                    working_with_untagged_evidence,
                 ],
                 &context,
                 &Budget::default(),
@@ -2566,6 +3469,290 @@ mod tests {
             .block
             .is_none(),
             "an incomplete or cross-job exception reached a node's prompt"
+        );
+    }
+
+    /// Nothing a person has not approved reaches a node, except (a) an `active` consolidator
+    /// `episodic` row with measured observations (including a merge successor), and (b) a `live`
+    /// run `working` row with well-tagged evidence read only by the job that wrote it.
+    ///
+    /// This test FAILS if a third appears: an `active` row with no `proposal_id` that is not
+    /// consolidator-episodic-measured, a `live` row reaching a run of another job, or a `live` row
+    /// whose `evidence` is empty or badly tagged. This door checks only that evidence exists and is
+    /// tagged; it does not validate that the sentence is true.
+    #[tokio::test]
+    async fn nothing_a_person_has_not_approved_reaches_a_node_but_the_two_named_exceptions() {
+        let pool = test_pool().await;
+
+        seed(&pool, Some("p"), "active", "owner approved").await;
+        let owner_id: i64 =
+            sqlx::query_scalar("SELECT id FROM knowledge WHERE title = 'owner approved'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let (approved_id, approved_proposal) = propose(
+            &pool,
+            Declaration {
+                project_id: Some("p"),
+                origin_run_id: Some(900_001),
+                kind: Kind::Prompt,
+                title: "run lesson approved",
+                body: "approved body",
+                reasoning: "the run declared it",
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+        approve(&pool, approved_proposal).await.unwrap();
+        let (proposed_id, _) = propose(
+            &pool,
+            Declaration {
+                project_id: Some("p"),
+                origin_run_id: Some(900_002),
+                kind: Kind::Prompt,
+                title: "run lesson proposed",
+                body: "not approved",
+                reasoning: "still waiting",
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // There is no public one-row consolidator writer: its production writer is per-pass
+        // machinery. These rows therefore reproduce that writer's persisted columns directly.
+        sqlx::query(
+            r#"INSERT INTO knowledge
+                 (layer, scope_kind, scope_id, source, generator, evidence, observations, kind,
+                  title, body, status, proposal_id, supersedes, created_at)
+               VALUES
+                 ('episodic', 'project', 'p', 'consolidator', 'gate',
+                  '[{"t":"run","id":1}]', 4, 'memory', 'measured episode', 'measured',
+                  'active', NULL, NULL, '2026-10-01T00:00:00+00:00'),
+                 ('episodic', 'project', 'p', 'consolidator', 'gate',
+                  '[{"t":"run","id":1}]', NULL, 'memory', 'unmeasured episode', 'unmeasured',
+                  'active', NULL, NULL, '2026-10-01T00:00:00+00:00'),
+                 ('semantic', 'project', 'p', 'consolidator', 'gate',
+                  '[{"t":"run","id":1}]', 4, 'memory', 'semantic consolidation', 'semantic',
+                  'active', NULL, NULL, '2026-10-01T00:00:00+00:00'),
+                 ('episodic', 'project', 'p', 'consolidator', 'gate',
+                  '[{"t":"run","id":1}]', 4, 'memory', 'proposed measurement', 'proposed',
+                  'proposed', NULL, NULL, '2026-10-01T00:00:00+00:00'),
+                 ('episodic', 'project', 'p', 'consolidator', 'gate',
+                  '[{"t":"run","id":1}]', 8, 'memory', 'measured merge successor', 'merged',
+                  'active', NULL, 4, '2026-10-01T00:00:00+00:00'),
+                 ('episodic', 'project', 'p', 'consolidator', 'gate',
+                  '[{"t":"run","id":1}]', NULL, 'memory', 'unmeasured merge successor',
+                  'not measured', 'active', NULL, 4, '2026-10-01T00:00:00+00:00')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let measured_id: i64 =
+            sqlx::query_scalar("SELECT id FROM knowledge WHERE title = 'measured episode'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let unmeasured_id: i64 =
+            sqlx::query_scalar("SELECT id FROM knowledge WHERE title = 'unmeasured episode'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let semantic_id: i64 =
+            sqlx::query_scalar("SELECT id FROM knowledge WHERE title = 'semantic consolidation'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let proposed_measurement_id: i64 =
+            sqlx::query_scalar("SELECT id FROM knowledge WHERE title = 'proposed measurement'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let measured_successor_id: i64 =
+            sqlx::query_scalar("SELECT id FROM knowledge WHERE title = 'measured merge successor'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let unmeasured_successor_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM knowledge WHERE title = 'unmeasured merge successor'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        for job_id in [77_i64, 78] {
+            sqlx::query(
+                "INSERT INTO jobs
+                   (id, project_id, project_root, rule_name, prompt, status, max_items, gate_each,
+                    review, gate_retries, head_sha, max_rounds, budget_usd, created_at, team_id)
+                 VALUES (?, 'p', '/project/p', NULL, 'test job', 'running', 1, 1, 0, 0, NULL,
+                         NULL, NULL, '2026-10-01T00:00:00+00:00', NULL)",
+            )
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO runs (id, project_id, prompt, status, job_id, created_at)
+                 VALUES (?, 'p', 'test run', 'running', ?, '2026-10-01T00:00:00+00:00')",
+            )
+            .bind(9_000 + job_id)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let finding_77_id = note_finding(
+            &pool,
+            9_077,
+            "finding for job 77",
+            &serde_json::json!([{"t": "run", "id": 9_077}]),
+        )
+        .await
+        .unwrap();
+        let finding_78_id = note_finding(
+            &pool,
+            9_078,
+            "finding for job 78",
+            &serde_json::json!([{"t": "run", "id": 9_078}]),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"INSERT INTO knowledge
+                 (layer, scope_kind, scope_id, source, evidence, kind, title, body, status,
+                  created_at)
+               VALUES
+                 ('working', 'job', '77', 'run', '[{"t":"vibes","id":1}]', 'memory',
+                  'unknown tag', 'bad tag', 'live', '2026-10-01T00:00:00+00:00'),
+                 ('working', 'job', '77', 'run', 'run:1', 'memory',
+                  'untagged evidence', 'not JSON', 'live', '2026-10-01T00:00:00+00:00'),
+                 ('working', 'job', '77', 'run', '[]', 'memory',
+                  'empty evidence', 'empty array', 'live', '2026-10-01T00:00:00+00:00'),
+                 ('working', 'project', 'p', 'run', '[{"t":"run","id":1}]', 'memory',
+                  'project live row', 'wrong scope', 'live', '2026-10-01T00:00:00+00:00')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let bad_live_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM knowledge WHERE title IN
+             ('unknown tag', 'untagged evidence', 'empty evidence', 'project live row')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let brief_77 = crate::brief::of(&pool, &job_context(77), "query words")
+            .await
+            .unwrap();
+        let traced_77: std::collections::BTreeSet<i64> =
+            brief_77.trace.iter().map(|row| row.knowledge_id).collect();
+        let admitted_77 = std::collections::BTreeSet::from([
+            owner_id,
+            approved_id,
+            measured_id,
+            measured_successor_id,
+            finding_77_id,
+        ]);
+        assert_eq!(
+            traced_77, admitted_77,
+            "a third exception entered the trace"
+        );
+        assert!(
+            brief_77.trace.iter().all(|row| row.shown),
+            "the admitted rows did not all reach the block"
+        );
+        let block_77 = brief_77.block.expect("the admitted set builds a briefing");
+        for admitted_title in [
+            "owner approved",
+            "run lesson approved",
+            "measured episode",
+            "measured merge successor",
+            "finding for job 77",
+        ] {
+            assert!(
+                block_77.contains(admitted_title),
+                "the block omitted admitted row {admitted_title}"
+            );
+        }
+        for refused_title in [
+            "run lesson proposed",
+            "unmeasured episode",
+            "semantic consolidation",
+            "proposed measurement",
+            "unmeasured merge successor",
+            "finding for job 78",
+            "unknown tag",
+            "untagged evidence",
+            "empty evidence",
+            "project live row",
+        ] {
+            assert!(
+                !block_77.contains(refused_title),
+                "the block included refused row {refused_title}"
+            );
+        }
+        for refused_id in [
+            proposed_id,
+            unmeasured_id,
+            semantic_id,
+            proposed_measurement_id,
+            unmeasured_successor_id,
+            finding_78_id,
+        ]
+        .into_iter()
+        .chain(bad_live_ids.iter().copied())
+        {
+            assert!(
+                !brief_77
+                    .trace
+                    .iter()
+                    .any(|row| row.knowledge_id == refused_id),
+                "refused row {refused_id} entered job 77's trace"
+            );
+        }
+
+        let brief_78 = crate::brief::of(&pool, &job_context(78), "query words")
+            .await
+            .unwrap();
+        assert!(
+            brief_78
+                .trace
+                .iter()
+                .any(|row| row.knowledge_id == finding_78_id),
+            "job 78 did not receive its own finding"
+        );
+        assert!(
+            !brief_78
+                .trace
+                .iter()
+                .any(|row| row.knowledge_id == finding_77_id),
+            "job 78 received job 77's finding"
+        );
+
+        let unapproved_active_runs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge
+              WHERE source = 'run' AND status = 'active' AND proposal_id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unapproved_active_runs, 0);
+        let wrongly_shaped_live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge
+              WHERE status = 'live'
+                AND NOT (layer = 'working' AND scope_kind = 'job' AND source = 'run')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            wrongly_shaped_live, 1,
+            "a writer produced a stray live row beyond the deliberate project-scope fixture"
         );
     }
 

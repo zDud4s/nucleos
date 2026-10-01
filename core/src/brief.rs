@@ -2,8 +2,9 @@
 //!
 //! `knowledge.rs` makes the selection decision with zero I/O; this module fetches candidates,
 //! gives them SQLite's FTS rank, and hands them to that pure selector. It also persists the
-//! selector's trace once a run exists. A briefing for work that never becomes a run leaves no
-//! trace: `run_knowledge.run_id` is deliberately NOT NULL and references `runs` (D15).
+//! selector's trace once a run exists, and `trace_of` reads that decision for one run. A briefing
+//! for work that never becomes a run leaves no trace: `run_knowledge.run_id` is deliberately NOT
+//! NULL and references `runs` (D15).
 
 use std::collections::HashMap;
 
@@ -55,6 +56,13 @@ const FINAL_ITEM_STATUSES: [&str; 7] = [
 /// section 13.6 is not the volume of one run: the consolidator grows the store by itself, so
 /// candidates times runs grows quadratically.
 pub const DEFAULT_KNOWLEDGE_TRACE_RETENTION_DAYS: i64 = 90;
+
+const UNTRACED_MODES: [&str; 4] = [
+    "assistant",
+    crate::council::COUNCIL_MODE,
+    crate::team::TEAM_MODE,
+    crate::email::TRIAGE_MODE,
+];
 
 /// The trace window, overridable independently from the other hourly retention sweeps.
 pub(crate) fn retention_days() -> i64 {
@@ -293,6 +301,89 @@ pub async fn prune(
         .execute(pool)
         .await?
         .rows_affected())
+}
+
+/// The trace and its context for one run.
+#[derive(serde::Serialize)]
+pub struct RunTrace {
+    pub run_id: i64,
+    pub mode: Option<String>,
+    pub traced: bool,
+    pub reason: Option<&'static str>,
+    pub items: Vec<TraceItem>,
+}
+
+/// One candidate the briefing considered, with each election signal kept separate.
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct TraceItem {
+    pub knowledge_id: i64,
+    pub shown: bool,
+    pub s_fts: f64,
+    pub s_scope: f64,
+    pub s_structure: f64,
+    pub s_recency: f64,
+    pub s_use: f64,
+    pub at: String,
+    pub layer: String,
+    pub kind: String,
+    pub scope_kind: String,
+    pub scope_id: Option<String>,
+    pub source: String,
+    pub status: String,
+    pub observations: Option<i64>,
+    pub title: String,
+    pub body: String,
+}
+
+/// Read the briefing decision for one run, naming why an existing run has no retained trace.
+pub async fn trace_of(pool: &SqlitePool, run_id: i64) -> sqlx::Result<Option<RunTrace>> {
+    let Some((mode, created_at)) = sqlx::query_as::<_, (Option<String>, String)>(
+        "SELECT mode, created_at FROM runs WHERE id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let items = sqlx::query_as::<_, TraceItem>(
+        "SELECT rk.knowledge_id, rk.shown, rk.s_fts, rk.s_scope, rk.s_structure,
+                rk.s_recency, rk.s_use, rk.at, k.layer, k.kind, k.scope_kind, k.scope_id,
+                k.source, k.status, k.observations, k.title, k.body
+           FROM run_knowledge rk
+           JOIN knowledge k ON k.id = rk.knowledge_id
+          WHERE rk.run_id = ?
+          ORDER BY rk.shown DESC, rk.knowledge_id ASC",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+
+    let traced = !items.is_empty();
+    let reason = if traced {
+        None
+    } else if mode
+        .as_deref()
+        .is_some_and(|mode| UNTRACED_MODES.contains(&mode))
+    {
+        Some("no_trace_context")
+    } else if chrono::DateTime::parse_from_rfc3339(&created_at).is_ok_and(|created_at| {
+        created_at.with_timezone(&chrono::Utc)
+            < chrono::Utc::now() - chrono::Duration::days(retention_days())
+    }) {
+        Some("past_retention")
+    } else {
+        Some("nothing_offered")
+    };
+
+    Ok(Some(RunTrace {
+        run_id,
+        mode,
+        traced,
+        reason,
+        items,
+    }))
 }
 
 /// What the work that received a briefing ultimately proved.
@@ -649,7 +740,7 @@ mod tests {
 
     use super::{
         SWEEP_BATCH, Verdict, credit_item, credit_run, fts_ranks, item_verdict, match_expression,
-        normalise_fts, of, prune, record, run_verdict, sweep, sweep_at_most,
+        normalise_fts, of, prune, record, run_verdict, sweep, sweep_at_most, trace_of,
     };
     use crate::job::ItemState;
     use crate::knowledge::{Context, Scope, Scored};
@@ -979,6 +1070,127 @@ mod tests {
         }
         let machine_scope = machine_scope.expect("the machine row is traced");
         assert!(project_scopes.iter().all(|scope| machine_scope < *scope));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_trace_carries_the_five_signals_apart_and_the_lines_that_lost() -> sqlx::Result<()>
+    {
+        let pool = test_pool().await;
+        let loser = seed(&pool, "machine", None, "the line that lost").await?;
+        let shown = seed(&pool, "project", Some("p1"), "the line that was shown").await?;
+        let run_id = seed_run(&pool, "completed", Some(0), Some("passed"), None).await?;
+        let trace = [
+            Scored {
+                knowledge_id: loser,
+                shown: false,
+                s_fts: 0.61,
+                s_scope: 0.72,
+                s_structure: 0.83,
+                s_recency: 0.94,
+                s_use: 0.15,
+                score: 0.0,
+            },
+            Scored {
+                knowledge_id: shown,
+                shown: true,
+                s_fts: 0.11,
+                s_scope: 0.22,
+                s_structure: 0.33,
+                s_recency: 0.44,
+                s_use: 0.55,
+                score: 0.0,
+            },
+        ];
+        record(&pool, run_id, None, &trace).await?;
+
+        let answer = trace_of(&pool, run_id)
+            .await?
+            .expect("the run exists, so its trace has an answer");
+        assert_eq!(answer.run_id, run_id);
+        assert_eq!(answer.mode.as_deref(), Some("worktree"));
+        assert!(answer.traced);
+        assert_eq!(answer.reason, None);
+        assert_eq!(answer.items.len(), 2);
+
+        let winner = &answer.items[0];
+        assert_eq!(winner.knowledge_id, shown);
+        assert!(winner.shown);
+        assert_eq!(winner.s_fts, 0.11);
+        assert_eq!(winner.s_scope, 0.22);
+        assert_eq!(winner.s_structure, 0.33);
+        assert_eq!(winner.s_recency, 0.44);
+        assert_eq!(winner.s_use, 0.55);
+        assert_eq!(winner.title, "the line that was shown");
+        assert_eq!(winner.layer, "semantic");
+        assert_eq!(winner.source, "owner");
+
+        let lost = &answer.items[1];
+        assert_eq!(lost.knowledge_id, loser);
+        assert!(!lost.shown);
+        assert_eq!(lost.s_fts, 0.61);
+        assert_eq!(lost.s_scope, 0.72);
+        assert_eq!(lost.s_structure, 0.83);
+        assert_eq!(lost.s_recency, 0.94);
+        assert_eq!(lost.s_use, 0.15);
+        assert_eq!(lost.title, "the line that lost");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_in_a_context_that_leaves_no_trace_says_so_instead_of_answering_empty()
+    -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let assistant = seed_run(&pool, "completed", Some(0), None, None).await?;
+        let council = seed_run(&pool, "completed", Some(0), None, None).await?;
+
+        for (run_id, mode) in [
+            (assistant, "assistant"),
+            (council, crate::council::COUNCIL_MODE),
+        ] {
+            sqlx::query("UPDATE runs SET mode = ? WHERE id = ?")
+                .bind(mode)
+                .bind(run_id)
+                .execute(&pool)
+                .await?;
+            let answer = trace_of(&pool, run_id).await?.expect("the run exists");
+            assert!(!answer.traced);
+            assert_eq!(answer.reason, Some("no_trace_context"));
+            assert!(answer.items.is_empty());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_past_the_retention_window_says_its_trace_is_gone() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let old = seed_run(&pool, "completed", Some(0), None, None).await?;
+        let today = seed_run(&pool, "completed", Some(0), None, None).await?;
+        let old_at = (chrono::Utc::now() - chrono::Duration::days(200)).to_rfc3339();
+        sqlx::query("UPDATE runs SET mode = 'real', created_at = ? WHERE id = ?")
+            .bind(old_at)
+            .bind(old)
+            .execute(&pool)
+            .await?;
+        sqlx::query("UPDATE runs SET mode = 'real' WHERE id = ?")
+            .bind(today)
+            .execute(&pool)
+            .await?;
+
+        let old_answer = trace_of(&pool, old).await?.expect("the old run exists");
+        assert!(!old_answer.traced);
+        assert_eq!(old_answer.reason, Some("past_retention"));
+
+        let today_answer = trace_of(&pool, today).await?.expect("today's run exists");
+        assert!(!today_answer.traced);
+        assert_eq!(today_answer.reason, Some("nothing_offered"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_nobody_knows_has_no_trace_at_all() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        assert!(trace_of(&pool, 999_999).await?.is_none());
         Ok(())
     }
 

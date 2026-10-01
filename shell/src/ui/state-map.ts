@@ -253,6 +253,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     action_authorized: { tone: "info", label: "action authorised by a grant" },
     proposal_record_failed: { tone: "danger", label: "proposal not recorded" },
     promotion_ready: { tone: "pending", label: "promotion ready" },
+    judge_demoted: { tone: "paused", label: "judge back to observing" },
     // A credential set or forgotten from the app. The line names the key and never the value.
     secret_stored: { tone: "info", label: "credential set" },
     secret_forgotten: { tone: "info", label: "credential forgotten" },

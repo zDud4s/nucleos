@@ -76,6 +76,23 @@ export type KnownStatus =
   | "expired"
   | "live";
 
+export const EVIDENCE_TAGS = [
+  "run",
+  "job_item",
+  "proposal",
+  "knowledge",
+  "project",
+  "command",
+  "gate",
+] as const;
+
+export type EvidenceTag = (typeof EVIDENCE_TAGS)[number];
+
+export interface EvidenceRef {
+  t: EvidenceTag;
+  id: number | string;
+}
+
 /** One thing the agent knows, as `knowledge::Known` serialises. */
 export interface Known {
   id: number;
@@ -85,6 +102,7 @@ export interface Known {
   scope_id: string | null;
   /** Who knocked at the door — never read from the body. */
   source: "owner" | "run" | "consolidator";
+  generator: string | null;
   kind: KnownKind;
   title: string;
   body: string;
@@ -94,9 +112,120 @@ export interface Known {
   /** The row this one replaces, ended when this one was approved. */
   supersedes: number | null;
   origin_run_id: number | null;
+  evidence: string | null;
+  observations: number | null;
+  fingerprint: string | null;
+  expires_after_runs: number | null;
+  last_confirmed_at: string | null;
+  shown_count: number;
+  outcome_count: number;
+  green_count: number;
+  last_shown_at: string | null;
   created_at: string;
   activated_at: string | null;
   ended_at: string | null;
+}
+
+/**
+ * Read the tagged evidence JSON without letting a stale or future tag invent a
+ * destination in the shell. Malformed JSON is absence; known entries survive
+ * independently of malformed neighbours.
+ */
+export function parseEvidence(raw: string | null): EvidenceRef[] {
+  if (raw === null) return [];
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+
+  const tags: ReadonlySet<string> = new Set(EVIDENCE_TAGS);
+  return parsed.flatMap((item): EvidenceRef[] => {
+    if (typeof item !== "object" || item === null) return [];
+    const candidate = item as { t?: unknown; id?: unknown };
+    if (typeof candidate.t !== "string" || !tags.has(candidate.t)) return [];
+    if (typeof candidate.id !== "string" && typeof candidate.id !== "number") return [];
+    return [{ t: candidate.t as EvidenceTag, id: candidate.id }];
+  });
+}
+
+export interface MeasuredScope {
+  scope: string;
+  total: number;
+  byGenerator: { generator: string; count: number }[];
+}
+
+export interface WaitingGroup {
+  key: string;
+  scope: string;
+  source: Known["source"];
+  rows: Known[];
+  proposalIds: number[];
+}
+
+/** Proposed rows, collected by the scope and source a person decides together. */
+export function groupWaiting(rows: Known[]): WaitingGroup[] {
+  const groups = new Map<string, WaitingGroup>();
+
+  for (const row of rows) {
+    if (row.status !== "proposed") continue;
+    const key = `${row.scope_kind}|${row.scope_id ?? ""}|${row.source}`;
+    const group = groups.get(key) ?? {
+      key,
+      scope: row.scope_id ?? "this machine",
+      source: row.source,
+      rows: [],
+      proposalIds: [],
+    };
+    group.rows.push(row);
+    groups.set(key, group);
+  }
+
+  return [...groups.values()]
+    .map((group) => {
+      const sorted = [...group.rows].sort((left, right) => left.id - right.id);
+      return {
+        ...group,
+        rows: sorted,
+        proposalIds: sorted.flatMap((row) =>
+          row.proposal_id === null ? [] : [row.proposal_id],
+        ),
+      };
+    })
+    .sort((left, right) => left.rows[0].id - right.rows[0].id);
+}
+
+/** Active measurements, grouped into the number spec 13.1 asks a person to watch. */
+export function measuredByGenerator(rows: Known[]): MeasuredScope[] {
+  const scopes = new Map<string, Map<string, number>>();
+
+  for (const row of rows) {
+    if (
+      row.status !== "active" ||
+      row.layer !== "episodic" ||
+      row.source !== "consolidator"
+    ) {
+      continue;
+    }
+    const scope = row.scope_id ?? "this machine";
+    const generator = row.generator ?? "unknown";
+    const counts = scopes.get(scope) ?? new Map<string, number>();
+    counts.set(generator, (counts.get(generator) ?? 0) + 1);
+    scopes.set(scope, counts);
+  }
+
+  return [...scopes.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([scope, counts]) => ({
+      scope,
+      total: [...counts.values()].reduce((sum, count) => sum + count, 0),
+      byGenerator: [...counts.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([generator, count]) => ({ generator, count })),
+    }));
 }
 
 /** One decision in a row's life — `knowledge::Event`. */
@@ -152,7 +281,7 @@ export function useKnowledgeHistory(id: number | null) {
  * row — it ends it — so a chain left on screen from before the decision would
  * show a superseded text as still in force.
  */
-function useKnowledgeDecision<Input>(mutationFn: (input: Input) => Promise<unknown>) {
+function useKnowledgeDecision<Input, Result>(mutationFn: (input: Input) => Promise<Result>) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn,
@@ -185,6 +314,44 @@ export function useApproveKnowledge() {
 export function useRejectKnowledge() {
   return useKnowledgeDecision((proposalId: number) =>
     apiFetch<void>(`/proposals/${proposalId}/reject`, { method: "POST" }),
+  );
+}
+
+export interface BatchResult {
+  done: number;
+  failed: number[];
+}
+
+/** Decide a visible group through the existing proposal doors, one row at a time. */
+export function useDecideKnowledgeBatch() {
+  return useKnowledgeDecision(
+    async ({
+      action,
+      proposalIds,
+    }: {
+      action: "approve" | "reject";
+      proposalIds: number[];
+    }): Promise<BatchResult> => {
+      let done = 0;
+      const failed: number[] = [];
+
+      for (const id of [...proposalIds].sort((left, right) => left - right)) {
+        try {
+          if (action === "approve") {
+            await apiFetch<{ refinement_id: number }>(`/proposals/${id}/approve`, {
+              method: "POST",
+            });
+          } else {
+            await apiFetch<void>(`/proposals/${id}/reject`, { method: "POST" });
+          }
+          done += 1;
+        } catch {
+          failed.push(id);
+        }
+      }
+
+      return { done, failed };
+    },
   );
 }
 
