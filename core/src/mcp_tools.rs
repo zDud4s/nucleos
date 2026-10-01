@@ -63,10 +63,12 @@ impl NucleosTools {
     /// schema: the wire form is what is paid for, and its punctuation and key names are a real part
     /// of it. A tool that somehow fails to serialise counts as nothing instead of panicking — this
     /// is an estimate feeding a display, and no reading here is worth taking a daemon down for.
-    pub fn advertised_schema_chars() -> usize {
+    pub fn advertised_schema_chars(job: Option<i64>) -> usize {
+        let served = job.map_or(McpBox::All, McpBox::JobNode);
         Self::tool_router()
             .list_all()
             .into_iter()
+            .filter(|tool| served_in_box(served, tool.name.as_ref()))
             .filter_map(|tool| serde_json::to_string(&tool).ok())
             .map(|json| json.len())
             .sum()
@@ -5067,7 +5069,7 @@ mod tests {
     /// not millions, which is the fact that makes it worth showing at all.
     #[test]
     fn the_announced_schema_block_is_measured_from_what_the_server_serves() {
-        let announced = NucleosTools::advertised_schema_chars();
+        let announced = NucleosTools::advertised_schema_chars(None);
 
         assert!(
             (20_000..80_000).contains(&announced),

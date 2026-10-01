@@ -719,6 +719,26 @@ pub fn build_mcp_config(exe_path: &str) -> serde_json::Value {
     })
 }
 
+/// The throwaway MCP config a job node is launched with.
+pub fn build_job_node_mcp_config(exe_path: &str, job_id: i64) -> serde_json::Value {
+    let args = vec![
+        "--mcp-tools".to_string(),
+        "--box".to_string(),
+        "job-node".to_string(),
+        "--job".to_string(),
+        job_id.to_string(),
+    ];
+    serde_json::json!({
+        "mcpServers": {
+            "nucleos": {
+                "type": "stdio",
+                "command": exe_path,
+                "args": args
+            }
+        }
+    })
+}
+
 /// Which client sent a chat message, as the client states it.
 ///
 /// Stated rather than inferred, and that is why this type exists at all. A Telegram group id is
@@ -2285,6 +2305,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             permission,
             resume_session_id: resume,
             mcp_config: Some(turn.mcp_path.clone()),
+            mcp_job: None,
             // Decided by `tool_policy_for`, which is where the rule is written out. The
             // default remains what it always was — the orchestrator talks to NucleOS and to
             // nothing else, and the MCP allowlist does not enforce that on its own, because
@@ -4030,6 +4051,23 @@ mod tests {
     }
 
     #[test]
+    fn the_job_node_config_names_the_box_and_the_job() {
+        let config = build_job_node_mcp_config("C:/x/n.exe", 7);
+        let args = config["mcpServers"]["nucleos"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(args, ["--mcp-tools", "--box", "job-node", "--job", "7"]);
+        assert_eq!(
+            crate::mcp_tools::box_from_args(&args[1..]),
+            Ok(crate::mcp_tools::McpBox::JobNode(7))
+        );
+    }
+
+    #[test]
     fn a_configuracao_mcp_e_escrita_por_inteiro() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
@@ -4609,7 +4647,7 @@ mod tests {
              being true, the figure below stops being about anything"
         );
         // Its server announces the whole tool list.
-        let surface = crate::mcp_tools::NucleosTools::advertised_schema_chars() as i64;
+        let surface = crate::mcp_tools::NucleosTools::advertised_schema_chars(None) as i64;
         assert!(surface > 0, "the daemon's server announces nothing at all");
         assert_eq!(
             recorded,
@@ -6586,6 +6624,7 @@ mod tests {
             permission: crate::runner::Permission::Default,
             resume_session_id: resume,
             mcp_config: None,
+            mcp_job: None,
             tool_policy: crate::runner::ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,

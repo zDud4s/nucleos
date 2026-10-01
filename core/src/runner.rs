@@ -267,6 +267,10 @@ pub struct RunRequest {
     pub permission: Permission,
     pub resume_session_id: Option<String>,
     pub mcp_config: Option<PathBuf>,
+    /// The job the server named by `mcp_config` is boxed to.
+    ///
+    /// `None` names the unboxed server. This is only `Some` together with `mcp_config`.
+    pub mcp_job: Option<i64>,
     pub tool_policy: ToolPolicy,
     pub progress_timeout: Option<Duration>,
     /// How many model responses this run may take before the daemon stops it. `None` is no ceiling.
@@ -2096,7 +2100,7 @@ pub(crate) fn authored_prompt(request: &RunRequest) -> crate::prompt_budget::Aut
             // different fact from the one above it, and `AuthoredPrompt::schema_chars` is where the
             // two are told apart for whoever reads the stored number.
             Some(_) if schemas_are_deferred(request) => 0,
-            Some(_) => crate::mcp_tools::NucleosTools::advertised_schema_chars(),
+            Some(_) => crate::mcp_tools::NucleosTools::advertised_schema_chars(request.mcp_job),
         },
         // Only counted when the flag is actually written. `Some("")` is not a state any caller
         // builds, but counting an absent value as zero and a present one by its length is what keeps
@@ -3609,6 +3613,13 @@ pub struct Launch {
 /// The test double for `CommandRunner`. `#[cfg(test)]` because every user of it is a test — building
 /// it into the daemon would ship a runner that can fake a run's outcome.
 #[cfg(test)]
+pub type JobMcpLaunch = (
+    Option<std::path::PathBuf>,
+    Option<i64>,
+    Option<&'static [&'static str]>,
+);
+
+#[cfg(test)]
 #[derive(Default)]
 pub struct FakeCommandRunner {
     pub canned: std::sync::Mutex<Option<RunOutcome>>,
@@ -3622,6 +3633,7 @@ pub struct FakeCommandRunner {
     pub last_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub last_resume: std::sync::Mutex<Option<String>>,
     pub last_mcp_config: std::sync::Mutex<Option<std::path::PathBuf>>,
+    pub last_job_mcp: std::sync::Mutex<Option<JobMcpLaunch>>,
     pub last_tool_policy: std::sync::Mutex<Option<ToolPolicy>>,
     pub last_session_id: std::sync::Mutex<Option<String>>,
     pub last_fork_session: std::sync::Mutex<Option<bool>>,
@@ -3878,6 +3890,11 @@ impl CommandRunner for FakeCommandRunner {
         *self.last_permission.lock().unwrap() = Some(request.permission);
         *self.last_resume.lock().unwrap() = request.resume_session_id.clone();
         *self.last_mcp_config.lock().unwrap() = request.mcp_config.clone();
+        *self.last_job_mcp.lock().unwrap() = Some((
+            request.mcp_config.clone(),
+            request.mcp_job,
+            request.allowed_mcp_tools,
+        ));
         *self.last_tool_policy.lock().unwrap() = Some(request.tool_policy);
         *self.last_session_id.lock().unwrap() = request.session_id.clone();
         *self.last_fork_session.lock().unwrap() = Some(request.fork_session);
@@ -4745,7 +4762,7 @@ mod tests {
         request.tool_policy = ToolPolicy::McpOnly;
         assert_eq!(
             authored_prompt(&request).schema_chars,
-            crate::mcp_tools::NucleosTools::advertised_schema_chars(),
+            crate::mcp_tools::NucleosTools::advertised_schema_chars(None),
             "denying the built-ins denies `ToolSearch` with them, the CLI cannot defer, and the run \
              really does read every schema its server announces"
         );
@@ -4780,7 +4797,7 @@ mod tests {
         request.denied_tools = vec!["ToolSearch".to_string()];
         assert_eq!(
             authored_prompt(&request).schema_chars,
-            crate::mcp_tools::NucleosTools::advertised_schema_chars(),
+            crate::mcp_tools::NucleosTools::advertised_schema_chars(None),
             "one name on `--disallowedTools` and the CLI has no way to fetch a schema on demand, so \
              it ships them all — the price must follow the flag, not the policy the flag sits under"
         );
@@ -4794,6 +4811,7 @@ mod tests {
             permission: Permission::Default,
             resume_session_id: None,
             mcp_config: None,
+            mcp_job: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,
@@ -4987,6 +5005,7 @@ mod tests {
             permission: Permission::Default,
             resume_session_id: None,
             mcp_config: None,
+            mcp_job: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,
@@ -6898,6 +6917,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_job_node_request_allows_exactly_note_finding() {
+        let mut request = baseline_run_request();
+        request.mcp_config = Some(PathBuf::from("C:/tmp/job-node.json"));
+        request.allowed_mcp_tools = Some(crate::mcp_tools::JOB_NODE_TOOLS);
+
+        let args = cli_args(&request, "claude-sonnet-5");
+        let allowed = args
+            .windows(2)
+            .find(|pair| pair[0] == "--allowedTools")
+            .map(|pair| pair[1].as_str())
+            .expect("a configured server must carry an allow-list");
+        assert_eq!(allowed, "mcp__nucleos__note_finding");
+        assert_ne!(allowed, "mcp__nucleos__*");
+        assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+    }
+
+    #[test]
+    fn a_job_node_server_is_priced_by_its_box() {
+        let mut request = baseline_run_request();
+        request.tool_policy = ToolPolicy::McpOnly;
+        request.mcp_config = Some(PathBuf::from("C:/tmp/job-node.json"));
+        request.mcp_job = Some(1);
+
+        let job_price = crate::mcp_tools::NucleosTools::advertised_schema_chars(Some(1));
+        assert_eq!(authored_prompt(&request).schema_chars, job_price);
+        assert_ne!(
+            job_price,
+            crate::mcp_tools::NucleosTools::advertised_schema_chars(None)
+        );
+    }
+
     #[tokio::test]
     async fn fake_runner_fails_configured_times_then_succeeds() {
         let runner = FakeCommandRunner {
@@ -7574,6 +7625,16 @@ mod tests {
             !args.iter().any(|arg| arg.contains("secret-token-value")),
             "{args:?}"
         );
+    }
+
+    #[test]
+    fn a_codex_job_node_carries_the_box_in_its_server_args() {
+        let config = crate::assistant::build_job_node_mcp_config("C:/x/n.exe", 7);
+        let overrides = codex_mcp_overrides(&config, &[]).unwrap();
+
+        assert!(overrides.iter().any(|value| {
+            value == r#"mcp_servers.nucleos.args=["--mcp-tools","--box","job-node","--job","7"]"#
+        }));
     }
 
     /// `codex exec` declines an unconfirmed MCP call; Claude pre-approves these same tools.
