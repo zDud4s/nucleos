@@ -1097,10 +1097,10 @@ fn action_key(tool_name: &str, tool_input: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(tool_input) else {
         return tool_input.to_owned();
     };
-    if matches!(tool_name, "Bash" | "PowerShell") {
-        if let Some(command) = value.get("command").and_then(serde_json::Value::as_str) {
-            return command.to_owned();
-        }
+    if matches!(tool_name, "Bash" | "PowerShell")
+        && let Some(command) = value.get("command").and_then(serde_json::Value::as_str)
+    {
+        return command.to_owned();
     }
     if let Some(map) = value.as_object_mut() {
         map.remove("description");
