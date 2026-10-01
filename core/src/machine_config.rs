@@ -1,7 +1,7 @@
 //! Who may write THIS MACHINE's settings, and what a valid one looks like.
 //!
 //! [`crate::ownership`] answers the same question for a file in a PROJECT, and its header explains
-//! at length why nine files are deliberately absent from that table: they are this machine's, so a
+//! at length why these files are deliberately absent from that table: they are this machine's, so a
 //! route under `/projects/{id}` that wrote one would edit a single daemon's configuration through a
 //! URL naming a project, and would do it identically whichever project was named. That reasoning
 //! stands. This module is the other half of it — the same fence, around the files whose owner is
@@ -30,7 +30,7 @@
 //!
 //! # The parsers had to be built before the table could exist
 //!
-//! Eight of these nine loaders are fail-soft on purpose: `load_email_config` and its neighbours
+//! Nine of these ten loaders are fail-soft on purpose: `load_email_config` and its neighbours
 //! answer a malformed file with defaults and a warning, so a typo in an optional pillar cannot stop
 //! the daemon from starting. That is right for startup and useless as a door — a validator that
 //! cannot say no admits anything. So each loader now delegates to a `parse_*_config` that returns
@@ -86,6 +86,7 @@ pub const BROWSER_FILE: &str = "browser.yaml";
 pub const TELEGRAM_FILE: &str = "telegram.yaml";
 pub const GITHUB_FILE: &str = "github.yaml";
 pub const COUNCIL_FILE: &str = "council.yaml";
+pub const ROUTER_FILE: &str = "router.yaml";
 
 /// One of this machine's settings files, with everything a caller needs to act on it safely.
 ///
@@ -147,6 +148,12 @@ fn validate_council(contents: &str) -> Result<(), String> {
     crate::config::parse_council_config(contents, true).map(|_| ())
 }
 
+/// The llm-router adviser's file. `parse_config` is the grammar and also the loopback fence, so the
+/// door refuses a router URL off this machine exactly as the daemon would at startup.
+fn validate_router(contents: &str) -> Result<(), String> {
+    crate::route_advice::parse_config(contents).map(|_| ())
+}
+
 /// Parses, and then asks the one question parsing cannot: whether the local route this file
 /// describes is a route the daemon will actually build.
 ///
@@ -169,7 +176,7 @@ fn validate_models(contents: &str) -> Result<(), String> {
         .map_err(|refusal| refusal.message())
 }
 
-/// This machine's settings files. Nine rows, and the count is asserted in the tests for the same
+/// This machine's settings files. Ten rows, and the count is asserted in the tests for the same
 /// reason the project registry asserts two: a row added without reading the header above is a row
 /// that has not answered the membership rule.
 pub static SETTINGS: &[Setting] = &[
@@ -228,6 +235,13 @@ pub static SETTINGS: &[Setting] = &[
         what: "who sits on this machine's council, which model or agent answers for each seat, and how long a seat gets",
         takes_effect: "when the daemon restarts",
         validate: validate_council,
+    },
+    Setting {
+        path: ROUTER_FILE,
+        area: "router",
+        what: "whether this machine asks a loopback llm-router which model and effort a run, a seat or a triage item should use, per surface, and which runners it may move a run to",
+        takes_effect: "when the daemon restarts — the router is read once at startup; an absent file leaves routing off",
+        validate: validate_router,
     },
     Setting {
         path: crate::config::MODELS_CONFIG_FILE,
@@ -419,7 +433,7 @@ mod tests {
     fn every_setting_can_refuse_and_says_what_it_changes() {
         assert_eq!(
             SETTINGS.len(),
-            9,
+            10,
             "see the module header before adding a row"
         );
         for setting in SETTINGS {
@@ -499,7 +513,7 @@ mod tests {
         }
     }
 
-    /// An empty file is valid for seven of the nine, and that property is what makes the page
+    /// An empty file is valid for eight of the ten, and that property is what makes the page
     /// usable: a settings surface has to be able to write a file that turns a pillar off.
     ///
     /// The two exceptions are named here rather than tolerated, because each is a real difference
@@ -530,6 +544,36 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// The llm-router's file is a row, and its door refuses what the daemon would refuse: a URL off
+    /// this machine, because the head of a prompt travels in the request.
+    #[test]
+    fn the_router_file_is_a_row_and_its_door_refuses_a_remote_router() {
+        let row = setting_for(ROUTER_FILE).expect("router.yaml is registered");
+        assert_eq!(row.area, "router");
+        assert!(
+            (row.validate)(
+                "mode: off
+"
+            )
+            .is_ok()
+        );
+        assert!(
+            (row.validate)(
+                "mode: shadow
+url: http://example.com:8080
+"
+            )
+            .is_err()
+        );
+        assert!(
+            (row.validate)(
+                "mode: sideways
+"
+            )
+            .is_err()
+        );
     }
 
     /// The shared path guard is reached, so traversal and the backslash are refused here exactly as

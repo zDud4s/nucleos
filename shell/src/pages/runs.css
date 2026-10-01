@@ -637,3 +637,23 @@
   text-transform: uppercase;
   color: var(--text-faint);
 }
+
+/* What ran and what the router advised: two quiet lines inside the facts panel. */
+.runs-route {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-sm);
+}
+
+.runs-route-row {
+  margin: 0 0 var(--space-1);
+}
+
+.runs-route-label {
+  color: var(--text-muted);
+  margin-right: var(--space-2);
+}
+
+.runs-route-match {
+  margin-left: var(--space-2);
+  color: var(--text-muted);
+}

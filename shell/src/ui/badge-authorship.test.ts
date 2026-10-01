@@ -21,6 +21,7 @@ const ALLOWED = new Map<string, { literals: number; tables?: string[]; reason: s
   ["pages/Calendar.tsx", { literals: 1, reason: "busy or free right now is computed from the calendar in the browser; the daemon sends no such literal." }],
   ["pages/Contacts.tsx", { literals: 4, reason: "a contact's verdict, whether you write back, and a merge are facts about a person, not a lifecycle." }],
   ["pages/Feed.tsx", { literals: 1, tables: ["readFeedKind"], reason: "the ignorance device for an unknown feed kind — the same posture as StateBadge, in the slice that owns feed kinds." }],
+  ["pages/RunDetail.tsx", { literals: 1, reason: "the llm-router mode a run was routed under (shadow or apply) is machine configuration read off the run, not a lifecycle state of the run." }],
   ["pages/System.tsx", { literals: 1, reason: "a token's authority level is an identifier off the wire, not a lifecycle state." }],
   ["pages/Voice.tsx", { literals: 8, reason: "the dictation phase and the spoken conversation's phase both live entirely in the webview (`lib/conversation.ts` for the second) — no núcleo literal exists for either." }],
   ["team/Decisions.tsx", { literals: 1, reason: "`granted — nobody decides` is a sentence about an absent proposal, not a state of one." }],

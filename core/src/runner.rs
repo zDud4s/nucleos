@@ -968,27 +968,40 @@ pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
 /// `is_error` and `terminal_reason` told the truth, which is why neither `subtype` nor the exit
 /// code is read.
 pub(crate) fn failed_on_a_transient_api_error(stdout: &str) -> bool {
-    let Some(result) = stdout.lines().rev().find_map(|line| {
-        serde_json::from_str::<serde_json::Value>(line.trim())
-            .ok()
-            .filter(|event| event.get("type").and_then(|kind| kind.as_str()) == Some("result"))
-    }) else {
+    let Some(result) = final_api_error(stdout) else {
         return false;
     };
-    if result.get("is_error").and_then(|flag| flag.as_bool()) != Some(true)
-        || result
-            .get("terminal_reason")
-            .and_then(|reason| reason.as_str())
-            != Some("api_error")
-    {
-        return false;
-    }
     match result.get("api_error_status") {
         None | Some(serde_json::Value::Null) => true,
         Some(status) => status
             .as_u64()
             .is_some_and(|code| code == 408 || code == 429 || (500..=599).contains(&code)),
     }
+}
+
+/// Whether the run ended on the API rate-limiting it: the last `result` event is an `api_error`
+/// with `api_error_status: 429`. Read exactly as [`failed_on_a_transient_api_error`] reads it, of
+/// which this is the one status that says "this subscription, right now" rather than "the network"
+/// or "the service" — the llm-router locks the subscription on it, and must not on a 529.
+pub(crate) fn failed_on_rate_limit(stdout: &str) -> bool {
+    final_api_error(stdout)
+        .and_then(|result| result.get("api_error_status").and_then(|s| s.as_u64()))
+        == Some(429)
+}
+
+/// The LAST `result` event, when it says `is_error: true` with `terminal_reason: "api_error"`.
+fn final_api_error(stdout: &str) -> Option<serde_json::Value> {
+    let result = stdout.lines().rev().find_map(|line| {
+        serde_json::from_str::<serde_json::Value>(line.trim())
+            .ok()
+            .filter(|event| event.get("type").and_then(|kind| kind.as_str()) == Some("result"))
+    })?;
+    (result.get("is_error").and_then(|flag| flag.as_bool()) == Some(true)
+        && result
+            .get("terminal_reason")
+            .and_then(|reason| reason.as_str())
+            == Some("api_error"))
+    .then_some(result)
 }
 
 /// Job 26's review, run 900483, cut down to what the detector above reads: the first of its ten
@@ -2034,6 +2047,16 @@ pub trait CommandRunner: Send + Sync {
     /// Defaulted so a runner with one model — every runner but the CLI one — answers `None` without
     /// having to say so, and so a caller that names no stage keeps today's behavior.
     fn model_for_stage(&self, _stage: Option<&str>) -> Option<String> {
+        None
+    }
+
+    /// The llm-router this runner consults before a run, or `None` when routing is off.
+    ///
+    /// Defaulted to `None`, and only `route_advice::RoutedRunner` answers `Some`: that wrapper is
+    /// built by `main.rs` only when `router.yaml` turns routing on, so a daemon with routing off
+    /// holds the very runner it held before routing existed. A capability on the trait rather than
+    /// an `AppState` field, so no state literal anywhere had to learn about it.
+    fn router(&self) -> Option<std::sync::Arc<crate::route_advice::Router>> {
         None
     }
 
@@ -3083,6 +3106,13 @@ pub(crate) fn stage_codex_images(
         .collect()
 }
 
+/// The model a Codex launch runs: the request's own when it names one, else the runner's
+/// configured model. A routed run names its model on the request, so this is where that choice
+/// reaches the command line.
+pub(crate) fn codex_model<'a>(request: &'a RunRequest, configured: &'a str) -> &'a str {
+    request.model.as_deref().unwrap_or(configured)
+}
+
 /// The full `codex exec` argument vector for one run, or the reason this tool cannot perform the
 /// run that was asked for. Pure for the same reason `cli_args` is: the flags deciding which model
 /// answers and where it is allowed to work are asserted in tests instead of inspected on a live
@@ -3425,12 +3455,8 @@ impl CommandRunner for CodexCliRunner {
             images: staged_files.0.clone(),
             sandbox_mode: self.sandbox_mode,
         };
-        let args = codex_cli_args(
-            &request,
-            request.model.as_deref().unwrap_or(&self.model),
-            &staged,
-        )
-        .map_err(std::io::Error::other)?;
+        let args = codex_cli_args(&request, codex_model(&request, &self.model), &staged)
+            .map_err(std::io::Error::other)?;
 
         // The Codex CLI binary. Overridable via `NUCLEOS_CODEX_BIN` for the same reason
         // `NUCLEOS_CLAUDE_BIN` exists: on Windows the npm-installed `codex` is a `.cmd` shim that
@@ -5925,6 +5951,42 @@ mod tests {
         }
     }
 
+    /// Only a 429 is a rate limit: an overloaded service (529), no status at all, or a turn that
+    /// ended for another reason is not the subscription being held.
+    #[test]
+    fn a_429_result_is_a_rate_limit() {
+        let ended_on = |status: &str| {
+            format!(
+                "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}}\n\
+                 {{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\
+                 \"terminal_reason\":\"api_error\",\"api_error_status\":{status},\
+                 \"result\":\"API Error\"}}"
+            )
+        };
+        for (status, limited) in [
+            ("429", true),
+            ("529", false),
+            ("500", false),
+            ("null", false),
+            ("400", false),
+        ] {
+            assert_eq!(
+                failed_on_rate_limit(&ended_on(status)),
+                limited,
+                "api_error_status {status}"
+            );
+        }
+        let not_an_api_error = r#"{"type":"result","is_error":true,"terminal_reason":"max_turns","api_error_status":429}"#;
+        assert!(!failed_on_rate_limit(not_an_api_error));
+        let recovered = format!(
+            "{}\n{}",
+            ended_on("429"),
+            r#"{"type":"result","is_error":false,"result":"done"}"#
+        );
+        assert!(!failed_on_rate_limit(&recovered));
+        assert!(!failed_on_rate_limit(""));
+    }
+
     /// A turn that ended for any other reason ended on something the work did, and a stream with no
     /// result at all says nothing about why it stopped.
     #[test]
@@ -7328,6 +7390,35 @@ mod tests {
         assert!(
             !directoryless_args.iter().any(|arg| arg == "-C"),
             "an absent cwd must not invent a directory: {directoryless_args:?}"
+        );
+    }
+
+    /// A routed run names its model on the request, and the Codex launch must run THAT model rather
+    /// than the one the runner was built with. Without this the router's advice would be recorded
+    /// as applied while the configured model answered.
+    #[test]
+    fn codex_launch_uses_the_requested_model_over_its_own() {
+        let mut request = baseline_run_request();
+        request.model = None;
+        assert_eq!(codex_model(&request, "cfg-model"), "cfg-model");
+
+        request.model = Some("gpt-x".into());
+        assert_eq!(codex_model(&request, "cfg-model"), "gpt-x");
+
+        let args = codex_cli_args(
+            &request,
+            codex_model(&request, "cfg-model"),
+            &CodexStaged::default(),
+        )
+        .expect("a baseline request asks for nothing the tool cannot honour");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-m" && pair[1] == "gpt-x"),
+            "the requested model must follow -m: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "cfg-model"),
+            "the configured model must not reach the vector: {args:?}"
         );
     }
 

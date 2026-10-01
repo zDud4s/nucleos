@@ -1979,12 +1979,43 @@ pub struct RecruitRequest {
     /// Absent means `mcp_only`, which is what every team agent already has.
     pub tool_policy: Option<String>,
     pub why: String,
+    /// `suggest_model`: answer the model adviser's suggestion for this candidate and file NOTHING.
+    /// Carried on this route rather than on one of its own so the team key reaches no new route —
+    /// the question is the director's alone either way, and it is answered by the same check.
+    #[serde(default)]
+    pub suggest_only: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct RecruitResponse {
     pub proposal_id: i64,
     pub outcome: String,
+}
+
+/// A director asks which model a candidate should run on. **Nothing is filed and nothing is
+/// hired**: the answer is the model adviser's suggestion or a plain "no suggestion".
+///
+/// The same two checks as `propose_teammate`, first and in the same order — a specialist is told
+/// the same sentence it is told there.
+pub async fn suggest_model(
+    state: &AppState,
+    scope: &crate::auth::Scope,
+    headers: &axum::http::HeaderMap,
+    request: &RecruitRequest,
+) -> Result<serde_json::Value, RecruitError> {
+    let crate::auth::Scope::TeamRun(team_run_id) = scope else {
+        return Err(RecruitError::NotADepartment);
+    };
+    if calling_node(&state.pool, team_run_id, headers).await != Caller::Director {
+        return Err(RecruitError::NotTheDirector);
+    }
+    Ok(crate::seat_advice::suggest_model(
+        state.runner.router(),
+        &request.speciality,
+        &request.why,
+        &request.prompt,
+    )
+    .await)
 }
 
 /// A director asks for somebody it does not have. **Nothing is hired here.**
@@ -2055,17 +2086,15 @@ pub async fn propose_teammate(
         .clone()
         .or_else(|| director.as_ref().map(|agent| agent.engine.clone()))
         .unwrap_or_else(|| "claude".to_owned());
-    let model = request
-        .model
-        .clone()
-        .or_else(|| director.as_ref().and_then(|agent| agent.model.clone()));
-
-    let proposed = crate::agent::AgentRequest {
+    let mut proposed = crate::agent::AgentRequest {
         name: request.name.trim().to_owned(),
         speciality: request.speciality.trim().to_owned(),
         prompt: request.prompt.clone(),
         engine,
-        model,
+        model: request
+            .model
+            .clone()
+            .or_else(|| director.as_ref().and_then(|agent| agent.model.clone())),
         tool_policy: request
             .tool_policy
             .clone()
@@ -2083,6 +2112,27 @@ pub async fn propose_teammate(
         return Err(RecruitError::Invalid(
             "say what you needed them for — it is the whole of what the owner will read".to_owned(),
         ));
+    }
+
+    // Under `recruit: apply`, the model adviser's pick for this candidate before the director's
+    // own; any failure there is the director's own, exactly as before. Asked only once the
+    // request is otherwise fileable, so a refused one sends its text nowhere; and an advised model
+    // that `validate_request` would refuse is dropped for the director's.
+    if request.model.is_none()
+        && let Some(advised) = crate::seat_advice::recruit_default(
+            state.runner.router(),
+            &proposed.engine,
+            &request.speciality,
+            &request.why,
+            &request.prompt,
+        )
+        .await
+    {
+        let director_model = proposed.model.replace(advised);
+        if let Err(why) = crate::agent::validate_request(&proposed) {
+            tracing::warn!(%why, "the adviser's model for a recruit was refused; keeping the director's");
+            proposed.model = director_model;
+        }
     }
 
     let payload = serde_json::json!({
@@ -3120,6 +3170,13 @@ async fn spawn_agent(
     let runner = state.runner.clone();
     let timeout = state.run_timeout;
     crate::runs::spawn_registered(state, run_id, async move {
+        // Asked inside the task, so a slow adviser delays this seat and never the caller handing
+        // out a round. `off` asks nothing and leaves the request as built above.
+        // Its outcome is reported by `ingest_landed_items`, against the `route_decision_id` this
+        // writes on the run's row, once the item lands.
+        let mut request = request;
+        let _decision =
+            crate::seat_advice::route_team_seat(&pool, runner.router(), run_id, &mut request).await;
         let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         // How much window this agent is holding, mirrored into the row while it runs.
@@ -3325,6 +3382,7 @@ async fn ingest_landed_items(state: &AppState, run: &TeamRun) -> Result<(), sqlx
             .bind(ordinal)
             .execute(&state.pool)
             .await?;
+            crate::seat_advice::report_team_item(&state.pool, state.runner.router(), run_id).await;
             continue;
         }
 
@@ -3363,6 +3421,11 @@ async fn ingest_landed_items(state: &AppState, run: &TeamRun) -> Result<(), sqlx
                 .await?;
             }
         }
+        // The seat is reported on how its RUN ended, after the item's own state is written — so a
+        // pass that could not write it retries next tick and reports once, not twice. A completed
+        // run whose answer could not be filed is still `pass`: the model did the work, the daemon
+        // is what failed to keep it.
+        crate::seat_advice::report_team_item(&state.pool, state.runner.router(), run_id).await;
     }
     Ok(())
 }
@@ -4345,26 +4408,26 @@ pub async fn post_team_recruit(
     axum::Extension(scope): axum::Extension<crate::auth::Scope>,
     headers: axum::http::HeaderMap,
     Json(request): Json<RecruitRequest>,
-) -> Result<Json<RecruitResponse>, (StatusCode, String)> {
-    propose_teammate(&state, &scope, &headers, &request)
-        .await
-        .map(Json)
-        .map_err(|error| {
-            let status = match &error {
-                RecruitError::NotADepartment | RecruitError::NotTheDirector => {
-                    StatusCode::FORBIDDEN
-                }
-                RecruitError::NoSuchRun => StatusCode::NOT_FOUND,
-                // 409 for both: somebody with that id already exists, or a question about them is
-                // already open. Neither is a malformed request, and both clear by somebody acting.
-                RecruitError::AlreadyExists(_) | RecruitError::AlreadyAsked(_) => {
-                    StatusCode::CONFLICT
-                }
-                RecruitError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
-                RecruitError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            (status, error.to_string())
-        })
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let answered = if request.suggest_only {
+        suggest_model(&state, &scope, &headers, &request).await
+    } else {
+        propose_teammate(&state, &scope, &headers, &request)
+            .await
+            .map(|filed| serde_json::to_value(filed).unwrap_or_default())
+    };
+    answered.map(Json).map_err(|error| {
+        let status = match &error {
+            RecruitError::NotADepartment | RecruitError::NotTheDirector => StatusCode::FORBIDDEN,
+            RecruitError::NoSuchRun => StatusCode::NOT_FOUND,
+            // 409 for both: somebody with that id already exists, or a question about them is
+            // already open. Neither is a malformed request, and both clear by somebody acting.
+            RecruitError::AlreadyExists(_) | RecruitError::AlreadyAsked(_) => StatusCode::CONFLICT,
+            RecruitError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            RecruitError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, error.to_string())
+    })
 }
 
 /// `POST /team-notes` — one member of a department leaves words for another.
@@ -6570,6 +6633,162 @@ mod tests {
             model: None,
             tool_policy: None,
             why: "the launch has a distribution agreement nobody here can read".to_owned(),
+            suggest_only: false,
+        }
+    }
+
+    /// A runner fronted by a stub model adviser answering `claude-opus-5`, with every surface
+    /// named in `surfaces` at its mode. Returns what the stub was asked.
+    async fn advised_runner(
+        state: &mut AppState,
+        surfaces: &[(&'static str, crate::route_advice::Mode)],
+    ) -> tokio::sync::mpsc::UnboundedReceiver<serde_json::Value> {
+        let (url, sent) = crate::router_client::test_support::stub_router(
+            200,
+            serde_json::json!({
+                "decision_id": "rt_team", "runner": "claude", "model": "claude-opus-5",
+                "effort": "high", "estimated_cost_usd": 0.2, "rule": "hard",
+            }),
+        )
+        .await;
+        let config = crate::route_advice::RouterConfig {
+            mode: crate::route_advice::Mode::Off,
+            url,
+            surfaces: surfaces.iter().copied().collect(),
+            ..crate::route_advice::RouterConfig::off()
+        };
+        let inner = state.runner.clone();
+        let router = std::sync::Arc::new(crate::route_advice::Router::new(
+            config,
+            crate::route_advice::Available {
+                kind: crate::route_advice::RunnerKind::Claude,
+                runner: inner.clone(),
+                default_model: "claude-sonnet-5".into(),
+                models: vec!["claude-*".into()],
+            },
+            Vec::new(),
+        ));
+        state.runner = std::sync::Arc::new(crate::route_advice::RoutedRunner { inner, router });
+        sent
+    }
+
+    /// `suggest_model` answers only the director -- the same check, the same sentence -- and files
+    /// nothing either way.
+    #[tokio::test]
+    async fn only_the_director_is_told_which_model_to_recruit() {
+        let (mut state, _root) = state_with_root().await;
+        let mut sent = advised_runner(
+            &mut state,
+            &[("recruit", crate::route_advice::Mode::Shadow)],
+        )
+        .await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "prepare the launch", None)
+            .await
+            .unwrap();
+        let (director_run, specialist_run) = director_and_specialist(&state, &run_id).await;
+        let scope = Scope::TeamRun(run_id.clone());
+
+        let refused = suggest_model(&state, &scope, &as_node(specialist_run), &a_lawyer()).await;
+        assert!(
+            matches!(refused, Err(RecruitError::NotTheDirector)),
+            "got {refused:?}"
+        );
+        assert!(
+            sent.try_recv().is_err(),
+            "a specialist's question reached the adviser"
+        );
+
+        let answered = suggest_model(&state, &scope, &as_node(director_run), &a_lawyer())
+            .await
+            .unwrap();
+        assert_eq!(answered["model"], "claude-opus-5");
+        assert_eq!(answered["rule"], "hard");
+        assert!(sent.try_recv().is_ok());
+        assert!(
+            !crate::proposals::recruit_pending_for(&state.pool, "contracts-lawyer")
+                .await
+                .unwrap(),
+            "a question about a model filed a recruit"
+        );
+    }
+
+    /// Under `recruit: apply` a recruit that named no model gets the adviser's; one that named a
+    /// model keeps it and nothing is asked.
+    #[tokio::test]
+    async fn a_recruit_with_no_model_takes_the_advice_under_apply() {
+        let (mut state, _root) = state_with_root().await;
+        let mut sent =
+            advised_runner(&mut state, &[("recruit", crate::route_advice::Mode::Apply)]).await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "prepare the launch", None)
+            .await
+            .unwrap();
+        let (director_run, _) = director_and_specialist(&state, &run_id).await;
+        let scope = Scope::TeamRun(run_id.clone());
+
+        let named = RecruitRequest {
+            name: "Tax adviser".to_owned(),
+            model: Some("claude-haiku-5".to_owned()),
+            ..a_lawyer()
+        };
+        let filed = propose_teammate(&state, &scope, &as_node(director_run), &named)
+            .await
+            .unwrap();
+        assert!(sent.try_recv().is_err(), "a named model was second-guessed");
+        let hired = approve_recruit(&state.pool, filed.proposal_id, None)
+            .await
+            .unwrap();
+        let agent = crate::agent::get(&state.pool, &hired)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.model.as_deref(), Some("claude-haiku-5"));
+
+        let filed = propose_teammate(&state, &scope, &as_node(director_run), &a_lawyer())
+            .await
+            .unwrap();
+        let body = sent.try_recv().expect("the adviser was asked");
+        assert_eq!(body["runners"], serde_json::json!(["claude"]));
+        let hired = approve_recruit(&state.pool, filed.proposal_id, None)
+            .await
+            .unwrap();
+        let agent = crate::agent::get(&state.pool, &hired)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    /// A recruit that is refused anyway — no `why`, or a request `validate_request` rejects — is
+    /// refused before the adviser hears anything: the task text is not sent for nothing.
+    #[tokio::test]
+    async fn a_recruit_refused_on_its_own_terms_never_reaches_the_adviser() {
+        let (mut state, _root) = state_with_root().await;
+        let mut sent =
+            advised_runner(&mut state, &[("recruit", crate::route_advice::Mode::Apply)]).await;
+        marketing(&state).await;
+        let run_id = start(&state, "marketing", "prepare the launch", None)
+            .await
+            .unwrap();
+        let (director_run, _) = director_and_specialist(&state, &run_id).await;
+        let scope = Scope::TeamRun(run_id.clone());
+
+        let no_why = RecruitRequest {
+            why: "   ".to_owned(),
+            ..a_lawyer()
+        };
+        let unrestricted = RecruitRequest {
+            tool_policy: Some("unrestricted".to_owned()),
+            ..a_lawyer()
+        };
+        for refused in [no_why, unrestricted] {
+            let answer = propose_teammate(&state, &scope, &as_node(director_run), &refused).await;
+            assert!(
+                matches!(answer, Err(RecruitError::Invalid(_))),
+                "got {answer:?}"
+            );
+            assert!(sent.try_recv().is_err(), "the adviser was asked");
         }
     }
 
@@ -7759,6 +7978,73 @@ mod tests {
         );
     }
 
+    /// A local member is never routed, whatever the team surface says: its model is the one the
+    /// local engine serves, and the adviser is not asked.
+    #[tokio::test]
+    async fn a_local_team_member_is_never_routed() {
+        const ANSWER: &str = "a local answer";
+        let base_url = stub_openai_compatible_member(ANSWER).await;
+        let (mut state, _root) = state_with_root().await;
+        let mut sent =
+            advised_runner(&mut state, &[("team", crate::route_advice::Mode::Apply)]).await;
+        state.assistants = std::sync::Arc::new(MemberAssistants {
+            base_url,
+            asked_for: std::sync::Mutex::new(Vec::new()),
+        });
+        let run = team_run_for_member(&state, "tr-local-unrouted").await;
+        let agent = local_member("a-frontier-moe");
+        let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+
+        spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+
+        assert_eq!(settled_run(&state, run_id).await.0, "completed");
+        assert!(sent.try_recv().is_err(), "a local seat asked the adviser");
+        let mode: Option<String> = sqlx::query_scalar("SELECT route_mode FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, None);
+    }
+
+    /// A cloud member under `team: apply` launches on the advice, and the row says so.
+    #[tokio::test]
+    async fn a_cloud_team_member_under_apply_launches_the_advice() {
+        let (mut state, _root) = state_with_root().await;
+        let fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        state.runner = fake.clone();
+        let mut sent =
+            advised_runner(&mut state, &[("team", crate::route_advice::Mode::Apply)]).await;
+        let run = team_run_for_member(&state, "tr-cloud-routed").await;
+        let agent = crate::agent::Agent {
+            engine: "claude".to_owned(),
+            model: Some("claude-sonnet-5".to_owned()),
+            ..local_member("unused")
+        };
+        let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+
+        spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+        settled_run(&state, run_id).await;
+
+        assert!(sent.try_recv().is_ok());
+        assert_eq!(
+            *fake.last_model.lock().unwrap(),
+            Some(Some("claude-opus-5".to_owned()))
+        );
+        // A run with no speed of its own is `normal`, whose ceiling is `medium`.
+        assert_eq!(
+            *fake.last_effort.lock().unwrap(),
+            Some(Some("medium".to_owned()))
+        );
+        let decision: Option<String> =
+            sqlx::query_scalar("SELECT route_decision_id FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(decision.as_deref(), Some("rt_team"));
+    }
+
     /// A member whose factory has no local route fails carrying the refusal's OWN sentence.
     ///
     /// The refusal travels verbatim for the reason `council.rs` gives at its seat: `Refusal::
@@ -7859,6 +8145,90 @@ mod tests {
         assert_eq!(states[1].1, "done");
         assert_eq!(states[1].2.as_deref(), Some("2-copywriter.md"));
         assert_eq!(fetch_run(&state, &id).await.state, "working");
+    }
+
+    /// A landed item tells the router how its seat went, against the decision on its run's row:
+    /// filed is `pass`, failed is `fail`, and an item launched unrouted reports nothing.
+    #[tokio::test]
+    async fn a_landed_item_reports_its_seats_outcome_to_the_router() {
+        let (mut state, _root) = state_with_root().await;
+        let (url, mut received) = crate::router_client::test_support::outcome_router(200).await;
+        let inner = state.runner.clone();
+        let router = std::sync::Arc::new(crate::route_advice::Router::new(
+            crate::route_advice::RouterConfig {
+                mode: crate::route_advice::Mode::Shadow,
+                url,
+                ..crate::route_advice::RouterConfig::off()
+            },
+            crate::route_advice::Available {
+                kind: crate::route_advice::RunnerKind::Claude,
+                runner: inner.clone(),
+                default_model: "claude-sonnet-5".into(),
+                models: vec!["claude-*".into()],
+            },
+            Vec::new(),
+        ));
+        state.runner = std::sync::Arc::new(crate::route_advice::RoutedRunner { inner, router });
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+
+        let mut items = Vec::new();
+        for (ordinal, status, decision) in [
+            (1, "failed", Some("rt_failed")),
+            (2, "completed", Some("rt_done")),
+            (3, "completed", None),
+        ] {
+            let (run_id, _) = open_run(&state, &id, "work", false).await.unwrap();
+            sqlx::query(
+                "UPDATE runs SET status = ?, stdout = 'the draft', route_decision_id = ?
+                 WHERE id = ?",
+            )
+            .bind(status)
+            .bind(decision)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            items.push((ordinal, run_id));
+        }
+        for (ordinal, run_id) in items {
+            sqlx::query(
+                "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state,
+                                         run_id)
+                 VALUES (?, ?, 0, 'copywriter', 'work', 'running', ?)",
+            )
+            .bind(&id)
+            .bind(ordinal)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let run = fetch_run(&state, &id).await;
+        ingest_landed_items(&state, &run).await.unwrap();
+        // A second pass finds nothing still running, so nothing is reported twice.
+        ingest_landed_items(&state, &run).await.unwrap();
+
+        let mut reports = Vec::new();
+        while let Ok(Some(report)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), received.recv()).await
+        {
+            reports.push(report);
+        }
+        reports.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            reports,
+            vec![
+                ("rt_done".to_owned(), serde_json::json!({"status": "pass"})),
+                (
+                    "rt_failed".to_owned(),
+                    serde_json::json!({"status": "fail"})
+                ),
+            ]
+        );
     }
 
     /// The core names the file, which is what makes a collision between two specialists impossible

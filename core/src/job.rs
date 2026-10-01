@@ -3918,6 +3918,7 @@ async fn spawn_node(
                     stage,
                     worktree_path: path.to_string_lossy().into_owned(),
                     branch,
+                    item_ordinal: item.as_ref().map(|claim| claim.ordinal),
                 },
             )
             .await
@@ -4548,6 +4549,11 @@ async fn record_gate(
             Some(format!("the gate could not be measured: {reason}")),
         ),
     };
+    // Told to the llm-router before anything below can return early. A DB read and a spawn, so it
+    // cannot hold the tick on the network; an item whose run was not advised reports nothing.
+    if let Some(router) = state.runner.router() {
+        crate::route_advice::report_item_gate(pool, router, job.id, ordinal as i64, &outcome).await;
+    }
 
     // Green: take the footing the next item will stand on.
     //

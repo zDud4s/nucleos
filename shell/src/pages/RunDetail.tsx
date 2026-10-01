@@ -18,6 +18,7 @@ import {
   type StopDecision,
 } from "../data/runs";
 import {
+  Badge,
   Button,
   ConfirmButton,
   ContextMeter,
@@ -233,6 +234,8 @@ function FactsPanel({ run }: { run: Run }) {
         <Fact label="Steerable">{run.steerable ? "yes — it accepts more turns" : "no"}</Fact>
       </dl>
 
+      <RouteBlock run={run} />
+
       {/* What went into the prompt stays here and not in the strip above: it is read once, as a
           fact of how the run was built, not watched like the cost and the context fill. */}
       <PromptBudget authored={run.authored_prompt_estimate} cliOwn={run.cli_own_estimate} />
@@ -250,6 +253,72 @@ function FactsPanel({ run }: { run: Run }) {
         </p>
       )}
     </Panel>
+  );
+}
+
+/** The `route_failed` JSON array as `a, b`; null when absent, empty or unreadable. */
+function failedAttempts(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string" || raw === "") return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    const labels = parsed.filter((label): label is string => typeof label === "string" && label !== "");
+    return labels.length === 0 ? null : labels.join(", ");
+  } catch {
+    return null;
+  }
+}
+
+/** `runner · model · effort`, skipping what is unknown; null when nothing is known. */
+function routeTriple(parts: Array<string | null | undefined>): string | null {
+  const known = parts.filter((part): part is string => typeof part === "string" && part !== "");
+  return known.length === 0 ? null : known.join(" · ");
+}
+
+/**
+ * What ran, and what the local router would have had it run.
+ *
+ * Renders nothing when the run carries none of it — a run from before the
+ * router has no trail, and an empty section would claim there was one.
+ * In `shadow` the advice is only a comparison, so it says whether it matched;
+ * in `apply` the advice is what ran, and no comparison is drawn.
+ */
+function RouteBlock({ run }: { run: Run }) {
+  const ran = routeTriple([run.runner, run.model, run.effort]);
+  const advised = routeTriple([run.advised_runner, run.advised_model, run.advised_effort]);
+  const mode = run.route_mode === "shadow" || run.route_mode === "apply" ? run.route_mode : null;
+  const failed = failedAttempts(run.route_failed);
+  // A mode with no decision is the router having given nothing usable: down, slow, refused, or an
+  // answer outside what was asked. The run launched as it would have without it.
+  const unadvised = mode !== null && !run.route_decision_id && advised === null;
+  if (ran === null && advised === null && failed === null && !unadvised) return null;
+
+  const matched =
+    mode === "shadow" &&
+    advised !== null &&
+    run.advised_runner === run.runner &&
+    run.advised_model === run.model &&
+    run.advised_effort === run.effort;
+
+  return (
+    <div className="runs-route">
+      {ran !== null && (
+        <p className="runs-route-row">
+          <span className="runs-route-label">Ran with</span> {ran}
+        </p>
+      )}
+      {mode !== null && advised !== null && (
+        <p className="runs-route-row">
+          <span className="runs-route-label">Router advised</span> {advised}{" "}
+          <Badge tone={mode === "apply" ? "active" : "shadow"}>{mode}</Badge>
+          {mode === "shadow" && (
+            <span className="runs-route-match">{matched ? "matched what ran" : "differs from what ran"}</span>
+          )}
+        </p>
+      )}
+      {unadvised && <p className="runs-successor">The router gave no usable advice; the run launched as configured.</p>}
+      {failed !== null && <p className="runs-successor">{`Already failed on this item: ${failed}`}</p>}
+    </div>
   );
 }
 

@@ -87,11 +87,14 @@ mod redact;
 mod relay;
 mod repo_trigger;
 mod resolver;
+mod route_advice;
+mod router_client;
 mod run_stop;
 mod runner;
 mod runs;
 mod scheduler;
 mod search;
+mod seat_advice;
 mod secrets;
 mod seed;
 mod sessions;
@@ -1390,6 +1393,16 @@ async fn main() {
         }
         None => Arc::new(claude_runner()),
     };
+    // The llm-router as an adviser. Off unless `~/.nucleos/router.yaml` turns it on, and off hands
+    // back the very runner built above. Read from the same root the settings page writes and the
+    // health row probes, so the three never disagree about which file is in force.
+    let primary_runner = route_advice::front(
+        primary_runner,
+        &models_config,
+        machine_file(machine_config::ROUTER_FILE)
+            .map(|path| route_advice::load_config(&path))
+            .unwrap_or_else(route_advice::RouterConfig::off),
+    );
 
     // The email sidecar's own key, minted before `AppState` exists rather than beside the spawn.
     //

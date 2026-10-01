@@ -427,6 +427,16 @@ struct ProposeTeammateParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct SuggestModelParams {
+    /// One line: what the candidate is for.
+    speciality: String,
+    /// Why this department needs them.
+    why: String,
+    /// Their standing instructions, if you have drafted them.
+    prompt: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct VcsTicketParams {
     /// The id the queue gave back when the operation was submitted.
     id: i64,
@@ -1037,6 +1047,37 @@ impl NucleosTools {
                     "model": model,
                     "tool_policy": tool_policy,
                     "why": why,
+                }))
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Ask which model a specialist you are about to propose should run on. Only a \
+                       director may call this, and it changes nothing: it answers this machine's \
+                       model adviser's suggestion (model, effort, estimated cost, and the rule \
+                       that chose it), or \"no suggestion\" when the adviser is off or \
+                       unavailable. Pass what you found as `model` to `propose_teammate` if you \
+                       agree with it."
+    )]
+    async fn suggest_model(
+        &self,
+        Parameters(SuggestModelParams {
+            speciality,
+            why,
+            prompt,
+        }): Parameters<SuggestModelParams>,
+    ) -> String {
+        // The recruit route with `suggest_only`, so the team key reaches no new route; the daemon
+        // answers it with the same director check `propose_teammate` gets.
+        json_result(
+            self.client
+                .propose_teammate(&serde_json::json!({
+                    "name": "",
+                    "speciality": speciality,
+                    "prompt": prompt.unwrap_or_default(),
+                    "why": why,
+                    "suggest_only": true,
                 }))
                 .await,
         )
@@ -2017,6 +2058,8 @@ pub const TEAM_TOOLS: &[&str] = &[
     "read_team_file",
     "report_to_owner",
     "send_team_note",
+    // Director-only like `propose_teammate`, and narrowed the same way, in the handler.
+    "suggest_model",
     "web_read",
     "web_search",
 ];
@@ -2398,6 +2441,9 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // not on this server, so a turn that reads them has nothing to reach for next.
     ("shadow_queue", ToolEffect::ReadsOwn),
     ("shadow_scoreboard", ToolEffect::ReadsOwn),
+    // `ReadsOwn`: it asks this machine's own model adviser, on loopback, and files nothing. What it
+    // sends is the director's own description of a candidate; what it answers is a model name.
+    ("suggest_model", ToolEffect::ReadsOwn),
     ("triage_email", ToolEffect::Acts),
     ("vcs_request", ToolEffect::Acts),
     ("vcs_ticket", ToolEffect::ReadsOwn),
@@ -2685,6 +2731,11 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             "report_to_owner" => {
                 self.tools
                     .report_to_owner(Parameters(parsed!(ReportParams)))
+                    .await
+            }
+            "suggest_model" => {
+                self.tools
+                    .suggest_model(Parameters(parsed!(SuggestModelParams)))
                     .await
             }
             // No `spend_is_permitted` guard, for `propose_action`'s reason: leaving words for a
@@ -3784,6 +3835,7 @@ mod tests {
                 "set_kill",
                 "shadow_queue",
                 "shadow_scoreboard",
+                "suggest_model",
                 "triage_email",
                 "vcs_request",
                 "vcs_ticket",

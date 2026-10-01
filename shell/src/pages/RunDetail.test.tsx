@@ -308,6 +308,67 @@ describe("RunDetail — what it was told", () => {
 /* ----------------------------------------------------------------- gate -- */
 
 describe("RunDetail — the gate", () => {
+  it("shows what ran and a shadow advice that differs", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail({
+          runner: "claude",
+          model: "sonnet",
+          effort: "high",
+          route_mode: "shadow",
+          advised_runner: "claude",
+          advised_model: "haiku",
+          advised_effort: "low",
+        }),
+        NO_TAIL,
+        [],
+      ),
+    );
+    await renderApp({ initialPath: "/runs/5" });
+    expect(await screen.findByText("claude · sonnet · high")).toBeDefined();
+    expect(screen.getByText("claude · haiku · low", { exact: false })).toBeDefined();
+    expect(screen.getByText("shadow")).toBeDefined();
+    expect(screen.getByText("differs from what ran")).toBeDefined();
+  });
+
+  it("says a shadow advice matched when it did", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail({
+          runner: "claude", model: "sonnet", effort: "high", route_mode: "shadow",
+          advised_runner: "claude", advised_model: "sonnet", advised_effort: "high",
+        }),
+        NO_TAIL,
+        [],
+      ),
+    );
+    await renderApp({ initialPath: "/runs/5" });
+    expect(await screen.findByText("matched what ran")).toBeDefined();
+  });
+
+  it("says when the router gave no usable advice, and lists what had already failed", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail({ route_mode: "shadow", route_decision_id: null, route_failed: '["sonnet@low","opus"]' }),
+        NO_TAIL,
+        [],
+      ),
+    );
+    const first = await renderApp({ initialPath: "/runs/5" });
+    expect(await screen.findByText("The router gave no usable advice; the run launched as configured.")).toBeDefined();
+    expect(screen.getByText("Already failed on this item: sonnet@low, opus")).toBeDefined();
+    expect(screen.queryByText("Router advised")).toBeNull();
+    first.unmount?.();
+  });
+
+  it("renders no router section when every field is null", async () => {
+    daemon.apiFetch.mockImplementation(detailFetch(detail(), NO_TAIL, []));
+    await renderApp({ initialPath: "/runs/5" });
+    await screen.findByText("This run");
+    expect(screen.queryByText("Ran with")).toBeNull();
+    expect(screen.queryByText("Router advised")).toBeNull();
+  });
+
   it("renders a run nobody gated as ungated, never as failed", async () => {
     const asked: string[] = [];
     daemon.apiFetch.mockImplementation(

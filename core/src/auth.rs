@@ -2276,6 +2276,8 @@ mod tests {
             ("read_team_file", Method::POST, "/team-files/read"),
             ("report_to_owner", Method::POST, "/team-reports"),
             ("send_team_note", Method::POST, "/team-notes"),
+            // The recruit route again, with `suggest_only`: no route of its own.
+            ("suggest_model", Method::POST, "/team-recruits"),
             ("web_read", Method::POST, "/web/read"),
             ("web_search", Method::POST, "/web/search"),
         ];
