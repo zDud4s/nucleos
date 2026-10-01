@@ -8,10 +8,6 @@
 //!
 //! The first half is PURE (the rules). The second is the I/O: the question put to the judge and
 //! the row written for every answer (D10, D11, D13), which decides nothing by itself.
-// Not every item is read even by the tests (the db spellings, `Moot`, `rule`) until the hook and
-// the rows are wired.
-#![allow(dead_code)] // consumed by Task 4.2
-
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -48,8 +44,10 @@ pub const DEFAULT_AT: f64 = 0.85;
 /// D4: in a park, "explain" also needs the task NOT to need the action (needed < 0.5).
 pub const NEEDED_BLOCKS_EXPLAIN_AT: f64 = 0.5;
 /// D5: redirects per lineage, counting only applied ones. A soft ceiling (D5 says why).
+#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.1
 pub const REDIRECTS_PER_LINEAGE: i64 = 2;
 /// D6: corrections per project in a rolling day.
+#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 7.1
 pub const CORRECTIONS_PER_PROJECT_PER_DAY: i64 = 3;
 /// D6/D10: how much of the gate's output reaches the Jev and the correction's prompt.
 pub const GATE_TAIL_CHARS: usize = 2000;
@@ -60,6 +58,7 @@ pub const GATE_TAIL_CHARS: usize = 2000;
 pub enum Event {
     HardDeny,
     Park,
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 7.1
     GateFailed,
 }
 
@@ -72,6 +71,7 @@ impl Event {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8.1
     pub fn from_db_str(value: &str) -> Option<Self> {
         match value {
             "hard_deny" => Some(Self::HardDeny),
@@ -100,6 +100,7 @@ impl Event {
     }
 
     /// D3: which outcomes each event may have. A correction is never an outcome of E1 or E3.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.1
     pub fn outcomes(self) -> &'static [Outcome] {
         match self {
             Self::HardDeny => &[Outcome::Deny, Outcome::Warn, Outcome::Stop],
@@ -123,6 +124,7 @@ pub enum Outcome {
     Explain,
     Owner,
     Correction,
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8.1
     Moot,
 }
 
@@ -140,6 +142,7 @@ impl Outcome {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8.1
     pub fn from_db_str(value: &str) -> Option<Self> {
         [
             Self::Deny,
@@ -158,6 +161,7 @@ impl Outcome {
     /// D4's caution order, on one scale for all three events: E1 stop > warn > deny, E3 stop >
     /// park > explain, E4 owner > correction. D11's bar reads it: a disagreement where the judge
     /// was LESS cautious than the person is the one it allows zero of.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.1
     pub fn caution(self) -> u8 {
         match self {
             Self::Stop => 2,
@@ -325,6 +329,7 @@ pub fn rule(event: Event, p: Probabilities, t: ResolveThresholds) -> Option<Outc
 /// the network/inline-code line and the guards G1-G3), and the project's rules having been read
 /// (the hook's `rules.were_read()`, the gate spec A's enforce keeps), and the lineage under
 /// `REDIRECTS_PER_LINEAGE`.
+#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.1
 pub fn applied_park(opinion: Outcome, may_redirect: bool) -> Outcome {
     match opinion {
         Outcome::Explain if !may_redirect => Outcome::Park,
@@ -333,6 +338,7 @@ pub fn applied_park(opinion: Outcome, may_redirect: bool) -> Outcome {
 }
 
 /// D7: the fixed phrase the judge's line carries, e.g. `judge: stopped — off_task p=0.91`.
+#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.2
 pub fn phrase(outcome: Outcome, p: Probabilities) -> String {
     let (word, question, value) = match outcome {
         Outcome::Stop => ("stopped", "off_task", p.off_task),
@@ -362,10 +368,8 @@ pub(crate) enum Subject {
         cwd: String,
         action_class: &'static str,
     },
-    Gate {
-        exit_code: i32,
-        output: String,
-    },
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.2
+    Gate { exit_code: i32, output: String },
 }
 
 /// One block put to the judge. Owned, so an observation can outlive the hook's request.
