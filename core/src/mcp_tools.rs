@@ -366,6 +366,22 @@ struct RecallParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct FindingParams {
+    /// One fact the next node of this job can check.
+    fact: String,
+    /// Concrete records that support the fact; the daemon validates their shape and existence.
+    evidence: Vec<EvidenceRef>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct EvidenceRef {
+    /// One of run, job_item, proposal, knowledge, project, command or gate.
+    t: String,
+    /// The referenced record's identifier, whose JSON shape depends on its type.
+    id: serde_json::Value,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ProposeActionParams {
     /// What to do: `send_email`, `file_document` or `calendar_event`.
     kind: String,
@@ -928,6 +944,28 @@ impl NucleosTools {
         Parameters(RecallParams { query, layer }): Parameters<RecallParams>,
     ) -> String {
         json_result(self.client.recall(&query, layer.as_deref()).await)
+    }
+
+    #[tool(
+        description = "Leave the next node of THIS job one fact another part of the system can \
+                       check: a command and its exit code, a test and the line it failed with, a \
+                       file that had to be touched for something to pass. `evidence` is required: \
+                       a list of {\"t\": ..., \"id\": ...} with `t` one of run, job_item, \
+                       proposal, knowledge, project, command, gate. The daemon checks that \
+                       evidence exists and is well formed; it does not check that your sentence \
+                       is true. Later nodes of this job will see it labelled as said by a run and \
+                       not approved, and it is discarded when the job ends. You cannot choose \
+                       where it goes."
+    )]
+    async fn note_finding(
+        &self,
+        Parameters(FindingParams { fact, evidence }): Parameters<FindingParams>,
+    ) -> String {
+        let evidence: Vec<serde_json::Value> = evidence
+            .into_iter()
+            .map(|evidence| serde_json::json!({"t": evidence.t, "id": evidence.id}))
+            .collect();
+        json_result(self.client.note_finding(&fact, &evidence).await)
     }
 
     #[tool(
@@ -2261,6 +2299,12 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // in the Teams tab, so there is no path by which a stranger's text arrives in this answer and
     // therefore nothing for `effect_of_call` to second-guess by argument.
     ("list_teams", ToolEffect::ReadsOwn),
+    // A finding writes into this job's own state, and only later nodes of the SAME job read it,
+    // like `send_team_note`. As `Acts`, the node's own first read of third-party text would shut it
+    // off and the feature would work only for a node that read nothing. What pays for the write is
+    // at the receiving end: the label, the floor of one evidence item, the same-job fence, and death
+    // with the job. This grade does not validate the content of the fact.
+    ("note_finding", ToolEffect::WritesOwn),
     // The four project reads, and this is the weakest line on this page, so it is argued rather
     // than asserted. `ReadsUntrusted` would kill the feature at birth: the turn would read the
     // repository and from that moment every `Acts` tool is refused — including `create_run` and
@@ -3705,6 +3749,7 @@ mod tests {
                 "list_projects",
                 "list_proposals",
                 "list_teams",
+                "note_finding",
                 "project_cat",
                 "project_diff",
                 "project_grep",
@@ -5076,6 +5121,16 @@ mod tests {
         )
     }
 
+    fn job_node_server(job_id: i64) -> NucleosTools {
+        NucleosTools::for_box(
+            crate::daemon_client::DaemonClient::new(
+                "http://127.0.0.1:1".to_string(),
+                "unused".to_string(),
+            ),
+            McpBox::JobNode(job_id),
+        )
+    }
+
     fn advertised(listed: &rmcp::model::ListToolsResult) -> Vec<String> {
         let mut names: Vec<String> = listed
             .tools
@@ -5084,6 +5139,151 @@ mod tests {
             .collect();
         names.sort_unstable();
         names
+    }
+
+    #[tokio::test]
+    async fn a_job_node_server_announces_only_the_finding_tool() {
+        let (_running, context) = served_request_context().await;
+
+        let job_node = job_node_server(9)
+            .list_tools(None, context.clone())
+            .await
+            .unwrap();
+        assert_eq!(advertised(&job_node), ["note_finding"]);
+
+        let unboxed = unboxed_server()
+            .list_tools(None, context.clone())
+            .await
+            .unwrap();
+        assert!(
+            !advertised(&unboxed)
+                .iter()
+                .any(|name| name == "note_finding")
+        );
+
+        let errand = errand_server(1).list_tools(None, context).await.unwrap();
+        assert!(
+            !advertised(&errand)
+                .iter()
+                .any(|name| name == "note_finding")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finding_called_outside_a_job_node_box_is_refused_before_it_runs() {
+        let (_running, context) = served_request_context().await;
+        let request = || {
+            rmcp::model::CallToolRequestParams::new("note_finding").with_arguments(
+                serde_json::json!({
+                    "fact": "the gate failed on the formatter",
+                    "evidence": [{"t": "run", "id": 1}]
+                })
+                .as_object()
+                .expect("the fixture is an object")
+                .clone(),
+            )
+        };
+        let reached_the_daemon = |answer: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>| {
+            answer.as_ref().is_ok_and(|result| {
+                result.content.iter().any(|block| {
+                    matches!(block, rmcp::model::ContentBlock::Text(text)
+                        if text.text.contains("error sending request"))
+                })
+            })
+        };
+
+        for (box_name, answer) in [
+            (
+                "the unboxed server",
+                unboxed_server().call_tool(request(), context.clone()).await,
+            ),
+            (
+                "the errand server",
+                errand_server(1).call_tool(request(), context.clone()).await,
+            ),
+        ] {
+            assert!(
+                !reached_the_daemon(&answer),
+                "{box_name} dispatched note_finding and only the dead port stopped it: {answer:?}"
+            );
+            let refusal_is_visible = match &answer {
+                Err(error) => error.message.contains("note_finding"),
+                Ok(result) => {
+                    result.is_error == Some(true)
+                        && result.content.iter().any(|block| {
+                            matches!(block, rmcp::model::ContentBlock::Text(text)
+                                if text.text.contains("note_finding"))
+                        })
+                }
+            };
+            assert!(
+                refusal_is_visible,
+                "{box_name} refused the call without naming note_finding: {answer:?}"
+            );
+        }
+
+        let control = job_node_server(9).call_tool(request(), context).await;
+        assert!(
+            reached_the_daemon(&control),
+            "the job-node control never dispatched, so the refusals prove nothing: {control:?}"
+        );
+    }
+
+    #[test]
+    fn note_finding_reaches_no_other_box() {
+        for (list, name) in [
+            (LOCAL_TOOLS, "LOCAL_TOOLS"),
+            (COUNCIL_TOOLS, "COUNCIL_TOOLS"),
+            (TEAM_TOOLS, "TEAM_TOOLS"),
+            (ERRAND_TOOLS, "ERRAND_TOOLS"),
+            (HOSTED_TOOLS, "HOSTED_TOOLS"),
+        ] {
+            assert!(
+                !list.contains(&"note_finding"),
+                "note_finding must stay off {name}"
+            );
+        }
+        assert_eq!(tool_effect("note_finding"), ToolEffect::WritesOwn);
+    }
+
+    #[test]
+    fn the_finding_parameters_carry_no_scope_and_no_measurement() {
+        let tool = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "note_finding")
+            .expect("note_finding is registered");
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("note_finding publishes its parameters");
+        let names: Vec<_> = properties.keys().map(String::as_str).collect();
+        for name in names {
+            let lowered = name.to_lowercase();
+            for forbidden in [
+                "project",
+                "scope",
+                "run",
+                "job",
+                "errand",
+                "observations",
+                "layer",
+                "status",
+            ] {
+                assert!(!lowered.contains(forbidden), "note_finding takes {name}");
+            }
+        }
+
+        let required: Vec<&str> = tool
+            .input_schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("note_finding publishes which parameters are required")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(required.contains(&"evidence"), "required: {required:?}");
     }
 
     /// §6.1 of the design, and the reason the injection barrier costs an errand nothing.
