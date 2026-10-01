@@ -1207,6 +1207,39 @@ mod tests {
         (run_id, proposal_id)
     }
 
+    /// Spec B D12: rejecting still ends the run; only the new door continues it. A regression
+    /// guard: it passes before the door exists.
+    #[tokio::test]
+    async fn rejecting_still_ends_the_run() {
+        let pool = test_pool().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-a', 'x', 'awaiting_approval', 'worktree', '2026-09-27T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let proposal_id = create_action_approval(
+            &pool,
+            run_id,
+            None,
+            Some("project-a"),
+            "Bash",
+            "r",
+            Some("{}"),
+        )
+        .await
+        .unwrap();
+        reject_proposal(&pool, proposal_id).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
+    }
+
     /// Spec B D12 (plan review 2026-09-27): the agent rewrites `description` on every attempt,
     /// so the mark ignores it — for a shell tool only the command counts, for any other tool the
     /// input without `description`, whatever the key order.

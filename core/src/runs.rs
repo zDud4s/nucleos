@@ -3254,7 +3254,6 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
 /// task under `RESUMED_TASK_HEADER` — except the two things that would let the refused action
 /// happen: it writes no `action_grants` row and sends nothing to `vcs::submit_on`.
 /// `resume_did_not_act` needs no care: it only fires from an unconsumed grant, and there is none.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 2.2
 pub async fn decline_action(state: &AppState, proposal_id: i64) -> Result<i64, ResumeError> {
     continue_paused_run(state, proposal_id, Continuation::Decline).await
 }
