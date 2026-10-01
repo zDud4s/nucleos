@@ -326,6 +326,79 @@ pub(crate) async fn after_gate_failed(state: AppState, run_id: i64, exit_code: i
     }
 }
 
+/// Spec D6/D7: says, once, every correction whose chain ended any way but `completed`. The owner
+/// has to know the automatic turn did not finish, whatever the reason. The chain's LATEST run
+/// decides: a parked correction goes on in its resume, a handed-off one in its successor, and both
+/// carry the lineage. A chain that completed with its gate failing already has its
+/// `worktree_gate_failed` line and is never corrected again (condition 4); it is marked without a
+/// line, so the sweep never reads it again.
+pub(crate) async fn report_ended_corrections(pool: &SqlitePool) {
+    let open: Vec<(i64, i64, String, i64, String)> = match sqlx::query_as(
+        "SELECT c.id, c.origin_run_id, c.project_id, r.id, r.status
+         FROM judge_corrections c
+         JOIN runs r ON r.id = (SELECT MAX(id) FROM runs
+                                WHERE (id = c.root_run_id OR lineage_root_id = c.root_run_id)
+                                  AND id >= c.correction_run_id)
+         WHERE c.end_reported_at IS NULL AND c.correction_run_id IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(open) => open,
+        Err(error) => {
+            tracing::warn!(%error, "judge: could not read the open corrections");
+            return;
+        }
+    };
+    for (id, origin, project_id, latest, status) in open {
+        let failed = match status.as_str() {
+            "completed" => false,
+            "failed" | "timed_out" | "cancelled" | "interrupted" => true,
+            // Still going: running, parked, or superseded with its resume not yet visible.
+            _ => continue,
+        };
+        if let Err(error) = report_one(pool, id, origin, &project_id, latest, &status, failed).await
+        {
+            tracing::warn!(%error, correction = id, "judge: could not report an ended correction; the next tick retries");
+        }
+    }
+}
+
+/// One correction, one transaction: the mark and the line commit together or not at all. The
+/// guard `end_reported_at IS NULL` makes a second sweep (or a concurrent one) write nothing.
+async fn report_one(
+    pool: &SqlitePool,
+    id: i64,
+    origin: i64,
+    project_id: &str,
+    latest: i64,
+    status: &str,
+    failed: bool,
+) -> sqlx::Result<()> {
+    // Before `begin`: `run_subject` reads on its own connection, and the test pool has one.
+    let subject = crate::feed::run_subject(pool, latest).await;
+    let mut tx = pool.begin().await?;
+    let marked = sqlx::query(
+        "UPDATE judge_corrections SET end_reported_at = ? WHERE id = ? AND end_reported_at IS NULL",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    if marked.rows_affected() == 1 && failed {
+        crate::feed::append_on(
+            &mut tx,
+            Some(project_id),
+            "judge_correction_failed",
+            &format!("the correction of run {origin} did not finish: run {latest} ended {status}"),
+            Some(latest),
+            Some(&subject),
+        )
+        .await?;
+    }
+    tx.commit().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +573,127 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    /// Spec D6: `judge_correction_failed` for every end of a correction that is not `completed`
+    /// (failed, a launch that failed, which is also `failed`, timed out, cancelled, interrupted by
+    /// a restart), exactly once; nothing for `completed`, `superseded` (a person approved its park
+    /// and the work goes on) or a correction still live.
+    #[tokio::test]
+    async fn every_end_of_a_correction_but_completed_is_said_once() {
+        let pool = pool().await;
+        let statuses = [
+            ("failed", true),
+            ("timed_out", true),
+            ("cancelled", true),
+            ("interrupted", true),
+            ("completed", false),
+            ("superseded", false),
+            ("running", false),
+            ("awaiting_approval", false),
+        ];
+        for (root, (status, _)) in statuses.iter().enumerate() {
+            let correction = sqlx::query(
+                "INSERT INTO runs (project_id, prompt, status, mode, stderr, lineage_root_id, created_at)
+                 VALUES ('p', 'x', ?, 'worktree', 'launch failed', ?, '2026-09-27T00:00:00Z')",
+            )
+            .bind(status)
+            .bind(root as i64 + 1000)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            sqlx::query(
+                "INSERT INTO judge_corrections (root_run_id, origin_run_id, correction_run_id, project_id, created_at)
+                 VALUES (?, ?, ?, 'p', '2026-09-27T00:00:00Z')",
+            )
+            .bind(root as i64 + 1000)
+            .bind(root as i64 + 1000)
+            .bind(correction)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        report_ended_corrections(&pool).await;
+        report_ended_corrections(&pool).await;
+
+        let said: Vec<String> = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE kind = 'judge_correction_failed' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let expected: Vec<&str> = statuses
+            .iter()
+            .filter(|(_, said)| *said)
+            .map(|(status, _)| *status)
+            .collect();
+        assert_eq!(said.len(), expected.len(), "once each: {said:?}");
+        for status in expected {
+            assert!(
+                said.iter().any(|summary| summary.ends_with(status)),
+                "{status}"
+            );
+        }
+    }
+
+    /// Spec D6: a correction parked and resumed goes on in a later run of its lineage; the sweep
+    /// waits for THAT run, and says its failure once.
+    #[tokio::test]
+    async fn a_superseded_correction_whose_resume_fails_is_said_once() {
+        let pool = pool().await;
+        let run = |status: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO runs (project_id, prompt, status, mode, lineage_root_id, created_at)
+                     VALUES ('p', 'x', ?, 'worktree', 500, '2026-09-27T00:00:00Z')",
+                )
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid()
+            }
+        };
+        let said = || async {
+            sqlx::query_scalar::<_, String>(
+                "SELECT summary FROM feed WHERE kind = 'judge_correction_failed'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+        let correction = run("superseded").await;
+        sqlx::query(
+            "INSERT INTO judge_corrections (root_run_id, origin_run_id, correction_run_id, project_id, created_at)
+             VALUES (500, 500, ?, 'p', '2026-09-27T00:00:00Z')",
+        )
+        .bind(correction)
+        .execute(&pool)
+        .await
+        .unwrap();
+        report_ended_corrections(&pool).await;
+        let resume = run("running").await;
+        report_ended_corrections(&pool).await;
+        assert!(
+            said().await.is_empty(),
+            "superseded, then running: the correction is still going"
+        );
+
+        sqlx::query("UPDATE runs SET status = 'failed' WHERE id = ?")
+            .bind(resume)
+            .execute(&pool)
+            .await
+            .unwrap();
+        report_ended_corrections(&pool).await;
+        report_ended_corrections(&pool).await;
+        assert_eq!(
+            said().await,
+            vec![format!(
+                "the correction of run 500 did not finish: run {resume} ended failed"
+            )]
+        );
     }
 }

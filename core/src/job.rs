@@ -5616,6 +5616,10 @@ async fn drive(state: &AppState, job: JobRow, now: DateTime<Utc>) {
 
 /// One pass over every live job.
 pub async fn job_tick(state: &AppState, now: DateTime<Utc>) {
+    // Spec D6: before the kill switch, because saying a correction did not finish is not work,
+    // and a notice that waits for the owner to lift the switch arrives too late.
+    crate::judge::correction::report_ended_corrections(&state.pool).await;
+
     // The panic button stops the chain, not just the node — and it fails closed, so a switch that
     // cannot be read holds every job. Deliberately nothing more than that: engaging it does not
     // mark jobs terminal, because the read fails closed, and a database hiccup that retired every
