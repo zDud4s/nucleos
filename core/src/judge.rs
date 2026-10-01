@@ -83,6 +83,8 @@ impl JudgeRuntime {
         }
     }
 
+    /// One occupant in both chairs; `jev()` no longer goes through it, so only tests do.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 4.1
     pub fn with(occupant: Arc<dyn Judge>) -> Self {
         Self {
             background: occupant.clone(),
