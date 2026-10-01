@@ -2,9 +2,11 @@ import { useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
+  groupWaiting,
   measuredByGenerator,
   parseEvidence,
   useApproveKnowledge,
+  useDecideKnowledgeBatch,
   useKnowledge,
   useKnowledgeHistory,
   useRejectKnowledge,
@@ -58,6 +60,7 @@ export function Learned() {
   const knowledge = useKnowledge();
   const approve = useApproveKnowledge();
   const reject = useRejectKnowledge();
+  const batch = useDecideKnowledgeBatch();
   const revert = useRevertKnowledge();
 
   const [layer, setLayer] = useState<KnownLayer | "all">("all");
@@ -74,6 +77,7 @@ export function Learned() {
   );
   const filtered = scoped?.filter((row) => layer === "all" || row.layer === layer);
   const waiting = filtered?.filter((row) => row.status === "proposed") ?? [];
+  const waitingGroups = groupWaiting(waiting);
   const inForce = filtered?.filter((row) => row.status === "active") ?? [];
   const live = filtered?.filter((row) => row.status === "live") ?? [];
   const over = filtered?.filter((row) => OVER.has(row.status)) ?? [];
@@ -84,6 +88,7 @@ export function Learned() {
   // to the same question, only one is ever in flight, and a refusal from any of
   // them is about the row the person just touched.
   const refusal = approve.error ?? reject.error ?? revert.error;
+  const deciding = approve.isPending || reject.isPending || batch.isPending;
 
   return (
     <>
@@ -145,48 +150,104 @@ export function Learned() {
             to every later run in its scope; refusing keeps the refusal on the
             record rather than erasing the question.
           </p>
-          <Rows label="Waiting for you">
-            {[...waiting]
-              .sort((left, right) => left.id - right.id)
-              .map((row) => (
-                <KnownRow
-                  key={row.id}
-                  row={row}
-                  decisions={
-                    row.proposal_id === null ? (
-                      // A proposed row whose question is gone cannot be decided from here, and a
-                      // button that 404s is worse than none: it invites a click that teaches the
-                      // person the app is broken when the daemon is merely inconsistent. Said in
-                      // the row, and said as `Quiet`: what is missing here is the decision, which
-                      // is the one-line absence that component is for. It was set faint, which is
-                      // the rung for metadata standing beside content — here the sentence is all
-                      // the row has to say in place of its two buttons.
-                      <Quiet says="no question to answer — decide in the daemon" />
-                    ) : (
-                      <>
-                        <Button
-                          variant="approve"
-                          onClick={() =>
-                            approve.mutate(row.proposal_id as number)
-                          }
-                          disabled={approve.isPending}
-                        >
-                          Approve
-                        </Button>
-                        <Button
-                          onClick={() =>
-                            reject.mutate(row.proposal_id as number)
-                          }
-                          disabled={reject.isPending}
-                        >
-                          Refuse
-                        </Button>
-                      </>
-                    )
-                  }
-                />
-              ))}
-          </Rows>
+          {waitingGroups.map((group) => {
+            const resultBelongsHere = sameProposalIds(
+              batch.variables?.proposalIds,
+              group.proposalIds,
+            );
+            return (
+              <section
+                key={group.key}
+                className="learned-group"
+                aria-label={`${group.scope}, ${group.source}`}
+              >
+                <div className="learned-group-head">
+                  <span>{group.scope}</span>
+                  <span>{group.source}</span>
+                  <Count n={group.rows.length} />
+                  {group.proposalIds.length > 1 && (
+                    <>
+                      <ConfirmButton
+                        label={`Approve all ${group.proposalIds.length}`}
+                        confirmLabel={`Let all ${group.proposalIds.length} into every later prompt`}
+                        variant="approve"
+                        onConfirm={() =>
+                          batch.mutate({
+                            action: "approve",
+                            proposalIds: group.proposalIds,
+                          })
+                        }
+                        disabled={deciding}
+                      />
+                      <Button
+                        onClick={() =>
+                          batch.mutate({
+                            action: "reject",
+                            proposalIds: group.proposalIds,
+                          })
+                        }
+                        disabled={deciding}
+                      >
+                        Refuse all {group.proposalIds.length}
+                      </Button>
+                    </>
+                  )}
+                </div>
+                {resultBelongsHere &&
+                  !batch.isPending &&
+                  batch.data !== undefined &&
+                  batch.data.failed.length > 0 && (
+                    <ErrorNote>
+                      {batch.data.done} decided; {batch.data.failed.length} could not be — they
+                      were already decided, or are gone. The list clears on the next read.
+                    </ErrorNote>
+                  )}
+                {resultBelongsHere && batch.isError && (
+                  <DecisionRefusal error={batch.error} />
+                )}
+                <Rows label={`${group.scope}, ${group.source}`}>
+                  {group.rows.map((row) => (
+                    <KnownRow
+                      key={row.id}
+                      row={row}
+                      decisions={
+                        row.proposal_id === null ? (
+                          // A proposed row whose question is gone cannot be decided from here, and a
+                          // button that 404s is worse than none: it invites a click that teaches the
+                          // person the app is broken when the daemon is merely inconsistent. Said in
+                          // the row, and said as `Quiet`: what is missing here is the decision, which
+                          // is the one-line absence that component is for. It was set faint, which is
+                          // the rung for metadata standing beside content — here the sentence is all
+                          // the row has to say in place of its two buttons.
+                          <Quiet says="no question to answer — decide in the daemon" />
+                        ) : (
+                          <>
+                            <Button
+                              variant="approve"
+                              onClick={() =>
+                                approve.mutate(row.proposal_id as number)
+                              }
+                              disabled={deciding}
+                            >
+                              Approve
+                            </Button>
+                            <Button
+                              onClick={() =>
+                                reject.mutate(row.proposal_id as number)
+                              }
+                              disabled={deciding}
+                            >
+                              Refuse
+                            </Button>
+                          </>
+                        )
+                      }
+                    />
+                  ))}
+                </Rows>
+              </section>
+            );
+          })}
         </Panel>
       )}
 
@@ -530,4 +591,11 @@ function headline(rows: Known[] | undefined): string | undefined {
   // out loud, and "3 refinements proposed" is the old table's name surviving in
   // the one place a person reads it.
   return base;
+}
+
+function sameProposalIds(left: number[] | undefined, right: number[]): boolean {
+  if (left === undefined || left.length !== right.length) return false;
+  const orderedLeft = [...left].sort((a, b) => a - b);
+  const orderedRight = [...right].sort((a, b) => a - b);
+  return orderedLeft.every((id, index) => id === orderedRight[index]);
 }

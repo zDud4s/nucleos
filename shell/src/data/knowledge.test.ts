@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  groupWaiting,
   measuredByGenerator,
   parseEvidence,
   type Known,
@@ -82,6 +83,57 @@ describe("measuredByGenerator", () => {
         scope: "this machine",
         total: 1,
         byGenerator: [{ generator: "unknown", count: 1 }],
+      },
+    ]);
+  });
+});
+
+describe("groupWaiting", () => {
+  it("separates scopes and sources, orders groups by their first row and leaves undecidable rows out of proposalIds", () => {
+    const rows = [
+      known({ id: 8, status: "proposed", scope_id: "beta", source: "run", proposal_id: 80 }),
+      known({ id: 2, status: "proposed", scope_id: "alpha", source: "owner", proposal_id: 20 }),
+      known({ id: 6, status: "active", scope_id: "alpha", source: "owner", proposal_id: 60 }),
+      known({ id: 4, status: "proposed", scope_id: "alpha", source: "run", proposal_id: 40 }),
+      known({ id: 3, status: "proposed", scope_id: "alpha", source: "owner", proposal_id: null }),
+      known({
+        id: 5,
+        status: "proposed",
+        scope_kind: "machine",
+        scope_id: null,
+        source: "owner",
+        proposal_id: 50,
+      }),
+    ];
+
+    expect(groupWaiting(rows)).toEqual([
+      {
+        key: "project|alpha|owner",
+        scope: "alpha",
+        source: "owner",
+        rows: [rows[1], rows[4]],
+        proposalIds: [20],
+      },
+      {
+        key: "project|alpha|run",
+        scope: "alpha",
+        source: "run",
+        rows: [rows[3]],
+        proposalIds: [40],
+      },
+      {
+        key: "machine||owner",
+        scope: "this machine",
+        source: "owner",
+        rows: [rows[5]],
+        proposalIds: [50],
+      },
+      {
+        key: "project|beta|run",
+        scope: "beta",
+        source: "run",
+        rows: [rows[0]],
+        proposalIds: [80],
       },
     ]);
   });
