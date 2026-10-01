@@ -97,6 +97,8 @@ export const keys = {
      */
     search: (filters: Record<string, string | undefined>) => ["runs", "search", filters] as const,
     detail: (id: number) => ["runs", "detail", id] as const,
+    /** `GET /route/report?days=` — what the router advised against what ran. */
+    routeReport: (days: number) => ["runs", "route-report", days] as const,
     /** The byte cursor lives in component state; the key only separates the tails. */
     tail: (id: number) => ["runs", "tail", id] as const,
     /**

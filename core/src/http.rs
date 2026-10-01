@@ -502,6 +502,9 @@ pub fn build_router(state: AppState) -> Router {
         // The literal path coexists with `/runs/{id}`; static segments win in matchit.
         .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
+        // What the llm-router advised against what launched, for judging shadow -> apply. A pure
+        // read of `runs`; see `route_report.rs`.
+        .route("/route/report", get(crate::route_report::get_route_report))
         // Beside the run it belongs to. Reads no table: the tail lives in `AppState`, because
         // `run_events` is not written until the run ends and there is nothing durable to read while
         // the thing is actually happening.
@@ -31674,6 +31677,52 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["id"], serde_json::json!(turn_id));
+    }
+
+    #[tokio::test]
+    async fn the_route_report_is_served_with_its_exact_shape_and_needs_the_token() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at, route_mode, route_decision_id, runner,
+                               model, effort, advised_runner, advised_model, advised_effort)
+             VALUES ('p', 'completed', ?, 'shadow', 'd', 'claude', 'sonnet', NULL,
+                     'claude', 'opus', 'high')",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let denied = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/route/report")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let response =
+            api_token_request(state, "GET", "/route/report?days=9999", "test-token", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "days": 365, "runs": 1, "shadow": 1, "apply": 0, "advised": 1,
+                "shadow_advised": 1, "matched": 0,
+                "pairs": [{
+                    "runner": "claude", "model": "sonnet", "effort": null,
+                    "advised_runner": "claude", "advised_model": "opus", "advised_effort": "high",
+                    "runs": 1, "passed": 1, "failed": 0
+                }]
+            })
+        );
     }
 
     #[tokio::test]

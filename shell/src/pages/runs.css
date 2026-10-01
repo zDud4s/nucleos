@@ -657,3 +657,55 @@
   margin-left: var(--space-2);
   color: var(--text-muted);
 }
+
+/* What ran, under the metadata line; the router's differing advice is quieter still. */
+.runs-row-route {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 var(--space-3);
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.runs-row-route-advice {
+  color: var(--text-faint);
+}
+
+/* The router panel: a line of totals, then a compact pairs table. */
+.runs-router-totals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-4);
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.runs-router-pairs {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.runs-router-caption {
+  text-align: left;
+  color: var(--text-muted);
+  padding-bottom: var(--space-1);
+}
+
+.runs-router-pairs th,
+.runs-router-pairs td {
+  text-align: right;
+  padding: var(--space-1) var(--space-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.runs-router-pairs th:first-child,
+.runs-router-pairs td:first-child {
+  text-align: left;
+  padding-left: 0;
+  font-family: var(--font-mono);
+}

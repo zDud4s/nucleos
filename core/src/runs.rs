@@ -76,6 +76,19 @@ pub struct RunSearchResult {
     pub completed_at: Option<String>,
     pub cost_usd: Option<f64>,
     pub prompt_excerpt: String,
+    // The same nine route columns `RunStatusResponse` answers for one run, under the same names and
+    // with the same meaning: NULL is "not recorded", and each is always serialised so the list reads
+    // an explicit `null` rather than a gap.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub runner: Option<String>,
+    pub route_mode: Option<String>,
+    pub route_decision_id: Option<String>,
+    pub advised_runner: Option<String>,
+    pub advised_model: Option<String>,
+    pub advised_effort: Option<String>,
+    /// A JSON array of `model[@effort]`, as TEXT: handed over as the column holds it, not parsed.
+    pub route_failed: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,7 +127,9 @@ pub async fn search(
 ) -> sqlx::Result<Vec<RunSearchResult>> {
     let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
         "SELECT id, project_id, status, mode, created_at, completed_at, cost_usd, \
-         substr(prompt, 1, {PROMPT_EXCERPT_CHARS}) AS prompt_excerpt FROM runs WHERE 1 = 1"
+         substr(prompt, 1, {PROMPT_EXCERPT_CHARS}) AS prompt_excerpt, \
+         model, effort, runner, route_mode, route_decision_id, \
+         advised_runner, advised_model, advised_effort, route_failed FROM runs WHERE 1 = 1"
     ));
 
     if let Some(project_id) = &filter.project_id {
@@ -4385,6 +4400,16 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
                     .map(|shared| shared.clone())
                     .unwrap_or_default();
                 record_the_cut_stream(&state.pool, id, &seen).await;
+            }
+            // A routed run the user cancelled tells the router `error` (`route_advice::
+            // report_cancelled` argues why not `fail`). Only after this write won: the aborted
+            // body's own run-end report needs the same CAS, so exactly one of the two speaks. Only
+            // a cancel — a pause resumes, and the run's later end reports for it.
+            if won
+                && status == "cancelled"
+                && let Some(router) = state.runner.router()
+            {
+                crate::route_advice::report_cancelled(&state.pool, router, id).await;
             }
             // The run is over; anything it queued and never started goes with it (spec §7). After
             // the status write, because this is a consequence of the run ending — and best-effort,
@@ -11286,6 +11311,82 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         assert_eq!(exit_code, Some(0));
     }
 
+    /// Inserts a `running` row carrying `decision` as its route decision.
+    async fn seed_routed_running(pool: &sqlx::SqlitePool, decision: Option<&str>) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at, route_decision_id)
+             VALUES ('x', 'running', 'real', ?, ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(decision)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// A routed run the user cancels tells the router `error`, once: the cancel's own status write
+    /// is the one that won, so the body's run-end report — which needs to win the same CAS — never
+    /// fires for it.
+    #[tokio::test]
+    async fn a_cancelled_routed_run_reports_error_once() {
+        let mut state = test_state().await;
+        let (url, mut received) = crate::router_client::test_support::outcome_router(200).await;
+        front_with_shadow_router(&mut state, &url);
+        let id = seed_routed_running(&state.pool, Some("rt_cancel")).await;
+        spawn_registered(&state, id, std::future::pending::<()>());
+
+        assert!(finalize_termination(&state, id, "cancelled").await);
+
+        let (decision, body) = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .expect("reported within 2s")
+            .unwrap();
+        assert_eq!(decision, "rt_cancel");
+        assert_eq!(body, serde_json::json!({"status": "error"}));
+        // A second cancel finds no handle, and nothing else may speak for this run.
+        assert!(!finalize_termination(&state, id, "cancelled").await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), received.recv())
+                .await
+                .is_err(),
+            "a cancelled run is reported exactly once"
+        );
+    }
+
+    /// No report when the cancel did not win the status write (the run finished on its own and
+    /// reports through its own end), when the run holds no decision, or when the terminator is a
+    /// pause rather than a cancel.
+    #[tokio::test]
+    async fn a_cancel_reports_only_a_decision_it_ended() {
+        let mut state = test_state().await;
+        let (url, mut received) = crate::router_client::test_support::outcome_router(200).await;
+        front_with_shadow_router(&mut state, &url);
+
+        let finished = seed_routed_running(&state.pool, Some("rt_finished")).await;
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(finished)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        spawn_registered(&state, finished, std::future::pending::<()>());
+        assert!(finalize_termination(&state, finished, "cancelled").await);
+
+        let unrouted = seed_routed_running(&state.pool, None).await;
+        spawn_registered(&state, unrouted, std::future::pending::<()>());
+        assert!(finalize_termination(&state, unrouted, "cancelled").await);
+
+        let paused = seed_routed_running(&state.pool, Some("rt_paused")).await;
+        spawn_registered(&state, paused, std::future::pending::<()>());
+        assert!(finalize_termination(&state, paused, "awaiting_approval").await);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), received.recv())
+                .await
+                .is_err()
+        );
+    }
+
     /// A run pausing for approval is not a run that ended, and the queue must not treat it as one.
     #[test]
     fn a_pause_for_approval_does_not_end_the_run() {
@@ -12661,7 +12762,9 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
 
         let json = serde_json::to_value(entry).unwrap();
         let object = json.as_object().unwrap();
-        assert_eq!(object.len(), 8);
+        // Eight run fields and the nine route fields: what launched and what the router advised
+        // are model names and ids, never transcript text.
+        assert_eq!(object.len(), 17);
         for field in [
             "id",
             "project_id",
@@ -12671,6 +12774,15 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             "completed_at",
             "cost_usd",
             "prompt_excerpt",
+            "model",
+            "effort",
+            "runner",
+            "route_mode",
+            "route_decision_id",
+            "advised_runner",
+            "advised_model",
+            "advised_effort",
+            "route_failed",
         ] {
             assert!(object.contains_key(field), "missing metadata field {field}");
         }
@@ -12824,6 +12936,81 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             until: None,
             limit: 50,
             live: false,
+        }
+    }
+
+    const ROUTE_FIELDS: [&str; 9] = [
+        "model",
+        "effort",
+        "runner",
+        "route_mode",
+        "route_decision_id",
+        "advised_runner",
+        "advised_model",
+        "advised_effort",
+        "route_failed",
+    ];
+
+    /// The run list answers the same nine route columns as `GET /runs/{id}`, flat and under their
+    /// column names; an unrouted row answers each as an explicit `null`, never an absent key.
+    #[tokio::test]
+    async fn the_run_list_answers_the_route_fields_flat_and_null_when_absent() {
+        let pool = search_test_pool().await;
+        let routed = insert_search_run(
+            &pool,
+            "p",
+            "completed",
+            "worktree",
+            "routed",
+            "2026-10-01T00:00:01Z",
+        )
+        .await;
+        let unrouted = insert_search_run(
+            &pool,
+            "p",
+            "completed",
+            "worktree",
+            "unrouted",
+            "2026-10-01T00:00:00Z",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE runs SET model = 'claude-sonnet-5', effort = 'high', runner = 'claude',
+                             route_mode = 'shadow', route_decision_id = 'd-1',
+                             advised_runner = 'codex', advised_model = 'gpt-6',
+                             advised_effort = 'medium', route_failed = '[\"m@low\"]'
+              WHERE id = ?",
+        )
+        .bind(routed)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows = search(&pool, &base_filter()).await.unwrap();
+        let wire = |id: i64| {
+            let row = rows.iter().find(|row| row.id == id).expect("listed");
+            serde_json::to_value(row).unwrap()
+        };
+
+        let routed = wire(routed);
+        let expected = [
+            "claude-sonnet-5",
+            "high",
+            "claude",
+            "shadow",
+            "d-1",
+            "codex",
+            "gpt-6",
+            "medium",
+            "[\"m@low\"]",
+        ];
+        for (key, value) in ROUTE_FIELDS.iter().zip(expected) {
+            assert_eq!(routed[key], serde_json::json!(value), "{key}");
+        }
+        let unrouted = wire(unrouted);
+        let object = unrouted.as_object().unwrap();
+        for key in ROUTE_FIELDS {
+            assert_eq!(object.get(key), Some(&serde_json::Value::Null), "{key}");
         }
     }
 

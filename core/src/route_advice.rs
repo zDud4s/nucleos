@@ -2226,6 +2226,28 @@ pub async fn report_item_gate(
     }
 }
 
+/// Reports a run the user cancelled against its decision, if it holds one. Same shape as
+/// `report_item_gate`: one DB read and a spawn, and an unreadable row only warns.
+///
+/// Always `error`, never `fail`: a cancel is a human changing their mind, not a verdict on the
+/// work — the run never got as far as being judged, exactly as with a deadline
+/// (`outcome_at_run_end`). Counting it as `fail` would teach the router that a model is bad at
+/// whatever people happen to stop.
+pub async fn report_cancelled(pool: &SqlitePool, router: Arc<Router>, run_id: i64) {
+    let decision: Option<Option<String>> =
+        sqlx::query_scalar("SELECT route_decision_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(run_id, %error, "could not read a cancelled run's route decision");
+                None
+            });
+    if let Some(decision_id) = decision.flatten().filter(|id| !id.is_empty()) {
+        report_detached(router, decision_id, Outcome::Error);
+    }
+}
+
 #[cfg(test)]
 mod outcome_tests {
     use super::*;
@@ -2455,6 +2477,45 @@ mod outcome_tests {
             .unwrap();
         assert_eq!(id, "rt_1");
         assert_eq!(body, serde_json::json!({"status": "fail"}));
+    }
+
+    /// A cancelled run with a decision says `error`; one without (or no such run) says nothing.
+    #[tokio::test]
+    async fn a_cancelled_run_reports_error_against_its_decision() {
+        let pool = pool().await;
+        let (url, mut received) = outcome_router(200).await;
+        let seed = |decision: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO runs (project_id, prompt, status, mode, created_at, route_decision_id)
+                     VALUES ('p', 'x', 'cancelled', 'worktree', '2026-10-01T00:00:00Z', ?)",
+                )
+                .bind(decision)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid()
+            }
+        };
+        let routed = seed(Some("rt_9")).await;
+        let unrouted = seed(None).await;
+
+        report_cancelled(&pool, router_at(&url), unrouted).await;
+        report_cancelled(&pool, router_at(&url), routed + 99).await;
+        report_cancelled(&pool, router_at(&url), routed).await;
+
+        let (id, body) = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .expect("reported within 2s")
+            .unwrap();
+        assert_eq!(id, "rt_9");
+        assert_eq!(body, serde_json::json!({"status": "error"}));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), received.recv())
+                .await
+                .is_err()
+        );
     }
 
     /// A run launched unrouted, or on a fallback, has no decision and reports nothing.
