@@ -231,6 +231,130 @@ export function useSetShadowVerdict() {
   });
 }
 
+/* ------------------------------------------------------------- the judge -- */
+
+/**
+ * Spec A D2: whether a model is asked about this project's tool calls. `observe` asks in
+ * parallel and decides nothing; `enforce` lets it decide (D7). Photographed onto each run at
+ * launch, so a change here reaches the project's NEXT runs.
+ */
+export type JudgeMode = "off" | "observe" | "enforce";
+
+export interface JudgeClassReadiness {
+  action_class: string;
+  reviewed: number;
+  agree: number;
+}
+
+/** D11, as the núcleo computes it — shown, never recomputed here, for `promotable`'s reason. */
+export interface JudgeReadiness {
+  reviewed: number;
+  agree: number;
+  ready: boolean;
+  by_class: JudgeClassReadiness[];
+}
+
+export interface JudgeStatus {
+  project_id: string;
+  judge: JudgeMode;
+  /** Review item G: why the project's `.ai/autopilot.yaml` cannot be read — the judge is without effect then. */
+  rules_error: string | null;
+  readiness: JudgeReadiness;
+}
+
+/** One entry of the judge's review queue (`judge::JudgeVerdictView`). */
+export interface JudgeVerdict {
+  id: number;
+  run_id: number;
+  tool_name: string;
+  tool_input: string | null;
+  action_class: string;
+  classifier_decision: string;
+  judge: string;
+  model: string;
+  p_in_scope: number | null;
+  p_safe: number | null;
+  p: number | null;
+  band: "allow" | "deny";
+  capped: boolean;
+  final_decision: string;
+  enforced: boolean;
+  created_at: string;
+}
+
+/**
+ * Spec A D5, in the words the owner reads before turning `enforce` on. The risk is the spec's,
+ * stated as plainly as the spec states it; the page shows it and does not soften it.
+ */
+export const JUDGE_RESIDUAL_RISK =
+  "A judge fooled by text the agent read can still approve a command that runs code the agent " +
+  "wrote in the workspace itself — a new build.rs under cargo test, an npm script, a Python " +
+  "file — and that code can reach the network. Nothing but an operating-system network sandbox " +
+  "closes this, and there is none yet. Turning enforce on accepts this risk for this project.";
+
+export function readJudgeBand(verdict: JudgeVerdict): string {
+  if (verdict.band === "deny") return "would refuse";
+  return verdict.capped ? "would allow — held back by a guard" : "would allow";
+}
+
+export function formatProbability(p: number | null): string {
+  return p === null ? "—" : p.toFixed(2);
+}
+
+export function useJudgeStatus(projectId: string | null) {
+  return useQuery({
+    queryKey: keys.autopilot.judge(projectId ?? ""),
+    queryFn: () =>
+      apiFetch<JudgeStatus>(`/autopilot/judge?project_id=${encodeURIComponent(projectId ?? "")}`),
+    enabled: projectId !== null,
+    refetchInterval: POLL.queue,
+  });
+}
+
+export function useJudgeVerdicts(projectId: string | null) {
+  return useQuery({
+    queryKey: keys.autopilot.judgeVerdicts(projectId ?? ""),
+    queryFn: () =>
+      apiFetch<JudgeVerdict[]>(
+        `/judge-verdicts/unreviewed?project_id=${encodeURIComponent(projectId ?? "")}`,
+      ),
+    enabled: projectId !== null,
+    refetchInterval: POLL.queue,
+  });
+}
+
+/** No optimistic write, for `useSetProjectMode`'s reason: whether a model decides must never look settled before it is. */
+export function useSetProjectJudge() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (change: { project_id: string; judge: JudgeMode }) =>
+      apiFetch<JudgeStatus>("/autopilot/judge", {
+        method: "POST",
+        body: JSON.stringify(change),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.all });
+    },
+  });
+}
+
+/** 204, like the shadow verdict. Moves the readiness, so the status is invalidated beside the queue. */
+export function useSetJudgeVerdict() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ verdictId, verdict }: { verdictId: number; verdict: "approve" | "reject" }) =>
+      apiFetch<void>(`/judge-verdicts/${verdictId}/verdict`, {
+        method: "POST",
+        body: JSON.stringify({ verdict }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.all });
+    },
+  });
+}
+
 /**
  * Move a project between `off`, `shadow` and `active`.
  *

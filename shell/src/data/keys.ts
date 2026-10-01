@@ -55,6 +55,11 @@ export const keys = {
     quotaBrake: ["autopilot", "quota-brake"] as const,
     scoreboard: (projectId: string) => ["autopilot", "scoreboard", projectId] as const,
     shadowDecisions: ["autopilot", "shadow-decisions"] as const,
+    /** One project's judge setting and readiness (`GET /autopilot/judge`). */
+    judge: (projectId: string) => ["autopilot", "judge", projectId] as const,
+    /** The judge's own review queue — NOT under `shadowDecisions`: they are two queues. */
+    judgeVerdictsAll: ["autopilot", "judge-verdicts"] as const,
+    judgeVerdicts: (projectId: string) => ["autopilot", "judge-verdicts", projectId] as const,
   },
 
   /**
