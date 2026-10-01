@@ -393,6 +393,21 @@ describe("RunDetail — why it stopped", () => {
     expect(screen.getByText(/unrecognized shell commands/)).toBeDefined();
   });
 
+  it("still puts the tail first on a live run, with the judge's block at the end", async () => {
+    const answer = detailFetch(detail({ status: "running", stdout: null }), NO_TAIL, []);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path.endsWith("/judge-verdicts") ? [] : answer(path, init),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    // `RunDetail.tsx` lifts block 3 (the tail) to the top of a live run; the judge's block,
+    // appended last, must not have shifted which block that is.
+    const tail = (await screen.findByText("Live output")).closest("section") as HTMLElement;
+    const facts = screen.getByText("This run").closest("section") as HTMLElement;
+    expect(tail.compareDocumentPosition(facts) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   /**
    * §9: nothing is rendered for a live run except that it is still going.
    *

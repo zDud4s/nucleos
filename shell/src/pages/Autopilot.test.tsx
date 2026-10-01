@@ -914,7 +914,7 @@ describe("Autopilot - the stat cards name what they count", () => {
 
     // What changed is the card no longer promising to BE the queue; the link
     // that actually goes there is untouched.
-    expect(screen.getByRole("link", { name: "Go to the queue" })).toBeDefined();
+    expect(await screen.findByRole("link", { name: "Go to the queue" })).toBeDefined();
   });
 });
 

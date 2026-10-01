@@ -29,6 +29,7 @@ import {
   RefusalNote,
   RunPipeline,
 } from "../ui";
+import { JudgeOpinionsBlock } from "./AutopilotJudge";
 import "./runs.css";
 
 /**
@@ -114,6 +115,8 @@ function KnownRun({ id }: { id: number }) {
     <RunTail key="tail" id={id} alive={alive} recorded={detail.stdout} />,
     <BriefingBlock key="briefing" id={id} />,
     <StdStreams key="streams" run={detail} />,
+    /* Last, not beside StopBlock: the live-run reorder below lifts block 3 by position. */
+    <JudgeOpinionsBlock key="judge" runId={id} />,
   ];
   /* While the run is going, what it is writing right now is the only block on this page
      that is changing, and it was fourth. A live run is watched, not read. */

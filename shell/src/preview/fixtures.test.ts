@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED } from "../data/autopilot";
-import { FEED, FEED_SEEN, FEED_TIMELINE, NOW, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
+import { FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOW, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
 import { readEfficiencySignal, readFeedKind, waitReasonFromSummary } from "../data/feed";
 import { LANE_FOLD_ABOVE, buildSequences, traceLanes } from "../lib/sequences";
 import { quietGaps } from "../lib/timeline";
@@ -139,6 +139,18 @@ describe("the preview fixtures", () => {
     );
     expect(short.length).toBeGreaterThan(0);
     expect(short.every((project) => !project.promotable)).toBe(true);
+  });
+
+  it("the judge is observing alpha, half way to its bar, with one of each verdict waiting", () => {
+    const status = JUDGE_STATUS.alpha;
+    expect(status.judge).toBe("observe");
+    expect(status.readiness.ready).toBe(false);
+    expect(status.readiness.reviewed).toBeLessThan(READINESS_MIN_REVIEWED);
+    expect(status.readiness.by_class.length).toBeGreaterThanOrEqual(2);
+    const verdicts = JUDGE_VERDICTS.alpha;
+    expect(verdicts.filter((verdict) => verdict.band === "allow" && !verdict.capped)).toHaveLength(1);
+    expect(verdicts.filter((verdict) => verdict.band === "allow" && verdict.capped)).toHaveLength(1);
+    expect(verdicts.filter((verdict) => verdict.band === "deny")).toHaveLength(1);
   });
 
   it("alpha's scoreboard agrees with its roster figures", () => {
