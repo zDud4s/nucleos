@@ -1,6 +1,6 @@
 //! Periodic measurements distilled from durable gate and refusal histories.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -9,6 +9,7 @@ use sqlx::{FromRow, SqliteConnection, SqlitePool};
 
 pub const CONSOLIDATION_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 const MIN_OBSERVATIONS: i64 = 2;
+const PROMOTION_PROJECTS: usize = 3;
 const EPISODIC_VALIDITY_RUNS: i64 = 50;
 const CLEARED_WINDOW_RUNS: usize = 5;
 const EVIDENCE_LIMIT: usize = 20;
@@ -74,6 +75,16 @@ struct DuplicateMember {
     body: String,
 }
 
+#[derive(Debug, FromRow)]
+struct PromotionMember {
+    id: i64,
+    scope_id: String,
+    generator: Option<String>,
+    observations: i64,
+    title: String,
+    body: String,
+}
+
 #[derive(Serialize)]
 struct Evidence {
     t: &'static str,
@@ -86,6 +97,7 @@ enum Outcome {
     Remeasured,
     Pending,
     Refused,
+    Elsewhere,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -94,6 +106,7 @@ pub struct PassReport {
     pub remeasured: usize,
     pub pending: usize,
     pub refused: usize,
+    pub elsewhere: usize,
     pub successors: usize,
     pub expired: usize,
     pub superseded: usize,
@@ -149,6 +162,7 @@ pub async fn run_pass(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Pas
         report.superseded += supersede_contradicted(pool, &project, &window, now).await?;
         report.expired += expire_unconfirmed(pool, &project, now).await?;
     }
+    promote_to_machine(pool, now).await?;
     Ok(report)
 }
 
@@ -159,6 +173,18 @@ async fn write_measurement(
     now: DateTime<Utc>,
 ) -> sqlx::Result<Outcome> {
     let mut transaction = pool.begin().await?;
+    let lives_at_machine_scope: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM knowledge
+          WHERE scope_kind = 'machine' AND scope_id IS NULL AND fingerprint = ?
+            AND source = 'consolidator' AND layer = 'episodic' AND status = 'active')",
+    )
+    .bind(&measurement.fingerprint)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if lives_at_machine_scope != 0 {
+        transaction.commit().await?;
+        return Ok(Outcome::Elsewhere);
+    }
     if let Some(id) =
         active_measurement(&mut transaction, project, &measurement.fingerprint).await?
     {
@@ -188,11 +214,12 @@ async fn write_measurement(
     }
     insert_measurement(
         &mut transaction,
-        "project",
-        Some(project),
+        ("project", Some(project)),
         measurement,
         now,
         None,
+        Some(EPISODIC_VALIDITY_RUNS),
+        "measured by the consolidator",
     )
     .await?;
     transaction.commit().await?;
@@ -205,6 +232,7 @@ fn record(report: &mut PassReport, outcome: Outcome) {
         Outcome::Remeasured => report.remeasured += 1,
         Outcome::Pending => report.pending += 1,
         Outcome::Refused => report.refused += 1,
+        Outcome::Elsewhere => report.elsewhere += 1,
     }
 }
 
@@ -382,11 +410,12 @@ async fn blocked_outcome(
 
 async fn insert_measurement(
     connection: &mut SqliteConnection,
-    scope_kind: &str,
-    scope_id: Option<&str>,
+    scope: (&str, Option<&str>),
     measurement: &Measurement,
     now: DateTime<Utc>,
     supersedes: Option<i64>,
+    expires_after_runs: Option<i64>,
+    event_note: &str,
 ) -> sqlx::Result<i64> {
     let now = now.to_rfc3339();
     let result = sqlx::query(
@@ -396,13 +425,13 @@ async fn insert_measurement(
          VALUES ('episodic', ?, ?, 'consolidator', ?, ?, ?, ?, ?, ?, ?, ?, ?,
                  'active', NULL, ?, NULL, ?, ?, NULL)",
     )
-    .bind(scope_kind)
-    .bind(scope_id)
+    .bind(scope.0)
+    .bind(scope.1)
     .bind(&measurement.generator)
     .bind(&measurement.evidence)
     .bind(measurement.observations)
     .bind(&measurement.fingerprint)
-    .bind(EPISODIC_VALIDITY_RUNS)
+    .bind(expires_after_runs)
     .bind(&now)
     .bind(&measurement.kind)
     .bind(&measurement.title)
@@ -415,9 +444,10 @@ async fn insert_measurement(
     let id = result.last_insert_rowid();
     sqlx::query(
         "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
-         VALUES (?, NULL, 'active', 'measured by the consolidator', ?)",
+         VALUES (?, NULL, 'active', ?, ?)",
     )
     .bind(id)
+    .bind(event_note)
     .bind(now)
     .execute(connection)
     .await?;
@@ -500,11 +530,12 @@ async fn write_reversal(
     let measurement = reversal_measurement(refused, window);
     insert_measurement(
         &mut transaction,
-        "project",
-        Some(project),
+        ("project", Some(project)),
         &measurement,
         now,
         Some(refused.id),
+        Some(EPISODIC_VALIDITY_RUNS),
+        "measured by the consolidator",
     )
     .await?;
     if supersede_old {
@@ -692,11 +723,12 @@ async fn merge_duplicates(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result
         };
         let successor = insert_measurement(
             &mut transaction,
-            &key.scope_kind,
-            key.scope_id.as_deref(),
+            (&key.scope_kind, key.scope_id.as_deref()),
             &measurement,
             now,
             None,
+            Some(EPISODIC_VALIDITY_RUNS),
+            "measured by the consolidator",
         )
         .await?;
         let now_text = now.to_rfc3339();
@@ -729,6 +761,126 @@ async fn merge_duplicates(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result
     Ok(merged)
 }
 
+/// Promote measurements repeated across independent projects into the inherited machine scope.
+pub async fn promote_to_machine(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
+    let fingerprints: Vec<String> = sqlx::query_scalar(
+        "SELECT fingerprint FROM knowledge
+          WHERE source = 'consolidator' AND layer = 'episodic'
+            AND scope_kind = 'project' AND status = 'active' AND fingerprint IS NOT NULL
+          GROUP BY fingerprint HAVING COUNT(DISTINCT scope_id) >= ?
+          ORDER BY fingerprint",
+    )
+    .bind(PROMOTION_PROJECTS as i64)
+    .fetch_all(pool)
+    .await?;
+    let mut promoted = 0;
+    for fingerprint in fingerprints {
+        let mut transaction = pool.begin().await?;
+        let fenced: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM knowledge
+              WHERE scope_kind = 'machine' AND scope_id IS NULL AND fingerprint = ?
+                AND status IN ('proposed', 'active', 'rejected', 'reverted'))",
+        )
+        .bind(&fingerprint)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if fenced != 0 {
+            transaction.commit().await?;
+            continue;
+        }
+        let contributors: Vec<PromotionMember> = sqlx::query_as(
+            "SELECT id, scope_id, generator, COALESCE(observations, 0) AS observations,
+                    title, body
+               FROM knowledge
+              WHERE source = 'consolidator' AND layer = 'episodic'
+                AND scope_kind = 'project' AND status = 'active' AND fingerprint = ?
+                AND scope_id IS NOT NULL
+              ORDER BY id",
+        )
+        .bind(&fingerprint)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let project_count = contributors
+            .iter()
+            .map(|row| row.scope_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        if project_count < PROMOTION_PROJECTS {
+            transaction.commit().await?;
+            continue;
+        }
+        let newest = contributors
+            .last()
+            .expect("a promotable fingerprint has contributors");
+        if !contributors
+            .iter()
+            .all(|row| row.generator.as_deref() == newest.generator.as_deref())
+        {
+            let ids = contributors.iter().map(|row| row.id).collect::<Vec<_>>();
+            tracing::warn!(contributor_ids = ?ids, "not promoting measurements with different generators");
+            transaction.commit().await?;
+            continue;
+        }
+        let observations = contributors.iter().map(|row| row.observations).sum::<i64>();
+        let evidence = contributors
+            .iter()
+            .map(|row| Evidence {
+                t: "knowledge",
+                id: row.id,
+            })
+            .collect::<Vec<_>>();
+        let measurement = Measurement {
+            generator: newest.generator.clone(),
+            fingerprint,
+            observations,
+            kind: "memory".to_owned(),
+            title: newest.title.clone(),
+            body: format!(
+                "Measured in {project_count} projects, {observations} observations in all: {}",
+                newest.body
+            ),
+            evidence: serde_json::to_string(&evidence).expect("evidence is serializable"),
+        };
+        let successor = insert_measurement(
+            &mut transaction,
+            ("machine", None),
+            &measurement,
+            now,
+            None,
+            None,
+            &format!("promoted from {project_count} projects"),
+        )
+        .await?;
+        let now_text = now.to_rfc3339();
+        for contributor in contributors {
+            let updated = sqlx::query(
+                "UPDATE knowledge SET status = 'archived', ended_at = ?
+                  WHERE id = ? AND source = 'consolidator' AND layer = 'episodic'
+                    AND status = 'active'",
+            )
+            .bind(&now_text)
+            .bind(contributor.id)
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() == 0 {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+                 VALUES (?, 'active', 'archived', ?, ?)",
+            )
+            .bind(contributor.id)
+            .bind(format!("promoted to machine scope as {successor}"))
+            .bind(&now_text)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        promoted += 1;
+    }
+    Ok(promoted)
+}
+
 fn clipped(value: &str, width: usize) -> String {
     value.chars().take(width).collect()
 }
@@ -744,8 +896,8 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use sqlx::{Row, SqlitePool};
 
-    use super::{CONSOLIDATION_INTERVAL, due, merge_duplicates, run_pass};
-    use crate::knowledge::{Known, approved, failure_signature};
+    use super::{CONSOLIDATION_INTERVAL, due, merge_duplicates, promote_to_machine, run_pass};
+    use crate::knowledge::{Known, Scope, approved, failure_signature, for_scope};
 
     const PROJECT: &str = "nucleos";
     const FAILURE: &str = "error: build failed because the linker refused output.exe";
@@ -848,6 +1000,23 @@ mod tests {
         .bind(source)
         .bind(generator)
         .bind(observations)
+        .bind(fingerprint)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn seed_machine_knowledge(pool: &SqlitePool, fingerprint: &str, status: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, generator, observations, fingerprint,
+                kind, title, body, status, created_at, activated_at)
+             VALUES ('episodic', 'machine', NULL, 'consolidator', 'gate', 6, ?,
+                     'memory', 'machine title', 'machine body', ?,
+                     '2026-09-29T00:00:00+00:00', '2026-09-29T00:00:00+00:00')",
+        )
         .bind(fingerprint)
         .bind(status)
         .execute(pool)
@@ -1644,6 +1813,258 @@ mod tests {
         assert_eq!(known(&pool, owner).await["status"], "active");
         assert_eq!(known(&pool, semantic_first).await["status"], "active");
         assert_eq!(known(&pool, semantic_second).await["status"], "active");
+    }
+
+    /// Promotion requires three projects and counts only the consolidator's measurements.
+    #[tokio::test]
+    async fn a_promotion_needs_three_distinct_projects_and_counts_only_measurements() {
+        let pool = test_pool().await;
+        let fingerprint = "gate:three-projects";
+        let first = seed_knowledge(
+            &pool,
+            "episodic",
+            "project",
+            "alpha",
+            "consolidator",
+            Some("gate"),
+            fingerprint,
+            "active",
+            Some(2),
+        )
+        .await;
+        let second = seed_knowledge(
+            &pool,
+            "episodic",
+            "project",
+            "bravo",
+            "consolidator",
+            Some("gate"),
+            fingerprint,
+            "active",
+            Some(3),
+        )
+        .await;
+
+        assert_eq!(promote_to_machine(&pool, at(1)).await.unwrap(), 0);
+
+        let third = seed_knowledge(
+            &pool,
+            "episodic",
+            "project",
+            "charlie",
+            "consolidator",
+            Some("gate"),
+            fingerprint,
+            "active",
+            Some(4),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE knowledge SET title = 'newest title', body = 'newest body' WHERE id = ?",
+        )
+        .bind(third)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(promote_to_machine(&pool, at(2)).await.unwrap(), 1);
+
+        let promoted = sqlx::query_as::<_, Known>(
+            "SELECT * FROM knowledge
+             WHERE scope_kind = 'machine' AND scope_id IS NULL AND fingerprint = ?",
+        )
+        .bind(fingerprint)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(promoted.observations, Some(9));
+        assert_eq!(promoted.title, "newest title");
+        assert_eq!(
+            promoted.body,
+            "Measured in 3 projects, 9 observations in all: newest body"
+        );
+        assert!(promoted.expires_after_runs.is_none());
+        let evidence = serde_json::from_str::<Vec<Value>>(
+            promoted.evidence.as_deref().expect("promotion evidence"),
+        )
+        .unwrap();
+        assert_eq!(
+            evidence,
+            vec![
+                serde_json::json!({"t": "knowledge", "id": first}),
+                serde_json::json!({"t": "knowledge", "id": second}),
+                serde_json::json!({"t": "knowledge", "id": third}),
+            ]
+        );
+        for id in [first, second, third] {
+            assert_eq!(known(&pool, id).await["status"], "archived");
+            let note: String = sqlx::query_scalar(
+                "SELECT note FROM knowledge_events WHERE knowledge_id = ? ORDER BY id DESC LIMIT 1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                note,
+                format!("promoted to machine scope as {}", promoted.id)
+            );
+        }
+        let promoted_note: String = sqlx::query_scalar(
+            "SELECT note FROM knowledge_events WHERE knowledge_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(promoted.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(promoted_note, "promoted from 3 projects");
+
+        let foreign = test_pool().await;
+        for (project, source) in [
+            ("alpha", "run"),
+            ("bravo", "run"),
+            ("charlie", "run"),
+            ("delta", "owner"),
+        ] {
+            seed_knowledge(
+                &foreign,
+                "episodic",
+                "project",
+                project,
+                source,
+                Some("gate"),
+                fingerprint,
+                "active",
+                Some(2),
+            )
+            .await;
+        }
+        assert_eq!(promote_to_machine(&foreign, at(2)).await.unwrap(), 0);
+        let machine_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'machine' AND fingerprint = ?",
+        )
+        .bind(fingerprint)
+        .fetch_one(&foreign)
+        .await
+        .unwrap();
+        assert_eq!(machine_rows, 0);
+    }
+
+    /// A machine lesson prevents the next project pass from recreating its archived contributor.
+    #[tokio::test]
+    async fn a_promoted_lesson_is_not_written_again_per_project() {
+        let pool = test_pool().await;
+        let fingerprint = gate_fingerprint(FAILURE);
+        for project in ["alpha", "bravo", "charlie"] {
+            seed_knowledge(
+                &pool,
+                "episodic",
+                "project",
+                project,
+                "consolidator",
+                Some("gate"),
+                &fingerprint,
+                "active",
+                Some(2),
+            )
+            .await;
+        }
+        assert_eq!(promote_to_machine(&pool, at(1)).await.unwrap(), 1);
+        let machine_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM knowledge
+             WHERE scope_kind = 'machine' AND scope_id IS NULL AND fingerprint = ?",
+        )
+        .bind(&fingerprint)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let before = known(&pool, machine_id).await;
+        seed_run(&pool, "delta", "completed", Some("failed"), Some(FAILURE)).await;
+        seed_run(&pool, "delta", "completed", Some("failed"), Some(FAILURE)).await;
+
+        let report = run_pass(&pool, at(2)).await.unwrap();
+
+        assert_eq!(report.elsewhere, 1);
+        let delta_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge
+             WHERE scope_kind = 'project' AND scope_id = 'delta' AND fingerprint = ?",
+        )
+        .bind(&fingerprint)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(delta_rows, 0);
+        assert_eq!(known(&pool, machine_id).await, before);
+    }
+
+    /// A rejected machine lesson fences the fingerprint from another promotion attempt.
+    #[tokio::test]
+    async fn a_refused_machine_lesson_is_not_promoted_again() {
+        let pool = test_pool().await;
+        let fingerprint = "gate:refused-machine";
+        seed_machine_knowledge(&pool, fingerprint, "rejected").await;
+        let mut contributors = Vec::new();
+        for project in ["alpha", "bravo", "charlie"] {
+            contributors.push(
+                seed_knowledge(
+                    &pool,
+                    "episodic",
+                    "project",
+                    project,
+                    "consolidator",
+                    Some("gate"),
+                    fingerprint,
+                    "active",
+                    Some(2),
+                )
+                .await,
+            );
+        }
+
+        assert_eq!(promote_to_machine(&pool, at(1)).await.unwrap(), 0);
+        for id in contributors {
+            assert_eq!(known(&pool, id).await["status"], "active");
+        }
+        let machine_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'machine' AND fingerprint = ?",
+        )
+        .bind(fingerprint)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(machine_rows, 1);
+    }
+
+    /// A promoted machine lesson is inherited and approved in a project that did not contribute.
+    #[tokio::test]
+    async fn a_promoted_lesson_reaches_a_node_in_any_project() {
+        let pool = test_pool().await;
+        let fingerprint = "gate:inherited-machine";
+        for project in ["alpha", "bravo", "charlie"] {
+            seed_knowledge(
+                &pool,
+                "episodic",
+                "project",
+                project,
+                "consolidator",
+                Some("gate"),
+                fingerprint,
+                "active",
+                Some(2),
+            )
+            .await;
+        }
+        assert_eq!(promote_to_machine(&pool, at(1)).await.unwrap(), 1);
+
+        let rows = for_scope(&pool, &Scope::Project("delta".to_owned()))
+            .await
+            .unwrap();
+        let promoted = rows
+            .iter()
+            .find(|row| row.fingerprint.as_deref() == Some(fingerprint))
+            .expect("the machine lesson should be inherited by another project");
+        assert_eq!(promoted.scope_kind, "machine");
+        assert!(approved(promoted));
     }
 
     /// The six-hour clock runs once at startup and never early after a completed pass.
