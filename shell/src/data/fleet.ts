@@ -65,6 +65,13 @@ export interface HeldSlot {
    * tell those apart cannot say whether a slot is busy or stuck.
    */
   item_status: string | null;
+  /**
+   * The wave a wave's worker belongs to; `null` for every other kind of owner. `owner_id` for a
+   * wave is `wave_workers.id`, one per worker, so this is what names the slot.
+   */
+  wave_id: number | null;
+  /** When that wave last renewed its lease; `null` for every other kind of owner. */
+  lease_renewed_at: string | null;
 }
 
 /** Whose tree an overlap belongs to. Job ids and run ids collide, so the pair is the identity. */
