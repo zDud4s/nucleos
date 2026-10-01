@@ -446,6 +446,30 @@ pub async fn pretooluse_decision(
     pretooluse_decision_from(state, scope, payload, Instant::now()).await
 }
 
+/// Whether `tool_name` is one of the job-node tools: `mcp__nucleos__<name>` for a `<name>` in
+/// `mcp_tools::JOB_NODE_TOOLS`, matched as a WHOLE name and never by prefix or wildcard.
+///
+/// This is the ONE `mcp__` name an unattended run may call, and it is a branch in
+/// `pretooluse_decision` and not a classifier class: the classifier is pure and per-tool, and a
+/// class would also have to be kept away from the judge and the scoreboard. A widening of
+/// `JOB_NODE_TOOLS` widens this by construction, so that list is the thing review must watch.
+fn is_job_node_tool(tool_name: &str) -> bool {
+    tool_name
+        .strip_prefix("mcp__nucleos__")
+        .is_some_and(|name| crate::mcp_tools::JOB_NODE_TOOLS.contains(&name))
+}
+
+/// The job a run belongs to, `None` for a run that is not a job's node (or whose row is gone).
+async fn job_id_of(pool: &sqlx::SqlitePool, run_id: i64) -> Result<Option<i64>, sqlx::Error> {
+    Ok(
+        sqlx::query_scalar::<_, Option<i64>>("SELECT job_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten(),
+    )
+}
+
 /// `pretooluse_decision` with the moment the request began taken as a parameter, so the budget the
 /// judge may spend (`judge_wait`) can be tested without sleeping through the probes that use it up.
 async fn pretooluse_decision_from(
@@ -646,6 +670,39 @@ async fn pretooluse_decision_from(
     // `propose_action`'s own grading exists precisely so this door shuts.
     if mode == crate::team::TEAM_MODE {
         return team_decision(&state, &payload).await;
+    }
+
+    // A job's node may record a finding: the one `mcp__` tool an unattended run is allowed. Before
+    // the classifier, like the branches above, so it never reaches the judge, never parks and writes
+    // no scoreboard row (the scoreboard measures the classifier, and this is not its decision).
+    // Anything short of ALL the conditions falls through and is refused as an unrecognised tool.
+    if is_job_node_tool(&payload.tool_name) && is_in_flight && crate::runs::runs_unattended(&mode) {
+        match job_id_of(&state.pool, run_id).await {
+            Ok(Some(job_id)) => {
+                tracing::info!(
+                    run_id = run_id,
+                    job_id = job_id,
+                    tool = %payload.tool_name,
+                    "pretooluse-decision: allowed a job-node tool"
+                );
+                return Json(Decision {
+                    decision: "allow".to_owned(),
+                    reason: "a job's run may record a finding".to_owned(),
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    run_id = run_id,
+                    %error,
+                    "pretooluse-decision: failed to resolve the run's job — failing closed"
+                );
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: "could not resolve the run's job — failing closed".to_owned(),
+                });
+            }
+        }
     }
 
     // The run's own project, off the row that already named it — and asked for only when the answer
@@ -4237,6 +4294,158 @@ mod tests {
         .unwrap();
 
         (job_id, run_id)
+    }
+
+    #[tokio::test]
+    async fn a_job_run_may_call_note_finding() {
+        let state = test_state().await;
+        let (_job_id, run_id) = in_flight_job_node(&state).await;
+        let app = test_router(state);
+        let verdict = decide(
+            &app,
+            &call(run_id, "mcp__nucleos__note_finding", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "allow");
+    }
+
+    #[tokio::test]
+    async fn a_job_run_is_still_refused_every_other_mcp_tool() {
+        let state = test_state().await;
+        let (_job_id, run_id) = in_flight_job_node(&state).await;
+        let app = test_router(state);
+        for tool in [
+            "mcp__nucleos__create_run",
+            "mcp__nucleos__web_read",
+            "mcp__other__note_finding",
+            "mcp__nucleos__note_finding__x",
+        ] {
+            let verdict = decide(&app, &call(run_id, tool, serde_json::json!({}))).await;
+            assert_eq!(verdict.decision, "deny", "{tool}");
+            assert!(
+                verdict
+                    .reason
+                    .contains("not available to an autonomous run"),
+                "{tool}: {}",
+                verdict.reason
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn note_finding_is_refused_to_a_run_without_a_job() {
+        let state = test_state().await;
+        let worktree =
+            in_flight_run(&state, "worktree", Some("p"), Some(r"C:\work\repo"), None).await;
+        let shadow = in_flight_run(&state, "shadow", Some("p"), None, None).await;
+        let app = test_router(state);
+        for run_id in [worktree, shadow] {
+            let verdict = decide(
+                &app,
+                &call(run_id, "mcp__nucleos__note_finding", serde_json::json!({})),
+            )
+            .await;
+            assert_eq!(verdict.decision, "deny", "run {run_id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn note_finding_is_refused_to_a_job_run_that_is_not_in_flight() {
+        let state = test_state().await;
+        let (_job_id, run_id) = in_flight_job_node(&state).await;
+        state.run_handles.lock().unwrap().remove(&run_id);
+        let app = test_router(state);
+        let verdict = decide(
+            &app,
+            &call(run_id, "mcp__nucleos__note_finding", serde_json::json!({})),
+        )
+        .await;
+        assert_ne!(verdict.decision, "allow");
+    }
+
+    #[tokio::test]
+    async fn allowing_note_finding_records_no_scoreboard_row() {
+        let state = test_state().await;
+        // A `shadow` run is the only mode that writes `shadow_decisions`, so only a shadow run
+        // that carries a job makes the zero-rows assertion discriminate: were the allow to fall
+        // through to the classifier, the call would be denied (and recorded) instead.
+        let run_id = in_flight_run(&state, "shadow", Some("proj"), None, None).await;
+        let job_id = sqlx::query(
+            "INSERT INTO jobs
+             (project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
+             VALUES ('proj', 'C:\\work\\repo', 'x', 'implementing', 5, 1, 1, '2026-08-07T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query("UPDATE runs SET job_id = ? WHERE id = ?")
+            .bind(job_id)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let verdict = decide(
+            &app,
+            &call(run_id, "mcp__nucleos__note_finding", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "allow");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM shadow_decisions WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn note_finding_is_not_allowed_by_the_job_branch_to_an_attended_run() {
+        let state = test_state().await;
+        let (job_id, _) = in_flight_job_node(&state).await;
+        // An attended mode: not shadow, worktree or team, so `runs_unattended` is false.
+        let run_id = in_flight_run(&state, "interactive", Some("proj"), None, None).await;
+        sqlx::query("UPDATE runs SET job_id = ? WHERE id = ?")
+            .bind(job_id)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state);
+        let verdict = decide(
+            &app,
+            &call(run_id, "mcp__nucleos__note_finding", serde_json::json!({})),
+        )
+        .await;
+        assert_ne!(verdict.decision, "allow");
+        assert_ne!(verdict.reason, "a job's run may record a finding");
+    }
+
+    #[tokio::test]
+    async fn a_failed_job_id_read_denies_note_finding() {
+        let state = test_state().await;
+        let (_job_id, run_id) = in_flight_job_node(&state).await;
+        // The first lookup (cwd, mode, project_id, permission_mode) never names `job_id`, so
+        // renaming the column lets it succeed and makes only the job read fail.
+        sqlx::query("ALTER TABLE runs RENAME COLUMN job_id TO job_id_gone")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state);
+        let verdict = decide(
+            &app,
+            &call(run_id, "mcp__nucleos__note_finding", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "deny");
+        assert!(
+            verdict.reason.contains("failing closed"),
+            "{}",
+            verdict.reason
+        );
     }
 
     /// Which runs earn the confinement widening, and which do not — the whole conjunction, one
