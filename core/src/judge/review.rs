@@ -157,6 +157,62 @@ pub async fn readiness(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Judg
     })
 }
 
+/// What the judge said about one decision, for the places the shell shows a decision (spec
+/// section 3: "the probability and the band in the list and in the detail of the decisions").
+/// A read of its own, so `shadow::list_unreviewed` - which the WIP brake counts (D11) - is untouched.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct JudgeOpinion {
+    pub id: i64,
+    pub run_id: i64,
+    pub shadow_decision_id: Option<i64>,
+    pub tool_name: String,
+    pub judge: String,
+    pub model: String,
+    pub p_in_scope: Option<f64>,
+    pub p_safe: Option<f64>,
+    pub p: Option<f64>,
+    pub band: Option<String>,
+    pub capped: bool,
+    pub final_decision: String,
+    pub enforced: bool,
+    pub error: Option<String>,
+    pub created_at: String,
+}
+
+const OPINION_COLUMNS: &str = "id, run_id, shadow_decision_id, tool_name, judge, model, p_in_scope,
+     p_safe, p, band, capped, final_decision, enforced, error, created_at";
+
+/// The LATEST verdict for each of these decisions (a decision can be judged twice when an
+/// observation is retried); decisions the judge never saw are simply absent.
+pub async fn opinions_for_decisions(
+    pool: &SqlitePool,
+    ids: &[i64],
+) -> sqlx::Result<Vec<JudgeOpinion>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+        "SELECT {OPINION_COLUMNS} FROM judge_verdicts
+         WHERE id IN (SELECT MAX(id) FROM judge_verdicts WHERE shadow_decision_id IN ("
+    ));
+    let mut list = query.separated(", ");
+    for id in ids {
+        list.push_bind(*id);
+    }
+    query.push(") GROUP BY shadow_decision_id) ORDER BY id");
+    query.build_query_as().fetch_all(pool).await
+}
+
+/// Every verdict of one run, oldest first - the run page's "what the judge said".
+pub async fn opinions_for_run(pool: &SqlitePool, run_id: i64) -> sqlx::Result<Vec<JudgeOpinion>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {OPINION_COLUMNS} FROM judge_verdicts WHERE run_id = ? ORDER BY id"
+    )))
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +350,51 @@ mod tests {
             (20, 19, true),
             "19/20 = 95%"
         );
+    }
+
+    /// The latest verdict for each decision asked about, and every verdict of one run, oldest
+    /// first - the two readings the shell draws next to shadow decisions and on a run's page.
+    #[tokio::test]
+    async fn the_judges_opinion_is_read_by_decision_and_by_run() {
+        let pool = pool().await;
+        let first = judged(&pool, "cargo test | tee a.log", Some("allow")).await;
+        let decision: i64 =
+            sqlx::query_scalar("SELECT shadow_decision_id FROM judge_verdicts WHERE id = ?")
+                .bind(first)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let run_id: i64 = sqlx::query_scalar("SELECT run_id FROM judge_verdicts WHERE id = ?")
+            .bind(first)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // A second verdict on the same decision (a retry of the observation) is the one shown.
+        sqlx::query(
+            "INSERT INTO judge_verdicts
+             (run_id, shadow_decision_id, tool_name, tool_input_digest, action_class,
+              classifier_decision, judge, model, questions_version, p, band, final_decision, created_at)
+             SELECT run_id, shadow_decision_id, tool_name, tool_input_digest, action_class,
+                    classifier_decision, judge, model, questions_version, 0.05, 'deny',
+                    final_decision, created_at
+             FROM judge_verdicts WHERE id = ?",
+        )
+        .bind(first)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let latest = opinions_for_decisions(&pool, &[decision, 999_999])
+            .await
+            .unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(
+            (latest[0].shadow_decision_id, latest[0].band.as_deref()),
+            (Some(decision), Some("deny"))
+        );
+
+        let of_run = opinions_for_run(&pool, run_id).await.unwrap();
+        assert_eq!(of_run.len(), 2);
+        assert_eq!(of_run[0].band.as_deref(), Some("allow"));
     }
 }

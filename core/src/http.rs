@@ -763,6 +763,11 @@ pub fn build_router(state: AppState) -> Router {
             get(get_unreviewed_judge_verdicts),
         )
         .route("/judge-verdicts/{id}/verdict", post(post_judge_verdict))
+        .route(
+            "/judge-verdicts/by-decision",
+            get(get_judge_opinions_by_decision),
+        )
+        .route("/runs/{id}/judge-verdicts", get(get_judge_opinions_of_run))
         .route("/scoreboard", get(get_scoreboard))
         .route("/email/cursor", get(get_email_cursor))
         .route("/email/triage", post(post_email_triage))
@@ -15114,6 +15119,40 @@ async fn get_unreviewed_judge_verdicts(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+#[derive(Deserialize)]
+struct DecisionIdsQuery {
+    /// Comma-separated `shadow_decisions.id`s - the page's own rows.
+    ids: String,
+}
+
+/// Admin-only like the rest of the judge's routes (in no table in `auth.rs`).
+async fn get_judge_opinions_by_decision(
+    State(state): State<AppState>,
+    Query(query): Query<DecisionIdsQuery>,
+) -> Result<Json<Vec<crate::judge::JudgeOpinion>>, StatusCode> {
+    let ids = query
+        .ids
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.trim().parse::<i64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    crate::judge::opinions_for_decisions(&state.pool, &ids)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_judge_opinions_of_run(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::judge::JudgeOpinion>>, StatusCode> {
+    crate::judge::opinions_for_run(&state.pool, id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 /// Accepts `approve|reject` once, like `post_shadow_verdict`: 400 for any other word, 404 for an
 /// unknown id, a verdict already given, or a verdict that was not in a deciding band.
 async fn post_judge_verdict(
@@ -21996,6 +22035,35 @@ mod tests {
 
     /// A bundle with a real graph in it, for the canvas routes.
     const TWO_NODE_GRAPH: &str = "nodes:\n  - {id: plan, type: agent, model: opus}\n  - {id: gate, type: command, command: cargo test}\nedges:\n  - {from: plan, to: gate}\n";
+
+    #[tokio::test]
+    async fn the_judges_opinions_are_served_by_decision_and_by_run() {
+        let state = test_state().await;
+        let (status, body) = workflow_call(
+            state.clone(),
+            "GET",
+            "/judge-verdicts/by-decision?ids=1,2",
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_array().map(Vec::len)),
+            (StatusCode::OK, Some(0))
+        );
+        let (status, _) = workflow_call(
+            state.clone(),
+            "GET",
+            "/judge-verdicts/by-decision?ids=x",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = workflow_call(state, "GET", "/runs/7/judge-verdicts", None).await;
+        assert_eq!(
+            (status, body.as_array().map(Vec::len)),
+            (StatusCode::OK, Some(0))
+        );
+    }
 
     async fn workflow_call(
         state: AppState,
