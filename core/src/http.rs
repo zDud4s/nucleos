@@ -15163,19 +15163,27 @@ async fn post_judge_verdict(
     if !matches!(body.verdict.as_str(), "approve" | "reject") {
         return Err(StatusCode::BAD_REQUEST);
     }
-    match crate::judge::set_verdict(&state.pool, id, &body.verdict).await {
-        Ok(true) => {
-            // A verdict is the only thing that moves readiness, so it is where the bar is checked.
-            // Best-effort: the verdict is recorded either way, and the next verdict checks again.
-            if let Ok(Some(project_id)) = crate::judge::project_of_verdict(&state.pool, id).await
-                && let Err(error) = autopilot::hold_judge_to_the_bar(&state.pool, &project_id).await
-            {
-                tracing::warn!(%error, %project_id, "could not hold the judge to its bar");
-            }
-            Ok(StatusCode::NO_CONTENT)
+    // The verdict and the demotion it may cause are ONE write: a verdict is the only thing that
+    // moves readiness, so it is where the bar is held, and a failure anywhere records nothing.
+    let recorded = async {
+        let mut tx = state.pool.begin().await?;
+        if !crate::judge::set_verdict(&mut tx, id, &body.verdict).await? {
+            return Ok(false);
         }
+        if let Some(project_id) = crate::judge::project_of_verdict(&mut tx, id).await? {
+            autopilot::hold_judge_to_the_bar(&mut tx, &project_id).await?;
+        }
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(true)
+    }
+    .await;
+    match recorded {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err(StatusCode::NOT_FOUND),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => {
+            tracing::warn!(%error, id, "could not record the judge verdict");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 
@@ -35733,5 +35741,107 @@ mod tests {
                 "kinds": [{"selector": "job_failed", "enabled": true}]
             })
         );
+    }
+
+    /// Seeds a project enforcing the judge with ten approved allows and one pending allow, so that
+    /// rejecting the pending one takes agreement to 10/11 (under the bar). Returns its verdict id.
+    async fn enforcing_project_with_a_pending_allow(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, judge) VALUES ('a', 'active', 'enforce')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut last = 0;
+        for index in 0..11 {
+            let run_id = sqlx::query(
+                "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+                 VALUES ('a', 'x', 'completed', 'worktree', '2026-09-27T00:00:00Z')",
+            )
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            let human = if index < 10 { Some("approve") } else { None };
+            last = sqlx::query(
+                "INSERT INTO judge_verdicts
+                 (run_id, tool_name, tool_input_digest, action_class, classifier_decision, judge,
+                  model, questions_version, band, final_decision, human_verdict, created_at)
+                 VALUES (?, 'Bash', ?, 'unrecognized', 'pending_approval', 'enforce', 'jev-latest',
+                         1, 'allow', 'allow', ?, '2026-09-27T00:00:00Z')",
+            )
+            .bind(run_id)
+            .bind(format!("digest-{index}"))
+            .bind(human)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        }
+        last
+    }
+
+    async fn post_judge_verdict_status(state: AppState, id: i64, verdict: &str) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/judge-verdicts/{id}/verdict"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "verdict": verdict })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_judge_verdict_that_breaks_the_bar_demotes_in_the_same_write() {
+        let state = test_state().await;
+        let id = enforcing_project_with_a_pending_allow(&state.pool).await;
+        let status = post_judge_verdict_status(state.clone(), id, "reject").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let judge: String =
+            sqlx::query_scalar("SELECT judge FROM autopilot_state WHERE project_id = 'a'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(judge, "observe");
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM feed WHERE project_id = 'a'")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(kinds, vec!["judge_demoted".to_owned()]);
+    }
+
+    /// The verdict and the demotion are one write: when holding the bar fails, nothing is recorded.
+    #[tokio::test]
+    async fn a_judge_verdict_is_not_recorded_when_holding_the_bar_fails() {
+        let state = test_state().await;
+        let id = enforcing_project_with_a_pending_allow(&state.pool).await;
+        // The demotion's feed line cannot be written, so the demotion fails as a whole.
+        sqlx::query("DROP TABLE feed")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let status = post_judge_verdict_status(state.clone(), id, "reject").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let human: Option<String> =
+            sqlx::query_scalar("SELECT human_verdict FROM judge_verdicts WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(human, None);
+        let judge: String =
+            sqlx::query_scalar("SELECT judge FROM autopilot_state WHERE project_id = 'a'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(judge, "enforce");
     }
 }

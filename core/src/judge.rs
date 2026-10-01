@@ -49,7 +49,7 @@ pub(crate) use client::ScriptedJudge;
 pub use client::{Answers, JevJudge, Judge, JudgeError, TYPESAFE_KEY};
 pub use review::{
     JudgeOpinion, JudgeReadiness, JudgeVerdictView, list_unreviewed, opinions_for_decisions,
-    opinions_for_run, project_of_verdict, readiness, set_verdict,
+    opinions_for_run, project_of_verdict, readiness, readiness_on, set_verdict,
 };
 
 /// D11: at most four calls in flight across the machine; without a permit, the call is skipped
