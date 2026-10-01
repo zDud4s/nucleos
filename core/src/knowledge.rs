@@ -55,7 +55,7 @@ pub enum Layer {
     Episodic,
     /// How work is done here.
     Procedural,
-    /// What one job knows while it is still running, and only for as long as it runs.
+    /// What one job knows while it is still running. Closes with the job.
     Working,
 }
 
@@ -1142,6 +1142,73 @@ fn hex16(bytes: &[u8]) -> String {
     encoded
 }
 
+/// Closes every live working finding owned by one job, preserving the transition as history.
+pub async fn close_working_for_job(pool: &SqlitePool, job_id: i64) -> sqlx::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let at = chrono::Utc::now().to_rfc3339();
+    let scope_id = job_id.to_string();
+    sqlx::query(
+        "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+         SELECT id, 'live', 'closed', 'the job ended', ?
+           FROM knowledge
+          WHERE layer = 'working' AND scope_kind = 'job' AND scope_id = ? AND status = 'live'",
+    )
+    .bind(&at)
+    .bind(&scope_id)
+    .execute(&mut *tx)
+    .await?;
+    let closed = sqlx::query(
+        "UPDATE knowledge SET status = 'closed', ended_at = ?
+          WHERE layer = 'working' AND scope_kind = 'job' AND scope_id = ? AND status = 'live'",
+    )
+    .bind(&at)
+    .bind(&scope_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(closed)
+}
+
+/// Closes live working findings whose job has ended or no longer exists.
+pub async fn close_orphaned_working(pool: &SqlitePool) -> sqlx::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let at = chrono::Utc::now().to_rfc3339();
+    let placeholders = vec!["?"; crate::job::TERMINAL_STATUSES.len()].join(", ");
+    let predicate = format!(
+        "layer = 'working' AND scope_kind = 'job' AND status = 'live'
+         AND NOT EXISTS (
+             SELECT 1 FROM jobs j
+              WHERE CAST(j.id AS TEXT) = knowledge.scope_id
+                AND j.status NOT IN ({placeholders})
+         )"
+    );
+
+    // `AssertSqlSafe`, audited: the only interpolation is one `?` per status in the fixed
+    // `TERMINAL_STATUSES` list. Every status is bound below.
+    let mut events = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+         SELECT id, 'live', 'closed', 'the job ended', ? FROM knowledge WHERE {predicate}"
+    )))
+    .bind(&at);
+    for status in crate::job::TERMINAL_STATUSES {
+        events = events.bind(status);
+    }
+    events.execute(&mut *tx).await?;
+
+    // Same audit as above; `ended_at` is bound before the fixed status list.
+    let mut update = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE knowledge SET status = 'closed', ended_at = ? WHERE {predicate}"
+    )))
+    .bind(&at);
+    for status in crate::job::TERMINAL_STATUSES {
+        update = update.bind(status);
+    }
+    let closed = update.execute(&mut *tx).await?.rows_affected();
+    tx.commit().await?;
+    Ok(closed)
+}
+
 /// What a node in this scope is entitled to be told.
 ///
 /// The chain comes too, and that is the whole reason this takes a [`Scope`] rather than a project
@@ -1980,6 +2047,182 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    async fn insert_job(pool: &SqlitePool, project_id: &str, status: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO jobs
+               (project_id, project_root, rule_name, prompt, status, max_items, gate_each, review,
+                gate_retries, head_sha, max_rounds, budget_usd, created_at, team_id)
+             VALUES (?, ?, NULL, 'test job', ?, 1, 1, 0, 0, NULL, NULL, NULL,
+                     '2026-09-20T00:00:00+00:00', NULL)",
+        )
+        .bind(project_id)
+        .bind(format!("/project/{project_id}"))
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn insert_job_knowledge(
+        pool: &SqlitePool,
+        job_id: i64,
+        layer: &str,
+        status: &str,
+        title: &str,
+    ) -> i64 {
+        sqlx::query(
+            r#"INSERT INTO knowledge
+                 (layer, scope_kind, scope_id, source, evidence, kind, title, body, status, created_at)
+               VALUES (?, 'job', ?, 'run', '[{"t":"run","id":1}]', 'memory', ?, 'b', ?,
+                       '2026-09-20T00:00:00+00:00')"#,
+        )
+        .bind(layer)
+        .bind(job_id.to_string())
+        .bind(title)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn a_finding_closes_with_its_job_through_the_one_place_that_ends_a_job() {
+        assert_eq!(
+            crate::job::TERMINAL_STATUSES.len(),
+            8,
+            "a ninth ending needs a deliberate finding-lifetime decision"
+        );
+        let pool = test_pool().await;
+
+        for (index, terminal) in crate::job::TERMINAL_STATUSES.iter().enumerate() {
+            let job_id = insert_job(&pool, &format!("retired-{index}"), "running").await;
+            let other_job_id = insert_job(&pool, &format!("running-{index}"), "running").await;
+            let finding = insert_job_knowledge(
+                &pool,
+                job_id,
+                "working",
+                "live",
+                &format!("finding-{index}"),
+            )
+            .await;
+            let other = insert_job_knowledge(
+                &pool,
+                other_job_id,
+                "working",
+                "live",
+                &format!("other-{index}"),
+            )
+            .await;
+            let approved = insert_job_knowledge(
+                &pool,
+                job_id,
+                "semantic",
+                "active",
+                &format!("approved-{index}"),
+            )
+            .await;
+
+            crate::job::retire(&pool, job_id, terminal).await.unwrap();
+
+            let (status, ended_at): (String, Option<String>) =
+                sqlx::query_as("SELECT status, ended_at FROM knowledge WHERE id = ?")
+                    .bind(finding)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                status, "closed",
+                "the `{terminal}` ending left its finding live"
+            );
+            assert!(ended_at.is_some(), "the closed finding has no ending time");
+            let event: (String, String, String) = sqlx::query_as(
+                "SELECT from_status, to_status, note FROM knowledge_events WHERE knowledge_id = ?",
+            )
+            .bind(finding)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                event,
+                ("live".into(), "closed".into(), "the job ended".into())
+            );
+            let event_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_events WHERE knowledge_id = ?")
+                    .bind(finding)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(event_count, 1, "retiring wrote more than one closing event");
+
+            let other_status: String =
+                sqlx::query_scalar("SELECT status FROM knowledge WHERE id = ?")
+                    .bind(other)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(other_status, "live", "another running job lost its finding");
+            let approved_row: (String, Option<String>) =
+                sqlx::query_as("SELECT status, ended_at FROM knowledge WHERE id = ?")
+                    .bind(approved)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(approved_row, ("active".into(), None));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_finding_is_closed_by_the_hourly_pass() {
+        let pool = test_pool().await;
+        let ended_job = insert_job(&pool, "ended", "running").await;
+        sqlx::query("UPDATE jobs SET status = 'failed' WHERE id = ?")
+            .bind(ended_job)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let running_job = insert_job(&pool, "running", "running").await;
+        let ended = insert_job_knowledge(&pool, ended_job, "working", "live", "ended").await;
+        let missing = insert_job_knowledge(&pool, 9_999_999, "working", "live", "missing").await;
+        let running = insert_job_knowledge(&pool, running_job, "working", "live", "running").await;
+
+        assert_eq!(close_orphaned_working(&pool).await.unwrap(), 2);
+        let statuses: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, status FROM knowledge WHERE id IN (?, ?, ?) ORDER BY id")
+                .bind(ended)
+                .bind(missing)
+                .bind(running)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            statuses,
+            vec![
+                (ended, "closed".into()),
+                (missing, "closed".into()),
+                (running, "live".into()),
+            ]
+        );
+        assert_eq!(close_orphaned_working(&pool).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn the_consolidator_has_no_path_to_the_working_layer() {
+        let production = include_str!("consolidate.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the consolidator has a test boundary")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !production.contains("working"),
+            "the consolidator became a second writer for the working layer"
+        );
     }
 
     /// One row of 0088's table, written while that table still exists.
