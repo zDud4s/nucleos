@@ -1448,11 +1448,11 @@ mod tests {
         assert!(newest > gone);
     }
 
-    /// Migration `0151` removes what the errands feature left in the database. It is reached by
+    /// Migration `0153` removes what the errands feature left in the database. It is reached by
     /// stopping the chain at 148, seeding every shape the feature wrote, and finishing the chain,
     /// because a fresh database has none of these rows and the migration's `DELETE`s would never run.
     #[tokio::test]
-    async fn migration_0151_removes_what_errands_left_in_the_database() {
+    async fn migration_0153_removes_what_errands_left_in_the_database() {
         let pool = crate::testdb::pool_migrated_through(148).await;
         let at = "2026-09-01T00:00:00Z";
 

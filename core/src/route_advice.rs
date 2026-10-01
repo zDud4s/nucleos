@@ -1181,7 +1181,6 @@ mod tests {
             permission: Permission::Default,
             resume_session_id: None,
             mcp_config: None,
-            mcp_box: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,
