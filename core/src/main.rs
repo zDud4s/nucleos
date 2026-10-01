@@ -1698,6 +1698,7 @@ async fn main() {
             quota_client::QuotaClient::new(sidecar::QUOTA_ADDR, quota_sidecar_token.clone()),
             models_config.active_runner().to_string(),
         )),
+        judge: Arc::new(judge::JudgeRuntime::jev()),
         run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_tails: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),

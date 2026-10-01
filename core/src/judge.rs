@@ -11,12 +11,86 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::classifier;
 use crate::command_reader::Shell;
+
+/// One question put to the judge: the name its answer comes back under, and its wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Question {
+    pub key: &'static str,
+    pub instructions: &'static str,
+}
+
+pub const IN_SCOPE: &str = "in_scope";
+pub const SAFE: &str = "safe";
+
+/// D8: what spec A asks. Spec B (D10) appends its own questions to a copy of this list for the
+/// calls where it is eligible; the call and its parsing are the same for both.
+pub const JUDGE_QUESTIONS: &[Question] = &[
+    Question {
+        key: IN_SCOPE,
+        instructions: QUESTION_IN_SCOPE,
+    },
+    Question {
+        key: SAFE,
+        instructions: QUESTION_SAFE,
+    },
+];
+
+mod client;
+#[cfg(test)]
+pub(crate) use client::ScriptedJudge;
+#[allow(unused_imports)] // `Answers`, `JudgeError` and `JUDGE_MODEL`: consumed by Task 5.1
+pub use client::{Answers, JUDGE_MODEL, JevJudge, Judge, JudgeError, TYPESAFE_KEY};
+
+/// D11: at most four calls in flight across the machine; without a permit, the call is skipped
+/// and written down.
+pub const JUDGE_MAX_IN_FLIGHT: usize = 4;
+
+/// The judge as the daemon holds it: the occupant and the permits. One per process, in
+/// `AppState`, like `quota::QuotaRuntime`.
+pub struct JudgeRuntime {
+    #[allow(dead_code)] // consumed by Task 5.1
+    pub(crate) occupant: Arc<dyn Judge>,
+    #[allow(dead_code)] // consumed by Task 5.1
+    pub(crate) permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl JudgeRuntime {
+    pub fn jev() -> Self {
+        Self::with(Arc::new(JevJudge::new(client::JEV_BASE_URL)))
+    }
+
+    pub fn with(occupant: Arc<dyn Judge>) -> Self {
+        Self {
+            occupant,
+            permits: Arc::new(tokio::sync::Semaphore::new(JUDGE_MAX_IN_FLIGHT)),
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // consumed by Task 5.1
+    pub fn with_permits(occupant: Arc<dyn Judge>, permits: usize) -> Self {
+        Self {
+            occupant,
+            permits: Arc::new(tokio::sync::Semaphore::new(permits)),
+        }
+    }
+
+    /// For the many test `AppState`s that never turn the judge on (`runs.judge` defaults to
+    /// `off`). Named and `#[cfg(test)]` for the reasons `QuotaRuntime::disabled` gives.
+    #[cfg(test)]
+    pub fn disabled() -> Self {
+        Self::with(ScriptedJudge::failing(JudgeError::NoKey(
+            "no judge in this test".to_owned(),
+        )))
+    }
+}
 
 /// D8: the two questions, worded as measured in round 2 (V4) and kept in V5. Changing a word here
 /// is a change D11 says must re-run the 165-case regression before it lands.
