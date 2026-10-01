@@ -195,7 +195,7 @@ export function Autopilot() {
         <ScoreboardPanel projectId={selected} project={focused} />
         <JudgePanel projectId={selected} project={focused} />
         <JudgeReviewPanel projectId={selected} />
-        <ResolvePanel projectId={selected} />
+        <ResolvePanel projectId={selected} project={focused} />
         <TriggerKills />
         <JobsPanel rows={rows} selected={selected} />
         <FeedEmbed />
