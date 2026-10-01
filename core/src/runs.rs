@@ -12485,7 +12485,9 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
 
         let json = serde_json::to_value(entry).unwrap();
         let object = json.as_object().unwrap();
-        assert_eq!(object.len(), 8);
+        // Eight run fields and the nine route fields: what launched and what the router advised
+        // are model names and ids, never transcript text.
+        assert_eq!(object.len(), 17);
         for field in [
             "id",
             "project_id",
@@ -12495,6 +12497,15 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             "completed_at",
             "cost_usd",
             "prompt_excerpt",
+            "model",
+            "effort",
+            "runner",
+            "route_mode",
+            "route_decision_id",
+            "advised_runner",
+            "advised_model",
+            "advised_effort",
+            "route_failed",
         ] {
             assert!(object.contains_key(field), "missing metadata field {field}");
         }

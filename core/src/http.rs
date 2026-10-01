@@ -31714,7 +31714,8 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "days": 365, "runs": 1, "shadow": 1, "apply": 0, "advised": 1, "matched": 0,
+                "days": 365, "runs": 1, "shadow": 1, "apply": 0, "advised": 1,
+                "shadow_advised": 1, "matched": 0,
                 "pairs": [{
                     "runner": "claude", "model": "sonnet", "effort": null,
                     "advised_runner": "claude", "advised_model": "opus", "advised_effort": "high",
