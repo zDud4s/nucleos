@@ -1809,6 +1809,16 @@ const RUN_DETAIL = {
   // The prompt budget's two halves: what the daemon wrote, and the CLI's own residual.
   authored_prompt_estimate: 2_400,
   cli_own_estimate: 18_600,
+  // A shadow-mode router: it advised something cheaper than what ran.
+  runner: "claude",
+  model: "sonnet",
+  effort: "high",
+  route_mode: "shadow",
+  route_decision_id: 7,
+  advised_runner: "claude",
+  advised_model: "haiku",
+  advised_effort: "low",
+  route_failed: null,
 } satisfies RunDetail;
 
 /*

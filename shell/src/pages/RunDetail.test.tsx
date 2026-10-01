@@ -308,6 +308,62 @@ describe("RunDetail — what it was told", () => {
 /* ----------------------------------------------------------------- gate -- */
 
 describe("RunDetail — the gate", () => {
+  it("shows what ran and a shadow advice that differs", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail({
+          runner: "claude",
+          model: "sonnet",
+          effort: "high",
+          route_mode: "shadow",
+          advised_runner: "claude",
+          advised_model: "haiku",
+          advised_effort: "low",
+        }),
+        NO_TAIL,
+        [],
+      ),
+    );
+    await renderApp({ initialPath: "/runs/5" });
+    expect(await screen.findByText("claude · sonnet · high")).toBeDefined();
+    expect(screen.getByText("claude · haiku · low", { exact: false })).toBeDefined();
+    expect(screen.getByText("shadow")).toBeDefined();
+    expect(screen.getByText("differs from what ran")).toBeDefined();
+  });
+
+  it("says a shadow advice matched when it did", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail({
+          runner: "claude", model: "sonnet", effort: "high", route_mode: "shadow",
+          advised_runner: "claude", advised_model: "sonnet", advised_effort: "high",
+        }),
+        NO_TAIL,
+        [],
+      ),
+    );
+    await renderApp({ initialPath: "/runs/5" });
+    expect(await screen.findByText("matched what ran")).toBeDefined();
+  });
+
+  it("shows a router failure muted, and nothing at all for a run without a trail", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(detail({ route_mode: "shadow", route_failed: "router timed out" }), NO_TAIL, []),
+    );
+    const first = await renderApp({ initialPath: "/runs/5" });
+    expect(await screen.findByText("Router could not advise: router timed out")).toBeDefined();
+    expect(screen.queryByText("Router advised")).toBeNull();
+    first.unmount?.();
+  });
+
+  it("renders no router section when every field is null", async () => {
+    daemon.apiFetch.mockImplementation(detailFetch(detail(), NO_TAIL, []));
+    await renderApp({ initialPath: "/runs/5" });
+    await screen.findByText("This run");
+    expect(screen.queryByText("Ran with")).toBeNull();
+    expect(screen.queryByText("Router advised")).toBeNull();
+  });
+
   it("renders a run nobody gated as ungated, never as failed", async () => {
     const asked: string[] = [];
     daemon.apiFetch.mockImplementation(

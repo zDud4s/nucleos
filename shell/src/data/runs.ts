@@ -100,6 +100,22 @@ export interface RunDetail {
    * reported no token usage at all.
    */
   cli_own_estimate: number | null;
+  /*
+   * The router's trail, all optional and all nullable: a run from before the
+   * feature carries none of them. `model`/`effort`/`runner` are what ran;
+   * `advised_*` is what a local llm-router suggested.
+   */
+  model?: string | null;
+  effort?: string | null;
+  runner?: string | null;
+  /** `off` | `shadow` | `apply`; null for a run from before the router. */
+  route_mode?: string | null;
+  route_decision_id?: number | null;
+  advised_runner?: string | null;
+  advised_model?: string | null;
+  advised_effort?: string | null;
+  /** Why the router could not advise. Read defensively: string, boolean or null. */
+  route_failed?: string | boolean | null;
 }
 
 /** What a run has written since a byte offset, while it is still writing. */
