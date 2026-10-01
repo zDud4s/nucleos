@@ -4087,6 +4087,263 @@ mod tests {
         (status, body)
     }
 
+    async fn finding_at_door(
+        pool: &SqlitePool,
+        scope: crate::auth::Scope,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let response = axum::Router::new()
+            .route(
+                "/knowledge/findings",
+                axum::routing::post(crate::http::post_finding),
+            )
+            .layer(axum::Extension(scope))
+            .with_state(declaration_test_state(pool.clone()))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/knowledge/findings")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+        });
+        (status, body)
+    }
+
+    async fn seed_job_run(pool: &SqlitePool, job_status: &str) -> (i64, i64) {
+        let job_id: i64 = sqlx::query_scalar(
+            "INSERT INTO jobs
+               (project_id, project_root, status, max_items, gate_retries, created_at)
+             VALUES ('nucleos', 'C:/tmp', ?, 1, 0, '2026-10-01T00:00:00Z')
+             RETURNING id",
+        )
+        .bind(job_status)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at, job_id, stage)
+             VALUES ('nucleos', 'leave a finding', 'running', 'worktree',
+                     '2026-10-01T00:00:00Z', ?, 'execute')
+             RETURNING id",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (job_id, run_id)
+    }
+
+    #[tokio::test]
+    async fn a_finding_with_no_evidence_is_refused_at_the_door() {
+        let pool = test_pool().await;
+        let (_, run_id) = seed_job_run(&pool, "implementing").await;
+        for (body, expected) in [
+            (
+                serde_json::json!({"fact": "the build needs the GNU host"}),
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!({"fact": "the build needs the GNU host", "evidence": []}),
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"fact": "the build needs the GNU host", "evidence": "run:1"}),
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"fact": "the build needs the GNU host", "evidence": [{}]}),
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let (status, _) = finding_at_door(&pool, crate::auth::Scope::Run(run_id), body).await;
+            assert_eq!(status, expected);
+            let written: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE layer = 'working'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(written, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_evidence_of_nothing_but_unknown_tags_is_no_evidence() {
+        let pool = test_pool().await;
+        let (_, run_id) = seed_job_run(&pool, "implementing").await;
+        for evidence in [
+            serde_json::json!([{"t": "vibes", "id": 1}]),
+            serde_json::json!([{"t": "run"}]),
+            serde_json::json!([{"t": "run", "id": 0}]),
+        ] {
+            let (status, _) = finding_at_door(
+                &pool,
+                crate::auth::Scope::Run(run_id),
+                serde_json::json!({"fact": "the build needs the GNU host", "evidence": evidence}),
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        let (status, _) = finding_at_door(
+            &pool,
+            crate::auth::Scope::Run(run_id),
+            serde_json::json!({
+                "fact": "the build needs the GNU host",
+                "evidence": [{"t": "vibes", "id": 1}, {"t": "run", "id": 5}],
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        let stored: String =
+            sqlx::query_scalar("SELECT evidence FROM knowledge WHERE layer = 'working'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, r#"[{"t":"run","id":5}]"#);
+    }
+
+    #[tokio::test]
+    async fn a_run_can_never_write_the_measurement_column() {
+        let pool = test_pool().await;
+        let (job_id, run_id) = seed_job_run(&pool, "implementing").await;
+        let (status, _) = finding_at_door(
+            &pool,
+            crate::auth::Scope::Run(run_id),
+            serde_json::json!({
+                "fact": "the build needs the GNU host",
+                "evidence": [{"t": "run", "id": run_id}],
+                "observations": 5,
+            }),
+        )
+        .await;
+        assert!(status.is_client_error());
+        let written: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE layer = 'working'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(written, 0);
+
+        let (status, _) = finding_at_door(
+            &pool,
+            crate::auth::Scope::Run(run_id),
+            serde_json::json!({
+                "fact": "the build needs the GNU host",
+                "evidence": [{"t": "run", "id": run_id}],
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        let row: (
+            Option<i64>,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<i64>,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT observations, layer, status, scope_kind, scope_id, source,
+                        proposal_id, origin_run_id
+                   FROM knowledge WHERE layer = 'working'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                None,
+                "working".to_owned(),
+                "live".to_owned(),
+                "job".to_owned(),
+                job_id.to_string(),
+                "run".to_owned(),
+                None,
+                run_id,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn the_door_answers_only_to_a_run_that_belongs_to_a_live_job() {
+        let pool = test_pool().await;
+        let evidence = serde_json::json!([{"t": "run", "id": 1}]);
+        let body =
+            serde_json::json!({"fact": "the build needs the GNU host", "evidence": evidence});
+        for scope in [
+            crate::auth::Scope::Control,
+            crate::auth::Scope::ApiToken(crate::auth::ApiTokenLevel::RunCreating),
+            crate::auth::Scope::TeamRun("t".into()),
+        ] {
+            let (status, _) = finding_at_door(&pool, scope, body.clone()).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        }
+
+        let run_without_job: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('nucleos', 'no job', 'running', 'real', '2026-10-01T00:00:00Z')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (status, _) = finding_at_door(
+            &pool,
+            crate::auth::Scope::Run(run_without_job),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+
+        for status in crate::job::TERMINAL_STATUSES {
+            let (_, run_id) = seed_job_run(&pool, status).await;
+            let (answer, _) =
+                finding_at_door(&pool, crate::auth::Scope::Run(run_id), body.clone()).await;
+            assert_eq!(answer, axum::http::StatusCode::CONFLICT, "{status}");
+        }
+
+        let (_, run_id) = seed_job_run(&pool, "implementing").await;
+        for fact in ["".to_owned(), "x".repeat(601)] {
+            let (status, _) = finding_at_door(
+                &pool,
+                crate::auth::Scope::Run(run_id),
+                serde_json::json!({"fact": fact, "evidence": [{"t": "run", "id": run_id}]}),
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        for number in 1..=21 {
+            let (status, _) = finding_at_door(
+                &pool,
+                crate::auth::Scope::Run(run_id),
+                serde_json::json!({
+                    "fact": format!("finding {number}"),
+                    "evidence": [{"t": "run", "id": run_id}],
+                }),
+            )
+            .await;
+            let expected = if number <= 20 {
+                axum::http::StatusCode::CREATED
+            } else {
+                axum::http::StatusCode::TOO_MANY_REQUESTS
+            };
+            assert_eq!(status, expected, "finding {number}");
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn seed_known(
         pool: &SqlitePool,
