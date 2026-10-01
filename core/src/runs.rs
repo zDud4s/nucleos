@@ -1190,7 +1190,6 @@ pub(crate) fn task_to_carry(prompt: &str) -> &str {
 /// prompt is the only thing that survives the session: a handoff or a resume out of the
 /// correction reads its task from here (`task_to_carry`), and with the note alone its successor
 /// would inherit a sentence about a gate as its brief, the incident `task_to_carry` records.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 6.4
 fn correction_prompt(exit_code: i32, gate_output: &str, task: &str) -> String {
     let mut output = gate_output.to_owned();
     while output.contains(RESUMED_TASK_HEADER) {
@@ -1423,6 +1422,24 @@ static DECLINE_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
          )
          SELECT ?, ?, ?, 'running', 'worktree', ?, ?, ?, ?, ?, ?, {}, {}
          FROM runs WHERE id = ?",
+        names_of(CONTINUATION_COLUMNS),
+        names_of(CARRIED_DENIALS),
+        values_of(CONTINUATION_COLUMNS),
+        values_of(CARRIED_DENIALS)
+    )
+});
+
+/// Spec B D6: the correction's INSERT. The SAME session (copied from the origin row, which the
+/// terminal write stored), `steerable` and the continuation columns from the origin, and the
+/// denials the conversation already spent (D6.2). Never a job's: the correction only fires
+/// outside jobs. Exactly one row or none: no origin, or an origin with no session, inserts nothing.
+static CORRECTION_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "INSERT INTO runs (
+             project_id, cwd, prompt, status, mode, session_id, created_at, steerable, {}, {}
+         )
+         SELECT project_id, ?, ?, 'running', 'worktree', session_id, ?, steerable, {}, {}
+         FROM runs WHERE id = ? AND session_id IS NOT NULL",
         names_of(CONTINUATION_COLUMNS),
         names_of(CARRIED_DENIALS),
         values_of(CONTINUATION_COLUMNS),
@@ -3425,6 +3442,314 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
 /// `resume_did_not_act` needs no care: it only fires from an unconsumed grant, and there is none.
 pub async fn decline_action(state: &AppState, proposal_id: i64) -> Result<i64, ResumeError> {
     continue_paused_run(state, proposal_id, Continuation::Decline).await
+}
+
+/// Why a correction did not happen. Every one of these goes to the owner (spec B D6).
+#[derive(Debug)]
+pub(crate) enum CorrectionRefusal {
+    AlreadyCorrected,
+    HandedOff,
+    Trace(String),
+    DailyCeiling,
+    NoSession,
+    NoWorktree,
+    NoSlot(String),
+    OriginGone,
+    NoTask(String),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for CorrectionRefusal {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+impl CorrectionRefusal {
+    /// The line the owner reads (spec B D7, `judge_needs_owner`).
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 7.1
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::AlreadyCorrected => {
+                "this task was already corrected once, and a lineage is corrected at most once"
+                    .to_owned()
+            }
+            Self::HandedOff => {
+                "the run handed off to a successor, which is working in its tree".to_owned()
+            }
+            Self::Trace(trace) => trace.clone(),
+            Self::DailyCeiling => format!(
+                "the project reached {} corrections in the last day",
+                crate::judge::resolve::CORRECTIONS_PER_PROJECT_PER_DAY
+            ),
+            Self::NoSession => "the run recorded no session to continue".to_owned(),
+            Self::NoWorktree => "the run's tree is gone".to_owned(),
+            Self::NoSlot(why) => format!("no slot to run it in: {why}"),
+            Self::OriginGone => "the run's row is gone".to_owned(),
+            Self::NoTask(why) => {
+                format!("the task this lineage started with could not be read: {why}")
+            }
+            Self::Db(error) => format!("the correction could not be written: {error}"),
+        }
+    }
+}
+
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .is_some_and(|database_error| database_error.is_unique_violation())
+}
+
+/// Spec B D6: one more turn for a completed worktree run whose gate failed, in the same
+/// conversation and the same tree. Its own function, not `resume_approved_run`: that one skips
+/// the kill switch and the budget, and needs a pending proposal and a paused run, and mixing two
+/// such different sets of safety rules in one function is how one of them gets lost. The caller
+/// (`judge::correction::after_gate_failed`) has already asked the judge and checked conditions
+/// 2, 3 and 5 to 8 outside any transaction; this function owns 1, 2, 4 and 7 inside it.
+///
+/// In one transaction, in this order (spec B D6 "Como", S3):
+/// 1. the `judge_corrections` row is the FIRST write, so from here the write lock is the
+///    correction's, and the UNIQUE refuses a concurrent second correction of the lineage;
+/// 2. conditions 1 (no successor) and 2 (no trace) again, and the daily ceiling counted with this
+///    row, none of which can change until the commit;
+/// 3. the run, by `INSERT ... SELECT` over the origin and exactly one row. Before the slot and the
+///    tree, where spec B lists it after them: both hand over TO the new id, which only exists once
+///    the row does, and the order inside one transaction changes nothing a reader can see;
+/// 4. the origin's slot handed over (a finished run's slot is only freed by the sweep), or, if the
+///    sweep already freed it, a new one claimed on this same transaction (`claim_on`, S4); no room
+///    rolls everything back;
+/// 5. the tree's owner moved, and it must move exactly one row;
+/// 6. `correction_run_id` recorded.
+///
+/// No `action_grants`, nothing sent to the git queue, and the origin's status left as it is.
+/// After the commit, launched like the resume: `--resume` with the session, one attempt, the
+/// origin's `steerable`, and a NEW worktree clock. The correction happens at most once per
+/// lineage, so it widens a lineage by one worktree clock at most, and it needs the time to build
+/// and run the gate; what was left of the origin's clock may be nothing.
+#[cfg_attr(not(test), allow(dead_code))] // consumed by Task 7.1
+pub(crate) async fn resume_for_correction(
+    state: &AppState,
+    origin: i64,
+    exit_code: i32,
+) -> Result<i64, CorrectionRefusal> {
+    let row: Option<(Option<String>, Option<String>, Option<String>, i64, i64)> = sqlx::query_as(
+        "SELECT project_id, session_id, gate_output, COALESCE(lineage_root_id, id), steerable
+         FROM runs WHERE id = ?",
+    )
+    .bind(origin)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some((project_id, session_id, gate_output, root, steerable)) = row else {
+        return Err(CorrectionRefusal::OriginGone);
+    };
+    // Condition 4, read first because it is monotone (a lineage once corrected stays corrected)
+    // and because after a correction the origin no longer owns its tree, so the lookups below
+    // would answer "no worktree" for what is really "already corrected". The UNIQUE inside the
+    // transaction is still what decides a race.
+    let corrected: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM judge_corrections WHERE root_run_id = ?)")
+            .bind(root)
+            .fetch_one(&state.pool)
+            .await?;
+    if corrected {
+        return Err(CorrectionRefusal::AlreadyCorrected);
+    }
+    let project_id = project_id.ok_or(CorrectionRefusal::OriginGone)?;
+    let session_id = session_id.ok_or(CorrectionRefusal::NoSession)?;
+    let (project_root, wt_path, branch): (String, String, String) = sqlx::query_as(
+        "SELECT project_root, path, branch FROM worktrees
+         WHERE owner_kind = 'run' AND owner_id = ? AND removed_at IS NULL",
+    )
+    .bind(origin)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(CorrectionRefusal::NoWorktree)?;
+    // Outside the transaction, for `resume_approved_run`'s reason: `original_task` walks the
+    // runs table with its own connection, and doing that under the write lock is a deadlock.
+    // Unreadable or empty is a refusal, never `unwrap_or_default`: nobody watches this turn, and
+    // an empty task would be the brief every later continuation of the lineage carries.
+    let task = original_task(&state.pool, origin)
+        .await
+        .map_err(|error| CorrectionRefusal::NoTask(error.to_string()))?;
+    if task.trim().is_empty() {
+        return Err(CorrectionRefusal::NoTask("it is empty".to_owned()));
+    }
+    let prompt = correction_prompt(exit_code, gate_output.as_deref().unwrap_or_default(), &task);
+    let draft = CorrectionDraft {
+        origin,
+        root,
+        project_id: &project_id,
+        wt_path: &wt_path,
+        branch: &branch,
+        prompt: &prompt,
+        now: chrono::Utc::now(),
+    };
+    let correction = write_correction(&state.pool, &draft).await?;
+
+    let daemon_token = mint_run_token(&state.pool, correction).await;
+    let gate_config =
+        match crate::config::load_schedule_rules(state.machine_config_root.as_deref(), &project_id)
+        {
+            Ok(rules) => rules
+                .gate_command
+                .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
+                    command,
+                    project_root: project_root.clone(),
+                }),
+            Err(error) => {
+                GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
+            }
+        };
+    let governed_by_classifier = classifier_governs_tools(
+        "worktree",
+        crate::runner::ToolPolicy::Unrestricted,
+        Some(std::path::Path::new(&wt_path)),
+    );
+    spawn_run(
+        state,
+        state.runner.clone(),
+        correction,
+        prompt,
+        Some(project_id),
+        Some(std::path::PathBuf::from(&wt_path)),
+        if governed_by_classifier {
+            crate::runner::Permission::Bypass
+        } else {
+            crate::runner::Permission::Default
+        },
+        Some(session_id.clone()),
+        session_id,
+        false,
+        Some((
+            "worktree_run_completed".to_owned(),
+            format!("correction run completed on {branch}"),
+        )),
+        gate_config,
+        1,
+        crate::runner::ToolPolicy::Unrestricted,
+        run_env(
+            &daemon_token,
+            correction,
+            None,
+            crate::speed::Capacity::solo(),
+        ),
+        steerable != 0,
+        run_timeout_for_mode(state.run_timeout, "worktree"),
+        progress_timeout_for_mode(state.progress_timeout, "worktree"),
+        governed_by_classifier,
+        state.runner.model_for_stage(None),
+    );
+    Ok(correction)
+}
+
+/// What `write_correction` writes, read and built before its transaction opens.
+struct CorrectionDraft<'a> {
+    origin: i64,
+    root: i64,
+    project_id: &'a str,
+    wt_path: &'a str,
+    branch: &'a str,
+    prompt: &'a str,
+    now: chrono::DateTime<chrono::Utc>,
+}
+
+/// Steps 1 to 6 of `resume_for_correction`, the one transaction. Its own function so a test can
+/// reach the UNIQUE that the pre-check normally answers first (spec B S3).
+async fn write_correction(
+    pool: &sqlx::SqlitePool,
+    draft: &CorrectionDraft<'_>,
+) -> Result<i64, CorrectionRefusal> {
+    let (origin, root, now_text) = (draft.origin, draft.root, draft.now.to_rfc3339());
+    let mut tx = pool.begin().await?;
+    if let Err(error) = sqlx::query(
+        "INSERT INTO judge_corrections (root_run_id, origin_run_id, project_id, created_at)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(root)
+    .bind(origin)
+    .bind(draft.project_id)
+    .bind(&now_text)
+    .execute(&mut *tx)
+    .await
+    {
+        return Err(if is_unique_violation(&error) {
+            CorrectionRefusal::AlreadyCorrected
+        } else {
+            error.into()
+        });
+    }
+    // `fetch_optional`: the row may have gone since the read outside, and that is `OriginGone`.
+    let successor: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT successor_run_id FROM runs WHERE id = ?")
+            .bind(origin)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match successor {
+        None => return Err(CorrectionRefusal::OriginGone),
+        Some(Some(_)) => return Err(CorrectionRefusal::HandedOff),
+        Some(None) => {}
+    }
+    if let Some(trace) =
+        crate::judge::correction::lineage_trace_on(&mut tx, root, Some(draft.branch)).await?
+    {
+        return Err(CorrectionRefusal::Trace(trace));
+    }
+    if crate::judge::correction::corrections_in_last_day_on(&mut tx, draft.project_id, draft.now)
+        .await?
+        > crate::judge::resolve::CORRECTIONS_PER_PROJECT_PER_DAY
+    {
+        return Err(CorrectionRefusal::DailyCeiling);
+    }
+    let inserted = sqlx::query(CORRECTION_INSERT.as_str())
+        .bind(draft.wt_path)
+        .bind(draft.prompt)
+        .bind(&now_text)
+        .bind(origin)
+        .execute(&mut *tx)
+        .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(CorrectionRefusal::OriginGone);
+    }
+    let correction = inserted.last_insert_rowid();
+    let handed = sqlx::query(
+        "UPDATE project_slots SET owner_id = ? WHERE owner_kind = 'run' AND owner_id = ?",
+    )
+    .bind(correction)
+    .bind(origin)
+    .execute(&mut *tx)
+    .await?;
+    if handed.rows_affected() == 0 {
+        match crate::concurrency::claim_on(
+            &mut tx,
+            draft.project_id,
+            crate::worktree::Owner::Run(correction),
+        )
+        .await?
+        {
+            crate::concurrency::ClaimOutcome::Claimed(_) => {}
+            crate::concurrency::ClaimOutcome::Full(no_room) => {
+                return Err(CorrectionRefusal::NoSlot(no_room.reason()));
+            }
+        }
+    }
+    let moved = sqlx::query(
+        "UPDATE worktrees SET owner_id = ?
+         WHERE owner_kind = 'run' AND owner_id = ? AND removed_at IS NULL",
+    )
+    .bind(correction)
+    .bind(origin)
+    .execute(&mut *tx)
+    .await?;
+    if moved.rows_affected() != 1 {
+        return Err(CorrectionRefusal::NoWorktree);
+    }
+    sqlx::query("UPDATE judge_corrections SET correction_run_id = ? WHERE root_run_id = ?")
+        .bind(correction)
+        .bind(root)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(correction)
 }
 
 async fn continue_paused_run(
@@ -9824,10 +10149,381 @@ error: {token}
             .unwrap();
         let declined = decline_action(&state, proposal_id).await.unwrap();
         assert_continued(&state.pool, paused, declined).await;
+
+        // The correction (spec B D6).
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE runs SET {set_all} WHERE id = {origin}"
+        )))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let correction = resume_for_correction(&state, origin, 7).await.unwrap();
+        assert_continued(&state.pool, origin, correction).await;
     }
 
     async fn count(pool: &sqlx::SqlitePool, sql: &'static str) -> i64 {
         sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    /// Polls `check` every 10 ms for up to 5 s, and panics if it never holds.
+    async fn wait_until<F: Fn() -> Fut, Fut: std::future::Future<Output = bool>>(check: F) {
+        for _ in 0..500 {
+            if check().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the condition never held in 5 s");
+    }
+
+    /// A worktree run that finished `completed` with its gate `failed`, in a real repository, in an
+    /// Active project with the resolver in enforce, holding slot 0. Returns (run, branch, repo).
+    async fn seed_failed_gate(state: &AppState) -> (i64, String, tempfile::TempDir) {
+        let container = crate::git_exec::tests::space_free_tempdir("nucleos-correction-");
+        let root = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&root);
+        let root = root.to_string_lossy().replace('\\', "/");
+        let branch = crate::git_exec::current_branch(
+            std::path::Path::new(&root),
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root, judge_resolve)
+             VALUES ('proj', 'active', ?, 'enforce')
+             ON CONFLICT(project_id) DO UPDATE SET project_root = excluded.project_root",
+        )
+        .bind(&root)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, steerable, denials,
+                               gate_status, gate_exit_code, gate_output, created_at, completed_at)
+             VALUES ('proj', ?, 'Fix the flaky test in core', 'completed', 'sess-1', 'worktree', 1, 1,
+                     'failed', 7, 'FAILED core::x', '2026-09-27T00:00:00Z', '2026-09-27T01:00:00Z')",
+        )
+        .bind(&root)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('run', ?, 'proj', ?, ?, ?, '2026-09-27T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(&root)
+        .bind(&root)
+        .bind(&branch)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO project_slots (project_id, slot, owner_kind, owner_id, claimed_at)
+             VALUES ('proj', 0, 'run', ?, '2026-09-27T00:00:00Z')",
+        )
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        (run_id, branch, container)
+    }
+
+    /// Spec B D6: the correction continues the SAME session in the SAME tree, takes the origin's
+    /// slot, keeps `steerable`, the lineage and the denials, and records itself on its lineage.
+    #[tokio::test]
+    async fn a_correction_continues_the_same_session_in_the_same_tree() {
+        let (state, runner) =
+            test_state_with_runner(Some(Duration::from_millis(200)), Duration::from_secs(600))
+                .await;
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+
+        let correction = resume_for_correction(&state, origin, 7).await.unwrap();
+
+        let (tree, slot): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT owner_id FROM worktrees), (SELECT owner_id FROM project_slots)",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!((tree, slot), (correction, correction));
+        let (steerable, root, denials, session, prompt): (
+            i64,
+            Option<i64>,
+            i64,
+            Option<String>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT steerable, lineage_root_id, denials, session_id, prompt FROM runs WHERE id = ?",
+        )
+        .bind(correction)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (steerable, root, denials, session.as_deref()),
+            (1, Some(origin), 1, Some("sess-1"))
+        );
+        assert!(prompt.contains("FAILED core::x") && prompt.ends_with("Fix the flaky test in core"));
+        let recorded: (i64, i64, Option<i64>) = sqlx::query_as(
+            "SELECT root_run_id, origin_run_id, correction_run_id FROM judge_corrections",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded, (origin, origin, Some(correction)));
+        wait_until(|| async { runner.last_resume.lock().unwrap().is_some() }).await; // --resume
+        // A fresh worktree clock: the origin started an hour before it ended, and the correction
+        // still has the whole of `run_timeout_for_mode(.., "worktree")` to finish in.
+        let status = || async {
+            sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = ?")
+                .bind(correction)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap()
+        };
+        wait_until(|| async { status().await != "running" }).await;
+        assert_eq!(status().await, "completed");
+    }
+
+    /// Spec B D6.1/D6.2: one correction per lineage, held by the database. A second is refused,
+    /// and so is the correction's own handoff successor or resume, which share the lineage.
+    #[tokio::test]
+    async fn a_lineage_is_corrected_at_most_once() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+        resume_for_correction(&state, origin, 7).await.unwrap();
+        let successor = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, session_id, mode, lineage_root_id, gate_status, created_at)
+             VALUES ('proj', 'x', 'completed', 's', 'worktree', ?, 'failed', '2026-09-27T02:00:00Z')",
+        )
+        .bind(origin)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        assert!(matches!(
+            resume_for_correction(&state, origin, 7).await,
+            Err(CorrectionRefusal::AlreadyCorrected)
+        ));
+        assert!(matches!(
+            resume_for_correction(&state, successor, 7).await,
+            Err(CorrectionRefusal::AlreadyCorrected)
+        ));
+    }
+
+    /// Spec B D6 (S3): two corrections of one lineage at once. One wins, the other is refused.
+    /// The test pool has ONE connection, so the two transactions run one after the other, and the
+    /// loser is refused by the pre-check or the UNIQUE depending on how the awaits interleave; the
+    /// UNIQUE alone is forced by the next test.
+    #[tokio::test]
+    async fn two_concurrent_corrections_of_one_lineage_leave_one() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+        let (a, b) = tokio::join!(
+            resume_for_correction(&state, origin, 7),
+            resume_for_correction(&state, origin, 7)
+        );
+        assert_eq!([a.is_ok(), b.is_ok()].iter().filter(|won| **won).count(), 1);
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM judge_corrections").await, 1);
+    }
+
+    /// Spec B D6 (S3): the UNIQUE, not the pre-check, decides a race. The row a concurrent
+    /// correction would have written is already there when the transaction opens.
+    #[tokio::test]
+    async fn the_unique_refuses_a_correction_the_pre_check_missed() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (origin, branch, _repo) = seed_failed_gate(&state).await;
+        sqlx::query(
+            "INSERT INTO judge_corrections (root_run_id, origin_run_id, project_id, created_at)
+             VALUES (?, ?, 'proj', ?)",
+        )
+        .bind(origin)
+        .bind(origin)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let runs_before = count(&state.pool, "SELECT COUNT(*) FROM runs").await;
+        let draft = CorrectionDraft {
+            origin,
+            root: origin,
+            project_id: "proj",
+            wt_path: "C:/x",
+            branch: &branch,
+            prompt: "p",
+            now: chrono::Utc::now(),
+        };
+        assert!(matches!(
+            write_correction(&state.pool, &draft).await,
+            Err(CorrectionRefusal::AlreadyCorrected)
+        ));
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM runs").await, runs_before);
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM judge_corrections").await, 1);
+    }
+
+    /// Spec B D6 condition 1, checked again inside the transaction: a run that handed off never
+    /// gets a second agent in its tree, and nothing is written.
+    #[tokio::test]
+    async fn a_run_that_handed_off_is_never_corrected() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+        sqlx::query("UPDATE runs SET successor_run_id = 999 WHERE id = ?")
+            .bind(origin)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            resume_for_correction(&state, origin, 7).await,
+            Err(CorrectionRefusal::HandedOff)
+        ));
+        assert_eq!(
+            count(&state.pool, "SELECT COUNT(*) FROM judge_corrections").await,
+            0,
+            "rolled back"
+        );
+    }
+
+    /// Spec B D6 (S4): the slot is handed over; when the sweep already freed it, a new one is
+    /// claimed in the same transaction; with no room, nothing at all is written.
+    #[tokio::test]
+    async fn a_correction_takes_the_origins_slot_or_a_new_one_or_nothing() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+        sqlx::query("DELETE FROM project_slots")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let correction = resume_for_correction(&state, origin, 7).await.unwrap();
+        let holder: i64 = sqlx::query_scalar("SELECT owner_id FROM project_slots")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(holder, correction, "claimed anew when the sweep had freed it");
+
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+        sqlx::query("UPDATE project_slots SET owner_id = 4242")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, created_at)
+             VALUES (4242, 'x', 'running', 'worktree', '2026-09-27T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE autopilot_state SET max_concurrent_slots = 1")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let runs_before = count(&state.pool, "SELECT COUNT(*) FROM runs").await;
+        assert!(matches!(
+            resume_for_correction(&state, origin, 7).await,
+            Err(CorrectionRefusal::NoSlot(_))
+        ));
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM runs").await, runs_before);
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM judge_corrections").await, 0);
+        let tree: i64 = sqlx::query_scalar("SELECT owner_id FROM worktrees")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(tree, origin, "the tree did not move");
+    }
+
+    /// Spec B D6 condition 2, re-checked inside the transaction, and condition 7's ceiling.
+    #[tokio::test]
+    async fn a_trace_or_a_spent_day_refuses_inside_the_transaction() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+        sqlx::query(
+            "INSERT INTO action_grants (run_id, tool_name, action_class, proposal_id, created_at)
+             VALUES (?, 'Bash', 'push-merge-deploy', 5, '2026-09-27T00:00:00Z')",
+        )
+        .bind(origin)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let runs_before = count(&state.pool, "SELECT COUNT(*) FROM runs").await;
+        assert!(matches!(
+            resume_for_correction(&state, origin, 7).await,
+            Err(CorrectionRefusal::Trace(_))
+        ));
+        assert_eq!(
+            count(&state.pool, "SELECT COUNT(*) FROM runs").await,
+            runs_before,
+            "rolled back"
+        );
+        assert_eq!(
+            count(&state.pool, "SELECT COUNT(*) FROM judge_corrections").await,
+            0,
+            "rolled back"
+        );
+
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+        let recent = chrono::Utc::now().to_rfc3339();
+        for root in [9001, 9002, 9003] {
+            sqlx::query(
+                "INSERT INTO judge_corrections (root_run_id, origin_run_id, project_id, created_at)
+                 VALUES (?, ?, 'proj', ?)",
+            )
+            .bind(root)
+            .bind(root)
+            .bind(&recent)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let runs_before = count(&state.pool, "SELECT COUNT(*) FROM runs").await;
+        assert!(matches!(
+            resume_for_correction(&state, origin, 7).await,
+            Err(CorrectionRefusal::DailyCeiling)
+        ));
+        assert_eq!(
+            count(&state.pool, "SELECT COUNT(*) FROM runs").await,
+            runs_before,
+            "rolled back"
+        );
+        assert_eq!(
+            count(&state.pool, "SELECT COUNT(*) FROM judge_corrections").await,
+            3,
+            "rolled back"
+        );
+    }
+
+    /// Spec B D6.2: with the origin row gone, nothing is inserted.
+    #[tokio::test]
+    async fn a_correction_whose_origin_vanished_inserts_nothing() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (origin, _branch, _repo) = seed_failed_gate(&state).await;
+        sqlx::query("DELETE FROM runs WHERE id = ?")
+            .bind(origin)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            resume_for_correction(&state, origin, 7).await,
+            Err(CorrectionRefusal::OriginGone)
+        ));
+        assert_eq!(count(&state.pool, "SELECT COUNT(*) FROM judge_corrections").await, 0);
     }
 
     async fn text_of(pool: &sqlx::SqlitePool, sql: &'static str, id: i64) -> String {
