@@ -1393,12 +1393,15 @@ async fn main() {
         }
         None => Arc::new(claude_runner()),
     };
-    // The llm-router as an adviser. Off unless `.ai/router.yaml` turns it on, and off hands back
-    // the very runner built above.
+    // The llm-router as an adviser. Off unless `~/.nucleos/router.yaml` turns it on, and off hands
+    // back the very runner built above. Read from the same root the settings page writes and the
+    // health row probes, so the three never disagree about which file is in force.
     let primary_runner = route_advice::front(
         primary_runner,
         &models_config,
-        route_advice::load_config(std::path::Path::new(".ai/router.yaml")),
+        machine_file(machine_config::ROUTER_FILE)
+            .map(|path| route_advice::load_config(&path))
+            .unwrap_or_else(route_advice::RouterConfig::off),
     );
 
     // The email sidecar's own key, minted before `AppState` exists rather than beside the spawn.

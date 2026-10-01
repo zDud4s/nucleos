@@ -1,7 +1,7 @@
 //! Who may write THIS MACHINE's settings, and what a valid one looks like.
 //!
 //! [`crate::ownership`] answers the same question for a file in a PROJECT, and its header explains
-//! at length why nine files are deliberately absent from that table: they are this machine's, so a
+//! at length why these files are deliberately absent from that table: they are this machine's, so a
 //! route under `/projects/{id}` that wrote one would edit a single daemon's configuration through a
 //! URL naming a project, and would do it identically whichever project was named. That reasoning
 //! stands. This module is the other half of it — the same fence, around the files whose owner is
@@ -30,7 +30,7 @@
 //!
 //! # The parsers had to be built before the table could exist
 //!
-//! Eight of these nine loaders are fail-soft on purpose: `load_email_config` and its neighbours
+//! Nine of these ten loaders are fail-soft on purpose: `load_email_config` and its neighbours
 //! answer a malformed file with defaults and a warning, so a typo in an optional pillar cannot stop
 //! the daemon from starting. That is right for startup and useless as a door — a validator that
 //! cannot say no admits anything. So each loader now delegates to a `parse_*_config` that returns
@@ -513,7 +513,7 @@ mod tests {
         }
     }
 
-    /// An empty file is valid for seven of the nine, and that property is what makes the page
+    /// An empty file is valid for eight of the ten, and that property is what makes the page
     /// usable: a settings surface has to be able to write a file that turns a pillar off.
     ///
     /// The two exceptions are named here rather than tolerated, because each is a real difference
