@@ -8,8 +8,8 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
-import { JudgePanel, JudgeReviewPanel } from "./AutopilotJudge";
-import { JUDGE_RESIDUAL_RISK, type JudgeStatus, type JudgeVerdict } from "../data/autopilot";
+import { JudgeOpinionLine, JudgeOpinionsBlock, JudgePanel, JudgeReviewPanel } from "./AutopilotJudge";
+import { JUDGE_RESIDUAL_RISK, type JudgeOpinion, type JudgeStatus, type JudgeVerdict } from "../data/autopilot";
 import { project, renderWithRouter } from "../test/harness";
 
 function status(overrides: Partial<JudgeStatus> = {}): JudgeStatus {
@@ -119,5 +119,55 @@ describe("the judge's review queue", () => {
         body: JSON.stringify({ verdict: "approve" }),
       }),
     );
+  });
+});
+
+const opinion: JudgeOpinion = {
+  id: 9,
+  run_id: 44,
+  shadow_decision_id: 301,
+  tool_name: "Bash",
+  judge: "observe",
+  model: "jev-latest",
+  p_in_scope: 0.97,
+  p_safe: 0.94,
+  p: 0.94,
+  band: "allow",
+  capped: true,
+  final_decision: "pending_approval",
+  enforced: false,
+  error: null,
+  created_at: "2026-09-27T10:00:00Z",
+};
+
+describe("what the judge said, beside a decision and on a run", () => {
+  it("names the probability and the band, and says when a guard held it back", async () => {
+    // Inside a <dl>, as the cards draw it: a bare <div><dt> is a DOM-nesting warning.
+    await renderWithRouter(
+      <dl>
+        <JudgeOpinionLine opinion={opinion} />
+      </dl>,
+      { initialPath: "/autopilot" },
+    );
+    expect(screen.getByText(/0\.94/)).toBeDefined();
+    expect(screen.getByText(/held back by a guard/)).toBeDefined();
+  });
+
+  it("says why there is no number when the call failed", async () => {
+    await renderWithRouter(
+      <dl>
+        <JudgeOpinionLine opinion={{ ...opinion, p: null, band: null, error: "deadline: no answer within 2s" }} />
+      </dl>,
+      { initialPath: "/autopilot" },
+    );
+    expect(screen.getByText(/no answer — deadline/)).toBeDefined();
+  });
+
+  it("lists a run's verdicts from the núcleo", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) =>
+      path === "/runs/44/judge-verdicts" ? [opinion] : undefined,
+    );
+    renderWithRouter(<JudgeOpinionsBlock runId={44} />, { initialPath: "/runs/44" });
+    expect(await screen.findByText(/0\.94/)).toBeDefined();
   });
 });

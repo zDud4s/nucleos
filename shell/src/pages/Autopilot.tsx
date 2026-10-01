@@ -24,6 +24,7 @@ import {
   useSetProjectMode,
   useSetScopedKill,
   useSetShadowVerdict,
+  useJudgeOpinionsForDecisions,
   useShadowDecisions,
   type ClassTally,
 } from "../data/autopilot";
@@ -86,7 +87,7 @@ import {
   promotionConsequence,
 } from "../lib/mode";
 import { OnboardPanel } from "../project/Onboard";
-import { JudgePanel, JudgeReviewPanel } from "./AutopilotJudge";
+import { JudgeOpinionLine, JudgePanel, JudgeReviewPanel } from "./AutopilotJudge";
 import "./autopilot.css";
 
 /** The three periods the núcleo writes, as the noun each one is: `daily` becomes `day`, not `dai`. */
@@ -1198,6 +1199,8 @@ function ShadowReviewPanel({
   const decisions = useShadowDecisions(projectId);
   const verdict = useSetShadowVerdict();
   const rows = decisions.data ?? [];
+  const opinions = useJudgeOpinionsForDecisions(rows.map((decision) => decision.id));
+  const opinionOf = (id: number) => opinions.data?.find((opinion) => opinion.shadow_decision_id === id);
 
   if (projectId !== null && decisions.data !== undefined && rows.length === 0) {
     return (
@@ -1247,6 +1250,9 @@ function ShadowReviewPanel({
                   <dt>the classifier</dt>
                   <dd>{readShadowDecision(decision.decision)}</dd>
                 </div>
+                {opinionOf(decision.id) !== undefined && (
+                  <JudgeOpinionLine opinion={opinionOf(decision.id)!} />
+                )}
                 <div className="ap-decision-fact">
                   <dt>run</dt>
                   <dd>

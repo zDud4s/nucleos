@@ -297,6 +297,56 @@ export function readJudgeBand(verdict: JudgeVerdict): string {
   return verdict.capped ? "would allow — held back by a guard" : "would allow";
 }
 
+/** What the judge said about one decision (`judge::JudgeOpinion`). `band` is null when the call failed. */
+export interface JudgeOpinion {
+  id: number;
+  run_id: number;
+  shadow_decision_id: number | null;
+  tool_name: string;
+  judge: string;
+  model: string;
+  p_in_scope: number | null;
+  p_safe: number | null;
+  p: number | null;
+  band: "allow" | "middle" | "deny" | null;
+  capped: boolean;
+  final_decision: string;
+  enforced: boolean;
+  error: string | null;
+  created_at: string;
+}
+
+export function useJudgeOpinionsForDecisions(ids: readonly number[]) {
+  return useQuery({
+    queryKey: keys.autopilot.judgeOpinions(ids),
+    queryFn: () => apiFetch<JudgeOpinion[]>(`/judge-verdicts/by-decision?ids=${ids.join(",")}`),
+    enabled: ids.length > 0,
+    refetchInterval: POLL.queue,
+  });
+}
+
+export function useRunJudgeOpinions(runId: number) {
+  return useQuery({
+    queryKey: keys.autopilot.runJudgeOpinions(runId),
+    queryFn: () => apiFetch<JudgeOpinion[]>(`/runs/${runId}/judge-verdicts`),
+    refetchInterval: POLL.queue,
+  });
+}
+
+/** One opinion in words: the number and the band, or why there is no number. */
+export function readJudgeOpinion(opinion: JudgeOpinion): string {
+  if (opinion.band === null) return `no answer — ${opinion.error ?? "not recorded"}`;
+  const band =
+    opinion.band === "deny"
+      ? "would refuse"
+      : opinion.band === "middle"
+        ? "left it to the classifier"
+        : opinion.capped
+          ? "would allow — held back by a guard"
+          : "would allow";
+  return `${formatProbability(opinion.p)} · ${band}${opinion.enforced ? " (applied)" : ""}`;
+}
+
 export function formatProbability(p: number | null): string {
   return p === null ? "—" : p.toFixed(2);
 }

@@ -6,11 +6,14 @@ import {
   READINESS_MIN_REVIEWED,
   formatProbability,
   readJudgeBand,
+  readJudgeOpinion,
+  useRunJudgeOpinions,
   useJudgeStatus,
   useJudgeVerdicts,
   useSetJudgeVerdict,
   useSetProjectJudge,
   type JudgeMode,
+  type JudgeOpinion,
   type JudgeVerdict,
 } from "../data/autopilot";
 import type { ProjectSummary } from "../data/system";
@@ -227,5 +230,36 @@ function VerdictCard({
         />
       </div>
     </Inset>
+  );
+}
+
+/** The judge's word on one decision, as one fact line. */
+export function JudgeOpinionLine({ opinion }: { opinion: JudgeOpinion }) {
+  return (
+    <div className="ap-decision-fact">
+      <dt>the judge</dt>
+      <dd>{readJudgeOpinion(opinion)}</dd>
+    </div>
+  );
+}
+
+/** A run's verdicts, oldest first — the run page's "what the judge said". Nothing when there are none. */
+export function JudgeOpinionsBlock({ runId }: { runId: number }) {
+  const opinions = useRunJudgeOpinions(runId);
+  const rows = opinions.data ?? [];
+  if (rows.length === 0) return null;
+  return (
+    <Panel title="What the judge said">
+      <dl className="ap-decision-facts">
+        {rows.map((opinion) => (
+          <div className="ap-decision-fact" key={opinion.id}>
+            <dt>
+              {opinion.tool_name} · <RelativeTime at={opinion.created_at} />
+            </dt>
+            <dd>{readJudgeOpinion(opinion)}</dd>
+          </div>
+        ))}
+      </dl>
+    </Panel>
   );
 }
