@@ -2226,21 +2226,22 @@ pub async fn report_item_gate(
     }
 }
 
-/// Reports a run the user cancelled against its decision, if it holds one. Same shape as
+/// Reports a run something stopped — the user's cancel, or the daemon's hook ending a run that kept
+/// probing denied actions — against its decision, if it holds one. Same shape as
 /// `report_item_gate`: one DB read and a spawn, and an unreadable row only warns.
 ///
-/// Always `error`, never `fail`: a cancel is a human changing their mind, not a verdict on the
-/// work — the run never got as far as being judged, exactly as with a deadline
-/// (`outcome_at_run_end`). Counting it as `fail` would teach the router that a model is bad at
-/// whatever people happen to stop.
-pub async fn report_cancelled(pool: &SqlitePool, router: Arc<Router>, run_id: i64) {
+/// Always `error`, never `fail`: a cancel is a human changing their mind and a hook stop is a
+/// policy verdict on the run's behaviour, neither a verdict on the work — the run never got as far
+/// as being judged, exactly as with a deadline (`outcome_at_run_end`). Counting it as `fail` would
+/// teach the router that a model is bad at whatever people happen to stop.
+pub async fn report_stopped(pool: &SqlitePool, router: Arc<Router>, run_id: i64) {
     let decision: Option<Option<String>> =
         sqlx::query_scalar("SELECT route_decision_id FROM runs WHERE id = ?")
             .bind(run_id)
             .fetch_optional(pool)
             .await
             .unwrap_or_else(|error| {
-                tracing::warn!(run_id, %error, "could not read a cancelled run's route decision");
+                tracing::warn!(run_id, %error, "could not read a stopped run's route decision");
                 None
             });
     if let Some(decision_id) = decision.flatten().filter(|id| !id.is_empty()) {
@@ -2501,9 +2502,9 @@ mod outcome_tests {
         let routed = seed(Some("rt_9")).await;
         let unrouted = seed(None).await;
 
-        report_cancelled(&pool, router_at(&url), unrouted).await;
-        report_cancelled(&pool, router_at(&url), routed + 99).await;
-        report_cancelled(&pool, router_at(&url), routed).await;
+        report_stopped(&pool, router_at(&url), unrouted).await;
+        report_stopped(&pool, router_at(&url), routed + 99).await;
+        report_stopped(&pool, router_at(&url), routed).await;
 
         let (id, body) = tokio::time::timeout(Duration::from_secs(2), received.recv())
             .await
