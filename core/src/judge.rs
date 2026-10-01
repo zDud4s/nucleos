@@ -72,7 +72,6 @@ pub enum Band {
 
 impl Band {
     #[allow(dead_code)] // consumed by Task 5.1
-    #[allow(dead_code)] // consumed by Task 5.1
     pub fn as_db_str(self) -> &'static str {
         match self {
             Self::Allow => "allow",
