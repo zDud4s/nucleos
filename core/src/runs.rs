@@ -3566,9 +3566,11 @@ async fn continue_paused_run(
     // paused row, and exactly one row or nothing. With `VALUES` the insert always happened and
     // every copied column needed its own guess for a vanished origin (`COALESCE(..., 1)` for the
     // taint); with `SELECT`, a vanished origin inserts nothing and the transaction rolls back,
-    // whatever the column. The continuation columns (`read_untrusted`, `permission_mode`,
-    // `judge`) are copied for the reason the handoff successor copies them: this is the same
-    // session, so its taint and its rules continue.
+    // whatever the column. The continuation columns (`CONTINUATION_COLUMNS`: the taint, the
+    // permission mode, both judge modes) are copied for the reason the handoff successor copies
+    // them: this is the same session, so its taint and its rules continue. `lineage_root_id` is not
+    // copied but computed, `COALESCE(lineage_root_id, id)`, so a root hands on its own id (spec B
+    // D6.1).
     let insert = match how {
         Continuation::Approve => RESUME_INSERT.as_str(),
         Continuation::Decline => DECLINE_INSERT.as_str(),
@@ -9467,6 +9469,35 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             .await
             .unwrap();
         assert_eq!(root, Some(43302));
+    }
+
+    /// The same, on the resume path: a paused run that is still its own root (`lineage_root_id`
+    /// NULL) hands its own id to the run the approval continues it with. A plain copy of the column
+    /// would make the resumed run a new root, and the one-correction-per-lineage guard (spec B D6)
+    /// would escape through an approval.
+    #[tokio::test]
+    async fn a_root_paused_run_hands_its_own_id_to_its_resume() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        let paused: (i64, Option<i64>) = sqlx::query_as(
+            "SELECT r.id, r.lineage_root_id FROM runs r JOIN proposals p ON p.run_id = r.id
+             WHERE p.id = ?",
+        )
+        .bind(proposal_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(paused.1, None, "the seed must be a root for this test to mean anything");
+
+        let resumed = resume_approved_run(&state, proposal_id).await.unwrap();
+        let root: Option<i64> = sqlx::query_scalar("SELECT lineage_root_id FROM runs WHERE id = ?")
+            .bind(resumed)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(root, Some(paused.0));
     }
 
     /// Spec B D6.2's fail-closed path, taken here because the resume becomes `INSERT ... SELECT`:
