@@ -5099,7 +5099,7 @@ mod run_env_tests {
 
 #[rustfmt::skip]
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     // These `current_thread` async tests hold `worktree::test_env_lock()` — a
     // process-wide MutexGuard — across their awaits to serialise mutation of the
     // shared `WORKTREE_ROOT` env override. Holding it across `.await` is the whole
@@ -5594,7 +5594,7 @@ mod tests {
         let _ = loop_task.await;
     }
 
-    async fn test_state_with_runner(
+    pub(crate) async fn test_state_with_runner(
         delay: Option<Duration>,
         run_timeout: Duration,
     ) -> (AppState, Arc<FakeCommandRunner>) {
@@ -6532,7 +6532,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     /// git cannot answer about a directory that is not there, so those approvals take the fallback
     /// and every assertion written before this feature still means what it meant. This helper is for
     /// the other side of that branch.
-    async fn seed_real_worktree_approval(
+    pub(crate) async fn seed_real_worktree_approval(
         state: &AppState,
         command: &str,
     ) -> (i64, String, tempfile::TempDir) {

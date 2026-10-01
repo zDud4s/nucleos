@@ -69,7 +69,6 @@ impl Event {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8.1
     pub fn from_db_str(value: &str) -> Option<Self> {
         match value {
             "hard_deny" => Some(Self::HardDeny),
@@ -98,7 +97,6 @@ impl Event {
     }
 
     /// D3: which outcomes each event may have. A correction is never an outcome of E1 or E3.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.1
     pub fn outcomes(self) -> &'static [Outcome] {
         match self {
             Self::HardDeny => &[Outcome::Deny, Outcome::Warn, Outcome::Stop],
@@ -122,7 +120,6 @@ pub enum Outcome {
     Explain,
     Owner,
     Correction,
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8.1
     Moot,
 }
 
@@ -140,7 +137,6 @@ impl Outcome {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8.1
     pub fn from_db_str(value: &str) -> Option<Self> {
         [
             Self::Deny,
@@ -159,7 +155,6 @@ impl Outcome {
     /// D4's caution order, on one scale for all three events: E1 stop > warn > deny, E3 stop >
     /// park > explain, E4 owner > correction. D11's bar reads it: a disagreement where the judge
     /// was LESS cautious than the person is the one it allows zero of.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 8b.1
     pub fn caution(self) -> u8 {
         match self {
             Self::Stop => 2,
