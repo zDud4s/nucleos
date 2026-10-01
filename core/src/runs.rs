@@ -1325,6 +1325,63 @@ async fn record_time_approx_cost(pool: &sqlx::SqlitePool, id: i64) {
     }
 }
 
+/// The columns a run that CONTINUES another carries over, as `(column, expression over the origin
+/// row)`. One list for every insertion that continues a run: the handoff, the approved resume,
+/// and spec B's correction and "decline the action", so a column added for one cannot be
+/// forgotten by another (spec B D6.2; spec A section 3 adds `judge`). Pairs rather than names
+/// because spec B's lineage is COMPUTED (`COALESCE(lineage_root_id, id)`), not copied.
+/// `every_continuation_carries_every_continuation_column` is what holds the insertions to it.
+pub(crate) const CONTINUATION_COLUMNS: &[(&str, &str)] = &[
+    ("read_untrusted", "read_untrusted"),
+    ("permission_mode", "permission_mode"),
+    ("judge", "judge"),
+];
+
+fn continuation_names() -> String {
+    CONTINUATION_COLUMNS
+        .iter()
+        .map(|(column, _)| *column)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn continuation_values() -> String {
+    CONTINUATION_COLUMNS
+        .iter()
+        .map(|(_, expression)| *expression)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Built once from `CONTINUATION_COLUMNS`. A `LazyLock` behind a `static` hands sqlx a
+/// `&'static str`, the only SQL text it trusts without `AssertSqlSafe`, and no caller input ever
+/// reaches it.
+static HANDOFF_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "INSERT INTO runs (
+             project_id, cwd, prompt, status, mode, session_id, created_at, job_id, stage,
+             item_id, steerable, {}
+         )
+         SELECT project_id, cwd, ?, 'running', mode, ?, ?, job_id, stage, item_id, steerable, {}
+         FROM runs WHERE id = ?",
+        continuation_names(),
+        continuation_values()
+    )
+});
+
+static RESUME_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "INSERT INTO runs (
+             project_id, cwd, prompt, status, mode, session_id, created_at, job_id, stage,
+             item_id, steerable, {}
+         )
+         SELECT ?, ?, ?, 'running', 'worktree', ?, ?, ?, ?, ?, ?, {}
+         FROM runs WHERE id = ?",
+        continuation_names(),
+        continuation_values()
+    )
+});
+
 async fn prepare_handoff_successor(
     pool: &sqlx::SqlitePool,
     run_id: i64,
@@ -1380,21 +1437,13 @@ async fn prepare_handoff_successor(
     // not would be a run that quietly went back to parking halfway through. Nothing sets the
     // column on this path today — the assistant writes it and the assistant does not hand off
     // — which is exactly why it is copied now, while the answer is still "nothing changes".
-    let inserted = sqlx::query(
-        "INSERT INTO runs (
-             project_id, cwd, prompt, status, mode, session_id, read_untrusted, created_at,
-             job_id, stage, item_id, steerable, permission_mode
-         )
-         SELECT project_id, cwd, ?, 'running', mode, ?, read_untrusted, ?, job_id, stage, item_id,
-                steerable, permission_mode
-         FROM runs WHERE id = ?",
-    )
-    .bind(&prompt)
-    .bind(&session_id)
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(run_id)
-    .execute(pool)
-    .await?;
+    let inserted = sqlx::query(HANDOFF_INSERT.as_str())
+        .bind(&prompt)
+        .bind(&session_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(run_id)
+        .execute(pool)
+        .await?;
     if inserted.rows_affected() != 1 {
         return Err(sqlx::Error::RowNotFound);
     }
@@ -2491,9 +2540,16 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
     // that existed before the field did. `0129` documents NULL on this column as "no CLI turn
     // wrote one", and that reading survives: a run that ASKS for a rung is a run somebody
     // deliberately gave one to, and the hook tells the two apart by `Option`, not by spelling.
+    // Spec A D2: the project's judge setting is photographed onto the run, so a run's rules do
+    // not change halfway through, the reason `permission_mode` is a snapshot. Only for the two
+    // modes the judge serves; every other run reads `off`, which is what it is.
     let inserted = sqlx::query(
-        "INSERT INTO runs (project_id, cwd, prompt, status, mode, session_id, steerable, permission_mode, created_at)
-         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)",
+        "INSERT INTO runs (project_id, cwd, prompt, status, mode, session_id, steerable, permission_mode, judge, created_at)
+         VALUES (?, ?, ?, 'running', ?, ?, ?, ?,
+                 CASE WHEN ? IN ('shadow', 'worktree')
+                      THEN COALESCE((SELECT judge FROM autopilot_state WHERE project_id = ?), 'off')
+                      ELSE 'off' END,
+                 ?)",
     )
     .bind(&project_id)
     .bind(&cwd)
@@ -2502,6 +2558,8 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
     .bind(&session_id)
     .bind(i64::from(steerable))
     .bind(permission_mode.map(crate::chats::PermissionMode::as_str))
+    .bind(mode)
+    .bind(&project_id)
     .bind(&now)
     .execute(&state.pool)
     .await;
@@ -3398,32 +3456,29 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // predecessor's own row — while the successor it writes carries no item, so approving that one
     // resolves to the job's tree instead. One approval looks correct; two do not.
     //
-    // `read_untrusted` and `permission_mode` are copied from the paused row for the reason the
-    // handoff successor copies them: this is the same session, so a stranger's words the paused run
-    // read are still in its context, and the hook's refusals on that flag must keep applying. Read
-    // inside this transaction, and a row that has vanished reads as tainted — the direction
-    // `read_untrusted_context` fails in.
-    let result = sqlx::query(
-        "INSERT INTO runs
-           (project_id, cwd, prompt, status, mode, session_id, created_at, job_id, stage, item_id,
-            steerable, read_untrusted, permission_mode)
-         VALUES (?, ?, ?, 'running', 'worktree', ?, ?, ?, ?, ?, ?,
-                 COALESCE((SELECT read_untrusted FROM runs WHERE id = ?), 1),
-                 (SELECT permission_mode FROM runs WHERE id = ?))",
-    )
-    .bind(&wt_project_id)
-    .bind(&wt_path)
-    .bind(&prompt)
-    .bind(&session_id)
-    .bind(&now)
-    .bind(job_id)
-    .bind(stage.as_deref())
-    .bind(item_id)
-    .bind(steerable)
-    .bind(original_run_id)
-    .bind(original_run_id)
-    .execute(&mut *tx)
-    .await?;
+    // Spec B D6.2, taken here because spec A adds a column to it: `INSERT ... SELECT` over the
+    // paused row, and exactly one row or nothing. With `VALUES` the insert always happened and
+    // every copied column needed its own guess for a vanished origin (`COALESCE(..., 1)` for the
+    // taint); with `SELECT`, a vanished origin inserts nothing and the transaction rolls back,
+    // whatever the column. The continuation columns (`read_untrusted`, `permission_mode`,
+    // `judge`) are copied for the reason the handoff successor copies them: this is the same
+    // session, so its taint and its rules continue.
+    let result = sqlx::query(RESUME_INSERT.as_str())
+        .bind(&wt_project_id)
+        .bind(&wt_path)
+        .bind(&prompt)
+        .bind(&session_id)
+        .bind(&now)
+        .bind(job_id)
+        .bind(stage.as_deref())
+        .bind(item_id)
+        .bind(steerable)
+        .bind(original_run_id)
+        .execute(&mut *tx)
+        .await?;
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound.into());
+    }
     let resume_id = result.last_insert_rowid();
     // The hand-over is a no-op for a job's tree, and must be: the job owns it, and moving ownership
     // to this one node would let the GC collect it the moment that node finished — with the rest of
@@ -8697,6 +8752,153 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             );
         }
     }
+
+    /// Spec A D2: a run launched for a project carries the project's judge setting as it stood at
+    /// launch; a run the judge never sees carries `off`.
+    #[tokio::test]
+    async fn a_run_photographs_its_projects_judge_at_launch() {
+        let (state, _runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, judge) VALUES ('p', 'shadow', 'observe')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let shadow_id = create_run_inner(&state, "plan".into(), Some("p".into()), None, "shadow", false)
+            .await
+            .unwrap();
+        let real_id = create_run_inner(&state, "chat".into(), Some("p".into()), None, "real", false)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE autopilot_state SET judge = 'off' WHERE project_id = 'p'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let judge_of = |id: i64| {
+            let pool = state.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT judge FROM runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(judge_of(shadow_id).await, "observe", "the snapshot outlives the setting");
+        assert_eq!(judge_of(real_id).await, "off", "a mode the judge never serves reads off");
+    }
+
+    /// Spec B D6.2, built here so B only has to add its columns: one list of continuation
+    /// columns, and every insertion that continues a run carries every one of them. A column added
+    /// to the list without a non-default value below fails this test on purpose.
+    #[tokio::test]
+    async fn every_continuation_carries_every_continuation_column() {
+        const NON_DEFAULTS: &[(&str, &str)] = &[
+            ("read_untrusted", "1"),
+            ("permission_mode", "'dont_ask'"),
+            ("judge", "'observe'"),
+        ];
+        for (column, _) in CONTINUATION_COLUMNS {
+            assert!(
+                NON_DEFAULTS.iter().any(|(name, _)| name == column),
+                "{column} needs a non-default value in this test"
+            );
+        }
+        let set_all = NON_DEFAULTS
+            .iter()
+            .map(|(column, value)| format!("{column} = {value}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // The handoff.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, mode, context_fill, created_at)
+             VALUES (43301, 'p', 'the task', 'running', 'worktree', ?, '2026-09-27T00:00:00Z')",
+        )
+        .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE runs SET {set_all} WHERE id = 43301")))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let successor = prepare_handoff_successor(&pool, 43301).await.unwrap().unwrap();
+        assert_continued(&pool, 43301, successor.id).await;
+
+        // The approved resume.
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        let paused: i64 =
+            sqlx::query_scalar("SELECT id FROM runs WHERE status = 'awaiting_approval'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE runs SET {set_all} WHERE id = {paused}")))
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+        assert_continued(&state.pool, paused, resume_id).await;
+    }
+
+    async fn assert_continued(pool: &sqlx::SqlitePool, origin: i64, continuation: i64) {
+        for (column, _) in CONTINUATION_COLUMNS {
+            let same: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT (SELECT {column} FROM runs WHERE id = ?1) IS (SELECT {column} FROM runs WHERE id = ?2)"
+            )))
+            .bind(origin)
+            .bind(continuation)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert!(same, "{column} did not travel from run {origin} to run {continuation}");
+        }
+    }
+
+    /// Spec B D6.2's fail-closed path, taken here because the resume becomes `INSERT ... SELECT`:
+    /// if the paused row is gone by the time the continuation is inserted, nothing is inserted and
+    /// the approval rolls back whole. The row is made to vanish INSIDE the resume's own
+    /// transaction, by a trigger on the supersede that runs just before the insert.
+    #[tokio::test]
+    async fn a_resume_whose_origin_vanished_inserts_nothing_and_rolls_back() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        sqlx::query(
+            "CREATE TRIGGER vanish AFTER UPDATE OF status ON runs
+             WHEN NEW.status = 'superseded'
+             BEGIN DELETE FROM runs WHERE id = NEW.id; END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs").fetch_one(&state.pool).await.unwrap();
+
+        // `rows_affected() != 1` answers `sqlx::Error::RowNotFound`, which `ResumeError` wraps as
+        // `Db` (`runs.rs:209-213`): this is the path, not some other failure on the way.
+        assert!(matches!(
+            resume_approved_run(&state, proposal_id).await,
+            Err(ResumeError::Db(sqlx::Error::RowNotFound))
+        ));
+
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs").fetch_one(&state.pool).await.unwrap();
+        assert_eq!(after, before, "the delete and the insert rolled back together");
+        let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending", "the approval did not land");
+    }
+
 
     #[tokio::test]
     async fn create_run_inner_persists_mode_and_threads_the_rung_per_run() {
