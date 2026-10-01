@@ -322,13 +322,13 @@ pub enum JudgeSpendScope<'a> {
     Job(i64),
 }
 
-/// Spec A D12: what the judge cost, summed on its own from `judge_verdicts.cost_usd` and never
+/// Spec A D12: what the judge cost, summed on its own from `judge_verdicts.cost_usd` and `judge_resolutions.cost_usd` (spec B D13) and never
 /// written into `runs.cost_usd` (that column is overwritten when a run terminates, and NULL there
 /// is the "approximate from the time" signal `compute_spend` reads). Every consultation counts,
 /// observation included: it costs money before the judge decides anything.
 ///
-/// `since`/`until` bound `judge_verdicts.created_at`; a verdict is instantaneous, so there is no
-/// overlap question like `overlaps_window`'s. Three spelled-out queries rather than one assembled,
+/// `since`/`until` bound each table's `created_at`; a verdict is instantaneous, so there is no
+/// overlap question like `overlaps_window`'s. Three spelled-out queries, each summing both tables, rather than one assembled,
 /// for the reason `spend_rows` gives.
 pub async fn judge_spend(
     pool: &SqlitePool,
@@ -341,8 +341,11 @@ pub async fn judge_spend(
     match scope {
         JudgeSpendScope::All => {
             sqlx::query_scalar(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM judge_verdicts
-                 WHERE (?1 IS NULL OR created_at >= ?1) AND (?2 IS NULL OR created_at < ?2)",
+                "SELECT
+                   (SELECT COALESCE(SUM(cost_usd), 0.0) FROM judge_verdicts
+                    WHERE (?1 IS NULL OR created_at >= ?1) AND (?2 IS NULL OR created_at < ?2))
+                 + (SELECT COALESCE(SUM(cost_usd), 0.0) FROM judge_resolutions
+                    WHERE (?1 IS NULL OR created_at >= ?1) AND (?2 IS NULL OR created_at < ?2))",
             )
             .bind(since)
             .bind(until)
@@ -351,11 +354,17 @@ pub async fn judge_spend(
         }
         JudgeSpendScope::Project(project_id) => {
             sqlx::query_scalar(
-                "SELECT COALESCE(SUM(judge_verdicts.cost_usd), 0.0) FROM judge_verdicts
-                 JOIN runs ON runs.id = judge_verdicts.run_id
-                 WHERE runs.project_id = ?3
-                   AND (?1 IS NULL OR judge_verdicts.created_at >= ?1)
-                   AND (?2 IS NULL OR judge_verdicts.created_at < ?2)",
+                "SELECT
+                   (SELECT COALESCE(SUM(judge_verdicts.cost_usd), 0.0) FROM judge_verdicts
+                    JOIN runs ON runs.id = judge_verdicts.run_id
+                    WHERE runs.project_id = ?3
+                      AND (?1 IS NULL OR judge_verdicts.created_at >= ?1)
+                      AND (?2 IS NULL OR judge_verdicts.created_at < ?2))
+                 + (SELECT COALESCE(SUM(judge_resolutions.cost_usd), 0.0) FROM judge_resolutions
+                    JOIN runs ON runs.id = judge_resolutions.run_id
+                    WHERE runs.project_id = ?3
+                      AND (?1 IS NULL OR judge_resolutions.created_at >= ?1)
+                      AND (?2 IS NULL OR judge_resolutions.created_at < ?2))",
             )
             .bind(since)
             .bind(until)
@@ -365,11 +374,17 @@ pub async fn judge_spend(
         }
         JudgeSpendScope::Job(job_id) => {
             sqlx::query_scalar(
-                "SELECT COALESCE(SUM(judge_verdicts.cost_usd), 0.0) FROM judge_verdicts
-                 JOIN runs ON runs.id = judge_verdicts.run_id
-                 WHERE runs.job_id = ?3
-                   AND (?1 IS NULL OR judge_verdicts.created_at >= ?1)
-                   AND (?2 IS NULL OR judge_verdicts.created_at < ?2)",
+                "SELECT
+                   (SELECT COALESCE(SUM(judge_verdicts.cost_usd), 0.0) FROM judge_verdicts
+                    JOIN runs ON runs.id = judge_verdicts.run_id
+                    WHERE runs.job_id = ?3
+                      AND (?1 IS NULL OR judge_verdicts.created_at >= ?1)
+                      AND (?2 IS NULL OR judge_verdicts.created_at < ?2))
+                 + (SELECT COALESCE(SUM(judge_resolutions.cost_usd), 0.0) FROM judge_resolutions
+                    JOIN runs ON runs.id = judge_resolutions.run_id
+                    WHERE runs.job_id = ?3
+                      AND (?1 IS NULL OR judge_resolutions.created_at >= ?1)
+                      AND (?2 IS NULL OR judge_resolutions.created_at < ?2))",
             )
             .bind(since)
             .bind(until)
@@ -1491,5 +1506,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run_cost, 1.0);
+    }
+
+    /// Spec B D13: the resolver's cost reaches the same four readers, apart from the run's own.
+    #[tokio::test]
+    async fn the_resolver_is_counted_with_the_judge() {
+        let pool = test_pool().await;
+        let now: DateTime<Utc> = "2026-09-27T12:00:00Z".parse().unwrap();
+        // `runs.job_id` references `jobs(id)` and the pool runs with foreign keys on.
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
+             VALUES (4, 'p', 'C:/work/repo', 'x', 'implementing', 5, 1, 1, '2026-09-27T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, job_id, prompt, status, mode, cost_usd, created_at, completed_at)
+             VALUES (8, 'p', 4, 'x', 'completed', 'worktree', 1.0, '2026-09-27T11:30:00+00:00', '2026-09-27T11:40:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO judge_resolutions (run_id, lineage_root_id, event, tool_input_digest,
+                                            default_outcome, final_outcome, cost_usd, created_at)
+             VALUES (8, 8, 'park', 'd', 'park', 'park', 0.5, '2026-09-27T11:35:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!((window_spend(&pool, now).await.unwrap() - 1.5).abs() < 1e-9);
+        assert!((hourly_spend(&pool, now).await.unwrap() - 1.5).abs() < 1e-9);
+        assert!((job_spend(&pool, 4, now).await.unwrap() - 1.5).abs() < 1e-9);
+        let since = now - chrono::Duration::days(1);
+        assert!((project_spend(&pool, "p", since, now).await.unwrap().usd - 1.5).abs() < 1e-9);
+        // Each scope on its own, so a JOIN that matched nothing cannot hide behind the run's 1.0.
+        for scope in [
+            JudgeSpendScope::All,
+            JudgeSpendScope::Project("p"),
+            JudgeSpendScope::Job(4),
+        ] {
+            assert!((judge_spend(&pool, None, None, scope).await.unwrap() - 0.5).abs() < 1e-9);
+        }
+        assert_eq!(
+            judge_spend(&pool, None, None, JudgeSpendScope::Job(99))
+                .await
+                .unwrap(),
+            0.0
+        );
     }
 }
