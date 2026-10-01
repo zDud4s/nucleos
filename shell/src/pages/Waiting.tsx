@@ -816,6 +816,9 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
    */
   const chosen = items.filter((proposal) => selected.has(proposal.id));
   const busy = batchApprove.isPending || batchReject.isPending;
+  // One decision at a time per queue: approve, decline and reject each continue or end the same
+  // run, and two in flight would leave the second to lose a race the daemon settles silently.
+  const deciding = approve.isPending || decline.isPending || reject.isPending;
 
   function toggle(id: number, on: boolean) {
     setSelected((current) => {
@@ -870,7 +873,11 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
       }
       notes={
         <DecisionNotes
-          outcome={approve.data}
+          // A decline continues the run too, so its outcome is the note the owner reads;
+          // whichever of the two was sent last is the one that answers.
+          outcome={
+            decline.submittedAt > approve.submittedAt ? decline.data : approve.data
+          }
           approveError={approve.isError ? approve.error : null}
           refuseError={
             reject.isError ? reject.error : decline.isError ? decline.error : null
@@ -978,7 +985,7 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
                   confirmLabel="Let this action happen"
                   subject={`#${proposal.id}`}
                   variant="approve"
-                  disabled={approve.isPending}
+                  disabled={deciding}
                   onArmedChange={onArmedChange}
                   onConfirm={() => approve.mutate(proposal.id)}
                 />
@@ -987,7 +994,7 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
                   confirmLabel="Refuse this action, keep the run going"
                   subject={`#${proposal.id}`}
                   variant="ghost"
-                  disabled={decline.isPending}
+                  disabled={deciding}
                   onArmedChange={onArmedChange}
                   onConfirm={() => decline.mutate(proposal.id)}
                 />
@@ -996,7 +1003,7 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
                   confirmLabel="Refuse and end the run"
                   subject={`#${proposal.id}`}
                   variant="ghost"
-                  disabled={reject.isPending}
+                  disabled={deciding}
                   onArmedChange={onArmedChange}
                   onConfirm={() => reject.mutate(proposal.id)}
                 />
