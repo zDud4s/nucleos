@@ -43,6 +43,7 @@ pub const JUDGE_QUESTIONS: &[Question] = &[
 ];
 
 mod client;
+pub(crate) mod resolve;
 mod review;
 #[cfg(test)]
 pub(crate) use client::ScriptedJudge;
