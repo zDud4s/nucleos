@@ -1211,8 +1211,9 @@ async fn pretooluse_decision_from(
                 dont_ask: permission == crate::chats::PermissionMode::DontAsk,
                 action_class: classification.action_class,
             };
-            // The lineage read (D2) is NOT here: `observe` does it inside its own task, off the
-            // response path (D10).
+            // The lineage read (D2) is NOT here. In observe, `observe` does it inside its own task,
+            // off the response path (D10); in enforce, `ask_unless_resolution` does it inside the
+            // question's deadline.
             if crate::judge::resolve::hard_deny_eligible(&eligibility) {
                 let run = RunSnapshot {
                     run_id,
@@ -1221,17 +1222,39 @@ async fn pretooluse_decision_from(
                     project_id: project_id.as_deref(),
                     cwd,
                 };
-                crate::judge::resolve::observe(
-                    &state.pool,
-                    &state.judge,
-                    resolve_asked(
-                        &state,
-                        crate::judge::resolve::Event::HardDeny,
-                        &run,
-                        &payload,
-                        &classification,
-                    ),
+                let asked = resolve_asked(
+                    &state,
+                    crate::judge::resolve::Event::HardDeny,
+                    &run,
+                    &payload,
+                    &classification,
                 );
+                match resolve_snapshot {
+                    crate::judge::JudgeMode::Off => {}
+                    crate::judge::JudgeMode::Observe => {
+                        crate::judge::resolve::observe(&state.pool, &state.judge, asked)
+                    }
+                    // Out of the hook's budget, as spec A's hook does: a ruling that arrives after
+                    // the caller gave up is never delivered. Observe only; the refusal stands.
+                    crate::judge::JudgeMode::Enforce if judge_wait(started).is_none() => {
+                        crate::judge::resolve::observe(&state.pool, &state.judge, asked)
+                    }
+                    // No `Enforce if !rules.were_read()` arm here, unlike the E3 point: spec A's
+                    // lock exists so the judge never approves over a refusal nobody can read. Here
+                    // the refusal is already given and stays, and stopping the run or telling the
+                    // owner never widens what the run may do.
+                    crate::judge::JudgeMode::Enforce => {
+                        resolve_hard_deny(
+                            &state,
+                            run_id,
+                            project_id.as_deref(),
+                            classification.action_class,
+                            &asked,
+                            judge_wait(started).unwrap_or(JUDGE_FLOOR),
+                        )
+                        .await
+                    }
+                }
             }
         }
     }
@@ -2800,6 +2823,86 @@ async fn count_denial_and_stop_a_prober(
     DenialCount::Stopped
 }
 
+/// Spec B D8: the judge stops a run by the road the denial limit already uses — the termination in
+/// a task of its own and awaited, for `count_denial_and_stop_a_prober`'s reason, and the caller
+/// then answers `deny`. The terminal write of `spawn_run` loses its CAS, so no E4 is born. A
+/// proven pattern; a new run status would have to be taught to the worktree GC and its test.
+async fn stop_by_judge(state: &AppState, run_id: i64, project_id: Option<&str>, phrase: String) {
+    let state = state.clone();
+    let project_id = project_id.map(str::to_owned);
+    let _ = tokio::spawn(async move {
+        if !finalize_termination(&state, run_id, "failed").await {
+            return;
+        }
+        let summary = format!("run {run_id} was stopped ({phrase})");
+        let subject = crate::feed::run_subject(&state.pool, run_id).await;
+        let _ = crate::feed::append(
+            &state.pool,
+            project_id.as_deref(),
+            "run_stopped_by_judge",
+            &summary,
+            Some(run_id),
+            Some(&subject),
+        )
+        .await;
+    })
+    .await;
+}
+
+/// Spec B E1 in enforce (D3, D7, D8, D9). Reached only on `DenialCount::Counted`, so the judge may
+/// stop a run BEFORE the denial limit and never after it. The answer to the hook is the
+/// classifier's `deny` whatever comes of this (D3: "a hard refusal keeps blocking the action"):
+/// the judge may only stop the run, tell the owner, or leave today's refusal — never an allow.
+///
+/// When the resolver stands aside (a resolution lineage, or a lineage read that failed or ran out
+/// of time) nothing is written and today's refusal stands: D3 gives E1 the `deny` as its default,
+/// and parking for a refusal nobody can approve would only end the run.
+async fn resolve_hard_deny(
+    state: &AppState,
+    run_id: i64,
+    project_id: Option<&str>,
+    action_class: &str,
+    asked: &crate::judge::resolve::Asked,
+    wait: Duration,
+) {
+    use crate::judge::resolve::{Event, Outcome};
+    let Some(row) =
+        crate::judge::resolve::ask_unless_resolution(&state.pool, &state.judge, asked, wait).await
+    else {
+        return;
+    };
+    // D3: E1's outcomes are deny, warn and stop, and nothing else, whatever the rule returned. No
+    // opinion (a failure, the deadline, a missing probability) is today's refusal (D1).
+    let applied = row
+        .judge_outcome
+        .filter(|outcome| Event::HardDeny.outcomes().contains(outcome))
+        .unwrap_or(Outcome::Deny);
+    let phrase = crate::judge::resolve::phrase(applied, row.p);
+    match applied {
+        Outcome::Stop => stop_by_judge(state, run_id, project_id, phrase).await,
+        // D3: "contacting the owner" at E1 is a line and never a pause; the run goes on.
+        Outcome::Warn => {
+            let summary = format!(
+                "run {run_id} was refused a {action_class} action its task seems to need ({phrase})"
+            );
+            let subject = crate::feed::run_subject(&state.pool, run_id).await;
+            let _ = crate::feed::append(
+                &state.pool,
+                project_id,
+                "judge_needs_owner",
+                &summary,
+                Some(run_id),
+                Some(&subject),
+            )
+            .await;
+        }
+        _ => {}
+    }
+    let enforced = applied != Outcome::Deny;
+    // D13: written off the response path.
+    crate::judge::resolve::record_later(&state.pool, row.settled(applied, enforced));
+}
+
 /// The whole `pending_approval` act: terminate the run, then record the proposal that makes the
 /// pause actionable. These two belong together — a run parked in `awaiting_approval` with no
 /// proposal can be neither approved nor rejected, and it goes on holding one of the project's
@@ -3902,6 +4005,151 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the resolver never wrote {n} row(s)");
+    }
+
+    async fn count_rows(pool: &sqlx::SqlitePool, sql: &'static str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    /// Spec B D3/D8: in enforce, an off-task hard refusal stops the run by the prober's road, and
+    /// is still a refusal; D7: the run's line carries the judge's phrase.
+    #[tokio::test]
+    async fn an_off_task_hard_refusal_stops_the_run_and_is_still_a_refusal() {
+        let state = judged_state(VerdictJudge::answering_keys(&[
+            ("off_task", 0.93),
+            ("needed", 0.1),
+        ]))
+        .await;
+        let run_id = resolving_run(&state, "enforce").await;
+        let app = test_router(state.clone());
+
+        let decision = decide(&app, &bash(run_id, "rm -rf /")).await;
+
+        assert_eq!(decision.decision, "deny", "never an allow (D3)");
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed");
+        let summary: String =
+            sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'run_stopped_by_judge'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(
+            summary.contains("judge: stopped — off_task p=0.93"),
+            "{summary}"
+        );
+        assert_eq!(
+            resolution_rows(&state.pool, 1).await[0],
+            (
+                "hard_deny".to_owned(),
+                Some("stop".to_owned()),
+                "stop".to_owned(),
+                1
+            )
+        );
+    }
+
+    /// Spec B D3: a task that needs the refused action tells the owner without stopping anything.
+    #[tokio::test]
+    async fn a_needed_hard_refusal_tells_the_owner_and_the_run_goes_on() {
+        let state = judged_state(VerdictJudge::answering_keys(&[
+            ("off_task", 0.1),
+            ("needed", 0.9),
+        ]))
+        .await;
+        let run_id = resolving_run(&state, "enforce").await;
+        let app = test_router(state.clone());
+
+        assert_eq!(
+            decide(&app, &bash(run_id, "rm -rf /")).await.decision,
+            "deny"
+        );
+
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        let kind: String = sqlx::query_scalar("SELECT kind FROM feed ORDER BY id DESC LIMIT 1")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(kind, "judge_needs_owner");
+        assert_eq!(
+            resolution_rows(&state.pool, 1).await[0],
+            (
+                "hard_deny".to_owned(),
+                Some("warn".to_owned()),
+                "warn".to_owned(),
+                1
+            )
+        );
+    }
+
+    /// Spec B D1: a failing judge or a slow one gives today's refusal and nothing more. A regression
+    /// guard: it held before `enforce` acted at E1, and holds that line now that it does.
+    #[tokio::test]
+    async fn a_failing_judge_at_a_hard_refusal_changes_nothing() {
+        for judge in [
+            VerdictJudge::failing(crate::judge::JudgeError::Http(500)),
+            VerdictJudge::slow(Duration::from_secs(5)),
+        ] {
+            let state = judged_state(judge).await;
+            let run_id = resolving_run(&state, "enforce").await;
+            let app = test_router(state.clone());
+
+            assert_eq!(
+                decide(&app, &bash(run_id, "rm -rf /")).await.decision,
+                "deny"
+            );
+
+            assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+            assert_eq!(
+                count_rows(&state.pool, "SELECT COUNT(*) FROM judge_corrections").await,
+                0,
+                "never a correction (D3)"
+            );
+            let (_, opinion, applied, enforced) = resolution_rows(&state.pool, 1).await.remove(0);
+            assert_eq!(
+                (opinion, applied.as_str(), enforced),
+                (None, "deny", 0),
+                "today's refusal, written down"
+            );
+        }
+    }
+
+    /// Spec B D2/S1 in enforce: a run in a lineage that resolves a git-queue conflict is never put
+    /// to the resolver at a hard refusal — today's refusal (D3's E1 default), the run goes on, and
+    /// no row.
+    #[tokio::test]
+    async fn a_hard_refusal_in_a_resolution_lineage_is_todays_refusal() {
+        let judge = VerdictJudge::answering_keys(&[("off_task", 0.99), ("needed", 0.99)]);
+        let state = judged_state(judge.clone()).await;
+        let run_id = resolving_run(&state, "enforce").await;
+        sqlx::query(
+            "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, created_at, resolution_run_id)
+             VALUES ('merge', '{}', 'p', 'C:/x', 'human', 'escalated', '2026-09-27T00:00:00Z', ?)",
+        )
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let app = test_router(state.clone());
+
+        assert_eq!(
+            decide(&app, &bash(run_id, "rm -rf /")).await.decision,
+            "deny"
+        );
+
+        assert!(
+            state.run_handles.lock().unwrap().contains_key(&run_id),
+            "never stopped by the judge"
+        );
+        assert!(judge.asked_keys().is_empty(), "never asked (D2/S1)");
+        settle().await;
+        assert_eq!(
+            count_rows(&state.pool, "SELECT COUNT(*) FROM judge_resolutions").await,
+            0
+        );
     }
 
     /// Spec B D11 at E1: a hard refusal in observe is asked about, written down, and still just a deny.

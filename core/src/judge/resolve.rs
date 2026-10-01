@@ -538,8 +538,20 @@ enum Failure {
 /// does, and returns the row, recorded by the CALLER, off the response path, once it knows the
 /// final outcome. Every failure leaves `judge_outcome` empty and the default in place (D1).
 pub(crate) async fn ask(pool: &SqlitePool, runtime: &JudgeRuntime, asked: &Asked) -> ResolutionRow {
+    ask_within(pool, runtime, asked, deadline_for(asked.event)).await
+}
+
+/// `ask` with the budget passed in, for a caller that has already spent part of the event's
+/// deadline on something the same decision needed (the lineage read, `ask_unless`). Never more
+/// than the event's own deadline.
+async fn ask_within(
+    pool: &SqlitePool,
+    runtime: &JudgeRuntime,
+    asked: &Asked,
+    deadline: Duration,
+) -> ResolutionRow {
     let mut row = ResolutionRow::new(asked);
-    let deadline = deadline_for(asked.event);
+    let deadline = deadline.min(deadline_for(asked.event));
     let started = Instant::now();
     // Set inside the budget as soon as the state exists, so a cut after it still knows the text
     // may have been sent and billed (spec A's `sent_chars`, for the same reason).
@@ -669,6 +681,63 @@ pub(crate) async fn is_resolution_lineage(pool: &SqlitePool, root: i64) -> bool 
     .fetch_one(pool)
     .await
     .unwrap_or(true)
+}
+
+/// Spec B D10, in enforce: whether the resolver may speak at all (D2/S1: never in a lineage that
+/// resolves a git-queue conflict) is part of the E1 and E3 decisions, so the lineage read sits
+/// inside the SAME budget as the question — the hook's deadline bounds the whole decision, not the
+/// call alone. `deadline` is what the hook can spare (`hooks::judge_wait`), never more than the
+/// event's own (`JUDGE_DEADLINE`). `None` means the resolver stood aside and the block stands as
+/// today (E1: the refusal; E3: the park): a resolution lineage, a read that failed
+/// (`is_resolution_lineage` reads an error as a resolution), or a read that did not come back in
+/// time. Never an allow.
+pub(crate) async fn ask_unless_resolution(
+    pool: &SqlitePool,
+    runtime: &JudgeRuntime,
+    asked: &Asked,
+    deadline: Duration,
+) -> Option<ResolutionRow> {
+    ask_unless(
+        pool,
+        runtime,
+        asked,
+        deadline,
+        is_resolution_lineage(pool, asked.lineage_root_id),
+    )
+    .await
+}
+
+/// `ask_unless_resolution` with the lineage read passed in, so a test can make it hang.
+///
+/// `None` carries no row: a resolution is never asked (D2/S1), exactly as `observe` leaves without
+/// writing one, and a read cut by the deadline sent nothing to the judge, so there is no cost to
+/// record (D13). The question gets what is LEFT of the budget, never a new one: two budgets in a
+/// row would outlast the hook.
+async fn ask_unless(
+    pool: &SqlitePool,
+    runtime: &JudgeRuntime,
+    asked: &Asked,
+    deadline: Duration,
+    lineage_read: impl std::future::Future<Output = bool>,
+) -> Option<ResolutionRow> {
+    let deadline = deadline.min(deadline_for(asked.event));
+    let started = Instant::now();
+    // A read cut by the deadline counts as a resolution: the cautious reading, as an error is.
+    if tokio::time::timeout(deadline, lineage_read)
+        .await
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    Some(
+        ask_within(
+            pool,
+            runtime,
+            asked,
+            deadline.saturating_sub(started.elapsed()),
+        )
+        .await,
+    )
 }
 
 #[cfg(test)]
@@ -1326,5 +1395,149 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(recorded_runs(&pool).await, vec![control]);
         assert_eq!(judge.calls(), 1);
+    }
+
+    /// D10 in enforce: the lineage read (D2/S1) is part of the E3 decision, so the ONE deadline
+    /// bounds it too. A read that hangs is cut there, the resolver stands aside (`None`: the park
+    /// stands), and no question is asked with a budget already spent.
+    #[tokio::test]
+    async fn a_lineage_read_that_hangs_parks_inside_the_deadline() {
+        let pool = pool().await;
+        let run_id = running_run(&pool).await;
+        let judge = ScriptedJudge::answering_keys(&[
+            ("off_task", 0.05),
+            ("needed", 0.1),
+            ("avoidable", 0.95),
+        ]);
+        let runtime = JudgeRuntime::with(judge.clone());
+        let hanging = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            false
+        };
+        let started = Instant::now();
+        let row = ask_unless(
+            &pool,
+            &runtime,
+            &asked(
+                run_id,
+                Event::Park,
+                "cargo test | tee t.log",
+                "unrecognized",
+            ),
+            crate::judge::JUDGE_DEADLINE,
+            hanging,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            row.is_none(),
+            "a lineage read cut by the deadline parks, never asks"
+        );
+        assert!(
+            elapsed < crate::judge::JUDGE_DEADLINE + Duration::from_millis(500),
+            "{elapsed:?}"
+        );
+        assert!(judge.asked_keys().is_empty());
+    }
+
+    /// D2/S1 and D1 in enforce: a lineage read that fails reads as a resolution — the park stands,
+    /// and the judge is never asked.
+    #[tokio::test]
+    async fn a_lineage_read_that_fails_parks() {
+        let pool = pool().await;
+        let run_id = running_run(&pool).await;
+        let judge = ScriptedJudge::answering_keys(&[
+            ("off_task", 0.05),
+            ("needed", 0.1),
+            ("avoidable", 0.95),
+        ]);
+        let runtime = JudgeRuntime::with(judge.clone());
+        sqlx::query("DROP TABLE vcs_requests")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let row = ask_unless_resolution(
+            &pool,
+            &runtime,
+            &asked(
+                run_id,
+                Event::Park,
+                "cargo test | tee t.log",
+                "unrecognized",
+            ),
+            crate::judge::JUDGE_DEADLINE,
+        )
+        .await;
+        assert!(
+            row.is_none(),
+            "an unreadable lineage is a resolution, and a resolution parks"
+        );
+        assert!(judge.asked_keys().is_empty());
+    }
+
+    /// D10: the read and the question share ONE budget, never one each. A read that spends most of
+    /// it leaves the question only the rest: the pair ends inside `JUDGE_DEADLINE`, with no
+    /// opinion — which the E3 point reads as a park.
+    #[tokio::test]
+    async fn the_lineage_read_and_the_question_share_one_deadline() {
+        let pool = pool().await;
+        let run_id = running_run(&pool).await;
+        let runtime = JudgeRuntime::with(ScriptedJudge::slow(crate::judge::JUDGE_DEADLINE));
+        let slow_but_clear = async {
+            tokio::time::sleep(crate::judge::JUDGE_DEADLINE / 2).await;
+            false
+        };
+        let started = Instant::now();
+        let row = ask_unless(
+            &pool,
+            &runtime,
+            &asked(
+                run_id,
+                Event::Park,
+                "cargo test | tee t.log",
+                "unrecognized",
+            ),
+            crate::judge::JUDGE_DEADLINE,
+            slow_but_clear,
+        )
+        .await
+        .expect("a lineage that is not a resolution is asked about");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < crate::judge::JUDGE_DEADLINE + Duration::from_millis(500),
+            "{elapsed:?}"
+        );
+        assert_eq!(row.judge_outcome, None);
+        assert!(
+            row.error.as_deref().unwrap().starts_with("deadline"),
+            "{:?}",
+            row.error
+        );
+    }
+
+    /// D10: a deadline larger than the event's own is cut to it — the hook can never hand the
+    /// resolver more than `JUDGE_DEADLINE`, whatever it computes.
+    #[tokio::test]
+    async fn a_larger_budget_is_cut_to_the_events_deadline() {
+        let pool = pool().await;
+        let run_id = running_run(&pool).await;
+        let runtime = JudgeRuntime::with(ScriptedJudge::slow(Duration::from_secs(30)));
+        let started = Instant::now();
+        let row = ask_unless(
+            &pool,
+            &runtime,
+            &asked(run_id, Event::HardDeny, "rm -rf x", "destructive"),
+            Duration::from_secs(20),
+            async { false },
+        )
+        .await
+        .expect("a lineage that is not a resolution is asked about");
+        assert!(
+            started.elapsed() < crate::judge::JUDGE_DEADLINE + Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(row.judge_outcome, None);
+        assert_eq!(row.final_outcome, Outcome::Deny);
     }
 }
