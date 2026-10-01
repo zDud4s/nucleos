@@ -799,7 +799,7 @@ async fn pretooluse_decision_from(
         .await
         {
             Ok(true) => {
-                count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
+                let _ = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
                 return Json(Decision {
                     decision: "deny".to_owned(),
                     reason: A_PERSON_DECLINED_THIS.to_owned(),
@@ -849,7 +849,7 @@ async fn pretooluse_decision_from(
                     request_id,
                     "pretooluse-decision: the action is already queued — refusing the retry"
                 );
-                count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
+                let _ = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
                 return Json(Decision {
                     decision: "deny".to_owned(),
                     reason: format!(
@@ -1115,8 +1115,9 @@ async fn pretooluse_decision_from(
                     // the classifier said, so the generic counter below never sees this refusal.
                     crate::judge::Ruling::Deny { reason, counts } => {
                         if counts {
-                            count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name)
-                                .await;
+                            let _ =
+                                count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name)
+                                    .await;
                         }
                         return Json(Decision {
                             decision: "deny".to_owned(),
@@ -1135,7 +1136,8 @@ async fn pretooluse_decision_from(
     // verdicts were also the wrong way round in cost: `pending_approval` stopped the run and
     // fetched a human, while `deny` — the harsher judgement — cost the run nothing at all.
     if classification.decision.decision == "deny" && is_in_flight {
-        count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
+        // Spec B D9: the hard refusal's outcome is read by the resolver (plan Chunk 4).
+        let _counted = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
     }
 
     // **An unrecognized tool is refused, not parked, and the two are not the same verdict.**
@@ -2587,13 +2589,30 @@ async fn get_run_names_a_council_run(state: &AppState, tool_input: &Value) -> bo
 /// and a retry, and far too little to search a grammar with.
 const DENIAL_LIMIT: i64 = 3;
 
+/// Spec B D9: what `count_denial_and_stop_a_prober` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenialCount {
+    /// Counted, and the run is still below `DENIAL_LIMIT` — the only case spec B's E1 may ask the
+    /// judge about: the judge may stop a run BEFORE the limit, never after it.
+    Counted(i64),
+    /// The allowance is spent. Returned whenever `denials >= DENIAL_LIMIT`, even when
+    /// `finalize_termination` lost its race to another terminator.
+    Stopped,
+    /// The count could not be written (the SQLITE_BUSY arm). The action is still refused.
+    NotCounted,
+}
+
 /// Records a denied attempt and, once a run has spent its allowance, stops it.
 ///
 /// Terminated to `failed` rather than `awaiting_approval`: a denied action is destructive by
 /// classification, and the pause path exists to make an action approvable. Offering a human an
 /// "approve" button here would launder precisely the verdict that is supposed to be final — the
 /// class-scoped grant deliberately only ever lifts a `pending_approval`.
-async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name: &str) {
+async fn count_denial_and_stop_a_prober(
+    state: &AppState,
+    run_id: i64,
+    tool_name: &str,
+) -> DenialCount {
     let denials: i64 = match sqlx::query_scalar(
         "UPDATE runs SET denials = denials + 1 WHERE id = ? RETURNING denials",
     )
@@ -2609,7 +2628,7 @@ async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name
         // indistinguishable from an attack.
         Err(error) => {
             tracing::warn!(run_id, %error, "could not count a denied action against the run");
-            return;
+            return DenialCount::NotCounted;
         }
     };
 
@@ -2620,7 +2639,7 @@ async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name
         "pretooluse-decision: denied action {denials}/{DENIAL_LIMIT} for this run"
     );
     if denials < DENIAL_LIMIT {
-        return;
+        return DenialCount::Counted(denials);
     }
 
     // Spawned and then awaited, for the same reason `pause_for_approval` is: terminating the run
@@ -2643,6 +2662,7 @@ async fn count_denial_and_stop_a_prober(state: &AppState, run_id: i64, tool_name
         .await;
     })
     .await;
+    DenialCount::Stopped
 }
 
 /// The whole `pending_approval` act: terminate the run, then record the proposal that makes the
@@ -3443,6 +3463,37 @@ mod tests {
     /// the row's id, making that run look in-flight to `pretooluse_decision` the same way a real
     /// governed run does. `project_id`, `cwd`, and `session_id` are `None` for tests that don't
     /// care about them; `created_at` is a fixed placeholder since no test ever asserts on it.
+    /// Spec B D9: the counter says what it did. Below the limit it counted, and says how many; at
+    /// or above it the run is stopped — `Stopped` even when another terminator won the race, so
+    /// nothing downstream mistakes a spent allowance for one with room; a count it could not write
+    /// is `NotCounted`.
+    #[tokio::test]
+    async fn the_denial_counter_says_what_it_did() {
+        let state = test_state().await;
+        let run_id =
+            in_flight_run(&state, "worktree", Some("p"), Some(r"C:\work\repo"), None).await;
+
+        assert_eq!(
+            count_denial_and_stop_a_prober(&state, run_id, "Bash").await,
+            DenialCount::Counted(1)
+        );
+        assert_eq!(
+            count_denial_and_stop_a_prober(&state, run_id, "Bash").await,
+            DenialCount::Counted(2)
+        );
+        crate::runs::finalize_termination(&state, run_id, "cancelled").await;
+        assert_eq!(
+            count_denial_and_stop_a_prober(&state, run_id, "Bash").await,
+            DenialCount::Stopped,
+            "the terminator lost the race, and the allowance is still spent"
+        );
+        assert_eq!(
+            count_denial_and_stop_a_prober(&state, 999_999, "Bash").await,
+            DenialCount::NotCounted,
+            "no row, no count — the SQLITE_BUSY arm's shape"
+        );
+    }
+
     async fn in_flight_run(
         state: &AppState,
         mode: &str,
