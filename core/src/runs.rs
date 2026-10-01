@@ -4202,6 +4202,16 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
                     .unwrap_or_default();
                 record_the_cut_stream(&state.pool, id, &seen).await;
             }
+            // A routed run the user cancelled tells the router `error` (`route_advice::
+            // report_cancelled` argues why not `fail`). Only after this write won: the aborted
+            // body's own run-end report needs the same CAS, so exactly one of the two speaks. Only
+            // a cancel — a pause resumes, and the run's later end reports for it.
+            if won
+                && status == "cancelled"
+                && let Some(router) = state.runner.router()
+            {
+                crate::route_advice::report_cancelled(&state.pool, router, id).await;
+            }
             // The run is over; anything it queued and never started goes with it (spec §7). After
             // the status write, because this is a consequence of the run ending — and best-effort,
             // because the run IS terminated either way and a queue row that outlives its run is a
@@ -10452,6 +10462,82 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 .unwrap();
         assert_eq!(status, "completed");
         assert_eq!(exit_code, Some(0));
+    }
+
+    /// Inserts a `running` row carrying `decision` as its route decision.
+    async fn seed_routed_running(pool: &sqlx::SqlitePool, decision: Option<&str>) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at, route_decision_id)
+             VALUES ('x', 'running', 'real', ?, ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(decision)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// A routed run the user cancels tells the router `error`, once: the cancel's own status write
+    /// is the one that won, so the body's run-end report — which needs to win the same CAS — never
+    /// fires for it.
+    #[tokio::test]
+    async fn a_cancelled_routed_run_reports_error_once() {
+        let mut state = test_state().await;
+        let (url, mut received) = crate::router_client::test_support::outcome_router(200).await;
+        front_with_shadow_router(&mut state, &url);
+        let id = seed_routed_running(&state.pool, Some("rt_cancel")).await;
+        spawn_registered(&state, id, std::future::pending::<()>());
+
+        assert!(finalize_termination(&state, id, "cancelled").await);
+
+        let (decision, body) = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .expect("reported within 2s")
+            .unwrap();
+        assert_eq!(decision, "rt_cancel");
+        assert_eq!(body, serde_json::json!({"status": "error"}));
+        // A second cancel finds no handle, and nothing else may speak for this run.
+        assert!(!finalize_termination(&state, id, "cancelled").await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), received.recv())
+                .await
+                .is_err(),
+            "a cancelled run is reported exactly once"
+        );
+    }
+
+    /// No report when the cancel did not win the status write (the run finished on its own and
+    /// reports through its own end), when the run holds no decision, or when the terminator is a
+    /// pause rather than a cancel.
+    #[tokio::test]
+    async fn a_cancel_reports_only_a_decision_it_ended() {
+        let mut state = test_state().await;
+        let (url, mut received) = crate::router_client::test_support::outcome_router(200).await;
+        front_with_shadow_router(&mut state, &url);
+
+        let finished = seed_routed_running(&state.pool, Some("rt_finished")).await;
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(finished)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        spawn_registered(&state, finished, std::future::pending::<()>());
+        assert!(finalize_termination(&state, finished, "cancelled").await);
+
+        let unrouted = seed_routed_running(&state.pool, None).await;
+        spawn_registered(&state, unrouted, std::future::pending::<()>());
+        assert!(finalize_termination(&state, unrouted, "cancelled").await);
+
+        let paused = seed_routed_running(&state.pool, Some("rt_paused")).await;
+        spawn_registered(&state, paused, std::future::pending::<()>());
+        assert!(finalize_termination(&state, paused, "awaiting_approval").await);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), received.recv())
+                .await
+                .is_err()
+        );
     }
 
     /// A run pausing for approval is not a run that ended, and the queue must not treat it as one.
