@@ -174,8 +174,11 @@ impl JevJudge {
     fn client(&self) -> Result<&reqwest::Client, JudgeError> {
         self.client
             .get_or_init(|| {
+                // Spec A D1: the state goes to the Jev and nowhere else. A redirect would re-POST it
+                // to whatever host the response names, so none is followed.
                 reqwest::Client::builder()
                     .timeout(self.timeout)
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .map_err(|error| error.to_string())
             })
