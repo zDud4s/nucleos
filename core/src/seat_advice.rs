@@ -458,6 +458,7 @@ mod tests {
             permission: crate::runner::Permission::Default,
             resume_session_id: None,
             mcp_config: None,
+            mcp_job: None,
             tool_policy: crate::runner::ToolPolicy::McpOnly,
             progress_timeout: None,
             max_turns: None,

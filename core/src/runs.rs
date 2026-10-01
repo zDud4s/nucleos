@@ -548,6 +548,39 @@ pub(crate) fn run_env(
     env
 }
 
+pub(crate) struct JobNodeMcp {
+    path: std::path::PathBuf,
+    job_id: i64,
+}
+
+impl JobNodeMcp {
+    /// None when the run belongs to no job, or the file could not be written (warn; the run then
+    /// launches with no MCP server, as a team run does).
+    pub(crate) fn for_run(run_id: i64, job_id: Option<i64>) -> Option<Self> {
+        let job_id = job_id?;
+        let path =
+            std::env::temp_dir().join(format!("nucleos-job-{}-{run_id}.json", std::process::id()));
+        let written = (|| -> std::io::Result<()> {
+            let exe = std::env::current_exe()?;
+            let config =
+                crate::assistant::build_job_node_mcp_config(&exe.to_string_lossy(), job_id);
+            let bytes = serde_json::to_vec(&config).map_err(std::io::Error::other)?;
+            crate::storage::write_atomic(&path, &bytes)
+        })();
+        if let Err(error) = written {
+            tracing::warn!(run_id, job_id, %error, "could not write job-node MCP config");
+            return None;
+        }
+        Some(Self { path, job_id })
+    }
+}
+
+impl Drop for JobNodeMcp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Mints a run's own daemon key and stores its secret, returning what goes in the environment.
 ///
 /// Called before the CLI is spawned, never after: the hook fires on the run's first tool call, and
@@ -1690,6 +1723,7 @@ async fn spawn_handoff_if_needed(
         // Never routed again: the model and effort above are already the predecessor's resolved
         // choice, and a second opinion halfway through one task would be a different run.
         None,
+        JobNodeMcp::for_run(successor.id, successor.job_id),
     );
 }
 
@@ -1731,6 +1765,7 @@ fn spawn_run(
     // What the llm-router is told about this run, or `None` for a run that is never routed (a
     // triage run, whose mail must not leave the machine, and a handoff successor).
     route: Option<crate::route_advice::RouteQuery>,
+    job_mcp: Option<JobNodeMcp>,
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
@@ -1817,11 +1852,8 @@ fn spawn_run(
                 cwd: spawn_cwd.clone(),
                 permission,
                 resume_session_id: resume_session_id.clone(),
-                mcp_config: None,
-                // No server, so no surface for one to announce. Written out beside its pair rather
-                // than left to a default, because the two fields are only ever true together: a box
-                // named here would describe tools this run is never offered, and `authored_prompt`
-                // would charge it for them.
+                mcp_config: job_mcp.as_ref().map(|mcp| mcp.path.clone()),
+                mcp_job: job_mcp.as_ref().map(|mcp| mcp.job_id),
                 tool_policy,
                 progress_timeout: Some(progress_timeout),
                 // The brake that was missing. These are the runs nobody is watching, and the
@@ -1848,9 +1880,9 @@ fn spawn_run(
                 denied_tools: Vec::new(),
                 session_name: None,
                 context_window: None,
-                // Nothing to narrow: `create_run_inner` never sets `mcp_config`, so the branch
-                // that reads this does not run for a run started here.
-                allowed_mcp_tools: None,
+                // A job node sees exactly the tool its boxed server serves; every other run still
+                // has no server and therefore nothing to narrow.
+                allowed_mcp_tools: job_mcp.as_ref().map(|_| crate::mcp_tools::JOB_NODE_TOOLS),
             };
             // Driven by the request's own flag, and beside the spawn that decides it: which run may
             // be spoken to is settled where its argument vector is chosen, not by whatever later
@@ -3174,6 +3206,12 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
             .model_for_stage(node.as_ref().map(|node| node.stage)),
         None,
         route,
+        JobNodeMcp::for_run(
+            id,
+            node.as_ref()
+                .map(|node| node.job_id)
+                .or(item.as_ref().map(|item| item.job_id)),
+        ),
     );
 
     Ok(id)
@@ -3988,6 +4026,7 @@ async fn continue_paused_run(
             item: None,
             resume: true,
         }),
+        JobNodeMcp::for_run(resume_id, job_id),
     );
 
     Ok(resume_id)
@@ -5662,6 +5701,22 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         test_state_with(None, crate::state::DEFAULT_RUN_TIMEOUT).await
     }
 
+    async fn wait_for_job_mcp(
+        runner: &FakeCommandRunner,
+    ) -> (
+        Option<PathBuf>,
+        Option<i64>,
+        Option<&'static [&'static str]>,
+    ) {
+        for _ in 0..200 {
+            if let Some(seen) = runner.last_job_mcp.lock().unwrap().clone() {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the runner never received an MCP launch shape");
+    }
+
     async fn advance_run_ids_past(pool: &sqlx::SqlitePool, id: i64) {
         sqlx::query(
             "INSERT INTO runs (id, prompt, status, mode, created_at)
@@ -5763,6 +5818,228 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             own_row.is_none(),
             "a job node must not provision or record a worktree of its own"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_node_run_is_launched_with_the_job_node_box() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-mcp-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-mcp-jobnode-");
+        let (state, runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let project_root = repo.to_string_lossy().into_owned();
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: &project_root,
+                rule_name: Some("nightly"),
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner).await.unwrap();
+        crate::worktree::record(
+            &state.pool,
+            owner,
+            "proj",
+            &project_root,
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .unwrap();
+
+        create_job_node_run(
+            &state,
+            "plan the work".into(),
+            "proj".into(),
+            project_root,
+            JobNode {
+                job_id,
+                stage: "plan",
+                worktree_path: info.path.to_string_lossy().into_owned(),
+                branch: info.branch,
+                item_ordinal: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (path, launched_job, tools) = wait_for_job_mcp(&runner).await;
+        assert_eq!(launched_job, Some(job_id));
+        assert_eq!(tools, Some(crate::mcp_tools::JOB_NODE_TOOLS));
+        let path = path.expect("a job node receives a per-run MCP config");
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            config["mcpServers"]["nucleos"]["args"],
+            serde_json::json!(["--mcp-tools", "--box", "job-node", "--job", job_id.to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_standalone_and_a_shadow_run_carry_no_mcp_server() {
+        let (state, runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+
+        create_run_inner(&state, "standalone".into(), None, None, "real", false)
+            .await
+            .unwrap();
+        assert_eq!(wait_for_job_mcp(&runner).await, (None, None, None));
+
+        *runner.last_job_mcp.lock().unwrap() = None;
+        create_run_inner(&state, "shadow".into(), None, None, "shadow", false)
+            .await
+            .unwrap();
+        assert_eq!(wait_for_job_mcp(&runner).await, (None, None, None));
+    }
+
+    #[test]
+    fn the_job_node_config_file_is_removed_when_the_run_ends() {
+        let run_id = 8_200_003;
+        let path = std::env::temp_dir().join(format!(
+            "nucleos-job-{}-{run_id}.json",
+            std::process::id()
+        ));
+        let guard = JobNodeMcp::for_run(run_id, Some(3)).expect("the config is written");
+        assert_eq!(guard.path, path);
+        assert!(path.is_file());
+        drop(guard);
+        assert!(!path.exists());
+
+        assert!(JobNodeMcp::for_run(run_id + 1, None).is_none());
+        let absent = std::env::temp_dir().join(format!(
+            "nucleos-job-{}-{}.json",
+            std::process::id(),
+            run_id + 1
+        ));
+        assert!(!absent.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_handoff_successor_and_an_approval_resume_of_a_job_node_keep_the_box() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-relaunch-mcp-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-relaunch-mcp-");
+        let (state, runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let project_root = repo.to_string_lossy().into_owned();
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: &project_root,
+                rule_name: Some("nightly"),
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner).await.unwrap();
+        crate::worktree::record(
+            &state.pool,
+            owner,
+            "proj",
+            &project_root,
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let predecessor = sqlx::query(
+            "INSERT INTO runs
+               (project_id, cwd, prompt, status, session_id, mode, context_fill, stdout,
+                created_at, job_id, stage)
+             VALUES ('proj', ?, 'continue the job', 'completed', 'old-session', 'worktree', ?,
+                     ?, ?, ?, 'implement')",
+        )
+        .bind(info.path.to_string_lossy().as_ref())
+        .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+        .bind(r#"{"type":"result","subtype":"success","result":"half done"}"#)
+        .bind(&now)
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        spawn_handoff_if_needed(
+            state.clone(),
+            state.runner.clone(),
+            predecessor,
+            Some("proj".into()),
+            Some(info.path.clone()),
+            crate::runner::Permission::Default,
+            None,
+            GateConfig::NotConfigured,
+            1,
+            crate::runner::ToolPolicy::Unrestricted,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            false,
+            None,
+            None,
+        )
+        .await;
+        let (_, handoff_job, handoff_tools) = wait_for_job_mcp(&runner).await;
+        assert_eq!(handoff_job, Some(job_id));
+        assert_eq!(handoff_tools, Some(crate::mcp_tools::JOB_NODE_TOOLS));
+
+        *runner.last_job_mcp.lock().unwrap() = None;
+        let paused = sqlx::query(
+            "INSERT INTO runs
+               (project_id, cwd, prompt, status, session_id, mode, created_at, job_id, stage)
+             VALUES ('proj', ?, 'finish the job', 'awaiting_approval', 'paused-session',
+                     'worktree', ?, ?, 'implement')",
+        )
+        .bind(info.path.to_string_lossy().as_ref())
+        .bind(&now)
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let proposal = proposals::create_action_approval(
+            &state.pool,
+            paused,
+            Some("paused-session"),
+            Some("proj"),
+            "Bash",
+            "needs approval",
+            Some(r#"{"command":"cargo build"}"#),
+        )
+        .await
+        .unwrap();
+
+        resume_approved_run(&state, proposal).await.unwrap();
+        let (_, resumed_job, resumed_tools) = wait_for_job_mcp(&runner).await;
+        assert_eq!(resumed_job, Some(job_id));
+        assert_eq!(resumed_tools, Some(crate::mcp_tools::JOB_NODE_TOOLS));
     }
 
     async fn create_worktree_run(
@@ -12636,6 +12913,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             permission: crate::runner::Permission::Default,
             resume_session_id: None,
             mcp_config: None,
+            mcp_job: None,
             tool_policy: crate::runner::ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,

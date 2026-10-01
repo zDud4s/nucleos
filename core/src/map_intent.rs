@@ -456,6 +456,7 @@ pub(crate) async fn ask_once(
         permission: crate::runner::Permission::Default,
         resume_session_id: None,
         mcp_config: None,
+        mcp_job: None,
         // The box that server would announce, and there is no server. Beside its pair for the
         // same reason `allowed_mcp_tools` below carries the sentence it does: this is only ever
         // read next to an `mcp_config`.
