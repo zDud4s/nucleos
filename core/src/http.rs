@@ -68,6 +68,10 @@ pub fn build_router(state: AppState) -> Router {
             get(get_autopilot_judge).post(post_autopilot_judge),
         )
         .route(
+            "/autopilot/judge-resolve",
+            get(get_autopilot_judge_resolve).post(post_autopilot_judge_resolve),
+        )
+        .route(
             "/autopilot/kill",
             get(get_autopilot_kill).post(post_autopilot_kill),
         )
@@ -3187,6 +3191,57 @@ async fn post_autopilot_judge(
         }
         Err(autopilot::JudgeActivationError::Database(error)) => {
             tracing::warn!(%error, "setting a project's judge failed");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct JudgeResolveRequest {
+    project_id: String,
+    judge_resolve: String,
+}
+
+#[derive(Serialize)]
+struct JudgeResolveResponse {
+    project_id: String,
+    judge_resolve: crate::judge::JudgeMode,
+}
+
+/// Spec B D11: one project's resolver setting. Admin-only like `/autopilot/judge`, by appearing
+/// in no table in `auth.rs`.
+async fn get_autopilot_judge_resolve(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<JudgeResolveResponse>, StatusCode> {
+    let judge_resolve = autopilot::autopilot_judge_resolve_mode(&state.pool, &query.project_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(JudgeResolveResponse {
+        project_id: query.project_id,
+        judge_resolve,
+    }))
+}
+
+async fn post_autopilot_judge_resolve(
+    State(state): State<AppState>,
+    Json(body): Json<JudgeResolveRequest>,
+) -> Result<Json<JudgeResolveResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let mode = crate::judge::JudgeMode::from_db_str(&body.judge_resolve)
+        .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "invalid"))?;
+    match autopilot::set_project_judge_resolve(&state.pool, &body.project_id, mode).await {
+        Ok(judge_resolve) => Ok(Json(JudgeResolveResponse {
+            project_id: body.project_id,
+            judge_resolve,
+        })),
+        Err(autopilot::ResolveActivationError::UnknownProject) => {
+            Err(refusal(StatusCode::NOT_FOUND, "unknown_project"))
+        }
+        Err(autopilot::ResolveActivationError::EnforceUnavailable) => {
+            Err(refusal(StatusCode::CONFLICT, "enforce_unavailable"))
+        }
+        Err(autopilot::ResolveActivationError::Database(error)) => {
+            tracing::error!(%error, project_id = %body.project_id, "setting judge_resolve failed");
             Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
         }
     }
@@ -21863,6 +21918,48 @@ mod tests {
         assert_eq!(
             (status, body["refusal"].as_str()),
             (StatusCode::CONFLICT, Some("not_ready"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_projects_resolver_is_read_and_set_over_http() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/judge-resolve",
+            Some(serde_json::json!({"project_id": "p", "judge_resolve": "observe"})),
+        )
+        .await;
+        assert_eq!(
+            (status, body["judge_resolve"].as_str()),
+            (StatusCode::OK, Some("observe"))
+        );
+        let (status, body) = workflow_call(
+            state.clone(),
+            "GET",
+            "/autopilot/judge-resolve?project_id=p",
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, body["judge_resolve"].as_str()),
+            (StatusCode::OK, Some("observe"))
+        );
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/autopilot/judge-resolve",
+            Some(serde_json::json!({"project_id": "p", "judge_resolve": "enforce"})),
+        )
+        .await;
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::CONFLICT, Some("enforce_unavailable"))
         );
     }
 

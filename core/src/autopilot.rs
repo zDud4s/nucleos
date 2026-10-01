@@ -290,6 +290,57 @@ pub async fn set_project_judge(
     Ok(judge)
 }
 
+#[derive(Debug)]
+pub enum ResolveActivationError {
+    UnknownProject,
+    /// Until the resolver's own warning is on screen, `enforce` cannot be set.
+    EnforceUnavailable,
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for ResolveActivationError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+pub async fn autopilot_judge_resolve_mode(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<JudgeMode> {
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT judge_resolve FROM autopilot_state WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await?;
+    stored.map_or(Ok(JudgeMode::Off), |value| {
+        JudgeMode::from_db_str(&value).ok_or_else(|| {
+            sqlx::Error::Protocol(format!("invalid judge_resolve in database: {value}"))
+        })
+    })
+}
+
+/// Spec B D11: the resolver's setting, photographed onto the project's next worktree runs (and
+/// read live by the E4). An opt-in because it sends TypeSafe what spec A never sends.
+pub async fn set_project_judge_resolve(
+    pool: &SqlitePool,
+    project_id: &str,
+    mode: JudgeMode,
+) -> Result<JudgeMode, ResolveActivationError> {
+    if mode == JudgeMode::Enforce {
+        return Err(ResolveActivationError::EnforceUnavailable);
+    }
+    let updated = sqlx::query("UPDATE autopilot_state SET judge_resolve = ? WHERE project_id = ?")
+        .bind(mode.as_db_str())
+        .bind(project_id)
+        .execute(pool)
+        .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ResolveActivationError::UnknownProject);
+    }
+    Ok(mode)
+}
+
 /// Review item E(ii): a project in `enforce` whose readiness no longer clears D11's bar drops to
 /// `observe`, with a feed line saying so. Answers whether it dropped. Guarded on `enforce` in the
 /// write, so a concurrent change of the setting keeps the last word; it only ever lowers `enforce`
@@ -812,6 +863,42 @@ mod tests {
     }
     use std::fs;
     use tempfile::TempDir;
+
+    /// Spec B D11: observing is an opt-in per project, independent of spec A's; enforcing is
+    /// refused until the resolver's warning is on screen.
+    #[tokio::test]
+    async fn a_project_opts_into_the_resolver_observing() {
+        use crate::judge::JudgeMode;
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            autopilot_judge_resolve_mode(&pool, "p").await.unwrap(),
+            JudgeMode::Off
+        );
+        set_project_judge_resolve(&pool, "p", JudgeMode::Observe)
+            .await
+            .unwrap();
+        assert_eq!(
+            autopilot_judge_resolve_mode(&pool, "p").await.unwrap(),
+            JudgeMode::Observe
+        );
+        assert_eq!(
+            autopilot_judge_mode(&pool, "p").await.unwrap(),
+            JudgeMode::Off,
+            "independent of spec A's judge"
+        );
+        assert!(matches!(
+            set_project_judge_resolve(&pool, "p", JudgeMode::Enforce).await,
+            Err(ResolveActivationError::EnforceUnavailable)
+        ));
+        assert!(matches!(
+            set_project_judge_resolve(&pool, "nobody", JudgeMode::Observe).await,
+            Err(ResolveActivationError::UnknownProject)
+        ));
+    }
 
     /// Spec A D11: observing is an opt-in per project; enforcing waits for the bar (plan Chunk 7)
     /// and, at the route, for the shell's residual-risk warning (plan Chunk 9).
