@@ -193,6 +193,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     run_failed_final: { tone: "danger", label: "run failed for good" },
     run_interrupted: { tone: "paused", label: "run interrupted" },
     run_stopped_probing: { tone: "danger", label: "run stopped after repeated refusals" },
+    // The resolver stopped a run (spec .ai/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md, E1): same reading as a run stopped after refusals.
+    run_stopped_by_judge: { tone: "danger", label: "run stopped by the judge" },
     resume_did_not_act: { tone: "info", label: "approved action never attempted" },
     shadow_run_completed: { tone: "shadow", label: "shadow run completed" },
     worktree_run_completed: { tone: "info", label: "worktree run completed" },
@@ -202,6 +204,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     // decides whether to spend the rest of the window, and nothing here frees itself before the
     // reset. The same argument budget makes in `wait_reason`, and this is the same kind of ceiling.
     quota_warning: { tone: "paused", label: "quota threshold crossed" },
+    // The resolver fell back to observe (spec .ai/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md): the authorisation dropped and waits on reviews, like a quota warning.
+    judge_resolve_demoted: { tone: "paused", label: "resolver back to observe" },
     quota_blind: { tone: "info", label: "quota brake ran blind" },
     // Worktrees.
     worktree_gate_failed: { tone: "danger", label: "worktree gate failed" },
