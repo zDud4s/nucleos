@@ -11,11 +11,11 @@
 //! speed profile's effort ceiling.
 //!
 //! **Off is structural, not a branch.** `main.rs` calls [`front`], which hands back the very `Arc`
-//! it was given unless `.ai/router.yaml` turns a surface on. Only then is the primary runner wrapped
+//! it was given unless `router.yaml` turns a surface on. Only then is the primary runner wrapped
 //! in a [`RoutedRunner`], whose one difference from what it wraps is answering
 //! `CommandRunner::router()` with `Some` — a capability on the trait, not an `AppState` field.
 //!
-//! Three modes, in `.ai/router.yaml`: `off` (the default, and what an absent, malformed or unknown
+//! Three modes, in `router.yaml`: `off` (the default, and what an absent, malformed or unknown
 //! value means), `shadow` (ask, record the advice beside what ran, launch what would have launched)
 //! and `apply` (launch the advice when it passes the checks). One switch per surface — `runs`,
 //! `team`, `council`, `recruit` — so `apply` can be turned on a surface at a time.
@@ -34,7 +34,7 @@ use crate::router_client::{RouteAdvice, RouteRequest, RouterClient};
 use crate::runner::{CommandRunner, Permission, RunOutcome, RunRequest, ToolPolicy, TurnEvent};
 use crate::speed::Speed;
 
-/// Where the router listens unless `.ai/router.yaml` says otherwise.
+/// Where the router listens unless `router.yaml` says otherwise.
 pub const DEFAULT_URL: &str = "http://127.0.0.1:18733";
 /// The ceiling on one route call. A run waits at most this long before launching without advice.
 pub const DEFAULT_TIMEOUT_MS: u64 = 2500;
@@ -128,7 +128,7 @@ impl RunnerKind {
     }
 }
 
-/// `.ai/router.yaml`, read once at startup.
+/// `router.yaml`, read once at startup.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouterConfig {
     /// The mode of every surface that names none of its own.
@@ -189,7 +189,8 @@ struct RawConfig {
     surfaces: BTreeMap<String, serde_yaml::Value>,
 }
 
-/// Reads `.ai/router.yaml`. Anything short of a well-formed, loopback configuration is `off`.
+/// Reads `router.yaml`, which lives under `machine_config::root()` (`~/.nucleos/`). Anything
+/// short of a well-formed, loopback configuration is `off`.
 ///
 /// An absent file is the ordinary case and is silent. A malformed one, an unknown mode or a URL off
 /// this machine is `off` plus a warning: the prompt's head travels in the request, and task text

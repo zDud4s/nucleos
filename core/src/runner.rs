@@ -2053,7 +2053,7 @@ pub trait CommandRunner: Send + Sync {
     /// The llm-router this runner consults before a run, or `None` when routing is off.
     ///
     /// Defaulted to `None`, and only `route_advice::RoutedRunner` answers `Some`: that wrapper is
-    /// built by `main.rs` only when `.ai/router.yaml` turns routing on, so a daemon with routing off
+    /// built by `main.rs` only when `router.yaml` turns routing on, so a daemon with routing off
     /// holds the very runner it held before routing existed. A capability on the trait rather than
     /// an `AppState` field, so no state literal anywhere had to learn about it.
     fn router(&self) -> Option<std::sync::Arc<crate::route_advice::Router>> {

@@ -2,7 +2,7 @@
 //! seat, a council seat, and a director's recruit.
 //!
 //! `route_advice::resolve` is the runs surface; these three are the other places the daemon already
-//! picks an agent's model (plan decision 4), and each has its own switch in `.ai/router.yaml`
+//! picks an agent's model (plan decision 4), and each has its own switch in `router.yaml`
 //! (`team`, `council`, `recruit`). The rules are the same: the daemon decides and the router
 //! suggests, `off` is today's launch byte for byte with no call made, and any failure — router down,
 //! slow, 400, 422, an answer outside what was sent — launches exactly what would have launched.

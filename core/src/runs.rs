@@ -8701,7 +8701,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     }
 
     /// Fronts `state.runner` with a shadow-mode router at `url`, the way `main.rs` does when
-    /// `.ai/router.yaml` turns routing on.
+    /// `router.yaml` turns routing on.
     fn front_with_shadow_router(state: &mut AppState, url: &str) {
         front_with_router(state, url, crate::route_advice::Mode::Shadow);
     }
