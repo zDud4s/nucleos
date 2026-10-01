@@ -2141,6 +2141,50 @@ pub fn outcome_of_run_end(stdout: &str) -> Option<Outcome> {
     }
 }
 
+/// Whether a job gate, run after this run ends, is what judges its work: a sequential item or an
+/// implement node (which names an item, or is an `implement` resumed without one). That gate
+/// reports through `report_item_gate`, so the run itself must not also say `pass` or `fail`.
+pub fn judged_by_a_job_gate(query: &RouteQuery) -> bool {
+    query.item.is_some() || query.stage.as_deref() == Some("implement")
+}
+
+/// What the router hears when a run has ended, or `None` for nothing to report.
+///
+/// - A gate verdict, when the run has one, is the answer.
+/// - `timed_out` is `error`, gated or not. Chosen over `fail` because `outcome_of_run_end`'s
+///   convention is that only a verdict on the work says `fail`, and a deadline is not one: a run
+///   cut short never got as far as being judged, and a slow tool or a hung build ends it the same
+///   way a slow model does.
+/// - A run nothing will gate (`judged_by_a_gate` false: a plan, a review, an ad-hoc run) is judged
+///   by its own exit: `completed` is `pass`; `failed` is what `outcome_of_run_end` says about the
+///   infrastructure (`rate_limited`, `error`) when it says anything, `error` for a run with no exit
+///   code of its own (`-1`: killed, or its stream broke), and `fail` otherwise — the turn ceiling
+///   included, since looping is the model's doing.
+/// - A gated run that ended without a verdict keeps the infrastructure rule only: its gate never
+///   ran, or reports on its own.
+pub fn outcome_at_run_end(
+    terminal_status: &str,
+    exit_code: i32,
+    stdout: &str,
+    gate: Option<&crate::gate::GateOutcome>,
+    judged_by_a_gate: bool,
+) -> Option<Outcome> {
+    if let Some(gate) = gate {
+        return Some(outcome_of_gate(gate));
+    }
+    match (terminal_status, judged_by_a_gate) {
+        ("timed_out", _) => Some(Outcome::Error),
+        ("failed", true) => outcome_of_run_end(stdout),
+        ("failed", false) => Some(outcome_of_run_end(stdout).unwrap_or(if exit_code == -1 {
+            Outcome::Error
+        } else {
+            Outcome::Fail
+        })),
+        ("completed", false) => Some(Outcome::Pass),
+        _ => None,
+    }
+}
+
 /// Reports `outcome` for `decision_id` on a task of its own and returns at once.
 pub fn report_detached(router: Arc<Router>, decision_id: String, outcome: Outcome) {
     tokio::spawn(async move {
@@ -2260,6 +2304,89 @@ mod outcome_tests {
             None
         );
         assert_eq!(outcome_of_run_end(""), None);
+    }
+
+    /// A run its deadline cut short says `error`, whether or not a gate would have judged it: the
+    /// deadline ended it, not a verdict on the work.
+    #[test]
+    fn a_timed_out_run_reports_error_gated_or_not() {
+        for judged in [true, false] {
+            assert_eq!(
+                outcome_at_run_end(
+                    "timed_out",
+                    crate::runner::PROGRESS_TIMEOUT_EXIT_CODE,
+                    "",
+                    None,
+                    judged
+                ),
+                Some(Outcome::Error),
+                "judged by a gate: {judged}"
+            );
+        }
+    }
+
+    /// A run nothing will gate — a plan, a review, an ad-hoc run — is judged by its own exit.
+    #[test]
+    fn an_ungated_run_reports_on_its_own_exit() {
+        let rate_limited = r#"{"type":"result","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"API Error"}"#;
+        let cases = [
+            ("completed", 0, "", Some(Outcome::Pass)),
+            ("failed", 1, "", Some(Outcome::Fail)),
+            ("failed", 1, rate_limited, Some(Outcome::RateLimited)),
+            // No exit code of its own: the daemon killed it or its stream broke.
+            ("failed", -1, "", Some(Outcome::Error)),
+            // Looping until the ceiling is the model's doing.
+            (
+                "failed",
+                crate::runner::TURN_CEILING_EXIT_CODE,
+                "",
+                Some(Outcome::Fail),
+            ),
+        ];
+        for (status, exit_code, stdout, expected) in cases {
+            assert_eq!(
+                outcome_at_run_end(status, exit_code, stdout, None, false),
+                expected,
+                "{status} / {exit_code}"
+            );
+        }
+    }
+
+    /// A gated run keeps today's rule: the gate's verdict when there is one, an infrastructure
+    /// failure otherwise, and nothing for a run that failed or finished without a verdict — the gate
+    /// that judges it reports separately.
+    #[test]
+    fn a_gated_run_leaves_pass_and_fail_to_its_gate() {
+        assert_eq!(
+            outcome_at_run_end("completed", 0, "", Some(&GateOutcome::Passed), true),
+            Some(Outcome::Pass)
+        );
+        assert_eq!(outcome_at_run_end("completed", 0, "", None, true), None);
+        assert_eq!(outcome_at_run_end("failed", 1, "", None, true), None);
+        assert_eq!(outcome_at_run_end("failed", -1, "", None, true), None);
+    }
+
+    /// Only a job's item work is gated by the job: a query with an item, or an `implement` node
+    /// resumed without one. A plan, a review and an ad-hoc run are not.
+    #[test]
+    fn only_item_work_is_judged_by_a_job_gate() {
+        let query = |stage: Option<&str>, item: bool| RouteQuery {
+            task: "t".into(),
+            stage: stage.map(str::to_owned),
+            item: item.then(|| ItemContext {
+                files: Vec::new(),
+                attempt: None,
+                gate_output: None,
+                failed: Vec::new(),
+            }),
+            resume: false,
+        };
+        assert!(judged_by_a_job_gate(&query(Some("implement"), true)));
+        assert!(judged_by_a_job_gate(&query(Some("implement"), false)));
+        assert!(judged_by_a_job_gate(&query(None, true)));
+        assert!(!judged_by_a_job_gate(&query(Some("plan"), false)));
+        assert!(!judged_by_a_job_gate(&query(Some("review"), false)));
+        assert!(!judged_by_a_job_gate(&query(None, false)));
     }
 
     /// Returns before the router has answered, and a router that is not there costs nothing.

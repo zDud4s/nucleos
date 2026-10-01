@@ -1700,6 +1700,14 @@ fn spawn_run(
     let run_messages = state.run_messages.clone();
     let run_tails = state.run_tails.clone();
 
+    // Whether a gate will judge this run's work: its own (`gate_config`) or the job's, run after it
+    // ends. Read before `resolve` takes the query. A run neither judges — a plan, a review, an
+    // ad-hoc run — reports on its own exit instead (`route_advice::outcome_at_run_end`).
+    let judged_by_a_gate = !matches!(gate_config, GateConfig::NotConfigured)
+        || route
+            .as_ref()
+            .is_some_and(crate::route_advice::judged_by_a_job_gate);
+
     spawn_registered(state, id, async move {
         // The router is asked HERE, inside the run's own task and before its first attempt, so
         // neither the HTTP handler nor the job tick ever waits on it. With routing off this hands
@@ -1950,25 +1958,26 @@ fn spawn_run(
                     let terminal_write_won =
                         matches!(&completed, Ok(result) if result.rows_affected() == 1);
                     // The router hears how this run ended, under the same CAS as every other
-                    // announcement of it: the gate's verdict when there is one, otherwise what a
-                    // failed CLI says about its infrastructure (a 429, an API outage). A run that
-                    // failed on its own work, or timed out, reports nothing — only a gate says
-                    // `fail`. Detached: the report never delays the handoff or the sweep below.
-                    if terminal_write_won && let Some((decision_id, router)) = &route_decision {
-                        let outcome = match &gate_outcome {
-                            Some(gate) => Some(crate::route_advice::outcome_of_gate(gate)),
-                            None if terminal_status == "failed" => {
-                                crate::route_advice::outcome_of_run_end(&o.stdout)
-                            }
-                            None => None,
-                        };
-                        if let Some(outcome) = outcome {
-                            crate::route_advice::report_detached(
-                                std::sync::Arc::clone(router),
-                                decision_id.clone(),
-                                outcome,
-                            );
-                        }
+                    // announcement of it: the gate's verdict when there is one; `error` for a run
+                    // its progress deadline killed; for a run no gate judges (a plan, a review),
+                    // its own exit; otherwise what a failed CLI says about its infrastructure.
+                    // `route_advice::outcome_at_run_end` holds the rule. Detached: the report
+                    // never delays the handoff or the sweep below.
+                    if terminal_write_won
+                        && let Some((decision_id, router)) = &route_decision
+                        && let Some(outcome) = crate::route_advice::outcome_at_run_end(
+                            terminal_status,
+                            o.exit_code,
+                            &o.stdout,
+                            gate_outcome.as_ref(),
+                            judged_by_a_gate,
+                        )
+                    {
+                        crate::route_advice::report_detached(
+                            std::sync::Arc::clone(router),
+                            decision_id.clone(),
+                            outcome,
+                        );
                     }
                     // A progress deadline kills the CLI before it can report what it spent, so the
                     // write above just recorded that NULL as final. The wall-clock arm approximates
@@ -2186,6 +2195,16 @@ fn spawn_run(
                     .await;
                     warn_on_terminal_write_err(&timed_out, id, "timed_out");
                     if matches!(&timed_out, Ok(result) if result.rows_affected() == 1) {
+                        // A deadline is not a verdict on the work, so the router hears `error`
+                        // (`route_advice::outcome_at_run_end` argues it), first and detached, so
+                        // nothing below can hold it up.
+                        if let Some((decision_id, router)) = &route_decision {
+                            crate::route_advice::report_detached(
+                                std::sync::Arc::clone(router),
+                                decision_id.clone(),
+                                crate::route_advice::Outcome::Error,
+                            );
+                        }
                         // The run is over; anything it queued and never started goes with it (spec
                         // §7). A run its wall clock killed is that spec's "the agent that submitted
                         // dies" as much as one a human cancelled — it will never come back to
@@ -8875,6 +8894,96 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             .await
             .unwrap();
         assert_eq!(status, "failed");
+    }
+
+    /// Launches one shadow-routed `real` run with `canned` as its outcome (or the fake's default
+    /// when `None`), on a runner that takes `delay` under a `run_timeout` wall clock, and returns
+    /// the first outcome the router hears for it.
+    async fn the_outcome_reported_for(
+        canned: Option<RunOutcome>,
+        delay: Option<Duration>,
+        run_timeout: Duration,
+    ) -> (String, serde_json::Value) {
+        let (mut state, runner) = test_state_with_runner(delay, run_timeout).await;
+        *runner.canned.lock().unwrap() = canned;
+        let (url, mut reports) = advising_router(serde_json::json!({
+            "decision_id": "rt_end", "runner": "claude", "model": "claude-sonnet-5"
+        }))
+        .await;
+        front_with_shadow_router(&mut state, &url);
+        create_run_inner(&state, "route me".into(), None, None, "real", false)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reports.recv())
+            .await
+            .expect("reported within 5s")
+            .unwrap()
+    }
+
+    fn ended_with(exit_code: i32) -> RunOutcome {
+        RunOutcome {
+            exit_code,
+            stdout: String::new(),
+            stderr: String::new(),
+            session_id: None,
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+        }
+    }
+
+    /// A routed run with no gate behind it — the shape of a plan or a review — is judged by its own
+    /// exit: zero is `pass`.
+    #[tokio::test]
+    async fn an_ungated_routed_run_that_exits_zero_reports_pass() {
+        let (decision, body) = the_outcome_reported_for(
+            Some(ended_with(0)),
+            None,
+            crate::state::DEFAULT_RUN_TIMEOUT,
+        )
+        .await;
+        assert_eq!(decision, "rt_end");
+        assert_eq!(body, serde_json::json!({"status": "pass"}));
+    }
+
+    /// ...and a non-zero exit that is not the API's doing is `fail`.
+    #[tokio::test]
+    async fn an_ungated_routed_run_that_exits_non_zero_reports_fail() {
+        let (_, body) = the_outcome_reported_for(
+            Some(ended_with(1)),
+            None,
+            crate::state::DEFAULT_RUN_TIMEOUT,
+        )
+        .await;
+        assert_eq!(body, serde_json::json!({"status": "fail"}));
+    }
+
+    /// A run the wall clock cut short reports `error`.
+    #[tokio::test]
+    async fn a_routed_run_the_wall_clock_cuts_short_reports_error() {
+        let (_, body) = the_outcome_reported_for(
+            None,
+            Some(Duration::from_secs(5)),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(body, serde_json::json!({"status": "error"}));
+    }
+
+    /// A run its progress deadline killed arrives with an outcome, and reports `error` too.
+    #[tokio::test]
+    async fn a_routed_run_its_progress_deadline_kills_reports_error() {
+        let (_, body) = the_outcome_reported_for(
+            Some(ended_with(crate::runner::PROGRESS_TIMEOUT_EXIT_CODE)),
+            None,
+            crate::state::DEFAULT_RUN_TIMEOUT,
+        )
+        .await;
+        assert_eq!(body, serde_json::json!({"status": "error"}));
     }
 
     /// Mail text never reaches the router, whatever the router's mode.
