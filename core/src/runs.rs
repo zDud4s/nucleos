@@ -76,6 +76,19 @@ pub struct RunSearchResult {
     pub completed_at: Option<String>,
     pub cost_usd: Option<f64>,
     pub prompt_excerpt: String,
+    // The same nine route columns `RunStatusResponse` answers for one run, under the same names and
+    // with the same meaning: NULL is "not recorded", and each is always serialised so the list reads
+    // an explicit `null` rather than a gap.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub runner: Option<String>,
+    pub route_mode: Option<String>,
+    pub route_decision_id: Option<String>,
+    pub advised_runner: Option<String>,
+    pub advised_model: Option<String>,
+    pub advised_effort: Option<String>,
+    /// A JSON array of `model[@effort]`, as TEXT: handed over as the column holds it, not parsed.
+    pub route_failed: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,7 +127,9 @@ pub async fn search(
 ) -> sqlx::Result<Vec<RunSearchResult>> {
     let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
         "SELECT id, project_id, status, mode, created_at, completed_at, cost_usd, \
-         substr(prompt, 1, {PROMPT_EXCERPT_CHARS}) AS prompt_excerpt FROM runs WHERE 1 = 1"
+         substr(prompt, 1, {PROMPT_EXCERPT_CHARS}) AS prompt_excerpt, \
+         model, effort, runner, route_mode, route_decision_id, \
+         advised_runner, advised_model, advised_effort, route_failed FROM runs WHERE 1 = 1"
     ));
 
     if let Some(project_id) = &filter.project_id {
@@ -12078,6 +12093,81 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             until: None,
             limit: 50,
             live: false,
+        }
+    }
+
+    const ROUTE_FIELDS: [&str; 9] = [
+        "model",
+        "effort",
+        "runner",
+        "route_mode",
+        "route_decision_id",
+        "advised_runner",
+        "advised_model",
+        "advised_effort",
+        "route_failed",
+    ];
+
+    /// The run list answers the same nine route columns as `GET /runs/{id}`, flat and under their
+    /// column names; an unrouted row answers each as an explicit `null`, never an absent key.
+    #[tokio::test]
+    async fn the_run_list_answers_the_route_fields_flat_and_null_when_absent() {
+        let pool = search_test_pool().await;
+        let routed = insert_search_run(
+            &pool,
+            "p",
+            "completed",
+            "worktree",
+            "routed",
+            "2026-10-01T00:00:01Z",
+        )
+        .await;
+        let unrouted = insert_search_run(
+            &pool,
+            "p",
+            "completed",
+            "worktree",
+            "unrouted",
+            "2026-10-01T00:00:00Z",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE runs SET model = 'claude-sonnet-5', effort = 'high', runner = 'claude',
+                             route_mode = 'shadow', route_decision_id = 'd-1',
+                             advised_runner = 'codex', advised_model = 'gpt-6',
+                             advised_effort = 'medium', route_failed = '[\"m@low\"]'
+              WHERE id = ?",
+        )
+        .bind(routed)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows = search(&pool, &base_filter()).await.unwrap();
+        let wire = |id: i64| {
+            let row = rows.iter().find(|row| row.id == id).expect("listed");
+            serde_json::to_value(row).unwrap()
+        };
+
+        let routed = wire(routed);
+        let expected = [
+            "claude-sonnet-5",
+            "high",
+            "claude",
+            "shadow",
+            "d-1",
+            "codex",
+            "gpt-6",
+            "medium",
+            "[\"m@low\"]",
+        ];
+        for (key, value) in ROUTE_FIELDS.iter().zip(expected) {
+            assert_eq!(routed[key], serde_json::json!(value), "{key}");
+        }
+        let unrouted = wire(unrouted);
+        let object = unrouted.as_object().unwrap();
+        for key in ROUTE_FIELDS {
+            assert_eq!(object.get(key), Some(&serde_json::Value::Null), "{key}");
         }
     }
 
