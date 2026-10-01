@@ -16,7 +16,6 @@ import { Calendar, validateCalendarSearch } from "./pages/Calendar";
 import { Chats } from "./pages/Chats";
 import { Contacts } from "./pages/Contacts";
 import { Council } from "./pages/Council";
-import { Errands } from "./pages/Errands";
 import { Feed, validateFeedSearch } from "./pages/Feed";
 import { Files } from "./pages/Files";
 import { Fleet } from "./pages/Fleet";
@@ -71,7 +70,6 @@ export const PAGES: Record<string, () => ReactNode> = {
   "/projects": Roster,
   "/learned": Learned,
   "/chats": Chats,
-  "/errands": Errands,
   "/teams": Teams,
   "/council": Council,
   "/agents": Agents,
@@ -236,7 +234,6 @@ const DETAIL_ROUTES: {
     }),
   },
   { path: "/chats/$chatId", component: Chats },
-  { path: "/errands/$errandId", component: Errands },
   { path: "/council/$councilId", component: Council },
   { path: "/teams/$teamId", component: Bench },
   { path: "/team-runs/$runId", component: TeamRunDetail },

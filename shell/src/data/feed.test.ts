@@ -17,7 +17,6 @@ function line(id: number, minute: number): FeedEntry {
     kind: "job_started",
     summary: `line ${id}`,
     run_id: null,
-    errand_id: null,
     subject: null,
     created_at: new Date(Date.UTC(2026, 7, 24, 9, minute)).toISOString(),
   };

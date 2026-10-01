@@ -25,7 +25,7 @@
 //! **The answer, in one sentence: writing is `WritesOwn` and reading taints.** Six of the eight
 //! `TEAM_TOOLS` are `ReadsUntrusted`, so grading the note-writing tool `Acts` would mean a
 //! specialist that read one web page could no longer tell a colleague what it found — the tool
-//! would fire only for specialists that read nothing. `errand_files_write` made exactly this trade
+//! would fire only for specialists that read nothing. a sibling tool once made exactly this trade
 //! for exactly this reason. The safety is not given up, it MOVES: the untrusted text travels with
 //! the words, and a node that receives a note is born marked `read_untrusted`, so it may read on and
 //! may no longer ask. The blast radius is bounded by `TEAM_TOOLS` itself — a note lands on another

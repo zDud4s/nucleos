@@ -5270,8 +5270,6 @@ const MESSAGE_SENTENCES: Record<string, string> = {
     "the kill switch is engaged; nothing autonomous starts until it is released, and this cannot be sent either",
   no_local_model:
     "no local model is available on this machine, and this conversation is set to answer locally",
-  errand_not_answering:
-    "the errand behind this conversation is not answering right now",
   // The relay's own refusals. Each has a different answer, which is why they are sentences here
   // rather than one "something went wrong": a cycle is a different conversation to pick, a chain
   // too deep is nothing you can fix from this window, and an absent owner clears by itself.

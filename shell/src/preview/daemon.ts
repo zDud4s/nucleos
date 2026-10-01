@@ -459,8 +459,6 @@ export const RECRUITS = [
     run_id: null,
     session_id: null,
     project_id: null,
-    errand_id: null,
-    errand_name: null,
     tool_name: "tax-analyst",
     reasoning:
       "Nobody on this department can read a VAT return, and three of October's exceptions are VAT reclassifications rather than mismatches.",
@@ -489,8 +487,6 @@ export const PROPOSALS: Proposal[] = [
     run_id: null,
     session_id: null,
     project_id,
-    errand_id: null,
-    errand_name: null,
     tool_name: "Bash",
     reasoning: "The next action needs an owner's approval.",
     tool_input: JSON.stringify({ command: "git status" }),
@@ -507,8 +503,6 @@ export const TEAM_ACTION_PROPOSALS: Proposal[] = ACTIONS.map((action) => ({
   run_id: null,
   session_id: null,
   project_id: "alpha",
-  errand_id: null,
-  errand_name: null,
   tool_name: action.kind,
   reasoning: action.why,
   tool_input: action.payload,
@@ -1277,20 +1271,20 @@ export const CALENDAR_CONFIG: CalendarConfigView = {
  * `06-feed.png` were the same string, which is a fact about this fixture and not about the page.
  */
 export const FEED: FeedEntry[] = [
-  { id: 14, project_id: "alpha", kind: "job_finished", summary: "job 41 finished `completed` after 6 item(s)", run_id: 41, errand_id: null, subject: "job:41", created_at: ago(3 * MINUTE) },
-  { id: 13, project_id: "alpha", kind: "job_started", summary: "job 42 started on job/42-tighten-the-gate", run_id: 42, errand_id: null, subject: "job:42", created_at: ago(9 * MINUTE) },
-  { id: 12, project_id: null, kind: "team_run_finished", summary: "a team run done: the department delivered", run_id: null, errand_id: null, subject: "team_run:30", created_at: ago(14 * MINUTE) },
-  { id: 11, project_id: "bravo", kind: "job_failed", summary: "job 39 could not start its implement node: the runner exited before the first turn", run_id: 39, errand_id: null, subject: "job:39", created_at: ago(31 * MINUTE) },
-  { id: 10, project_id: "bravo", kind: "job_waiting", summary: "job 40 is waiting: another run holds the project's worktree slot", run_id: 40, errand_id: null, subject: "job:40", created_at: ago(48 * MINUTE) },
-  { id: 9, project_id: "alpha", kind: "vcs_request_finished", summary: "vcs request 21 escalated — the merge would revert two files nobody asked about", run_id: null, errand_id: null, subject: "vcs:21", created_at: ago(HOUR) },
-  { id: 8, project_id: null, kind: "team_trigger_armed", summary: "`morning digest` is armed for support", run_id: null, errand_id: null, subject: null, created_at: ago(95 * MINUTE) },
-  { id: 7, project_id: null, kind: "email_urgent", summary: "the accountant is blocked on the Q3 reconciliation and has asked twice", run_id: null, errand_id: null, subject: null, created_at: ago(2 * HOUR) },
-  { id: 6, project_id: "alpha", kind: "token_efficiency", summary: "token efficiency (project alpha): 4 runs in a row sent a prompt of 38412 tokens and neither read nor wrote a single cached token", run_id: 38, errand_id: null, subject: null, created_at: ago(3 * HOUR) },
-  { id: 5, project_id: null, kind: "web.read", summary: "read https://docs.rs/sqlx/latest/sqlx/ (raw)", run_id: null, errand_id: 2, subject: "errand:2", created_at: ago(4 * HOUR) },
-  { id: 4, project_id: null, kind: "errand_rule_fired", summary: "the rule \"weekday sweep\" of the errand \"inbox\" started a turn", run_id: null, errand_id: 2, subject: "errand:2", created_at: ago(5 * HOUR) },
-  { id: 3, project_id: "delta", kind: "council_finished", summary: "council done", run_id: null, errand_id: null, subject: "council:11", created_at: ago(7 * HOUR) },
-  { id: 2, project_id: "bravo", kind: "worktree_released", summary: "released worktree C:/Projects/bravo/.nucleos/worktrees/run-318 + branch run/318-retry-the-gate", run_id: null, errand_id: null, subject: "run:318", created_at: ago(DAY) },
-  { id: 1, project_id: "alpha", kind: "map_stamp_recorded", summary: "module map stamp for core/src/feed.rs", run_id: null, errand_id: null, subject: null, created_at: ago(2 * DAY) },
+  { id: 14, project_id: "alpha", kind: "job_finished", summary: "job 41 finished `completed` after 6 item(s)", run_id: 41, subject: "job:41", created_at: ago(3 * MINUTE) },
+  { id: 13, project_id: "alpha", kind: "job_started", summary: "job 42 started on job/42-tighten-the-gate", run_id: 42, subject: "job:42", created_at: ago(9 * MINUTE) },
+  { id: 12, project_id: null, kind: "team_run_finished", summary: "a team run done: the department delivered", run_id: null, subject: "team_run:30", created_at: ago(14 * MINUTE) },
+  { id: 11, project_id: "bravo", kind: "job_failed", summary: "job 39 could not start its implement node: the runner exited before the first turn", run_id: 39, subject: "job:39", created_at: ago(31 * MINUTE) },
+  { id: 10, project_id: "bravo", kind: "job_waiting", summary: "job 40 is waiting: another run holds the project's worktree slot", run_id: 40, subject: "job:40", created_at: ago(48 * MINUTE) },
+  { id: 9, project_id: "alpha", kind: "vcs_request_finished", summary: "vcs request 21 escalated — the merge would revert two files nobody asked about", run_id: null, subject: "vcs:21", created_at: ago(HOUR) },
+  { id: 8, project_id: null, kind: "team_trigger_armed", summary: "`morning digest` is armed for support", run_id: null, subject: null, created_at: ago(95 * MINUTE) },
+  { id: 7, project_id: null, kind: "email_urgent", summary: "the accountant is blocked on the Q3 reconciliation and has asked twice", run_id: null, subject: null, created_at: ago(2 * HOUR) },
+  { id: 6, project_id: "alpha", kind: "token_efficiency", summary: "token efficiency (project alpha): 4 runs in a row sent a prompt of 38412 tokens and neither read nor wrote a single cached token", run_id: 38, subject: null, created_at: ago(3 * HOUR) },
+  { id: 5, project_id: null, kind: "web.read", summary: "read https://docs.rs/sqlx/latest/sqlx/ (raw)", run_id: null, subject: null, created_at: ago(4 * HOUR) },
+  { id: 4, project_id: null, kind: "email_digest", summary: "digest: 12 e-mails triaged, nothing urgent", run_id: null, subject: null, created_at: ago(5 * HOUR) },
+  { id: 3, project_id: "delta", kind: "council_finished", summary: "council done", run_id: null, subject: "council:11", created_at: ago(7 * HOUR) },
+  { id: 2, project_id: "bravo", kind: "worktree_released", summary: "released worktree C:/Projects/bravo/.nucleos/worktrees/run-318 + branch run/318-retry-the-gate", run_id: null, subject: "run:318", created_at: ago(DAY) },
+  { id: 1, project_id: "alpha", kind: "map_stamp_recorded", summary: "module map stamp for core/src/feed.rs", run_id: null, subject: null, created_at: ago(2 * DAY) },
 ];
 
 /**
@@ -1313,38 +1307,36 @@ export const FEED: FeedEntry[] = [
  * is what folds a job's start, plan, failed gate and unmerged item into one row.
  */
 const NIGHT: Omit<FeedEntry, "id">[] = [
-  { project_id: null, kind: "command_finished", summary: "project command `gates` on alpha exited 0 after 4m12s", run_id: null, errand_id: null, subject: null, created_at: ago(889 * MINUTE) },
-  { project_id: "alpha", kind: "map_stamp_recorded", summary: "module map stamp for core/src/feed.rs at 4d2c1e2", run_id: null, errand_id: null, subject: null, created_at: ago(851 * MINUTE) },
-  { project_id: "alpha", kind: "config_written", summary: "~/.nucleos/projects/alpha/autopilot.yaml written from the app", run_id: null, errand_id: null, subject: null, created_at: ago(759 * MINUTE) },
-  { project_id: "bravo", kind: "run_interrupted", summary: "run 900585 interrupted: the núcleo restarted mid-turn", run_id: 900585, errand_id: null, subject: "run:900585", created_at: ago(686 * MINUTE) },
-  { project_id: "charlie", kind: "job_started", summary: "job 54 started on job/54-flaky-hunt from the rule flaky hunt", run_id: null, errand_id: null, subject: "job:54", created_at: ago(637 * MINUTE) },
-  { project_id: "charlie", kind: "job_finished", summary: "job 54 finished `completed` after 3 item(s)", run_id: null, errand_id: null, subject: "job:54", created_at: ago(593 * MINUTE) },
-  { project_id: "charlie", kind: "shadow_run_completed", summary: "shadow run 900590 completed: would have opened 2 pull requests", run_id: 900590, errand_id: null, subject: "run:900590", created_at: ago(561 * MINUTE) },
-  { project_id: "charlie", kind: "vcs_request_finished", summary: "vcs request 44 landed job/54-flaky-hunt into main", run_id: null, errand_id: null, subject: "vcs:44", created_at: ago(511 * MINUTE) },
-  { project_id: null, kind: "email_digest", summary: "digest: 23 e-mails triaged, 1 urgent held for the morning", run_id: null, errand_id: null, subject: null, created_at: ago(466 * MINUTE) },
-  { project_id: null, kind: "errand_rule_fired", summary: "the rule \"invoice follow-up\" of the errand \"inbox\" started a turn", run_id: null, errand_id: 2, subject: "errand:2", created_at: ago(449 * MINUTE) },
-  { project_id: null, kind: "team_run_started", summary: "team run 31 started: Finanças on the weekly close", run_id: null, errand_id: null, subject: "team_run:31", created_at: ago(458 * MINUTE) },
-  { project_id: null, kind: "team_action", summary: "Finanças's `ledger_summary` carried out: the Q3 ledger summary is drafted", run_id: null, errand_id: null, subject: "team_run:31", created_at: ago(431 * MINUTE) },
-  { project_id: null, kind: "team_run_finished", summary: "team run 31 done: Finanças delivered the weekly close with 3 action(s)", run_id: null, errand_id: null, subject: "team_run:31", created_at: ago(420 * MINUTE) },
-  { project_id: "charlie", kind: "worktree_removed", summary: "removed worktree C:/repos/charlie/.nucleos/worktrees/run-900577 after its branch merged", run_id: null, errand_id: null, subject: "run:900577", created_at: ago(175 * MINUTE) },
-  { project_id: null, kind: "errand_investigation_done", summary: "errand 2 investigation done: 4 invoice threads matched", run_id: null, errand_id: 2, subject: "errand:2", created_at: ago(151 * MINUTE) },
-  { project_id: "delta", kind: "run_retry", summary: "run 900598 attempt 1 failed, retrying: the sidecar handshake timed out", run_id: 900598, errand_id: null, subject: "run:900598", created_at: ago(70 * MINUTE) },
-  { project_id: "delta", kind: "run_retry", summary: "run 900598 attempt 2 failed, retrying: the sidecar handshake timed out", run_id: 900598, errand_id: null, subject: "run:900598", created_at: ago(62 * MINUTE) },
-  { project_id: "delta", kind: "run_failed_final", summary: "run 900598 failed after 3 attempts: the sidecar handshake timed out", run_id: 900598, errand_id: null, subject: "run:900598", created_at: ago(54 * MINUTE) },
-  { project_id: null, kind: "web.read", summary: "read https://docs.rs/git2/latest/git2/struct.Repository.html (raw)", run_id: null, errand_id: 2, subject: "errand:2", created_at: ago(51 * MINUTE) },
-  { project_id: "alpha", kind: "job_started", summary: "job 57 started on job/57-importer from the rule nightly reconciliation", run_id: null, errand_id: null, subject: "job:57", created_at: ago(46 * MINUTE) },
-  { project_id: "alpha", kind: "job_planned", summary: "job 57 planned 4 item(s) on job/57-importer", run_id: null, errand_id: null, subject: "job:57", created_at: ago(43 * MINUTE) },
-  { project_id: "alpha", kind: "job_gate_failed", summary: "job 57 gate failed on round 1: 2 tests in core/src/storage.rs", run_id: 900609, errand_id: null, subject: "job:57", created_at: ago(39 * MINUTE) },
-  { project_id: null, kind: "council_started", summary: "council 12 convened on 6 open proposals", run_id: null, errand_id: null, subject: "council:12", created_at: ago(36 * MINUTE) },
-  { project_id: "alpha", kind: "worktree_run_completed", summary: "worktree run 900604 completed on run/900604-flaky-gate", run_id: 900604, errand_id: null, subject: "run:900604", created_at: ago(33 * MINUTE) },
-  { project_id: null, kind: "council_stage", summary: "council 12 phase 2 done: 4 seats ranked", run_id: null, errand_id: null, subject: "council:12", created_at: ago(27 * MINUTE) },
-  { project_id: null, kind: "council_finished", summary: "council 12 done: the week's proposals are ranked", run_id: null, errand_id: null, subject: "council:12", created_at: ago(23 * MINUTE) },
-  { project_id: "charlie", kind: "promotion_ready", summary: "charlie has 5 of 5 action classes ready for active mode", run_id: null, errand_id: null, subject: null, created_at: ago(18 * MINUTE) },
-  { project_id: null, kind: "email_urgent", summary: "the accountant is blocked on the Q3 reconciliation and has asked twice", run_id: null, errand_id: null, subject: null, created_at: ago(14 * MINUTE) },
-  { project_id: "alpha", kind: "worktree_released", summary: "released worktree C:/repos/alpha/.nucleos/worktrees/run-900604 + branch run/900604-flaky-gate", run_id: null, errand_id: null, subject: "run:900604", created_at: ago(11 * MINUTE) },
-  { project_id: "bravo", kind: "job_waiting", summary: "job 58 is waiting: another run holds the project's worktree slot", run_id: null, errand_id: null, subject: "job:58", created_at: ago(6 * MINUTE) },
-  { project_id: "bravo", kind: "run_retry", summary: "run 900612 attempt 1 failed to launch, retrying: the runner exited before the first turn", run_id: 900612, errand_id: null, subject: "run:900612", created_at: ago(4 * MINUTE) },
-  { project_id: "alpha", kind: "job_item_conflicted", summary: "job 57 item 3 did not merge: core/src/storage.rs changed under it on job/57-importer", run_id: null, errand_id: null, subject: "job:57", created_at: ago(2 * MINUTE) },
+  { project_id: null, kind: "command_finished", summary: "project command `gates` on alpha exited 0 after 4m12s", run_id: null, subject: null, created_at: ago(889 * MINUTE) },
+  { project_id: "alpha", kind: "map_stamp_recorded", summary: "module map stamp for core/src/feed.rs at 4d2c1e2", run_id: null, subject: null, created_at: ago(851 * MINUTE) },
+  { project_id: "alpha", kind: "config_written", summary: "~/.nucleos/projects/alpha/autopilot.yaml written from the app", run_id: null, subject: null, created_at: ago(759 * MINUTE) },
+  { project_id: "bravo", kind: "run_interrupted", summary: "run 900585 interrupted: the núcleo restarted mid-turn", run_id: 900585, subject: "run:900585", created_at: ago(686 * MINUTE) },
+  { project_id: "charlie", kind: "job_started", summary: "job 54 started on job/54-flaky-hunt from the rule flaky hunt", run_id: null, subject: "job:54", created_at: ago(637 * MINUTE) },
+  { project_id: "charlie", kind: "job_finished", summary: "job 54 finished `completed` after 3 item(s)", run_id: null, subject: "job:54", created_at: ago(593 * MINUTE) },
+  { project_id: "charlie", kind: "shadow_run_completed", summary: "shadow run 900590 completed: would have opened 2 pull requests", run_id: 900590, subject: "run:900590", created_at: ago(561 * MINUTE) },
+  { project_id: "charlie", kind: "vcs_request_finished", summary: "vcs request 44 landed job/54-flaky-hunt into main", run_id: null, subject: "vcs:44", created_at: ago(511 * MINUTE) },
+  { project_id: null, kind: "email_digest", summary: "digest: 23 e-mails triaged, 1 urgent held for the morning", run_id: null, subject: null, created_at: ago(466 * MINUTE) },
+  { project_id: null, kind: "team_run_started", summary: "team run 31 started: Finanças on the weekly close", run_id: null, subject: "team_run:31", created_at: ago(458 * MINUTE) },
+  { project_id: null, kind: "team_action", summary: "Finanças's `ledger_summary` carried out: the Q3 ledger summary is drafted", run_id: null, subject: "team_run:31", created_at: ago(431 * MINUTE) },
+  { project_id: null, kind: "team_run_finished", summary: "team run 31 done: Finanças delivered the weekly close with 3 action(s)", run_id: null, subject: "team_run:31", created_at: ago(420 * MINUTE) },
+  { project_id: "charlie", kind: "worktree_removed", summary: "removed worktree C:/repos/charlie/.nucleos/worktrees/run-900577 after its branch merged", run_id: null, subject: "run:900577", created_at: ago(175 * MINUTE) },
+  { project_id: "delta", kind: "run_retry", summary: "run 900598 attempt 1 failed, retrying: the sidecar handshake timed out", run_id: 900598, subject: "run:900598", created_at: ago(70 * MINUTE) },
+  { project_id: "delta", kind: "run_retry", summary: "run 900598 attempt 2 failed, retrying: the sidecar handshake timed out", run_id: 900598, subject: "run:900598", created_at: ago(62 * MINUTE) },
+  { project_id: "delta", kind: "run_failed_final", summary: "run 900598 failed after 3 attempts: the sidecar handshake timed out", run_id: 900598, subject: "run:900598", created_at: ago(54 * MINUTE) },
+  { project_id: null, kind: "web.read", summary: "read https://docs.rs/git2/latest/git2/struct.Repository.html (raw)", run_id: null, subject: null, created_at: ago(51 * MINUTE) },
+  { project_id: "alpha", kind: "job_started", summary: "job 57 started on job/57-importer from the rule nightly reconciliation", run_id: null, subject: "job:57", created_at: ago(46 * MINUTE) },
+  { project_id: "alpha", kind: "job_planned", summary: "job 57 planned 4 item(s) on job/57-importer", run_id: null, subject: "job:57", created_at: ago(43 * MINUTE) },
+  { project_id: "alpha", kind: "job_gate_failed", summary: "job 57 gate failed on round 1: 2 tests in core/src/storage.rs", run_id: 900609, subject: "job:57", created_at: ago(39 * MINUTE) },
+  { project_id: null, kind: "council_started", summary: "council 12 convened on 6 open proposals", run_id: null, subject: "council:12", created_at: ago(36 * MINUTE) },
+  { project_id: "alpha", kind: "worktree_run_completed", summary: "worktree run 900604 completed on run/900604-flaky-gate", run_id: 900604, subject: "run:900604", created_at: ago(33 * MINUTE) },
+  { project_id: null, kind: "council_stage", summary: "council 12 phase 2 done: 4 seats ranked", run_id: null, subject: "council:12", created_at: ago(27 * MINUTE) },
+  { project_id: null, kind: "council_finished", summary: "council 12 done: the week's proposals are ranked", run_id: null, subject: "council:12", created_at: ago(23 * MINUTE) },
+  { project_id: "charlie", kind: "promotion_ready", summary: "charlie has 5 of 5 action classes ready for active mode", run_id: null, subject: null, created_at: ago(18 * MINUTE) },
+  { project_id: null, kind: "email_urgent", summary: "the accountant is blocked on the Q3 reconciliation and has asked twice", run_id: null, subject: null, created_at: ago(14 * MINUTE) },
+  { project_id: "alpha", kind: "worktree_released", summary: "released worktree C:/repos/alpha/.nucleos/worktrees/run-900604 + branch run/900604-flaky-gate", run_id: null, subject: "run:900604", created_at: ago(11 * MINUTE) },
+  { project_id: "bravo", kind: "job_waiting", summary: "job 58 is waiting: another run holds the project's worktree slot", run_id: null, subject: "job:58", created_at: ago(6 * MINUTE) },
+  { project_id: "bravo", kind: "run_retry", summary: "run 900612 attempt 1 failed to launch, retrying: the runner exited before the first turn", run_id: 900612, subject: "run:900612", created_at: ago(4 * MINUTE) },
+  { project_id: "alpha", kind: "job_item_conflicted", summary: "job 57 item 3 did not merge: core/src/storage.rs changed under it on job/57-importer", run_id: null, subject: "job:57", created_at: ago(2 * MINUTE) },
 ];
 
 /**
@@ -1381,13 +1373,12 @@ function weekBehind(): Omit<FeedEntry, "id">[] {
       ],
     },
     { subject: (n) => `vcs:${n}`, run: false, steps: [["vcs_request_finished", (n) => `vcs request ${n} landed job/${n}-maintenance into main`, 0]] },
-    { subject: () => "errand:2", run: false, steps: [["errand_rule_fired", () => 'the rule "weekday sweep" of the errand "inbox" started a turn', 0]] },
     { subject: () => null, run: false, steps: [["team_trigger_armed", () => "`morning digest` is armed for support", 0]] },
   ];
   let n = 100;
   for (let day = 7; day >= 1; day -= 1) {
     const midnight = Date.parse(new Date(NOW - day * DAY).toISOString().slice(0, 10) + "T00:00:00Z");
-    rows.push({ project_id: null, kind: "email_digest", summary: "digest: 31 e-mails triaged, nothing urgent", run_id: null, errand_id: null, subject: null, created_at: new Date(midnight + 7 * HOUR + 2 * MINUTE).toISOString() });
+    rows.push({ project_id: null, kind: "email_digest", summary: "digest: 31 e-mails triaged, nothing urgent", run_id: null, subject: null, created_at: new Date(midnight + 7 * HOUR + 2 * MINUTE).toISOString() });
     for (let hour = 7; hour < 19; hour += 1) {
       const count = 1 + Math.floor(random() * 3);
       for (let i = 0; i < count; i += 1) {
@@ -1395,12 +1386,11 @@ function weekBehind(): Omit<FeedEntry, "id">[] {
         const story = stories[Math.floor(random() * stories.length)];
         const project = projects[Math.floor(random() * projects.length)];
         n += 1;
-        const errand = story.subject(n) === "errand:2" ? 2 : null;
-        const owner = story.subject(n) === null || errand !== null ? null : project;
+        const owner = story.subject(n) === null ? null : project;
         for (const [kind, say, after] of story.steps) {
           const at = begin + after * MINUTE;
           if (at > NOW - 900 * MINUTE) break;
-          rows.push({ project_id: owner, kind, summary: say(n, project), run_id: story.run ? 900000 + n : null, errand_id: errand, subject: story.subject(n), created_at: new Date(at).toISOString() });
+          rows.push({ project_id: owner, kind, summary: say(n, project), run_id: story.run ? 900000 + n : null, subject: story.subject(n), created_at: new Date(at).toISOString() });
         }
       }
     }
@@ -1410,11 +1400,10 @@ function weekBehind(): Omit<FeedEntry, "id">[] {
     return new Date(midnight + hour * HOUR + minute * MINUTE).toISOString();
   };
   rows.push(
-    { project_id: "bravo", kind: "job_started", summary: "job 71 started on job/71-importer", run_id: null, errand_id: null, subject: "job:71", created_at: at(5, 14, 2) },
-    { project_id: "bravo", kind: "job_failed", summary: "job 71 could not start its implement node: the runner exited before the first turn", run_id: null, errand_id: null, subject: "job:71", created_at: at(5, 14, 12) },
-    { project_id: "delta", kind: "worktree_gc_failed", summary: "could not remove worktree C:/repos/delta/.nucleos/worktrees/run-900431: a file is in use", run_id: null, errand_id: null, subject: "run:900431", created_at: at(3, 10, 40) },
-    { project_id: null, kind: "email_triage_stalled", summary: "triage stalled: 4 messages could not be read after 3 attempts", run_id: null, errand_id: null, subject: null, created_at: at(2, 16, 5) },
-    { project_id: null, kind: "errand_rule_failed", summary: 'the rule "weekday sweep" of the errand "inbox" failed: the mailbox refused the login', run_id: null, errand_id: 2, subject: "errand:2", created_at: at(6, 9, 30) },
+    { project_id: "bravo", kind: "job_started", summary: "job 71 started on job/71-importer", run_id: null, subject: "job:71", created_at: at(5, 14, 2) },
+    { project_id: "bravo", kind: "job_failed", summary: "job 71 could not start its implement node: the runner exited before the first turn", run_id: null, subject: "job:71", created_at: at(5, 14, 12) },
+    { project_id: "delta", kind: "worktree_gc_failed", summary: "could not remove worktree C:/repos/delta/.nucleos/worktrees/run-900431: a file is in use", run_id: null, subject: "run:900431", created_at: at(3, 10, 40) },
+    { project_id: null, kind: "email_triage_stalled", summary: "triage stalled: 4 messages could not be read after 3 attempts", run_id: null, subject: null, created_at: at(2, 16, 5) },
   );
   return rows;
 }
@@ -1516,7 +1505,7 @@ const STEMS = [
   "instrumentation", "classifier", "concurrency", "credentials", "resolver",
   "council", "triage", "sessions", "worktree", "workflow_graph", "map_anchor",
   "map_join", "map_store", "map_recency", "notifications", "transcription",
-  "attribution", "budget", "collision", "exclusion", "errands", "detect",
+  "attribution", "budget", "collision", "exclusion", "mailer", "detect",
 ];
 
 function generatedMap(): ProjectMap {

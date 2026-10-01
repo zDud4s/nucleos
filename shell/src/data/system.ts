@@ -93,13 +93,6 @@ export interface Proposal {
   run_id: number | null;
   session_id: string | null;
   project_id: string | null;
-  /**
-   * Not derivable from `project_id`: an errand has no project, so an errand's
-   * proposal and a machine-wide one both carry a null `project_id`.
-   */
-  errand_id: number | null;
-  /** Joined in only by the queries whose readers need it; null means this query did not ask. */
-  errand_name: string | null;
   tool_name: string | null;
   reasoning: string;
   tool_input: string | null;

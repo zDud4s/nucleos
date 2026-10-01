@@ -1823,7 +1823,7 @@ function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
  * The núcleo would accept a dismiss for these, and the design still asks for no
  * controls, which is the right call: the turn that reached for this ended long
  * ago, so there is nothing to allow and nothing to release. The only useful
- * response is to go and do the thing yourself, or to decide the errand was wrong
+ * response is to go and do the thing yourself, or to decide the agent was wrong
  * to try — and neither of those is a button on this page. A dismiss button here
  * would read as "handled" for something nobody handled.
  */
@@ -1856,11 +1856,6 @@ function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
               <span className="waiting-card-id">refusal #{proposal.id}</span>
               <span className="waiting-card-title">
                 {proposal.tool_name ?? "an action that names no tool"}
-              </span>
-              {/* The one listing that joins the errand in: "send_email" without
-                  the errand is the verb with the subject missing. */}
-              <span className="waiting-meta">
-                {proposal.errand_name ?? "no errand"}
               </span>
               <RelativeTime at={proposal.created_at} />
             </div>

@@ -106,7 +106,7 @@ func TestRunGuardedReportsWhetherTheWorkFinished(t *testing.T) {
 	}
 }
 
-// Two topics of the same group are two errands, and the núcleo hands each its own turn — so one
+// Two topics of the same group are two conversations, and the núcleo hands each its own turn — so one
 // slow topic must not hold up the other. Before topics, "one queue per chat" was the same statement
 // as "one queue per conversation"; it stopped being once a chat could hold several.
 func TestTopicsOfOneGroupDoNotBlockEachOther(t *testing.T) {

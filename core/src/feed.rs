@@ -7,12 +7,6 @@ pub struct FeedEntry {
     pub kind: String,
     pub summary: String,
     pub run_id: Option<i64>,
-    /// The errand this line belongs to, if it belongs to one.
-    ///
-    /// Beside `project_id` rather than replacing it, because they are two different owners and a
-    /// row has at most one of them. What must not happen is both being NULL when the line is
-    /// somebody's: that is the state `Global` reads as "the machine did this by itself".
-    pub errand_id: Option<i64>,
     /// What this line is about, as a [`Subject::key`] — `job:57`, `run:900598` — or `None`.
     ///
     /// Serialized as `null` rather than omitted: a reader grouping lines into stories has to tell
@@ -37,7 +31,6 @@ pub enum Subject {
     Council(String),
     TeamRun(String),
     Vcs(i64),
-    Errand(i64),
 }
 
 impl Subject {
@@ -49,7 +42,6 @@ impl Subject {
             Subject::Council(id) => format!("council:{id}"),
             Subject::TeamRun(id) => format!("team_run:{id}"),
             Subject::Vcs(id) => format!("vcs:{id}"),
-            Subject::Errand(id) => format!("errand:{id}"),
         }
     }
 }
@@ -80,16 +72,13 @@ pub async fn run_subject(pool: &sqlx::SqlitePool, run_id: i64) -> Subject {
 
 /// The feed scope to search.
 ///
-/// `Global` means the machine's own lines and nobody else's — `project_id IS NULL` AND `errand_id
-/// IS NULL`. It is deliberately not a merge of every scope, which is what `All` is for, and the
-/// second half of that clause is not redundant: an errand has no project, so without it an errand's
-/// every line answers to `Global` and buries the kill switch and the budget underneath them.
+/// `Global` means the machine's own lines and nobody else's — `project_id IS NULL`. It is
+/// deliberately not a merge of every scope, which is what `All` is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedScope {
     All,
     Global,
     Project(String),
-    Errand(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -108,9 +97,8 @@ use crate::search::escape_like;
 ///
 /// `subject` is a required argument, not a sibling entry point, although most call sites pass
 /// `None`: the question "what is this line about" has to be answered by every writer, and a
-/// parameter is what makes a new writer answer it. `append_for_errand` below made the opposite
-/// choice for the opposite reason — an errand is an owner a line must never acquire by accident,
-/// whereas a subject left out by accident is just a line the replay cannot group.
+/// parameter is what makes a new writer answer it; a subject left out by accident is a line the
+/// replay cannot group.
 pub async fn append(
     pool: &sqlx::SqlitePool,
     project_id: Option<&str>,
@@ -156,65 +144,8 @@ pub async fn append_on(
     Ok(result.last_insert_rowid())
 }
 
-/// Writes a line that belongs to an errand.
-///
-/// A separate entry point rather than a sixth parameter on [`append`], and the reason is that the
-/// sixth parameter would be `None` at every one of its forty-odd call sites. A caller that has an
-/// errand says so by calling this; nobody else has to be edited to keep saying they have not got
-/// one — and no existing line can acquire an errand through a mistake at a call site that never had
-/// a reason to think about errands.
-///
-/// `project_id` is not offered, because a row cannot have both owners: an errand is standing work
-/// that is NOT a code project, and that is most of what an errand is.
-///
-/// Nor is a subject offered: every errand line is about its errand, including the ones that name
-/// the run a rule started, so the subject is derived from `errand_id` rather than asked for.
-pub async fn append_for_errand(
-    pool: &sqlx::SqlitePool,
-    errand_id: i64,
-    kind: &str,
-    summary: &str,
-    run_id: Option<i64>,
-) -> sqlx::Result<i64> {
-    let created_at = chrono::Utc::now().to_rfc3339();
-    let result = sqlx::query(
-        "INSERT INTO feed (project_id, errand_id, kind, summary, run_id, subject, created_at)
-         VALUES (NULL, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(errand_id)
-    .bind(kind)
-    .bind(summary)
-    .bind(run_id)
-    .bind(Subject::Errand(errand_id).key())
-    .bind(created_at)
-    .execute(pool)
-    .await?;
-    Ok(result.last_insert_rowid())
-}
-
-/// One errand's own lines, newest first.
-///
-/// [`list_feed`]'s counterpart for the other owner. Not folded into it as a second `Option`
-/// parameter: two optional owners in one signature makes "both given" and "neither given" states a
-/// caller can reach and this module would have to have an opinion about, when the caller always
-/// knows which of the two it is holding.
-pub async fn list_errand_feed(
-    pool: &sqlx::SqlitePool,
-    errand_id: i64,
-    limit: i64,
-) -> sqlx::Result<Vec<FeedEntry>> {
-    sqlx::query_as::<_, FeedEntry>(
-        "SELECT id, project_id, kind, summary, run_id, errand_id, subject, created_at
-         FROM feed WHERE errand_id = ? ORDER BY id DESC LIMIT ?",
-    )
-    .bind(errand_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-}
-
-/// Returns one feed scope newest-first. `None` selects the machine's own rows (`project_id IS NULL`
-/// AND `errand_id IS NULL`), not a merge of every project's feed and not an errand's.
+/// Returns one feed scope newest-first. `None` selects the machine's own rows (`project_id IS NULL`),
+/// not a merge of every project's feed.
 pub async fn list_feed(
     pool: &sqlx::SqlitePool,
     project_id: Option<&str>,
@@ -223,7 +154,7 @@ pub async fn list_feed(
     match project_id {
         Some(project_id) => {
             sqlx::query_as::<_, FeedEntry>(
-                "SELECT id, project_id, kind, summary, run_id, errand_id, subject, created_at
+                "SELECT id, project_id, kind, summary, run_id, subject, created_at
                  FROM feed WHERE project_id = ? ORDER BY id DESC LIMIT ?",
             )
             .bind(project_id)
@@ -233,8 +164,8 @@ pub async fn list_feed(
         }
         None => {
             sqlx::query_as::<_, FeedEntry>(
-                "SELECT id, project_id, kind, summary, run_id, errand_id, subject, created_at
-                 FROM feed WHERE project_id IS NULL AND errand_id IS NULL
+                "SELECT id, project_id, kind, summary, run_id, subject, created_at
+                 FROM feed WHERE project_id IS NULL
                  ORDER BY id DESC LIMIT ?",
             )
             .bind(limit)
@@ -271,7 +202,7 @@ pub async fn latest_summary(
 /// Distinct from `list_feed(None)`, which returns only global (`project_id IS NULL`) rows.
 pub async fn list_all(pool: &sqlx::SqlitePool, limit: i64) -> sqlx::Result<Vec<FeedEntry>> {
     sqlx::query_as::<_, FeedEntry>(
-        "SELECT id, project_id, kind, summary, run_id, errand_id, subject, created_at
+        "SELECT id, project_id, kind, summary, run_id, subject, created_at
          FROM feed ORDER BY id DESC LIMIT ?",
     )
     .bind(limit)
@@ -285,19 +216,16 @@ pub async fn search(
     filter: &SearchFilter,
 ) -> sqlx::Result<Vec<FeedEntry>> {
     let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT id, project_id, kind, summary, run_id, errand_id, subject, created_at FROM feed WHERE 1 = 1",
+        "SELECT id, project_id, kind, summary, run_id, subject, created_at FROM feed WHERE 1 = 1",
     );
 
     match &filter.scope {
         FeedScope::All => {}
         FeedScope::Global => {
-            query.push(" AND project_id IS NULL AND errand_id IS NULL");
+            query.push(" AND project_id IS NULL");
         }
         FeedScope::Project(project_id) => {
             query.push(" AND project_id = ").push_bind(project_id);
-        }
-        FeedScope::Errand(errand_id) => {
-            query.push(" AND errand_id = ").push_bind(errand_id);
         }
     }
     if let Some(kind) = &filter.kind {
@@ -394,7 +322,7 @@ pub fn timeline_window(
 
 /// Every scope's lines with `since <= created_at <= until` and `id > after_id`, oldest first.
 ///
-/// Across every owner — machine, project and errand — because this is the page that shows the day
+/// Across every owner — machine and project — because this is the page that shows the day
 /// whole; the scoped readers above are still where a single owner's lines come from.
 ///
 /// When more than `cap` match it is the NEWEST `cap` that come back, still ascending, with
@@ -413,7 +341,7 @@ pub async fn timeline(
     cap: i64,
 ) -> sqlx::Result<Timeline> {
     let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT id, project_id, kind, summary, run_id, errand_id, subject, created_at FROM feed
+        "SELECT id, project_id, kind, summary, run_id, subject, created_at FROM feed
          WHERE created_at >= ",
     );
     query.push_bind(since.to_rfc3339());
@@ -541,8 +469,8 @@ pub async fn prune(
 mod tests {
     use super::{
         FeedScope, SearchFilter, Seen, Subject, TIMELINE_MAX, Timeline, WindowError, append,
-        append_for_errand, latest_summary, list_all, list_errand_feed, list_feed, mark_seen, prune,
-        run_subject, search, seen, timeline, timeline_window,
+        latest_summary, list_all, list_feed, mark_seen, prune, run_subject, search, seen, timeline,
+        timeline_window,
     };
 
     /// A search that filters on nothing but the scope, so a scope test is about the scope.
@@ -765,7 +693,6 @@ mod tests {
             Subject::Council("c-1".into()),
             Subject::TeamRun("t-1".into()),
             Subject::Vcs(21),
-            Subject::Errand(2),
         ]
         .iter()
         .map(Subject::key)
@@ -777,8 +704,7 @@ mod tests {
                 "run:900598",
                 "council:c-1",
                 "team_run:t-1",
-                "vcs:21",
-                "errand:2"
+                "vcs:21"
             ]
         );
     }
@@ -827,17 +753,6 @@ mod tests {
             "a line without a subject still carries the field: {bare_json}"
         );
         assert!(bare_json["subject"].is_null());
-    }
-
-    /// An errand's lines are about the errand without the caller having to say so.
-    #[tokio::test]
-    async fn an_errands_line_is_about_its_errand() {
-        let pool = test_pool().await;
-        append_for_errand(&pool, 2, "errand_rule_fired", "a turn", Some(9))
-            .await
-            .unwrap();
-        let entries = list_errand_feed(&pool, 2, 50).await.unwrap();
-        assert_eq!(entries[0].subject.as_deref(), Some("errand:2"));
     }
 
     /// The timeline is the reader the replay is built on, so it has to carry the key too.
@@ -999,68 +914,12 @@ mod tests {
         assert_eq!(project[0].summary, "project summary");
     }
 
-    /// An errand's line does not fall into the global feed.
-    ///
-    /// This is the whole of T10 and it is a correction, not an addition. `Global` has always meant
-    /// `project_id IS NULL`, and that was the same thing as "belongs to nobody in particular" only
-    /// because a project was the one owner there was. An errand is a second owner with no
-    /// `project_id`, so on the old clause every scheduled errand turn — and there will be one per
-    /// rule per day — would land in the feed a person opens to see what the MACHINE did overnight.
-    /// The global feed would become an errand log, and the thing it was for would be unreadable.
-    #[tokio::test]
-    async fn an_errands_line_does_not_fall_into_the_global_feed() {
-        let pool = test_pool().await;
-        append(
-            &pool,
-            None,
-            "kill_switch",
-            "the stop was released",
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        append_for_errand(&pool, 1, "errand_rule_fired", "manhã fired", None)
-            .await
-            .unwrap();
-
-        let global = list_feed(&pool, None, 50).await.unwrap();
-        assert_eq!(global.len(), 1, "{global:?}");
-        assert_eq!(global[0].summary, "the stop was released");
-
-        let searched = search(&pool, &scoped(FeedScope::Global)).await.unwrap();
-        assert_eq!(searched.len(), 1, "{searched:?}");
-        assert_eq!(searched[0].summary, "the stop was released");
-    }
-
-    /// One errand's feed is its own, and it carries the errand it belongs to.
-    ///
-    /// Two errands share `project_id IS NULL` and nothing else in the row told them apart, which is
-    /// the same gap `proposals.errand_id` closed one table over. Without it the only feed an errand
-    /// could have is everybody's.
-    #[tokio::test]
-    async fn an_errands_feed_is_its_own() {
-        let pool = test_pool().await;
-        append_for_errand(&pool, 1, "errand_rule_fired", "carros", None)
-            .await
-            .unwrap();
-        append_for_errand(&pool, 2, "errand_rule_fired", "casa", None)
-            .await
-            .unwrap();
-
-        let carros = search(&pool, &scoped(FeedScope::Errand(1))).await.unwrap();
-
-        assert_eq!(carros.len(), 1, "{carros:?}");
-        assert_eq!(carros[0].summary, "carros");
-        assert_eq!(carros[0].errand_id, Some(1));
-    }
-
-    /// The aggregate keeps aggregating: `All` still means everything, errands included.
+    /// The aggregate keeps aggregating: `All` still means everything.
     ///
     /// `Global` narrowing and `All` narrowing with it would be the same bug in the other direction
     /// — a machine-wide view that quietly stopped showing a whole class of work.
     #[tokio::test]
-    async fn the_aggregate_still_carries_the_errands_too() {
+    async fn the_aggregate_carries_every_scope() {
         let pool = test_pool().await;
         append(
             &pool,
@@ -1082,39 +941,12 @@ mod tests {
         )
         .await
         .unwrap();
-        append_for_errand(&pool, 1, "errand_rule_fired", "manhã fired", None)
-            .await
-            .unwrap();
 
-        assert_eq!(list_all(&pool, 50).await.unwrap().len(), 3);
+        assert_eq!(list_all(&pool, 50).await.unwrap().len(), 2);
         assert_eq!(
             search(&pool, &scoped(FeedScope::All)).await.unwrap().len(),
-            3
+            2
         );
-    }
-
-    /// A project's feed does not acquire errands, which is the regression half of the same change.
-    #[tokio::test]
-    async fn a_projects_feed_is_untouched_by_errands() {
-        let pool = test_pool().await;
-        append(
-            &pool,
-            Some("project-a"),
-            "run_completed",
-            "a run",
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        append_for_errand(&pool, 1, "errand_rule_fired", "manhã fired", None)
-            .await
-            .unwrap();
-
-        let project = list_feed(&pool, Some("project-a"), 50).await.unwrap();
-        assert_eq!(project.len(), 1);
-        assert_eq!(project[0].summary, "a run");
-        assert_eq!(project[0].errand_id, None);
     }
 
     #[tokio::test]
@@ -1406,7 +1238,7 @@ mod tests {
         timeline.entries.iter().map(|entry| entry.id).collect()
     }
 
-    /// The window is inclusive at both ends, carries every owner a line can have, and reads oldest
+    /// The window is inclusive at both ends, carries every scope, and reads oldest
     /// first — the opposite of every other reader here, because a day is read from its morning.
     #[tokio::test]
     async fn a_timeline_is_every_scope_inside_the_window_oldest_first() {
@@ -1424,14 +1256,8 @@ mod tests {
         )
         .await;
         let tie = insert_entry(&pool, None, "event", "tie", "2026-03-01T12:00:00+00:00").await;
-        let errand = append_for_errand(&pool, 4, "errand_rule_fired", "errand", None)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE feed SET created_at = '2026-03-01T10:00:00+00:00' WHERE id = ?")
-            .bind(errand)
-            .execute(&pool)
-            .await
-            .unwrap();
+        let middle =
+            insert_entry(&pool, None, "event", "middle", "2026-03-01T10:00:00+00:00").await;
         let end = insert_entry(&pool, None, "event", "end", "2026-03-01T18:00:00+00:00").await;
         insert_entry(&pool, None, "event", "after", "2026-03-01T18:00:01+00:00").await;
 
@@ -1445,7 +1271,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(ids(&found), [start, errand, late, tie, end]);
+        assert_eq!(ids(&found), [start, middle, late, tie, end]);
         assert!(!found.truncated);
     }
 
@@ -1620,5 +1446,133 @@ mod tests {
         assert_eq!(pruned.through, Some(gone));
         assert_eq!(pruned.through_created_at, None);
         assert!(newest > gone);
+    }
+
+    /// Migration `0151` removes what the errands feature left in the database. It is reached by
+    /// stopping the chain at 148, seeding every shape the feature wrote, and finishing the chain,
+    /// because a fresh database has none of these rows and the migration's `DELETE`s would never run.
+    #[tokio::test]
+    async fn migration_0151_removes_what_errands_left_in_the_database() {
+        let pool = crate::testdb::pool_migrated_through(148).await;
+        let at = "2026-09-01T00:00:00Z";
+
+        sqlx::query(
+            "INSERT INTO errands (id, name, chat_key, folder, created_at) VALUES (1, 'e', 'k', 'f', ?)",
+        )
+        .bind(at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO errand_rules (errand_id, name, cron, prompt, last_fired_at, created_at)              VALUES (1, 'r', '* * * * *', 'p', ?, ?)",
+        )
+        .bind(at)
+        .bind(at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO errand_artifacts (errand_id, path, created_at) VALUES (1, 'a', ?)",
+        )
+        .bind(at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO feed (id, kind, summary, created_at, errand_id, subject)              VALUES (1, 'errand_note', 'about an errand', ?, 1, 'errand:1')",
+        )
+        .bind(at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO feed (id, kind, summary, created_at) VALUES (2, 'machine', 'kept', ?)",
+        )
+        .bind(at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO proposals (id, kind, reasoning, created_at, errand_id)              VALUES (1, 'action-approval', 'refused', ?, 1)",
+        )
+        .bind(at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO knowledge (id, layer, scope_kind, scope_id, source, kind, title, body, status, created_at)              VALUES (1, 'semantic', 'errand', '1', 'owner', 'memory', 't', 'b', 'active', ?)",
+        )
+        .bind(at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO knowledge_events (knowledge_id, to_status, at) VALUES (1, 'active', ?)",
+        )
+        .bind(at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO notify_policy (scope, selector, enabled, updated_at)              VALUES ('family', 'errand_', 1, ?)",
+        )
+        .bind(at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        crate::testdb::apply_migrations_after(&pool, 148).await;
+
+        for table in ["errands", "errand_rules", "errand_artifacts"] {
+            let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = ?")
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(left, 0, "table {table} must be gone");
+        }
+        for table in ["feed", "proposals"] {
+            let column: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = 'errand_id'",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(column, 0, "{table} must have no errand_id column");
+        }
+
+        let feed: Vec<i64> = sqlx::query_scalar("SELECT id FROM feed ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(feed, vec![2], "only the machine line stays");
+        let proposals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proposals")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            proposals, 1,
+            "a proposal is a refused-action record and stays"
+        );
+        let knowledge: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'errand'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(knowledge, 0);
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(events, 0);
+        let policy: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notify_policy")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(policy, 0);
     }
 }

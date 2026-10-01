@@ -9,7 +9,7 @@ import { readState } from "../ui/state-map";
  * A line is a moment; what a person asks about is a THING — did job 57 land, is run 900612 still
  * trying. So the trace draws sequences: every line about one subject is one row, a bar from its
  * first line to its last. The subject is the núcleo's (`job:57`, `run:900598`), with the older
- * owners as the fallback for a line written before subjects existed — a run id, then an errand.
+ * owners as the fallback for a line written before subjects existed — a run id.
  *
  * A line with none of them is about nothing that lasts — a digest, a config written, an urgent
  * e-mail — and those group by KIND into a series: eight nightly digests are one row of eight
@@ -24,7 +24,7 @@ import { readState } from "../ui/state-map";
  * The subject families the núcleo writes; `series` for subject-less lines of one kind, and `line`
  * for a series of exactly one.
  */
-export type SequenceFamily = "job" | "run" | "council" | "team_run" | "vcs" | "errand" | "series" | "line";
+export type SequenceFamily = "job" | "run" | "council" | "team_run" | "vcs" | "series" | "line";
 
 /** What a sequence's bar is filled with: how its newest line weighs, or a shadow decision, or nothing. */
 export type SequenceShade = Exclude<FeedGravity, "routine"> | "shadow" | "routine";
@@ -34,7 +34,7 @@ export interface FeedSequence {
   /** `null` for a subject whose prefix this shell has never heard of — it is named by itself. */
   family: SequenceFamily | null;
   name: string;
-  /** The project, or the errand for a line that is not the errand's own; `null` is the machine itself. */
+  /** The project; `null` is the machine itself. */
   owner: string | null;
   lane: FeedLane;
   /** Oldest first. */
@@ -60,13 +60,12 @@ export interface FeedSequence {
 }
 
 const RANK: Record<FeedGravity, number> = { routine: 0, asks: 1, held: 2, wrong: 3 };
-const FAMILIES: ReadonlySet<string> = new Set(["job", "run", "council", "team_run", "vcs", "errand"]);
+const FAMILIES: ReadonlySet<string> = new Set(["job", "run", "council", "team_run", "vcs"]);
 
-/** The key a line is grouped under: its subject, else its run, else its errand, else its kind. */
+/** The key a line is grouped under: its subject, else its run, else its kind. */
 export function sequenceKey(entry: FeedEntry): string {
   if (entry.subject !== null && entry.subject !== "") return entry.subject;
   if (entry.run_id !== null) return `run:${entry.run_id}`;
-  if (entry.errand_id !== null) return `errand:${entry.errand_id}`;
   return `kind:${entry.kind}`;
 }
 
@@ -97,7 +96,7 @@ function withoutName(label: string, name: string): string {
  *
  * The id is always there, because it is what the rest of the app searches by. A second part is
  * added only where a summary the núcleo writes carries one in a fixed shape — the rule a job was
- * started from, the errand's own name — and never guessed from free text.
+ * started from — and never guessed from free text.
  */
 function nameOf(key: string, family: SequenceFamily | null, id: string, lines: FeedEntry[]): string {
   const extra = (pattern: RegExp) => {
@@ -118,8 +117,6 @@ function nameOf(key: string, family: SequenceFamily | null, id: string, lines: F
       return `team run ${id}`;
     case "vcs":
       return `vcs request ${id}`;
-    case "errand":
-      return `errand ${id}${extra(/of the errand "([^"]+)"/)}`;
     case "line":
     case "series":
       return readFeedKind(lines[0].kind)?.label ?? lines[0].kind;
@@ -176,7 +173,6 @@ export function buildSequences(entries: FeedEntry[]): FeedSequence[] {
 
     const retries = lines.filter((line) => line.kind === "run_retry").length;
     const project = lines.find((line) => line.project_id !== null)?.project_id ?? null;
-    const errand = family === "errand" ? null : (lines.find((line) => line.errand_id !== null)?.errand_id ?? null);
     // A series is many owners' lines of one kind; it has an owner only when they all share one.
     const shared = family !== "series" || lines.every((line) => line.project_id === project);
     const name = nameOf(key, family, id, lines);
@@ -186,7 +182,7 @@ export function buildSequences(entries: FeedEntry[]): FeedSequence[] {
       key,
       family,
       name,
-      owner: shared ? (project ?? (errand !== null ? `errand ${errand}` : null)) : null,
+      owner: shared ? project : null,
       lane: feedLaneOf((weightiest ?? lines[0]).kind),
       lines,
       start: time(lines[0]),

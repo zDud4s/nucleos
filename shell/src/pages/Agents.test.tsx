@@ -46,7 +46,7 @@ function team(overrides: Partial<Employer> = {}): Employer {
 
 /**
  * The agent routes, over mutable state — the same shape `councilFetch` in
- * `Council.test.tsx` and `errandsFetch` in `Errands.test.tsx` use: a page that
+ * `Council.test.tsx` uses: a page that
  * refetches after a mutation needs the next `GET` to answer with the changed
  * row, not with whatever a one-shot mock happened to return first.
  *

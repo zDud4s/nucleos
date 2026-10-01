@@ -267,23 +267,6 @@ pub struct RunRequest {
     pub permission: Permission,
     pub resume_session_id: Option<String>,
     pub mcp_config: Option<PathBuf>,
-    /// Which surface the server named by `mcp_config` announces: an errand id for a boxed server,
-    /// `None` for one that serves the whole tool list.
-    ///
-    /// **The other half of a pair.** `mcp_config` says a server is offered at all; this says what
-    /// that server offers. The two are set together or not at all, and a `Some` here beside a
-    /// `None` there is a state no caller builds — nothing is announced by a server that does not
-    /// exist.
-    ///
-    /// **It is the ARGUMENT, carried, and never a re-derivation.** The value is the `errand` that
-    /// `assistant::build_mcp_config(exe, errand)` was called with, passed along from that same call
-    /// site — so the box this field names and the box the config file describes are one expression
-    /// evaluated once, and cannot drift. The alternatives were to read the box back out of the
-    /// config path, out of the file, or out of the chat's errand row; each is a second source of
-    /// truth for a fact the launch already holds in a local variable, and each goes quietly wrong
-    /// the day one side changes. [`authored_prompt`] is the only reader, and its doc says what such
-    /// a guess would cost.
-    pub mcp_box: Option<i64>,
     pub tool_policy: ToolPolicy,
     pub progress_timeout: Option<Duration>,
     /// How many model responses this run may take before the daemon stops it. `None` is no ceiling.
@@ -428,7 +411,7 @@ pub struct RunRequest {
     /// followed by a `compact_result`. Both are read back below, so a compaction is something the
     /// transcript can show rather than something that silently happened.
     ///
-    /// `None` on every run that is not a conversation. A one-shot errand has no second turn for a
+    /// `None` on every run that is not a conversation. A one-shot run has no second turn for a
     /// compaction to serve, and naming a window for it would only move the point at which a single
     /// long tool loop starts summarising itself.
     pub context_window: Option<i64>,
@@ -2087,23 +2070,10 @@ pub trait CommandRunner: Send + Sync {
 /// a second source of truth for any of them is a number that quietly stops matching the day somebody
 /// changes a flag.
 ///
-/// **The schema block is priced from `mcp_config` being present, and priced BY THE BOX that config
-/// names.** A run with no `--mcp-config` is offered no tools by this daemon, so its schema cost is a
-/// real zero rather than an unknown. A run that has one pays for whatever its own server announces,
-/// which is not the same figure for every run: an unboxed server advertises the whole tool list, an
-/// errand's server advertises four errand tools and the handful every box keeps, and the two differ
-/// by roughly twelve to one. Charging every server the unboxed figure — which this did while the
-/// only launcher recording a row never set `mcp_config` at all — would have overstated an errand
-/// turn by that factor the moment a chat turn started being recorded, which is what it now is.
-///
-/// **Which box is a fact the launch holds, not one this function may infer.** It arrives on
-/// `RunRequest::mcp_box`, carried from the `assistant::build_mcp_config(exe, errand)` call that
-/// wrote the config file, so the price and the surface are two readings of one expression. The
-/// tempting shortcut — recover the box from the config path, or parse the file, or look up the
-/// chat's errand — is the thing this pair of fields exists to forbid: every one of those produces a
-/// number that LOOKS measured, agrees with the file only for as long as nobody edits either side,
-/// and reports its disagreement to nobody when it stops. `served_in_box` in `mcp_tools` is the same
-/// argument one layer down, and says why the price and the fold must not be two copies of a rule.
+/// **The schema block is priced from `mcp_config` being present.** A run with no `--mcp-config` is
+/// offered no tools by this daemon, so its schema cost is a real zero rather than an unknown. A run
+/// that has one pays for whatever its server announces, which is the whole tool list, read off the
+/// same router that answers `list_tools`.
 ///
 /// **A server that is ANNOUNCED is not a server whose schemas are SENT, and only the second is
 /// charged.** When the CLI keeps its `ToolSearch` built-in it advertises MCP tools by NAME and
@@ -2126,7 +2096,7 @@ pub(crate) fn authored_prompt(request: &RunRequest) -> crate::prompt_budget::Aut
             // different fact from the one above it, and `AuthoredPrompt::schema_chars` is where the
             // two are told apart for whoever reads the stored number.
             Some(_) if schemas_are_deferred(request) => 0,
-            Some(_) => crate::mcp_tools::NucleosTools::advertised_schema_chars(request.mcp_box),
+            Some(_) => crate::mcp_tools::NucleosTools::advertised_schema_chars(),
         },
         // Only counted when the flag is actually written. `Some("")` is not a state any caller
         // builds, but counting an absent value as zero and a present one by its length is what keeps
@@ -2994,8 +2964,7 @@ pub(crate) struct CodexStaged {
 /// Translates the daemon's stdio MCP configuration into Codex overrides.
 /// `codex exec` runs with approval policy `never`, so Codex immediately declines an MCP tool call
 /// that needs confirmation ("user cancelled MCP tool call" on 0.144.4). `approve` pre-approves
-/// the daemon's own MCP servers, as the Claude path does with `--allowedTools mcp__nucleos__*`;
-/// an errand's box remains enforced by the server's own arguments.
+/// the daemon's own MCP servers, as the Claude path does with `--allowedTools mcp__nucleos__*`.
 pub(crate) fn codex_mcp_overrides(
     config: &serde_json::Value,
     env_names: &[String],
@@ -3339,7 +3308,7 @@ impl CommandRunner for CodexCliRunner {
             )));
         }
         // MCP config is honoured through `codex_mcp_overrides`, which translates it into
-        // `-c mcp_servers.<name>...` overrides. An errand's tool box travels in the server's own `--mcp-tools` arguments, so it survives that translation.
+        // `-c mcp_servers.<name>...` overrides.
         // The daemon's own servers are pre-approved (`default_tools_approval_mode = "approve"`).
         // Servers in the user's `~/.codex/config.toml` still load with that file's approval because
         // `codex exec` has no counterpart to the Claude CLI's `--strict-mcp-config`.
@@ -3647,17 +3616,12 @@ pub struct FakeCommandRunner {
     pub delay: std::sync::Mutex<Option<std::time::Duration>>,
     pub last_permission: std::sync::Mutex<Option<Permission>>,
     /// The prompt the launch was handed. Recorded because a turn's prompt is not always the text
-    /// the person typed — an errand's notebook is prepended to it — so what the CLI actually
+    /// the person typed — a launcher may prepend context to it — so what the CLI actually
     /// received is the only place that injection can be observed.
     pub last_prompt: std::sync::Mutex<Option<String>>,
     pub last_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub last_resume: std::sync::Mutex<Option<String>>,
     pub last_mcp_config: std::sync::Mutex<Option<std::path::PathBuf>>,
-    /// Which box the launch said its server serves. Recorded beside `last_mcp_config` because the
-    /// two are one fact in two halves, and this is the half that is easy to get wrong: a path is
-    /// obviously present or absent, whereas a box that quietly disagrees with the config file looks
-    /// exactly like an honest `None` and is charged as the whole tool surface.
-    pub last_mcp_box: std::sync::Mutex<Option<Option<i64>>>,
     pub last_tool_policy: std::sync::Mutex<Option<ToolPolicy>>,
     pub last_session_id: std::sync::Mutex<Option<String>>,
     pub last_fork_session: std::sync::Mutex<Option<bool>>,
@@ -3914,7 +3878,6 @@ impl CommandRunner for FakeCommandRunner {
         *self.last_permission.lock().unwrap() = Some(request.permission);
         *self.last_resume.lock().unwrap() = request.resume_session_id.clone();
         *self.last_mcp_config.lock().unwrap() = request.mcp_config.clone();
-        *self.last_mcp_box.lock().unwrap() = Some(request.mcp_box);
         *self.last_tool_policy.lock().unwrap() = Some(request.tool_policy);
         *self.last_session_id.lock().unwrap() = request.session_id.clone();
         *self.last_fork_session.lock().unwrap() = Some(request.fork_session);
@@ -4737,69 +4700,16 @@ mod tests {
     /// than a gap.
     ///
     /// This daemon writes `--mcp-config` or it does not; when it does not, the model is offered no
-    /// tools by us and there is no schema block in its prompt to pay for. The second half of the
-    /// test is the state the pairing forbids: a box named with no server to announce it still costs
-    /// nothing, because it is `mcp_config` that decides whether anything is announced at all.
+    /// tools by us and there is no schema block in its prompt to pay for.
     #[test]
     fn a_request_offered_no_server_is_charged_nothing_for_schemas() {
         let mut request = baseline_run_request();
-        // `McpOnly` and not the baseline's `Unrestricted`, so that the zeros below are attributable
+        // `McpOnly` and not the baseline's `Unrestricted`, so that the zero below is attributable
         // to the ABSENT SERVER. An unrestricted run defers its schemas and reads 0 whatever its
-        // config says, which would make both assertions pass without touching what they are about.
+        // config says, which would make the assertion pass without touching what it is about.
         request.tool_policy = ToolPolicy::McpOnly;
         assert!(request.mcp_config.is_none());
         assert_eq!(authored_prompt(&request).schema_chars, 0);
-
-        request.mcp_box = Some(7);
-        assert_eq!(
-            authored_prompt(&request).schema_chars,
-            0,
-            "a box with no server behind it announced nothing, so it may not be charged for"
-        );
-    }
-
-    /// A boxed server announces a fraction of the surface, and the price follows the box rather
-    /// than the mere presence of the flag.
-    ///
-    /// **The assertions are relationships and not byte counts, on purpose.** The figure is
-    /// `serde_json` run over the live tool router, so it moves whenever a tool is added, renamed, or
-    /// has a sentence added to its description — and a hardcoded literal here would fail on every
-    /// honest edit and teach its next reader to paste in whatever the failure printed. What has to
-    /// hold is the property: the boxed price is the box's own, it is a small part of the whole, and
-    /// it is what a boxed request is charged.
-    ///
-    /// The order-of-magnitude bound is the one that would have caught the bug this pair of fields
-    /// exists to prevent. Pricing every server unboxed overstated an errand turn by roughly twelve
-    /// to one, which is invisible in a total and enormous in a bill.
-    #[test]
-    fn a_boxed_request_is_charged_for_the_box_and_not_the_whole_surface() {
-        let mut request = baseline_run_request();
-        request.mcp_config = Some(PathBuf::from("mcp.json"));
-        // `McpOnly` is the only policy under which a schema price is non-zero at all: it denies the
-        // built-ins, `ToolSearch` among them, so the CLI cannot defer and the schemas really are in
-        // the prompt. Under the baseline's `Unrestricted` every assertion below would read 0 against
-        // 0 and the box-versus-whole comparison would be vacuous.
-        request.tool_policy = ToolPolicy::McpOnly;
-        let whole = authored_prompt(&request).schema_chars;
-
-        request.mcp_box = Some(7);
-        let boxed = authored_prompt(&request).schema_chars;
-
-        assert_eq!(
-            boxed,
-            crate::mcp_tools::NucleosTools::advertised_schema_chars(Some(7)),
-            "the price must be the box's own announcement, taken from the one function that folds it"
-        );
-        assert!(
-            boxed > 0,
-            "an errand's server announces four errand tools and the handful every box keeps, so \
-             its surface is small and is not empty"
-        );
-        assert!(
-            boxed * 8 < whole,
-            "a boxed server must announce a small part of the whole surface — measured at roughly \
-             twelve to one — and this said {boxed} against {whole}"
-        );
     }
 
     /// The same server, announced twice, charged once — because only one of the two runs was sent
@@ -4835,7 +4745,7 @@ mod tests {
         request.tool_policy = ToolPolicy::McpOnly;
         assert_eq!(
             authored_prompt(&request).schema_chars,
-            crate::mcp_tools::NucleosTools::advertised_schema_chars(request.mcp_box),
+            crate::mcp_tools::NucleosTools::advertised_schema_chars(),
             "denying the built-ins denies `ToolSearch` with them, the CLI cannot defer, and the run \
              really does read every schema its server announces"
         );
@@ -4870,7 +4780,7 @@ mod tests {
         request.denied_tools = vec!["ToolSearch".to_string()];
         assert_eq!(
             authored_prompt(&request).schema_chars,
-            crate::mcp_tools::NucleosTools::advertised_schema_chars(request.mcp_box),
+            crate::mcp_tools::NucleosTools::advertised_schema_chars(),
             "one name on `--disallowedTools` and the CLI has no way to fetch a schema on demand, so \
              it ships them all — the price must follow the flag, not the policy the flag sits under"
         );
@@ -4884,7 +4794,6 @@ mod tests {
             permission: Permission::Default,
             resume_session_id: None,
             mcp_config: None,
-            mcp_box: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,
@@ -5078,7 +4987,6 @@ mod tests {
             permission: Permission::Default,
             resume_session_id: None,
             mcp_config: None,
-            mcp_box: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,

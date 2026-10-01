@@ -292,8 +292,8 @@ pub async fn remove(
         // TEXT, so comparing them without it matches NOTHING — the same silent nothing as the wrong
         // position above, arriving by a different route.
         //
-        // `machine` and `errand` appear in neither statement, and that is correct: machine rows are
-        // not a project's, and an errand has no project at all.
+        // `machine` appears in neither statement, and that is correct: machine rows are not a
+        // project's.
         forgotten += sqlx::query(
             "DELETE FROM knowledge_events
               WHERE knowledge_id IN (

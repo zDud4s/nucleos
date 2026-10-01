@@ -43,7 +43,6 @@ function entry(overrides: Partial<FeedEntry> = {}): FeedEntry {
     kind: "job_started",
     summary: "job 1 started",
     run_id: null,
-    errand_id: null,
     subject: null,
     created_at: "2026-08-17T09:00:00Z",
     ...overrides,

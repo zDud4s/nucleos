@@ -32,7 +32,6 @@ import {
   GraduationCap,
   Hourglass,
   LayoutDashboard,
-  ListChecks,
   Mail,
   MessagesSquare,
   Mic,
@@ -191,7 +190,6 @@ export const NAV: NavGroup[] = [
     label: "Work",
     items: [
       { id: "chats", label: "Chats", path: "/chats", icon: MessagesSquare, badge: "chats" },
-      { id: "errands", label: "Errands", path: "/errands", icon: ListChecks },
       { id: "teams", label: "Teams", path: "/teams", icon: Users },
       { id: "agents", label: "Agents", path: "/agents", icon: Bot },
       { id: "council", label: "Council", path: "/council", icon: Scale },

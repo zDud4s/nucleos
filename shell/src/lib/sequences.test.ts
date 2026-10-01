@@ -20,7 +20,6 @@ function line(id: number, minute: number, kind: string, overrides: Partial<FeedE
     kind,
     summary: `line ${id}`,
     run_id: null,
-    errand_id: null,
     subject: null,
     created_at: new Date(T0 + minute * MINUTE).toISOString(),
     ...overrides,
@@ -28,10 +27,9 @@ function line(id: number, minute: number, kind: string, overrides: Partial<FeedE
 }
 
 describe("which lines are one sequence", () => {
-  it("keys on the subject, then the run, then the errand, then the line itself", () => {
+  it("keys on the subject, then the run, then the line itself", () => {
     expect(sequenceKey(line(1, 0, "job_started", { subject: "job:57", run_id: 9 }))).toBe("job:57");
     expect(sequenceKey(line(2, 0, "run_retry", { run_id: 900612 }))).toBe("run:900612");
-    expect(sequenceKey(line(3, 0, "errand_rule_fired", { errand_id: 2, project_id: null }))).toBe("errand:2");
     expect(sequenceKey(line(4, 0, "email_urgent", { project_id: null }))).toBe("kind:email_urgent");
   });
 
@@ -97,7 +95,6 @@ describe("which lines are one sequence", () => {
       line(3, 2, "council_finished", { subject: "council:12", project_id: null }),
       line(4, 3, "team_run_finished", { subject: "team_run:8", project_id: null }),
       line(5, 4, "vcs_request_finished", { subject: "vcs:21" }),
-      line(6, 5, "errand_rule_fired", { subject: "errand:2", project_id: null, errand_id: 2, summary: 'the rule "weekday sweep" of the errand "inbox" started a turn' }),
       line(7, 6, "promotion_ready", { project_id: "charlie" }),
       line(8, 7, "job_finished", { subject: "widget:3" }),
     ]).map((sequence) => sequence.name);
@@ -107,19 +104,9 @@ describe("which lines are one sequence", () => {
       "council 12",
       "team run 8",
       "vcs request 21",
-      "errand 2 · inbox",
       "promotion ready",
       "widget:3",
     ]);
-  });
-
-  it("an errand's line elsewhere is owned by the errand; the machine's own has no owner", () => {
-    const [web, digest] = buildSequences([
-      line(1, 0, "web.read", { project_id: null, errand_id: 2, subject: "run:5" }),
-      line(2, 1, "email_digest", { project_id: null }),
-    ]);
-    expect(web.owner).toBe("errand 2");
-    expect(digest.owner).toBeNull();
   });
 
   it("counts attempts from retries, and a retry that is the newest line leaves the run open", () => {
@@ -167,9 +154,9 @@ describe("which lines are one sequence", () => {
 
   it("is coloured by how it ended, not by the last thing that went wrong", () => {
     const [recovered] = buildSequences([
-      line(1, 0, "errand_rule_fired", { subject: "errand:2" }),
-      line(2, 10, "errand_rule_failed", { subject: "errand:2" }),
-      line(3, 20, "web.read", { subject: "errand:2" }),
+      line(1, 0, "job_started", { subject: "run:5" }),
+      line(2, 10, "job_item_failed", { subject: "run:5" }),
+      line(3, 20, "web.read", { subject: "run:5" }),
     ]);
     expect(recovered.gravity).toBe("wrong");
     expect(recovered.shade).toBe("routine");
@@ -208,7 +195,7 @@ describe("lanes on the trace", () => {
         line(2, 1, "job_finished", { subject: "job:1" }),
       ]),
     );
-    expect(lanes.map((lane) => lane.lane)).toEqual(["jobs", "errands"]);
+    expect(lanes.map((lane) => lane.lane)).toEqual(["jobs", "mail"]);
     expect(lanes[0].folded).toEqual([]);
   });
 

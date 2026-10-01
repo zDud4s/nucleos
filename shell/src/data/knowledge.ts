@@ -52,10 +52,10 @@ export type KnownKind = "prompt" | "memory" | "skill" | "subagent";
 export type KnownLayer = "semantic" | "episodic" | "procedural" | "working";
 
 /**
- * Whose it is. Two columns rather than one, because `errand` and `job` are not
- * projects and a single nullable `project_id` could not say so.
+ * Whose it is. Two columns rather than one, because a `job` is not
+ * a project and a single nullable `project_id` could not say so.
  */
-export type KnownScope = "machine" | "project" | "errand" | "job";
+export type KnownScope = "machine" | "project" | "job";
 
 /**
  * A row's status.

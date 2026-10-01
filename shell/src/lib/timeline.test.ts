@@ -16,7 +16,7 @@ import {
 const NOON = new Date(2026, 7, 24, 12, 0, 0, 0).getTime();
 
 function line(id: number, at: number, kind = "job_started"): FeedEntry {
-  return { id, project_id: "alpha", kind, summary: `line ${id}`, run_id: null, errand_id: null, subject: null, created_at: new Date(at).toISOString() };
+  return { id, project_id: "alpha", kind, summary: `line ${id}`, run_id: null, subject: null, created_at: new Date(at).toISOString() };
 }
 
 const seenAt = (at: number) => ({ through: 1, through_created_at: new Date(at).toISOString(), seen_at: new Date(at).toISOString() });

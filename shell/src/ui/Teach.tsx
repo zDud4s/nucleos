@@ -13,8 +13,7 @@ export interface TeachProps {
  * An empty list, used to explain the machine.
  *
  * Most of this app's surfaces are empty most of the time, and each emptiness
- * means something specific: no errands exist yet *and they are created from
- * Telegram*; no proposals are waiting *because the autopilot is off*; the
+ * means something specific: no proposals are waiting *because the autopilot is off*; the
  * archive has no pages *because nothing has been read yet*. "Nothing here" is
  * a wasted sentence in every one of those cases.
  *

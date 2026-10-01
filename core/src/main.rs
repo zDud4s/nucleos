@@ -28,7 +28,6 @@ mod council;
 mod daemon_client;
 mod detect;
 mod email;
-mod errands;
 mod exclusion;
 mod feed;
 mod files;
@@ -838,9 +837,9 @@ async fn main() {
     }
 
     if std::env::args().any(|a| a == "--mcp-tools") {
-        // `--box errand --errand <id>` and `--box job-node --job <id>` narrow what this process
-        // serves. Refused rather than ignored when the box is not one this server knows: a launcher
-        // that misspells it would otherwise get the broad tool set, with nothing saying so.
+        // `--box job-node --job <id>` narrows what this process serves. Refused rather than
+        // ignored when the box is not one this server knows: a launcher that misspells it would
+        // otherwise get the broad tool set, with nothing saying so.
         let args: Vec<String> = std::env::args().collect();
         let served = match mcp_tools::box_from_args(&args) {
             Ok(served) => served,

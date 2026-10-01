@@ -132,7 +132,7 @@
  *
  * `--surface-raised` and not `--surface`, which is the one thing the copies
  * genuinely disagreed about — nine more boxes (`runs-row`, `teams-rule`,
- * `council-seat`, `errands-rule`, `mail-detail-attachment`, …) used the lower
+ * `council-seat`, `mail-detail-attachment`, …) used the lower
  * rung. The split is a dark-theme artefact: in light the two tokens are the same
  * white, so those nine and these ten already render identically, and only dark
  * had to be decided. On a `--surface` panel the lower rung leaves the box with
@@ -1048,8 +1048,7 @@
  * a *claim*: nobody wrote this by hand. Six pages hit the same wall, and the
  * clearest statement of it came from `council.css` — a seat's answer set in mono
  * while the chairman's synthesis below it stays in the body face would assert
- * two different authors. `errands` put a notebook a person writes at 11px muted
- * and said so; `mail` declined the well outright for a message body.
+ * two different authors. `mail` declined the well outright for a message body.
  *
  * So the recess stays and the face changes. Same hole, same surface; what
  * differs is who filled it.

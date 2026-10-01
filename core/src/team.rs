@@ -2850,9 +2850,8 @@ fn mcp_config_path(team_run_id: &str) -> std::path::PathBuf {
 fn write_mcp_config(team_run_id: &str) -> std::io::Result<std::path::PathBuf> {
     let path = mcp_config_path(team_run_id);
     let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-    // `None`: a department is not an errand. What narrows its surface is `--allowedTools` from
-    // `TEAM_TOOLS`, decided per node, not the server-side box.
-    let body = serde_json::to_vec(&crate::assistant::build_mcp_config(&exe, None))
+    // What narrows a department's surface is `--allowedTools` from `TEAM_TOOLS`, decided per node.
+    let body = serde_json::to_vec(&crate::assistant::build_mcp_config(&exe))
         .map_err(std::io::Error::other)?;
     crate::storage::write_atomic(&path, &body)?;
     Ok(path)
@@ -3128,12 +3127,11 @@ async fn spawn_agent(
         permission: crate::runner::Permission::Default,
         resume_session_id: None,
         mcp_config,
-        // Unboxed, like the council seat this launch is modelled on: `write_mcp_config` above
-        // calls `assistant::build_mcp_config(&exe, None)`, so a member with tools is offered the
-        // whole surface. `allowed_mcp_tools` below narrows what the member may CALL, which is a
+        // Like the council seat this launch is modelled on: `write_mcp_config` above calls
+        // `assistant::build_mcp_config(&exe)`, so a member with tools is offered the whole
+        // surface. `allowed_mcp_tools` below narrows what the member may CALL, which is a
         // different question from what its server announces — and it is the announcement that is
         // paid for in the prompt.
-        mcp_box: None,
         tool_policy: if with_tools {
             crate::runner::ToolPolicy::McpOnly
         } else {

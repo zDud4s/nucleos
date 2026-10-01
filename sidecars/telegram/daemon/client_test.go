@@ -100,115 +100,15 @@ func TestClientGetProjects(t *testing.T) {
 	}
 }
 
-// The errand routes, and the one thing about them that is not obvious: `/pausa` typed in a topic
-// has to find the errand of THAT topic, and the only handle the sidecar holds is the chat key. So
-// the lookup is a list filtered by key, and a topic with no errand is a normal answer rather than
-// an error — most topics do not have one.
-func TestClientErrandRoutes(t *testing.T) {
-	var patched map[string]any
-	var created map[string]string
-	var closedPath string
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.URL.Path == "/errands" && r.Method == http.MethodGet:
-			_, _ = w.Write([]byte(`[
-				{"id":4,"name":"carros","chat_key":"-100123:7","brain":"local","folder":"carros-4","status":"active"},
-				{"id":5,"name":"casa","chat_key":"-100123:9","brain":"cloud","folder":"casa-5","status":"paused"}
-			]`))
-		case r.URL.Path == "/errands" && r.Method == http.MethodPost:
-			_ = json.NewDecoder(r.Body).Decode(&created)
-			_, _ = w.Write([]byte(`{"errand_id":6}`))
-		case r.URL.Path == "/errands/4" && r.Method == http.MethodPatch:
-			_ = json.NewDecoder(r.Body).Decode(&patched)
-			w.WriteHeader(http.StatusNoContent)
-		case r.URL.Path == "/errands/4" && r.Method == http.MethodDelete:
-			closedPath = r.URL.Path
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-
-	client := New(server.URL, "tok")
-
-	errands, err := client.ListErrands()
-	if err != nil {
-		t.Fatalf("ListErrands: %v", err)
-	}
-	if len(errands) != 2 || errands[0].Name != "carros" || errands[0].ChatKey != "-100123:7" {
-		t.Fatalf("ListErrands = %+v", errands)
-	}
-
-	found, ok, err := client.ErrandOfChat("-100123:9")
-	if err != nil || !ok {
-		t.Fatalf("ErrandOfChat: %+v, %v, %v", found, ok, err)
-	}
-	if found.ID != 5 || found.Status != "paused" || found.Brain != "cloud" {
-		t.Fatalf("ErrandOfChat = %+v", found)
-	}
-
-	// A topic with no errand is the common case, and it is an answer and not a failure: almost no
-	// topic has one, and reporting it as an error would put "couldn't reach the daemon" in front of
-	// somebody who simply typed `/pausa` in the wrong place.
-	if _, ok, err := client.ErrandOfChat("-100123:404"); err != nil || ok {
-		t.Fatalf("a topic with no errand should answer not-found: ok=%v err=%v", ok, err)
-	}
-
-	id, err := client.CreateErrand("barcos", "-100123:11")
-	if err != nil {
-		t.Fatalf("CreateErrand: %v", err)
-	}
-	if id != 6 {
-		t.Errorf("CreateErrand id = %d, want 6", id)
-	}
-	if created["name"] != "barcos" || created["chat_key"] != "-100123:11" {
-		t.Errorf("CreateErrand body = %#v", created)
-	}
-
-	if err := client.SetErrandStatus(4, "paused"); err != nil {
-		t.Fatalf("SetErrandStatus: %v", err)
-	}
-	if patched["status"] != "paused" {
-		t.Errorf("patch body = %#v, want status", patched)
-	}
-	// The two PATCH fields are sent one at a time on purpose: `/pausa` must not also restate the
-	// brain, or a command about one thing quietly rewrites another.
-	if _, present := patched["brain"]; present {
-		t.Errorf("a status change must not carry a brain: %#v", patched)
-	}
-
-	patched = nil
-	if err := client.SetErrandBrain(4, "cloud"); err != nil {
-		t.Fatalf("SetErrandBrain: %v", err)
-	}
-	if patched["brain"] != "cloud" {
-		t.Errorf("patch body = %#v, want brain", patched)
-	}
-	if _, present := patched["status"]; present {
-		t.Errorf("a brain change must not carry a status: %#v", patched)
-	}
-
-	if err := client.CloseErrand(4); err != nil {
-		t.Fatalf("CloseErrand: %v", err)
-	}
-	if closedPath != "/errands/4" {
-		t.Errorf("CloseErrand path = %q", closedPath)
-	}
-}
-
 // A refusal arrives as data, not as a sentence. The núcleo names what it refused in the body, and
-// four of its refusals share three status codes — so a client that keeps only the number cannot
-// tell a paused errand (which clears when somebody resumes it) from a chat mid-turn (which clears
-// on its own). Both are 409.
+// several of its refusals share a status code — so a client that keeps only the number cannot
+// tell a chat mid-turn (which clears on its own) from a missing local model (which does not).
+// Both are 409.
 func TestARefusalCarriesTheNucleosOwnNameForIt(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
-		_, _ = w.Write([]byte(`{"refusal":"errand_not_answering"}`))
+		_, _ = w.Write([]byte(`{"refusal":"no_local_model"}`))
 	}))
 	defer server.Close()
 
@@ -221,7 +121,7 @@ func TestARefusalCarriesTheNucleosOwnNameForIt(t *testing.T) {
 	if refused.Status != http.StatusConflict {
 		t.Errorf("Status = %d, want 409", refused.Status)
 	}
-	if refused.Refusal != "errand_not_answering" {
+	if refused.Refusal != "no_local_model" {
 		t.Errorf("Refusal = %q, want the name the núcleo gave it", refused.Refusal)
 	}
 }

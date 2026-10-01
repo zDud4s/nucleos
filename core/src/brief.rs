@@ -1815,7 +1815,7 @@ mod tests {
     ///
     /// Its limits are deliberate and named. (a) Its granularity is the file, so a second launcher
     /// inside an already listed file is invisible. That is true today of `council::run_local_seat`,
-    /// team's `local_agent::run_turn` branch, and `assistant::spawn_local_turn`/`errand_turn`: they
+    /// team's `local_agent::run_turn` branch, and `assistant::spawn_local_turn`: they
     /// build prompts and are deliberately not briefed. (b) It reads only `core/src/*.rs`, not
     /// subdirectories or other crates such as `shell/src-tauri` and `sidecars/`. (c) A launcher that
     /// does not spell `crate::runner::RunRequest {` (for example, imported `RunRequest {` or a

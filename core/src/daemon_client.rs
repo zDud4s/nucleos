@@ -1151,178 +1151,19 @@ impl DaemonClient {
             .await
             .map_err(|e| e.to_string())
     }
-
-    /// Opens an errand on a topic, and answers with the id the daemon minted for it.
-    ///
-    /// There is deliberately no parameter for the folder. It is derived from the id, which does not
-    /// exist until the row does, and `errands::create` mints it there precisely so no caller — this
-    /// one included — gets to say where on disk an errand writes.
-    pub async fn create_errand(&self, name: &str, chat_key: &str) -> Result<i64, String> {
-        let response: Value = self
-            .request(reqwest::Method::POST, "/errands")
-            .json(&serde_json::json!({ "name": name, "chat_key": chat_key }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        response["errand_id"]
-            .as_i64()
-            .ok_or_else(|| "create errand response missing errand_id".into())
-    }
-
-    /// Every errand, newest first, closed ones included — the route makes no distinction and neither
-    /// does this: an errand that ended is still the record of what it found.
-    pub async fn list_errands(&self) -> Result<Value, String> {
-        self.request(reqwest::Method::GET, "/errands")
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    /// Pauses or resumes an errand, moves it between the local model and the cloud, or both.
-    /// `None` leaves that half where it was.
-    pub async fn patch_errand(
-        &self,
-        id: i64,
-        status: Option<&str>,
-        brain: Option<&str>,
-    ) -> Result<Value, String> {
-        let response = self
-            .request(reqwest::Method::PATCH, &format!("/errands/{id}"))
-            .json(&serde_json::json!({ "status": status, "brain": brain }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        // Success here is `204 No Content`, so there is no body and `.json()` would fail with a
-        // decoding error naming nothing useful — the reason `cancel_run` goes through this too.
-        json_or_null(response).await
-    }
-
-    /// Ends an errand, and removes nothing.
-    ///
-    /// Named `close` rather than `delete` after what it does, not after the verb it travels as: the
-    /// row survives with `status = done` and the folder keeps what was found. A method called
-    /// `delete_errand` would describe the HTTP and lie about the effect.
-    pub async fn close_errand(&self, id: i64) -> Result<Value, String> {
-        let response = self
-            .request(reqwest::Method::DELETE, &format!("/errands/{id}"))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        json_or_null(response).await
-    }
-
-    /// What is in this errand's folder, by name.
-    ///
-    /// Every path below is relative to that folder and only means anything against this errand — the
-    /// daemon scopes the listing there, so a name from here can be handed straight back to
-    /// [`Self::read_errand_file`].
-    pub async fn list_errand_files(&self, errand_id: i64) -> Result<Vec<String>, String> {
-        let response = self
-            .request(reqwest::Method::GET, &format!("/errands/{errand_id}/files"))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let listed = json_or_refusal(response, "the listing of an errand's folder").await?;
-        serde_json::from_value(listed).map_err(|e| e.to_string())
-    }
-
-    /// One file of this errand, read back by name.
-    pub async fn read_errand_file(&self, errand_id: i64, path: &str) -> Result<String, String> {
-        let response = self
-            .request(reqwest::Method::GET, &errand_file_path(errand_id, path))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let answer = json_or_refusal(response, &format!("reading {path:?}")).await?;
-        contents_of(&answer)
-    }
-
-    /// Writes a file into this errand's folder.
-    ///
-    /// The whole content, every time — there is no append and no patch, because the daemon writes
-    /// the file and records what wrote it in one step, and a partial write would leave that mark
-    /// describing a file that is now half something else.
-    pub async fn write_errand_file(
-        &self,
-        errand_id: i64,
-        path: &str,
-        contents: &str,
-    ) -> Result<(), String> {
-        let response = self
-            .request(reqwest::Method::PUT, &errand_file_path(errand_id, path))
-            .json(&serde_json::json!({ "contents": contents }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        json_or_refusal(response, &format!("writing {path:?}"))
-            .await
-            .map(|_| ())
-    }
-
-    /// The errand's notebook, which is what it knows across turns.
-    ///
-    /// An empty string is the ordinary answer for an errand that has not written anything yet, and
-    /// not an error: the daemon answers a notebook that does not exist that way on purpose.
-    pub async fn read_errand_notebook(&self, errand_id: i64) -> Result<String, String> {
-        let response = self
-            .request(
-                reqwest::Method::GET,
-                &format!("/errands/{errand_id}/notebook"),
-            )
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let answer = json_or_refusal(response, "reading an errand's notebook").await?;
-        contents_of(&answer)
-    }
-}
-
-/// Where one file of an errand lives, with the path encoded for the wire.
-///
-/// Extracted so both callers spell it the same way, and encoded for the reason
-/// [`urlencoding_encode`] gives about a query value — sharper here, because this value IS the path:
-/// a name carrying `#` or a space would otherwise arrive at the daemon as a different request than
-/// the one intended. `/` survives as `%2F` and reaches the handler decoded, so a file in a
-/// subdirectory of the folder is still reachable, and `..` reaches the daemon's guard as part of the
-/// path it inspects rather than as something the encoding smuggled past it.
-fn errand_file_path(errand_id: i64, path: &str) -> String {
-    format!("/errands/{errand_id}/files/{}", urlencoding_encode(path))
-}
-
-/// The `contents` a read answered with.
-///
-/// Both reads share the envelope, so they share the complaint when it is not there — an answer in an
-/// unexpected shape is a daemon that changed under this client, and reporting it as an empty file
-/// would look exactly like an errand that has written nothing.
-fn contents_of(answer: &Value) -> Result<String, String> {
-    answer["contents"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| "the daemon's answer carried no contents".to_owned())
 }
 
 /// The body of an answer, or the status it was refused with.
 ///
-/// A refusal from the errand routes is a bare status with an empty body — they return
-/// `Result<_, StatusCode>` — so `.json()` on one fails with a decoding error that names nothing
-/// useful. The status IS the message, and on this surface it is a message worth reading: `404` is an
-/// errand, or a file, that is not there; `400` is a path that named somewhere outside the errand's
-/// folder, which is the guard doing its job and not a fault to retry. `context` says which of the
-/// two the caller was attempting, because the status alone does not.
+/// A refusal from a route that returns `Result<_, StatusCode>` is a bare status with an empty body,
+/// so `.json()` on one fails with a decoding error that names nothing useful. The status IS the
+/// message. `context` says what the caller was attempting, because the status alone does not.
 ///
-/// The web routes refuse differently — a status AND a sentence — and go through here for the second
-/// reason, which is sharper. Everything this returns is read by a model deciding what to tell a
-/// person, and the two failures are answered oppositely: a search that came back empty is a fact
-/// about the world, and a search that never happened is a fact about the machine. Told "error
-/// decoding response body", a model has neither, and what it writes into the errand's notebook is
-/// that it looked and found nothing.
+/// The web routes refuse differently — a status AND a sentence — and go through here too.
+/// Everything this returns is read by a model deciding what to tell a person, and the two failures
+/// are answered oppositely: a search that came back empty is a fact about the world, and a search
+/// that never happened is a fact about the machine. Told "error decoding response body", a model has
+/// neither, and what it reports is that it looked and found nothing.
 async fn json_or_refusal(response: reqwest::Response, context: &str) -> Result<Value, String> {
     let status = response.status();
     if !status.is_success() {
@@ -1700,13 +1541,13 @@ mod tests {
         assert_eq!(body.cwd, "C:/projects/active");
     }
 
-    /// What an errand is told when the web is off, and why the wording is the whole task.
+    /// What a model is told when the web is off, and why the wording is the whole task.
     ///
     /// `/web/search` answers a disabled pillar with `503` and a sentence in plain text. Neither web
     /// method looked at the status, so the sentence never arrived: `.json()` choked on it and the
     /// model received `{"error":"error decoding response body"}`. That reads as a glitch in the
-    /// plumbing, and §10 names the failure it produces — the errand writes down that it searched
-    /// and found nothing, which is a lie that then lives in the notebook for good.
+    /// plumbing, and the failure it produces is the model reporting that it searched and found
+    /// nothing, which is a lie.
     ///
     /// A model told the search did not happen can say so. A model told the response would not parse
     /// has nothing to report and will fill the gap itself.
@@ -1745,7 +1586,7 @@ mod tests {
 
     /// A refusal is read by a model, so its length is a cost. The daemon's own sentences are short;
     /// the thing likely to answer a request with kilobytes is a proxy between here and it, and
-    /// handing that to the turn as context is how an unrelated error page becomes what the errand
+    /// handing that to the turn as context is how an unrelated error page becomes what the model
     /// thinks it learned.
     #[tokio::test]
     async fn a_refusal_that_arrives_as_a_wall_of_text_is_cut_down() {

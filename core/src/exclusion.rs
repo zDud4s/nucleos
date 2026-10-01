@@ -254,8 +254,7 @@ pub async fn live(pool: &SqlitePool, project_id: Option<&str>) -> sqlx::Result<V
 /// front to back, and the request that has been waiting longest is the one holding somebody up.
 pub async fn pending_requests(pool: &SqlitePool) -> sqlx::Result<Vec<crate::proposals::Proposal>> {
     sqlx::query_as::<_, crate::proposals::Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
-                NULL AS errand_name, tool_name, reasoning,
+        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
                 tool_input, read_from, created_at, decided_at,
                 NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
          FROM proposals

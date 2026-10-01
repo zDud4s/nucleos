@@ -54,7 +54,6 @@ function argumentAt(source: string, open: number, position: number): string | nu
 const WRITERS: { name: string; position: number }[] = [
   { name: "append", position: 3 },
   { name: "append_on", position: 3 },
-  { name: "append_for_errand", position: 3 },
   { name: "say", position: 3 },
   // `job.rs::say_once` forwards to `say` only when the same line is not already written.
   { name: "say_once", position: 3 },
