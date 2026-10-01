@@ -1026,14 +1026,79 @@ enum Failure {
     Ask(JudgeError),
 }
 
-/// D10/D11/D12: puts one call to the judge within `JUDGE_DEADLINE` and writes down what came of it.
-/// In this chunk nothing is decided; the plan's Task 8.1 makes it return a ruling for `enforce`.
+/// What the judge's answer means for the call (spec A D7). `Classifier` is the middle band, a
+/// capped approval, a failure, the deadline, or `observe`: the flow goes on with the classifier's
+/// verdict, untouched.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ruling {
+    Allow {
+        reason: String,
+    },
+    /// `counts` is D7's rule: a judge's refusal counts against the run's denial allowance only
+    /// when the classifier had said `pending_approval` - the counter exists to stop a run that
+    /// rephrases an action until it passes, and that only happens where the judge could approve.
+    Deny {
+        reason: String,
+        counts: bool,
+    },
+    Classifier,
+}
+
+/// D7/D12: the ruling a recorded answer amounts to in `enforce`, with the number in the reason.
+/// Anything short of a complete, uncapped answer is `Classifier`, never an allow; and a classifier
+/// `deny` is never relaxed, whatever the band.
+fn rule(row: &VerdictRow, thresholds: Thresholds, asked: &Asked) -> Ruling {
+    let (Some(p), Some(in_scope), Some(safe)) = (row.p, row.p_in_scope, row.p_safe) else {
+        return Ruling::Classifier;
+    };
+    if p.is_nan() || asked.classifier_decision == "deny" {
+        return Ruling::Classifier;
+    }
+    match (row.band, row.capped) {
+        (Some(Band::Allow), false) => Ruling::Allow {
+            reason: format!(
+                "judge {} p={p:.2} ≥ {:.2} (in_scope {in_scope:.2}, safe {safe:.2})",
+                row.model, thresholds.allow_at
+            ),
+        },
+        (Some(Band::Deny), _) => Ruling::Deny {
+            reason: format!(
+                "judge {} p={p:.2} ≤ {:.2} (in_scope {in_scope:.2}, safe {safe:.2})",
+                row.model, thresholds.deny_at
+            ),
+            counts: asked.classifier_decision == "pending_approval",
+        },
+        _ => Ruling::Classifier,
+    }
+}
+
+impl VerdictRow {
+    /// `enforced = 1` only where the ruling was applied (an allow or a deny in `enforce`); the
+    /// `judge` column already says which mode was asked. Spec B counts "applied" by this column.
+    fn ruled(&mut self, ruling: &Ruling) {
+        match ruling {
+            Ruling::Allow { .. } => {
+                self.final_decision = "allow".to_owned();
+                self.enforced = true;
+            }
+            Ruling::Deny { counts, .. } => {
+                self.final_decision = "deny".to_owned();
+                self.enforced = true;
+                self.counted_as_denial = *counts;
+            }
+            Ruling::Classifier => {}
+        }
+    }
+}
+
+/// D10/D11/D12: puts one call to the judge within `JUDGE_DEADLINE`, writes down what came of it
+/// and, in `enforce`, returns what the hook must do (D7).
 pub(crate) async fn judge_call(
     pool: &SqlitePool,
     runtime: &JudgeRuntime,
     asked: &Asked,
     mode: JudgeMode,
-) {
+) -> Ruling {
     let mut row = VerdictRow::new(asked, mode, runtime.occupant.model());
     let started = std::time::Instant::now();
     // Written inside the budget as soon as the state exists, so a cut after it still knows the
@@ -1049,6 +1114,7 @@ pub(crate) async fn judge_call(
     })
     .await;
     row.latency_ms = Some(started.elapsed().as_millis() as i64);
+    let mut ruling = Ruling::Classifier;
     match outcome {
         Err(_) => {
             if let Some(chars) = sent_chars {
@@ -1065,13 +1131,21 @@ pub(crate) async fn judge_call(
             }
             row.error = Some(error.to_string());
         }
-        Ok(Ok((prepared, answers))) => row.answered(&answers, &prepared, asked),
+        Ok(Ok((prepared, answers))) => {
+            row.answered(&answers, &prepared, asked);
+            if mode == JudgeMode::Enforce {
+                ruling = rule(&row, prepared.thresholds, asked);
+            }
+        }
     }
+    row.ruled(&ruling);
+    // Written off the response path: the hook has its answer before the row exists.
     record_later(pool, row);
+    ruling
 }
 
-/// D11: asks in parallel and changes nothing. Detached, so the hook never waits for it — "não se
-/// acrescenta latência nenhuma".
+/// D11: asks in parallel and changes nothing. Detached, so the hook never waits for it - "nao se
+/// acrescenta latencia nenhuma".
 pub(crate) fn observe_if_asked(pool: &SqlitePool, runtime: &Arc<JudgeRuntime>, asked: Asked) {
     if !judge_is_asked(
         &asked.tool_name,
@@ -1082,7 +1156,25 @@ pub(crate) fn observe_if_asked(pool: &SqlitePool, runtime: &Arc<JudgeRuntime>, a
     }
     let pool = pool.clone();
     let runtime = runtime.clone();
-    tokio::spawn(async move { judge_call(&pool, &runtime, &asked, JudgeMode::Observe).await });
+    tokio::spawn(async move {
+        let _ = judge_call(&pool, &runtime, &asked, JudgeMode::Observe).await;
+    });
+}
+
+/// D4/D7: asks and waits - at most `JUDGE_DEADLINE` - and returns what the hook must do.
+pub(crate) async fn enforce_if_asked(
+    pool: &SqlitePool,
+    runtime: &JudgeRuntime,
+    asked: Asked,
+) -> Ruling {
+    if !judge_is_asked(
+        &asked.tool_name,
+        asked.action_class,
+        &asked.classifier_decision,
+    ) {
+        return Ruling::Classifier;
+    }
+    judge_call(pool, runtime, &asked, JudgeMode::Enforce).await
 }
 
 /// Fixtures the judge's two test modules share: a migrated in-memory database and a running run.
@@ -1848,6 +1940,26 @@ mod tests {
             assert!(!error.to_string().contains(KEY), "{error}");
             assert!(!format!("{error:?}").contains(KEY), "{error:?}");
         }
+    }
+
+    /// D12: the reason carries the number.
+    #[tokio::test]
+    async fn an_enforced_ruling_carries_the_number() {
+        let pool = pool().await;
+        let run_id = running_run(&pool).await;
+        let ruling = judge_call(
+            &pool,
+            &JudgeRuntime::with(ScriptedJudge::answering(0.97, 0.94)),
+            &asked(run_id, None, "cargo test --workspace | tee t.log"),
+            JudgeMode::Enforce,
+        )
+        .await;
+        assert_eq!(
+            ruling,
+            Ruling::Allow {
+                reason: "judge jev-latest p=0.94 ≥ 0.85 (in_scope 0.97, safe 0.94)".to_owned()
+            }
+        );
     }
 }
 
