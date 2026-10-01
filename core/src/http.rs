@@ -3212,6 +3212,11 @@ async fn post_autopilot_judge(
 ) -> Result<Json<AutopilotJudgeResponse>, (StatusCode, Json<serde_json::Value>)> {
     let judge = crate::judge::JudgeMode::from_db_str(&body.judge)
         .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "invalid"))?;
+    // Until the shell shows the residual risk beside the control, nothing accepts `enforce`
+    // (spec A review decision D); the bar below `set_project_judge` is already in force.
+    if judge == crate::judge::JudgeMode::Enforce {
+        return Err(refusal(StatusCode::CONFLICT, "enforce_unavailable"));
+    }
     match autopilot::set_project_judge(&state.pool, &body.project_id, judge).await {
         Ok(_) => judge_status(&state, body.project_id)
             .await
@@ -3220,8 +3225,16 @@ async fn post_autopilot_judge(
         Err(autopilot::JudgeActivationError::UnknownProject) => {
             Err(refusal(StatusCode::NOT_FOUND, "unknown_project"))
         }
-        Err(autopilot::JudgeActivationError::EnforceUnavailable) => {
-            Err(refusal(StatusCode::CONFLICT, "enforce_unavailable"))
+        Err(autopilot::JudgeActivationError::NotActive) => {
+            Err(refusal(StatusCode::CONFLICT, "not_active"))
+        }
+        Err(autopilot::JudgeActivationError::NotReady { reviewed, agree }) => {
+            tracing::info!(
+                reviewed,
+                agree,
+                "enforce refused: the judge's bar is not met"
+            );
+            Err(refusal(StatusCode::CONFLICT, "not_ready"))
         }
         Err(autopilot::JudgeActivationError::Database(error)) => {
             tracing::warn!(%error, "setting a project's judge failed");
