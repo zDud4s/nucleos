@@ -1029,6 +1029,84 @@ pub async fn grant_covers_class(
     Ok(result.rows_affected() == 1)
 }
 
+/// Spec B D12: the key a person's "not this action" is stored under — SHA-256 of the tool's name
+/// and of what the action DOES, not of every byte the agent sent. The input arrives as the hook
+/// serialises it (`payload.tool_input.to_string()`), which is the same text `pause_for_approval`
+/// stores on the proposal, so the decline and the hook start from the same bytes.
+///
+/// For `Bash` and `PowerShell` the action is the `command` string alone. For every other tool it
+/// is the input without its `description` key, as canonical JSON (`serde_json` is built without
+/// `preserve_order`, so `Value`'s map is a `BTreeMap` and `to_string()` writes sorted keys). The
+/// agent rewrites `description` on every attempt ("Push the branch", then "Push again"), so a
+/// hash over it would almost never match a real retry — the same reason spec A's judge strips it
+/// before asking. An input that is not JSON is hashed as it came. A unit separator between name
+/// and key, so no split of the two can produce another pair's bytes.
+pub fn action_hash(tool_name: &str, tool_input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(tool_name.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(action_key(tool_name, tool_input).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn action_key(tool_name: &str, tool_input: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(tool_input) else {
+        return tool_input.to_owned();
+    };
+    if matches!(tool_name, "Bash" | "PowerShell")
+        && let Some(command) = value.get("command").and_then(serde_json::Value::as_str)
+    {
+        return command.to_owned();
+    }
+    if let Some(map) = value.as_object_mut() {
+        map.remove("description");
+    }
+    value.to_string()
+}
+
+/// Spec B D12: records the decline inside the transaction that continues the run. `OR IGNORE`
+/// because the only way to meet the UNIQUE is a second decline of the same action in the same
+/// lineage, and the mark it would write is the one already there.
+pub async fn record_declined_action_on(
+    conn: &mut sqlx::SqliteConnection,
+    lineage_root_id: i64,
+    tool_name: &str,
+    tool_input: Option<&str>,
+    proposal_id: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO declined_actions (lineage_root_id, tool_input_hash, proposal_id, created_at)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(lineage_root_id)
+    .bind(action_hash(tool_name, tool_input.unwrap_or_default()))
+    .bind(proposal_id)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Spec B D12: whether a person already declined this exact action in this lineage. One read by
+/// the unique index, on the hook's path. The same `action_hash` as the decline, so a retry whose
+/// `description` changed is still the same action.
+pub async fn declined_in_lineage(
+    pool: &SqlitePool,
+    lineage_root_id: i64,
+    tool_name: &str,
+    tool_input: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM declined_actions
+                        WHERE lineage_root_id = ? AND tool_input_hash = ?)",
+    )
+    .bind(lineage_root_id)
+    .bind(action_hash(tool_name, tool_input))
+    .fetch_one(pool)
+    .await
+}
+
 /// The queued request that already has this action, if the approval handed it to the queue instead
 /// of back to the run (migration 0054).
 ///
@@ -1103,6 +1181,79 @@ mod tests {
         .await
         .unwrap();
         (run_id, proposal_id)
+    }
+
+    /// Spec B D12: rejecting still ends the run; only the new door continues it. A regression
+    /// guard: it passes before the door exists.
+    #[tokio::test]
+    async fn rejecting_still_ends_the_run() {
+        let pool = test_pool().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-a', 'x', 'awaiting_approval', 'worktree', '2026-09-27T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let proposal_id = create_action_approval(
+            &pool,
+            run_id,
+            None,
+            Some("project-a"),
+            "Bash",
+            "r",
+            Some("{}"),
+        )
+        .await
+        .unwrap();
+        reject_proposal(&pool, proposal_id).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
+    }
+
+    /// Spec B D12 (plan review 2026-09-27): the agent rewrites `description` on every attempt,
+    /// so the mark ignores it — for a shell tool only the command counts, for any other tool the
+    /// input without `description`, whatever the key order.
+    #[test]
+    fn a_retry_with_another_description_is_the_same_action() {
+        let bash = |command: &str, description: &str| {
+            serde_json::json!({ "command": command, "description": description }).to_string()
+        };
+        assert_eq!(
+            action_hash("Bash", &bash("git push origin HEAD", "Push the branch")),
+            action_hash(
+                "Bash",
+                &bash("git push origin HEAD", "Push again, it failed")
+            )
+        );
+        assert_ne!(
+            action_hash("Bash", &bash("git push origin HEAD", "d")),
+            action_hash("Bash", &bash("git push --force origin HEAD", "d"))
+        );
+        assert_ne!(
+            action_hash("Bash", &bash("x", "d")),
+            action_hash("PowerShell", &bash("x", "d")),
+            "the tool is part of the action"
+        );
+        assert_eq!(
+            action_hash(
+                "Write",
+                r#"{"file_path":"a.py","content":"x","description":"one"}"#
+            ),
+            action_hash(
+                "Write",
+                r#"{"content":"x","file_path":"a.py","description":"two"}"#
+            )
+        );
+        assert_ne!(
+            action_hash("Write", r#"{"file_path":"a.py","content":"x"}"#),
+            action_hash("Write", r#"{"file_path":"a.py","content":"y"}"#)
+        );
     }
 
     /// Spec A D14: a run released while it waited leaves no pending approval behind, and the
