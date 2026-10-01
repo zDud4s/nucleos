@@ -146,8 +146,6 @@ pub enum Scope {
     #[cfg_attr(not(test), allow(dead_code))]
     Errand(String),
     /// A job, and the project it belongs to when the caller knows it.
-    ///
-    /// Read by nothing outside the tests until the working layer exists to put rows here.
     #[cfg_attr(not(test), allow(dead_code))]
     Job {
         id: i64,
@@ -606,9 +604,14 @@ fn cut_notice(omitted: usize) -> String {
 
 fn item_piece(row: &Known, width: usize) -> String {
     let layer = Layer::parse(&row.layer).expect("selection only carries recognised layers");
+    let provenance = match layer {
+        Layer::Working => "(said by a run of this job, not approved) ",
+        _ => "",
+    };
     format!(
-        "\n- [{}] {}: {}",
+        "\n- [{}] {}{}: {}",
         layer.as_str(),
+        provenance,
         row.title,
         clip(&row.body, width)
     )
@@ -1147,6 +1150,10 @@ fn hex16(bytes: &[u8]) -> String {
 /// scope's id is NULL and `= NULL` is never true — the bug would be a briefing silently missing
 /// everything known about the house.
 ///
+/// Approved rows are fetched across the whole chain. A `live` row is fetched only when its stored
+/// shape is a job-scoped working finding; [`select`] and its [`admitted`] gate still decide whether
+/// that row belongs to this exact job and is evidenced enough to reach the prompt.
+///
 /// Ordered here as well as in [`render`], so a caller that skips the renderer still gets a stable
 /// list, and so the LIMIT below cuts the tail rather than an arbitrary middle.
 pub async fn for_scope(pool: &SqlitePool, scope: &Scope) -> sqlx::Result<Vec<Known>> {
@@ -1158,7 +1165,9 @@ pub async fn for_scope(pool: &SqlitePool, scope: &Scope) -> sqlx::Result<Vec<Kno
     let sql = format!(
         "SELECT {COLUMNS}
            FROM knowledge
-          WHERE status = 'active' AND ({})
+          WHERE (status = 'active'
+                 OR (status = 'live' AND layer = 'working' AND scope_kind = 'job'))
+            AND ({})
           ORDER BY id
           LIMIT ?",
         terms.join(" OR ")
@@ -2305,6 +2314,128 @@ mod tests {
             vec!["house-wide", "the project's", "this job's own"],
             "a job did not read its whole chain, or read past the end of it: {titles:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_live_finding_is_read_by_its_own_job_and_no_other_job() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, evidence, kind, title, body, status, created_at)
+             VALUES
+               ('working', 'job', '41', 'run', '[{\"t\":\"run\",\"id\":1}]', 'memory',
+                'forty-one finding', 'body', 'live', '2026-09-20T00:00:00+00:00'),
+               ('working', 'job', '42', 'run', '[{\"t\":\"run\",\"id\":1}]', 'memory',
+                'forty-two finding', 'body', 'live', '2026-09-20T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let scope = Scope::Job {
+            id: 41,
+            project: Some("p".into()),
+        };
+        let rows = for_scope(&pool, &scope).await.unwrap();
+        assert!(rows.iter().any(|row| row.title == "forty-one finding"));
+        assert!(!rows.iter().any(|row| row.title == "forty-two finding"));
+
+        let brief = crate::brief::of(&pool, &job_context(41), "q")
+            .await
+            .unwrap();
+        let block = brief.block.expect("the finding reaches its own job");
+        assert!(block.contains("forty-one finding"));
+        assert!(!block.contains("forty-two finding"));
+    }
+
+    #[tokio::test]
+    async fn a_live_row_outside_the_job_scope_is_never_fetched() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, evidence, kind, title, body, status, created_at)
+             VALUES
+               ('working', 'project', 'p', 'run', '[{\"t\":\"run\",\"id\":1}]', 'memory',
+                'project live row', 'body', 'live', '2026-09-20T00:00:00+00:00'),
+               ('semantic', 'job', '41', 'run', '[{\"t\":\"run\",\"id\":1}]', 'memory',
+                'semantic live row', 'body', 'live', '2026-09-20T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows = for_scope(
+            &pool,
+            &Scope::Job {
+                id: 41,
+                project: Some("p".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            rows.is_empty(),
+            "ineligible live rows were fetched: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_finding_is_labelled_as_said_by_a_run_and_not_approved() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, evidence, kind, title, body, status, created_at)
+             VALUES
+               ('working', 'job', '41', 'run', '[{\"t\":\"run\",\"id\":1}]', 'memory',
+                'forty-one finding', 'body', 'live', '2026-09-20T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let brief = crate::brief::of(&pool, &job_context(41), "q")
+            .await
+            .unwrap();
+        let block = brief.block.expect("the finding renders");
+        assert!(block.contains("said by a run of this job, not approved"));
+
+        let approved = select(
+            &[one(1, "memory", "approved semantic", "body")],
+            &project_context(),
+            &Budget::default(),
+        )
+        .block
+        .expect("the approved semantic row renders");
+        assert!(!approved.contains("said by a run of this job, not approved"));
+    }
+
+    #[tokio::test]
+    async fn recall_never_answers_a_live_row() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, evidence, kind, title, body, status, created_at)
+             VALUES
+               ('working', 'job', '41', 'run', '[{\"t\":\"run\",\"id\":1}]', 'memory',
+                'live finding', 'the recallword is here', 'live',
+                '2026-09-20T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let recalled = crate::brief::recall(
+            &pool,
+            &Scope::Job {
+                id: 41,
+                project: Some("p".into()),
+            },
+            "recallword",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(recalled.is_empty(), "recall answered a live row");
     }
 
     /// The whole mechanism, end to end and in the order it happens: a run declares, nothing reaches
