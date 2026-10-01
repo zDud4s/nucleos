@@ -2543,11 +2543,18 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
     // Spec A D2: the project's judge setting is photographed onto the run, so a run's rules do
     // not change halfway through, the reason `permission_mode` is a snapshot. Only for the two
     // modes the judge serves; every other run reads `off`, which is what it is.
+    // Spec B D11: `judge_resolve` is photographed like `judge`, for the same reason, but only for
+    // worktree runs: the B never acts anywhere else (D2), and a snapshot it can never read would
+    // be a value that looks like a setting and means nothing.
     let inserted = sqlx::query(
-        "INSERT INTO runs (project_id, cwd, prompt, status, mode, session_id, steerable, permission_mode, judge, created_at)
+        "INSERT INTO runs (project_id, cwd, prompt, status, mode, session_id, steerable,
+                           permission_mode, judge, judge_resolve, created_at)
          VALUES (?, ?, ?, 'running', ?, ?, ?, ?,
                  CASE WHEN ? IN ('shadow', 'worktree')
                       THEN COALESCE((SELECT judge FROM autopilot_state WHERE project_id = ?), 'off')
+                      ELSE 'off' END,
+                 CASE WHEN ? = 'worktree'
+                      THEN COALESCE((SELECT judge_resolve FROM autopilot_state WHERE project_id = ?), 'off')
                       ELSE 'off' END,
                  ?)",
     )
@@ -2558,6 +2565,8 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
     .bind(&session_id)
     .bind(i64::from(steerable))
     .bind(permission_mode.map(crate::chats::PermissionMode::as_str))
+    .bind(mode)
+    .bind(&project_id)
     .bind(mode)
     .bind(&project_id)
     .bind(&now)
@@ -8933,6 +8942,50 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         };
         assert_eq!(judge_of(shadow_id).await, "observe", "the snapshot outlives the setting");
         assert_eq!(judge_of(real_id).await, "off", "a mode the judge never serves reads off");
+    }
+
+    /// Spec B D11: a worktree run carries the project's `judge_resolve` as it stood at launch; any
+    /// other mode reads `off`, because the B only ever acts on worktree runs (D2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_worktree_run_photographs_its_projects_judge_resolve_at_launch() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-resolve-photo-");
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(30)), crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root, judge_resolve)
+             VALUES ('proj', 'active', ?, 'observe')",
+        )
+        .bind(&project_root)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let worktree_id = create_worktree_run(&state, "do it", "proj", &project_root).await.unwrap();
+        let shadow_id = create_run_inner(&state, "plan".into(), Some("proj".into()), None, "shadow", false)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE autopilot_state SET judge_resolve = 'off'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let resolve_of = |id: i64| {
+            let pool = state.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT judge_resolve FROM runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(resolve_of(worktree_id).await, "observe", "the snapshot outlives the setting");
+        assert_eq!(resolve_of(shadow_id).await, "off", "the B never acts on a shadow run");
+        crate::runs::finalize_termination(&state, worktree_id, "cancelled").await;
     }
 
     /// Spec B D6.2, built here so B only has to add its columns: one list of continuation
