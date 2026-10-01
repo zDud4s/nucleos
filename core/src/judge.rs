@@ -43,9 +43,14 @@ pub const JUDGE_QUESTIONS: &[Question] = &[
 ];
 
 mod client;
+mod review;
 #[cfg(test)]
 pub(crate) use client::ScriptedJudge;
 pub use client::{Answers, JevJudge, Judge, JudgeError, TYPESAFE_KEY};
+pub use review::{
+    JudgeOpinion, JudgeReadiness, JudgeVerdictView, list_unreviewed, opinions_for_decisions,
+    opinions_for_run, project_of_verdict, readiness, readiness_on, set_verdict,
+};
 
 /// D11: at most four calls in flight across the machine; without a permit, the call is skipped
 /// and written down.
@@ -1080,8 +1085,35 @@ pub(crate) fn observe_if_asked(pool: &SqlitePool, runtime: &Arc<JudgeRuntime>, a
     tokio::spawn(async move { judge_call(&pool, &runtime, &asked, JudgeMode::Observe).await });
 }
 
+/// Fixtures the judge's two test modules share: a migrated in-memory database and a running run.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub async fn pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    pub async fn running_run(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, cwd, judge, created_at)
+             VALUES ('p', 'Fix the flaky test in core', 'running', 'worktree', 'C:/work/repo',
+                     'observe', '2026-09-27T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{pool, running_run};
     use super::*;
     use serde_json::json;
 
@@ -1398,16 +1430,6 @@ mod tests {
         );
     }
 
-    async fn pool() -> sqlx::SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-        pool
-    }
-
     /// D2: every project and every run starts with the judge off, and the column refuses a mode
     /// nobody defined.
     #[tokio::test]
@@ -1455,18 +1477,6 @@ mod tests {
     }
 
     use std::time::Instant;
-
-    async fn running_run(pool: &sqlx::SqlitePool) -> i64 {
-        sqlx::query(
-            "INSERT INTO runs (project_id, prompt, status, mode, cwd, judge, created_at)
-             VALUES ('p', 'Fix the flaky test in core', 'running', 'worktree', 'C:/work/repo',
-                     'observe', '2026-09-27T00:00:00Z')",
-        )
-        .execute(pool)
-        .await
-        .unwrap()
-        .last_insert_rowid()
-    }
 
     fn asked(run_id: i64, shadow: Option<i64>, command: &str) -> Asked {
         Asked {

@@ -759,6 +759,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/worktrees/{run_id}/release", post(post_worktree_release))
         .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
+        .route(
+            "/judge-verdicts/unreviewed",
+            get(get_unreviewed_judge_verdicts),
+        )
+        .route("/judge-verdicts/{id}/verdict", post(post_judge_verdict))
+        .route(
+            "/judge-verdicts/by-decision",
+            get(get_judge_opinions_by_decision),
+        )
+        .route("/runs/{id}/judge-verdicts", get(get_judge_opinions_of_run))
         .route("/scoreboard", get(get_scoreboard))
         .route("/email/cursor", get(get_email_cursor))
         .route("/email/triage", post(post_email_triage))
@@ -3163,14 +3173,20 @@ struct AutopilotJudgeResponse {
     /// Review item G: `Some` when this project's `autopilot.yaml` cannot be read, which leaves
     /// the judge without effect (every call falls back to the classifier, D7/D10).
     rules_error: Option<String>,
+    /// D11: how far the project is from being allowed to enforce, with the classes beside it.
+    readiness: crate::judge::JudgeReadiness,
 }
 
-/// One project's judge, as both handlers answer it.
+/// One project's judge, as both handlers answer it. A readiness that cannot be read is a 500, like
+/// the mode: a panel shown a made-up zero would read "nothing reviewed yet".
 async fn judge_status(
     state: &AppState,
     project_id: String,
 ) -> Result<AutopilotJudgeResponse, StatusCode> {
     let judge = autopilot::autopilot_judge_mode(&state.pool, &project_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let readiness = crate::judge::readiness(&state.pool, &project_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let rules_error =
@@ -3179,6 +3195,7 @@ async fn judge_status(
         project_id,
         judge,
         rules_error,
+        readiness,
     })
 }
 
@@ -3201,6 +3218,11 @@ async fn post_autopilot_judge(
 ) -> Result<Json<AutopilotJudgeResponse>, (StatusCode, Json<serde_json::Value>)> {
     let judge = crate::judge::JudgeMode::from_db_str(&body.judge)
         .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "invalid"))?;
+    // Until the shell shows the residual risk beside the control, nothing accepts `enforce`
+    // (spec A review decision D); the bar below `set_project_judge` is already in force.
+    if judge == crate::judge::JudgeMode::Enforce {
+        return Err(refusal(StatusCode::CONFLICT, "enforce_unavailable"));
+    }
     match autopilot::set_project_judge(&state.pool, &body.project_id, judge).await {
         Ok(_) => judge_status(&state, body.project_id)
             .await
@@ -3209,8 +3231,16 @@ async fn post_autopilot_judge(
         Err(autopilot::JudgeActivationError::UnknownProject) => {
             Err(refusal(StatusCode::NOT_FOUND, "unknown_project"))
         }
-        Err(autopilot::JudgeActivationError::EnforceUnavailable) => {
-            Err(refusal(StatusCode::CONFLICT, "enforce_unavailable"))
+        Err(autopilot::JudgeActivationError::NotActive) => {
+            Err(refusal(StatusCode::CONFLICT, "not_active"))
+        }
+        Err(autopilot::JudgeActivationError::NotReady { reviewed, agree }) => {
+            tracing::info!(
+                reviewed,
+                agree,
+                "enforce refused: the judge's bar is not met"
+            );
+            Err(refusal(StatusCode::CONFLICT, "not_ready"))
         }
         Err(autopilot::JudgeActivationError::Database(error)) => {
             tracing::warn!(%error, "setting a project's judge failed");
@@ -15141,6 +15171,84 @@ async fn post_shadow_verdict(
     .await?
 }
 
+async fn get_unreviewed_judge_verdicts(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<Vec<crate::judge::JudgeVerdictView>>, StatusCode> {
+    crate::judge::list_unreviewed(&state.pool, &query.project_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct DecisionIdsQuery {
+    /// Comma-separated `shadow_decisions.id`s - the page's own rows.
+    ids: String,
+}
+
+/// Admin-only like the rest of the judge's routes (in no table in `auth.rs`).
+async fn get_judge_opinions_by_decision(
+    State(state): State<AppState>,
+    Query(query): Query<DecisionIdsQuery>,
+) -> Result<Json<Vec<crate::judge::JudgeOpinion>>, StatusCode> {
+    let ids = query
+        .ids
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.trim().parse::<i64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    crate::judge::opinions_for_decisions(&state.pool, &ids)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_judge_opinions_of_run(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::judge::JudgeOpinion>>, StatusCode> {
+    crate::judge::opinions_for_run(&state.pool, id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Accepts `approve|reject` once, like `post_shadow_verdict`: 400 for any other word, 404 for an
+/// unknown id, a verdict already given, or a verdict that was not in a deciding band.
+async fn post_judge_verdict(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<VerdictRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if !matches!(body.verdict.as_str(), "approve" | "reject") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // The verdict and the demotion it may cause are ONE write: a verdict is the only thing that
+    // moves readiness, so it is where the bar is held, and a failure anywhere records nothing.
+    let recorded = async {
+        let mut tx = state.pool.begin().await?;
+        if !crate::judge::set_verdict(&mut tx, id, &body.verdict).await? {
+            return Ok(false);
+        }
+        if let Some(project_id) = crate::judge::project_of_verdict(&mut tx, id).await? {
+            autopilot::hold_judge_to_the_bar(&mut tx, &project_id).await?;
+        }
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(true)
+    }
+    .await;
+    match recorded {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, id, "could not record the judge verdict");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 /// The §8.2 promotion nudge: a feed entry the moment a project's last outstanding action class
 /// clears the bar. Without it the gate solves promotion-by-impatience but leaves the opposite
 /// failure — a project that quietly became promotable and nobody noticed.
@@ -21998,6 +22106,35 @@ mod tests {
     /// A bundle with a real graph in it, for the canvas routes.
     const TWO_NODE_GRAPH: &str = "nodes:\n  - {id: plan, type: agent, model: opus}\n  - {id: gate, type: command, command: cargo test}\nedges:\n  - {from: plan, to: gate}\n";
 
+    #[tokio::test]
+    async fn the_judges_opinions_are_served_by_decision_and_by_run() {
+        let state = test_state().await;
+        let (status, body) = workflow_call(
+            state.clone(),
+            "GET",
+            "/judge-verdicts/by-decision?ids=1,2",
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_array().map(Vec::len)),
+            (StatusCode::OK, Some(0))
+        );
+        let (status, _) = workflow_call(
+            state.clone(),
+            "GET",
+            "/judge-verdicts/by-decision?ids=x",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = workflow_call(state, "GET", "/runs/7/judge-verdicts", None).await;
+        assert_eq!(
+            (status, body.as_array().map(Vec::len)),
+            (StatusCode::OK, Some(0))
+        );
+    }
+
     async fn workflow_call(
         state: AppState,
         method: &str,
@@ -22048,6 +22185,8 @@ mod tests {
             (status, body["judge"].as_str()),
             (StatusCode::OK, Some("observe"))
         );
+        assert_eq!(body["readiness"]["reviewed"], 0);
+        assert_eq!(body["readiness"]["ready"], false);
         let (status, _) = workflow_call(
             state.clone(),
             "POST",
@@ -35741,5 +35880,107 @@ mod tests {
                 "kinds": [{"selector": "job_failed", "enabled": true}]
             })
         );
+    }
+
+    /// Seeds a project enforcing the judge with ten approved allows and one pending allow, so that
+    /// rejecting the pending one takes agreement to 10/11 (under the bar). Returns its verdict id.
+    async fn enforcing_project_with_a_pending_allow(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, judge) VALUES ('a', 'active', 'enforce')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut last = 0;
+        for index in 0..11 {
+            let run_id = sqlx::query(
+                "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+                 VALUES ('a', 'x', 'completed', 'worktree', '2026-09-27T00:00:00Z')",
+            )
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            let human = if index < 10 { Some("approve") } else { None };
+            last = sqlx::query(
+                "INSERT INTO judge_verdicts
+                 (run_id, tool_name, tool_input_digest, action_class, classifier_decision, judge,
+                  model, questions_version, band, final_decision, human_verdict, created_at)
+                 VALUES (?, 'Bash', ?, 'unrecognized', 'pending_approval', 'enforce', 'jev-latest',
+                         1, 'allow', 'allow', ?, '2026-09-27T00:00:00Z')",
+            )
+            .bind(run_id)
+            .bind(format!("digest-{index}"))
+            .bind(human)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        }
+        last
+    }
+
+    async fn post_judge_verdict_status(state: AppState, id: i64, verdict: &str) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/judge-verdicts/{id}/verdict"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "verdict": verdict })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_judge_verdict_that_breaks_the_bar_demotes_in_the_same_write() {
+        let state = test_state().await;
+        let id = enforcing_project_with_a_pending_allow(&state.pool).await;
+        let status = post_judge_verdict_status(state.clone(), id, "reject").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let judge: String =
+            sqlx::query_scalar("SELECT judge FROM autopilot_state WHERE project_id = 'a'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(judge, "observe");
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM feed WHERE project_id = 'a'")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(kinds, vec!["judge_demoted".to_owned()]);
+    }
+
+    /// The verdict and the demotion are one write: when holding the bar fails, nothing is recorded.
+    #[tokio::test]
+    async fn a_judge_verdict_is_not_recorded_when_holding_the_bar_fails() {
+        let state = test_state().await;
+        let id = enforcing_project_with_a_pending_allow(&state.pool).await;
+        // The demotion's feed line cannot be written, so the demotion fails as a whole.
+        sqlx::query("DROP TABLE feed")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let status = post_judge_verdict_status(state.clone(), id, "reject").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let human: Option<String> =
+            sqlx::query_scalar("SELECT human_verdict FROM judge_verdicts WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(human, None);
+        let judge: String =
+            sqlx::query_scalar("SELECT judge FROM autopilot_state WHERE project_id = 'a'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(judge, "enforce");
     }
 }

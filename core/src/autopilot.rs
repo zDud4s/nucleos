@@ -180,11 +180,17 @@ pub async fn set_project_mode(
         Mode::Off => None,
     };
 
+    // Spec A section 3: `enforce` was authorised on top of Active; leaving Active withdraws that
+    // authorisation and keeps measuring (`observe`), in the same write, so the two columns are
+    // never out of step. `off` stays `off`.
     sqlx::query(
         "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, ?, ?)
          ON CONFLICT(project_id) DO UPDATE SET
              mode = excluded.mode,
-             project_root = excluded.project_root",
+             project_root = excluded.project_root,
+             judge = CASE
+                 WHEN excluded.mode <> 'active' AND autopilot_state.judge = 'enforce'
+                 THEN 'observe' ELSE autopilot_state.judge END",
     )
     .bind(project_id)
     .bind(mode.as_db_str())
@@ -198,9 +204,14 @@ pub async fn set_project_mode(
 #[derive(Debug)]
 pub enum JudgeActivationError {
     UnknownProject,
-    /// Until the plan's Chunk 7 lands the bar of D11, `set_project_judge` refuses enforcement
-    /// outright; from then the route refuses it until Chunk 9 (review decision D).
-    EnforceUnavailable,
+    /// D2: the judge only decides on top of Active.
+    NotActive,
+    /// D11: fewer than `READINESS_MIN_REVIEWED` distinct reviewed actions, or under
+    /// `READINESS_MIN_AGREE_PERCENT` agreeing.
+    NotReady {
+        reviewed: i64,
+        agree: i64,
+    },
     Database(sqlx::Error),
 }
 
@@ -232,17 +243,89 @@ pub async fn set_project_judge(
     judge: JudgeMode,
 ) -> Result<JudgeMode, JudgeActivationError> {
     if judge == JudgeMode::Enforce {
-        return Err(JudgeActivationError::EnforceUnavailable);
+        // One transaction, and the guarded write goes FIRST: it takes SQLite's write lock, so the
+        // mode check and the readiness read below cannot be overtaken by another writer (a mode
+        // change, a verdict) between the check and the write.
+        let mut tx = pool.begin().await?;
+        let enforced = sqlx::query(
+            "UPDATE autopilot_state SET judge = 'enforce' WHERE project_id = ? AND mode = 'active'",
+        )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if enforced == 0 {
+            let known: Option<String> =
+                sqlx::query_scalar("SELECT mode FROM autopilot_state WHERE project_id = ?")
+                    .bind(project_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            tx.rollback().await?;
+            return Err(if known.is_some() {
+                JudgeActivationError::NotActive
+            } else {
+                JudgeActivationError::UnknownProject
+            });
+        }
+        let readiness = crate::judge::readiness_on(&mut tx, project_id).await?;
+        if !readiness.ready {
+            tx.rollback().await?;
+            return Err(JudgeActivationError::NotReady {
+                reviewed: readiness.reviewed,
+                agree: readiness.agree,
+            });
+        }
+        tx.commit().await?;
+        return Ok(judge);
     }
     let updated = sqlx::query("UPDATE autopilot_state SET judge = ? WHERE project_id = ?")
         .bind(judge.as_db_str())
         .bind(project_id)
         .execute(pool)
-        .await?;
-    if updated.rows_affected() == 0 {
+        .await?
+        .rows_affected();
+    if updated == 0 {
         return Err(JudgeActivationError::UnknownProject);
     }
     Ok(judge)
+}
+
+/// Review item E(ii): a project in `enforce` whose readiness no longer clears D11's bar drops to
+/// `observe`, with a feed line saying so. Answers whether it dropped. Guarded on `enforce` in the
+/// write, so a concurrent change of the setting keeps the last word; it only ever lowers `enforce`
+/// to `observe` and never raises anything. Runs already in flight keep the snapshot they launched
+/// with (D2): that is the snapshot's point, and the panel says it.
+pub async fn hold_judge_to_the_bar(
+    conn: &mut sqlx::SqliteConnection,
+    project_id: &str,
+) -> sqlx::Result<bool> {
+    let readiness = crate::judge::readiness_on(&mut *conn, project_id).await?;
+    if readiness.ready {
+        return Ok(false);
+    }
+    let dropped = sqlx::query(
+        "UPDATE autopilot_state SET judge = 'observe' WHERE project_id = ? AND judge = 'enforce'",
+    )
+    .bind(project_id)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected()
+        == 1;
+    if dropped {
+        crate::feed::append_on(
+            conn,
+            Some(project_id),
+            "judge_demoted",
+            &format!(
+                "the judge went back to observing {project_id}: {} of {} reviewed actions agreed, under the bar",
+                readiness.agree, readiness.reviewed
+            ),
+            None,
+            None,
+        )
+        .await?;
+    }
+    Ok(dropped)
 }
 
 pub async fn autopilot_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, String, Mode)>> {
@@ -733,7 +816,7 @@ mod tests {
     /// Spec A D11: observing is an opt-in per project; enforcing waits for the bar (plan Chunk 7)
     /// and, at the route, for the shell's residual-risk warning (plan Chunk 9).
     #[tokio::test]
-    async fn a_project_opts_into_observation_and_not_yet_into_enforcement() {
+    async fn a_project_opts_into_observation() {
         use crate::judge::JudgeMode;
         let pool = test_pool().await;
         sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
@@ -752,13 +835,219 @@ mod tests {
             JudgeMode::Observe
         );
         assert!(matches!(
-            set_project_judge(&pool, "p", JudgeMode::Enforce).await,
-            Err(JudgeActivationError::EnforceUnavailable)
-        ));
-        assert!(matches!(
             set_project_judge(&pool, "nobody", JudgeMode::Observe).await,
             Err(JudgeActivationError::UnknownProject)
         ));
+    }
+
+    /// `count` distinct actions (the digest is keyed on the run, so two calls never collide),
+    /// each judged `allow` and approved by a person.
+    async fn agreed_reviews(pool: &SqlitePool, project_id: &str, count: usize) {
+        for _ in 0..count {
+            let run_id = sqlx::query(
+                "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+                 VALUES (?, 'x', 'completed', 'worktree', '2026-09-27T00:00:00Z')",
+            )
+            .bind(project_id)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            sqlx::query(
+                "INSERT INTO judge_verdicts
+                 (run_id, tool_name, tool_input_digest, action_class, classifier_decision, judge,
+                  model, questions_version, band, final_decision, human_verdict, created_at)
+                 VALUES (?, 'Bash', ?, 'unrecognized', 'pending_approval', 'observe', 'jev-latest',
+                         1, 'allow', 'pending_approval', 'approve', '2026-09-27T00:00:00Z')",
+            )
+            .bind(run_id)
+            .bind(format!("digest-{run_id}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Spec A D11: `enforce` only on an Active project that cleared the bar.
+    #[tokio::test]
+    async fn enforce_needs_an_active_project_that_cleared_the_bar() {
+        use crate::judge::JudgeMode;
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode) VALUES ('a', 'active'), ('s', 'shadow')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        agreed_reviews(&pool, "a", 9).await;
+        assert!(matches!(
+            set_project_judge(&pool, "a", JudgeMode::Enforce).await,
+            Err(JudgeActivationError::NotReady {
+                reviewed: 9,
+                agree: 9
+            })
+        ));
+        agreed_reviews(&pool, "s", 10).await;
+        assert!(matches!(
+            set_project_judge(&pool, "s", JudgeMode::Enforce).await,
+            Err(JudgeActivationError::NotActive)
+        ));
+        agreed_reviews(&pool, "a", 1).await;
+        assert_eq!(
+            set_project_judge(&pool, "a", JudgeMode::Enforce)
+                .await
+                .unwrap(),
+            JudgeMode::Enforce
+        );
+    }
+
+    /// The guarded enforce write lands inside a transaction: a refusal (not active, not ready)
+    /// leaves the stored setting untouched, and a success leaves the invariant true. The race
+    /// itself (a mode change between the check and the write) cannot be interleaved
+    /// deterministically on one pool; what pins it is that the write is `AND mode = 'active'`
+    /// and that a refusal rolls it back, both asserted here.
+    #[tokio::test]
+    async fn a_refused_enforce_writes_nothing_and_an_accepted_one_keeps_the_invariant() {
+        use crate::judge::JudgeMode;
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, judge)
+             VALUES ('a', 'active', 'observe'), ('s', 'shadow', 'observe')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        agreed_reviews(&pool, "s", 10).await;
+        assert!(matches!(
+            set_project_judge(&pool, "s", JudgeMode::Enforce).await,
+            Err(JudgeActivationError::NotActive)
+        ));
+        assert!(matches!(
+            set_project_judge(&pool, "a", JudgeMode::Enforce).await,
+            Err(JudgeActivationError::NotReady { .. })
+        ));
+        for project in ["a", "s"] {
+            assert_eq!(
+                autopilot_judge_mode(&pool, project).await.unwrap(),
+                JudgeMode::Observe,
+                "{project}: a refusal rolls the write back"
+            );
+        }
+        agreed_reviews(&pool, "a", 10).await;
+        set_project_judge(&pool, "a", JudgeMode::Enforce)
+            .await
+            .unwrap();
+        let broken: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM autopilot_state WHERE judge = 'enforce' AND mode <> 'active'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(broken, 0);
+        assert_eq!(
+            autopilot_judge_mode(&pool, "a").await.unwrap(),
+            JudgeMode::Enforce
+        );
+    }
+
+    /// Spec A section 3 (and spec B D11): leaving Active drops `enforce` to `observe` in the same
+    /// write; `off` stays `off`; the reviews already won keep counting.
+    #[tokio::test]
+    async fn leaving_active_drops_enforce_to_observe() {
+        use crate::judge::JudgeMode;
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, judge)
+             VALUES ('e', 'active', 'enforce'), ('o', 'active', 'off')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        set_project_mode(&pool, None, "e", Mode::Off, None)
+            .await
+            .unwrap();
+        set_project_mode(&pool, None, "o", Mode::Off, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            autopilot_judge_mode(&pool, "e").await.unwrap(),
+            JudgeMode::Observe
+        );
+        assert_eq!(
+            autopilot_judge_mode(&pool, "o").await.unwrap(),
+            JudgeMode::Off
+        );
+    }
+
+    /// Review item E(ii): enforcing is held to the bar, not only switched on by it. A review that
+    /// takes the agreement under 95% drops the project back to observing, with a feed line.
+    #[tokio::test]
+    async fn a_bar_no_longer_met_drops_enforce_to_observe_and_says_so() {
+        use crate::judge::JudgeMode;
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, judge) VALUES ('a', 'active', 'enforce')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        agreed_reviews(&pool, "a", 10).await;
+        assert!(
+            !hold_judge_to_the_bar(pool.acquire().await.unwrap().as_mut(), "a")
+                .await
+                .unwrap(),
+            "10/10 holds"
+        );
+        assert_eq!(
+            autopilot_judge_mode(&pool, "a").await.unwrap(),
+            JudgeMode::Enforce
+        );
+
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('a', 'x', 'completed', 'worktree', '2026-09-27T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO judge_verdicts
+             (run_id, tool_name, tool_input_digest, action_class, classifier_decision, judge, model,
+              questions_version, band, final_decision, human_verdict, created_at)
+             VALUES (?, 'Bash', 'wrong', 'unrecognized', 'pending_approval', 'enforce', 'jev-latest',
+                     1, 'allow', 'allow', 'reject', '2026-09-27T00:00:00Z')",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            hold_judge_to_the_bar(pool.acquire().await.unwrap().as_mut(), "a")
+                .await
+                .unwrap(),
+            "10/11 is under 95%"
+        );
+        assert_eq!(
+            autopilot_judge_mode(&pool, "a").await.unwrap(),
+            JudgeMode::Observe
+        );
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM feed WHERE project_id = 'a'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kinds, vec!["judge_demoted".to_owned()]);
+        // Never the other way: a project already observing is not touched, and nothing re-enables.
+        assert!(
+            !hold_judge_to_the_bar(pool.acquire().await.unwrap().as_mut(), "a")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            autopilot_judge_mode(&pool, "a").await.unwrap(),
+            JudgeMode::Observe
+        );
     }
 
     async fn test_pool() -> SqlitePool {
@@ -1455,6 +1744,45 @@ mod tests {
             reviewable.len(),
             3,
             "and the four already-enforced worktree decisions are in neither"
+        );
+    }
+
+    /// Spec A D11: the judge's queue is NOT work in progress. Counting it would make every observed
+    /// call of an Active project pending work, and a busy project would brake its own autonomy.
+    #[tokio::test]
+    async fn the_judges_queue_is_not_work_in_progress() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode) VALUES ('project-a', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = seed_shadow_decisions(&pool, "worktree", 2).await;
+        let before = project_roster(&pool).await.unwrap()[0].clone();
+        sqlx::query(
+            "INSERT INTO judge_verdicts
+             (run_id, tool_name, tool_input_digest, action_class, classifier_decision, judge,
+              model, questions_version, band, final_decision, created_at)
+             VALUES (?, 'Bash', 'd', 'unrecognized', 'pending_approval', 'observe', 'jev-latest',
+                     1, 'allow', 'pending_approval', '2026-09-27T00:00:00Z')",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let after = project_roster(&pool).await.unwrap()[0].clone();
+        assert_eq!(
+            (
+                after.open_review_items,
+                after.open_shadow_decisions,
+                after.queue_full
+            ),
+            (
+                before.open_review_items,
+                before.open_shadow_decisions,
+                before.queue_full
+            )
         );
     }
 
