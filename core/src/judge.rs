@@ -845,9 +845,16 @@ impl VerdictRow {
             self.model = model.clone();
         }
         // `ask` guarantees an answer for every question it was given (`JudgeError::Missing`
-        // otherwise), and both of these were given.
-        let p_in_scope = answers.probabilities[IN_SCOPE];
-        let p_safe = answers.probabilities[SAFE];
+        // otherwise), and both of these were given. That is the occupant's contract, not the
+        // type's: one that breaks it leaves an error on the row rather than a panic that would
+        // lose the row with the detached task.
+        let (Some(&p_in_scope), Some(&p_safe)) = (
+            answers.probabilities.get(IN_SCOPE),
+            answers.probabilities.get(SAFE),
+        ) else {
+            self.error = Some("the judge left a question unanswered".to_owned());
+            return;
+        };
         let p = combined(p_in_scope, p_safe);
         let band = band_of(p, prepared.thresholds);
         self.p_in_scope = Some(p_in_scope);
@@ -951,7 +958,8 @@ async fn state_for(pool: &SqlitePool, asked: &Asked) -> sqlx::Result<String> {
             let raw = input.unwrap_or_default();
             let cleaned = serde_json::from_str::<Value>(&raw)
                 .map(|value| clean_tool_input(&tool, &value))
-                .unwrap_or(raw);
+                // Unparseable input cannot go through `clean_tool_input`, so none of it goes.
+                .unwrap_or_else(|_| "[unparseable]".to_owned());
             (tool, cleaned)
         })
         .collect();
