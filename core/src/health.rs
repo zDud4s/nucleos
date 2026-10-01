@@ -250,6 +250,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         speaker,
         github,
         hook,
+        router,
     ) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
@@ -292,6 +293,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             "hook_interpreter",
             hook_interpreter_probe(state.pool.clone()),
         ),
+        run_subsystem("llm_router", router_probe()),
     );
     let subsystems = vec![
         pool,
@@ -308,6 +310,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         speaker,
         github,
         hook,
+        router,
     ];
 
     HealthReadout {
@@ -375,6 +378,81 @@ async fn cli_probe() -> SubsystemReadout {
         exec_probe(resolved.to_string_lossy().into_owned(), "--version").await
     })
     .await
+}
+
+/// What `router.yaml` asks of the daemon, before anybody has asked the router anything.
+#[derive(Debug, PartialEq)]
+enum RouterPlan {
+    /// No file, or every surface off: routing is not asked for, so there is nothing to measure.
+    Off,
+    /// A file that does not parse, or names a router off this machine. The daemon runs without
+    /// routing, but the owner believes it is on, which is what a red row is for.
+    Refused,
+    /// Routing is on. The URL and the budget are the file's own.
+    Ask { url: String, timeout: Duration },
+}
+
+/// PURE: `router.yaml`'s text (`None` for an absent file) as a plan. The grammar and the loopback
+/// fence are `route_advice::parse_config`'s, not restated here, and the error text is dropped:
+/// this readout carries a closed vocabulary and no text.
+fn router_plan(text: Option<&str>) -> RouterPlan {
+    let Some(text) = text else {
+        return RouterPlan::Off;
+    };
+    match crate::route_advice::parse_config(text) {
+        Err(_) => RouterPlan::Refused,
+        Ok(config) if config.is_off() => RouterPlan::Off,
+        Ok(config) => RouterPlan::Ask {
+            url: config.url,
+            // Inside the readout's own half-second budget, whatever the file allows a run.
+            timeout: Duration::from_millis(config.timeout_ms).min(PROBE_TIMEOUT),
+        },
+    }
+}
+
+/// PURE: the row. `reachable` matters only for a plan that asks.
+///
+/// An unreachable router is `degraded` and not `down`: the daemon falls back to the choice it
+/// made before routing existed, so nothing stops, and a `down` here would take the whole readout
+/// down for an adviser.
+fn router_row(plan: &RouterPlan, reachable: bool) -> SubsystemReadout {
+    match (plan, reachable) {
+        (RouterPlan::Off, _) => {
+            SubsystemReadout::disabled("llm_router", FailureCategory::NotConfigured)
+        }
+        (RouterPlan::Refused, _) => {
+            SubsystemReadout::down("llm_router", FailureCategory::NotConfigured)
+        }
+        (RouterPlan::Ask { .. }, true) => SubsystemReadout::ok("llm_router"),
+        (RouterPlan::Ask { .. }, false) => {
+            SubsystemReadout::degraded("llm_router", FailureCategory::Unreachable)
+        }
+    }
+}
+
+/// Reads `~/.nucleos/router.yaml` as the settings door does, then asks the router for its tiers.
+/// Task text never travels: `targets` is a GET with no body.
+async fn router_probe() -> SubsystemReadout {
+    let text = tokio::task::spawn_blocking(|| {
+        let path = crate::machine_config::root()?.join(crate::machine_config::ROUTER_FILE);
+        std::fs::read_to_string(path).ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    router_answer(router_plan(text.as_deref())).await
+}
+
+/// The probe's one question, for a plan already made: does the router answer `targets`?
+async fn router_answer(plan: RouterPlan) -> SubsystemReadout {
+    let reachable = match &plan {
+        RouterPlan::Ask { url, timeout } => crate::router_client::RouterClient::new(url, *timeout)
+            .targets()
+            .await
+            .is_ok(),
+        _ => false,
+    };
+    router_row(&plan, reachable)
 }
 
 /// PURE: the row, from whether the interpreter resolved and whether any rostered project wires
@@ -985,6 +1063,91 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    #[test]
+    fn the_router_row_follows_the_file_and_then_the_router() {
+        assert_eq!(router_plan(None), RouterPlan::Off);
+        assert_eq!(
+            router_plan(Some(
+                "mode: off
+"
+            )),
+            RouterPlan::Off
+        );
+        assert_eq!(
+            router_plan(Some(
+                "mode: shadow
+: [
+"
+            )),
+            RouterPlan::Refused
+        );
+        assert_eq!(
+            router_plan(Some(
+                "mode: shadow
+url: http://example.com:1
+"
+            )),
+            RouterPlan::Refused
+        );
+        let ask = router_plan(Some(
+            "mode: shadow
+url: http://127.0.0.1:9
+",
+        ));
+        assert!(matches!(ask, RouterPlan::Ask { .. }));
+
+        let off = router_row(&RouterPlan::Off, false);
+        assert_eq!(
+            (off.name, off.status),
+            ("llm_router", HealthState::Disabled)
+        );
+        let refused = router_row(&RouterPlan::Refused, false);
+        assert_eq!(refused.status, HealthState::Down);
+        assert!(refused.reason.is_some());
+        assert_eq!(router_row(&ask, true).status, HealthState::Ok);
+        let unreachable = router_row(&ask, false);
+        assert_eq!(unreachable.status, HealthState::Degraded);
+        assert_eq!(unreachable.reason, Some(FailureCategory::Unreachable));
+    }
+
+    /// The probe's one question, against a real listener: a router that answers `targets` is green,
+    /// and a port nobody listens on is amber.
+    #[tokio::test]
+    async fn a_router_that_answers_its_targets_is_green_and_a_silent_one_is_amber() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0u8; 1024];
+                let _ = socket.read(&mut buffer).await;
+                let body = r#"{"targets":[]}"#;
+                let reply = format!(
+                    "HTTP/1.1 200 OK
+content-type: application/json
+content-length: {}
+connection: close
+
+{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        let ask = |port: u16| {
+            router_plan(Some(&format!(
+                "mode: shadow
+url: http://127.0.0.1:{port}
+"
+            )))
+        };
+        assert_eq!(router_answer(ask(port)).await.status, HealthState::Ok);
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = free.local_addr().unwrap().port();
+        drop(free);
+        assert_eq!(router_answer(ask(dead)).await.status, HealthState::Degraded);
     }
 
     #[test]
