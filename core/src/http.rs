@@ -758,6 +758,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/worktrees/{run_id}/release", post(post_worktree_release))
         .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
+        .route(
+            "/judge-verdicts/unreviewed",
+            get(get_unreviewed_judge_verdicts),
+        )
+        .route("/judge-verdicts/{id}/verdict", post(post_judge_verdict))
         .route("/scoreboard", get(get_scoreboard))
         .route("/email/cursor", get(get_email_cursor))
         .route("/email/triage", post(post_email_triage))
@@ -15077,6 +15082,33 @@ async fn post_shadow_verdict(
         }
     })
     .await?
+}
+
+async fn get_unreviewed_judge_verdicts(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<Vec<crate::judge::JudgeVerdictView>>, StatusCode> {
+    crate::judge::list_unreviewed(&state.pool, &query.project_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Accepts `approve|reject` once, like `post_shadow_verdict`: 400 for any other word, 404 for an
+/// unknown id, a verdict already given, or a verdict that was not in a deciding band.
+async fn post_judge_verdict(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<VerdictRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if !matches!(body.verdict.as_str(), "approve" | "reject") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match crate::judge::set_verdict(&state.pool, id, &body.verdict).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 /// The §8.2 promotion nudge: a feed entry the moment a project's last outstanding action class

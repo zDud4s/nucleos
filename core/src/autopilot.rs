@@ -1458,6 +1458,45 @@ mod tests {
         );
     }
 
+    /// Spec A D11: the judge's queue is NOT work in progress. Counting it would make every observed
+    /// call of an Active project pending work, and a busy project would brake its own autonomy.
+    #[tokio::test]
+    async fn the_judges_queue_is_not_work_in_progress() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode) VALUES ('project-a', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = seed_shadow_decisions(&pool, "worktree", 2).await;
+        let before = project_roster(&pool).await.unwrap()[0].clone();
+        sqlx::query(
+            "INSERT INTO judge_verdicts
+             (run_id, tool_name, tool_input_digest, action_class, classifier_decision, judge,
+              model, questions_version, band, final_decision, created_at)
+             VALUES (?, 'Bash', 'd', 'unrecognized', 'pending_approval', 'observe', 'jev-latest',
+                     1, 'allow', 'pending_approval', '2026-09-27T00:00:00Z')",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let after = project_roster(&pool).await.unwrap()[0].clone();
+        assert_eq!(
+            (
+                after.open_review_items,
+                after.open_shadow_decisions,
+                after.queue_full
+            ),
+            (
+                before.open_review_items,
+                before.open_shadow_decisions,
+                before.queue_full
+            )
+        );
+    }
+
     /// Seeds `count` unreviewed decisions on a fresh run in `mode`, and answers its run id.
     async fn seed_shadow_decisions(pool: &SqlitePool, mode: &str, count: usize) -> i64 {
         let run_id = sqlx::query(
