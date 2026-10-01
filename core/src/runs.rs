@@ -4447,6 +4447,72 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
+    /// Spec B D11: every project and every run starts with the B off, independent of spec A's
+    /// `judge`, and a mode nobody defined is refused. D6.1: a new run is its own root (NULL).
+    #[tokio::test]
+    async fn the_resolver_starts_off_and_every_run_is_its_own_root() {
+        let pool = retention_pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'worktree', '2026-09-27T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let project: String = sqlx::query_scalar("SELECT judge_resolve FROM autopilot_state")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let (run, root): (String, Option<i64>) =
+            sqlx::query_as("SELECT judge_resolve, lineage_root_id FROM runs")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((project.as_str(), run.as_str(), root), ("off", "off", None));
+        assert!(sqlx::query("UPDATE runs SET judge_resolve = 'maybe'").execute(&pool).await.is_err());
+        assert!(
+            sqlx::query("UPDATE autopilot_state SET judge_resolve = 'maybe'")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
+    /// Spec B D6.1 and D12: one correction per lineage and one decline mark per (lineage, action),
+    /// held by the database; D13: an outcome nobody defined is refused.
+    #[tokio::test]
+    async fn the_resolvers_tables_hold_their_uniqueness_in_the_database() {
+        let pool = retention_pool().await;
+        let correction = "INSERT INTO judge_corrections (root_run_id, origin_run_id, project_id, created_at)
+                          VALUES (7, 7, 'p', '2026-09-27T00:00:00Z')";
+        sqlx::query(correction).execute(&pool).await.unwrap();
+        assert!(sqlx::query(correction).execute(&pool).await.is_err(), "a second correction of lineage 7");
+
+        let mark = "INSERT INTO declined_actions (lineage_root_id, tool_input_hash, proposal_id, created_at)
+                    VALUES (7, 'h', 1, '2026-09-27T00:00:00Z')";
+        sqlx::query(mark).execute(&pool).await.unwrap();
+        assert!(sqlx::query(mark).execute(&pool).await.is_err());
+
+        let resolution = |outcome: &str| {
+            format!(
+                "INSERT INTO judge_resolutions (run_id, lineage_root_id, event, tool_input_digest,
+                                                default_outcome, final_outcome, created_at)
+                 VALUES (1, 1, 'park', 'd', 'park', '{outcome}', '2026-09-27T00:00:00Z')"
+            )
+        };
+        sqlx::query(sqlx::AssertSqlSafe(resolution("explain"))).execute(&pool).await.unwrap();
+        assert!(
+            sqlx::query(sqlx::AssertSqlSafe(resolution("approve")))
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
     /// A run that ends in a status the GC does not collect keeps its worktree forever, and nothing
     /// reports it: the run is over, so nothing is waiting on the tree and nobody goes looking.
     ///
