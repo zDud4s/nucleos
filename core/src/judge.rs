@@ -742,8 +742,9 @@ impl JudgeMode {
 }
 
 /// D10: the whole of the judge's work in the hook — reading the thresholds and the state, the
-/// permit, the key, the call — inside one budget. 2 s is D10's figure, and D4 guarantees it is
-/// never added to a git subprocess; spec B (D10) raises this one constant to 3 s when its
+/// permit, the key, the call — inside one budget. 2 s is D10's figure and the most the hook ever
+/// waits; the hook shrinks it to what is left of its own 5 s budget after the declared-git probes
+/// (`hooks::judge_wait`), or skips the wait. Spec B (D10) raises this one constant to 3 s when its
 /// questions join.
 pub const JUDGE_DEADLINE: Duration = Duration::from_secs(2);
 
@@ -787,6 +788,11 @@ fn estimated_tokens(state_chars: usize) -> i64 {
 }
 
 /// D12: one row per consultation, whatever came of it.
+///
+/// `final_decision` is the decision at the judge's point (spec D4): the ruling when the judge
+/// ruled, the classifier's own verdict when it did not. It is recorded before the hook's later
+/// unattended/DontAsk conversions, which can still turn a `pending_approval` into a `deny`, so a
+/// reader scoring plan B must not take it as the decision the run finally received.
 struct VerdictRow {
     run_id: i64,
     shadow_decision_id: Option<i64>,
@@ -826,6 +832,8 @@ impl VerdictRow {
             p: None,
             band: None,
             capped: false,
+            // The decision at the judge's point, before the hook's unattended/DontAsk conversions
+            // (see the struct doc); `ruled` overwrites it only when the judge itself ruled.
             final_decision: asked.classifier_decision.clone(),
             enforced: false,
             counted_as_denial: false,
@@ -1099,12 +1107,24 @@ pub(crate) async fn judge_call(
     asked: &Asked,
     mode: JudgeMode,
 ) -> Ruling {
+    judge_call_within(pool, runtime, asked, mode, JUDGE_DEADLINE).await
+}
+
+/// `judge_call` with the budget the caller can spare, `JUDGE_DEADLINE` being the most it ever is.
+pub(crate) async fn judge_call_within(
+    pool: &SqlitePool,
+    runtime: &JudgeRuntime,
+    asked: &Asked,
+    mode: JudgeMode,
+    deadline: Duration,
+) -> Ruling {
+    let deadline = deadline.min(JUDGE_DEADLINE);
     let mut row = VerdictRow::new(asked, mode, runtime.occupant.model());
     let started = std::time::Instant::now();
     // Written inside the budget as soon as the state exists, so a cut after it still knows the
     // text may have been sent and billed.
     let mut sent_chars: Option<usize> = None;
-    let outcome = tokio::time::timeout(JUDGE_DEADLINE, async {
+    let outcome = tokio::time::timeout(deadline, async {
         let prepared = prepare(pool, asked).await.map_err(Failure::Prepare)?;
         sent_chars = Some(prepared.state.chars().count());
         let answers = ask(runtime, &prepared.state, JUDGE_QUESTIONS)
@@ -1120,7 +1140,7 @@ pub(crate) async fn judge_call(
             if let Some(chars) = sent_chars {
                 row.cost_usd = charged(estimated_tokens(chars));
             }
-            row.error = Some(format!("deadline: no answer within {JUDGE_DEADLINE:?}"));
+            row.error = Some(format!("deadline: no answer within {deadline:?}"));
         }
         Ok(Err(Failure::Prepare(error))) => row.error = Some(error),
         Ok(Err(Failure::Ask(error))) => {
@@ -1161,11 +1181,13 @@ pub(crate) fn observe_if_asked(pool: &SqlitePool, runtime: &Arc<JudgeRuntime>, a
     });
 }
 
-/// D4/D7: asks and waits - at most `JUDGE_DEADLINE` - and returns what the hook must do.
+/// D4/D7: asks and waits - at most `deadline`, itself capped at `JUDGE_DEADLINE` - and returns
+/// what the hook must do. The hook computes `deadline` from what is left of its own budget.
 pub(crate) async fn enforce_if_asked(
     pool: &SqlitePool,
     runtime: &JudgeRuntime,
     asked: Asked,
+    deadline: Duration,
 ) -> Ruling {
     if !judge_is_asked(
         &asked.tool_name,
@@ -1174,7 +1196,7 @@ pub(crate) async fn enforce_if_asked(
     ) {
         return Ruling::Classifier;
     }
-    judge_call(pool, runtime, &asked, JudgeMode::Enforce).await
+    judge_call_within(pool, runtime, &asked, JudgeMode::Enforce, deadline).await
 }
 
 /// Fixtures the judge's two test modules share: a migrated in-memory database and a running run.
