@@ -87,6 +87,7 @@ mod relay;
 mod repo_trigger;
 mod resolver;
 mod route_advice;
+mod route_report;
 mod router_client;
 mod run_stop;
 mod runner;

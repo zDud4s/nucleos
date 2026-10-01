@@ -300,6 +300,9 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/presets/{id}"),
     (Method::GET, "/runs/awaiting-approval"),
     (Method::GET, "/runs/{id}"),
+    // The router-advice report is an aggregate over rows `GET /runs` already lists, so it
+    // discloses nothing a read-only key cannot reach already.
+    (Method::GET, "/route/report"),
     // A stop report reads rows that already happened: the run's own row plus, for a `gate` or
     // `timeout` kind, the `shadow_decisions` leading up to it. It starts nothing and holds no
     // resource, so a read-only key that could not reach it would have to be handed Admin — the
@@ -927,6 +930,7 @@ mod tests {
             .route("/feed", get(|| async {}))
             .route("/runs", get(|| async {}).post(|| async {}))
             .route("/runs/{id}", get(|| async {}))
+            .route("/route/report", get(|| async {}))
             // A stand-in, like the gate route below: this file's tests are about who may reach a
             // path, and the path is what `permits` matches on.
             .route("/runs/{id}/stop", get(|| async {}))
@@ -1592,6 +1596,24 @@ mod tests {
     fn a_read_only_api_key_may_read_why_a_run_stopped() {
         let scope = Scope::ApiToken(ApiTokenLevel::ReadOnly);
         assert!(permits(&scope, &Method::GET, "/runs/{id}/stop"));
+    }
+
+    /// The router-advice report is a read: the weakest key reaches it over the real middleware, and
+    /// the same key still cannot launch a run.
+    #[tokio::test]
+    async fn a_read_only_key_reads_the_route_report_over_http() {
+        let state = test_state("control-token").await;
+        let token = stored_api_token(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let app = protected_router(state);
+
+        assert_eq!(
+            status_of(&app, "GET", "/route/report?days=7", &token).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(&app, "POST", "/route/report", &token).await,
+            StatusCode::FORBIDDEN
+        );
     }
 
     /// §11 item 9, asked of a real token through the real middleware rather than of `permits`.
