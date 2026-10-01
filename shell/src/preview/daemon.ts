@@ -1,5 +1,5 @@
 import type { Agent } from "../data/agents";
-import type { ClassTally, JudgeResolveStatus, JudgeStatus, JudgeVerdict } from "../data/autopilot";
+import type { ClassTally, JudgeResolveStatus, Resolution, JudgeStatus, JudgeVerdict } from "../data/autopilot";
 import type { Concurrency, Job, JobDetail, JobItem, RunSearchResult } from "../data/fleet";
 import type { MapImport, MapModule, ProjectMap } from "../data/project-map";
 import type {
@@ -820,10 +820,54 @@ export const SCOREBOARD: Record<string, ClassTally[]> = {
 };
 
 /** Alpha observes, six distinct actions reviewed, two classes — the panel's half-way state. */
-/** Spec B D11: the resolver is an opt-in, so the preview shows every project off. */
-export function judgeResolveFixture(project: string) {
-  return { project_id: project, judge_resolve: "off" } satisfies JudgeResolveStatus;
+/** Alpha observes, six units reviewed, all agreeing: the panel's half-way state (spec B D11). */
+export const JUDGE_RESOLVE_STATUS: Record<string, JudgeResolveStatus> = {
+  alpha: {
+    project_id: "alpha",
+    judge_resolve: "observe",
+    readiness: { reviewed: 6, agree: 6, less_cautious: 0, ready: false },
+  },
+};
+
+/** Spec B D11: an opt-in, so every other project reads off. */
+export function judgeResolveFixture(project: string): JudgeResolveStatus {
+  return (
+    JUDGE_RESOLVE_STATUS[project] ?? {
+      project_id: project,
+      judge_resolve: "off",
+      readiness: { reviewed: 0, agree: 0, less_cautious: 0, ready: false },
+    }
+  );
 }
+
+function resolution(id: number, overrides: Partial<Resolution>): Resolution {
+  return {
+    id, run_id: 44, lineage_root_id: 44, event: "park", tool_name: "Bash",
+    tool_input: JSON.stringify({ command: "cargo test --workspace | tee t.log" }), gate_output: null,
+    p_off_task: 0.04, p_needed: 0.12, p_avoidable: 0.93, p_fixable: null,
+    default_outcome: "park", judge_outcome: "explain", final_outcome: "park", enforced: false,
+    created_at: ago(2 * HOUR),
+    ...overrides,
+  };
+}
+
+/** One block of each event the queue shows: a hard refusal, a park, a failed gate. */
+export const JUDGE_RESOLUTIONS: Record<string, Resolution[]> = {
+  alpha: [
+    resolution(601, {
+      event: "hard_deny", tool_input: JSON.stringify({ command: "rm -rf target/../.git" }),
+      p_off_task: 0.91, p_needed: 0.08, p_avoidable: null,
+      default_outcome: "deny", judge_outcome: "stop", final_outcome: "deny", created_at: ago(5 * HOUR),
+    }),
+    resolution(602, {}),
+    resolution(603, {
+      run_id: 45, lineage_root_id: 45, event: "gate_failed", tool_name: null, tool_input: null,
+      gate_output: "test core::judge::resolve::tests::x ... FAILED", p_off_task: null, p_needed: null,
+      p_avoidable: null, p_fixable: 0.88, default_outcome: "owner", judge_outcome: "correction",
+      final_outcome: "owner", created_at: ago(30 * MINUTE),
+    }),
+  ],
+};
 
 export const JUDGE_STATUS: Record<string, JudgeStatus> = {
   alpha: {
@@ -2453,6 +2497,9 @@ export function answer(path: string, init?: RequestInit): unknown {
   }
   if (splitQuery(path)[0] === "/autopilot/judge-resolve") {
     return judgeResolveFixture(splitQuery(path)[1].get("project_id") ?? "");
+  }
+  if (splitQuery(path)[0] === "/judge-resolutions/unreviewed") {
+    return JUDGE_RESOLUTIONS[splitQuery(path)[1].get("project_id") ?? ""] ?? [];
   }
   if (splitQuery(path)[0] === "/judge-verdicts/unreviewed") {
     return JUDGE_VERDICTS[splitQuery(path)[1].get("project_id") ?? ""] ?? [];

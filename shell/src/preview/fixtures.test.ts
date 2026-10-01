@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED } from "../data/autopilot";
-import { judgeResolveFixture, FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOW, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
+import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED, RESOLVE_MIN_REVIEWED } from "../data/autopilot";
+import { judgeResolveFixture, JUDGE_RESOLUTIONS, JUDGE_RESOLVE_STATUS, FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOW, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
 import { readEfficiencySignal, readFeedKind, waitReasonFromSummary } from "../data/feed";
 import { LANE_FOLD_ABOVE, buildSequences, traceLanes } from "../lib/sequences";
 import { quietGaps } from "../lib/timeline";
@@ -154,8 +154,21 @@ describe("the preview fixtures", () => {
   });
 
   it("the resolver is off for every project until somebody turns it on", () => {
-    expect(judgeResolveFixture("alpha")).toEqual({ project_id: "alpha", judge_resolve: "off" });
-    expect(judgeResolveFixture("nobody").judge_resolve).toBe("off");
+    expect(judgeResolveFixture("nobody")).toEqual({
+      project_id: "nobody",
+      judge_resolve: "off",
+      readiness: { reviewed: 0, agree: 0, less_cautious: 0, ready: false },
+    });
+  });
+
+  it("the resolver is observing alpha, half way to its bar, with one block of each event waiting", () => {
+    const status = JUDGE_RESOLVE_STATUS.alpha;
+    expect(status.judge_resolve).toBe("observe");
+    expect(status.readiness).toEqual({ reviewed: 6, agree: 6, less_cautious: 0, ready: false });
+    expect(status.readiness.reviewed).toBeLessThan(RESOLVE_MIN_REVIEWED);
+    expect(judgeResolveFixture("alpha")).toBe(status);
+    const events = JUDGE_RESOLUTIONS.alpha.map((row) => row.event).sort();
+    expect(events).toEqual(["gate_failed", "hard_deny", "park"]);
   });
 
   it("alpha's scoreboard agrees with its roster figures", () => {

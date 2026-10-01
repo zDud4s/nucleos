@@ -63,6 +63,8 @@ export const keys = {
     runJudgeOpinions: (runId: number) => ["autopilot", "run-judge-opinions", runId] as const,
     /** One project's resolver setting (`GET /autopilot/judge-resolve`) — spec B, apart from the judge's. */
     judgeResolve: (projectId: string) => ["autopilot", "judge-resolve", projectId] as const,
+    /** One project's resolver review queue (`GET /judge-resolutions/unreviewed`). */
+    judgeResolutions: (projectId: string) => ["autopilot", "judge-resolutions", projectId] as const,
     /** The judge's own review queue — NOT under `shadowDecisions`: they are two queues. */
     judgeVerdictsAll: ["autopilot", "judge-verdicts"] as const,
     judgeVerdicts: (projectId: string) => ["autopilot", "judge-verdicts", projectId] as const,

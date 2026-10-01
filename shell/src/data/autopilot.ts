@@ -402,9 +402,123 @@ export const RESOLVE_DATA_WARNING =
   "when a finished run fails its gate. Observing changes nothing a run does — it asks, and writes " +
   "the answer down for you to review.";
 
+export type ResolveEvent = "hard_deny" | "park" | "gate_failed";
+export type ResolveOutcome = "deny" | "warn" | "stop" | "park" | "explain" | "owner" | "correction";
+
+/** Spec B D3, as `Event::outcomes` in `core/src/judge/resolve.rs` lists them. */
+const OUTCOMES: Record<ResolveEvent, ResolveOutcome[]> = {
+  hard_deny: ["deny", "warn", "stop"],
+  park: ["explain", "park", "stop"],
+  gate_failed: ["correction", "owner"],
+};
+
+export function outcomesFor(event: ResolveEvent): ResolveOutcome[] {
+  return OUTCOMES[event];
+}
+
+/** The owner's words for each outcome: what they would have wanted, not the column's name. */
+const OUTCOME_WORDS: Record<ResolveOutcome, string> = {
+  deny: "refuse, and let it carry on",
+  warn: "refuse, and tell me",
+  stop: "stop the run",
+  park: "ask me",
+  explain: "carry on without it",
+  owner: "hand it to me",
+  correction: "let it fix the gate",
+};
+
+export function readOutcome(outcome: ResolveOutcome): string {
+  return OUTCOME_WORDS[outcome];
+}
+
+/** Spec B D11's bar, as `RESOLVE_MIN_REVIEWED`/`RESOLVE_MIN_AGREE_PERCENT` in `judge/resolve_review.rs`. */
+export const RESOLVE_MIN_REVIEWED = 10;
+export const RESOLVE_MIN_AGREE_PERCENT = 90;
+
+/** Spec B D11, as the núcleo computes it: shown, never recomputed here. */
+export interface ResolveReadiness {
+  reviewed: number;
+  agree: number;
+  less_cautious: number;
+  ready: boolean;
+}
+
+export function readReadiness(r: ResolveReadiness): string {
+  if (r.less_cautious > 0) {
+    const reviews = r.less_cautious === 1 ? "review" : "reviews";
+    return `${r.less_cautious} ${reviews} where the judge was less careful than you — not ready`;
+  }
+  if (r.reviewed < RESOLVE_MIN_REVIEWED) return `${r.reviewed} of ${RESOLVE_MIN_REVIEWED} reviews`;
+  return r.ready
+    ? `${r.reviewed} reviewed, ${r.agree} agree — ready`
+    : `${r.agree} of ${r.reviewed} agree — under ${RESOLVE_MIN_AGREE_PERCENT}%`;
+}
+
 export interface JudgeResolveStatus {
   project_id: string;
   judge_resolve: JudgeMode;
+  readiness: ResolveReadiness;
+}
+
+/** One entry of the resolver's review queue (`judge::resolve_review::ResolutionView`). */
+export interface Resolution {
+  id: number;
+  run_id: number;
+  lineage_root_id: number;
+  event: ResolveEvent;
+  tool_name: string | null;
+  tool_input: string | null;
+  gate_output: string | null;
+  p_off_task: number | null;
+  p_needed: number | null;
+  p_avoidable: number | null;
+  p_fixable: number | null;
+  default_outcome: ResolveOutcome;
+  judge_outcome: ResolveOutcome;
+  final_outcome: string;
+  enforced: boolean;
+  created_at: string;
+}
+
+/**
+ * Spec B section 5, in the words the owner reads before letting the resolver decide: the four
+ * risks as the spec states them, and the one line that never moves.
+ */
+export const RESOLVE_ENFORCE_RISK =
+  "Letting the resolver decide accepts, for this project: a run may be told to carry on without " +
+  "an action a person would have approved, and finish with work half done (it is told to say what " +
+  "is missing); a run may be stopped when the judge thinks an action is off its task; a finished " +
+  "run whose gate failed may be continued once, on its own, in the same conversation — that " +
+  "correction may break more than it fixes, and its prompt carries the gate's output, which the " +
+  "agent itself may have written; and the judge's questions are measured only by the reviews " +
+  "below, never by a test set. A hard refusal is never run, whatever the judge says.";
+
+export function useJudgeResolutions(projectId: string | null) {
+  return useQuery({
+    queryKey: keys.autopilot.judgeResolutions(projectId ?? ""),
+    queryFn: () =>
+      apiFetch<Resolution[]>(
+        `/judge-resolutions/unreviewed?project_id=${encodeURIComponent(projectId ?? "")}`,
+      ),
+    enabled: projectId !== null,
+    refetchInterval: POLL.queue,
+  });
+}
+
+/** 204, once. Moves the readiness, so the status is invalidated beside the queue. */
+export function useSetResolutionOutcome() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, outcome }: { id: number; outcome: ResolveOutcome }) =>
+      apiFetch<void>(`/judge-resolutions/${id}/outcome`, {
+        method: "POST",
+        body: JSON.stringify({ outcome }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.all });
+    },
+  });
 }
 
 export function useJudgeResolveStatus(projectId: string | null) {
