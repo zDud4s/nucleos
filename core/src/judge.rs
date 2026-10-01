@@ -6,9 +6,6 @@
 //! This file starts as the PURE half: what is asked, how the answer is read, what the judge may
 //! never approve, which calls it is asked about, and the text it is shown. The client, the rows
 //! and the review queue arrive with the plan's later chunks.
-// Nothing outside the tests consumes this until the hook is wired (plan Task 5.2); Task 6.4
-// removes this line.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

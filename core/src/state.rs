@@ -406,7 +406,6 @@ pub struct AppState {
     pub quota: Arc<crate::quota::QuotaRuntime>,
     /// Spec A: the autopilot's judge, its occupant and its four permits (D10/D11). Built once at
     /// startup; `runs.judge` decides per run whether it is asked at all.
-    #[allow(dead_code)] // consumed by Task 5.2 (the hook is its first reader)
     pub judge: Arc<crate::judge::JudgeRuntime>,
     /// The browser pillar: whether it is on, and the client for the process that drives Chromium.
     ///
