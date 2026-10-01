@@ -732,7 +732,8 @@ fn select_pass<'a>(
 ///
 /// Consolidator measurements count only when they have both their episodic shape and a measured
 /// observation count. `recall` shares this rule with briefing admission rather than inventing a
-/// second meaning for `active`.
+/// second meaning for `active`. The other named exception is not approval: `admitted` separately
+/// requires a same-job working row with well-tagged evidence.
 pub(crate) fn approved(row: &Known) -> bool {
     match row.status.as_str() {
         "active" if row.source == "consolidator" => {
@@ -746,18 +747,16 @@ pub(crate) fn approved(row: &Known) -> bool {
 // Only what a person approved. Filtered here rather than trusted from the caller's query:
 // `select` is the last thing between a `proposed` row and a node's prompt, and something that
 // reaches a prompt unapproved makes the approval decorative, which is the entire mechanism.
-// The only named exceptions are a measured consolidator observation and an evidenced working
-// fact read inside the same job; spelling their complete shapes here keeps a third one out.
+// The only named exceptions are a measured consolidator observation and a working fact with
+// well-tagged evidence read inside the same job; spelling their complete shapes here keeps a third
+// one out.
 fn admitted(row: &Known, context: &Context) -> bool {
     match row.status.as_str() {
         "active" => approved(row),
         "live" => {
             row.source == "run"
                 && row.layer == "working"
-                && row
-                    .evidence
-                    .as_deref()
-                    .is_some_and(|evidence| !evidence.trim().is_empty())
+                && row.evidence.as_deref().is_some_and(evidence_is_tagged)
                 && context
                     .chain
                     .iter()
@@ -770,8 +769,8 @@ fn admitted(row: &Known, context: &Context) -> bool {
 /// Select a bounded briefing without doing I/O.
 ///
 /// Admission applies spec §4.5 first: approved rows plus the two named exceptions, measured
-/// consolidator observations and evidenced same-job working facts. Structure then owns its bytes
-/// first. Populated layers claim their item floors, and candidates left over compete in
+/// consolidator observations and same-job working facts with well-tagged evidence. Structure then
+/// owns its bytes first. Populated layers claim their item floors, and candidates left over compete in
 /// [`ordered_candidates`] order. The first pass discovers which scope groups are cut; the second
 /// reserves those notices before choosing rows and accounts for any cut it exposes at the
 /// boundary. The trace covers every admitted candidate.
@@ -1842,9 +1841,6 @@ pub(crate) fn tagged_evidence(raw: &serde_json::Value) -> Option<String> {
 }
 
 /// Whether stored evidence still has at least one shaped, known referent.
-///
-/// Read by `admitted` from Task 8.4.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn evidence_is_tagged(stored: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(stored)
         .ok()
@@ -3409,7 +3405,7 @@ mod tests {
     /// The admission rule is asserted on `select`, the seam every caller passes through. Active
     /// rows still represent approval. The only rows that may bypass it are (a) an `active`
     /// consolidator `episodic` row with observations and (b) a `live` run `working` row with
-    /// non-empty evidence, read only inside the job that wrote it. Enumerating the surrounding
+    /// well-tagged evidence, read only inside the job that wrote it. Enumerating the surrounding
     /// status/source/layer space makes a third exception fail here rather than reach a prompt.
     #[test]
     fn nothing_that_a_person_has_not_approved_reaches_a_node() {
@@ -3436,7 +3432,7 @@ mod tests {
                     if status == "live" {
                         row.scope_kind = "job".into();
                         row.scope_id = Some("77".into());
-                        row.evidence = Some("run:900001".into());
+                        row.evidence = Some(r#"[{"t":"run","id":900001}]"#.into());
                     }
 
                     let measured_exception = status == "active"
@@ -3446,10 +3442,7 @@ mod tests {
                     let working_exception = status == "live"
                         && source == "run"
                         && layer == "working"
-                        && row
-                            .evidence
-                            .as_deref()
-                            .is_some_and(|value| !value.is_empty());
+                        && row.evidence.as_deref().is_some_and(evidence_is_tagged);
                     let approved = status == "active" && source != "consolidator";
                     assert_eq!(
                         select(std::slice::from_ref(&row), &context, &Budget::default(),)
@@ -3488,7 +3481,17 @@ mod tests {
         another_jobs_working_fact.id = 102;
         another_jobs_working_fact.title = "another job's".into();
         another_jobs_working_fact.scope_id = Some("78".into());
-        another_jobs_working_fact.evidence = Some("run:900002".into());
+        another_jobs_working_fact.evidence = Some(r#"[{"t":"run","id":900002}]"#.into());
+
+        let mut working_with_unknown_tag = working_without_evidence.clone();
+        working_with_unknown_tag.id = 103;
+        working_with_unknown_tag.title = "unknown evidence tag".into();
+        working_with_unknown_tag.evidence = Some(r#"[{"t":"vibes","id":1}]"#.into());
+
+        let mut working_with_untagged_evidence = working_without_evidence.clone();
+        working_with_untagged_evidence.id = 104;
+        working_with_untagged_evidence.title = "untagged evidence".into();
+        working_with_untagged_evidence.evidence = Some("run:900001".into());
 
         assert!(
             select(
@@ -3496,6 +3499,8 @@ mod tests {
                     measurement_without_observations,
                     working_without_evidence,
                     another_jobs_working_fact,
+                    working_with_unknown_tag,
+                    working_with_untagged_evidence,
                 ],
                 &context,
                 &Budget::default(),
@@ -3503,6 +3508,290 @@ mod tests {
             .block
             .is_none(),
             "an incomplete or cross-job exception reached a node's prompt"
+        );
+    }
+
+    /// Nothing a person has not approved reaches a node, except (a) an `active` consolidator
+    /// `episodic` row with measured observations (including a merge successor), and (b) a `live`
+    /// run `working` row with well-tagged evidence read only by the job that wrote it.
+    ///
+    /// This test FAILS if a third appears: an `active` row with no `proposal_id` that is not
+    /// consolidator-episodic-measured, a `live` row reaching a run of another job, or a `live` row
+    /// whose `evidence` is empty or badly tagged. This door checks only that evidence exists and is
+    /// tagged; it does not validate that the sentence is true.
+    #[tokio::test]
+    async fn nothing_a_person_has_not_approved_reaches_a_node_but_the_two_named_exceptions() {
+        let pool = test_pool().await;
+
+        seed(&pool, Some("p"), "active", "owner approved").await;
+        let owner_id: i64 =
+            sqlx::query_scalar("SELECT id FROM knowledge WHERE title = 'owner approved'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let (approved_id, approved_proposal) = propose(
+            &pool,
+            Declaration {
+                project_id: Some("p"),
+                origin_run_id: Some(900_001),
+                kind: Kind::Prompt,
+                title: "run lesson approved",
+                body: "approved body",
+                reasoning: "the run declared it",
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+        approve(&pool, approved_proposal).await.unwrap();
+        let (proposed_id, _) = propose(
+            &pool,
+            Declaration {
+                project_id: Some("p"),
+                origin_run_id: Some(900_002),
+                kind: Kind::Prompt,
+                title: "run lesson proposed",
+                body: "not approved",
+                reasoning: "still waiting",
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // There is no public one-row consolidator writer: its production writer is per-pass
+        // machinery. These rows therefore reproduce that writer's persisted columns directly.
+        sqlx::query(
+            r#"INSERT INTO knowledge
+                 (layer, scope_kind, scope_id, source, generator, evidence, observations, kind,
+                  title, body, status, proposal_id, supersedes, created_at)
+               VALUES
+                 ('episodic', 'project', 'p', 'consolidator', 'gate',
+                  '[{"t":"run","id":1}]', 4, 'memory', 'measured episode', 'measured',
+                  'active', NULL, NULL, '2026-10-01T00:00:00+00:00'),
+                 ('episodic', 'project', 'p', 'consolidator', 'gate',
+                  '[{"t":"run","id":1}]', NULL, 'memory', 'unmeasured episode', 'unmeasured',
+                  'active', NULL, NULL, '2026-10-01T00:00:00+00:00'),
+                 ('semantic', 'project', 'p', 'consolidator', 'gate',
+                  '[{"t":"run","id":1}]', 4, 'memory', 'semantic consolidation', 'semantic',
+                  'active', NULL, NULL, '2026-10-01T00:00:00+00:00'),
+                 ('episodic', 'project', 'p', 'consolidator', 'gate',
+                  '[{"t":"run","id":1}]', 4, 'memory', 'proposed measurement', 'proposed',
+                  'proposed', NULL, NULL, '2026-10-01T00:00:00+00:00'),
+                 ('episodic', 'project', 'p', 'consolidator', 'gate',
+                  '[{"t":"run","id":1}]', 8, 'memory', 'measured merge successor', 'merged',
+                  'active', NULL, 4, '2026-10-01T00:00:00+00:00'),
+                 ('episodic', 'project', 'p', 'consolidator', 'gate',
+                  '[{"t":"run","id":1}]', NULL, 'memory', 'unmeasured merge successor',
+                  'not measured', 'active', NULL, 4, '2026-10-01T00:00:00+00:00')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let measured_id: i64 =
+            sqlx::query_scalar("SELECT id FROM knowledge WHERE title = 'measured episode'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let unmeasured_id: i64 =
+            sqlx::query_scalar("SELECT id FROM knowledge WHERE title = 'unmeasured episode'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let semantic_id: i64 =
+            sqlx::query_scalar("SELECT id FROM knowledge WHERE title = 'semantic consolidation'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let proposed_measurement_id: i64 =
+            sqlx::query_scalar("SELECT id FROM knowledge WHERE title = 'proposed measurement'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let measured_successor_id: i64 =
+            sqlx::query_scalar("SELECT id FROM knowledge WHERE title = 'measured merge successor'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let unmeasured_successor_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM knowledge WHERE title = 'unmeasured merge successor'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        for job_id in [77_i64, 78] {
+            sqlx::query(
+                "INSERT INTO jobs
+                   (id, project_id, project_root, rule_name, prompt, status, max_items, gate_each,
+                    review, gate_retries, head_sha, max_rounds, budget_usd, created_at, team_id)
+                 VALUES (?, 'p', '/project/p', NULL, 'test job', 'running', 1, 1, 0, 0, NULL,
+                         NULL, NULL, '2026-10-01T00:00:00+00:00', NULL)",
+            )
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO runs (id, project_id, prompt, status, job_id, created_at)
+                 VALUES (?, 'p', 'test run', 'running', ?, '2026-10-01T00:00:00+00:00')",
+            )
+            .bind(9_000 + job_id)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let finding_77_id = note_finding(
+            &pool,
+            9_077,
+            "finding for job 77",
+            &serde_json::json!([{"t": "run", "id": 9_077}]),
+        )
+        .await
+        .unwrap();
+        let finding_78_id = note_finding(
+            &pool,
+            9_078,
+            "finding for job 78",
+            &serde_json::json!([{"t": "run", "id": 9_078}]),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"INSERT INTO knowledge
+                 (layer, scope_kind, scope_id, source, evidence, kind, title, body, status,
+                  created_at)
+               VALUES
+                 ('working', 'job', '77', 'run', '[{"t":"vibes","id":1}]', 'memory',
+                  'unknown tag', 'bad tag', 'live', '2026-10-01T00:00:00+00:00'),
+                 ('working', 'job', '77', 'run', 'run:1', 'memory',
+                  'untagged evidence', 'not JSON', 'live', '2026-10-01T00:00:00+00:00'),
+                 ('working', 'job', '77', 'run', '[]', 'memory',
+                  'empty evidence', 'empty array', 'live', '2026-10-01T00:00:00+00:00'),
+                 ('working', 'project', 'p', 'run', '[{"t":"run","id":1}]', 'memory',
+                  'project live row', 'wrong scope', 'live', '2026-10-01T00:00:00+00:00')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let bad_live_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM knowledge WHERE title IN
+             ('unknown tag', 'untagged evidence', 'empty evidence', 'project live row')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let brief_77 = crate::brief::of(&pool, &job_context(77), "query words")
+            .await
+            .unwrap();
+        let traced_77: std::collections::BTreeSet<i64> =
+            brief_77.trace.iter().map(|row| row.knowledge_id).collect();
+        let admitted_77 = std::collections::BTreeSet::from([
+            owner_id,
+            approved_id,
+            measured_id,
+            measured_successor_id,
+            finding_77_id,
+        ]);
+        assert_eq!(
+            traced_77, admitted_77,
+            "a third exception entered the trace"
+        );
+        assert!(
+            brief_77.trace.iter().all(|row| row.shown),
+            "the admitted rows did not all reach the block"
+        );
+        let block_77 = brief_77.block.expect("the admitted set builds a briefing");
+        for admitted_title in [
+            "owner approved",
+            "run lesson approved",
+            "measured episode",
+            "measured merge successor",
+            "finding for job 77",
+        ] {
+            assert!(
+                block_77.contains(admitted_title),
+                "the block omitted admitted row {admitted_title}"
+            );
+        }
+        for refused_title in [
+            "run lesson proposed",
+            "unmeasured episode",
+            "semantic consolidation",
+            "proposed measurement",
+            "unmeasured merge successor",
+            "finding for job 78",
+            "unknown tag",
+            "untagged evidence",
+            "empty evidence",
+            "project live row",
+        ] {
+            assert!(
+                !block_77.contains(refused_title),
+                "the block included refused row {refused_title}"
+            );
+        }
+        for refused_id in [
+            proposed_id,
+            unmeasured_id,
+            semantic_id,
+            proposed_measurement_id,
+            unmeasured_successor_id,
+            finding_78_id,
+        ]
+        .into_iter()
+        .chain(bad_live_ids.iter().copied())
+        {
+            assert!(
+                !brief_77
+                    .trace
+                    .iter()
+                    .any(|row| row.knowledge_id == refused_id),
+                "refused row {refused_id} entered job 77's trace"
+            );
+        }
+
+        let brief_78 = crate::brief::of(&pool, &job_context(78), "query words")
+            .await
+            .unwrap();
+        assert!(
+            brief_78
+                .trace
+                .iter()
+                .any(|row| row.knowledge_id == finding_78_id),
+            "job 78 did not receive its own finding"
+        );
+        assert!(
+            !brief_78
+                .trace
+                .iter()
+                .any(|row| row.knowledge_id == finding_77_id),
+            "job 78 received job 77's finding"
+        );
+
+        let unapproved_active_runs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge
+              WHERE source = 'run' AND status = 'active' AND proposal_id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unapproved_active_runs, 0);
+        let wrongly_shaped_live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge
+              WHERE status = 'live'
+                AND NOT (layer = 'working' AND scope_kind = 'job' AND source = 'run')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            wrongly_shaped_live, 1,
+            "a writer produced a stray live row beyond the deliberate project-scope fixture"
         );
     }
 
