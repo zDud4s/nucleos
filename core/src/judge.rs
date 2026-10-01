@@ -928,6 +928,15 @@ async fn thresholds_for(
     .map_err(|error| error.to_string())
 }
 
+/// Review item G: why this project's thresholds cannot be read, if they cannot - the same read the
+/// hook makes, so the panel says exactly what the hook will do (fall back to the classifier).
+pub(crate) async fn rules_problem(
+    machine_root: Option<PathBuf>,
+    project_id: &str,
+) -> Option<String> {
+    thresholds_for(machine_root, Some(project_id)).await.err()
+}
+
 /// D9: the state for one call. The task is `runs.prompt` (NOT NULL) or, for a job node, its
 /// item's description; the recent actions are this run's `shadow_decisions` before this one, each
 /// through `clean_tool_input` like the action itself.
