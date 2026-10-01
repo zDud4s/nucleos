@@ -230,6 +230,41 @@ fn judge_asked(
     }
 }
 
+/// Spec B: what the hook already read about the run, as the resolver's request needs it. A struct
+/// and not positional arguments: three of them are `i64`-ish and in a row, and swapped at the call
+/// they would compile and record the wrong lineage.
+struct RunSnapshot<'a> {
+    run_id: i64,
+    lineage_root: i64,
+    shadow_decision_id: Option<i64>,
+    project_id: Option<&'a str>,
+    cwd: &'a str,
+}
+
+/// Spec B: the block this call is, as the resolver is asked about it.
+fn resolve_asked(
+    state: &AppState,
+    event: crate::judge::resolve::Event,
+    run: &RunSnapshot<'_>,
+    payload: &PreToolUsePayload,
+    classification: &classifier::Classification,
+) -> crate::judge::resolve::Asked {
+    crate::judge::resolve::Asked {
+        run_id: run.run_id,
+        lineage_root_id: run.lineage_root,
+        event,
+        event_ref: run.shadow_decision_id,
+        project_id: run.project_id.map(str::to_owned),
+        machine_root: state.machine_config_root.clone(),
+        subject: crate::judge::resolve::Subject::Call {
+            tool_name: payload.tool_name.clone(),
+            tool_input: payload.tool_input.clone(),
+            cwd: run.cwd.to_owned(),
+            action_class: classification.action_class,
+        },
+    }
+}
+
 /// A refusal that never becomes an approval, however its caller fails.
 fn deny_with(reason: &str) -> Decision {
     Decision {
@@ -514,61 +549,82 @@ async fn pretooluse_decision_from(
     // does not change the rules underneath it. `off` when the row is gone.
     // Spec B D6.1: the lineage root rides along for D12's mark. NULL means this run is its own
     // root, hence the COALESCE; an absent row is its own root too, with nothing to match.
-    let (cwd, mode, project_id, permission, judge_snapshot, lineage_root) = match sqlx::query_as::<
-        _,
-        (
-            Option<String>,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-            i64,
-        ),
-    >(
-        "SELECT cwd, mode, project_id, permission_mode, judge, COALESCE(lineage_root_id, id)
-         FROM runs WHERE id = ?",
-    )
-    .bind(run_id)
-    .fetch_optional(&state.pool)
-    .await
-    {
-        Ok(Some((cwd, mode, project_id, permission, judge, lineage_root))) => (
-            is_in_flight.then_some(cwd).flatten(),
-            mode,
-            project_id,
-            permission.as_deref().map_or(
-                crate::chats::PermissionMode::Auto,
-                crate::chats::PermissionMode::from_wire,
+    // Spec B D2/D10: `job_id` and the run's `judge_resolve` snapshot ride along too, for the
+    // resolver's eligibility; the same query, so no extra read on the hook's path.
+    let (cwd, mode, project_id, permission, judge_snapshot, lineage_root, job_id, resolve_snapshot) =
+        match sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+                String,
+                i64,
+                Option<i64>,
+                String,
             ),
-            crate::judge::JudgeMode::from_db_str(&judge).unwrap_or(crate::judge::JudgeMode::Off),
-            lineage_root,
-        ),
-        Ok(None) => (
-            None,
-            "real".to_owned(),
-            None,
-            crate::chats::PermissionMode::Auto,
-            crate::judge::JudgeMode::Off,
-            run_id,
-        ),
-        // `mode` decides WHICH set of rules applies, so an unreadable one cannot resolve to the
-        // most permissive of them. `Ok(None)` above can safely default to `real` because the row is
-        // genuinely absent — there is no run whose rules we are guessing at. An `Err` is different:
-        // the run may well be a triage or shadow run whose barrier we would be stepping over, and
-        // the pool this reads through is shared with feed appends and run-status writes, so
-        // SQLITE_BUSY under contention is an ordinary event rather than a theoretical one.
-        Err(error) => {
-            tracing::warn!(
-                run_id = run_id,
-                %error,
-                "pretooluse-decision: failed to resolve the run's mode — failing closed"
-            );
-            return Json(Decision {
-                decision: "deny".to_owned(),
-                reason: "could not resolve the run's mode — failing closed".to_owned(),
-            });
-        }
-    };
+        >(
+            "SELECT cwd, mode, project_id, permission_mode, judge, COALESCE(lineage_root_id, id),
+                job_id, judge_resolve
+         FROM runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(Some((
+                cwd,
+                mode,
+                project_id,
+                permission,
+                judge,
+                lineage_root,
+                job_id,
+                judge_resolve,
+            ))) => (
+                is_in_flight.then_some(cwd).flatten(),
+                mode,
+                project_id,
+                permission.as_deref().map_or(
+                    crate::chats::PermissionMode::Auto,
+                    crate::chats::PermissionMode::from_wire,
+                ),
+                crate::judge::JudgeMode::from_db_str(&judge)
+                    .unwrap_or(crate::judge::JudgeMode::Off),
+                lineage_root,
+                job_id,
+                crate::judge::JudgeMode::from_db_str(&judge_resolve)
+                    .unwrap_or(crate::judge::JudgeMode::Off),
+            ),
+            Ok(None) => (
+                None,
+                "real".to_owned(),
+                None,
+                crate::chats::PermissionMode::Auto,
+                crate::judge::JudgeMode::Off,
+                run_id,
+                None,
+                crate::judge::JudgeMode::Off,
+            ),
+            // `mode` decides WHICH set of rules applies, so an unreadable one cannot resolve to the
+            // most permissive of them. `Ok(None)` above can safely default to `real` because the row is
+            // genuinely absent — there is no run whose rules we are guessing at. An `Err` is different:
+            // the run may well be a triage or shadow run whose barrier we would be stepping over, and
+            // the pool this reads through is shared with feed appends and run-status writes, so
+            // SQLITE_BUSY under contention is an ordinary event rather than a theoretical one.
+            Err(error) => {
+                tracing::warn!(
+                    run_id = run_id,
+                    %error,
+                    "pretooluse-decision: failed to resolve the run's mode — failing closed"
+                );
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: "could not resolve the run's mode — failing closed".to_owned(),
+                });
+            }
+        };
 
     // Barrier 2 of spec §5.5. A triage run is launched with no tools at all (barrier 1), so a tool
     // call arriving here means barrier 1 is not in force — which is the entire reason this branch
@@ -1136,8 +1192,48 @@ async fn pretooluse_decision_from(
     // verdicts were also the wrong way round in cost: `pending_approval` stopped the run and
     // fetched a human, while `deny` — the harsher judgement — cost the run nothing at all.
     if classification.decision.decision == "deny" && is_in_flight {
-        // Spec B D9: the hard refusal's outcome is read by the resolver (plan Chunk 4).
-        let _counted = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
+        let counted = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
+        // Spec B E1 (D9): only on `Counted`. A spent allowance (`Stopped`) or a count that could
+        // not be written (`NotCounted`) is never put to the judge: the limit exists to stop an
+        // agent searching the classifier's grammar, and the judge has no defence against injection.
+        // The judge may stop a run before the limit, never after it. Only the B's questions are
+        // asked here (D10: a hard refusal never reaches spec A's judge). Observe decides nothing:
+        // the answer is already `deny` and stays `deny` (D11).
+        if matches!(counted, DenialCount::Counted(_))
+            && let Some(cwd) = cwd.as_deref()
+        {
+            let eligibility = crate::judge::resolve::Eligibility {
+                in_flight: is_in_flight,
+                run_mode: &mode,
+                job_id,
+                resolution_lineage: false,
+                resolve: resolve_snapshot,
+                dont_ask: permission == crate::chats::PermissionMode::DontAsk,
+                action_class: classification.action_class,
+            };
+            // The lineage read (D2) is NOT here: `observe` does it inside its own task, off the
+            // response path (D10).
+            if crate::judge::resolve::hard_deny_eligible(&eligibility) {
+                let run = RunSnapshot {
+                    run_id,
+                    lineage_root,
+                    shadow_decision_id,
+                    project_id: project_id.as_deref(),
+                    cwd,
+                };
+                crate::judge::resolve::observe(
+                    &state.pool,
+                    &state.judge,
+                    resolve_asked(
+                        &state,
+                        crate::judge::resolve::Event::HardDeny,
+                        &run,
+                        &payload,
+                        &classification,
+                    ),
+                );
+            }
+        }
     }
 
     // **An unrecognized tool is refused, not parked, and the two are not the same verdict.**
@@ -1256,6 +1352,45 @@ async fn pretooluse_decision_from(
             decision: "deny".to_owned(),
             reason: format!("{}{DONT_ASK_CLAUSE}", classification.reason),
         });
+    }
+
+    // Spec B E3, D10: after the branches above that already turn a park into a refusal
+    // (`unrecognized-tool`, a job node's park, `dont_ask`), so only a real park is asked about;
+    // after spec A's judge, so what reaches here is what it left alone. In observe the question is
+    // detached and never delays the hook, and the park below is unchanged (D11).
+    if classification.decision.decision == "pending_approval"
+        && is_in_flight
+        && let Some(cwd) = cwd.as_deref()
+    {
+        let eligibility = crate::judge::resolve::Eligibility {
+            in_flight: is_in_flight,
+            run_mode: &mode,
+            job_id,
+            resolution_lineage: false,
+            resolve: resolve_snapshot,
+            dont_ask: permission == crate::chats::PermissionMode::DontAsk,
+            action_class: classification.action_class,
+        };
+        if crate::judge::resolve::park_eligible(&eligibility) {
+            let run = RunSnapshot {
+                run_id,
+                lineage_root,
+                shadow_decision_id,
+                project_id: project_id.as_deref(),
+                cwd,
+            };
+            crate::judge::resolve::observe(
+                &state.pool,
+                &state.judge,
+                resolve_asked(
+                    &state,
+                    crate::judge::resolve::Event::Park,
+                    &run,
+                    &payload,
+                    &classification,
+                ),
+            );
+        }
     }
 
     if classification.decision.decision == "pending_approval" {
@@ -3735,6 +3870,204 @@ mod tests {
     /// A call the judge must NOT be asked about has had time to be asked, if it were going to be.
     async fn settle() {
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    async fn resolving_run(state: &AppState, resolve: &str) -> i64 {
+        let run_id =
+            in_flight_run(state, "worktree", Some("p"), Some("C:\\work\\repo"), None).await;
+        sqlx::query("UPDATE runs SET judge_resolve = ?, prompt = 'Fix the build' WHERE id = ?")
+            .bind(resolve)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        run_id
+    }
+
+    /// Resolutions are recorded detached; this waits for `n`, or fails after five seconds.
+    async fn resolution_rows(
+        pool: &sqlx::SqlitePool,
+        n: usize,
+    ) -> Vec<(String, Option<String>, String, i64)> {
+        for _ in 0..500 {
+            let rows: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(
+                "SELECT event, judge_outcome, final_outcome, enforced FROM judge_resolutions ORDER BY id",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            if rows.len() >= n {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the resolver never wrote {n} row(s)");
+    }
+
+    /// Spec B D11 at E1: a hard refusal in observe is asked about, written down, and still just a deny.
+    #[tokio::test]
+    async fn an_observed_hard_refusal_is_still_only_a_refusal() {
+        let judge = VerdictJudge::answering_keys(&[("off_task", 0.95), ("needed", 0.2)]);
+        let state = judged_state(judge.clone()).await;
+        let run_id = resolving_run(&state, "observe").await;
+        let app = test_router(state.clone());
+
+        let decision = decide(&app, &bash(run_id, "rm -rf /")).await;
+
+        assert_eq!(decision.decision, "deny");
+        assert!(
+            state.run_handles.lock().unwrap().contains_key(&run_id),
+            "observe never stops a run"
+        );
+        let rows = resolution_rows(&state.pool, 1).await;
+        assert_eq!(
+            rows[0],
+            (
+                "hard_deny".to_owned(),
+                Some("stop".to_owned()),
+                "deny".to_owned(),
+                0
+            )
+        );
+    }
+
+    /// Spec B D9: at the limit (Stopped) and with a count that could not be written (NotCounted),
+    /// the judge is never asked.
+    #[tokio::test]
+    async fn a_spent_allowance_is_never_put_to_the_judge() {
+        let judge = VerdictJudge::answering_keys(&[("off_task", 0.1), ("needed", 0.1)]);
+        let state = judged_state(judge.clone()).await;
+        let run_id = resolving_run(&state, "observe").await;
+        sqlx::query("UPDATE runs SET denials = 2 WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        decide(&app, &bash(run_id, "rm -rf /")).await;
+        settle().await;
+
+        assert_eq!(judge.calls(), 0);
+    }
+
+    /// Spec B D11 at E3: an observed park still parks, and the opinion is written down.
+    #[tokio::test]
+    async fn an_observed_park_still_parks() {
+        let judge = VerdictJudge::answering_keys(&[
+            ("off_task", 0.05),
+            ("needed", 0.1),
+            ("avoidable", 0.97),
+        ]);
+        let state = judged_state(judge).await;
+        let run_id = resolving_run(&state, "observe").await;
+        let app = test_router(state.clone());
+
+        let decision = decide(&app, &bash(run_id, PARKED)).await;
+
+        assert_eq!(decision.decision, "pending_approval");
+        let rows = resolution_rows(&state.pool, 1).await;
+        assert_eq!(
+            rows[0],
+            (
+                "park".to_owned(),
+                Some("explain".to_owned()),
+                "park".to_owned(),
+                0
+            )
+        );
+    }
+
+    /// Spec B D2 and D10: the resolver is never asked for a job's node, a resolution's lineage, a
+    /// run with the B off, the `dont_ask` rung or `unrecognized-tool`. The last two are turned
+    /// into a `deny` by the branches before the E3 point, so `park_eligible` alone is what covers
+    /// those fields (`every_condition_of_eligibility_counts_on_its_own`).
+    #[tokio::test]
+    async fn the_resolver_is_never_asked_where_it_cannot_act() {
+        let judge =
+            VerdictJudge::answering_keys(&[("off_task", 0.5), ("needed", 0.5), ("avoidable", 0.5)]);
+        let state = judged_state(judge.clone()).await;
+        let app = test_router(state.clone());
+
+        let (_job, job_run) = in_flight_job_node(&state).await;
+        sqlx::query("UPDATE runs SET judge_resolve = 'observe' WHERE id = ?")
+            .bind(job_run)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        decide(&app, &bash(job_run, "rm -rf /")).await;
+
+        let resolver = resolving_run(&state, "observe").await;
+        let successor = resolving_run(&state, "observe").await;
+        sqlx::query("UPDATE runs SET lineage_root_id = ? WHERE id = ?")
+            .bind(resolver)
+            .bind(successor)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, created_at, resolution_run_id)
+             VALUES ('merge', '{}', 'p', 'C:/x', 'human', 'escalated', '2026-09-27T00:00:00Z', ?)",
+        )
+        .bind(resolver)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        decide(&app, &bash(successor, PARKED)).await;
+
+        let off = resolving_run(&state, "off").await;
+        decide(&app, &bash(off, "rm -rf /")).await;
+
+        let dont_ask = resolving_run(&state, "observe").await;
+        sqlx::query("UPDATE runs SET permission_mode = 'dont_ask' WHERE id = ?")
+            .bind(dont_ask)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        decide(&app, &bash(dont_ask, PARKED)).await;
+
+        let tool = resolving_run(&state, "observe").await;
+        decide(
+            &app,
+            &serde_json::json!({"run_id": tool, "tool_name": "WebSearch", "tool_input": {"query": "x"}})
+                .to_string(),
+        )
+        .await;
+
+        settle().await;
+        assert_eq!(judge.calls(), 0);
+    }
+
+    /// Spec B D10: with spec A on and the classifier allowing, the B's questions are never asked.
+    #[tokio::test]
+    async fn an_allowed_write_never_carries_the_resolvers_questions() {
+        let judge = VerdictJudge::answering_keys(&[("in_scope", 0.5), ("safe", 0.5)]);
+        let state = judged_state(judge.clone()).await;
+        let run_id = resolving_run(&state, "observe").await;
+        sqlx::query("UPDATE runs SET judge = 'observe' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &serde_json::json!({"run_id": run_id, "tool_name": "Write",
+                "tool_input": {"file_path": "C:\\work\\repo\\a.rs", "content": "x"}})
+            .to_string(),
+        )
+        .await;
+        verdict_rows(&state.pool, 1).await;
+        settle().await;
+
+        assert!(
+            judge
+                .asked_keys()
+                .iter()
+                .flatten()
+                .all(|key| !["off_task", "needed", "avoidable"].contains(key))
+        );
     }
 
     async fn denials(state: &AppState, run_id: i64) -> i64 {
