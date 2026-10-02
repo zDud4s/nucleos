@@ -15,7 +15,6 @@ pub const PHASE_REVISE: &str = "revise";
 
 /// A step whose run finished but whose output could not be read — distinct from `error`, where the
 /// run itself failed, because the remedy differs: the model spoke, just not in the shape asked for.
-#[allow(dead_code)] // The structured critique parser arrives in a later packet.
 pub const STEP_INVALID: &str = "invalid";
 
 /// One step as stored.
@@ -82,8 +81,8 @@ pub async fn steps_of(pool: &SqlitePool, id: &str) -> sqlx::Result<Vec<StepRow>>
     .await
 }
 
-/// Moves the council to a round and phase. Guarded on `running`, for the reason `set_stage` gives:
-/// a cancel that landed first is not undone by a boundary crossed a moment later.
+/// Moves the council to a round and phase. Guarded on `running`, so a cancel that landed first is
+/// not undone by a boundary crossed a moment later.
 pub async fn set_position(
     pool: &SqlitePool,
     id: &str,
@@ -103,7 +102,6 @@ pub async fn set_position(
 }
 
 /// Records how many critique rounds ran and whether the council stopped before it was asked to.
-#[allow(dead_code)] // The round driver arrives in a later packet.
 pub async fn set_progress(
     pool: &SqlitePool,
     id: &str,
@@ -120,7 +118,6 @@ pub async fn set_progress(
 }
 
 /// Records the chairman's structured synthesis and how producing it ended.
-#[allow(dead_code)] // The chairman's structured output arrives in a later packet.
 pub async fn set_synthesis(
     pool: &SqlitePool,
     id: &str,
@@ -138,7 +135,6 @@ pub async fn set_synthesis(
 
 /// Marks every step of a council still `pending` as `cancelled`, when the council is cancelled. A
 /// step that already ended keeps how it ended.
-#[allow(dead_code)] // Cancellation moves onto the steps in a later packet.
 pub async fn cancel_pending_steps(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
     sqlx::query("UPDATE council_rounds SET status = ? WHERE council_id = ? AND status = ?")
         .bind(SEAT_CANCELLED)
@@ -152,7 +148,6 @@ pub async fn cancel_pending_steps(pool: &SqlitePool, id: &str) -> sqlx::Result<(
 /// At startup, after `council::reconcile`: a step still `pending` in a council that is no longer
 /// `running` will never be finished by anyone, so it is settled as `error` rather than left drawn as
 /// in progress for ever. Returns how many steps it settled.
-#[allow(dead_code)] // Wired into startup in a later packet.
 pub async fn error_orphan_steps(pool: &SqlitePool) -> sqlx::Result<u64> {
     let result = sqlx::query(
         "UPDATE council_rounds SET status = ?, error = ?
@@ -172,11 +167,9 @@ pub async fn error_orphan_steps(pool: &SqlitePool) -> sqlx::Result<u64> {
 mod tests {
     use super::*;
 
+    use crate::council::insert_council;
+
     use crate::config::{CouncilSeat, SeatKind};
-    use crate::council::{
-        Ranking, SEAT_OK, SEAT_PENDING, STAGE_RANKING, STAGE_REVISION, insert_council,
-        set_revision, set_stage, set_stage1, set_stage2,
-    };
 
     /// A database as it stood the day before 0154: the three migrations that shaped the council
     /// tables, applied raw. `migrate!()` would also work and would prove nothing — it runs 0154
@@ -725,109 +718,5 @@ mod tests {
         );
         assert_eq!(payload_of(&steps[0]), Some(serde_json::json!({ "x": 1 })));
         assert_eq!(STEP_INVALID, "invalid");
-    }
-
-    #[tokio::test]
-    async fn store_legacy_setters_also_write_steps() {
-        let pool = migrated_pool().await;
-        convened(&pool, "c1", 2).await;
-
-        set_stage1(&pool, "c1", 0, Some(1), SEAT_OK, None)
-            .await
-            .unwrap();
-        set_stage1(&pool, "c1", 1, None, SEAT_PENDING, None)
-            .await
-            .unwrap();
-        set_stage(&pool, "c1", STAGE_RANKING).await.unwrap();
-        assert_eq!(
-            (position(&pool, "c1").await.0, position(&pool, "c1").await.1),
-            (1, "critique".to_string())
-        );
-
-        let ballot = [
-            Ranking {
-                anon: "B".to_string(),
-                rank: 2,
-            },
-            Ranking {
-                anon: "A".to_string(),
-                rank: 1,
-            },
-        ];
-        set_stage2(&pool, "c1", 0, Some(2), SEAT_OK, None, Some(&ballot))
-            .await
-            .unwrap();
-        set_stage2(&pool, "c1", 1, Some(4), "error", Some("refused"), None)
-            .await
-            .unwrap();
-        set_stage(&pool, "c1", STAGE_REVISION).await.unwrap();
-        assert_eq!(
-            (position(&pool, "c1").await.0, position(&pool, "c1").await.1),
-            (1, "revise".to_string())
-        );
-
-        set_revision(&pool, "c1", 0, Some(3), SEAT_OK, None)
-            .await
-            .unwrap();
-        // The last stage of a two-round council is the chairman's.
-        set_stage(&pool, "c1", STAGE_REVISION + 1).await.unwrap();
-        assert_eq!(
-            (position(&pool, "c1").await.0, position(&pool, "c1").await.1),
-            (1, "chairman".to_string())
-        );
-
-        let steps = steps_of(&pool, "c1").await.unwrap();
-        let shapes: Vec<_> = steps.iter().map(shape).collect();
-        assert_eq!(
-            shapes,
-            vec![
-                (
-                    0,
-                    0,
-                    PHASE_ANSWER.to_string(),
-                    Some(1),
-                    "ok".to_string(),
-                    None
-                ),
-                (
-                    0,
-                    1,
-                    PHASE_CRITIQUE.to_string(),
-                    Some(2),
-                    "ok".to_string(),
-                    None
-                ),
-                (
-                    0,
-                    1,
-                    PHASE_REVISE.to_string(),
-                    Some(3),
-                    "ok".to_string(),
-                    None
-                ),
-                (
-                    1,
-                    0,
-                    PHASE_ANSWER.to_string(),
-                    None,
-                    "pending".to_string(),
-                    None
-                ),
-                (
-                    1,
-                    1,
-                    PHASE_CRITIQUE.to_string(),
-                    Some(4),
-                    "error".to_string(),
-                    Some("refused".to_string())
-                ),
-            ]
-        );
-        // The legacy `[{anon, rank}]` vote arrives as the new ordered ballot.
-        assert_eq!(
-            payload_of(&steps[1]),
-            Some(serde_json::json!({ "reviews": [], "ranking": ["A", "B"] }))
-        );
-        assert_eq!(payload_of(&steps[4]), None);
     }
 }

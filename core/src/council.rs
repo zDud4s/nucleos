@@ -1,4 +1,5 @@
-//! The council: N seats answer one question, rank each other blind, and a chairman synthesises.
+//! The council: N seats answer one question, critique and rank each other blind, and a chairman
+//! synthesises.
 //!
 //! Ported from `.ai/scripts/council_run.py`, which ran three phases over `claude` and `codex`
 //! subprocesses from outside the product. What it did was worth more than where it lived: asking
@@ -10,9 +11,9 @@
 //! allowed to call is `hooks.rs`. This module decides who answers, who ranks whom, and in what
 //! order — and every one of those is a decision that can be tested without a subprocess.
 //!
-//! **The average rank is the load-bearing piece.** Ranks are averaged rather than summed because a
-//! council degrades: a seat that failed casts no votes, and a seat that nobody could rank receives
-//! none. Sums make an absent participant look bad; averages make it look absent.
+//! **The ballots are averaged, not summed** (`tally::borda`), because a council degrades: a seat
+//! that failed casts no votes, and a critique that could not be read is an abstention. Sums make an
+//! absent participant look bad; means make it look absent.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -63,28 +64,6 @@ pub const SEAT_CANCELLED: &str = "cancelled";
 /// Phase 2 and the revision: there was nothing to rank, so there was nothing to revise against.
 pub const SEAT_SKIPPED: &str = "skipped";
 
-/// The phase numbers `council_runs.stage` carries.
-///
-/// The chairman is deliberately NOT among them, and that is the whole reason these are named at
-/// all. It used to be phase 3 and now it is the LAST phase, which is 3 or 4 depending on whether a
-/// second round was asked for — a constant called `STAGE_CHAIRMAN` would have to be a lie in one of
-/// the two shapes. [`stages_total`] is where that number is worked out, once.
-pub const STAGE_ANSWER: i64 = 1;
-pub const STAGE_RANKING: i64 = 2;
-/// The second round, when the roster asked for one. Never reached with `rounds: 1`.
-pub const STAGE_REVISION: i64 = 3;
-
-/// The `rounds` value at which the revision phase exists. See `config::MAX_COUNCIL_ROUNDS`.
-const ROUNDS_WITH_REVISION: i64 = 2;
-
-/// How many phases a council of this many rounds runs — three, or four with a second round.
-///
-/// Derived from `rounds` rather than stored beside it. A column would be a third copy of one fact,
-/// free to disagree with the other two, and the arithmetic is this line.
-pub fn stages_total(rounds: i64) -> i64 {
-    if rounds >= ROUNDS_WITH_REVISION { 4 } else { 3 }
-}
-
 /// Where a local seat's tool box reaches the daemon.
 ///
 /// Loopback HTTP even though it runs INSIDE the daemon, for the reason `mcp_tools::LocalToolBox`
@@ -112,85 +91,6 @@ pub struct Anonymized {
     pub anon_map: BTreeMap<String, usize>,
     /// Viewer `seat_idx` to the labels it is shown, ascending. Never contains the viewer's own.
     pub for_seat: BTreeMap<usize, Vec<String>>,
-}
-
-/// One row of the average-rank leaderboard.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LeaderboardEntry {
-    pub seat_idx: usize,
-    pub avg_rank: f64,
-    /// How many peers ranked this seat. Reported because an average over one vote and an average
-    /// over five are not the same claim, and a table that showed only the average would present
-    /// them as one.
-    pub n: usize,
-}
-
-/// One leaderboard line as a REVISING seat is shown it.
-///
-/// [`LeaderboardEntry`] is keyed on `seat_idx`, which is the seat's identity everywhere in this
-/// system — handing one to a seat would undo in the fourth phase everything the second phase was
-/// built to protect. This is the same standing said in the only vocabulary a seat has: the labels
-/// it was shown.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Standing {
-    /// The label this line stands for, or `None` for the reader's own answer.
-    ///
-    /// `None` rather than the reader's own label, and it is not a convenience. A seat is never told
-    /// which label it is: phase 2 excluded its own label from what it saw, and naming it here would
-    /// hand back the one fact the shuffle withheld — from which a seat that compares two councils
-    /// could start unpicking the map.
-    pub label: Option<String>,
-    pub avg_rank: f64,
-    pub n: usize,
-}
-
-/// PURE: the leaderboard as one seat may be shown it.
-///
-/// Three narrowings, each of them a leak that would otherwise be one line away. Seat indices become
-/// labels. The reader's own line loses its label. And a seat this reader was never shown is left
-/// out entirely — its label would be a label attached to no answer, which is a peer the reader can
-/// only guess at and a count of the council it was not given.
-pub fn standings_for(
-    viewer: usize,
-    anon: &Anonymized,
-    leaderboard: &[LeaderboardEntry],
-) -> Vec<Standing> {
-    let shown: std::collections::BTreeSet<&str> = anon
-        .for_seat
-        .get(&viewer)
-        .map(|labels| labels.iter().map(String::as_str).collect())
-        .unwrap_or_default();
-    let label_of: BTreeMap<usize, &str> = anon
-        .anon_map
-        .iter()
-        .map(|(label, seat_idx)| (*seat_idx, label.as_str()))
-        .collect();
-
-    leaderboard
-        .iter()
-        .filter_map(|entry| {
-            if entry.seat_idx == viewer {
-                return Some(Standing {
-                    label: None,
-                    avg_rank: entry.avg_rank,
-                    n: entry.n,
-                });
-            }
-            let label = label_of.get(&entry.seat_idx)?;
-            shown.contains(label).then(|| Standing {
-                label: Some((*label).to_string()),
-                avg_rank: entry.avg_rank,
-                n: entry.n,
-            })
-        })
-        .collect()
-}
-
-/// One label-and-rank pair a seat wrote, after filtering.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Ranking {
-    pub anon: String,
-    pub rank: i64,
 }
 
 /// The label for a position in the shuffle: 0 is `A`.
@@ -299,273 +199,15 @@ pub fn anonymize(seed: &str, seats: &[usize]) -> Anonymized {
     Anonymized { anon_map, for_seat }
 }
 
-/// Whether a byte is a regex `\w` — the definition the word boundaries below are taken against.
-fn is_word_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-/// PURE: the label-and-rank pairs a seat wrote, filtered to the labels it was shown.
-///
-/// The Python did this with `\b(?:Response\s+)?([A-Z])\s*[:.)-]\s*(\d+)\b`. This crate has no
-/// `regex` dependency and does not acquire one for nine lines of scanning, so the automaton is
-/// written out — the same habit `redact.rs` keeps for its detectors.
-///
-/// Three rules carried over unchanged, each answering a way a model gets this wrong:
-///
-/// - **A label the seat was never shown is discarded.** Accepting it would let a model that invents
-///   a fourth response bias a three-seat leaderboard, and inventing is exactly what a model asked
-///   to produce structure does when it has nothing to say.
-/// - **First mention wins.** A model that writes `A: 1` in its reasoning and `A: 3` in its summary
-///   has contradicted itself; counting both would let it vote twice.
-/// - **Everything else in the text is ignored.** The reply is prose with an ordering in it, not a
-///   form, and requiring a form would turn a formatting slip into a lost vote.
-pub fn parse_rankings(text: &str, allowed: &[String]) -> Vec<Ranking> {
-    let bytes = text.as_bytes();
-    let mut rankings: Vec<Ranking> = Vec::new();
-    let mut cursor = 0usize;
-
-    while cursor < bytes.len() {
-        // `\b` before the optional `Response`: the previous byte must not be a word byte, because
-        // the letter in `partB: 1` is part of a word and names nothing.
-        let at_boundary = cursor == 0 || !is_word_byte(bytes[cursor - 1]);
-        if !at_boundary {
-            cursor += 1;
-            continue;
-        }
-
-        match match_ranking(bytes, cursor) {
-            Some((label, rank, end)) => {
-                let label = label.to_string();
-                let already_voted = rankings.iter().any(|ranking| ranking.anon == label);
-                if allowed.contains(&label) && !already_voted {
-                    rankings.push(Ranking { anon: label, rank });
-                }
-                // Continue past the match, as `re.finditer` does, so `A: 1 B: 2` is two pairs and
-                // never one overlapping read of the other.
-                cursor = end;
-            }
-            None => cursor += 1,
-        }
-    }
-
-    rankings
-}
-
-/// One attempt at `(?:Response\s+)?([A-Z])\s*[:.)-]\s*(\d+)\b` starting exactly at `start`.
-///
-/// Returns the label, the rank and where the match ended. The optional prefix is tried first and
-/// the bare letter second, which is the order a greedy optional group is tried in.
-fn match_ranking(bytes: &[u8], start: usize) -> Option<(char, i64, usize)> {
-    const PREFIX: &[u8] = b"Response";
-
-    let after_prefix = if bytes[start..].starts_with(PREFIX) {
-        let mut cursor = start + PREFIX.len();
-        let space_start = cursor;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        // `\s+` — at least one. `ResponseA: 1` matches nothing here and falls through to the bare
-        // branch, which then fails on the `R`, exactly as the regex does.
-        (cursor > space_start).then_some(cursor)
-    } else {
-        None
-    };
-
-    for mut cursor in after_prefix.into_iter().chain(std::iter::once(start)) {
-        let Some(label) = bytes.get(cursor).copied().filter(u8::is_ascii_uppercase) else {
-            continue;
-        };
-        cursor += 1;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if !matches!(bytes.get(cursor), Some(b':' | b'.' | b')' | b'-')) {
-            continue;
-        }
-        cursor += 1;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        let digits_start = cursor;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
-            cursor += 1;
-        }
-        if cursor == digits_start {
-            continue;
-        }
-        // `\b` after the digits: `A: 12x` is not a rank of 12.
-        if bytes.get(cursor).copied().is_some_and(is_word_byte) {
-            continue;
-        }
-        let digits = &bytes[digits_start..cursor];
-        // Saturating rather than failing. A number too long for an `i64` is not a rank anybody
-        // meant, and dropping the pair would silently turn nonsense into a missing vote; sorting it
-        // last says the same thing out loud.
-        let rank = std::str::from_utf8(digits)
-            .ok()
-            .and_then(|text| text.parse::<i64>().ok())
-            .unwrap_or(i64::MAX);
-        return Some((char::from(label), rank, cursor));
-    }
-
-    None
-}
-
-/// PURE: the average-rank leaderboard, best first.
-///
-/// `votes` is what each viewer wrote, already filtered by `parse_rankings`. `anon_map` translates a
-/// label back to the seat it stood for; a label absent from it is dropped rather than panicking,
-/// because the map and the votes are read from two different database columns and a row edited by
-/// hand must not take the daemon down.
-///
-/// Ties break on `seat_idx`, so the order is total and the same council read twice reads the same.
-pub fn aggregate_rankings(
-    votes: &BTreeMap<usize, Vec<Ranking>>,
-    anon_map: &BTreeMap<String, usize>,
-) -> Vec<LeaderboardEntry> {
-    let mut collected: BTreeMap<usize, Vec<i64>> = BTreeMap::new();
-    for ranked in votes.values() {
-        for ranking in ranked {
-            let Some(seat) = anon_map.get(&ranking.anon) else {
-                continue;
-            };
-            collected.entry(*seat).or_default().push(ranking.rank);
-        }
-    }
-
-    let mut board: Vec<LeaderboardEntry> = collected
-        .into_iter()
-        .map(|(seat_idx, ranks)| {
-            let total: f64 = ranks.iter().map(|rank| *rank as f64).sum();
-            LeaderboardEntry {
-                seat_idx,
-                avg_rank: total / ranks.len() as f64,
-                n: ranks.len(),
-            }
-        })
-        .collect();
-    board.sort_by(|left, right| {
-        left.avg_rank
-            .partial_cmp(&right.avg_rank)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(left.seat_idx.cmp(&right.seat_idx))
-    });
-    board
-}
-
-/// PURE: whether phase 2 is worth running.
+/// PURE: whether a critique round is worth running.
 ///
 /// Two valid answers is the floor, and it is a floor rather than a preference: with one there is
-/// nothing to compare it against, and the single seat would be asked to rank an empty set. Below it
-/// the phase is skipped whole and phase 3 still runs, because the answers themselves are the part
-/// with value — a council that produced one good answer and no ranking is worth reading, and one
-/// that produced a ranking of nothing is not.
-pub fn stage2_should_run(valid_responses: usize) -> bool {
-    valid_responses >= 2
-}
-
-/// The prompt a phase-1 seat receives: the owner's question, exactly as written.
-///
-/// Nothing is prepended. A seat is an agent with tools that can go and find what it needs, and a
-/// preamble explaining that it is on a panel would change the answer being measured into an answer
-/// about being measured.
-pub fn stage1_prompt(question: &str) -> String {
-    question.to_string()
-}
-
-/// The prompt a phase-2 seat receives: the question, the peers' answers under their labels, and the
-/// instruction to order them.
-///
-/// `shown` is `(label, answer)` for the labels this seat may see — never its own.
-pub fn stage2_prompt(question: &str, shown: &[(String, String)]) -> String {
-    let mut prompt = format!(
-        "Question:\n{question}\n\n\
-         Rank the anonymous peer responses by accuracy and insight.\n\
-         Use lines like `A: 1` where 1 is best.\n\n"
-    );
-    for (label, answer) in shown {
-        prompt.push_str(&format!("Response {label}:\n{answer}\n\n"));
-    }
-    prompt.trim_end().to_string() + "\n"
-}
-
-/// The prompt a revising seat receives: the question, its own answer, the SAME anonymised peer
-/// answers it ranked, and where the council placed each of them.
-///
-/// `shown` is the identical `(label, answer)` list [`stage2_prompt`] built for this seat, and that
-/// identity is the property rather than an implementation detail. A second round that widened what
-/// a seat sees would not be a revision of the first — it would be a different question, asked of a
-/// seat that had already been paid for answering the first one.
-///
-/// Its own answer arrives UNLABELLED, under a heading that says it is the reader's. The alternative
-/// — putting it among the peers under its own label — would tell the seat which label it is, and
-/// that is exactly the fact phase 2 withheld.
-///
-/// No tools, like phase 2 and for the same reason: a seat that could go and find targeted evidence
-/// after reading its peers would turn the second round into a measure of who had time left.
-pub fn revision_prompt(
-    question: &str,
-    own_answer: &str,
-    shown: &[(String, String)],
-    standings: &[Standing],
-) -> String {
-    let mut prompt = format!(
-        "Question:\n{question}\n\n\
-         Your own answer:\n{own}\n\n\
-         The anonymous peer responses you ranked:\n\n",
-        own = own_answer.trim()
-    );
-    for (label, answer) in shown {
-        prompt.push_str(&format!("Response {label}:\n{answer}\n\n"));
-    }
-    prompt.push_str("Where the council placed each answer, by average rank — lower is better:\n");
-    if standings.is_empty() {
-        // Said rather than left blank, for the reason `stage3_prompt` gives one function down: a
-        // seat handed an empty section invents what belongs in it.
-        prompt.push_str("No ranking could be read out of the votes.\n");
-    }
-    for standing in standings {
-        // `You` and not the reader's label. See `Standing::label`.
-        let who = standing.label.as_deref().unwrap_or("You");
-        prompt.push_str(&format!(
-            "{who}: {:.2} from {} vote(s)\n",
-            standing.avg_rank, standing.n
-        ));
-    }
-    prompt.push_str(
-        "\nRevise your own answer in the light of the ranking. Reply with the revised answer in \
-         full — it replaces what you wrote, and nothing else you have said is carried forward. Do \
-         not name, or guess at, who wrote any response.\n",
-    );
-    prompt
-}
-
-/// The prompt the chairman receives: the question, the valid answers BY SEAT, and the leaderboard.
-///
-/// The anonymity ends here on purpose. Phase 2 hid the authors so the ranking measured the argument;
-/// the chairman is writing the answer and needs to know that the two agreeing responses came from
-/// two different models rather than from one model asked twice.
-pub fn stage3_prompt(
-    question: &str,
-    responses: &BTreeMap<usize, String>,
-    leaderboard: &[LeaderboardEntry],
-) -> String {
-    let mut prompt = format!("Question:\n{question}\n\nValid council responses:\n");
-    if responses.is_empty() {
-        // Said rather than left blank. A chairman handed an empty section writes a synthesis of
-        // nothing and presents it as an answer; one told that every seat failed reports that, which
-        // is the true and useful thing to say.
-        prompt.push_str("No seat produced a valid response.\n\n");
-    } else {
-        for (seat_idx, answer) in responses {
-            prompt.push_str(&format!("Seat {seat_idx}:\n{answer}\n\n"));
-        }
-    }
-    let board = serde_json::to_string_pretty(leaderboard).unwrap_or_else(|_| "[]".to_string());
-    prompt.push_str(&format!(
-        "Average-rank leaderboard:\n{board}\n\nSynthesize one final chairman answer.\n"
-    ));
-    prompt
+/// nothing to compare it against, and the single seat would be asked to judge an empty set. Below it
+/// the round is skipped whole and the chairman still runs, because the answers themselves are the
+/// part with value — a council that produced one good answer and no critique is worth reading, and
+/// one that produced a critique of nothing is not.
+fn critique_should_run(valid_answers: usize) -> bool {
+    valid_answers >= 2
 }
 
 /// The council's settings, resolved once at startup.
@@ -650,20 +292,8 @@ pub struct SeatRow {
     /// is deliberately not stored beside it: a name is editable and this column is a reference, so
     /// the two would drift and the row would be the one that looked authoritative.
     pub agent_id: Option<String>,
-    pub stage1_run_id: Option<i64>,
-    pub stage1_status: String,
-    pub stage1_error: Option<String>,
-    pub stage2_run_id: Option<i64>,
-    pub stage2_status: String,
-    pub stage2_error: Option<String>,
-    /// The JSON as stored. Parsed on the way out to the client, not here, so a row written by a
-    /// future version with a field this one does not know about still reads.
-    pub rankings: Option<String>,
-    /// The second round, or the columns a council of one round never touches. `pending` is what
-    /// those keep — see `0136_council_revision.sql`, which argues why that is not tidied.
-    pub revision_run_id: Option<i64>,
-    pub revision_status: String,
-    pub revision_error: Option<String>,
+    // What each phase of the seat did is not here: it is one row per step in `council_rounds`
+    // (`store::steps_of`), which replaced the column triple per phase this row used to carry.
     /// The role the seat was asked to play (`formats::Role`), or NULL for a plain seat. Text as
     /// stored, so a role a later version adds still reads rather than failing the whole row.
     pub role: Option<String>,
@@ -676,14 +306,15 @@ pub struct CouncilRow {
     pub created_at: String,
     pub question: String,
     pub status: String,
+    /// Legacy and no longer advanced: written as 1 when a council convenes and never moved, because
+    /// `current_round`/`current_phase` replaced it. Kept because `job.rs` and `hooks.rs` fixtures
+    /// write it (see `0154_council_rounds.sql`).
     pub stage: i64,
-    /// 1 or 2, copied off the file when the council convened. What [`stages_total`] is computed
-    /// from, and the reason a reader can tell whether `stage = 3` is the last phase or the third
-    /// of four.
+    /// Critique rounds asked for, 1 to `config::MAX_COUNCIL_ROUNDS`, fixed when the council
+    /// convened. `rounds_run` is how many actually ran.
     pub rounds: i64,
     pub anon_seed: String,
     pub anon_map: Option<String>,
-    pub leaderboard: Option<String>,
     pub chairman_kind: String,
     pub chairman_ref: String,
     pub chairman_agent_id: Option<String>,
@@ -709,6 +340,10 @@ pub struct CouncilRow {
 /// nothing will ever drive: `run_council` reads its roster back from `council_seats`, so a crash
 /// between the two writes would leave a row stuck at `running` for the reconciliation to find and
 /// nothing else.
+///
+/// Test-only since roles arrived: `start_with` writes through [`insert_council_with_roles`], and
+/// this role-less shape is what the fixtures convene councils with.
+#[cfg(test)]
 pub async fn insert_council(
     pool: &sqlx::SqlitePool,
     id: &str,
@@ -717,21 +352,38 @@ pub async fn insert_council(
     members: &[CouncilSeat],
     rounds: i64,
 ) -> sqlx::Result<()> {
+    insert_council_with_roles(pool, id, question, chairman, members, rounds, &[]).await
+}
+
+/// [`insert_council`], with the role each seat plays: `roles[seat_idx]`, `None` (or past the end of
+/// the slice) for a plain seat. A sibling rather than a seventh argument on `insert_council`, so
+/// every caller that has no roles — the fixtures above all — keeps writing exactly what it wrote;
+/// and the same transaction, so a council never exists with its roles still to come.
+async fn insert_council_with_roles(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    question: &str,
+    chairman: &CouncilSeat,
+    members: &[CouncilSeat],
+    rounds: i64,
+    roles: &[Option<formats::Role>],
+) -> sqlx::Result<()> {
     let mut transaction = pool.begin().await?;
     sqlx::query(
         "INSERT INTO council_runs
            (id, created_at, question, status, stage, rounds, anon_seed, chairman_kind,
-            chairman_ref, chairman_agent_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            chairman_ref, chairman_agent_id, current_round, current_phase)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
     )
     .bind(id)
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(question)
     .bind(STATUS_RUNNING)
-    .bind(STAGE_ANSWER)
-    // Written rather than left to the column's DEFAULT, as `stage1_status` is below and for the
-    // same reason: the number this module computes `stages_total` from and the number the database
-    // holds must not be able to drift apart.
+    // The legacy `stage`, written as the 1 it always started at and never advanced: the position
+    // is `current_round`/`current_phase` now. See `CouncilRow::stage`.
+    .bind(1_i64)
+    // Written rather than left to the column's DEFAULT: the number the driver runs and the number
+    // the database holds must not be able to drift apart.
     .bind(rounds)
     // The council's own id. Stored again under its own name so the shuffle stays recomputable even
     // if what the seed is derived from ever changes.
@@ -741,24 +393,22 @@ pub async fn insert_council(
     // answered in March has to keep reading as what answered in March.
     .bind(&chairman.model_ref)
     .bind(chairman.agent_id())
+    .bind(store::PHASE_ANSWER)
     .execute(&mut *transaction)
     .await?;
 
     for (seat_idx, seat) in members.iter().enumerate() {
+        let role = roles.get(seat_idx).copied().flatten().map(|r| r.as_str());
         sqlx::query(
-            "INSERT INTO council_seats
-               (council_id, seat_idx, kind, model_ref, agent_id, stage1_status, stage2_status)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO council_seats (council_id, seat_idx, kind, model_ref, agent_id, role)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(seat_idx as i64)
         .bind(seat.kind.as_db_str())
         .bind(&seat.model_ref)
         .bind(seat.agent_id())
-        // Written rather than left to the column's DEFAULT, so the constant this module reads back
-        // and the value the database writes cannot drift apart.
-        .bind(SEAT_PENDING)
-        .bind(SEAT_PENDING)
+        .bind(role)
         .execute(&mut *transaction)
         .await?;
     }
@@ -864,9 +514,7 @@ async fn agent_names(pool: &sqlx::SqlitePool) -> BTreeMap<String, String> {
 
 pub async fn get_seat_rows(pool: &sqlx::SqlitePool, id: &str) -> sqlx::Result<Vec<SeatRow>> {
     sqlx::query_as::<_, SeatRow>(
-        "SELECT seat_idx, kind, model_ref, agent_id, stage1_run_id, stage1_status, stage1_error,
-                stage2_run_id, stage2_status, stage2_error, rankings,
-                revision_run_id, revision_status, revision_error, role
+        "SELECT seat_idx, kind, model_ref, agent_id, role
          FROM council_seats WHERE council_id = ? ORDER BY seat_idx",
     )
     .bind(id)
@@ -889,55 +537,17 @@ pub async fn list_council_rows(
     .await
 }
 
-/// Moves the council to a phase. Guarded on `running`, so a cancel that landed first is not undone
-/// by a phase boundary crossed a moment later.
-///
-/// Also moves the new round/phase position (`store::set_position`) — a dual write that lasts only
-/// until every reader has moved off `stage`.
-pub async fn set_stage(pool: &sqlx::SqlitePool, id: &str, stage: i64) -> sqlx::Result<()> {
-    sqlx::query("UPDATE council_runs SET stage = ? WHERE id = ? AND status = ?")
-        .bind(stage)
-        .bind(id)
-        .bind(STATUS_RUNNING)
-        .execute(pool)
-        .await?;
-    let rounds: Option<(i64,)> = sqlx::query_as("SELECT rounds FROM council_runs WHERE id = ?")
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
-    let Some((rounds,)) = rounds else {
-        return Ok(());
-    };
-    let (round, phase) = position_of_stage(stage, rounds);
-    store::set_position(pool, id, round, phase).await
-}
-
-/// The round and phase a legacy `stage` number stands for. The same mapping `0154_council_rounds.sql`
-/// applies to the councils it copies: 3 is the revision only when there was a second round, and
-/// otherwise — like anything past it — the chairman, which is always the last stage.
-fn position_of_stage(stage: i64, rounds: i64) -> (i64, &'static str) {
-    match stage {
-        s if s <= STAGE_ANSWER => (0, store::PHASE_ANSWER),
-        STAGE_RANKING => (1, store::PHASE_CRITIQUE),
-        STAGE_REVISION if rounds >= ROUNDS_WITH_REVISION => (1, store::PHASE_REVISE),
-        _ => (1, PHASE_CHAIRMAN),
-    }
-}
-
 /// The position of a council whose seats are done and whose chairman is synthesising. Not a step
 /// phase — the chairman has no row in `council_rounds` — only a value of `current_phase`.
 const PHASE_CHAIRMAN: &str = "chairman";
 
-/// The legacy `[{anon, rank}]` vote as the new critique payload: `{"reviews": [], "ranking": [...]}`,
-/// labels best first, ties in the order they were given. The same conversion `0154` applies to the
-/// councils it copies; no vote is no payload, and a blank vote is an empty ballot.
-fn critique_payload(rankings: Option<&[Ranking]>) -> Option<String> {
-    let mut ranked: Vec<&Ranking> = rankings?.iter().collect();
-    // Stable, so a tie keeps the order the seat gave it.
-    ranked.sort_by_key(|r| r.rank);
-    let ballot: Vec<&str> = ranked.iter().map(|r| r.anon.as_str()).collect();
-    Some(serde_json::json!({ "reviews": [], "ranking": ballot }).to_string())
-}
+/// The position of a council the chairman has finished with.
+const PHASE_DONE: &str = "done";
+
+/// What `council_runs.synthesis_status` records: a synthesis that parsed and validated, or the
+/// chairman's raw text kept with the reason it could not be structured (`formats::degraded`).
+const SYNTHESIS_OK: &str = "ok";
+const SYNTHESIS_DEGRADED: &str = "degraded";
 
 /// Records the phase-1 shuffle.
 pub async fn set_anon_map(
@@ -947,21 +557,6 @@ pub async fn set_anon_map(
 ) -> sqlx::Result<()> {
     let encoded = serde_json::to_string(anon_map).unwrap_or_else(|_| "{}".to_string());
     sqlx::query("UPDATE council_runs SET anon_map = ? WHERE id = ?")
-        .bind(encoded)
-        .bind(id)
-        .execute(pool)
-        .await
-        .map(|_| ())
-}
-
-/// Records the phase-2 leaderboard.
-pub async fn set_leaderboard(
-    pool: &sqlx::SqlitePool,
-    id: &str,
-    leaderboard: &[LeaderboardEntry],
-) -> sqlx::Result<()> {
-    let encoded = serde_json::to_string(leaderboard).unwrap_or_else(|_| "[]".to_string());
-    sqlx::query("UPDATE council_runs SET leaderboard = ? WHERE id = ?")
         .bind(encoded)
         .bind(id)
         .execute(pool)
@@ -999,120 +594,6 @@ pub async fn finish(
             .execute(pool)
             .await?;
     Ok(result.rows_affected() > 0)
-}
-
-/// Records how one seat's phase 1 ended.
-pub async fn set_stage1(
-    pool: &sqlx::SqlitePool,
-    id: &str,
-    seat_idx: usize,
-    run_id: Option<i64>,
-    status: &str,
-    error: Option<&str>,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        "UPDATE council_seats SET stage1_run_id = ?, stage1_status = ?, stage1_error = ?
-         WHERE council_id = ? AND seat_idx = ?",
-    )
-    .bind(run_id)
-    .bind(status)
-    .bind(error)
-    .bind(id)
-    .bind(seat_idx as i64)
-    .execute(pool)
-    .await?;
-    // Dual write, until every reader has moved to `council_rounds`.
-    store::upsert_step(
-        pool,
-        id,
-        0,
-        seat_idx as i64,
-        store::PHASE_ANSWER,
-        run_id,
-        status,
-        error,
-        None,
-    )
-    .await
-}
-
-/// Records how one seat's phase 2 ended, and what it voted.
-pub async fn set_stage2(
-    pool: &sqlx::SqlitePool,
-    id: &str,
-    seat_idx: usize,
-    run_id: Option<i64>,
-    status: &str,
-    error: Option<&str>,
-    rankings: Option<&[Ranking]>,
-) -> sqlx::Result<()> {
-    let encoded = rankings.map(|ranked| serde_json::to_string(ranked).unwrap_or_default());
-    sqlx::query(
-        "UPDATE council_seats SET stage2_run_id = ?, stage2_status = ?, stage2_error = ?,
-                rankings = ?
-         WHERE council_id = ? AND seat_idx = ?",
-    )
-    .bind(run_id)
-    .bind(status)
-    .bind(error)
-    .bind(encoded)
-    .bind(id)
-    .bind(seat_idx as i64)
-    .execute(pool)
-    .await?;
-    // Dual write, until every reader has moved to `council_rounds`.
-    let payload = critique_payload(rankings);
-    store::upsert_step(
-        pool,
-        id,
-        1,
-        seat_idx as i64,
-        store::PHASE_CRITIQUE,
-        run_id,
-        status,
-        error,
-        payload.as_deref(),
-    )
-    .await
-}
-
-/// Records how one seat's second round ended.
-///
-/// No `rankings` counterpart to phase 2's: a revision produces prose, and the prose lives in the
-/// transcript of the run this attaches — the same argument `0065_council.sql` makes for keeping the
-/// answers out of these tables.
-pub async fn set_revision(
-    pool: &sqlx::SqlitePool,
-    id: &str,
-    seat_idx: usize,
-    run_id: Option<i64>,
-    status: &str,
-    error: Option<&str>,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        "UPDATE council_seats SET revision_run_id = ?, revision_status = ?, revision_error = ?
-         WHERE council_id = ? AND seat_idx = ?",
-    )
-    .bind(run_id)
-    .bind(status)
-    .bind(error)
-    .bind(id)
-    .bind(seat_idx as i64)
-    .execute(pool)
-    .await?;
-    // Dual write, until every reader has moved to `council_rounds`.
-    store::upsert_step(
-        pool,
-        id,
-        1,
-        seat_idx as i64,
-        store::PHASE_REVISE,
-        run_id,
-        status,
-        error,
-        None,
-    )
-    .await
 }
 
 /// Why a council could not be started. Every variant is a refusal BEFORE anything is spent.
@@ -1328,6 +809,24 @@ pub async fn start(
     question: &str,
     roster: Option<RosterOverride>,
 ) -> Result<String, StartError> {
+    start_with(state, question, roster, None, BTreeMap::new()).await
+}
+
+/// [`start`], with the two things a request may ask for beyond the roster: how many critique rounds
+/// to run (`None` is the file's), and a role per seat, keyed by the seat index as a string.
+///
+/// Both are validated BEFORE the budget is read and before anything is written, with the other
+/// refusals: a round count outside `1..=config::MAX_COUNCIL_ROUNDS`, a key that is not the index of
+/// a seat on this roster, and a role outside the closed set (`formats::Role::parse`, exact and
+/// case-sensitive) are each `Invalid`. A typo that quietly became "no role" or "the default rounds"
+/// would run — and bill — a council nobody asked for.
+pub async fn start_with(
+    state: &crate::state::AppState,
+    question: &str,
+    roster: Option<RosterOverride>,
+    rounds: Option<u32>,
+    roles: BTreeMap<String, String>,
+) -> Result<String, StartError> {
     let configured = state.council.config().ok_or(StartError::NotConfigured)?;
     let token = state
         .council
@@ -1343,6 +842,18 @@ pub async fn start(
     if question.is_empty() {
         return Err(StartError::Invalid("the question is empty".to_string()));
     }
+
+    let rounds = rounds.unwrap_or(configured.rounds);
+    if !(1..=crate::config::MAX_COUNCIL_ROUNDS).contains(&rounds) {
+        return Err(StartError::Invalid(format!(
+            "rounds is {rounds}; a council runs 1 to {} rounds",
+            crate::config::MAX_COUNCIL_ROUNDS
+        )));
+    }
+    let seat_count = roster
+        .as_ref()
+        .map_or(configured.members.len(), |roster| roster.members.len());
+    let roles = seat_roles(&roles, seat_count)?;
 
     let (chairman, members) = match &roster {
         Some(override_roster) => {
@@ -1384,13 +895,20 @@ pub async fn start(
     }
 
     let id = crate::auth::generate_uuid_v4();
-    // From the FILE, never from the override. A roster override says who sits; how many rounds
-    // they sit for is a council-wide setting the owner made once, and letting a request raise it
-    // would let a caller double the bill without touching configuration.
-    let rounds = i64::from(configured.rounds);
-    insert_council(&state.pool, &id, question, &chairman, &members, rounds)
-        .await
-        .map_err(|error| StartError::Unavailable(error.to_string()))?;
+    // The request's count when it gave one, bounded above by `MAX_COUNCIL_ROUNDS` like the file's
+    // — so a caller can ask for more deliberation, never for more than the daemon will ever run.
+    let rounds = i64::from(rounds);
+    insert_council_with_roles(
+        &state.pool,
+        &id,
+        question,
+        &chairman,
+        &members,
+        rounds,
+        &roles,
+    )
+    .await
+    .map_err(|error| StartError::Unavailable(error.to_string()))?;
 
     let mcp_path = mcp_config_path(&id);
     let exe = std::env::current_exe()
@@ -1425,6 +943,7 @@ pub async fn start(
         token,
         timeout: std::time::Duration::from_secs(configured.timeout_seconds),
         rounds,
+        roles,
     };
     tokio::spawn(async move {
         let _guard = guard;
@@ -1432,6 +951,36 @@ pub async fn start(
     });
 
     Ok(id)
+}
+
+/// A request's `{seat index: role}` as one entry per seat, or the refusal that names what is wrong.
+///
+/// The key is parsed as an unsigned index, so `seat-0` and `-1` are refused as not being one, and
+/// an index at or past `seat_count` as naming a seat this roster does not have.
+fn seat_roles(
+    requested: &BTreeMap<String, String>,
+    seat_count: usize,
+) -> Result<Vec<Option<formats::Role>>, StartError> {
+    let mut roles = vec![None; seat_count];
+    for (key, value) in requested {
+        let seat_idx: usize = key
+            .parse()
+            .map_err(|_| StartError::Invalid(format!("`{key}` is not a seat index")))?;
+        let Some(slot) = roles.get_mut(seat_idx) else {
+            return Err(StartError::Invalid(format!(
+                "seat {seat_idx} is not on a roster of {seat_count} seats"
+            )));
+        };
+        let role = formats::Role::parse(value).ok_or_else(|| {
+            let known: Vec<&str> = formats::Role::ALL.iter().map(|r| r.as_str()).collect();
+            StartError::Invalid(format!(
+                "`{value}` is not a role; a seat may be one of {}",
+                known.join(", ")
+            ))
+        })?;
+        *slot = Some(role);
+    }
+    Ok(roles)
 }
 
 /// Everything one council needs, moved into the background task in one piece.
@@ -1445,23 +994,29 @@ struct Driver {
     token: String,
     /// The wall clock ONE seat gets.
     timeout: std::time::Duration,
-    /// 1 or 2, as the row records it. Read from the driver rather than from the row at each phase
-    /// boundary, because it cannot change under a running council: the file may be edited mid-flight
-    /// and the deliberation that is already paid for has to finish the shape it started.
+    /// Critique rounds asked for, as the row records it. Read from the driver rather than from the
+    /// row at each phase boundary, because it cannot change under a running council: the file may be
+    /// edited mid-flight and the deliberation that is already paid for has to finish the shape it
+    /// started. One critique round runs whatever the count, for now; the revise rounds that make
+    /// the count matter come with the next packet of council-deliberacao.
     rounds: i64,
+    /// The role each seat plays, by `seat_idx`; `None` for a plain seat.
+    roles: Vec<Option<formats::Role>>,
 }
 
-/// Which column of the record a seat's state belongs in.
+/// Where a seat's state is recorded.
 ///
-/// An enum rather than a stage number plus an optional index, because the three cases carry
-/// different data: phase 2 needs the labels the seat was shown in order to filter its vote, and the
-/// chairman has no seat row at all.
+/// A step of one seat — a row of `council_rounds` keyed by (round, seat, phase) — or the chairman,
+/// which has no seat and hangs its run off the council itself.
 enum Slot {
-    Stage1(usize),
-    /// The viewer, and the labels it was shown — the filter `parse_rankings` applies.
-    Stage2(usize, Vec<String>),
-    /// The second round. Only the seat index: a revision is prose, and there is no vote to filter.
-    Revision(usize),
+    Step {
+        round: i64,
+        seat_idx: usize,
+        phase: &'static str,
+        /// The labels a critiquing seat was shown — the filter `formats::parse_critique` applies.
+        /// Empty for every other phase.
+        shown: Vec<String>,
+    },
     Chairman,
 }
 
@@ -1474,26 +1029,55 @@ struct SeatOutcome {
 
 impl Driver {
     async fn run(self) {
-        let (answers, anon) = self.stage1().await;
+        let answers = self.answer_phase().await;
         if self.was_settled().await {
             return;
         }
 
-        let leaderboard = self.stage2(&answers, &anon).await;
+        // The shuffle is over the seats that answered: a seat with no answer has nothing to be
+        // judged on, so it is neither shown to a peer nor asked to judge one — it gets no step
+        // after its failed answer.
+        let participants: Vec<usize> = answers.keys().copied().collect();
+        let anon = anonymize(&self.id, &participants);
+        if let Err(error) = set_anon_map(&self.state.pool, &self.id, &anon.anon_map).await {
+            tracing::warn!(council = %self.id, %error, "could not record the anonymisation map");
+        }
+
+        let critiques = self.critique_phase(1, &answers, &anon).await;
+        let rounds_run = i64::from(critiques.is_some());
+        if let Err(error) = store::set_progress(&self.state.pool, &self.id, rounds_run, false).await
+        {
+            tracing::warn!(council = %self.id, %error, "could not record the council's progress");
+        }
         if self.was_settled().await {
             return;
         }
 
-        // `None` back means nothing was revised — one round configured, or a ranking that never
-        // happened — and the chairman reads phase 1, which is byte for byte what it read before
-        // this phase existed.
-        let revised = self.revision(&answers, &anon, &leaderboard).await;
-        if self.was_settled().await {
-            return;
-        }
-
-        self.stage3(revised.as_ref().unwrap_or(&answers), &leaderboard)
+        self.chairman_phase(rounds_run, &answers, &anon, &critiques.unwrap_or_default())
             .await;
+    }
+
+    /// Moves the council's position, warning rather than failing: the position is what a reader is
+    /// shown, never what the driver decides from.
+    async fn move_to(&self, round: i64, phase: &str) {
+        if let Err(error) = store::set_position(&self.state.pool, &self.id, round, phase).await {
+            tracing::warn!(council = %self.id, %error, round, phase, "could not move the council");
+        }
+    }
+
+    /// The name the chairman knows a seat by: its agent's, or the model's when no agent took it.
+    fn seat_name(&self, seat_idx: usize) -> String {
+        match self.members.get(seat_idx) {
+            Some(seat) => match &seat.agent {
+                Some(agent) => agent.name.clone(),
+                None => seat.model_ref.clone(),
+            },
+            None => format!("seat {seat_idx}"),
+        }
+    }
+
+    fn role_of(&self, seat_idx: usize) -> Option<formats::Role> {
+        self.roles.get(seat_idx).copied().flatten()
     }
 
     /// Whether somebody has already closed this council — a cancel, or a write that lost a race.
@@ -1513,18 +1097,24 @@ impl Driver {
         }
     }
 
-    /// Phase 1 — every seat answers the owner's question, all at once.
+    /// Round 0 — every seat answers the owner's question, all at once, behind its role.
     ///
-    /// Returns the valid answers by `seat_idx` and the shuffle over them.
-    async fn stage1(&self) -> (BTreeMap<usize, String>, Anonymized) {
+    /// Returns the valid answers by `seat_idx`.
+    async fn answer_phase(&self) -> BTreeMap<usize, String> {
+        self.move_to(0, store::PHASE_ANSWER).await;
         let running = self.members.iter().enumerate().map(|(seat_idx, seat)| {
-            let prompt = stage1_prompt(&self.question);
-            // With tools: this is the phase where a seat goes and finds what it needs. Phases 2 and
-            // 3 get none, so nobody can go looking for ammunition after seeing a peer's answer.
+            let prompt = prompts::answer_prompt(&self.question, self.role_of(seat_idx));
+            // With tools: this is the phase where a seat goes and finds what it needs. The critique
+            // and the chairman get none, so nobody can go looking for ammunition after seeing a
+            // peer's answer.
             async move {
-                let outcome = self
-                    .run_seat(Slot::Stage1(seat_idx), seat, prompt, true)
-                    .await;
+                let slot = Slot::Step {
+                    round: 0,
+                    seat_idx,
+                    phase: store::PHASE_ANSWER,
+                    shown: Vec::new(),
+                };
+                let outcome = self.run_seat(slot, seat, prompt, true).await;
                 (seat_idx, outcome)
             }
         });
@@ -1537,17 +1127,12 @@ impl Driver {
             }
         }
 
-        let valid: Vec<usize> = answers.keys().copied().collect();
-        let anon = anonymize(&self.id, &valid);
-        if let Err(error) = set_anon_map(&self.state.pool, &self.id, &anon.anon_map).await {
-            tracing::warn!(council = %self.id, %error, "could not record the anonymisation map");
-        }
         let _ = crate::feed::append(
             &self.state.pool,
             None,
             "council_stage",
             &format!(
-                "council phase 1 done: {} of {} seats answered",
+                "council answers done: {} of {} seats answered",
                 answers.len(),
                 self.members.len()
             ),
@@ -1556,220 +1141,262 @@ impl Driver {
         )
         .await;
 
-        (answers, anon)
+        answers
     }
 
-    /// Phase 2 — each seat orders its peers' answers under shuffled labels.
+    /// A critique round — each seat that answered reviews and ranks its peers' answers under
+    /// shuffled labels, never its own.
     ///
-    /// Skipped whole below two valid answers, and skipping is recorded rather than left blank: a
-    /// seat with `stage2_status = 'skipped'` and one with `'pending'` mean different things, and
-    /// only one of them is a council that stopped.
-    async fn stage2(
+    /// Returns the critiques that could be read, by the critic's `seat_idx`, or `None` when the round
+    /// did not run. Below two valid answers it is skipped whole, and skipping is recorded rather
+    /// than left blank: a `skipped` step and a `pending` one mean different things, and only one of
+    /// them is a council that stopped. A critique that ran and could not be read is an ABSTENTION —
+    /// one ballot fewer, recorded `invalid` with the reason — not a failed council.
+    async fn critique_phase(
         &self,
+        round: i64,
         answers: &BTreeMap<usize, String>,
         anon: &Anonymized,
-    ) -> Vec<LeaderboardEntry> {
-        if !stage2_should_run(answers.len()) {
-            for seat_idx in 0..self.members.len() {
-                let _ = set_stage2(
+    ) -> Option<BTreeMap<usize, formats::Critique>> {
+        if !critique_should_run(answers.len()) {
+            for seat_idx in answers.keys() {
+                if let Err(error) = store::upsert_step(
                     &self.state.pool,
                     &self.id,
-                    seat_idx,
+                    round,
+                    *seat_idx as i64,
+                    store::PHASE_CRITIQUE,
                     None,
                     SEAT_SKIPPED,
                     None,
                     None,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(council = %self.id, %error, "could not record a skipped critique");
+                }
             }
-            return Vec::new();
+            return None;
         }
 
-        if let Err(error) = set_stage(&self.state.pool, &self.id, STAGE_RANKING).await {
-            tracing::warn!(council = %self.id, %error, "could not advance the council to phase 2");
-        }
+        self.move_to(round, store::PHASE_CRITIQUE).await;
 
-        let ranking = anon.for_seat.iter().filter_map(|(viewer, labels)| {
+        let critiquing = anon.for_seat.iter().filter_map(|(viewer, labels)| {
             let seat = self.members.get(*viewer)?;
-            let shown: Vec<(String, String)> = labels
+            let peers: Vec<(String, String)> = labels
                 .iter()
                 .filter_map(|label| {
                     let seat_idx = anon.anon_map.get(label)?;
                     Some((label.clone(), answers.get(seat_idx)?.clone()))
                 })
                 .collect();
-            let allowed: Vec<String> = shown.iter().map(|(label, _)| label.clone()).collect();
-            let prompt = stage2_prompt(&self.question, &shown);
+            let shown: Vec<String> = peers.iter().map(|(label, _)| label.clone()).collect();
+            let prompt = prompts::critique_prompt(&self.question, self.role_of(*viewer), &peers);
             Some(async move {
                 // No tools. A seat that could fetch targeted evidence after reading its peers'
-                // answers would turn the ranking into a measure of who had time left.
-                let outcome = self
-                    .run_seat(Slot::Stage2(*viewer, allowed.clone()), seat, prompt, false)
-                    .await;
-                (*viewer, allowed, outcome)
+                // answers would turn the critique into a measure of who had time left.
+                let slot = Slot::Step {
+                    round,
+                    seat_idx: *viewer,
+                    phase: store::PHASE_CRITIQUE,
+                    shown: shown.clone(),
+                };
+                let outcome = self.run_seat(slot, seat, prompt, false).await;
+                (*viewer, shown, outcome)
             })
         });
-        let outcomes = crate::join::all(ranking).await;
+        let outcomes = crate::join::all(critiquing).await;
 
-        let mut votes: BTreeMap<usize, Vec<Ranking>> = BTreeMap::new();
-        for (seat_idx, allowed, outcome) in outcomes {
-            if outcome.status == SEAT_OK {
-                votes.insert(seat_idx, parse_rankings(&outcome.answer, &allowed));
+        // Parsed again rather than handed back by `record`: the parse is pure, so the ballot the
+        // tally reads and the payload the step stores cannot differ.
+        let mut critiques = BTreeMap::new();
+        for (seat_idx, shown, outcome) in outcomes {
+            if outcome.status == SEAT_OK
+                && let Ok(critique) = formats::parse_critique(&outcome.answer, &shown)
+            {
+                critiques.insert(seat_idx, critique);
             }
         }
 
-        let leaderboard = aggregate_rankings(&votes, &anon.anon_map);
-        if let Err(error) = set_leaderboard(&self.state.pool, &self.id, &leaderboard).await {
-            tracing::warn!(council = %self.id, %error, "could not record the leaderboard");
-        }
         let _ = crate::feed::append(
             &self.state.pool,
             None,
             "council_stage",
-            &format!("council phase 2 done: {} seats ranked", leaderboard.len()),
+            &format!(
+                "council round {round} of {}: {} of {} critiques read",
+                self.rounds,
+                critiques.len(),
+                answers.len()
+            ),
             None,
             Some(&crate::feed::Subject::Council(self.id.clone())),
         )
         .await;
 
-        leaderboard
+        Some(critiques)
     }
 
-    /// The second round — each seat revises its own answer in the light of the ranking.
+    /// The last phase — the chairman writes the council's synthesis, as structured JSON.
     ///
-    /// Returns the answers the CHAIRMAN should read, or `None` when nothing was revised and phase 1
-    /// stands. `None` is the shipped path and it does no work at all: a council of one round makes
-    /// no query here, writes no row, and leaves `stage` climbing 1, 2, 3 exactly as it always did.
+    /// A chairman RUN that fails is the one failure that settles the council as `error`, and it is
+    /// survivable in the way the others are not: the answers and critiques are still readable, and
+    /// they are the part with value.
     ///
-    /// A seat's revised answer replaces its first ONLY when the revision came back `ok`. Every
-    /// other ending — the model refused, the clock ran out, somebody cancelled — leaves the first
-    /// answer standing, because a failed second attempt is not a reason to throw away a first one
-    /// that worked. The predicate is the recorded status and nothing else, exactly as phase 1's is:
-    /// `stage1` counts an `ok` seat as having answered without inspecting what it wrote, and a
-    /// second rule here would make the two phases disagree about what `ok` means.
-    async fn revision(
+    /// A chairman that ran and wrote something unreadable is a different fact and does not fail the
+    /// council. It is asked ONCE more, with the first prompt plus the reason the first reply was
+    /// refused; if that also cannot be used, its raw text is kept as a `degraded` synthesis — shown
+    /// as it came, with the reason — rather than thrown away.
+    ///
+    /// `answers` are the final answers by seat. A seat whose answer failed is absent, so the
+    /// chairman is never asked to weigh a position nobody stated.
+    async fn chairman_phase(
         &self,
+        rounds_run: i64,
         answers: &BTreeMap<usize, String>,
         anon: &Anonymized,
-        leaderboard: &[LeaderboardEntry],
-    ) -> Option<BTreeMap<usize, String>> {
-        if self.rounds < ROUNDS_WITH_REVISION {
-            return None;
-        }
+        critiques: &BTreeMap<usize, formats::Critique>,
+    ) {
+        self.move_to(rounds_run, PHASE_CHAIRMAN).await;
 
-        // No ranking, no revision. `stage2_should_run` is asked rather than the leaderboard
-        // inspected, so the two phases skip on exactly the same condition and cannot drift: a
-        // council can produce an empty leaderboard with phase 2 having genuinely run, when every
-        // vote was blank, and that is a ranking — a thin one, but one the seats were shown.
-        //
-        // Recorded as `skipped` and not left `pending`, for the reason phase 2 already gives: the
-        // two words mean different things, and only one of them is a council that stopped.
-        if !stage2_should_run(answers.len()) {
-            for seat_idx in 0..self.members.len() {
-                let _ = set_revision(
-                    &self.state.pool,
-                    &self.id,
-                    seat_idx,
-                    None,
-                    SEAT_SKIPPED,
-                    None,
+        let ballots: BTreeMap<usize, Vec<String>> = critiques
+            .iter()
+            .map(|(critic, critique)| (*critic, critique.ranking.clone()))
+            .collect();
+        let agreement = tally::agreement(&ballots, &anon.anon_map);
+        // A seat no ballot scored has no standing to report; listing it at 0.00 would read as
+        // "ranked last" when the truth is "never ranked".
+        let leaderboard_lines: Vec<String> = tally::borda(&ballots, &anon.anon_map)
+            .into_iter()
+            .filter(|row| row.n > 0)
+            .enumerate()
+            .map(|(place, row)| {
+                format!(
+                    "{}. {} — {:.2}, {} vote(s)",
+                    place + 1,
+                    self.leaderboard_name(row.seat_idx),
+                    row.score,
+                    row.n
                 )
-                .await;
-            }
-            return None;
-        }
-
-        if let Err(error) = set_stage(&self.state.pool, &self.id, STAGE_REVISION).await {
-            tracing::warn!(council = %self.id, %error, "could not advance the council to the second round");
-        }
-
-        let revising = anon.for_seat.iter().filter_map(|(viewer, labels)| {
-            let seat = self.members.get(*viewer)?;
-            let own = answers.get(viewer)?.clone();
-            // The SAME list phase 2 built, rebuilt the same way from the same shuffle. Not carried
-            // over from phase 2, because carrying it would mean holding every peer's answer for
-            // both phases to keep one `Vec` alive; rebuilt from `anon` and `answers`, which are the
-            // two things that decided it in the first place and neither of which has changed.
-            let shown: Vec<(String, String)> = labels
-                .iter()
-                .filter_map(|label| {
-                    let seat_idx = anon.anon_map.get(label)?;
-                    Some((label.clone(), answers.get(seat_idx)?.clone()))
-                })
-                .collect();
-            let standings = standings_for(*viewer, anon, leaderboard);
-            let prompt = revision_prompt(&self.question, &own, &shown, &standings);
-            Some(async move {
-                // No tools, as in phase 2.
-                let outcome = self
-                    .run_seat(Slot::Revision(*viewer), seat, prompt, false)
-                    .await;
-                (*viewer, outcome)
             })
-        });
-        let outcomes = crate::join::all(revising).await;
+            .collect();
 
-        let mut revised = answers.clone();
-        let mut count = 0usize;
-        for (seat_idx, outcome) in outcomes {
-            if outcome.status == SEAT_OK {
-                revised.insert(seat_idx, outcome.answer);
-                count += 1;
+        let input = prompts::ChairmanInput {
+            question: self.question.clone(),
+            answers: answers
+                .iter()
+                .map(|(seat_idx, answer)| prompts::SeatBrief {
+                    seat_idx: *seat_idx,
+                    name: self.seat_name(*seat_idx),
+                    role: self.role_of(*seat_idx),
+                    answer: answer.clone(),
+                })
+                .collect(),
+            critiques: critique_counts(critiques, &anon.anon_map),
+            leaderboard_lines,
+            agreement_level: agreement.level.clone(),
+            // Nothing is revised yet; the revise rounds arrive with the next packet.
+            changes: Vec::new(),
+        };
+        let seats: std::collections::BTreeSet<usize> = answers.keys().copied().collect();
+        let judge = |raw: &str| -> Result<formats::Synthesis, String> {
+            let synthesis = formats::parse_synthesis(raw)?;
+            formats::validate_synthesis(&synthesis, &seats, &agreement.level)?;
+            Ok(synthesis)
+        };
+
+        let first = match self
+            .ask_chairman(prompts::chairman_prompt(&input, None))
+            .await
+        {
+            Ok(raw) => raw,
+            Err((status, error)) => return self.settle(rounds_run, status, error).await,
+        };
+        let (synthesis, synthesis_status) = match judge(&first) {
+            Ok(synthesis) => (synthesis, SYNTHESIS_OK),
+            Err(reason) => {
+                if self.was_settled().await {
+                    return;
+                }
+                match self
+                    .ask_chairman(prompts::chairman_prompt(&input, Some(&reason)))
+                    .await
+                {
+                    Ok(second) => match judge(&second) {
+                        Ok(synthesis) => (synthesis, SYNTHESIS_OK),
+                        Err(reason) => (formats::degraded(&second, &reason), SYNTHESIS_DEGRADED),
+                    },
+                    Err((status, _)) if status == STATUS_CANCELLED => {
+                        return self.settle(rounds_run, status, None).await;
+                    }
+                    // The retry's RUN failed, but the first reply is still text the chairman
+                    // wrote: kept as degraded, which is more than an `error` council would show.
+                    Err((_, error)) => (
+                        formats::degraded(
+                            &first,
+                            &format!(
+                                "{reason}; the retry failed: {}",
+                                error.as_deref().unwrap_or("no reason given")
+                            ),
+                        ),
+                        SYNTHESIS_DEGRADED,
+                    ),
+                }
             }
-        }
+        };
 
-        let _ = crate::feed::append(
+        let encoded = serde_json::to_string(&synthesis).ok();
+        if let Err(error) = store::set_synthesis(
             &self.state.pool,
-            None,
-            "council_stage",
-            &format!("council phase {STAGE_REVISION} done: {count} seats revised"),
-            None,
-            Some(&crate::feed::Subject::Council(self.id.clone())),
+            &self.id,
+            encoded.as_deref(),
+            synthesis_status,
         )
-        .await;
-
-        Some(revised)
+        .await
+        {
+            tracing::warn!(council = %self.id, %error, "could not record the synthesis");
+        }
+        self.settle(rounds_run, STATUS_DONE, None).await;
     }
 
-    /// The last phase — the chairman writes the answer.
-    ///
-    /// The failure here is the one that settles the council as `error`, and it is survivable in the
-    /// way the others are not: phases 1 and 2 are still readable, and they are the part with value.
-    /// The answers and the ranking are worth having without the synthesis; the synthesis is not
-    /// worth having without them.
-    ///
-    /// `answers` is whatever the phase before it settled on: the phase-1 answers, or those with a
-    /// seat's revision substituted where the second round produced one. The chairman is not told
-    /// which, and there is nothing useful it could do with the distinction — it is synthesising the
-    /// council's best statement of each position, not auditing how many attempts it took.
-    async fn stage3(&self, answers: &BTreeMap<usize, String>, leaderboard: &[LeaderboardEntry]) {
-        // The LAST phase, which is 3 or 4. Not the constant `3` it was: with a second round the
-        // chairman is the fourth thing that happens, and a `stage` that went 1, 2, 3, 3 would show
-        // a reader the revision and the synthesis as one phase.
-        let last = stages_total(self.rounds);
-        if let Err(error) = set_stage(&self.state.pool, &self.id, last).await {
-            tracing::warn!(council = %self.id, %error, "could not advance the council to phase {last}");
+    /// The leaderboard's name for a seat: the agent with its model beside it, or the bare model.
+    fn leaderboard_name(&self, seat_idx: usize) -> String {
+        match self.members.get(seat_idx) {
+            Some(seat) => match &seat.agent {
+                Some(agent) => format!("{} ({})", agent.name, seat.model_ref),
+                None => seat.model_ref.clone(),
+            },
+            None => format!("seat {seat_idx}"),
         }
+    }
 
-        let prompt = stage3_prompt(&self.question, answers, leaderboard);
+    /// One chairman run: its reply, or how the council settles when the run itself did not answer.
+    async fn ask_chairman(&self, prompt: String) -> Result<String, (&'static str, Option<String>)> {
         let outcome = self
             .run_seat(Slot::Chairman, &self.chairman, prompt, false)
             .await;
-
-        let (status, error) = if outcome.status == SEAT_OK {
-            (STATUS_DONE, None)
+        if outcome.status == SEAT_OK {
+            Ok(outcome.answer)
         } else if outcome.status == SEAT_CANCELLED {
-            (STATUS_CANCELLED, None)
+            Err((STATUS_CANCELLED, None))
         } else {
-            (
+            Err((
                 STATUS_ERROR,
                 Some(
                     outcome
                         .error
                         .unwrap_or_else(|| "the chairman produced no synthesis".to_string()),
                 ),
-            )
-        };
+            ))
+        }
+    }
+
+    /// Settles the council, first writer wins, and says so in the feed when this call was it.
+    async fn settle(&self, rounds_run: i64, status: &str, error: Option<String>) {
+        if status != STATUS_CANCELLED {
+            // Guarded on `running` like every position write, so it is a no-op for a council a
+            // cancel has already settled.
+            self.move_to(rounds_run, PHASE_DONE).await;
+        }
         match finish(&self.state.pool, &self.id, status, error.as_deref()).await {
             Ok(true) => {
                 let _ = crate::feed::append(
@@ -1863,52 +1490,39 @@ impl Driver {
             }
             SeatKind::Local => self.run_local_seat(run_id, seat, prompt, with_tools).await,
         };
+        // The REPLY, not the stream it arrived in: a CLI seat's stdout is its whole `stream-json`
+        // transcript, and what a peer is shown, a critique is parsed from and the chairman reads is
+        // the text the model wrote. A runner that already returns plain text is passed through.
+        let outcome = if outcome.status == SEAT_OK {
+            let answer = crate::runner::extract_reply(&outcome.answer).unwrap_or(outcome.answer);
+            SeatOutcome { answer, ..outcome }
+        } else {
+            outcome
+        };
         self.record(&slot, Some(run_id), &outcome).await;
         outcome
     }
 
-    /// Writes one seat's state into the column that belongs to its phase.
+    /// Writes one seat's state: its step, or the chairman's run on the council.
     async fn record(&self, slot: &Slot, run_id: Option<i64>, outcome: &SeatOutcome) {
         let written = match slot {
-            Slot::Stage1(seat_idx) => {
-                set_stage1(
+            Slot::Step {
+                round,
+                seat_idx,
+                phase,
+                shown,
+            } => {
+                let (status, error, payload) = step_record(phase, shown, outcome);
+                store::upsert_step(
                     &self.state.pool,
                     &self.id,
-                    *seat_idx,
+                    *round,
+                    *seat_idx as i64,
+                    phase,
                     run_id,
-                    outcome.status,
-                    outcome.error.as_deref(),
-                )
-                .await
-            }
-            Slot::Stage2(seat_idx, allowed) => {
-                // The vote is parsed here rather than by the caller, so the rankings land in the
-                // same write as the status and a reader never sees `ok` with no vote beside it.
-                //
-                // An unreadable ranking is a BLANK vote and not an error: the seat answered, and
-                // what it wrote had no ordering in it. Recording that as a failure would make a
-                // formatting slip indistinguishable from a model that refused.
-                let rankings =
-                    (outcome.status == SEAT_OK).then(|| parse_rankings(&outcome.answer, allowed));
-                set_stage2(
-                    &self.state.pool,
-                    &self.id,
-                    *seat_idx,
-                    run_id,
-                    outcome.status,
-                    outcome.error.as_deref(),
-                    rankings.as_deref(),
-                )
-                .await
-            }
-            Slot::Revision(seat_idx) => {
-                set_revision(
-                    &self.state.pool,
-                    &self.id,
-                    *seat_idx,
-                    run_id,
-                    outcome.status,
-                    outcome.error.as_deref(),
+                    status,
+                    error.as_deref(),
+                    payload.as_deref(),
                 )
                 .await
             }
@@ -2342,6 +1956,75 @@ impl Driver {
     }
 }
 
+/// PURE: what one step's row says, given how its run ended — `(status, error, payload)`.
+///
+/// An answer that came back `ok` is stored as `{"answer": text}`. A critique that came back `ok` is
+/// parsed against the labels the seat was shown: what parses is stored as the ballot, already
+/// narrowed to those labels; what does not is `invalid`, with the parser's reason — the run
+/// finished, so its id stays on the step and the transcript stays reachable. Every other ending
+/// keeps its own status and error, and carries no payload.
+fn step_record(
+    phase: &str,
+    shown: &[String],
+    outcome: &SeatOutcome,
+) -> (&'static str, Option<String>, Option<String>) {
+    if outcome.status != SEAT_OK {
+        return (outcome.status, outcome.error.clone(), None);
+    }
+    if phase == store::PHASE_CRITIQUE {
+        return match formats::parse_critique(&outcome.answer, shown) {
+            Ok(critique) => (SEAT_OK, None, serde_json::to_string(&critique).ok()),
+            Err(reason) => (store::STEP_INVALID, Some(reason), None),
+        };
+    }
+    let payload = formats::AnswerPayload {
+        answer: outcome.answer.clone(),
+    };
+    (SEAT_OK, None, serde_json::to_string(&payload).ok())
+}
+
+/// PURE: how the critiques landed on each answer — stance counts and the reasons given against it,
+/// by the seat that wrote the answer.
+///
+/// A review of a label that names no seat, or of the critic's own answer, is ignored for the reason
+/// `tally::borda` ignores it: the critic was never shown it.
+fn critique_counts(
+    critiques: &BTreeMap<usize, formats::Critique>,
+    anon_map: &BTreeMap<String, usize>,
+) -> Vec<prompts::SeatCritiques> {
+    let mut counts: BTreeMap<usize, prompts::SeatCritiques> = BTreeMap::new();
+    for (critic, critique) in critiques {
+        for review in &critique.reviews {
+            let Some(&seat) = anon_map.get(&review.label) else {
+                continue;
+            };
+            if seat == *critic {
+                continue;
+            }
+            let entry = counts
+                .entry(seat)
+                .or_insert_with(|| prompts::SeatCritiques {
+                    seat_idx: seat,
+                    agree: 0,
+                    disagree: 0,
+                    unsure: 0,
+                    disagree_whys: Vec::new(),
+                });
+            for point in &review.points {
+                match point.stance {
+                    formats::Stance::Agree => entry.agree += 1,
+                    formats::Stance::Disagree => {
+                        entry.disagree += 1;
+                        entry.disagree_whys.push(point.why.clone());
+                    }
+                    formats::Stance::Unsure => entry.unsure += 1,
+                }
+            }
+        }
+    }
+    counts.into_values().collect()
+}
+
 /// The last of a stderr stream, for the seat's error column.
 ///
 /// Bounded because a CLI that fails at startup can produce a great deal of it, and the column is
@@ -2370,20 +2053,17 @@ fn tail_of(text: &str) -> String {
 pub async fn cancel(state: &crate::state::AppState, id: &str) -> sqlx::Result<bool> {
     let settled = finish(&state.pool, id, STATUS_CANCELLED, None).await?;
 
-    let seats = get_seat_rows(&state.pool, id).await?;
     let chairman_run = get_council_row(&state.pool, id)
         .await?
         .and_then(|row| row.chairman_run_id);
-    let mut opened: Vec<i64> = Vec::new();
-    for seat in &seats {
-        opened.extend(seat.stage1_run_id);
-        opened.extend(seat.stage2_run_id);
-        // The second round is terminated exactly as the other two are. It is `None` on a council of
-        // one round, so this line costs nothing there and is not conditional on `rounds` — a cancel
-        // that had to know the shape of the council it was stopping would be one shape away from
-        // leaving a process running.
-        opened.extend(seat.revision_run_id);
-    }
+    // Every step's run, whatever its round and phase. Not conditional on `rounds`: a cancel that had
+    // to know the shape of the council it was stopping would be one shape away from leaving a
+    // process running.
+    let mut opened: Vec<i64> = store::steps_of(&state.pool, id)
+        .await?
+        .into_iter()
+        .filter_map(|step| step.run_id)
+        .collect();
     opened.extend(chairman_run);
     for run_id in opened {
         // `finalize_termination` is the atomic-handle arbiter: it is a no-op for a run that has
@@ -2391,6 +2071,9 @@ pub async fn cancel(state: &crate::state::AppState, id: &str) -> sqlx::Result<bo
         // simple.
         crate::runs::finalize_termination(state, run_id, "cancelled").await;
     }
+    // After the runs, so a step whose seat future records `cancelled` on its own and one this
+    // settles end up the same; a step that already ended keeps how it ended.
+    store::cancel_pending_steps(&state.pool, id).await?;
 
     if settled {
         let _ = crate::feed::append(
@@ -2423,6 +2106,9 @@ pub async fn reconcile(pool: &sqlx::SqlitePool) -> sqlx::Result<u64> {
     .bind(STATUS_RUNNING)
     .fetch_all(pool)
     .await?;
+    // The steps those councils left `pending` will never be finished by anybody either; settled as
+    // `error` rather than drawn as in progress for ever. A step that ended keeps how it ended.
+    store::error_orphan_steps(pool).await?;
     Ok(reconciled.len() as u64)
 }
 
@@ -2462,7 +2148,7 @@ pub(crate) fn retention_days() -> i64 {
 /// that answers every question with `null` for ever, which is worse than its absence.
 ///
 /// Only terminal councils. A row still `running` is one a driver may be part-way through writing,
-/// and deleting it would leave `set_stage` and `finish` updating nothing while the seats went on
+/// and deleting it would leave `store::upsert_step` and `finish` updating nothing while the seats went on
 /// answering. Councils abandoned by a stopped daemon are settled by [`reconcile`] at startup, so
 /// they reach this sweep as `error` — the reconciliation is what makes "only terminal" safe rather
 /// than a way for a crashed council to become immortal.
@@ -2958,413 +2644,6 @@ mod tests {
         );
     }
 
-    /// Why the leaderboard averages instead of summing.
-    ///
-    /// Seat 0 is ranked first by both of the peers that voted; seat 1 is ranked first by the one
-    /// peer that voted on it. Summing would put seat 0 at 2 and seat 1 at 1 and call seat 1 better,
-    /// purely for having been seen less. Averaging calls them equal, which is what the votes say.
-    #[test]
-    fn average_rank_compares_under_partial_participation() {
-        let anon_map: BTreeMap<String, usize> = [("A".to_string(), 0), ("B".to_string(), 1)]
-            .into_iter()
-            .collect();
-        let votes: BTreeMap<usize, Vec<Ranking>> = [
-            (
-                1,
-                vec![Ranking {
-                    anon: "A".into(),
-                    rank: 1,
-                }],
-            ),
-            (
-                2,
-                vec![
-                    Ranking {
-                        anon: "A".into(),
-                        rank: 1,
-                    },
-                    Ranking {
-                        anon: "B".into(),
-                        rank: 1,
-                    },
-                ],
-            ),
-        ]
-        .into_iter()
-        .collect();
-
-        let board = aggregate_rankings(&votes, &anon_map);
-        assert_eq!(board.len(), 2);
-        assert_eq!(board[0].avg_rank, 1.0);
-        assert_eq!(board[1].avg_rank, 1.0);
-        // The counts are what say the two averages are not equally well supported.
-        let by_seat: BTreeMap<usize, usize> = board
-            .iter()
-            .map(|entry| (entry.seat_idx, entry.n))
-            .collect();
-        assert_eq!(by_seat[&0], 2);
-        assert_eq!(by_seat[&1], 1);
-    }
-
-    /// A total order, so the same council read twice reads the same. Without the tie-break the
-    /// order would come from a hash map and change between runs.
-    #[test]
-    fn leaderboard_ties_break_by_seat_idx() {
-        let anon_map: BTreeMap<String, usize> = [
-            ("A".to_string(), 7),
-            ("B".to_string(), 2),
-            ("C".to_string(), 5),
-        ]
-        .into_iter()
-        .collect();
-        let votes: BTreeMap<usize, Vec<Ranking>> = [(
-            0,
-            vec![
-                Ranking {
-                    anon: "A".into(),
-                    rank: 2,
-                },
-                Ranking {
-                    anon: "B".into(),
-                    rank: 2,
-                },
-                Ranking {
-                    anon: "C".into(),
-                    rank: 2,
-                },
-            ],
-        )]
-        .into_iter()
-        .collect();
-
-        let board = aggregate_rankings(&votes, &anon_map);
-        assert_eq!(
-            board.iter().map(|entry| entry.seat_idx).collect::<Vec<_>>(),
-            vec![2, 5, 7]
-        );
-    }
-
-    /// A label the council never issued is dropped rather than crashing the aggregation. The map
-    /// and the votes are read from two different columns, and a row edited by hand is not a reason
-    /// for the daemon to fall over.
-    #[test]
-    fn a_vote_for_a_label_that_does_not_exist_is_dropped() {
-        let anon_map: BTreeMap<String, usize> = [("A".to_string(), 0)].into_iter().collect();
-        let votes: BTreeMap<usize, Vec<Ranking>> = [(
-            1,
-            vec![
-                Ranking {
-                    anon: "A".into(),
-                    rank: 1,
-                },
-                Ranking {
-                    anon: "Z".into(),
-                    rank: 1,
-                },
-            ],
-        )]
-        .into_iter()
-        .collect();
-
-        let board = aggregate_rankings(&votes, &anon_map);
-        assert_eq!(board.len(), 1);
-        assert_eq!(board[0].seat_idx, 0);
-    }
-
-    fn allowed(labels: &[&str]) -> Vec<String> {
-        labels.iter().map(|label| (*label).to_string()).collect()
-    }
-
-    /// The formats a model actually writes. Requiring one of them would turn a formatting slip into
-    /// a lost vote, which is the failure this parser exists to avoid.
-    #[test]
-    fn parse_rankings_reads_the_accepted_shapes() {
-        let allowed = allowed(&["A", "B", "C", "D"]);
-
-        assert_eq!(
-            parse_rankings("A: 1\nB: 2\n", &allowed),
-            vec![
-                Ranking {
-                    anon: "A".into(),
-                    rank: 1
-                },
-                Ranking {
-                    anon: "B".into(),
-                    rank: 2
-                }
-            ]
-        );
-        assert_eq!(
-            parse_rankings("Response B: 2", &allowed),
-            vec![Ranking {
-                anon: "B".into(),
-                rank: 2
-            }]
-        );
-        assert_eq!(
-            parse_rankings("C) 3", &allowed),
-            vec![Ranking {
-                anon: "C".into(),
-                rank: 3
-            }]
-        );
-        assert_eq!(
-            parse_rankings("D - 4", &allowed),
-            vec![Ranking {
-                anon: "D".into(),
-                rank: 4
-            }]
-        );
-        assert_eq!(
-            parse_rankings("A.1", &allowed),
-            vec![Ranking {
-                anon: "A".into(),
-                rank: 1
-            }]
-        );
-
-        // Prose around the ordering is the normal case, not the exception.
-        assert_eq!(
-            parse_rankings(
-                "Thinking it over, the strongest was A: 1, and B: 2 came close behind.",
-                &allowed
-            ),
-            vec![
-                Ranking {
-                    anon: "A".into(),
-                    rank: 1
-                },
-                Ranking {
-                    anon: "B".into(),
-                    rank: 2
-                }
-            ]
-        );
-
-        // A reply with no ordering in it is a blank vote and not a failure.
-        assert!(parse_rankings("They were all about the same.", &allowed).is_empty());
-        assert!(parse_rankings("", &allowed).is_empty());
-    }
-
-    /// A model that invents a response it was never shown would otherwise bias the leaderboard, and
-    /// inventing structure is exactly what a model asked for structure does when it has none.
-    #[test]
-    fn parse_rankings_discards_labels_the_seat_never_saw() {
-        let allowed = allowed(&["A", "B"]);
-        assert_eq!(
-            parse_rankings("A: 1\nB: 2\nC: 3\nZ: 4\n", &allowed),
-            vec![
-                Ranking {
-                    anon: "A".into(),
-                    rank: 1
-                },
-                Ranking {
-                    anon: "B".into(),
-                    rank: 2
-                }
-            ]
-        );
-    }
-
-    /// A seat that contradicts itself does not get to vote twice.
-    #[test]
-    fn parse_rankings_takes_the_first_mention_of_a_label() {
-        let allowed = allowed(&["A", "B"]);
-        assert_eq!(
-            parse_rankings("A: 1\nB: 2\nOn reflection, A: 3.", &allowed),
-            vec![
-                Ranking {
-                    anon: "A".into(),
-                    rank: 1
-                },
-                Ranking {
-                    anon: "B".into(),
-                    rank: 2
-                }
-            ]
-        );
-    }
-
-    /// The boundaries, which are what stop ordinary prose from reading as a vote.
-    #[test]
-    fn parse_rankings_respects_word_boundaries() {
-        let allowed = allowed(&["A", "B", "C"]);
-        // A capital inside a word names nothing.
-        assert!(parse_rankings("partB: 1", &allowed).is_empty());
-        // Nor does a rank that runs into a word.
-        assert!(parse_rankings("A: 12x", &allowed).is_empty());
-        // `ResponseA` has no space, so neither branch of the pattern matches.
-        assert!(parse_rankings("ResponseA: 1", &allowed).is_empty());
-        // Lowercase is not a label.
-        assert!(parse_rankings("a: 1", &allowed).is_empty());
-        // Two pairs on one line are two pairs.
-        assert_eq!(parse_rankings("A: 1 B: 2 C: 3", &allowed).len(), 3);
-    }
-
-    /// With fewer than two answers there is nothing to compare, and the phase would ask a seat to
-    /// order an empty set.
-    #[test]
-    fn stage2_is_skipped_below_two_valid_responses() {
-        assert!(!stage2_should_run(0));
-        assert!(!stage2_should_run(1));
-        assert!(stage2_should_run(2));
-        assert!(stage2_should_run(8));
-    }
-
-    /// The chairman must be told that every seat failed, rather than handed an empty section it
-    /// will synthesise something confident out of.
-    #[test]
-    fn the_chairman_is_told_when_no_seat_answered() {
-        let prompt = stage3_prompt("why?", &BTreeMap::new(), &[]);
-        assert!(prompt.contains("No seat produced a valid response."));
-        assert!(prompt.contains("Synthesize one final chairman answer."));
-    }
-
-    /// The chairman sees who said what; phase 2 did not. Two agreeing answers from two models is a
-    /// different fact from one model asked twice, and only the chairman needs it.
-    #[test]
-    fn the_chairman_sees_the_seats_by_name_and_the_ranker_does_not() {
-        let responses: BTreeMap<usize, String> =
-            [(0, "first".to_string()), (2, "third".to_string())]
-                .into_iter()
-                .collect();
-        let chairman = stage3_prompt("why?", &responses, &[]);
-        assert!(chairman.contains("Seat 0:"));
-        assert!(chairman.contains("Seat 2:"));
-
-        let ranker = stage2_prompt(
-            "why?",
-            &[
-                ("A".to_string(), "first".to_string()),
-                ("B".to_string(), "third".to_string()),
-            ],
-        );
-        assert!(ranker.contains("Response A:"));
-        assert!(!ranker.contains("Seat "));
-    }
-
-    /// The second round shows a seat its own answer, the peers it ranked, and where each landed —
-    /// and the standings travel in the vocabulary the seat has, which is labels.
-    ///
-    /// The reader's own line says `You` and not its label. That is the fact phase 2 withheld: a
-    /// seat is never shown its own label, and giving it back here would hand it the one anchor from
-    /// which the shuffle could start being unpicked.
-    #[test]
-    fn the_revision_prompt_shows_the_ranking_in_labels_and_the_reader_as_itself() {
-        // Three answers; seat 1 is the reader, so it saw A and C and never B, which is itself.
-        let anon = Anonymized {
-            anon_map: [
-                ("A".to_string(), 0),
-                ("B".to_string(), 1),
-                ("C".to_string(), 2),
-            ]
-            .into_iter()
-            .collect(),
-            for_seat: [
-                (0, vec!["B".to_string(), "C".to_string()]),
-                (1, vec!["A".to_string(), "C".to_string()]),
-                (2, vec!["A".to_string(), "B".to_string()]),
-            ]
-            .into_iter()
-            .collect(),
-        };
-        let leaderboard = vec![
-            LeaderboardEntry {
-                seat_idx: 2,
-                avg_rank: 1.0,
-                n: 2,
-            },
-            LeaderboardEntry {
-                seat_idx: 1,
-                avg_rank: 1.5,
-                n: 2,
-            },
-            LeaderboardEntry {
-                seat_idx: 0,
-                avg_rank: 2.0,
-                n: 2,
-            },
-        ];
-
-        let standings = standings_for(1, &anon, &leaderboard);
-        assert_eq!(
-            standings,
-            vec![
-                Standing {
-                    label: Some("C".to_string()),
-                    avg_rank: 1.0,
-                    n: 2
-                },
-                Standing {
-                    label: None,
-                    avg_rank: 1.5,
-                    n: 2
-                },
-                Standing {
-                    label: Some("A".to_string()),
-                    avg_rank: 2.0,
-                    n: 2
-                },
-            ],
-            "the order of the leaderboard survives; only the naming changes"
-        );
-
-        let prompt = revision_prompt(
-            "why?",
-            "my own first answer",
-            &[
-                ("A".to_string(), "what A said".to_string()),
-                ("C".to_string(), "what C said".to_string()),
-            ],
-            &standings,
-        );
-        assert!(prompt.contains("Your own answer:\nmy own first answer"));
-        assert!(prompt.contains("Response A:\nwhat A said"));
-        assert!(prompt.contains("Response C:\nwhat C said"));
-        assert!(prompt.contains("You: 1.50 from 2 vote(s)"));
-        assert!(prompt.contains("C: 1.00 from 2 vote(s)"));
-        // Never `B`, which is what this seat is. Not in the responses, because phase 2 did not show
-        // it; not in the standings, because saying it would be saying which one the reader is.
-        assert!(!prompt.contains("Response B"));
-        assert!(!prompt.contains("B: "));
-        assert!(!prompt.contains("Seat "));
-        assert!(!prompt.contains("seat_idx"));
-    }
-
-    /// A standing for an answer the reader never saw is a peer it can only guess at, and a count of
-    /// a council it was not given. Left out rather than shown under a label attached to nothing.
-    #[test]
-    fn a_reader_is_shown_no_standing_for_an_answer_it_never_saw() {
-        let anon = Anonymized {
-            anon_map: [("A".to_string(), 0), ("B".to_string(), 1)]
-                .into_iter()
-                .collect(),
-            // Deliberately narrower than the map: seat 0 was shown nothing at all.
-            for_seat: [(0, Vec::new())].into_iter().collect(),
-        };
-        let leaderboard = vec![
-            LeaderboardEntry {
-                seat_idx: 0,
-                avg_rank: 1.0,
-                n: 1,
-            },
-            LeaderboardEntry {
-                seat_idx: 1,
-                avg_rank: 2.0,
-                n: 1,
-            },
-        ];
-        assert_eq!(
-            standings_for(0, &anon, &leaderboard),
-            vec![Standing {
-                label: None,
-                avg_rank: 1.0,
-                n: 1
-            }],
-            "only the reader's own line survives when it was shown no peer"
-        );
-    }
-
     #[test]
     fn labels_stay_distinct_past_the_alphabet() {
         assert_eq!(label_for(0), "A");
@@ -3446,14 +2725,17 @@ mod tests {
         assert_eq!(row.anon_seed, "c1", "the seed is the council's own id");
         assert_eq!(row.chairman_ref, "claude-opus-4-8");
         assert_eq!(row.anon_map, None);
-        assert_eq!(row.leaderboard, None);
+        // Where a council starts: round 0, the answer phase.
+        assert_eq!(row.current_round, 0);
+        assert_eq!(row.current_phase, store::PHASE_ANSWER);
 
         let seats = get_seat_rows(&pool, "c1").await.unwrap();
         assert_eq!(seats.len(), 2);
         assert_eq!(seats[0].seat_idx, 0);
         assert_eq!(seats[1].kind, "local");
         assert_eq!(seats[1].model_ref, "qwen3.5:4b");
-        assert_eq!(seats[0].stage1_status, SEAT_PENDING);
+        // A council inserted without roles seats every member as itself.
+        assert!(seats.iter().all(|seat| seat.role.is_none()));
 
         pool.close().await;
     }
@@ -3504,10 +2786,13 @@ mod tests {
         .unwrap();
         finish(&pool, "c1", STATUS_CANCELLED, None).await.unwrap();
 
-        set_stage(&pool, "c1", 3).await.unwrap();
+        store::set_position(&pool, "c1", 1, store::PHASE_CRITIQUE)
+            .await
+            .unwrap();
+        let row = get_council_row(&pool, "c1").await.unwrap().unwrap();
         assert_eq!(
-            get_council_row(&pool, "c1").await.unwrap().unwrap().stage,
-            1
+            (row.current_round, row.current_phase.as_str()),
+            (0, store::PHASE_ANSWER)
         );
 
         pool.close().await;
@@ -3540,61 +2825,6 @@ mod tests {
         pool.close().await;
     }
 
-    #[tokio::test]
-    async fn a_seats_phases_are_recorded_independently() {
-        let pool = test_pool().await;
-        insert_council(
-            &pool,
-            "c1",
-            "why?",
-            &seat(SeatKind::Cloud, "m"),
-            &[seat(SeatKind::Cloud, "m"), seat(SeatKind::Cloud, "m")],
-            1,
-        )
-        .await
-        .unwrap();
-
-        set_stage1(&pool, "c1", 0, Some(11), SEAT_OK, None)
-            .await
-            .unwrap();
-        set_stage1(&pool, "c1", 1, Some(12), SEAT_TIMEOUT, Some("wall clock"))
-            .await
-            .unwrap();
-        set_stage2(
-            &pool,
-            "c1",
-            0,
-            Some(21),
-            SEAT_OK,
-            None,
-            Some(&[Ranking {
-                anon: "B".into(),
-                rank: 1,
-            }]),
-        )
-        .await
-        .unwrap();
-        set_stage2(&pool, "c1", 1, None, SEAT_SKIPPED, None, None)
-            .await
-            .unwrap();
-
-        let seats = get_seat_rows(&pool, "c1").await.unwrap();
-        assert_eq!(seats[0].stage1_status, SEAT_OK);
-        assert_eq!(seats[0].stage1_run_id, Some(11));
-        // A seat that ran out of clock is not a seat that refused, and the two must stay legible
-        // apart in the record.
-        assert_eq!(seats[1].stage1_status, SEAT_TIMEOUT);
-        assert_eq!(seats[1].stage1_error.as_deref(), Some("wall clock"));
-        assert_eq!(
-            seats[0].rankings.as_deref(),
-            Some(r#"[{"anon":"B","rank":1}]"#)
-        );
-        assert_eq!(seats[1].stage2_status, SEAT_SKIPPED);
-        assert_eq!(seats[1].rankings, None);
-
-        pool.close().await;
-    }
-
     // ── The three phases, driven end to end ──────────────────────────────────────────────────
     //
     // Against a runner that answers by PHASE rather than by call order, which is what the Python
@@ -3622,11 +2852,15 @@ mod tests {
 
     #[derive(Default)]
     struct ScriptedRunner {
+        /// The answer phase: every prompt that carries none of the three phase markers.
         stage1: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
-        stage2: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
-        /// The second round, which only a council with `rounds: 2` ever reaches.
-        revision: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
-        chairman: std::sync::Mutex<Option<Scripted>>,
+        /// Prompts carrying `prompts::CRITIQUE_MARKER`.
+        critique: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
+        /// Prompts carrying `prompts::REVISE_MARKER` — only a council of more than one round.
+        revise: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
+        /// Prompts carrying `prompts::CHAIRMAN_MARKER`, one reply per attempt — a queue because the
+        /// chairman is retried once on an unreadable synthesis. Empty means a valid synthesis.
+        chairman: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
         /// Every request, in the order it arrived, for the assertions about HOW a seat was launched.
         seen: std::sync::Mutex<Vec<SeenRequest>>,
     }
@@ -3642,26 +2876,27 @@ mod tests {
 
     impl ScriptedRunner {
         fn next_for(&self, prompt: &str) -> Scripted {
-            // Asked FIRST, because a revision prompt also quotes peer responses and a looser marker
-            // would route the second round into phase 2's queue.
-            if prompt.contains("Revise your own answer in the light of the ranking") {
-                self.revision
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or(Scripted::Answers(String::new()))
-            } else if prompt.contains("Rank the anonymous peer responses") {
-                self.stage2
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or(Scripted::Answers(String::new()))
-            } else if prompt.contains("Synthesize one final chairman answer") {
+            // Routed on the constants `prompts` exports and not on prose, so a reworded prompt
+            // cannot silently send one phase's reply to another. The chairman is asked FIRST
+            // because its prompt quotes answers and critiques that could carry any other text.
+            if prompt.contains(prompts::CHAIRMAN_MARKER) {
                 self.chairman
                     .lock()
                     .unwrap()
-                    .clone()
-                    .unwrap_or(Scripted::Answers("the synthesis".to_string()))
+                    .pop_front()
+                    .unwrap_or_else(|| Scripted::Answers(synthesis_reply("the synthesis")))
+            } else if prompt.contains(prompts::REVISE_MARKER) {
+                self.revise
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Scripted::Answers(String::new()))
+            } else if prompt.contains(prompts::CRITIQUE_MARKER) {
+                self.critique
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Scripted::Answers(String::new()))
             } else {
                 self.stage1
                     .lock()
@@ -3818,9 +3053,9 @@ mod tests {
             Scripted::Answers("the third answer".into()),
         ]
         .into();
-        *runner.stage2.lock().unwrap() = [
-            Scripted::Answers("A: 1\nB: 2".into()),
-            Scripted::Answers("A: 1\nB: 2".into()),
+        *runner.critique.lock().unwrap() = [
+            Scripted::Answers(critique_json(&["A", "B"])),
+            Scripted::Answers(critique_json(&["A", "B"])),
         ]
         .into();
 
@@ -3910,6 +3145,16 @@ mod tests {
                 .all(|(_, status)| status == "pass" || status == "error"),
             "{reports:?}"
         );
+        // Every launch of every phase — answers, critiques and the chairman — went through the one
+        // routed seat-launch helper: the router was asked once per request the runner saw.
+        let launched = runner.seen.lock().unwrap().len();
+        assert_eq!(routed, launched, "a phase launched around the router");
+        assert!(
+            prompts(&runner)
+                .iter()
+                .any(|prompt| prompt.contains(prompts::CRITIQUE_MARKER)),
+            "the critique phase ran, so its launches are among the routed ones"
+        );
     }
 
     /// A seat that failed is information about the model, not a reason to abandon the question.
@@ -3922,9 +3167,9 @@ mod tests {
             Scripted::Answers("the third answer".into()),
         ]
         .into();
-        *runner.stage2.lock().unwrap() = [
-            Scripted::Answers("A: 1\nB: 2".into()),
-            Scripted::Answers("A: 1\nB: 2".into()),
+        *runner.critique.lock().unwrap() = [
+            Scripted::Answers(critique_json(&["A", "B"])),
+            Scripted::Answers(critique_json(&["A", "B"])),
         ]
         .into();
         let state = council_state(runner.clone(), Some(roster(3))).await;
@@ -3933,19 +3178,31 @@ mod tests {
         let row = settled(&state, &id).await;
 
         assert_eq!(row.status, STATUS_DONE);
-        assert_eq!(row.stage, 3);
-        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
-        assert_eq!(seats[0].stage1_status, SEAT_OK);
-        assert_eq!(seats[1].stage1_status, SEAT_ERROR);
-        assert_eq!(seats[1].stage1_error.as_deref(), Some("the model refused"));
-        assert_eq!(seats[2].stage1_status, SEAT_OK);
+        let steps = steps_for(&state, &id).await;
+        assert_eq!(
+            step_at(&steps, 0, 0, store::PHASE_ANSWER).unwrap().status,
+            SEAT_OK
+        );
+        let failed = step_at(&steps, 1, 0, store::PHASE_ANSWER).unwrap();
+        assert_eq!(failed.status, SEAT_ERROR);
+        assert_eq!(failed.error.as_deref(), Some("the model refused"));
+        assert_eq!(
+            step_at(&steps, 2, 0, store::PHASE_ANSWER).unwrap().status,
+            SEAT_OK
+        );
 
-        // Two valid answers, so phase 2 ran — and only for the seats that had one to be ranked
-        // against, which is the same set.
-        assert_eq!(seats[0].stage2_status, SEAT_OK);
-        assert_eq!(seats[2].stage2_status, SEAT_OK);
+        // Two valid answers, so the critique ran — and only for the seats that had one to be
+        // judged against, which is the same set.
+        assert_eq!(
+            step_at(&steps, 0, 1, store::PHASE_CRITIQUE).unwrap().status,
+            SEAT_OK
+        );
+        assert_eq!(
+            step_at(&steps, 2, 1, store::PHASE_CRITIQUE).unwrap().status,
+            SEAT_OK
+        );
         // The failed seat is not in the shuffle, so it was never shown anything and never asked.
-        assert_eq!(seats[1].stage2_status, SEAT_PENDING);
+        assert!(step_at(&steps, 1, 1, store::PHASE_CRITIQUE).is_none());
 
         let anon: BTreeMap<String, usize> =
             serde_json::from_str(row.anon_map.as_deref().unwrap()).unwrap();
@@ -3968,9 +3225,9 @@ mod tests {
             Scripted::Answers("the third answer".into()),
         ]
         .into();
-        *runner.stage2.lock().unwrap() = [
-            Scripted::Answers("A: 1\nB: 2".into()),
-            Scripted::Answers("A: 1\nB: 2".into()),
+        *runner.critique.lock().unwrap() = [
+            Scripted::Answers(critique_json(&["A", "B"])),
+            Scripted::Answers(critique_json(&["A", "B"])),
         ]
         .into();
         let state = council_state(runner.clone(), Some(roster(3))).await;
@@ -3979,10 +3236,11 @@ mod tests {
         let row = settled(&state, &id).await;
 
         assert_eq!(row.status, STATUS_DONE);
-        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
-        assert_eq!(seats[1].stage1_status, SEAT_ERROR);
-        let run_id = seats[1]
-            .stage1_run_id
+        let steps = steps_for(&state, &id).await;
+        let died = step_at(&steps, 1, 0, store::PHASE_ANSWER).unwrap();
+        assert_eq!(died.status, SEAT_ERROR);
+        let run_id = died
+            .run_id
             .expect("a seat that launched has a run row, whatever it ended with");
 
         /// `exit_code, cost_usd, num_turns, input_tokens, output_tokens, cache_creation_tokens`.
@@ -4039,11 +3297,12 @@ mod tests {
         let row = settled(&state, &id).await;
 
         assert_eq!(row.status, STATUS_DONE);
-        // The leaderboard is written as an empty list rather than left NULL, because "phase 2 ran
-        // and nobody was ranked" and "phase 2 never ran" are different, and only the second is this.
-        assert_eq!(row.leaderboard, None);
-        for seat in get_seat_rows(&state.pool, &id).await.unwrap() {
-            assert_eq!(seat.stage2_status, SEAT_SKIPPED);
+        // No critique round ran, and the record says so rather than claiming one.
+        assert_eq!(row.rounds_run, 0);
+        for step in steps_for(&state, &id).await {
+            if step.phase == store::PHASE_CRITIQUE {
+                assert_eq!(step.status, SEAT_SKIPPED, "{step:?}");
+            }
         }
         assert!(
             runner
@@ -4051,7 +3310,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|request| !request.prompt.contains("Rank the anonymous peer"))
+                .all(|request| !request.prompt.contains(prompts::CRITIQUE_MARKER))
         );
     }
 
@@ -4065,7 +3324,8 @@ mod tests {
             Scripted::WillNotLaunch("the binary is missing".into()),
         ]
         .into();
-        *runner.chairman.lock().unwrap() = Some(Scripted::Answers("nobody answered".into()));
+        *runner.chairman.lock().unwrap() =
+            [Scripted::Answers(synthesis_reply("nobody answered"))].into();
         let state = council_state(runner.clone(), Some(roster(2))).await;
 
         let id = start(&state, "why?", None).await.unwrap();
@@ -4077,14 +3337,10 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .find(|request| {
-                request
-                    .prompt
-                    .contains("Synthesize one final chairman answer")
-            })
+            .find(|request| request.prompt.contains(prompts::CHAIRMAN_MARKER))
             .map(|request| request.prompt.clone())
             .expect("the chairman ran");
-        assert!(chairman_prompt.contains("No seat produced a valid response."));
+        assert!(chairman_prompt.contains("No seat produced a valid answer."));
     }
 
     /// A seat that ran out of clock and a seat that refused are different facts about a model, and
@@ -4099,9 +3355,15 @@ mod tests {
         let id = start(&state, "why?", None).await.unwrap();
         settled(&state, &id).await;
 
-        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
-        assert_eq!(seats[0].stage1_status, SEAT_TIMEOUT);
-        assert_eq!(seats[1].stage1_status, SEAT_ERROR);
+        let steps = steps_for(&state, &id).await;
+        assert_eq!(
+            step_at(&steps, 0, 0, store::PHASE_ANSWER).unwrap().status,
+            SEAT_TIMEOUT
+        );
+        assert_eq!(
+            step_at(&steps, 1, 0, store::PHASE_ANSWER).unwrap().status,
+            SEAT_ERROR
+        );
         // And the run rows keep the same distinction, so anything reading `runs` sees it too.
         let statuses: Vec<String> =
             sqlx::query_scalar("SELECT status FROM runs WHERE mode = ? ORDER BY id")
@@ -4143,8 +3405,13 @@ mod tests {
         assert_eq!(row.status, STATUS_CANCELLED);
         // `cancelled`, not `error`. Somebody stopped this; nothing broke.
         assert_eq!(row.error, None);
-        // Phase 2 never started.
-        assert_eq!(row.stage, 1);
+        // The critique never started: the council is still where the answers left it.
+        assert_eq!(row.current_phase, store::PHASE_ANSWER);
+        assert!(
+            prompts(&runner)
+                .iter()
+                .all(|prompt| !prompt.contains(prompts::CRITIQUE_MARKER))
+        );
 
         for _ in 0..300 {
             if !config_path.exists() {
@@ -4169,14 +3436,6 @@ mod tests {
         assert!(state.run_handles.lock().unwrap().is_empty());
     }
 
-    /// The same roster, asked to deliberate twice.
-    fn two_round_roster(members: usize) -> CouncilConfig {
-        CouncilConfig {
-            rounds: 2,
-            ..roster(members)
-        }
-    }
-
     /// Every prompt the council sent, in order.
     fn prompts(runner: &ScriptedRunner) -> Vec<String> {
         runner
@@ -4188,12 +3447,8 @@ mod tests {
             .collect()
     }
 
-    fn is_revision(prompt: &str) -> bool {
-        prompt.contains("Revise your own answer in the light of the ranking")
-    }
-
     fn is_synthesis(prompt: &str) -> bool {
-        prompt.contains("Synthesize one final chairman answer")
+        prompt.contains(prompts::CHAIRMAN_MARKER)
     }
 
     #[tokio::test]
@@ -4204,9 +3459,9 @@ mod tests {
             Scripted::Answers("the second answer".into()),
         ]
         .into();
-        *runner.stage2.lock().unwrap() = [
-            Scripted::Answers("A: 1".into()),
-            Scripted::Answers("A: 1".into()),
+        *runner.critique.lock().unwrap() = [
+            Scripted::Answers(critique_json(&["A"])),
+            Scripted::Answers(critique_json(&["A"])),
         ]
         .into();
         let state = council_state(runner.clone(), Some(roster(2))).await;
@@ -4237,408 +3492,6 @@ mod tests {
         assert_eq!(traces, 0);
     }
 
-    /// The non-regression test, and the most important one in this file: `rounds: 1` is what ships,
-    /// and it has to be the council that ran before the second round existed — the same three
-    /// phases, the same `stage` values, the same rows.
-    #[tokio::test]
-    async fn with_one_round_nothing_revises_and_the_row_says_three_phases() {
-        let runner = std::sync::Arc::new(ScriptedRunner::default());
-        *runner.stage1.lock().unwrap() = [
-            Scripted::Answers("the first answer".into()),
-            Scripted::Answers("the second answer".into()),
-        ]
-        .into();
-        *runner.stage2.lock().unwrap() = [
-            Scripted::Answers("A: 1".into()),
-            Scripted::Answers("A: 1".into()),
-        ]
-        .into();
-        // `roster` and not `two_round_roster`: this is the file saying nothing about rounds.
-        let state = council_state(runner.clone(), Some(roster(2))).await;
-
-        let id = start(&state, "why?", None).await.unwrap();
-        let row = settled(&state, &id).await;
-
-        assert_eq!(row.status, STATUS_DONE);
-        assert_eq!(row.rounds, 1);
-        assert_eq!(row.stage, 3, "the chairman is still the third phase");
-        assert_eq!(stages_total(row.rounds), 3);
-
-        for seat in get_seat_rows(&state.pool, &id).await.unwrap() {
-            // `pending` and not `skipped`. A council of one round never had a fourth phase to skip,
-            // and `rounds` on the row is what says so — see `0136_council_revision.sql`.
-            assert_eq!(seat.revision_status, SEAT_PENDING);
-            assert_eq!(seat.revision_run_id, None);
-            assert_eq!(seat.revision_error, None);
-        }
-
-        let sent = prompts(&runner);
-        assert!(
-            !sent.iter().any(|prompt| is_revision(prompt)),
-            "a one-round council must not ask a seat to revise anything"
-        );
-        // Three phases' worth of launches and not four: two answers, two rankings, one synthesis.
-        assert_eq!(sent.len(), 5);
-        let chairman = sent.iter().find(|prompt| is_synthesis(prompt)).unwrap();
-        assert!(chairman.contains("the first answer"));
-        assert!(chairman.contains("the second answer"));
-
-        let view = get_council(
-            axum::extract::State(state.clone()),
-            axum::extract::Path(id.clone()),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(view.rounds, 1);
-        // No revise step on any seat: a council of one round never had one to record.
-        assert!(view.seats.iter().all(|seat| {
-            seat.steps
-                .iter()
-                .all(|step| step.phase != store::PHASE_REVISE)
-        }));
-    }
-
-    /// The point of the second round: what the chairman reads is what the seats wrote AFTER seeing
-    /// where the council placed them.
-    #[tokio::test]
-    async fn a_second_round_hands_the_chairman_the_revised_answers() {
-        let runner = std::sync::Arc::new(ScriptedRunner::default());
-        *runner.stage1.lock().unwrap() = [
-            Scripted::Answers("alpha at first".into()),
-            Scripted::Answers("beta at first".into()),
-        ]
-        .into();
-        *runner.stage2.lock().unwrap() = [
-            Scripted::Answers("A: 1".into()),
-            Scripted::Answers("A: 1".into()),
-        ]
-        .into();
-        *runner.revision.lock().unwrap() = [
-            Scripted::Answers("alpha on reflection".into()),
-            Scripted::Answers("beta on reflection".into()),
-        ]
-        .into();
-        let state = council_state(runner.clone(), Some(two_round_roster(2))).await;
-
-        let id = start(&state, "why?", None).await.unwrap();
-        let row = settled(&state, &id).await;
-
-        assert_eq!(row.status, STATUS_DONE);
-        assert_eq!(row.rounds, 2);
-        // The chairman is the FOURTH phase here. A `stage` that stopped at 3 would show a reader
-        // the revision and the synthesis as one thing.
-        assert_eq!(row.stage, 4);
-        assert_eq!(stages_total(row.rounds), 4);
-
-        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
-        for seat in &seats {
-            assert_eq!(seat.revision_status, SEAT_OK);
-            assert!(seat.revision_run_id.is_some());
-        }
-        // A separate `runs` row per round, not a second turn of the first one: cost, cancellation
-        // and reconciliation all hang off that row, and a shared one would have to carry two.
-        assert_ne!(seats[0].revision_run_id, seats[0].stage1_run_id);
-
-        let sent = prompts(&runner);
-        let chairman = sent.iter().find(|prompt| is_synthesis(prompt)).unwrap();
-        assert!(chairman.contains("alpha on reflection"));
-        assert!(chairman.contains("beta on reflection"));
-        assert!(
-            !chairman.contains("alpha at first") && !chairman.contains("beta at first"),
-            "a revised seat is read at its revision, not at both"
-        );
-
-        let view = get_council(
-            axum::extract::State(state.clone()),
-            axum::extract::Path(id.clone()),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(view.rounds, 2);
-        // Both are served. The first answer is what the leaderboard was cast over, so a client
-        // shown only the revision would be shown a ranking of text it never displayed.
-        assert_eq!(
-            step_answer(&view.seats[0], 0, store::PHASE_ANSWER).as_deref(),
-            Some("alpha at first")
-        );
-        assert_eq!(
-            step_answer(&view.seats[0], 1, store::PHASE_REVISE).as_deref(),
-            Some("alpha on reflection")
-        );
-        assert_eq!(
-            step_of(&view.seats[0], 1, store::PHASE_REVISE)
-                .unwrap()
-                .status,
-            SEAT_OK
-        );
-    }
-
-    /// A failed second attempt is not a reason to throw away a first one that worked. The chairman
-    /// reads a seat's revision when the revision came back `ok`, and its first answer otherwise.
-    #[tokio::test]
-    async fn a_seat_that_failed_to_revise_is_read_at_its_first_answer() {
-        let runner = std::sync::Arc::new(ScriptedRunner::default());
-        *runner.stage1.lock().unwrap() = [
-            Scripted::Answers("alpha at first".into()),
-            Scripted::Answers("beta at first".into()),
-        ]
-        .into();
-        *runner.stage2.lock().unwrap() = [
-            Scripted::Answers("A: 1".into()),
-            Scripted::Answers("A: 1".into()),
-        ]
-        .into();
-        *runner.revision.lock().unwrap() = [
-            Scripted::Answers("alpha on reflection".into()),
-            Scripted::Fails("the model refused to revise".into()),
-        ]
-        .into();
-        let state = council_state(runner.clone(), Some(two_round_roster(2))).await;
-
-        let id = start(&state, "why?", None).await.unwrap();
-        let row = settled(&state, &id).await;
-        assert_eq!(row.status, STATUS_DONE);
-
-        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
-        assert_eq!(seats[0].revision_status, SEAT_OK);
-        assert_eq!(seats[1].revision_status, SEAT_ERROR);
-        assert_eq!(
-            seats[1].revision_error.as_deref(),
-            Some("the model refused to revise")
-        );
-
-        let sent = prompts(&runner);
-        let chairman = sent.iter().find(|prompt| is_synthesis(prompt)).unwrap();
-        assert!(chairman.contains("alpha on reflection"));
-        assert!(
-            chairman.contains("beta at first"),
-            "the seat that could not revise still has an answer, and it is the one it wrote"
-        );
-    }
-
-    /// Revising in the light of a ranking that does not exist is not revising. Below two valid
-    /// answers phase 2 is skipped whole, and the round that reads its output is skipped with it.
-    #[tokio::test]
-    async fn a_skipped_ranking_skips_the_revision_too() {
-        let runner = std::sync::Arc::new(ScriptedRunner::default());
-        *runner.stage1.lock().unwrap() = [
-            Scripted::Answers("the only answer".into()),
-            Scripted::Fails("no".into()),
-        ]
-        .into();
-        let state = council_state(runner.clone(), Some(two_round_roster(2))).await;
-
-        let id = start(&state, "why?", None).await.unwrap();
-        let row = settled(&state, &id).await;
-
-        assert_eq!(row.status, STATUS_DONE);
-        for seat in get_seat_rows(&state.pool, &id).await.unwrap() {
-            assert_eq!(seat.stage2_status, SEAT_SKIPPED);
-            // `skipped` and not `pending`: this council HAD a fourth phase and did not run it,
-            // which is a different sentence from never having had one.
-            assert_eq!(seat.revision_status, SEAT_SKIPPED);
-            assert_eq!(seat.revision_run_id, None);
-        }
-        assert!(
-            !prompts(&runner).iter().any(|prompt| is_revision(prompt)),
-            "no ranking, no revision"
-        );
-        // The chairman is still the fourth phase — the council was configured for four, and one of
-        // them being skipped does not renumber the rest. Phase 2 already behaves this way.
-        assert_eq!(row.stage, 4);
-    }
-
-    /// The anonymity has to survive the second round, and this walks every request the council made
-    /// to say so. The sibling for phase 2 is `a_seat_is_launched_scoped_and_only_phase_one_has_tools`
-    /// plus `the_chairman_sees_the_seats_by_name_and_the_ranker_does_not`; this is their shape,
-    /// applied to a phase that shows a seat MORE than phase 2 did and must leak no more.
-    #[tokio::test]
-    async fn a_revising_seat_is_shown_no_peer_identity() {
-        let runner = std::sync::Arc::new(ScriptedRunner::default());
-        *runner.stage1.lock().unwrap() = [
-            Scripted::Answers("quartz".into()),
-            Scripted::Answers("basalt".into()),
-            Scripted::Answers("gneiss".into()),
-        ]
-        .into();
-        // Every label ranked by every seat. Which two of the three a given seat may actually see is
-        // decided by a shuffle over the council's uuid, so the vote is written label-agnostically
-        // and `parse_rankings` drops the one label each seat was not shown. The point is that all
-        // three seats end up ON the leaderboard, which is what gives each of them a standing of its
-        // own to be shown as `You`.
-        *runner.stage2.lock().unwrap() = [
-            Scripted::Answers("A: 1\nB: 2\nC: 3".into()),
-            Scripted::Answers("A: 1\nB: 2\nC: 3".into()),
-            Scripted::Answers("A: 1\nB: 2\nC: 3".into()),
-        ]
-        .into();
-        *runner.revision.lock().unwrap() = [
-            Scripted::Answers("quartz, revised".into()),
-            Scripted::Answers("basalt, revised".into()),
-            Scripted::Answers("gneiss, revised".into()),
-        ]
-        .into();
-        let state = council_state(runner.clone(), Some(two_round_roster(3))).await;
-
-        let id = start(&state, "why?", None).await.unwrap();
-        let row = settled(&state, &id).await;
-        assert_eq!(row.status, STATUS_DONE);
-
-        let answer_of = ["quartz", "basalt", "gneiss"];
-        let anon_map: BTreeMap<String, usize> =
-            serde_json::from_str(row.anon_map.as_deref().unwrap()).unwrap();
-        let anon = anonymize(&id, &[0, 1, 2]);
-        assert_eq!(
-            anon.anon_map, anon_map,
-            "the row records the shuffle that ran"
-        );
-
-        let sent = prompts(&runner);
-        // Everything except the chairman's. Anonymity ends AT the chairman and nowhere earlier —
-        // that is `stage3_prompt`'s own decision and it has its own test.
-        for prompt in sent.iter().filter(|prompt| !is_synthesis(prompt)) {
-            for model_ref in ["model-0", "model-1", "model-2", "the-chairman"] {
-                assert!(
-                    !prompt.contains(model_ref),
-                    "a seat was told which model wrote something: {prompt}"
-                );
-            }
-            assert!(!prompt.contains("Seat "), "{prompt}");
-            assert!(!prompt.contains("seat_idx"), "{prompt}");
-        }
-
-        let revisions: Vec<&String> = sent.iter().filter(|prompt| is_revision(prompt)).collect();
-        assert_eq!(revisions.len(), 3, "every answering seat revised");
-        let mut readers = std::collections::BTreeSet::new();
-        for prompt in revisions {
-            // Which seat this is, read off the one answer the prompt presents as the reader's own.
-            let reader = (0..3)
-                .find(|seat_idx| {
-                    prompt.contains(&format!("Your own answer:\n{}\n", answer_of[*seat_idx]))
-                })
-                .unwrap_or_else(|| panic!("a revision prompt with no reader: {prompt}"));
-            readers.insert(reader);
-
-            let shown = &anon.for_seat[&reader];
-            assert_eq!(shown.len(), 2);
-            for label in shown {
-                let peer = anon_map[label];
-                assert!(
-                    prompt.contains(&format!("Response {label}:\n{}\n", answer_of[peer])),
-                    "the seat must see the SAME labelled answers it ranked: {prompt}"
-                );
-            }
-            // Its own label appears nowhere — not over its answer, and not in the standings. That
-            // is the one fact phase 2 withheld, and the second round does not give it back.
-            let own_label = anon_map
-                .iter()
-                .find(|(_, seat_idx)| **seat_idx == reader)
-                .map(|(label, _)| label.clone())
-                .unwrap();
-            assert!(
-                !prompt.contains(&format!("Response {own_label}:")),
-                "{prompt}"
-            );
-            assert!(!prompt.contains(&format!("{own_label}: ")), "{prompt}");
-            // Its own standing IS shown — a seat is entitled to know where it came — but as `You`,
-            // which is the one rendering that says it without saying which label it is.
-            assert!(prompt.contains("You: "), "{prompt}");
-            assert_eq!(
-                prompt.matches("Response ").count(),
-                2,
-                "exactly the two peers it ranked, and no third: {prompt}"
-            );
-        }
-        assert_eq!(
-            readers.len(),
-            3,
-            "three distinct readers, not one seat three times"
-        );
-    }
-
-    /// A cancel terminates the second round exactly as it terminates the other three phases. The
-    /// sibling is `cancelling_terminates_the_seats_and_removes_the_mcp_config`, which does this for
-    /// phase 1; a phase `cancel` did not know about would leave two CLI processes running.
-    #[tokio::test]
-    async fn cancelling_terminates_a_revision_in_flight() {
-        let runner = std::sync::Arc::new(ScriptedRunner::default());
-        *runner.stage1.lock().unwrap() = [
-            Scripted::Answers("alpha at first".into()),
-            Scripted::Answers("beta at first".into()),
-        ]
-        .into();
-        *runner.stage2.lock().unwrap() = [
-            Scripted::Answers("A: 1".into()),
-            Scripted::Answers("A: 1".into()),
-        ]
-        .into();
-        *runner.revision.lock().unwrap() = [Scripted::Hangs, Scripted::Hangs].into();
-        let mut config = two_round_roster(2);
-        // Long enough that only the cancel can end this.
-        config.timeout_seconds = 600;
-        let state = council_state(runner.clone(), Some(config)).await;
-
-        let id = start(&state, "why?", None).await.unwrap();
-
-        // Both revisions in flight: the council has reached the round AND has two live runs.
-        let mut reached = false;
-        for _ in 0..600 {
-            let row = get_council_row(&state.pool, &id).await.unwrap().unwrap();
-            if row.stage == STAGE_REVISION && state.run_handles.lock().unwrap().len() == 2 {
-                reached = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(reached, "the second round never got two seats in flight");
-
-        assert!(cancel(&state, &id).await.unwrap());
-        let row = settled(&state, &id).await;
-        assert_eq!(row.status, STATUS_CANCELLED);
-        assert_eq!(row.error, None);
-        // The chairman never ran, so the phase never moved past the round that was stopped.
-        assert_eq!(row.stage, STAGE_REVISION);
-
-        // Polled and not read once. `cancel` settles the RECORD first and terminates the runs
-        // second, so the row says `cancelled` a moment before the aborted seats have written why —
-        // which is the ordering the whole cancellation design rests on, not a slow test.
-        let mut seats = Vec::new();
-        for _ in 0..300 {
-            seats = get_seat_rows(&state.pool, &id).await.unwrap();
-            if seats
-                .iter()
-                .all(|seat| seat.revision_status == SEAT_CANCELLED)
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        for seat in &seats {
-            assert_eq!(seat.revision_status, SEAT_CANCELLED);
-        }
-        for run_id in seats.iter().filter_map(|seat| seat.revision_run_id) {
-            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
-                .bind(run_id)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
-            assert_eq!(status, "cancelled");
-        }
-        for _ in 0..300 {
-            if state.run_handles.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(state.run_handles.lock().unwrap().is_empty());
-        assert!(
-            !prompts(&runner).iter().any(|prompt| is_synthesis(prompt)),
-            "a cancelled round must not be followed by a synthesis"
-        );
-    }
-
     /// One `runs` row per seat, whichever machine answers it. The row is what carries cost,
     /// cancellation and orphan reconciliation, and a seat that skipped it would need all three
     /// written again.
@@ -4667,9 +3520,18 @@ mod tests {
         assert_eq!(seats.len(), 2);
         assert_eq!(seats[0].kind, "cloud");
         assert_eq!(seats[1].kind, "local");
-        assert!(seats[0].stage1_run_id.is_some());
+        let steps = steps_for(&state, &id).await;
         assert!(
-            seats[1].stage1_run_id.is_some(),
+            step_at(&steps, 0, 0, store::PHASE_ANSWER)
+                .unwrap()
+                .run_id
+                .is_some()
+        );
+        assert!(
+            step_at(&steps, 1, 0, store::PHASE_ANSWER)
+                .unwrap()
+                .run_id
+                .is_some(),
             "a local seat is a run like any other"
         );
 
@@ -4681,7 +3543,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|request| !request.prompt.contains("Synthesize"))
+                .filter(|request| !is_synthesis(&request.prompt))
                 .count(),
             1
         );
@@ -4697,9 +3559,9 @@ mod tests {
             Scripted::Answers("second".into()),
         ]
         .into();
-        *runner.stage2.lock().unwrap() = [
-            Scripted::Answers("A: 1".into()),
-            Scripted::Answers("A: 1".into()),
+        *runner.critique.lock().unwrap() = [
+            Scripted::Answers(critique_json(&["A"])),
+            Scripted::Answers(critique_json(&["A"])),
         ]
         .into();
         let state = council_state(runner.clone(), Some(roster(2))).await;
@@ -4716,8 +3578,8 @@ mod tests {
         }
 
         let ranking_or_synthesis = seen.iter().filter(|request| {
-            request.prompt.contains("Rank the anonymous peer")
-                || request.prompt.contains("Synthesize one final")
+            request.prompt.contains(prompts::CRITIQUE_MARKER)
+                || request.prompt.contains(prompts::CHAIRMAN_MARKER)
         });
         for request in ranking_or_synthesis {
             // No tools after phase 1. A seat that could go and find targeted evidence AFTER seeing
@@ -4759,9 +3621,9 @@ mod tests {
             Scripted::Answers(long.clone()),
         ]
         .into();
-        *runner.stage2.lock().unwrap() = [
-            Scripted::Answers("A: 1".into()),
-            Scripted::Answers("A: 1".into()),
+        *runner.critique.lock().unwrap() = [
+            Scripted::Answers(critique_json(&["A"])),
+            Scripted::Answers(critique_json(&["A"])),
         ]
         .into();
         let state = council_state(runner.clone(), Some(roster(2))).await;
@@ -4946,8 +3808,9 @@ mod tests {
         let id = start(&state, "why?", None).await.unwrap();
         // Wait for the first seat to land its answer while the second still hangs.
         for _ in 0..300 {
-            let seats = get_seat_rows(&state.pool, &id).await.unwrap();
-            if seats[0].stage1_status == SEAT_OK {
+            let steps = steps_for(&state, &id).await;
+            if step_at(&steps, 0, 0, store::PHASE_ANSWER).is_some_and(|step| step.status == SEAT_OK)
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -5317,9 +4180,9 @@ mod tests {
             Scripted::Answers("the second answer".into()),
         ]
         .into();
-        *runner.stage2.lock().unwrap() = [
-            Scripted::Answers("A: 1\nB: 2".into()),
-            Scripted::Answers("A: 2\nB: 1".into()),
+        *runner.critique.lock().unwrap() = [
+            Scripted::Answers(critique_json(&["A", "B"])),
+            Scripted::Answers(critique_json(&["B", "A"])),
         ]
         .into();
         let state = council_state(
@@ -5355,14 +4218,20 @@ mod tests {
         settled(&state, &id).await;
 
         let seen = runner.seen.lock().unwrap();
-        assert!(seen.len() >= 5, "two phase-1, two phase-2 and a chairman");
+        assert!(seen.len() >= 5, "two answers, two critiques and a chairman");
         for request in seen.iter() {
+            // The chairman is the one reader the anonymity ends for, on purpose: it is told who
+            // said what (`prompts::chairman_prompt`). Every SEAT prompt is held to the rule.
+            let names_allowed = is_synthesis(&request.prompt);
             for forbidden in [
                 "Cetico",
                 "Economista",
                 "doubts the premise",
                 "counts the money",
             ] {
+                if names_allowed && (forbidden == "Cetico" || forbidden == "Economista") {
+                    continue;
+                }
                 assert!(
                     !request.prompt.contains(forbidden),
                     "`{forbidden}` reached a seat's prompt:\n{}",
@@ -5895,15 +4764,17 @@ mod tests {
 
         let seats = get_seat_rows(&state.pool, &id).await.unwrap();
         assert_eq!(seats.len(), 1);
+        let steps = steps_for(&state, &id).await;
+        let answered = step_at(&steps, 0, 0, store::PHASE_ANSWER).expect("the seat has a step");
         assert_eq!(
-            seats[0].stage1_status, SEAT_OK,
+            answered.status, SEAT_OK,
             "the local seat did not answer: {:?}",
-            seats[0].stage1_error
+            answered.error
         );
         let answer: Option<String> = sqlx::query_scalar("SELECT stdout FROM runs WHERE id = ?")
             .bind(
-                seats[0]
-                    .stage1_run_id
+                answered
+                    .run_id
                     .expect("a local seat lands a run row like any other"),
             )
             .fetch_one(&state.pool)
@@ -6020,15 +4891,17 @@ mod tests {
 
         let seats = get_seat_rows(&state.pool, &id).await.unwrap();
         assert_eq!(seats.len(), 1);
+        let steps = steps_for(&state, &id).await;
+        let answered = step_at(&steps, 0, 0, store::PHASE_ANSWER).expect("the seat has a step");
         assert_eq!(
-            seats[0].stage1_status, SEAT_OK,
+            answered.status, SEAT_OK,
             "the real server refused the seat: {:?}",
-            seats[0].stage1_error
+            answered.error
         );
         let answer: Option<String> = sqlx::query_scalar("SELECT stdout FROM runs WHERE id = ?")
             .bind(
-                seats[0]
-                    .stage1_run_id
+                answered
+                    .run_id
                     .expect("a local seat lands a run row like any other"),
             )
             .fetch_one(&state.pool)
@@ -6268,14 +5141,15 @@ mod tests {
         let pool = &state.pool;
         bare_council(pool, "c1", 3, 2).await;
         set_anon_map(pool, "c1", &abc()).await.unwrap();
-        // A stale legacy leaderboard that contradicts the ballots: the view must not serve it.
-        sqlx::query(
-            "UPDATE council_runs SET leaderboard = '[{\"seat_idx\":2,\"avg_rank\":1.0,\"votes\":9}]'
-              WHERE id = 'c1'",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
+        // The legacy `leaderboard` column is gone (0154 drops it), so there is no stale copy left
+        // for the view to serve by mistake: the ballots below are the only source.
+        assert!(
+            sqlx::query("SELECT leaderboard FROM council_runs WHERE id = 'c1'")
+                .fetch_optional(pool)
+                .await
+                .is_err(),
+            "council_runs.leaderboard must no longer exist"
+        );
 
         let round_one: &[(usize, &[&str])] = &[(0, &["C", "B"]), (1, &["C", "A"])];
         let round_two: &[(usize, &[&str])] =
@@ -6670,5 +5544,606 @@ mod tests {
         let row = get_council_row(pool, "silent").await.unwrap().unwrap();
         assert_eq!(synthesis_of(pool, &row).await, None);
         assert_eq!(view_of(&state, "silent").await.synthesis, None);
+    }
+
+    // ---- P6: the round driver — answer, critique, structured chairman ----
+    //
+    // Written first (RED). The driver these bind to: `start_with(state, question, roster, rounds,
+    // roles)`, one `council_rounds` step per (seat, round, phase) written through `store`, the
+    // chairman's synthesis parsed and validated with ONE retry, and cancel/reconcile settling the
+    // steps as well as the council.
+
+    /// Every step of a council, as stored.
+    async fn steps_for(state: &crate::state::AppState, id: &str) -> Vec<store::StepRow> {
+        store::steps_of(&state.pool, id).await.unwrap()
+    }
+
+    /// The step of `seat_idx` at (`round`, `phase`), if one was written.
+    fn step_at<'a>(
+        steps: &'a [store::StepRow],
+        seat_idx: i64,
+        round: i64,
+        phase: &str,
+    ) -> Option<&'a store::StepRow> {
+        steps
+            .iter()
+            .find(|step| step.seat_idx == seat_idx && step.round == round && step.phase == phase)
+    }
+
+    /// A chairman reply that parses AND validates at any agreement level: it states a minority,
+    /// so the "a dissent may be absent only when strong or insufficient" rule never refuses it.
+    fn synthesis_reply(answer: &str) -> String {
+        format!(
+            "```json\n{}\n```",
+            serde_json::json!({
+                "answer": answer,
+                "consensus": ["the point everybody made"],
+                "disagreements": [],
+                "minority": "the view one seat held alone",
+                "confidence": { "level": "moderate", "why": "two of three agreed" },
+                "open_questions": [],
+            })
+        )
+    }
+
+    /// The prompts that carry `marker`, in the order they were sent.
+    fn prompts_with(runner: &ScriptedRunner, marker: &str) -> Vec<String> {
+        prompts(runner)
+            .into_iter()
+            .filter(|prompt| prompt.contains(marker))
+            .collect()
+    }
+
+    fn roles(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(seat, role)| (seat.to_string(), role.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn driver_one_round_answers_critiques_and_synthesises() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("answer zero".into()),
+            Scripted::Answers("answer one".into()),
+            Scripted::Answers("answer two".into()),
+        ]
+        .into();
+        // Each seat ranks every label; `parse_critique` keeps only the two it was shown.
+        *runner.critique.lock().unwrap() = [
+            Scripted::Answers(critique_json(&["A", "B", "C"])),
+            Scripted::Answers(critique_json(&["A", "B", "C"])),
+            Scripted::Answers(critique_json(&["C", "B", "A"])),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+        assert_eq!(row.rounds_run, 1, "one critique round ran");
+        assert!(!row.stopped_early);
+        assert!(row.chairman_run_id.is_some());
+
+        let steps = steps_for(&state, &id).await;
+        for (seat_idx, text) in ["answer zero", "answer one", "answer two"]
+            .into_iter()
+            .enumerate()
+        {
+            let seat_idx = seat_idx as i64;
+            let answer = step_at(&steps, seat_idx, 0, store::PHASE_ANSWER)
+                .unwrap_or_else(|| panic!("seat {seat_idx} has no answer step: {steps:?}"));
+            assert_eq!(answer.status, SEAT_OK);
+            assert!(answer.run_id.is_some());
+            let payload: serde_json::Value =
+                serde_json::from_str(answer.payload.as_deref().expect("an answer payload"))
+                    .unwrap();
+            assert_eq!(payload, serde_json::json!({ "answer": text }));
+
+            let critique = step_at(&steps, seat_idx, 1, store::PHASE_CRITIQUE)
+                .unwrap_or_else(|| panic!("seat {seat_idx} has no critique step: {steps:?}"));
+            assert_eq!(critique.status, SEAT_OK);
+            assert!(critique.run_id.is_some());
+            let ballot: formats::Critique =
+                serde_json::from_str(critique.payload.as_deref().expect("a critique payload"))
+                    .unwrap();
+            assert_eq!(
+                ballot.ranking.len(),
+                2,
+                "a seat's ballot keeps only the labels it was shown"
+            );
+        }
+        // No revise in this packet, whatever the round count.
+        assert!(steps.iter().all(|step| step.phase != store::PHASE_REVISE));
+
+        // Every critique prompt shows the two peers' answers and never the reader's own.
+        let critiques = prompts_with(&runner, prompts::CRITIQUE_MARKER);
+        assert_eq!(critiques.len(), 3);
+        for prompt in &critiques {
+            let shown = ["answer zero", "answer one", "answer two"]
+                .into_iter()
+                .filter(|answer| prompt.contains(answer))
+                .count();
+            assert_eq!(
+                shown, 2,
+                "a critique must show exactly the peers:\n{prompt}"
+            );
+            assert!(
+                !prompt.contains("model-"),
+                "a critique names no model:\n{prompt}"
+            );
+        }
+
+        // The chairman is told who said what, the tally, and the agreement level.
+        let chairman = prompts_with(&runner, prompts::CHAIRMAN_MARKER);
+        assert_eq!(chairman.len(), 1, "a valid synthesis is not retried");
+        for name in ["model-0", "model-1", "model-2"] {
+            assert!(
+                chairman[0].contains(name),
+                "{name} missing:\n{}",
+                chairman[0]
+            );
+        }
+        assert!(
+            !chairman[0].contains("No ranking could be read out of the critiques."),
+            "three valid ballots make a leaderboard:\n{}",
+            chairman[0]
+        );
+        assert!(chairman[0].contains("Agreement level: "));
+
+        assert_eq!(row.synthesis_status.as_deref(), Some("ok"));
+        let synthesis: formats::Synthesis =
+            serde_json::from_str(row.synthesis_json.as_deref().expect("a synthesis")).unwrap();
+        assert_eq!(synthesis.answer, "the synthesis");
+        assert_eq!(synthesis.degraded_reason, None);
+
+        // Three answers, three critiques, one chairman.
+        assert_eq!(runner.seen.lock().unwrap().len(), 7);
+    }
+
+    #[tokio::test]
+    async fn driver_invalid_critique_is_an_abstention() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("answer zero".into()),
+            Scripted::Answers("answer one".into()),
+            Scripted::Answers("answer two".into()),
+        ]
+        .into();
+        *runner.critique.lock().unwrap() = [
+            Scripted::Answers(critique_json(&["A", "B", "C"])),
+            Scripted::Answers("I would rather not rank anybody.".into()),
+            Scripted::Answers(critique_json(&["C", "B", "A"])),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+
+        // An unreadable critique is one ballot fewer, not a failed council.
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+        assert_eq!(row.synthesis_status.as_deref(), Some("ok"));
+
+        let steps = steps_for(&state, &id).await;
+        let critiques: Vec<&store::StepRow> = steps
+            .iter()
+            .filter(|step| step.phase == store::PHASE_CRITIQUE)
+            .collect();
+        assert_eq!(critiques.len(), 3, "{steps:?}");
+        let invalid: Vec<&&store::StepRow> = critiques
+            .iter()
+            .filter(|step| step.status == store::STEP_INVALID)
+            .collect();
+        assert_eq!(invalid.len(), 1, "{critiques:?}");
+        assert!(
+            invalid[0]
+                .error
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty()),
+            "an invalid step says why it could not be read: {:?}",
+            invalid[0]
+        );
+        // The run itself finished: the step keeps it, so the transcript stays reachable.
+        assert!(invalid[0].run_id.is_some());
+        assert_eq!(
+            critiques
+                .iter()
+                .filter(|step| step.status == SEAT_OK)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_failed_answer_leaves_every_later_phase() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("answer zero".into()),
+            Scripted::Fails("the model refused".into()),
+            Scripted::Answers("answer two".into()),
+        ]
+        .into();
+        *runner.critique.lock().unwrap() = [
+            Scripted::Answers(critique_json(&["A", "B"])),
+            Scripted::Answers(critique_json(&["A", "B"])),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+
+        // The failed seat has its answer step and nothing after it.
+        let steps = steps_for(&state, &id).await;
+        let of_failed: Vec<&store::StepRow> =
+            steps.iter().filter(|step| step.seat_idx == 1).collect();
+        assert_eq!(of_failed.len(), 1, "{of_failed:?}");
+        assert_eq!(of_failed[0].phase, store::PHASE_ANSWER);
+        assert_eq!(of_failed[0].status, SEAT_ERROR);
+
+        // Only the two seats with an answer were asked to critique, and neither was shown a third.
+        let critiques = prompts_with(&runner, prompts::CRITIQUE_MARKER);
+        assert_eq!(critiques.len(), 2);
+        // The chairman reads the final answers, and the failed seat has none.
+        let chairman = prompts_with(&runner, prompts::CHAIRMAN_MARKER);
+        assert_eq!(chairman.len(), 1);
+        assert!(chairman[0].contains("Seat 0 — "), "{}", chairman[0]);
+        assert!(chairman[0].contains("Seat 2 — "), "{}", chairman[0]);
+        assert!(!chairman[0].contains("Seat 1 — "), "{}", chairman[0]);
+    }
+
+    #[tokio::test]
+    async fn driver_chairman_invalid_twice_settles_done_degraded() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("answer zero".into()),
+            Scripted::Answers("answer one".into()),
+        ]
+        .into();
+        *runner.chairman.lock().unwrap() = [
+            Scripted::Answers("first attempt, no JSON at all".into()),
+            Scripted::Answers("second attempt, still prose".into()),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(roster(2))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+
+        // A synthesis that will not parse is shown as it came, not turned into a failed council.
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+        assert_eq!(
+            prompts_with(&runner, prompts::CHAIRMAN_MARKER).len(),
+            2,
+            "retried exactly once"
+        );
+        assert_eq!(row.synthesis_status.as_deref(), Some("degraded"));
+        let synthesis: formats::Synthesis =
+            serde_json::from_str(row.synthesis_json.as_deref().expect("a degraded synthesis"))
+                .unwrap();
+        assert_eq!(synthesis.answer, "second attempt, still prose");
+        assert!(
+            synthesis
+                .degraded_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty()),
+            "{synthesis:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_chairman_retry_carries_the_error() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("answer zero".into()),
+            Scripted::Answers("answer one".into()),
+        ]
+        .into();
+        // Parses, and fails validation: the retry has to carry the VALIDATION error too.
+        *runner.chairman.lock().unwrap() = [
+            Scripted::Answers(synthesis_reply("   ")),
+            Scripted::Answers(synthesis_reply("the second, valid synthesis")),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(roster(2))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+
+        let chairman = prompts_with(&runner, prompts::CHAIRMAN_MARKER);
+        assert_eq!(chairman.len(), 2);
+        assert!(!chairman[0].contains("Your previous synthesis was refused"));
+        assert!(
+            chairman[1].contains("Your previous synthesis was refused"),
+            "{}",
+            chairman[1]
+        );
+        assert!(
+            chairman[1].contains("synthesis has an empty answer"),
+            "the retry names what was wrong:\n{}",
+            chairman[1]
+        );
+        // The same question plus the one fact that changed.
+        assert!(chairman[1].starts_with(chairman[0].as_str()));
+
+        assert_eq!(row.synthesis_status.as_deref(), Some("ok"));
+        let synthesis: formats::Synthesis =
+            serde_json::from_str(row.synthesis_json.as_deref().unwrap()).unwrap();
+        assert_eq!(synthesis.answer, "the second, valid synthesis");
+    }
+
+    #[tokio::test]
+    async fn driver_cancel_marks_pending_steps_cancelled() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [Scripted::Hangs, Scripted::Hangs].into();
+        let mut config = roster(2);
+        config.timeout_seconds = 600;
+        let state = council_state(runner.clone(), Some(config)).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        // Both seats in flight, and each one's step written `pending` with its run beside it —
+        // the run id on the step is what `cancel` terminates by.
+        for _ in 0..300 {
+            let steps = steps_for(&state, &id).await;
+            if state.run_handles.lock().unwrap().len() == 2
+                && steps.len() == 2
+                && steps.iter().all(|step| step.run_id.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let in_flight = steps_for(&state, &id).await;
+        assert_eq!(in_flight.len(), 2, "{in_flight:?}");
+        for step in &in_flight {
+            assert_eq!(step.phase, store::PHASE_ANSWER);
+            assert_eq!(step.status, SEAT_PENDING, "{step:?}");
+            assert!(step.run_id.is_some(), "{step:?}");
+        }
+
+        assert!(cancel(&state, &id).await.unwrap());
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_CANCELLED);
+
+        // Settled however the seats' own futures unwind: never `error`, never left `pending`.
+        let mut steps = Vec::new();
+        for _ in 0..300 {
+            steps = steps_for(&state, &id).await;
+            if steps.iter().all(|step| step.status == SEAT_CANCELLED) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for step in &steps {
+            assert_eq!(step.status, SEAT_CANCELLED, "{step:?}");
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(step.run_id.unwrap())
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            assert_eq!(status, "cancelled", "the step's run was terminated");
+        }
+        assert!(prompts_with(&runner, prompts::CRITIQUE_MARKER).is_empty());
+        assert!(prompts_with(&runner, prompts::CHAIRMAN_MARKER).is_empty());
+    }
+
+    #[tokio::test]
+    async fn driver_reconcile_errors_orphan_pending_steps() {
+        let pool = test_pool().await;
+        insert_council(
+            &pool,
+            "c1",
+            "why?",
+            &seat(SeatKind::Cloud, "m"),
+            &[seat(SeatKind::Cloud, "m"), seat(SeatKind::Cloud, "m")],
+            1,
+        )
+        .await
+        .unwrap();
+        // A crash in the middle of the answers: one seat had finished, one had not.
+        store::upsert_step(
+            &pool,
+            "c1",
+            0,
+            0,
+            store::PHASE_ANSWER,
+            Some(1),
+            SEAT_OK,
+            None,
+            Some(r#"{"answer":"done"}"#),
+        )
+        .await
+        .unwrap();
+        store::upsert_step(
+            &pool,
+            "c1",
+            0,
+            1,
+            store::PHASE_ANSWER,
+            Some(2),
+            SEAT_PENDING,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        reconcile(&pool).await.unwrap();
+
+        assert_eq!(
+            get_council_row(&pool, "c1").await.unwrap().unwrap().status,
+            STATUS_ERROR
+        );
+        let steps = store::steps_of(&pool, "c1").await.unwrap();
+        let finished = step_at(&steps, 0, 0, store::PHASE_ANSWER).unwrap();
+        assert_eq!(
+            finished.status, SEAT_OK,
+            "a finished step keeps how it ended"
+        );
+        let orphan = step_at(&steps, 1, 0, store::PHASE_ANSWER).unwrap();
+        assert_eq!(
+            orphan.status, SEAT_ERROR,
+            "nothing will ever finish this step"
+        );
+        assert!(orphan.error.is_some());
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn driver_start_refuses_unknown_role_and_out_of_roster_seat() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        let state = council_state(runner.clone(), Some(roster(2))).await;
+
+        for (pairs, what) in [
+            (roles(&[("0", "jester")]), "a role outside the closed set"),
+            (roles(&[("0", "Skeptic")]), "a role is case-sensitive"),
+            (roles(&[("2", "skeptic")]), "a seat past the roster"),
+            (
+                roles(&[("seat-0", "skeptic")]),
+                "a key that is not a seat index",
+            ),
+            (roles(&[("-1", "skeptic")]), "a negative seat"),
+        ] {
+            match start_with(&state, "why?", None, None, pairs).await {
+                Err(StartError::Invalid(reason)) => {
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "{what}: refused without a reason"
+                    )
+                }
+                other => panic!("{what}: expected Invalid, got {other:?}"),
+            }
+        }
+
+        // Refused before anything was written or spent.
+        assert!(
+            list_council_rows(&state.pool, 10, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(runner.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn driver_start_refuses_rounds_outside_one_to_three() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        let state = council_state(runner.clone(), Some(roster(2))).await;
+
+        for rounds in [0, crate::config::MAX_COUNCIL_ROUNDS + 1, 99] {
+            match start_with(&state, "why?", None, Some(rounds), BTreeMap::new()).await {
+                Err(StartError::Invalid(reason)) => {
+                    assert!(!reason.trim().is_empty(), "rounds {rounds}")
+                }
+                other => panic!("rounds {rounds}: expected Invalid, got {other:?}"),
+            }
+        }
+        assert!(
+            list_council_rows(&state.pool, 10, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(runner.seen.lock().unwrap().is_empty());
+
+        // The request's count, when valid, is the one the council records — not the file's.
+        let id = start_with(
+            &state,
+            "why?",
+            None,
+            Some(crate::config::MAX_COUNCIL_ROUNDS),
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.rounds, i64::from(crate::config::MAX_COUNCIL_ROUNDS));
+
+        // No count asked for: the file's.
+        let id = start_with(&state, "why?", None, None, BTreeMap::new())
+            .await
+            .unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.rounds, i64::from(crate::config::DEFAULT_COUNCIL_ROUNDS));
+    }
+
+    #[tokio::test]
+    async fn driver_roles_reach_every_phase_of_their_seat() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("answer zero".into()),
+            Scripted::Answers("answer one".into()),
+        ]
+        .into();
+        *runner.critique.lock().unwrap() = [
+            Scripted::Answers(critique_json(&["A", "B"])),
+            Scripted::Answers(critique_json(&["A", "B"])),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(roster(2))).await;
+
+        let id = start_with(&state, "why?", None, None, roles(&[("1", "skeptic")]))
+            .await
+            .unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+
+        // Recorded on the seat, and only on that seat.
+        let seats = get_seat_rows(&state.pool, &id).await.unwrap();
+        assert_eq!(seats[0].role, None);
+        assert_eq!(seats[1].role.as_deref(), Some("skeptic"));
+
+        let paragraph = formats::Role::Skeptic.paragraph();
+        let sent = prompts(&runner);
+        // The answer phase: the role in front of the question for seat 1, nothing for seat 0.
+        let answers: Vec<&String> = sent
+            .iter()
+            .filter(|prompt| {
+                !prompt.contains(prompts::CRITIQUE_MARKER)
+                    && !prompt.contains(prompts::CHAIRMAN_MARKER)
+            })
+            .collect();
+        assert_eq!(answers.len(), 2);
+        assert!(answers.iter().any(|prompt| prompt.as_str() == "why?"));
+        assert!(
+            answers
+                .iter()
+                .any(|prompt| prompt.as_str() == format!("{paragraph}\n\nwhy?")),
+            "{answers:?}"
+        );
+        // The critique phase: the same seat critiques in the same role.
+        let critiques = prompts_with(&runner, prompts::CRITIQUE_MARKER);
+        assert_eq!(critiques.len(), 2);
+        assert_eq!(
+            critiques
+                .iter()
+                .filter(|prompt| prompt.starts_with(paragraph))
+                .count(),
+            1,
+            "{critiques:?}"
+        );
+        assert_eq!(
+            critiques
+                .iter()
+                .filter(|prompt| prompt.contains(paragraph))
+                .count(),
+            1,
+            "a role is its own seat's, never shown to a peer"
+        );
+        // The chairman is told which seat played which part.
+        let chairman = prompts_with(&runner, prompts::CHAIRMAN_MARKER);
+        assert_eq!(chairman.len(), 1);
+        assert!(
+            chairman[0].contains("Seat 1 — model-1, skeptic"),
+            "{}",
+            chairman[0]
+        );
+        assert!(!chairman[0].contains(paragraph));
     }
 }

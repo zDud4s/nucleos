@@ -7,13 +7,11 @@
 -- make room. A council of N rounds would need 3N columns decided at schema time; a row per step
 -- needs none, and the number of rounds becomes data — which is what it is.
 --
--- ADDITIVE ONLY. Nothing is dropped here: the old `stage1_*`, `stage2_*`, `rankings`, `revision_*`
--- columns and `council_runs.stage` stay, and the setters that write them also write the new table
--- until every reader has moved over. The drops come later, appended to this file before it lands,
--- once nothing reads the old shape. Until then both shapes are written and the new one is authoritative
--- for nobody yet.
+-- The old `stage1_*`, `stage2_*`, `rankings`, `revision_*` columns and `council_runs.leaderboard`
+-- are copied into the new shape first and DROPPED at the end of this file, once the copy is done:
+-- nothing reads the old shape any more.
 --
--- `council_runs.stage` is kept DELIBERATELY, beyond that transition: `job.rs` and `hooks.rs` tests
+-- `council_runs.stage` is kept DELIBERATELY: `job.rs` and `hooks.rs` tests
 -- insert council rows that name it, and a column their fixtures write is not this migration's to
 -- take away.
 --
@@ -133,3 +131,22 @@ UPDATE council_runs
            WHEN stage = 3 AND rounds >= 2 THEN 'revise'
            ELSE 'chairman'
        END;
+
+-- The drops, now that nothing reads the old shape: every step lives in `council_rounds`, and the
+-- leaderboard is computed from the stored ballots when a council is read (`tally::borda`) rather
+-- than kept as a copy that could drift from them. After the copy above, in the same file, so no
+-- database ever runs a version of this migration that drops a column before copying it.
+--
+-- `council_runs.stage` is NOT dropped, for the reason given at the top. `council_seats.kind`,
+-- `model_ref`, `agent_id` and `role` stay — they are who the seat is, not what it did.
+ALTER TABLE council_seats DROP COLUMN stage1_run_id;
+ALTER TABLE council_seats DROP COLUMN stage1_status;
+ALTER TABLE council_seats DROP COLUMN stage1_error;
+ALTER TABLE council_seats DROP COLUMN stage2_run_id;
+ALTER TABLE council_seats DROP COLUMN stage2_status;
+ALTER TABLE council_seats DROP COLUMN stage2_error;
+ALTER TABLE council_seats DROP COLUMN rankings;
+ALTER TABLE council_seats DROP COLUMN revision_run_id;
+ALTER TABLE council_seats DROP COLUMN revision_status;
+ALTER TABLE council_seats DROP COLUMN revision_error;
+ALTER TABLE council_runs DROP COLUMN leaderboard;

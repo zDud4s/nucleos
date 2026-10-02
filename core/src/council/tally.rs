@@ -5,11 +5,6 @@
 //! spec (2026-10-02, §2) states as a number is pinned by a test that runs in microseconds, and the
 //! orchestration that calls it cannot quietly bend one.
 
-// Not wired into the council's run loop yet; P6 of council-deliberacao calls these and removes
-// this line. Without it every item below is dead code and clippy refuses the gate. Unconditional
-// rather than `cfg_attr(not(test), ..)`: `contested` has no test of its own in this packet, so it
-// is dead under `cfg(test)` too.
-#![allow(dead_code)]
 // The call-ceiling test spells its sums term by term — `3 + 3 + 0 + 2` reads as "N answers, R
 // rankings, R-1 revisions, chairman and retry" — and the `+ 0` is the zero revisions of one round.
 // Clippy calls that a no-op; here it is the arithmetic being documented.
@@ -223,6 +218,7 @@ pub fn agreement(
 ///
 /// A label that names no seat, or the critic's own, is ignored for the same reason `borda`
 /// ignores it: the critic was never shown it.
+#[allow(dead_code)] // Read by the early-stop rule of the revise rounds, council-deliberacao P7.
 pub fn contested(
     critiques: &BTreeMap<usize, Vec<(String, bool)>>,
     anon_map: &BTreeMap<String, usize>,
@@ -241,6 +237,7 @@ pub fn contested(
 /// Another round is worth paying for only if it could change something. Stop when the Borda
 /// order did not move AND no answer is disputed now that was not disputed before — a dispute that
 /// settled is no reason to go on.
+#[allow(dead_code)] // Asked between revise rounds, council-deliberacao P7.
 pub fn should_stop_early(
     prev_order: &[usize],
     prev_contested: &BTreeSet<usize>,
@@ -252,6 +249,7 @@ pub fn should_stop_early(
 
 /// The most runner calls a council of `members` seats over `rounds` rounds can make: N answers,
 /// R rankings of N, R-1 revisions of N, one chairman and one chairman retry.
+#[allow(dead_code)] // No caller until the revise rounds land, council-deliberacao P7.
 pub fn call_ceiling(members: usize, rounds: u32) -> usize {
     let rounds = rounds as usize;
     members + rounds * members + rounds.saturating_sub(1) * members + 2

@@ -4,11 +4,6 @@
 //! Pure on purpose: strings in, string out. What a seat may see in each phase is the whole of the
 //! anonymity guarantee, so it is decided here, where a test can read it, and not at the call site.
 
-// Not wired into the council's run loop yet; a later packet of council-deliberacao calls these and
-// removes this line. Unconditional for the same reason as in `formats`: some items are exercised
-// by no test of their own.
-#![allow(dead_code)]
-
 use crate::council::formats::{Point, Role, Stance};
 
 /// The sentence every critique prompt carries verbatim. A test runner that stands in for a seat
@@ -88,6 +83,7 @@ fn stance_word(stance: Stance) -> &'static str {
 /// placed would revise towards the winner rather than towards the argument, and a label would tell
 /// it which one it was — exactly what the critique phase withheld. A test holds the text below to
 /// that, down to never using the word for an ordering.
+#[allow(dead_code)] // Sent by the revise phase, council-deliberacao P7.
 pub fn revise_prompt(
     question: &str,
     role: Option<Role>,

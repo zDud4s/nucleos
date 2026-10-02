@@ -5,11 +5,6 @@
 //! parser refuses what it cannot vouch for instead of repairing it — a guessed repair would put
 //! words in a seat's mouth that the seat never said.
 
-// Not wired into the council's run loop yet; a later packet of council-deliberacao calls these and
-// removes this line. Unconditional because some items are exercised by no test of their own, so
-// they are dead under `cfg(test)` as well.
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -93,6 +88,8 @@ pub struct Critique {
     pub ranking: Vec<String>,
 }
 
+// The revise phase that reads these lands in the next packet of council-deliberacao (P7).
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Revision {
     #[serde(default)]
@@ -155,8 +152,8 @@ fn blank(s: &Option<String>) -> bool {
     s.as_deref().is_none_or(|s| s.trim().is_empty())
 }
 
-/// A critique, with everything about a label the seat was never shown thrown away — the same rule
-/// `council::parse_rankings` applies, since a ballot for an answer nobody saw is made up.
+/// A critique, with everything about a label the seat was never shown thrown away, since a ballot
+/// for an answer nobody saw is made up.
 /// A label ranked twice is refused outright rather than deduplicated: which of the two positions
 /// the seat meant is not something to guess.
 pub fn parse_critique(text: &str, shown: &[String]) -> Result<Critique, String> {
@@ -175,6 +172,7 @@ pub fn parse_critique(text: &str, shown: &[String]) -> Result<Critique, String> 
 
 /// A revision. Claiming a change requires saying what changed and why; an unchanged revision's
 /// answer is dropped, because the seat's earlier answer is the one that stands.
+#[allow(dead_code)] // Called by the revise phase, council-deliberacao P7.
 pub fn parse_revision(text: &str) -> Result<Revision, String> {
     let mut revision: Revision = serde_json::from_str(extract_json(text))
         .map_err(|e| format!("revision did not parse: {e}"))?;
