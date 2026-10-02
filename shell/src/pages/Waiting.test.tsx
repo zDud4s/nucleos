@@ -161,6 +161,12 @@ interface WaitingWorld {
   skipped: Proposal[];
   refused: Proposal[];
   vcs: VcsRequestSummary[];
+  /**
+   * What `GET /waiting/git` answers. Left out, it is the escalated and blocked rows of `vcs` — the
+   * two lists agree unless a test is about the one place they differ: the history listing is capped
+   * and permanent, the waiting listing is neither.
+   */
+  vcsWaiting?: VcsRequestSummary[];
   parked: AwaitingRun[];
   /** What `POST /proposals/{id}/approve` answers — thrown if it is an `Error`. */
   approveAnswer: unknown;
@@ -199,6 +205,8 @@ function waitingWorld(overrides: Partial<WaitingWorld> = {}): WaitingWorld {
  * read it once and sorted by `kind` would show an empty queue for six of the
  * nine sections that exist.
  */
+const VCS_WANTS_A_PERSON = ["escalated", "blocked"];
+
 function waitingFetch(state: WaitingWorld): (path: string, init?: RequestInit) => Promise<unknown> {
   const shared = daemonFetch(daemonState());
   return async (path, init) => {
@@ -232,6 +240,8 @@ function waitingFetch(state: WaitingWorld): (path: string, init?: RequestInit) =
         return state.refused;
       case "/vcs/requests":
         return state.vcs;
+      case "/waiting/git":
+        return state.vcsWaiting ?? state.vcs.filter((row) => VCS_WANTS_A_PERSON.includes(row.status));
       case "/runs/awaiting-approval":
         return state.parked;
       default:
@@ -313,6 +323,7 @@ describe("Waiting - each section reads the route that serves it", () => {
       "/proposals/skipped-items",
       "/proposals/refused-actions",
       "/vcs/requests",
+      "/waiting/git",
       "/runs/awaiting-approval",
     ]) {
       expect(daemon.apiFetch).toHaveBeenCalledWith(path);
@@ -375,6 +386,44 @@ describe("Waiting - git requests", () => {
     // the card, for the one sentence on it that is asking somebody to do something.
     expect(within(row).getByText(/alpha:main/).textContent).not.toContain("submit it again");
     expect(within(row).getByText("submit it again").className).toBe("waiting-hint");
+  });
+
+  it("the git section waits on /waiting/git, not on the history's escalations", async () => {
+    // The history listing still holds an old escalation that something else has since settled, and
+    // the one row that really wants a person is older than that listing's window — so it is not in
+    // it at all. Only a page reading `/waiting/git` can get both of those right.
+    const world = waitingWorld({
+      vcs: [vcsRow({ id: 61, status: "escalated" })],
+      vcsWaiting: [vcsRow({ id: 62, status: "escalated" })],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    const list = await screen.findByRole("list", { name: "Git requests waiting on you" });
+    expect(await within(list).findByText("push #62")).toBeDefined();
+    expect(within(list).queryByText("push #61")).toBeNull();
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/waiting/git");
+  });
+
+  it("a git row waiting on you can be dismissed", async () => {
+    const world = waitingWorld({ vcsWaiting: [vcsRow({ id: 62, status: "escalated" })] });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Put push #62 away" }));
+
+    // Two clicks, and the second may land inside the dwell and be swallowed, so it is retried until
+    // the control disarms — the same way the skipped item's dismissal is driven above.
+    await waitFor(() => {
+      const armed = screen.queryByRole("button", { name: "Nobody needs to act · #62" });
+      if (armed !== null) fireEvent.click(armed);
+      expect(screen.queryByRole("button", { name: "Nobody needs to act · #62" })).toBeNull();
+    });
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/vcs/requests/62/dismiss", { method: "POST" });
+    });
   });
 });
 

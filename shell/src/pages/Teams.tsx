@@ -21,6 +21,7 @@ import {
   Button,
   ErrorNote,
   Meter,
+  Modal,
   PageHeader,
   Panel,
   Quiet,
@@ -33,6 +34,8 @@ import {
   usd,
 } from "../ui";
 import "./teams.css";
+
+const NEW_TEAM_FORM = "new-team-form";
 
 /**
  * Teams — the console. `/teams` and nothing else; `/teams/$teamId` is the bench
@@ -91,6 +94,7 @@ export function Teams() {
   const triggers = useTeamTriggers();
   const actions = useOpenTeamActions();
   const [creating, setCreating] = useState(false);
+  const [formState, setFormState] = useState({ canSubmit: false, busy: false });
 
   const rows = teams.data ?? [];
   const allRuns = runs.data ?? [];
@@ -104,8 +108,8 @@ export function Teams() {
         title="Teams"
         headline={headlineFor(rows, allRuns, openActions, teams.data !== undefined)}
         actions={
-          <Button intent="go" onClick={() => setCreating((open) => !open)} aria-expanded={creating}>
-            {creating ? "Close" : "New team"}
+          <Button intent="go" onClick={() => setCreating(true)} aria-haspopup="dialog">
+            New team
           </Button>
         }
       />
@@ -113,15 +117,34 @@ export function Teams() {
       {stale && <StaleNote dataUpdatedAt={teams.dataUpdatedAt} />}
       {teams.isError && teams.data === undefined && <ListError error={teams.error} />}
 
-      {/* Closed by default, and that is the point: the old page opened an
-          eleven-field form above a list you had not read yet. */}
-      {creating && (
-        <Panel title="New team">
-          {/* The very form the Charter tab is, minus the drift guard — there is
-              nothing to have drifted from yet. One editor, one place. */}
-          <NewDepartment />
-        </Panel>
-      )}
+      {/* A dialog over the page rather than a panel above the list: the eleven-field form
+          used to shove a list nobody had read yet down the screen. Creating navigates to
+          the new team's bench, which unmounts this page and with it the dialog. */}
+      <Modal
+        open={creating}
+        onOpenChange={setCreating}
+        title="New team"
+        size="md"
+        footer={
+          <>
+            <Button onClick={() => setCreating(false)}>Cancel</Button>
+            <Button
+              type="submit"
+              form={NEW_TEAM_FORM}
+              intent="go"
+              disabled={!formState.canSubmit || formState.busy}
+            >
+              {formState.busy ? "Creating…" : "Create team"}
+            </Button>
+          </>
+        }
+      >
+        {/* The very form the Charter tab is, minus the drift guard — there is
+            nothing to have drifted from yet. One editor, one place. Its submit
+            lives in the footer (`form=` points back at it), so it stays put while
+            the body scrolls; errors and refusals stay in the body. */}
+        <NewDepartment dialog={{ formId: NEW_TEAM_FORM, onState: setFormState }} />
+      </Modal>
 
       {rows.length === 0 ? (
         <Teach title="No team yet">
