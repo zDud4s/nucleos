@@ -205,6 +205,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            files_trash: None,
             workflow_library: None,
             machine_config_root: Some(home.path().to_path_buf()),
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),

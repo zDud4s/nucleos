@@ -2119,6 +2119,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            files_trash: None,
             email: Arc::new(crate::state::EmailRuntime::default()),
             voice: Arc::new(voice),
             browser: Arc::new(crate::browser::BrowserRuntime::disabled()),

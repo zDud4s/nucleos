@@ -624,6 +624,7 @@ mod tests {
             run_tails: Default::default(),
             // No files folder: nothing on the wheel's path reads or writes one.
             files_root: None,
+            files_trash: None,
             workflow_library: None,
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),

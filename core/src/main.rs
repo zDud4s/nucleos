@@ -1260,6 +1260,31 @@ async fn main() {
             None
         }
     };
+    // Where a delete from that folder goes instead of being destroyed — beside the root and never
+    // in it (`files::trash_for`). The retention sweep runs here once, off the startup path because
+    // an expired folder can be a large tree, and again on every delete; nothing else keeps a timer
+    // for it. `None` means a delete refuses rather than removing for good.
+    let files_trash = match files::ensure_trash(dirs.data_local_dir()) {
+        Ok(trash) => {
+            let sweep = trash.clone();
+            tokio::task::spawn_blocking(move || {
+                match files::purge(&sweep, files::TRASH_RETENTION) {
+                    Ok(0) => {}
+                    Ok(removed) => {
+                        tracing::info!(removed, "cleared expired entries from the files trash")
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not clear expired entries from the files trash")
+                    }
+                }
+            });
+            Some(trash)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not create the files trash — deleting from the Files tab will be unavailable");
+            None
+        }
+    };
 
     let voice_config = machine_file(machine_config::VOICE_FILE)
         .as_deref()
@@ -1664,6 +1689,7 @@ async fn main() {
         local_triage_disabled,
         assistants,
         files_root,
+        files_trash,
         // `None` when this machine has no home directory to hang a library off. Resolved here and
         // not per request, like `files_root` above: it is a fact about the machine.
         workflow_library: seeded_library(),

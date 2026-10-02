@@ -9,6 +9,10 @@
 //! were chosen by whoever sent the mail an attachment was filed from, and are later read by an
 //! agent. That a person now also uploads their own files here changes who picked the name, never
 //! the rule: this folder is arranged through this module or not at all.
+//!
+//! Deleting moves into a trash that lives BESIDE the root, never in it (see [`trash_for`]), so no
+//! route over the root can reach what was deleted and the only way back in is [`restore`] — which
+//! puts the recorded path through [`resolve_within`] like any other.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -356,47 +360,389 @@ pub fn resolve_file(root: &Path, relative: &str) -> Result<PathBuf, PathError> {
     Ok(target)
 }
 
-/// Removes a file, or a directory the caller has said out loud it wants gone with its contents.
+/// Where deleted things wait, beside the root and never inside it.
 ///
-/// The two-step for a full directory is the whole point: `remove_dir_all` on a mistyped path is the
-/// one action here nobody can undo, and this folder holds attachments that exist nowhere else once
-/// the mail body they came from has expired. An empty directory goes without ceremony — there is
-/// nothing to lose — and a full one is refused until the caller repeats itself with `recursive`.
-pub fn delete(root: &Path, relative: &str, recursive: bool) -> Result<(), PathError> {
+/// A sibling rather than a hidden folder under the root, and that choice is the whole security
+/// argument for the trash: every route over the root reaches whatever [`resolve_within`] lets it,
+/// so a trash inside the root would be listed, searched, downloaded and moved like anything else —
+/// and a `move` OUT of it would be a restore that skipped every check [`restore`] makes. Outside the
+/// root, the only doors to it are the functions below that take it by name.
+pub fn trash_for(data_local_dir: &Path) -> PathBuf {
+    data_local_dir.join("files-trash")
+}
+
+/// Creates the trash if it is missing, and returns it canonicalised — once, at startup, for the
+/// reason [`ensure_root`] gives: the root was canonicalised the same way, and a rename between a
+/// resolved path and an unresolved one is how the two stop agreeing about where they are.
+pub fn ensure_trash(data_local_dir: &Path) -> std::io::Result<PathBuf> {
+    let trash = trash_for(data_local_dir);
+    std::fs::create_dir_all(&trash)?;
+    std::fs::canonicalize(&trash)
+}
+
+/// How long something deleted can still be brought back.
+///
+/// Thirty days because it is the window a person already knows: the mail this folder files
+/// attachments from expires on the same clock, and every mainstream "recently deleted" uses it, so
+/// nobody has to learn a second number. Past it an entry is removed for good — at startup and on
+/// every delete, which bounds the trash by the rate things are deleted rather than by a timer the
+/// daemon would have to keep alive.
+pub const TRASH_RETENTION: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// What a delete put in the trash — the answer to "what can I undo", and one row of the "Recently
+/// deleted" list.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Trashed {
+    /// The handle a restore names. Opaque to the caller, and checked character by character before
+    /// it goes anywhere near a path — see [`valid_trash_id`].
+    pub id: String,
+    /// Where it was, relative to the root with forward slashes: the path a restore puts it back at.
+    pub path: String,
+    pub is_dir: bool,
+    /// For a folder, everything under it — the one number a person weighing "do I want this back"
+    /// cannot see any other way. A lower bound past [`SEARCH_VISITS`] entries, where the walk stops.
+    pub size_bytes: i64,
+    /// RFC 3339 UTC, to the millisecond.
+    pub deleted_at: String,
+}
+
+/// The record kept beside each trashed item, as `origin.json`. [`Trashed`] minus the id, because
+/// the id is the entry's own directory name and a second copy of it could only disagree with it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Origin {
+    path: String,
+    deleted_at: String,
+    is_dir: bool,
+    size_bytes: i64,
+}
+
+/// The record's name inside an entry.
+const ORIGIN_FILE: &str = "origin.json";
+
+/// The folder the item itself goes into, inside its entry.
+///
+/// A subfolder and not the entry itself, because a person can delete a file called `origin.json`:
+/// placed beside the record under its own name it would overwrite it, or be overwritten by it. Kept
+/// under its ORIGINAL name inside this folder rather than renamed to something opaque, so that a
+/// person looking at the trash by hand — the recovery of last resort — sees what each entry is.
+const ITEM_DIR: &str = "item";
+
+/// `yyyymmddThhmmssmmm`, then `-` and eight hex digits: 27 characters, all of them ASCII, all of
+/// them legal in a filename everywhere, and fixed-width so that sorting ids sorts time.
+const TRASH_ID_STAMP: usize = 18;
+const TRASH_ID_LEN: usize = TRASH_ID_STAMP + 1 + 8;
+
+/// Makes the suffix of an id unique within a millisecond in this process. The directory is created
+/// with `create_dir`, which fails rather than reuses, so this counter is what makes a collision
+/// rare and the filesystem is what makes one harmless — two daemons, or a counter that wrapped,
+/// simply try the next number.
+static TRASH_SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether `id` is one this module could have made. Strict on purpose: it is the only thing a
+/// restore joins onto the trash path, and a whitelist of the exact shape is the rule
+/// [`resolve_within`] applies to paths — anything that is not certainly an id is refused, so `..`,
+/// a separator or a drive letter never reaches a `join`.
+fn valid_trash_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() == TRASH_ID_LEN
+        && bytes[..8].iter().all(u8::is_ascii_digit)
+        && bytes[8] == b'T'
+        && bytes[9..TRASH_ID_STAMP].iter().all(u8::is_ascii_digit)
+        && bytes[TRASH_ID_STAMP] == b'-'
+        && bytes[TRASH_ID_STAMP + 1..]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
+/// When an entry was made, read off its NAME rather than its record: the name is the one thing a
+/// half-written entry is guaranteed to have, so dating by it is what lets a purge clear an entry
+/// whose record never landed instead of keeping it forever.
+fn trash_id_time(id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if !valid_trash_id(id) {
+        return None;
+    }
+    chrono::NaiveDateTime::parse_from_str(&id[..TRASH_ID_STAMP], "%Y%m%dT%H%M%S%3f")
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
+/// Creates a fresh, empty entry in the trash and returns its id and path.
+fn new_trash_entry(
+    trash: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(String, PathBuf), PathError> {
+    let stamp = now.format("%Y%m%dT%H%M%S%3f").to_string();
+    // Bounded, because the only way to exhaust it is a trash where every attempt collides, and
+    // that should surface as the error it is rather than as a loop.
+    let mut last_error = None;
+    for _ in 0..16 {
+        let sequence = TRASH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("{stamp}-{sequence:08x}");
+        let entry = trash.join(&id);
+        match std::fs::create_dir(&entry) {
+            Ok(()) => return Ok((id, entry)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(PathError::Io(error.to_string())),
+        }
+    }
+    Err(PathError::Io(last_error.map_or_else(
+        || "no free trash id".to_string(),
+        |e| e.to_string(),
+    )))
+}
+
+/// How many bytes a trashed item holds. A folder is walked — never through a symlink, for the
+/// cycle [`search`] names — and the walk is capped like a search's, because it runs on the delete
+/// path and a folder of a million files should not make "delete" slow to answer.
+fn size_of(target: &Path, metadata: &std::fs::Metadata) -> i64 {
+    if metadata.is_symlink() {
+        return 0;
+    }
+    if !metadata.is_dir() {
+        return metadata.len() as i64;
+    }
+    let mut total = 0i64;
+    let mut visits = 0usize;
+    let mut pending = vec![target.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(reader) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for item in reader.flatten() {
+            visits += 1;
+            if visits > SEARCH_VISITS {
+                return total;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(item.path()) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.push(item.path());
+            } else if !metadata.is_symlink() {
+                total = total.saturating_add(metadata.len() as i64);
+            }
+        }
+    }
+    total
+}
+
+/// Moves a file, or a directory the caller has said out loud it wants gone with its contents, into
+/// the trash — and says what it moved, so the caller can offer to undo it.
+///
+/// It used to remove, and nothing could bring a mistake back: this folder holds attachments that
+/// exist nowhere else once the mail body they came from has expired. A rename into a sibling
+/// directory costs the same as a removal and buys [`TRASH_RETENTION`] of second chances.
+///
+/// The two-step for a full directory stays exactly as it was, although the step it guarded is no
+/// longer irreversible. It was never only for a person: an agent that names the wrong folder should
+/// still have to repeat itself before a whole subtree leaves the place every other agent looks.
+///
+/// **A failed move is an error, never a removal.** `rename` fails across volumes, on a file another
+/// process holds open, on a trash that went missing — and in every one of those the thing asked for
+/// stays exactly where it was. Falling back to deleting would turn "the trash is unavailable" into
+/// the irreversible act this function exists to replace, and it would do so precisely when nobody
+/// is looking. A symlink is moved as the link it is: `rename` never follows one.
+///
+/// The record is written BEFORE the item moves, so there is never a trashed item without a way
+/// back. The opposite half-state — a record with no item, when the move fails — is cleaned up here,
+/// and if even that fails the entry is invisible to [`list_trash`] and dated by its name for
+/// [`purge`].
+pub fn delete(
+    root: &Path,
+    trash: &Path,
+    relative: &str,
+    recursive: bool,
+) -> Result<Trashed, PathError> {
     let target = resolve_within(root, relative)?;
     if target == root {
         // Emptying the root is not something a wrong path should be able to ask for by accident.
         return Err(PathError::Unsafe);
     }
+    // Not followed: a symlink is trashed as the link, and its size is not its target's.
     let metadata = std::fs::symlink_metadata(&target).map_err(|_| PathError::NotFound)?;
-    if !metadata.is_dir() {
-        // A symlink is removed as the link it is, never followed — which is also why the metadata
-        // read above does not follow it. Windows needs `remove_dir` for a link that points at a
-        // directory and `remove_file` for every other link, and nothing in the entry says which,
-        // so the second is tried when the first refuses rather than reported as an I/O failure.
-        return std::fs::remove_file(&target)
-            .or_else(|error| {
-                if metadata.is_symlink() {
-                    std::fs::remove_dir(&target)
-                } else {
-                    Err(error)
-                }
-            })
-            .map_err(|e| PathError::Io(e.to_string()));
+    if metadata.is_dir() {
+        let empty = std::fs::read_dir(&target)
+            .map_err(|e| PathError::Io(e.to_string()))?
+            .next()
+            .is_none();
+        if !empty && !recursive {
+            return Err(PathError::NotEmpty);
+        }
+    }
+    let Some(name) = target.file_name().map(std::ffi::OsStr::to_os_string) else {
+        return Err(PathError::Unsafe);
+    };
+    // Recorded as the root-relative path the routes speak, with forward slashes on every platform,
+    // so the record means the same thing to a restore on this machine and to a person reading it.
+    let path = target
+        .strip_prefix(root)
+        .map_err(|_| PathError::Escapes)?
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let now = chrono::Utc::now();
+    let origin = Origin {
+        path,
+        deleted_at: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        is_dir: metadata.is_dir(),
+        size_bytes: size_of(&target, &metadata),
+    };
+
+    let (id, entry) = new_trash_entry(trash, now)?;
+    let moved = (|| {
+        let record = serde_json::to_vec_pretty(&origin).map_err(std::io::Error::other)?;
+        std::fs::write(entry.join(ORIGIN_FILE), record)?;
+        std::fs::create_dir(entry.join(ITEM_DIR))?;
+        std::fs::rename(&target, entry.join(ITEM_DIR).join(&name))
+    })();
+    if let Err(error) = moved {
+        // Only what this call created is removed — a record and two empty directories — and each
+        // with the call that refuses anything else, so a mistake here can never reach the item.
+        let _ = std::fs::remove_dir(entry.join(ITEM_DIR));
+        let _ = std::fs::remove_file(entry.join(ORIGIN_FILE));
+        let _ = std::fs::remove_dir(&entry);
+        return Err(PathError::Io(error.to_string()));
     }
 
-    let empty = std::fs::read_dir(&target)
-        .map_err(|e| PathError::Io(e.to_string()))?
-        .next()
-        .is_none();
-    if !empty && !recursive {
-        return Err(PathError::NotEmpty);
+    // After the move and never instead of it: the delete that was asked for has already happened,
+    // and an old entry that would not go is a disk-space question, not this caller's failure.
+    if let Err(error) = purge(trash, TRASH_RETENTION) {
+        tracing::warn!(%error, trash = %trash.display(), "could not clear expired entries from the files trash");
     }
-    if empty {
-        std::fs::remove_dir(&target).map_err(|e| PathError::Io(e.to_string()))
-    } else {
-        std::fs::remove_dir_all(&target).map_err(|e| PathError::Io(e.to_string()))
+
+    Ok(Trashed {
+        id,
+        path: origin.path,
+        is_dir: origin.is_dir,
+        size_bytes: origin.size_bytes,
+        deleted_at: origin.deleted_at,
+    })
+}
+
+/// Reads one entry back, or `None` for anything that is not a whole one: a name this module did
+/// not make, a record that will not parse, or a record whose item is gone (a move that failed and
+/// could not be cleaned up, or a restore that could not clear its leftovers).
+fn read_trash_entry(trash: &Path, id: &str) -> Option<(Origin, PathBuf)> {
+    if !valid_trash_id(id) {
+        return None;
     }
+    let entry = trash.join(id);
+    let record = std::fs::read(entry.join(ORIGIN_FILE)).ok()?;
+    let origin: Origin = serde_json::from_slice(&record).ok()?;
+    let name = Path::new(&origin.path).file_name()?.to_os_string();
+    let item = entry.join(ITEM_DIR).join(name);
+    std::fs::symlink_metadata(&item).ok()?;
+    Some((origin, item))
+}
+
+/// What is in the trash, newest first.
+///
+/// An entry that is not whole is skipped rather than failing the list: one bad record must not hide
+/// every good one, which is the whole list a person came here to use. Newest first by id, which
+/// sorts as time because its stamp is fixed-width and leads.
+pub fn list_trash(trash: &Path) -> Result<Vec<Trashed>, PathError> {
+    let mut items = Vec::new();
+    for item in std::fs::read_dir(trash).map_err(|e| PathError::Io(e.to_string()))? {
+        let Ok(item) = item else { continue };
+        let Some(id) = item.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some((origin, _)) = read_trash_entry(trash, &id) else {
+            continue;
+        };
+        items.push(Trashed {
+            id,
+            path: origin.path,
+            is_dir: origin.is_dir,
+            size_bytes: origin.size_bytes,
+            deleted_at: origin.deleted_at,
+        });
+    }
+    items.sort_by(|a, b| b.id.cmp(&a.id));
+    Ok(items)
+}
+
+/// Puts a trashed item back where it was, and returns that path relative to the root.
+///
+/// The recorded path is NOT trusted because this module wrote it: it goes through
+/// [`resolve_within`] like every other path, because the trash is a directory on disk that anything
+/// with the user's permissions can edit, and a restore is a write into the root. One gate, still.
+///
+/// A taken destination is refused rather than numbered, for the reason [`move_entry`] gives — the
+/// person asked for THIS thing back at THIS path, and a `guia (2).docx` they did not ask for is how
+/// the caller and the disk come to disagree. A missing parent folder is refused rather than
+/// created, also for `move_entry`'s reason: a silently recreated parent is how a file ends up
+/// somewhere nobody looks. Either way the item stays in the trash, and the caller can make room or
+/// recreate the folder and try again.
+pub fn restore(root: &Path, trash: &Path, id: &str) -> Result<String, PathError> {
+    if !valid_trash_id(id) {
+        return Err(PathError::Unsafe);
+    }
+    let (origin, item) = read_trash_entry(trash, id).ok_or(PathError::NotFound)?;
+    let destination = resolve_within(root, &origin.path)?;
+    if destination == root {
+        return Err(PathError::Unsafe);
+    }
+    // `symlink_metadata` and not `exists`: a dangling link at the destination is still a name that
+    // is taken, and `exists` would follow it and say there is nothing there.
+    if std::fs::symlink_metadata(&destination).is_ok() {
+        return Err(PathError::Exists);
+    }
+    match destination.parent() {
+        Some(parent) if parent.is_dir() => {}
+        _ => return Err(PathError::NotFound),
+    }
+    std::fs::rename(&item, &destination).map_err(|e| PathError::Io(e.to_string()))?;
+
+    // The item is home; what is left is a record and an empty folder. Removed with the calls that
+    // refuse anything non-empty, and a failure is logged rather than returned — the restore that
+    // was asked for has happened, and the leftover is invisible to `list_trash` and dated for
+    // `purge`.
+    let entry = trash.join(id);
+    let cleaned = std::fs::remove_dir(entry.join(ITEM_DIR))
+        .and_then(|()| std::fs::remove_file(entry.join(ORIGIN_FILE)))
+        .and_then(|()| std::fs::remove_dir(&entry));
+    if let Err(error) = cleaned {
+        tracing::warn!(%error, entry = %entry.display(), "restored, but could not clear the trash entry");
+    }
+    Ok(origin.path)
+}
+
+/// Removes, for good, every entry older than `max_age`, and says how many went.
+///
+/// Only names this module could have made are touched — anything else in the directory was put
+/// there by somebody else, and this function has no business guessing what. One entry that will
+/// not go (a file held open, say) is logged and skipped rather than stopping the rest; the error
+/// returned is only for a trash that cannot be read at all. `remove_dir_all` does not follow
+/// symlinks, so a trashed link to a folder takes the link and never the folder it points at.
+pub fn purge(trash: &Path, max_age: std::time::Duration) -> std::io::Result<usize> {
+    let Ok(max_age) = chrono::Duration::from_std(max_age) else {
+        // An age too large to represent keeps everything, which is the safe way to be wrong.
+        return Ok(0);
+    };
+    let cutoff = chrono::Utc::now() - max_age;
+    let mut removed = 0;
+    for item in std::fs::read_dir(trash)? {
+        let Ok(item) = item else { continue };
+        let Some(id) = item.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(made) = trash_id_time(&id) else {
+            continue;
+        };
+        if made >= cutoff {
+            continue;
+        }
+        match std::fs::remove_dir_all(item.path()) {
+            Ok(()) => removed += 1,
+            Err(error) => {
+                tracing::warn!(%error, %id, "could not remove an expired files trash entry");
+            }
+        }
+    }
+    Ok(removed)
 }
 
 /// Renames or moves something inside the root. Both are the same operation with a different parent.
@@ -461,6 +807,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = ensure_root(dir.path()).unwrap();
         (dir, root)
+    }
+
+    /// A root and its trash, made the way startup makes them: siblings under one data directory.
+    fn temp_root_and_trash() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = ensure_root(dir.path()).unwrap();
+        let trash = ensure_trash(dir.path()).unwrap();
+        (dir, root, trash)
     }
 
     /// The whole module rests on this one function, so it is tested against every shape of "name
@@ -728,25 +1082,32 @@ mod tests {
     /// was filed from is gone after thirty days, so this copy is the only one.
     #[test]
     fn a_full_folder_is_refused_until_the_caller_says_recursive() {
-        let (_guard, root) = temp_root();
+        let (_guard, root, trash) = temp_root_and_trash();
         create_folder(&root, "BACMAT").unwrap();
         write_file(&root, "BACMAT", "guia.docx", b"x").unwrap();
 
-        assert_eq!(delete(&root, "BACMAT", false), Err(PathError::NotEmpty));
+        assert_eq!(
+            delete(&root, &trash, "BACMAT", false),
+            Err(PathError::NotEmpty)
+        );
         assert!(root.join("BACMAT").join("guia.docx").exists());
+        assert!(
+            list_trash(&trash).unwrap().is_empty(),
+            "a refused delete still made an entry"
+        );
 
-        delete(&root, "BACMAT", true).unwrap();
+        delete(&root, &trash, "BACMAT", true).unwrap();
         assert!(!root.join("BACMAT").exists());
     }
 
     #[test]
     fn a_file_and_an_empty_folder_go_without_ceremony() {
-        let (_guard, root) = temp_root();
+        let (_guard, root, trash) = temp_root_and_trash();
         write_file(&root, "", "guia.docx", b"x").unwrap();
         create_folder(&root, "vazia").unwrap();
 
-        delete(&root, "guia.docx", false).unwrap();
-        delete(&root, "vazia", false).unwrap();
+        delete(&root, &trash, "guia.docx", false).unwrap();
+        delete(&root, &trash, "vazia", false).unwrap();
 
         assert!(list(&root, "").unwrap().is_empty());
     }
@@ -754,14 +1115,301 @@ mod tests {
     /// The two deletions nothing should be able to ask for by accident.
     #[test]
     fn the_root_itself_is_not_deletable_and_neither_is_anything_outside_it() {
-        let (_guard, root) = temp_root();
+        let (_guard, root, trash) = temp_root_and_trash();
         write_file(&root, "", "guia.docx", b"x").unwrap();
 
-        assert_eq!(delete(&root, "", true), Err(PathError::Unsafe));
-        assert_eq!(delete(&root, ".", true), Err(PathError::Unsafe));
-        assert_eq!(delete(&root, "../outside", true), Err(PathError::Escapes));
-        assert_eq!(delete(&root, "nao-existe", false), Err(PathError::NotFound));
+        assert_eq!(delete(&root, &trash, "", true), Err(PathError::Unsafe));
+        assert_eq!(delete(&root, &trash, ".", true), Err(PathError::Unsafe));
+        assert_eq!(
+            delete(&root, &trash, "../outside", true),
+            Err(PathError::Escapes)
+        );
+        assert_eq!(
+            delete(&root, &trash, "nao-existe", false),
+            Err(PathError::NotFound)
+        );
         assert!(root.join("guia.docx").exists());
+    }
+
+    /// Deleting is a move, not a removal: the root no longer has it, the trash does, and the answer
+    /// says enough to undo it.
+    #[test]
+    fn a_delete_moves_the_item_into_the_trash_and_leaves_nothing_in_the_root() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        create_folder(&root, "BACMAT").unwrap();
+        write_file(&root, "BACMAT", "guia.docx", b"conteudo").unwrap();
+
+        let trashed = delete(&root, &trash, "BACMAT/guia.docx", false).unwrap();
+
+        assert!(!root.join("BACMAT").join("guia.docx").exists());
+        assert_eq!(trashed.path, "BACMAT/guia.docx");
+        assert!(!trashed.is_dir);
+        assert_eq!(trashed.size_bytes, 8);
+        assert!(valid_trash_id(&trashed.id), "{:?}", trashed.id);
+        assert!(trashed.deleted_at.ends_with('Z'), "{}", trashed.deleted_at);
+        assert_eq!(
+            std::fs::read(trash.join(&trashed.id).join(ITEM_DIR).join("guia.docx")).unwrap(),
+            b"conteudo"
+        );
+        // Nothing of the trash is reachable through the root: it is a sibling, not a child.
+        assert!(!trash.starts_with(&root));
+        assert!(search(&root, "", "guia").unwrap().hits.is_empty());
+        assert_eq!(list_trash(&trash).unwrap(), vec![trashed]);
+    }
+
+    /// A deleted file that happens to be called `origin.json` must not collide with the record kept
+    /// beside it — which is why the item lives one folder down.
+    #[test]
+    fn a_file_named_like_the_record_survives_the_round_trip() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        write_file(&root, "", "origin.json", b"meu").unwrap();
+
+        let trashed = delete(&root, &trash, "origin.json", false).unwrap();
+        assert_eq!(restore(&root, &trash, &trashed.id).unwrap(), "origin.json");
+
+        assert_eq!(std::fs::read(root.join("origin.json")).unwrap(), b"meu");
+    }
+
+    /// Two deletes in the same millisecond are two entries, never one overwriting the other.
+    #[test]
+    fn deletes_in_quick_succession_get_distinct_ids() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        let mut ids = std::collections::HashSet::new();
+        for index in 0..20 {
+            let name = format!("f{index}.txt");
+            write_file(&root, "", &name, b"x").unwrap();
+            assert!(ids.insert(delete(&root, &trash, &name, false).unwrap().id));
+        }
+        assert_eq!(list_trash(&trash).unwrap().len(), 20);
+    }
+
+    #[test]
+    fn the_trash_lists_newest_first_and_skips_what_is_not_whole() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        for name in ["primeiro.txt", "segundo.txt", "terceiro.txt"] {
+            write_file(&root, "", name, b"x").unwrap();
+            delete(&root, &trash, name, false).unwrap();
+            // Past a millisecond, so the order under test is time and not the counter.
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        // Three kinds of debris a real trash can hold, none of which may break the list: a name
+        // this module did not make, an entry with no record, and a record that will not parse.
+        std::fs::create_dir(trash.join("nao-e-um-id")).unwrap();
+        std::fs::create_dir(trash.join("20990101T000000000-0000abcd")).unwrap();
+        let garbled = trash.join("20990102T000000000-0000abce");
+        std::fs::create_dir(&garbled).unwrap();
+        std::fs::write(garbled.join(ORIGIN_FILE), b"{not json").unwrap();
+
+        let paths: Vec<_> = list_trash(&trash)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.path)
+            .collect();
+        assert_eq!(paths, vec!["terceiro.txt", "segundo.txt", "primeiro.txt"]);
+    }
+
+    #[test]
+    fn a_file_comes_back_from_the_trash_to_where_it_was() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        create_folder(&root, "BACMAT").unwrap();
+        write_file(&root, "BACMAT", "guia.docx", b"conteudo").unwrap();
+        let trashed = delete(&root, &trash, "BACMAT/guia.docx", false).unwrap();
+
+        assert_eq!(
+            restore(&root, &trash, &trashed.id).unwrap(),
+            "BACMAT/guia.docx"
+        );
+
+        assert_eq!(
+            std::fs::read(root.join("BACMAT").join("guia.docx")).unwrap(),
+            b"conteudo"
+        );
+        assert!(list_trash(&trash).unwrap().is_empty());
+        assert!(
+            !trash.join(&trashed.id).exists(),
+            "the emptied entry was left behind"
+        );
+    }
+
+    #[test]
+    fn a_full_folder_comes_back_whole() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        create_folder(&root, "BACMAT/2026").unwrap();
+        write_file(&root, "BACMAT", "guia.docx", b"abc").unwrap();
+        write_file(&root, "BACMAT/2026", "recibo.pdf", b"defgh").unwrap();
+
+        let trashed = delete(&root, &trash, "BACMAT", true).unwrap();
+        assert!(trashed.is_dir);
+        assert_eq!(trashed.size_bytes, 8, "a folder's size is what is under it");
+        assert!(!root.join("BACMAT").exists());
+
+        assert_eq!(restore(&root, &trash, &trashed.id).unwrap(), "BACMAT");
+        assert_eq!(
+            std::fs::read(root.join("BACMAT").join("2026").join("recibo.pdf")).unwrap(),
+            b"defgh"
+        );
+        assert_eq!(
+            std::fs::read(root.join("BACMAT").join("guia.docx")).unwrap(),
+            b"abc"
+        );
+    }
+
+    /// A restore asks for one exact place, as a rename does: a taken name is refused, not numbered
+    /// and not overwritten, and the item stays in the trash to be asked for again.
+    #[test]
+    fn a_restore_refuses_a_taken_name() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        write_file(&root, "", "guia.docx", b"antigo").unwrap();
+        let trashed = delete(&root, &trash, "guia.docx", false).unwrap();
+        write_file(&root, "", "guia.docx", b"novo").unwrap();
+
+        assert_eq!(restore(&root, &trash, &trashed.id), Err(PathError::Exists));
+
+        assert_eq!(std::fs::read(root.join("guia.docx")).unwrap(), b"novo");
+        assert_eq!(list_trash(&trash).unwrap(), vec![trashed]);
+    }
+
+    /// The folder it came from is gone, and is not silently recreated — the reason `move_entry`
+    /// gives: a recreated parent is how a file ends up somewhere nobody looks.
+    #[test]
+    fn a_restore_refuses_a_folder_that_is_no_longer_there() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        create_folder(&root, "Pasta").unwrap();
+        write_file(&root, "Pasta", "dentro.txt", b"y").unwrap();
+        let inner = delete(&root, &trash, "Pasta/dentro.txt", false).unwrap();
+        delete(&root, &trash, "Pasta", false).unwrap();
+
+        assert_eq!(restore(&root, &trash, &inner.id), Err(PathError::NotFound));
+
+        assert!(!root.join("Pasta").exists());
+        assert!(list_trash(&trash).unwrap().contains(&inner));
+    }
+
+    /// The id is the only thing from the request that is joined onto the trash path, so everything
+    /// that is not certainly an id is refused before it reaches one.
+    #[test]
+    fn a_restore_refuses_anything_that_is_not_an_id() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            r"C:\x",
+            "../files",
+            "20260101T000000000-0000abcd/../..",
+            "20260101T000000000-0000ABCD",
+            "20260101T000000000-0000abc",
+            "20260101T000000000-0000abcd ",
+        ] {
+            assert_eq!(
+                restore(&root, &trash, bad),
+                Err(PathError::Unsafe),
+                "accepted {bad:?}"
+            );
+        }
+        // Well formed but not there.
+        assert_eq!(
+            restore(&root, &trash, "20260101T000000000-0000abcd"),
+            Err(PathError::NotFound)
+        );
+    }
+
+    /// The record is on disk where anything can edit it, so the path it names goes through the same
+    /// gate as a path from a request.
+    #[test]
+    fn a_tampered_record_cannot_restore_outside_the_root() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        write_file(&root, "", "guia.docx", b"x").unwrap();
+        let trashed = delete(&root, &trash, "guia.docx", false).unwrap();
+        let record = trash.join(&trashed.id).join(ORIGIN_FILE);
+        let text = std::fs::read_to_string(&record)
+            .unwrap()
+            .replace("\"guia.docx\"", "\"../guia.docx\"");
+        std::fs::write(&record, text).unwrap();
+
+        assert_eq!(restore(&root, &trash, &trashed.id), Err(PathError::Escapes));
+        assert!(!root.parent().unwrap().join("guia.docx").exists());
+    }
+
+    #[test]
+    fn a_purge_removes_only_what_has_expired() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        write_file(&root, "", "recente.txt", b"x").unwrap();
+        let recent = delete(&root, &trash, "recente.txt", false).unwrap();
+        // An entry from years ago with a tree in it, and one with no record at all — dated by its
+        // name, which is what lets a half-written entry expire instead of staying forever.
+        let old = trash.join("20200101T000000000-00000001");
+        std::fs::create_dir_all(old.join(ITEM_DIR).join("velho")).unwrap();
+        std::fs::write(old.join(ITEM_DIR).join("velho").join("a.txt"), b"x").unwrap();
+        let bare = trash.join("20200102T000000000-00000002");
+        std::fs::create_dir(&bare).unwrap();
+        // Something this module did not make is never touched, however old it looks.
+        std::fs::create_dir(trash.join("de-outra-pessoa")).unwrap();
+
+        assert_eq!(purge(&trash, TRASH_RETENTION).unwrap(), 2);
+
+        assert!(!old.exists());
+        assert!(!bare.exists());
+        assert!(trash.join(&recent.id).exists());
+        assert!(trash.join("de-outra-pessoa").exists());
+    }
+
+    /// Every delete sweeps the trash as it goes, so nothing past retention outlives the next one.
+    #[test]
+    fn a_delete_sweeps_expired_entries() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        let old = trash.join("20200101T000000000-00000001");
+        std::fs::create_dir(&old).unwrap();
+        write_file(&root, "", "novo.txt", b"x").unwrap();
+
+        delete(&root, &trash, "novo.txt", false).unwrap();
+
+        assert!(!old.exists());
+    }
+
+    /// When the trash cannot take the item, the item stays exactly where it was. The fallback this
+    /// refuses — "could not move it, so remove it" — is the irreversible act the trash replaced.
+    #[test]
+    fn a_trash_that_cannot_take_the_item_leaves_it_where_it_was() {
+        let (_guard, root, trash) = temp_root_and_trash();
+        write_file(&root, "", "guia.docx", b"conteudo").unwrap();
+        let missing = trash.join("apagada");
+
+        assert!(matches!(
+            delete(&root, &missing, "guia.docx", false),
+            Err(PathError::Io(_))
+        ));
+        assert_eq!(std::fs::read(root.join("guia.docx")).unwrap(), b"conteudo");
+    }
+
+    /// The same at the rename itself: a file another process holds open without sharing delete
+    /// cannot be renamed on Windows, and the half-made entry is cleaned up behind the refusal.
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_rename_leaves_the_item_and_no_entry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_guard, root, trash) = temp_root_and_trash();
+        write_file(&root, "", "aberto.docx", b"conteudo").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(root.join("aberto.docx"))
+            .unwrap();
+
+        let refused = delete(&root, &trash, "aberto.docx", false);
+        drop(held);
+
+        assert!(matches!(refused, Err(PathError::Io(_))), "{refused:?}");
+        assert_eq!(
+            std::fs::read(root.join("aberto.docx")).unwrap(),
+            b"conteudo"
+        );
+        assert_eq!(
+            std::fs::read_dir(&trash).unwrap().count(),
+            0,
+            "the half-made entry was left in the trash"
+        );
     }
 
     #[test]

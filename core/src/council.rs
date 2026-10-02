@@ -3528,6 +3528,7 @@ mod tests {
             local_triage_disabled: None,
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             files_root: None,
+            files_trash: None,
             workflow_library: None,
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),

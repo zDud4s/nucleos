@@ -928,6 +928,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/files/download", get(get_file_download))
         .route("/files/search", get(get_files_search))
         .route("/files/move", post(post_files_move))
+        // The way back from `DELETE /files`, which moves into a trash rather than destroying. Both
+        // are in no scope table in `auth.rs`, which leaves them to Admin and the control token like
+        // the routes that change the folder: the list is the doorway to a restore, and a restore
+        // is a write into the root.
+        .route("/files/trash", get(get_files_trash))
+        .route("/files/restore", post(post_files_restore))
         // Whole-body limit rather than the 2 MB default, for the same reason `/voice/capture` has
         // one: the request this route exists for is bigger than the default and would be rejected
         // identically every time. The ceiling is a memory ceiling too — see `files::MAX_UPLOAD_BYTES`.
@@ -2075,6 +2081,15 @@ pub(crate) fn files_root(state: &AppState) -> Result<&std::path::Path, StatusCod
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
+/// The trash beside the root, or the same 503 when startup could not make it. A delete with no
+/// trash refuses rather than removing for good — see `AppState::files_trash`.
+fn files_trash(state: &AppState) -> Result<&std::path::Path, StatusCode> {
+    state
+        .files_trash
+        .as_deref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
 #[derive(Deserialize)]
 struct FolderQuery {
     /// Relative to the root. Absent means the root itself.
@@ -2258,23 +2273,73 @@ struct DeleteQuery {
     recursive: bool,
 }
 
+/// Moves one entry into the trash and answers with what was moved — the `id` is what an undo, or a
+/// restore from the "Recently deleted" list later, sends back. 200 with a body rather than the 204
+/// it was while this removed for good: the caller now has something to keep.
 async fn delete_file(
     State(state): State<AppState>,
     Query(query): Query<DeleteQuery>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<crate::files::Trashed>, StatusCode> {
     let root = files_root(&state)?.to_path_buf();
+    let trash = files_trash(&state)?.to_path_buf();
 
     let deleted = uncancellable(async move {
         tokio::task::spawn_blocking(move || {
-            crate::files::delete(&root, &query.path, query.recursive)
+            crate::files::delete(&root, &trash, &query.path, query.recursive)
         })
         .await
     })
     .await?
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    deleted
-        .map(|()| StatusCode::NO_CONTENT)
+    deleted.map(Json).map_err(folder_status)
+}
+
+/// What can still be brought back, newest first. Blocking work off the runtime like search: it
+/// reads one small record per entry, and a trash holds up to thirty days of deletes.
+async fn get_files_trash(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::files::Trashed>>, StatusCode> {
+    let trash = files_trash(&state)?.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::files::list_trash(&trash))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(folder_status)
+}
+
+#[derive(Deserialize)]
+struct RestoreRequest {
+    /// An id from `DELETE /files` or `GET /files/trash`, and nothing else — `files::restore`
+    /// refuses anything not shaped like one before it touches a path.
+    id: String,
+}
+
+#[derive(serde::Serialize)]
+struct Restored {
+    /// Where it is again, relative to the root: the recorded path, which the shell can open.
+    path: String,
+}
+
+/// Puts one trashed entry back where it was. A taken name is 409 and a folder that is no longer
+/// there is 404 — both leave the entry in the trash, so the caller can make room and ask again.
+/// Uncancellable like a move, for the same reason: a restore half-observed by a dropped connection
+/// has still happened.
+async fn post_files_restore(
+    State(state): State<AppState>,
+    Json(body): Json<RestoreRequest>,
+) -> Result<Json<Restored>, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+    let trash = files_trash(&state)?.to_path_buf();
+
+    let restored = uncancellable(async move {
+        tokio::task::spawn_blocking(move || crate::files::restore(&root, &trash, &body.id)).await
+    })
+    .await?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    restored
+        .map(|path| Json(Restored { path }))
         .map_err(folder_status)
 }
 
@@ -15169,6 +15234,7 @@ mod tests {
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_tails: Default::default(),
                 files_root: None,
+                files_trash: None,
                 workflow_library: None,
                 machine_config_root: None,
                 secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
@@ -16078,6 +16144,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            files_trash: None,
             workflow_library: None,
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
@@ -17430,6 +17497,23 @@ mod tests {
         }
     }
 
+    /// A root AND its trash, made the way startup makes them — siblings under one data directory.
+    /// Separate from `with_files_root` because only a delete or a restore needs the trash, and the
+    /// many tests that hand `with_files_root` a bare temp directory would otherwise put one in that
+    /// directory's parent: the system temp folder.
+    fn with_files_and_trash(
+        state: AppState,
+        data_dir: &std::path::Path,
+    ) -> (AppState, std::path::PathBuf) {
+        let root = crate::files::ensure_root(data_dir).unwrap();
+        let trash = crate::files::ensure_trash(data_dir).unwrap();
+        let state = AppState {
+            files_trash: Some(trash),
+            ..with_files_root(state, root.clone())
+        };
+        (state, root)
+    }
+
     async fn call(
         state: AppState,
         method: &str,
@@ -17500,9 +17584,177 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
+            call(state.clone(), "GET", "/files/trash", None).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            call(
+                state.clone(),
+                "POST",
+                "/files/restore",
+                Some(serde_json::json!({"id": "20260101T000000000-00000000"}))
+            )
+            .await
+            .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
             upload(state, "", "guia.docx", b"x").await.0,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    /// A root with no trash beside it refuses to delete rather than removing for good: "the trash is
+    /// unavailable" must never quietly become the one act nobody can undo.
+    #[tokio::test]
+    async fn a_delete_with_no_trash_refuses_and_removes_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::files::ensure_root(temp.path()).unwrap();
+        let state = with_files_root(test_state().await, root.clone());
+        upload(state.clone(), "", "guia.docx", b"x").await;
+
+        assert_eq!(
+            call(state, "DELETE", "/files?path=guia.docx", None).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(root.join("guia.docx").exists());
+    }
+
+    /// The whole undo, through the routes: a delete answers with the id, the trash lists it, a
+    /// restore by that id puts it back, and asking again finds nothing to restore.
+    #[tokio::test]
+    async fn a_deleted_file_is_listed_in_the_trash_and_comes_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, root) = with_files_and_trash(test_state().await, temp.path());
+        call(
+            state.clone(),
+            "POST",
+            "/files/folder",
+            Some(serde_json::json!({"path": "BACMAT"})),
+        )
+        .await;
+        upload(state.clone(), "BACMAT", "guia.docx", b"conteudo").await;
+
+        let (status, trashed) = call(
+            state.clone(),
+            "DELETE",
+            "/files?path=BACMAT%2Fguia.docx",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(trashed["path"], "BACMAT/guia.docx");
+        assert_eq!(trashed["is_dir"], false);
+        assert_eq!(trashed["size_bytes"], 8);
+        assert!(trashed["deleted_at"].is_string());
+        let id = trashed["id"].as_str().unwrap().to_string();
+        assert!(!root.join("BACMAT").join("guia.docx").exists());
+        // Gone from the folder's own routes — the trash is not somewhere they can see.
+        let (_, listed) = call(state.clone(), "GET", "/files?path=BACMAT", None).await;
+        assert_eq!(listed, serde_json::json!([]));
+
+        let (status, trash) = call(state.clone(), "GET", "/files/trash", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(trash, serde_json::json!([trashed]));
+
+        let (status, restored) = call(
+            state.clone(),
+            "POST",
+            "/files/restore",
+            Some(serde_json::json!({ "id": id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(restored, serde_json::json!({"path": "BACMAT/guia.docx"}));
+        assert_eq!(
+            std::fs::read(root.join("BACMAT").join("guia.docx")).unwrap(),
+            b"conteudo"
+        );
+
+        let (_, trash) = call(state.clone(), "GET", "/files/trash", None).await;
+        assert_eq!(trash, serde_json::json!([]));
+        assert_eq!(
+            call(
+                state,
+                "POST",
+                "/files/restore",
+                Some(serde_json::json!({ "id": id }))
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// A restore's refusals, each with the status the other folder routes use for the same fact.
+    #[tokio::test]
+    async fn a_restore_refuses_a_bad_id_and_a_taken_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, root) = with_files_and_trash(test_state().await, temp.path());
+
+        for bad in ["", "..", "a/b", "C:\\x", "../files-trash"] {
+            assert_eq!(
+                call(
+                    state.clone(),
+                    "POST",
+                    "/files/restore",
+                    Some(serde_json::json!({ "id": bad }))
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST,
+                "accepted {bad:?}"
+            );
+        }
+
+        upload(state.clone(), "", "guia.docx", b"antigo").await;
+        let (_, trashed) = call(state.clone(), "DELETE", "/files?path=guia.docx", None).await;
+        upload(state.clone(), "", "guia.docx", b"novo").await;
+        assert_eq!(
+            call(
+                state,
+                "POST",
+                "/files/restore",
+                Some(serde_json::json!({ "id": trashed["id"] }))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(std::fs::read(root.join("guia.docx")).unwrap(), b"novo");
+    }
+
+    /// The trash routes sit behind the same token as every other folder route.
+    #[tokio::test]
+    async fn the_trash_routes_refuse_a_call_without_the_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _root) = with_files_and_trash(test_state().await, temp.path());
+        for (method, uri, body) in [
+            ("GET", "/files/trash", Body::empty()),
+            (
+                "POST",
+                "/files/restore",
+                Body::from(r#"{"id":"20260101T000000000-00000000"}"#),
+            ),
+            ("DELETE", "/files?path=x", Body::empty()),
+        ] {
+            let response = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("Content-Type", "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
     }
 
     /// Filing checks where it would write BEFORE it fetches anything. The order is the test: no
@@ -17685,8 +17937,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_folder_is_not_deleted_by_a_single_request() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::files::ensure_root(temp.path()).unwrap();
-        let state = with_files_root(test_state().await, root.clone());
+        let (state, root) = with_files_and_trash(test_state().await, temp.path());
 
         call(
             state.clone(),
@@ -17714,7 +17965,7 @@ mod tests {
             )
             .await
             .0,
-            StatusCode::NO_CONTENT
+            StatusCode::OK
         );
         assert!(!root.join("BACMAT").exists());
     }
@@ -17771,8 +18022,7 @@ mod tests {
     #[tokio::test]
     async fn a_path_that_leaves_the_root_is_refused_by_every_route() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::files::ensure_root(temp.path()).unwrap();
-        let state = with_files_root(test_state().await, root);
+        let (state, _root) = with_files_and_trash(test_state().await, temp.path());
 
         for escape in ["..", "../outside", "/etc", "C:\\Windows"] {
             let listed = call(
@@ -30934,6 +31184,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            files_trash: None,
             workflow_library: None,
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),

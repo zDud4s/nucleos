@@ -173,6 +173,11 @@ const EMAIL_ROUTES: &[(Method, &str)] = &[
 /// already does, so refusing it would protect nothing; rearranging or deleting somebody's folder is
 /// a different act, and the folder holds the only copy of an attachment once the mail it came from
 /// has expired.
+///
+/// The trash follows the routes that change the folder, not the ones that read it: `POST
+/// /files/restore` is a write into the root, and `GET /files/trash` — though it changes nothing —
+/// is the doorway to that write and a list of what the owner chose to be rid of. Both are in no
+/// table either.
 const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/status"),
     (Method::GET, "/health/readout"),
@@ -897,6 +902,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            files_trash: None,
             workflow_library: None,
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
@@ -985,6 +991,8 @@ mod tests {
             .route("/files/search", get(|| async {}))
             .route("/files/upload", post(|| async {}))
             .route("/files/move", post(|| async {}))
+            .route("/files/trash", get(|| async {}))
+            .route("/files/restore", post(|| async {}))
             .route("/api-tokens", get(|| async {}).post(|| async {}))
             .route("/api-tokens/{name}", axum::routing::delete(|| async {}))
             // The browser pillar, mounted so the refusals below are refusals of a route that
@@ -1803,6 +1811,8 @@ mod tests {
             ("POST", "/files/upload"),
             ("POST", "/files/move"),
             ("DELETE", "/files"),
+            ("GET", "/files/trash"),
+            ("POST", "/files/restore"),
             // The browser, all of it, including the two reads. `GET /web/pages` beside it IS an
             // allowlisted read, and the difference is what these routes disclose: the pages a
             // machine has fetched, against the list of hosts a person has accounts on and the
@@ -1865,6 +1875,8 @@ mod tests {
             ("POST", "/files/upload"),
             ("POST", "/files/move"),
             ("DELETE", "/files"),
+            ("GET", "/files/trash"),
+            ("POST", "/files/restore"),
         ] {
             assert_eq!(
                 status_of(&app, method, uri, &token).await,
@@ -2008,6 +2020,8 @@ mod tests {
             ("POST", "/web/search"),
             ("POST", "/browser/open"),
             ("DELETE", "/files"),
+            ("GET", "/files/trash"),
+            ("POST", "/files/restore"),
         ] {
             assert_eq!(
                 status_of(&app, method, path, &token).await,
@@ -2149,6 +2163,9 @@ mod tests {
             // and a DELETE on the same path, so a table of paths alone would have handed a
             // department the deleting of the owner's folder along with the listing of it.
             ("DELETE", "/files"),
+            // Nor what was deleted from it, nor the way back.
+            ("GET", "/files/trash"),
+            ("POST", "/files/restore"),
             // A department asks for an action and does not read the queue of them. Same path, other
             // method — the pair-shaped table again.
             ("GET", "/team-actions"),
