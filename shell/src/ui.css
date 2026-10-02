@@ -2783,3 +2783,61 @@ ol.ui-well {
     opacity: 1;
   }
 }
+
+/* Slider: a discrete dial over named levels (the effort control). No accent: cyan is for links. */
+.ui-slider-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 9rem;
+}
+.ui-slider {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 1.1rem;
+  touch-action: none;
+  user-select: none;
+}
+.ui-slider-track {
+  position: relative;
+  flex: 1;
+  height: 0.25rem;
+  border-radius: 999px;
+  background: var(--border);
+}
+.ui-slider-range {
+  position: absolute;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--text);
+}
+.ui-slider-thumb {
+  display: block;
+  width: 0.9rem;
+  height: 0.9rem;
+  border-radius: 999px;
+  border: 2px solid var(--text);
+  background: var(--surface-raised);
+  cursor: grab;
+}
+.ui-slider-thumb:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+.ui-slider-wrap[data-disabled] {
+  opacity: 0.5;
+}
+.ui-slider-wrap[data-disabled] .ui-slider-thumb {
+  cursor: not-allowed;
+}
+.ui-slider-ticks {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: var(--text-muted, var(--text));
+}
+.ui-slider-tick[data-active] {
+  color: var(--text);
+  font-weight: 600;
+}

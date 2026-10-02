@@ -579,6 +579,7 @@ pub fn build_router(state: AppState) -> Router {
         // because it is the same answer for every chat and a per-chat copy would be fetched once
         // per row in the list.
         .route("/assistant/models", get(get_assistant_models))
+        .route("/assistant/models/groups", get(get_model_groups))
         .route("/assistant/tools", get(get_deniable_tools))
         .route("/assistant/commands", get(get_commands))
         .route("/assistant/chats", get(list_chats).post(create_chat))
@@ -12740,6 +12741,14 @@ enum Asking {
     Chat { rooted: bool },
 }
 
+/// Whether the asker is a rooted chat: `None` for the daemon's own menu.
+fn rooted_of(asking: Asking) -> Option<bool> {
+    match asking {
+        Asking::Daemon => None,
+        Asking::Chat { rooted } => Some(rooted),
+    }
+}
+
 /// Which route a choice id names and can actually run, or a refusal.
 ///
 /// One function because two routes ask — opening a conversation and re-pointing one — and sharing
@@ -12781,7 +12790,12 @@ async fn chosen_brain_in(
     id: &str,
     asking: Asking,
 ) -> Result<crate::chats::Brain, BrainRefusal> {
-    if matches!(asking, Asking::Chat { rooted: false }) && config.runner_of(id) == Some("codex") {
+    if matches!(asking, Asking::Chat { rooted: false })
+        && config
+            .runner_of(id)
+            .or_else(|| crate::model_catalog::runner_by_id(id))
+            == Some("codex")
+    {
         return Err(BrainRefusal::NeedsRoot);
     }
 
@@ -12791,6 +12805,13 @@ async fn chosen_brain_in(
     };
     let brain = if let Some(choice) = cheap_choices.into_iter().find(|choice| choice.id == id) {
         crate::chats::Brain::from_wire(&choice.brain)
+    } else if crate::model_catalog::cached_or_fallback().iter().any(|found| {
+        found.id == id
+            && crate::model_catalog::admits(config.active_runner(), rooted_of(asking), found.runner)
+    }) {
+        // A model the vendor lists (or the built-in catalogue names) that no config row does.
+        // Looked up without the network, like the cheap catalogue above.
+        crate::chats::Brain::Cloud
     } else {
         let (_, choices) = menu(asking).await;
         choices
@@ -12872,11 +12893,66 @@ async fn get_assistant_models(
         // What an unpinned conversation runs on, so the window can NAME that state rather than
         // showing an empty selection and letting a person guess.
         "configured": config.configured_model(),
+        // The same model as a person reads it, from the daemon's one naming function.
+        "configured_label": crate::model_catalog::display_name(config.configured_model()),
         // The union, for the one case with no model chosen yet — the front door before anybody
         // picks. Also what the door validates against. Unaffected by the installed merge: an
         // installed model carries no effort levels of its own, `effort_levels()` keeps calling the
         // sync `catalogue()`, and there is nothing for the network read to add here.
         "efforts": config.effort_levels(),
+    }))
+}
+
+/// The picker as groups: provider and family, newest first, named as a person reads them.
+///
+/// The config's cloud choices come first and win; the discovered models (live vendor lists, or the
+/// built-in catalogue when there is no key or the vendor does not answer) are appended when the
+/// runner may answer them. Never carries a key.
+async fn get_model_groups(
+    State(state): State<AppState>,
+    Query(query): Query<ModelsQuery>,
+) -> Json<serde_json::Value> {
+    let asking = match query.chat {
+        Some(chat_id) => Asking::Chat {
+            rooted: crate::assistant::may_answer_on_codex(
+                crate::chats::cwd_of(&state.pool, &chat_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            ),
+        },
+        None => Asking::Daemon,
+    };
+    let (config, choices) = menu(asking).await;
+    let mut cloud: Vec<crate::config::AssistantChoice> = choices
+        .into_iter()
+        .filter(|choice| choice.brain == "cloud")
+        .map(|mut choice| {
+            if choice.label == choice.id {
+                choice.label = crate::model_catalog::display_name(&choice.id);
+            }
+            choice
+        })
+        .collect();
+    let snapshot = crate::model_catalog::current().await;
+    let mut created = std::collections::HashMap::new();
+    for found in &snapshot.models {
+        if let Some(at) = found.created {
+            created.insert(found.id.clone(), at);
+        }
+        if cloud.iter().any(|choice| choice.id == found.id) {
+            continue;
+        }
+        if crate::model_catalog::admits(config.active_runner(), rooted_of(asking), found.runner) {
+            cloud.push(crate::model_catalog::as_choice(found));
+        }
+    }
+    Json(serde_json::json!({
+        "groups": crate::model_catalog::group(cloud, &created),
+        "source": snapshot.source,
+        "catalogue_version": crate::model_catalog::CATALOGUE_VERSION,
+        "fetched_at": snapshot.fetched_at,
     }))
 }
 
@@ -28227,6 +28303,64 @@ mod tests {
             crate::config::EFFORT_LEVELS.len()
         );
         assert!(body["configured"].is_string());
+    }
+
+    /// The grouped picker: provider and family groups, product names for labels, the version of
+    /// the catalogue the fallback came from, and never a key.
+    #[tokio::test]
+    async fn model_groups_route_answers_groups_with_labels() {
+        let state = test_state().await;
+
+        let (status, body) = call(state, "GET", "/assistant/models/groups", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "fallback");
+        assert_eq!(body["catalogue_version"], crate::model_catalog::CATALOGUE_VERSION);
+        assert!(body["fetched_at"].is_string());
+        let groups = body["groups"].as_array().expect("groups is a list");
+        assert!(!groups.is_empty());
+        for group in groups {
+            assert!(group["provider"].is_string());
+            assert!(group["family"].is_string());
+            assert!(group["label"].as_str().unwrap().contains(" · "));
+            let models = group["models"].as_array().unwrap();
+            assert!(!models.is_empty(), "an empty group was served: {group}");
+            for model in models {
+                assert_ne!(
+                    model["label"], model["id"],
+                    "a raw id leaked into a label: {model}"
+                );
+            }
+        }
+        // The daemon's own menu follows the active runner, which is Claude here.
+        let all: Vec<&serde_json::Value> = groups
+            .iter()
+            .flat_map(|g| g["models"].as_array().unwrap())
+            .collect();
+        let ids: Vec<&str> = all.iter().filter_map(|m| m["id"].as_str()).collect();
+        assert!(ids.contains(&"claude-sonnet-5-5"), "{ids:?}");
+        assert!(!ids.contains(&"gpt-5.5"), "a Codex model on a Claude daemon: {ids:?}");
+        let sonnet = all.iter().find(|m| m["id"] == "claude-sonnet-5-5").unwrap();
+        assert_eq!(sonnet["label"], "Sonnet 5.5");
+    }
+
+    /// A catalogue model the config never listed can still be pinned, because the door validates
+    /// against what the picker offers.
+    #[tokio::test]
+    async fn a_fallback_catalogue_model_can_be_pinned_on_a_chat() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let status =
+            patch_chat_request(state.clone(), &id, r#"{"model":"claude-sonnet-5-5"}"#).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::chats::model_of(&state.pool, &id).await.unwrap().0,
+            Some("claude-sonnet-5-5".to_string())
+        );
     }
 
     /// `installed` reaches the wire, and reads `null` wherever the question is meaningless.

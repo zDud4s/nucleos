@@ -112,4 +112,5 @@ export {
  * repeated here because a vendored component is the case most likely to be
  * imported by its own path out of habit.
  */
+export { Slider, type SliderProps } from "./Slider";
 export { Tabs, TabsContent, TabsList, TabsTrigger } from "./vendor/tabs";
