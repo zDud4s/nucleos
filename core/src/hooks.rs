@@ -10720,6 +10720,11 @@ mod tests {
 
     /// The queue settling the request while the route waits: the answer carries the outcome, not a
     /// ticket. The test state runs no queue worker, so the row is moved by hand and nothing races it.
+    ///
+    /// The settler waits for the row to EXIST rather than for a fixed delay. Admission comes after
+    /// three git subprocesses (toplevel, branch, project), and on Windows those alone took ~150ms:
+    /// a settler that slept 100ms and fired once updated zero rows, the request was admitted after
+    /// it, and the route waited out its whole budget on a row nobody would ever move.
     #[tokio::test]
     async fn a_session_merge_that_settles_inside_the_wait_says_how_it_ended() {
         let state = test_state().await;
@@ -10727,13 +10732,26 @@ mod tests {
 
         let pool = state.pool.clone();
         let settler = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            sqlx::query(
-                "UPDATE vcs_requests SET status = 'blocked',                  failure_reason = 'uncommitted work in the way' WHERE id = 1",
-            )
-            .execute(&pool)
-            .await
-            .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let moved = sqlx::query(
+                    "UPDATE vcs_requests SET status = 'blocked', \
+                     failure_reason = 'uncommitted work in the way' \
+                     WHERE id = 1 AND status = 'queued'",
+                )
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected();
+                if moved == 1 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "request #1 was never admitted"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         });
 
         let decision = session_git_decision_within(
