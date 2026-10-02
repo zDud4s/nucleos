@@ -70,9 +70,16 @@ fn git_bin() -> String {
 /// The diff-side command strings `inspect.rs` disables (`diff.external`, a `textconv` filter) are
 /// deliberately absent: nothing here produces a diff, and carrying flags that cannot apply would
 /// advertise a protection that was never at issue in this module.
+///
+/// It also carries [`crate::git_exec::QUEUE_MARKER`]. `merge_branch` and `catch_up` run real merges
+/// in `job-*`/`item-*` checkouts, and with an absolute `core.hooksPath` the repository's
+/// `pre-merge-commit` guard sees them: without the marker it refuses every one, and each refusal
+/// reads as a conflict. `git_exec::run_git` comes through here too, so this is the one place the
+/// marker has to be set for every git process this crate starts.
 pub(crate) fn git() -> tokio::process::Command {
     let mut command = tokio::process::Command::new(git_bin());
     command.arg("-c").arg("core.fsmonitor=");
+    command.env(crate::git_exec::QUEUE_MARKER, "1");
     command
 }
 
@@ -221,24 +228,88 @@ pub async fn adopt_or_create_at(
 
     match create_at(project_root, owner, base).await {
         Ok(info) => Ok(info),
+        // A refusal before git ran (a spaced or relative root) says nothing about the branch.
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(error),
         Err(error) => {
-            // Only try this once, and only for a branch that exists with no checkout on it: `git
-            // branch -D` refuses a branch some worktree is using, which is the one case where
-            // deleting would take somebody else's work.
-            let deleted = git()
+            if !local_branch_exists(project_root, &branch).await {
+                return Err(error);
+            }
+            // The branch may carry commits nothing else holds: a checkpoint, or the commit the
+            // orphan sweep made to preserve a tree before collecting it. Deleting it is only safe
+            // when every one of its commits is already reachable from where the new tree starts;
+            // otherwise the branch IS the work, and the tree is re-attached to it instead.
+            let start = base.unwrap_or("HEAD");
+            if is_ancestor(project_root, &branch, start).await {
+                // Only try this once. `git branch -D` also refuses a branch some worktree is using,
+                // which is the one case where deleting would take somebody else's checkout.
+                let deleted = git()
+                    .arg("-C")
+                    .arg(project_root)
+                    .arg("branch")
+                    .arg("-D")
+                    .arg(&branch)
+                    .output()
+                    .await;
+                return match deleted {
+                    Ok(output) if output.status.success() => {
+                        create_at(project_root, owner, base).await
+                    }
+                    _ => Err(error),
+                };
+            }
+            let attached = git()
                 .arg("-C")
                 .arg(project_root)
-                .arg("branch")
-                .arg("-D")
+                .arg("worktree")
+                .arg("add")
+                .arg(&path)
                 .arg(&branch)
                 .output()
-                .await;
-            match deleted {
-                Ok(output) if output.status.success() => create_at(project_root, owner, base).await,
-                _ => Err(error),
+                .await?;
+            if !attached.status.success() {
+                let stderr = String::from_utf8_lossy(&attached.stderr);
+                return Err(io::Error::other(format!(
+                    "{error}; re-attaching {branch}, which carries unmerged work, failed too: {stderr}"
+                )));
             }
+            // Where it was born is no longer known, and HEAD is where it stands rather than where
+            // it began — so no base, exactly as for an adopted tree.
+            Ok(WorktreeInfo {
+                path,
+                branch,
+                base_sha: None,
+            })
         }
     }
+}
+
+/// Whether `refs/heads/<branch>` exists in `project_root`'s repository.
+async fn local_branch_exists(project_root: &Path, branch: &str) -> bool {
+    git()
+        .arg("-C")
+        .arg(project_root)
+        .arg("show-ref")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Whether every commit of `ancestor` is reachable from `descendant`. A failure to answer is
+/// `false`, which is the answer that keeps the branch.
+async fn is_ancestor(project_root: &Path, ancestor: &str, descendant: &str) -> bool {
+    git()
+        .arg("-C")
+        .arg(project_root)
+        .arg("merge-base")
+        .arg("--is-ancestor")
+        .arg(ancestor)
+        .arg(descendant)
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
 }
 
 /// `create`, on a named starting point instead of wherever the project's checkout happens to stand.
@@ -407,6 +478,18 @@ pub(crate) async fn catch_up(worktree: &Path, source: &str) -> io::Result<CatchU
         .output()
         .await?;
     if !unmerged.status.success() || unmerged.stdout.is_empty() {
+        // A merge refused after it started — a `pre-merge-commit` hook, a commit that failed —
+        // leaves MERGE_HEAD and a staged tree behind with no conflict in it. That is not the staged
+        // conflict this function promises, and leaving it would make the next merge here fail on
+        // "you have not concluded your merge". Best effort, as in `merge_branch`; with no merge in
+        // progress it is a no-op that fails harmlessly.
+        let _ = git()
+            .arg("-C")
+            .arg(worktree)
+            .arg("merge")
+            .arg("--abort")
+            .output()
+            .await;
         let stderr = String::from_utf8_lossy(&merged.stderr);
         return Err(io::Error::other(format!(
             "merging {source} left no conflicted paths to resolve: {stderr}"
@@ -1728,7 +1811,78 @@ pub async fn orphaned_worktrees(
         orphans_under(&legacy, &live, min_age, &mut orphans).await;
     }
 
-    Ok(orphans)
+    // `NUCLEOS_WORKTREE_ROOT` is one directory for every project, so a `run-5` under it may be
+    // another repository's tree. That repository's git does not list it here, which is exactly the
+    // `Registration::Absent` that lets `collect_by_hand` delete it — so a tree is only this
+    // project's to sweep when this repository's own bookkeeping claims it.
+    let mut ours = Vec::with_capacity(orphans.len());
+    for orphan in orphans {
+        if belongs_to_project(project_root, &orphan).await {
+            ours.push(orphan);
+        } else {
+            tracing::debug!(
+                path = %orphan.display(),
+                project = %project_root.display(),
+                "leaving a worktree directory another repository owns to that repository's sweep"
+            );
+        }
+    }
+    Ok(ours)
+}
+
+/// Whether a directory under a worktree root is `project_root`'s to sweep.
+///
+/// Yes when this repository's `git worktree list` registers it, or when its `.git` file points into
+/// this repository's git directory (a registration gone stale). A directory with no `.git` at all is
+/// one `git worktree add` never finished, and holds no history anybody could lose. Anything else —
+/// a `.git` naming another repository, a `.git` directory, an answer git could not give — is not
+/// ours, and the sweep leaves it.
+async fn belongs_to_project(project_root: &Path, dir: &Path) -> bool {
+    let dot_git = dir.join(".git");
+    if tokio::fs::symlink_metadata(&dot_git).await.is_err() {
+        return true;
+    }
+    if matches!(
+        registration(project_root, dir).await,
+        Ok(Registration::Present)
+    ) {
+        return true;
+    }
+
+    let Ok(contents) = tokio::fs::read_to_string(&dot_git).await else {
+        return false;
+    };
+    let Some(gitdir) = contents.trim().strip_prefix("gitdir:") else {
+        return false;
+    };
+    let gitdir = PathBuf::from(gitdir.trim());
+
+    let Ok(output) = git()
+        .arg("-C")
+        .arg(project_root)
+        .arg("rev-parse")
+        .arg("--path-format=absolute")
+        .arg("--git-common-dir")
+        .output()
+        .await
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let common = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if path_contains(&common, &gitdir) {
+        return true;
+    }
+    // Spelled differently (a short 8.3 name, a symlinked temp dir): compare where they resolve.
+    match (
+        std::fs::canonicalize(&common),
+        std::fs::canonicalize(&gitdir),
+    ) {
+        (Ok(common), Ok(gitdir)) => path_contains(&common, &gitdir),
+        _ => false,
+    }
 }
 
 /// The last resort for an orphan `git worktree remove` would not take: delete the directory here.
@@ -4342,6 +4496,189 @@ mod tests {
 
         assert_eq!(collected, 1);
         assert!(!orphan.path.exists());
+    }
+
+    /// Under a shared `NUCLEOS_WORKTREE_ROOT`, project A's sweep must not collect project B's tree.
+    /// A's git does not list it, which is the very `Absent` that used to let `collect_by_hand`
+    /// delete it. A's own orphan is the control.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_shared_root_sweep_leaves_another_repositorys_tree_alone() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('project-a', 'active', ?)")
+            .bind(repo_a.path().to_string_lossy().as_ref())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let ours = create(repo_a.path(), Owner::Run(45))
+            .await
+            .expect("create A's worktree");
+        let theirs = create(repo_b.path(), Owner::Run(46))
+            .await
+            .expect("create B's worktree");
+
+        let orphans = orphaned_worktrees(&pool, repo_a.path(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(orphans, vec![ours.path.clone()]);
+
+        let collected = reconcile_orphaned_worktrees(&pool, Duration::ZERO, &[])
+            .await
+            .unwrap();
+        assert_eq!(collected, 1);
+        assert!(!ours.path.exists(), "the control must be collected");
+        assert!(
+            theirs.path.join(".git").exists(),
+            "project A's sweep deleted project B's worktree"
+        );
+    }
+
+    /// Points `repo`'s hooks (shared by all its worktrees) at a directory holding one
+    /// `pre-merge-commit` with `body`.
+    fn install_pre_merge_commit(repo: &Path, hooks: &Path, body: &str) {
+        std::fs::create_dir_all(hooks).expect("create hooks directory");
+        let hook = hooks.join("pre-merge-commit");
+        std::fs::write(&hook, format!("#!/bin/sh\n{body}\n")).expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .expect("make hook executable");
+        }
+        assert!(git_ok(
+            repo,
+            &[
+                OsStr::new("config"),
+                OsStr::new("core.hooksPath"),
+                hooks.as_os_str(),
+            ],
+        ));
+    }
+
+    /// Commits `name` in `tree`, so two checkouts diverge and a merge between them is a real one.
+    fn commit_file(tree: &Path, name: &str) {
+        std::fs::write(tree.join(name), "content\n").expect("write");
+        assert!(git_ok(tree, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            tree,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new(name)]
+        ));
+    }
+
+    /// The repository's queue guard refuses a merge that does not carry `NUCLEOS_QUEUE_EXEC`, and
+    /// an item merge into a job's tree is the queue's own. Without the marker every item merge was
+    /// refused by the hook and recorded `conflicted`. The plain `git merge` is the control: it
+    /// proves the hook really runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_item_merge_carries_the_queue_marker_past_the_merge_guard() {
+        let _lock = env_lock();
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let hooks = root.path().join("hooks");
+        install_pre_merge_commit(
+            repo.path(),
+            &hooks,
+            "[ -n \"$NUCLEOS_QUEUE_EXEC\" ] || exit 1",
+        );
+
+        let job = create(repo.path(), Owner::Job(1)).await.expect("job");
+        let item = create(repo.path(), Owner::Item(2)).await.expect("item");
+        commit_file(&job.path, "job.txt");
+        commit_file(&item.path, "item.txt");
+
+        let by_hand = Command::new("git")
+            .arg("-C")
+            .arg(&job.path)
+            .args(["merge", "--no-ff", "--no-edit", &item.branch])
+            .env_remove(crate::git_exec::QUEUE_MARKER)
+            .output()
+            .expect("git should start");
+        assert!(!by_hand.status.success(), "the guard hook did not run");
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&job.path)
+            .args(["merge", "--abort"])
+            .status();
+
+        assert!(
+            merge_branch(&job.path, &item.branch)
+                .await
+                .expect("merge the item"),
+            "the queue's own merge was refused by the queue guard"
+        );
+        assert!(job.path.join("item.txt").exists());
+    }
+
+    /// A merge that starts and is then refused — here by a `pre-merge-commit` hook — leaves
+    /// MERGE_HEAD with no conflict in it. `catch_up` reports that as an error and must not leave
+    /// the merge half-done for the next one to trip over.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_catch_up_leaves_no_merge_in_progress() {
+        let _lock = env_lock();
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let hooks = root.path().join("hooks");
+        install_pre_merge_commit(repo.path(), &hooks, "exit 1");
+
+        let theirs = create(repo.path(), Owner::Item(1)).await.expect("theirs");
+        let mine = create(repo.path(), Owner::Item(2)).await.expect("mine");
+        commit_file(&theirs.path, "theirs.txt");
+        commit_file(&mine.path, "mine.txt");
+
+        assert!(catch_up(&mine.path, &theirs.branch).await.is_err());
+        assert!(
+            !git_ok(
+                &mine.path,
+                &[
+                    OsStr::new("rev-parse"),
+                    OsStr::new("-q"),
+                    OsStr::new("--verify"),
+                    OsStr::new("MERGE_HEAD"),
+                ],
+            ),
+            "a refused catch-up left MERGE_HEAD behind"
+        );
+        assert!(!mine.path.join("theirs.txt").exists());
+    }
+
+    /// An item branch whose tree is gone but which carries commits nothing else holds — a
+    /// checkpoint, or the sweep's preservation commit — is re-attached, never `branch -D`'d.
+    #[tokio::test(flavor = "current_thread")]
+    async fn recreating_an_item_tree_reattaches_a_branch_with_unmerged_work() {
+        let _lock = env_lock();
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+
+        let first = adopt_or_create_at(repo.path(), Owner::Item(8), None)
+            .await
+            .expect("create the item's tree");
+        commit_file(&first.path, "checkpoint.txt");
+        let checkpoint = git_stdout(&first.path, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
+        std::fs::remove_dir_all(&first.path).expect("remove the checkout");
+
+        let again = adopt_or_create_at(repo.path(), Owner::Item(8), None)
+            .await
+            .expect("re-attach the item's branch");
+        assert_eq!(again.path, first.path);
+        assert!(
+            again.path.join("checkpoint.txt").exists(),
+            "the checkpointed work is gone from the recreated tree"
+        );
+        assert_eq!(
+            git_stdout(
+                repo.path(),
+                &[OsStr::new("rev-parse"), OsStr::new("nucleos/item-8")]
+            ),
+            checkpoint,
+            "the branch carrying unmerged work was deleted"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
