@@ -1783,6 +1783,18 @@ pub const TERMINAL_STATUSES: [&str; 8] = [
     STATUS_CANCELLED,
 ];
 
+/// [`LIVE_STATUSES`] as a SQL list, for the compare-and-set every job status write makes.
+///
+/// A macro rather than a `const` because `concat!` only takes literals, and sqlx refuses SQL built
+/// at run time; `concat!` keeps every statement a `&'static str` while the list lives in one place.
+/// `the_status_guard_names_every_live_status` holds it against the constant. Defined above its
+/// first use because `macro_rules!` is scoped by position in the file.
+macro_rules! live_statuses_sql {
+    () => {
+        "('planning','implementing','gating','reviewing','awaiting_approval','waiting')"
+    };
+}
+
 /// Writes a job's terminal status and stamps it done.
 ///
 /// Clears `wait_reason` on the way out: a finished job is not waiting for anything, and a stale
@@ -1792,7 +1804,13 @@ pub const TERMINAL_STATUSES: [&str; 8] = [
 /// place that does both for jobs — every ending funnels here, from `finish` to `cancel` to the
 /// startup reconciliation, so a new ending added later cannot forget. The sweeps are backstops, not
 /// the mechanism: they repair what a crash left behind rather than what this function forgot.
-pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Result<()> {
+///
+/// **Compare-and-set: only a live job is retired, and the answer says whether this call did it.**
+/// A pass reads the job, then spends minutes in a gate or a node launch before it writes; a cancel
+/// landing in between used to be overwritten by whatever that pass wrote next — `gate_failed`
+/// over `cancelled`, or worse, `implementing` with the next item started. The first ending is the
+/// one that stands, and a `false` here tells the caller it is not the one who ended the job.
+pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Result<bool> {
     if !TERMINAL_STATUSES.contains(&status) {
         // Written anyway. A job left live would hold the project's exclusivity slot forever and
         // take the whole project's autonomy down with it, which is worse than a worktree directory
@@ -1803,27 +1821,48 @@ pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Resul
             "retiring a job into a status the worktree GC does not collect"
         );
     }
-    sqlx::query(
+    let retired = sqlx::query(concat!(
         "UPDATE jobs SET status = ?, completed_at = ?, wait_reason = NULL, resume_status = NULL
-         WHERE id = ?",
-    )
+         WHERE id = ? AND status IN ",
+        live_statuses_sql!()
+    ))
     .bind(status)
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(job_id)
     .execute(pool)
     .await?;
+    // Closed and released whichever way the write went. A job that was already over has no live
+    // findings and holds no slot, so both are no-ops for it — and a backstop if something left one
+    // behind.
     if let Err(error) = crate::knowledge::close_working_for_job(pool, job_id).await {
         // A job left live holds the project's exclusivity slot forever, which is worse than a
         // finding the hourly retention net will close later. Retirement therefore continues.
         tracing::warn!(job_id, %error, "job: failed to close working findings");
     }
     crate::concurrency::release(pool, crate::worktree::Owner::Job(job_id)).await?;
-    Ok(())
+    Ok(retired.rows_affected() > 0)
 }
 
 /// Records how a job ended.
 pub async fn finish(pool: &SqlitePool, job_id: i64, outcome: Outcome) -> sqlx::Result<()> {
-    retire(pool, job_id, outcome.as_status()).await
+    retire(pool, job_id, outcome.as_status()).await.map(drop)
+}
+
+/// Moves a job to another live stage, but only while it is still live.
+///
+/// `false` means the job ended — cancelled, expired, retired by another path — between the read
+/// that led here and this write. The caller must stop: writing the stage anyway is exactly what
+/// used to bring a cancelled job back to `implementing` and start its next item.
+async fn set_live_status(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Result<bool> {
+    let moved = sqlx::query(concat!(
+        "UPDATE jobs SET status = ? WHERE id = ? AND status IN ",
+        live_statuses_sql!()
+    ))
+    .bind(status)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(moved.rows_affected() > 0)
 }
 
 /// Parks a job that could not start its next node, so it is retried rather than abandoned.
@@ -1845,14 +1884,17 @@ pub async fn wait(pool: &SqlitePool, job_id: i64, reason: &str) -> sqlx::Result<
 /// pause while the reason still holds. Without it, the second call would record `waiting` as the
 /// stage to return to and the job would never find its way home.
 pub async fn pause(pool: &SqlitePool, job_id: i64, status: &str, reason: &str) -> sqlx::Result<()> {
-    sqlx::query(
+    // Live jobs only, for `retire`'s reason: parking a job that was cancelled meanwhile would make
+    // it live again, with `cancelled` filed as the stage to return to.
+    sqlx::query(concat!(
         "UPDATE jobs
          SET resume_status = CASE WHEN status NOT IN ('waiting','awaiting_approval')
                                   THEN status ELSE resume_status END,
              status = ?,
              wait_reason = ?
-         WHERE id = ?",
-    )
+         WHERE id = ? AND status IN ",
+        live_statuses_sql!()
+    ))
     .bind(status)
     .bind(reason)
     .bind(job_id)
@@ -3122,8 +3164,8 @@ async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<Reconci
 
     // The two statuses excluded here are `node_in_flight`'s, written out because sqlx will not take
     // SQL built at runtime. `a_node_still_in_flight_is_not_reconciled` holds the two in step.
-    let landed: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT i.ordinal, r.status
+    let landed: Vec<(i64, i64, String)> = sqlx::query_as(
+        "SELECT i.ordinal, r.id, r.status
          FROM job_items i JOIN runs r ON r.id = i.run_id
          WHERE i.job_id = ? AND i.status = 'running'
            AND r.status NOT IN ('running','awaiting_approval')",
@@ -3132,7 +3174,25 @@ async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<Reconci
     .fetch_all(pool)
     .await?;
 
-    for (ordinal, run_status) in landed {
+    for (ordinal, run_id, run_status) in landed {
+        // **A terminal row whose task is still registered is not finished yet.** The run body
+        // writes its ending first and only then decides on a context handoff, inserts the
+        // successor and moves `job_items.run_id` onto it. A pass landing in that gap read the
+        // predecessor's `completed`, called the item implemented and gated or started the next
+        // item while the successor was editing the same tree. The registration outlives every
+        // write the body makes — it drops when the task returns, after the handoff — so waiting
+        // for it closes the gap without a second notion of "in handoff" to keep in step. A cancel
+        // removes the entry itself before it writes, and a restart starts with none, so neither
+        // can leave an item waiting on a task that is not there.
+        if state
+            .run_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&run_id)
+        {
+            continue;
+        }
+
         // Only `completed` is done. `timed_out`, `cancelled` and `interrupted` all leave a tree
         // holding edits no gate has measured, and calling any of them finished would let the next
         // item build on top of them — so all three stop the chain.
@@ -3193,12 +3253,16 @@ async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<Reconci
             }
         }
 
-        sqlx::query("UPDATE job_items SET status = ? WHERE job_id = ? AND ordinal = ?")
-            .bind(item_status)
-            .bind(job.id)
-            .bind(ordinal)
-            .execute(pool)
-            .await?;
+        // `AND status = 'running'`: a job cancel marks the item `cancelled` on its own, and this
+        // pass, having read the row before that, must not write `implemented` back over it.
+        sqlx::query(
+            "UPDATE job_items SET status = ? WHERE job_id = ? AND ordinal = ? AND status = 'running'",
+        )
+        .bind(item_status)
+        .bind(job.id)
+        .bind(ordinal)
+        .execute(pool)
+        .await?;
         match item_status {
             "failed" => {
                 say(
@@ -3339,10 +3403,11 @@ async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
         .execute(pool)
         .await?;
     }
-    sqlx::query("UPDATE jobs SET status = 'implementing' WHERE id = ?")
-        .bind(job.id)
-        .execute(pool)
-        .await?;
+    if !set_live_status(pool, job.id, "implementing").await? {
+        // Ended while its plan was being read. The queue stays written — it is what the job meant
+        // to do, and reads as such — but nothing announces it as a job about to do it.
+        return Ok(());
+    }
 
     let dropped = if planned.dropped > 0 {
         // Said out loud, never silently: a queue cut from seven to five reads downstream as "the
@@ -3617,11 +3682,9 @@ async fn open_the_next_round(
     .execute(pool)
     .await?;
 
-    if !dry {
-        sqlx::query("UPDATE jobs SET status = 'implementing' WHERE id = ?")
-            .bind(job.id)
-            .execute(pool)
-            .await?;
+    if !dry && !set_live_status(pool, job.id, "implementing").await? {
+        // Ended while the replan was being read; see `ingest_plan`.
+        return Ok(());
     }
 
     say(
@@ -3966,7 +4029,9 @@ async fn spawn_node(
                     tracing::warn!(job_id = job.id, run_id, %error, "could not record a node's briefing trace");
                 }
             }
-            if let Some(ItemClaim { ordinal, .. }) = item {
+            // Whether the job was still live to record the node against. `None` is a write that
+            // failed, which says nothing about the job and is left alone as before.
+            let still_live = if let Some(ItemClaim { ordinal, .. }) = item {
                 let _ =
                     sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = ?")
                         .bind(run_id)
@@ -3976,18 +4041,32 @@ async fn spawn_node(
                         .await;
                 // Denormalised on purpose: the item statuses are what a resume actually reads, and
                 // this is here so a row nobody joins does not read as a lie.
-                let _ = sqlx::query(
-                    "UPDATE jobs SET status = 'implementing', stage_cursor = ? WHERE id = ?",
-                )
+                sqlx::query(concat!(
+                    "UPDATE jobs SET status = 'implementing', stage_cursor = ?
+                     WHERE id = ? AND status IN ",
+                    live_statuses_sql!()
+                ))
                 .bind(ordinal as i64)
                 .bind(job.id)
                 .execute(pool)
-                .await;
+                .await
+                .ok()
+                .map(|moved| moved.rows_affected() > 0)
             } else if stage == "review" {
-                let _ = sqlx::query("UPDATE jobs SET status = 'reviewing' WHERE id = ?")
-                    .bind(job.id)
-                    .execute(pool)
-                    .await;
+                set_live_status(pool, job.id, "reviewing").await.ok()
+            } else {
+                None
+            };
+            if still_live == Some(false) {
+                // The job ended while this node was being created — a cancel that swept the job's
+                // runs before this one existed. Left running, it would edit a tree nobody drives
+                // any more, so it is stopped the way that cancel would have stopped it.
+                tracing::info!(
+                    job_id = job.id,
+                    run_id,
+                    "job ended while its node started; cancelling the node"
+                );
+                crate::runs::finalize_termination(state, run_id, STATUS_CANCELLED).await;
             }
             Step::Stopped
         }
@@ -4316,10 +4395,14 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
         .await;
     };
 
-    let _ = sqlx::query("UPDATE jobs SET status = 'gating' WHERE id = ?")
-        .bind(job.id)
-        .execute(pool)
-        .await;
+    // Both writes are compare-and-set, and losing either stops the pass. A gate takes minutes, and
+    // a cancel is most likely to land inside one: the old unconditional `implementing` afterwards
+    // brought the cancelled job back to life, and `record_gate` then checkpointed and moved on to
+    // the next item. `Ok(false)` is the job having ended; an `Err` says nothing about the job and
+    // is let through as before.
+    if matches!(set_live_status(pool, job.id, "gating").await, Ok(false)) {
+        return Step::Stopped;
+    }
     let outcome = crate::gate::run_gate(
         &worktree,
         Path::new(&job.project_root),
@@ -4327,10 +4410,17 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
         crate::state::DEFAULT_GATE_TIMEOUT,
     )
     .await;
-    let _ = sqlx::query("UPDATE jobs SET status = 'implementing' WHERE id = ?")
-        .bind(job.id)
-        .execute(pool)
-        .await;
+    if matches!(
+        set_live_status(pool, job.id, "implementing").await,
+        Ok(false)
+    ) {
+        tracing::info!(
+            job_id = job.id,
+            ordinal,
+            "job ended while its gate ran; the outcome is not recorded"
+        );
+        return Step::Stopped;
+    }
     record_gate(state, job, ordinal, outcome).await
 }
 
@@ -6129,7 +6219,11 @@ pub async fn cancel(state: &AppState, job_id: i64) -> sqlx::Result<CancelOutcome
         .bind(job_id)
         .execute(pool)
         .await?;
-    retire(pool, job_id, STATUS_CANCELLED).await?;
+    if !retire(pool, job_id, STATUS_CANCELLED).await? {
+        // Another ending got there first, between the liveness read above and this write. That
+        // ending stands, and the caller is told the job was already over rather than cancelled.
+        return Ok(CancelOutcome::NotLive);
+    }
 
     let _ = crate::feed::append(
         pool,
@@ -11419,6 +11513,109 @@ mod tests {
         assert_eq!(item_statuses(&pool, job_id).await, vec!["running"]);
     }
 
+    /// The handoff window. A node's body writes `completed` BEFORE it inserts its context-handoff
+    /// successor and moves the item onto it, so a pass in that gap saw a finished node and called
+    /// the item implemented while the successor went on editing the tree. A registration still
+    /// held is what says the body has not finished deciding.
+    #[tokio::test]
+    async fn a_node_whose_task_is_still_registered_is_not_reconciled() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["running"]).await;
+        let run_id = seed_node(&pool, job_id, "implement", "completed").await;
+        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ?")
+            .bind(run_id)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let task = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(60)));
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["running"],
+            "an item was finished while its node's task could still hand it off"
+        );
+
+        // And once the task is gone, the same row is the ending it says it is.
+        state.run_handles.lock().unwrap().remove(&run_id);
+        task.abort();
+        reconcile_nodes(&state, &job).await.unwrap();
+        assert_eq!(item_statuses(&pool, job_id).await, vec!["implemented"]);
+    }
+
+    /// A pass reads a live job, then spends minutes in a gate or a launch before it writes. A
+    /// cancel landing in between used to be overwritten by that write — `implementing` brought the
+    /// job back to life and the next item started. Every status write now finds the job live or
+    /// does nothing, and says which.
+    #[tokio::test]
+    async fn a_cancelled_job_is_not_revived_by_a_pass_that_read_it_live() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", STATUS_CANCELLED)
+            .await
+            .unwrap();
+
+        assert!(
+            !set_live_status(&pool, job_id, "implementing")
+                .await
+                .unwrap()
+        );
+        assert!(!set_live_status(&pool, job_id, "gating").await.unwrap());
+        assert!(!retire(&pool, job_id, "gate_failed").await.unwrap());
+        pause(&pool, job_id, "waiting", "budget").await.unwrap();
+
+        let (status, resume_status): (String, Option<String>) =
+            sqlx::query_as("SELECT status, resume_status FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, STATUS_CANCELLED,
+            "the first ending is the one that stands"
+        );
+        assert_eq!(resume_status, None);
+
+        // The live path is unchanged: a job still running moves, and the first ending wins it.
+        let live = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        assert!(set_live_status(&pool, live, "gating").await.unwrap());
+        assert!(retire(&pool, live, STATUS_CANCELLED).await.unwrap());
+        assert!(!retire(&pool, live, "completed").await.unwrap());
+    }
+
+    /// The guard every status write carries is spelled out as SQL, so it is held against the
+    /// constant the way `LIVE_WHERE_SQL` is: a live status missing from it would make that stage
+    /// unwritable, and an extra one would let a write revive a job that ended.
+    #[test]
+    fn the_status_guard_names_every_live_status() {
+        let guard = live_statuses_sql!();
+        for status in LIVE_STATUSES {
+            assert!(
+                guard.contains(&format!("'{status}'")),
+                "the status guard does not know `{status}`"
+            );
+        }
+        let named = guard
+            .split('\'')
+            .skip(1)
+            .step_by(2)
+            .filter(|token| !token.is_empty())
+            .count();
+        assert_eq!(
+            named,
+            LIVE_STATUSES.len(),
+            "the guard names a status nothing drives"
+        );
+    }
+
     /// Only `completed` is done. A node that timed out, was cancelled or was interrupted leaves the
     /// tree holding edits no gate has measured, and calling any of those finished would let the
     /// next item build on top of them.
@@ -13344,6 +13541,17 @@ mod tests {
         );
         let run_id = run_id.expect("the retried item has a node of its own attached to it");
 
+        // `interrupted` is what a restart writes, and a restarted daemon holds no task for the
+        // run. Drop this one's registration too, or `reconcile_nodes` reads the row as still
+        // inside its handoff window and leaves the item running.
+        if let Some(task) = state
+            .run_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id)
+        {
+            task.abort();
+        }
         sqlx::query("UPDATE runs SET status = 'interrupted', exit_code = NULL WHERE id = ?")
             .bind(run_id)
             .execute(&pool)

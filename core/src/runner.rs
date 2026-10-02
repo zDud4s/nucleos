@@ -2837,9 +2837,14 @@ impl CommandRunner for ClaudeCliRunner {
             policy_violation = policy_unverified_after_stream(request.tool_policy, init_seen);
         }
 
+        // A stdout read error stops this loop listening, and nothing else ever will: the CLI may be
+        // alive and still writing into a pipe nobody drains, so `wait()` below would block until it
+        // chose to exit — or, with a full pipe, forever. Stopping it is the only way to reach the
+        // terminal write the error already decided on.
         if policy_violation.is_some()
             || progress_timeout_elapsed.is_some()
             || turns_exceeded.is_some()
+            || post_launch_error.is_some()
         {
             // Kill the whole tree first so terminating the supervisor cannot orphan its tools.
             drop(tree_killer.take());
@@ -3524,7 +3529,12 @@ impl CommandRunner for CodexCliRunner {
             }
         }
 
-        if progress_timeout_elapsed.is_some() || turns_exceeded.is_some() {
+        // A read error is in the list for the Claude body's reason: nothing is listening any more,
+        // and a CLI still alive behind a broken pipe would hold `wait()` until it chose to exit.
+        if progress_timeout_elapsed.is_some()
+            || turns_exceeded.is_some()
+            || post_launch_error.is_some()
+        {
             // Kill the whole tree first, so terminating the supervisor cannot orphan its tools.
             drop(tree_killer.take());
             let _ = child.start_kill();
