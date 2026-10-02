@@ -40,16 +40,6 @@
         ]
       }
     ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python \"${CLAUDE_PROJECT_DIR}/.ai/scripts/evidence_gate.py\" --hook"
-          }
-        ]
-      }
-    ],
     "SubagentStop": [
       {
         "hooks": [
