@@ -22,6 +22,7 @@ use crate::config::{CouncilConfig, CouncilSeat, SeatAgent, SeatKind, SeatSpec};
 
 pub mod formats;
 pub mod prompts;
+pub mod store;
 pub mod tally;
 
 /// The roster on this machine, or `None` when there is no home directory to hang it off.
@@ -813,14 +814,52 @@ pub async fn list_council_rows(
 
 /// Moves the council to a phase. Guarded on `running`, so a cancel that landed first is not undone
 /// by a phase boundary crossed a moment later.
+///
+/// Also moves the new round/phase position (`store::set_position`) — a dual write that lasts only
+/// until every reader has moved off `stage`.
 pub async fn set_stage(pool: &sqlx::SqlitePool, id: &str, stage: i64) -> sqlx::Result<()> {
     sqlx::query("UPDATE council_runs SET stage = ? WHERE id = ? AND status = ?")
         .bind(stage)
         .bind(id)
         .bind(STATUS_RUNNING)
         .execute(pool)
-        .await
-        .map(|_| ())
+        .await?;
+    let rounds: Option<(i64,)> = sqlx::query_as("SELECT rounds FROM council_runs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    let Some((rounds,)) = rounds else {
+        return Ok(());
+    };
+    let (round, phase) = position_of_stage(stage, rounds);
+    store::set_position(pool, id, round, phase).await
+}
+
+/// The round and phase a legacy `stage` number stands for. The same mapping `0154_council_rounds.sql`
+/// applies to the councils it copies: 3 is the revision only when there was a second round, and
+/// otherwise — like anything past it — the chairman, which is always the last stage.
+fn position_of_stage(stage: i64, rounds: i64) -> (i64, &'static str) {
+    match stage {
+        s if s <= STAGE_ANSWER => (0, store::PHASE_ANSWER),
+        STAGE_RANKING => (1, store::PHASE_CRITIQUE),
+        STAGE_REVISION if rounds >= ROUNDS_WITH_REVISION => (1, store::PHASE_REVISE),
+        _ => (1, PHASE_CHAIRMAN),
+    }
+}
+
+/// The position of a council whose seats are done and whose chairman is synthesising. Not a step
+/// phase — the chairman has no row in `council_rounds` — only a value of `current_phase`.
+const PHASE_CHAIRMAN: &str = "chairman";
+
+/// The legacy `[{anon, rank}]` vote as the new critique payload: `{"reviews": [], "ranking": [...]}`,
+/// labels best first, ties in the order they were given. The same conversion `0154` applies to the
+/// councils it copies; no vote is no payload, and a blank vote is an empty ballot.
+fn critique_payload(rankings: Option<&[Ranking]>) -> Option<String> {
+    let mut ranked: Vec<&Ranking> = rankings?.iter().collect();
+    // Stable, so a tie keeps the order the seat gave it.
+    ranked.sort_by_key(|r| r.rank);
+    let ballot: Vec<&str> = ranked.iter().map(|r| r.anon.as_str()).collect();
+    Some(serde_json::json!({ "reviews": [], "ranking": ballot }).to_string())
 }
 
 /// Records the phase-1 shuffle.
@@ -904,8 +943,20 @@ pub async fn set_stage1(
     .bind(id)
     .bind(seat_idx as i64)
     .execute(pool)
+    .await?;
+    // Dual write, until every reader has moved to `council_rounds`.
+    store::upsert_step(
+        pool,
+        id,
+        0,
+        seat_idx as i64,
+        store::PHASE_ANSWER,
+        run_id,
+        status,
+        error,
+        None,
+    )
     .await
-    .map(|_| ())
 }
 
 /// Records how one seat's phase 2 ended, and what it voted.
@@ -931,8 +982,21 @@ pub async fn set_stage2(
     .bind(id)
     .bind(seat_idx as i64)
     .execute(pool)
+    .await?;
+    // Dual write, until every reader has moved to `council_rounds`.
+    let payload = critique_payload(rankings);
+    store::upsert_step(
+        pool,
+        id,
+        1,
+        seat_idx as i64,
+        store::PHASE_CRITIQUE,
+        run_id,
+        status,
+        error,
+        payload.as_deref(),
+    )
     .await
-    .map(|_| ())
 }
 
 /// Records how one seat's second round ended.
@@ -958,8 +1022,20 @@ pub async fn set_revision(
     .bind(id)
     .bind(seat_idx as i64)
     .execute(pool)
+    .await?;
+    // Dual write, until every reader has moved to `council_rounds`.
+    store::upsert_step(
+        pool,
+        id,
+        1,
+        seat_idx as i64,
+        store::PHASE_REVISE,
+        run_id,
+        status,
+        error,
+        None,
+    )
     .await
-    .map(|_| ())
 }
 
 /// Why a council could not be started. Every variant is a refusal BEFORE anything is spent.
