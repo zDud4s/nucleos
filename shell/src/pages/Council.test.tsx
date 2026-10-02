@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { act } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -314,7 +317,7 @@ describe("Council - a seat's answer", () => {
 
     await renderCouncil("/council/c-1");
 
-    const seats = await panelFor("Seats");
+    const seats = await panelFor("Deliberation");
     // The emphasis is an element, and the asterisks are gone with it.
     await waitFor(() => {
       const strong = Array.from(seats.querySelectorAll("strong")).find(
@@ -357,9 +360,12 @@ describe("Council - a seat's answer", () => {
     // The ranking was cast over the FIRST answers, so a card that dropped the
     // round-0 answer for a later one would be showing a leaderboard of text it
     // never displayed.
-    const seats = await panelFor("Seats");
+    // The panel opens on the last round, and the answer lives in the Answers tab only.
+    const seats = await panelFor("Deliberation");
+    const answers = await openRound("Answers");
+    expect(seats.contains(answers)).toBe(true);
     await waitFor(() =>
-      expect(seats.textContent).toContain("yes, ship it — the tests carry the proof"),
+      expect(answers.textContent).toContain("yes, ship it — the tests carry the proof"),
     );
   });
 
@@ -385,7 +391,7 @@ describe("Council - a seat's answer", () => {
 
     await renderCouncil("/council/c-1");
 
-    const seats = await panelFor("Seats");
+    const seats = await panelFor("Deliberation");
     expect(within(seats).getByText("the seat timed out")).toBeDefined();
     expect(within(seats).getByText("failed")).toBeDefined();
   });
@@ -422,7 +428,7 @@ describe("Council - a step the daemon could not read", () => {
 
     await renderCouncil("/council/c-1");
 
-    const seats = await panelFor("Seats");
+    const seats = await panelFor("Deliberation");
     expect(within(seats).getByText("invalid")).toBeDefined();
     expect(within(seats).queryByText("failed")).toBeNull();
   });
@@ -439,7 +445,7 @@ describe("Council - a seat an agent filled", () => {
 
     await renderCouncil("/council/c-1");
 
-    const seats = await panelFor("Seats");
+    const seats = await panelFor("Deliberation");
     // Both facts on the card, not one. The name answers who, and the model is
     // what a reader reaches for when the answer is bad — a card that showed
     // only the name would have taken that away to make room for it.
@@ -459,7 +465,7 @@ describe("Council - a seat an agent filled", () => {
 
     // The non-regression half: agents are an addition to this page, not a
     // migration of it, and a roster written the old way renders as it did.
-    const seats = await panelFor("Seats");
+    const seats = await panelFor("Deliberation");
     expect(within(seats).getByText("Cloud")).toBeDefined();
     expect(within(seats).getByText("claude-opus-4")).toBeDefined();
   });
@@ -478,7 +484,7 @@ describe("Council - a seat whose agent was deleted", () => {
     // pair — an id with no name — is the deleted agent, and the daemon is not
     // wrong to serve it. The title falls back to the id: ugly, and still an
     // answer to who. An empty title would be the page pretending nobody sat.
-    const seats = await panelFor("Seats");
+    const seats = await panelFor("Deliberation");
     const title = seats.querySelector(".council-seat-name");
     expect(title?.textContent?.trim()).toBe("ag-7");
     expect(within(seats).getByText(/no longer in the catalogue/i)).toBeDefined();
@@ -1335,11 +1341,15 @@ describe("Council - the list row and the config", () => {
  * or to a named group, because the seat grid above the timeline repeats the
  * answers and the latest step and would otherwise satisfy a query by accident.
  *
- * UI contract (what `CouncilRounds.tsx` must render):
- *  - a level-2 heading "Rounds" and a `tablist` named "Rounds" with one `tab` per round 0..rounds_run:
- *    "Answers" (round 0), "Round 1", "Round 2"; "Answers" is selected on first render. Tabs are Radix
- *    (`ui/Tabs`), so they are selected by `mouseDown`, and only the selected `tabpanel` is mounted.
- *  - round 0 panel: each seat's answer text, under the seat's `seatName`.
+ * UI contract (what `CouncilRounds.tsx` renders as `CouncilDeliberation`):
+ *  - a level-2 heading "Deliberation" (no "Seats" or "Rounds" heading) and a `tablist` named "Rounds"
+ *    with one `tab` per round 0..lastRound: "Answers" (round 0), "Round 1", "Round 2"; the LAST round is
+ *    selected on first render. Tabs are Radix (`ui/Tabs`), so they are selected by `mouseDown`, and only
+ *    the selected `tabpanel` is mounted.
+ *  - each tab panel holds a `list` named "Seats" with one `listitem` per seat, side by side: the seat's
+ *    title, model, role, "Seat <n>" (1-based), then that round's step head and content.
+ *  - round 0 panel: each seat's answer text, once, with a more/less button named
+ *    "more of <seatName>'s answer" / "less of <seatName>'s answer".
  *  - round n panel, per seat that voted: a `list` named "Ballot of <seatName>" whose `listitem`s are the
  *    DE-ANONYMISED ranking, best first, as seat names -- never the bare labels.
  *  - per reviewing seat a `group` named "Critiques by <seatName>"; inside, one `group` per reviewed
@@ -1440,16 +1450,83 @@ describe("Council - round by round", () => {
 
     await renderCouncil("/council/c-1");
 
-    expect(await screen.findByRole("heading", { level: 2, name: "Rounds" })).toBeDefined();
+    expect(await screen.findByRole("heading", { level: 2, name: "Deliberation" })).toBeDefined();
     const tabs = within(await screen.findByRole("tablist", { name: "Rounds" })).getAllByRole("tab");
     expect(tabs.map((tab) => tab.textContent)).toEqual(["Answers", "Round 1", "Round 2"]);
-    expect(tabs[0].getAttribute("aria-selected")).toBe("true");
+    expect(tabs[2].getAttribute("aria-selected")).toBe("true");
 
-    const panel = await screen.findByRole("tabpanel");
+    const panel = await openRound("Answers");
     expect(panel.textContent).toContain("alpha");
     expect(panel.textContent).toContain("line one");
     expect(panel.textContent).toContain("beta says ship");
     expect(panel.textContent).toContain("gamma says wait");
+  });
+
+  it("draws one deliberation panel with the seats side by side and no separate seats panel", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+
+    await renderCouncil("/council/c-1");
+
+    const panel = await panelFor("Deliberation");
+    expect(screen.queryByRole("heading", { level: 2, name: "Seats" })).toBeNull();
+    expect(screen.queryByRole("heading", { level: 2, name: "Rounds" })).toBeNull();
+    const seats = within(panel).getByRole("list", { name: "Seats" });
+    expect(within(seats).getAllByRole("listitem", { hidden: false }).filter((li) => li.parentElement === seats)).toHaveLength(3);
+  });
+
+  it("opens on the last round", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+
+    await renderCouncil("/council/c-1");
+
+    const tab = await screen.findByRole("tab", { name: "Round 2" });
+    expect(tab.getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("tab", { name: "Answers" }).getAttribute("aria-selected")).toBe("false");
+  });
+
+  it("shows each seat's answer exactly once", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+
+    await renderCouncil("/council/c-1");
+    await openRound("Answers");
+
+    expect(screen.getAllByText("beta says ship")).toHaveLength(1);
+  });
+
+  it("names more and less after the seat", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+
+    await renderCouncil("/council/c-1");
+    await openRound("Answers");
+
+    const more = await screen.findByRole("button", { name: "more of alpha's answer" });
+    expect(more.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(more);
+    const less = await screen.findByRole("button", { name: "less of alpha's answer" });
+    expect(less.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("labels a seat by its 1-based position", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+
+    await renderCouncil("/council/c-1");
+
+    const panel = await panelFor("Deliberation");
+    expect(within(panel).getByText("Seat 1")).toBeDefined();
+    expect(within(panel).queryByText("Seat 0")).toBeNull();
+  });
+
+  it("lays the seats out in a 16rem auto-fill grid and leaves no dead flex on the row question", () => {
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "council.css"), "utf8").replace(
+      /\/\*[\s\S]*?\*\//g,
+      "",
+    );
+    const body = (rule: RegExp) => rule.exec(css)?.[1] ?? "";
+
+    expect(body(/\.council-seats\s*\{([^}]*)\}/)).toMatch(
+      /grid-template-columns:\s*repeat\(\s*auto-fill\s*,\s*minmax\(\s*16rem\s*,\s*1fr\s*\)\s*\)/,
+    );
+    expect(body(/\.council-row-question\s*\{([^}]*)\}/)).not.toMatch(/(^|[;\s])flex(-[a-z]+)?\s*:/);
   });
 
   it("de-anonymises a ballot into seat names, best first", async () => {

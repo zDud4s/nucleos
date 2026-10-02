@@ -24,10 +24,8 @@ import {
   type RosterOverride,
   type RosterSeat,
   type SeatView,
-  type StepView,
 } from "../data/council";
-import { CouncilRich } from "./CouncilRich";
-import { CouncilRounds, StepTail } from "./CouncilRounds";
+import { CouncilDeliberation } from "./CouncilRounds";
 import { CouncilSynthesis } from "./CouncilSynthesis";
 import { clearDraft, draftFrom, offerDraft, peekDraft } from "./council-draft";
 import {
@@ -826,12 +824,9 @@ function CouncilDetail({ id }: { id: string }) {
           the seats ranked each other, then the deliberation itself. */}
       <CouncilSynthesis view={detail} />
       <Leaderboard leaderboard={detail.leaderboard} seats={detail.seats} />
-      <SeatGrid seats={detail.seats} running={councilIsAlive(detail.status)} />
-      {/* How each seat got where the grid shows it, round by round. Only once a
-          critique round has run: before that its one tab, "Answers", is the
-          seat grid again, word for word — and while a seat is still answering,
-          the copy would show its settled answer twice beside the live tail. */}
-      {detail.rounds_run >= 1 && <CouncilRounds view={detail} />}
+      {/* Always drawn: before any critique round its one tab, "Answers", is
+          where the seats' answers live, and it is the only place they do. */}
+      <CouncilDeliberation view={detail} running={councilIsAlive(detail.status)} />
     </>
   );
 }
@@ -869,178 +864,6 @@ function DetailError({ error }: { error: unknown }) {
 function CancelRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return <ErrorNote>the núcleo did not answer — this council was not cancelled</ErrorNote>;
-}
-
-/* ------------------------------------------------------------------- seats -- */
-
-function SeatGrid({ seats, running }: { seats: SeatView[]; running: boolean }) {
-  return (
-    <Panel title="Seats" aside={<Count n={seats.length} />}>
-      {seats.length === 0 ? (
-        <Quiet says="no seat has been recorded for this council yet." />
-      ) : (
-        <Rows label="Seats">
-          {seats.map((seat) => (
-            <SeatCard key={seat.seat_idx} seat={seat} running={running} />
-          ))}
-        </Rows>
-      )}
-    </Panel>
-  );
-}
-
-/**
- * What this seat is called out loud.
- *
- * An agent's name wins the title, and the model stays underneath it in
- * `.council-seat-ref`: *who* answered and *what* ran are different facts, and
- * the second is the one you reach for when the answer is bad. A seat the
- * roster named by model has no name of its own, so its kind is still the title
- * — that case is unchanged and is not the lesser one.
- *
- * The agent's id stands in when the name is gone. `agent_name` is read from
- * the catalogue as the view is built, so a `null` beside a set `agent_id`
- * means the agent has been deleted since it answered — a real state the seat
- * says out loud rather than papering over with a blank line. (`seatName`, used
- * away from the card, falls back to the model instead: there the card is not
- * beside it to say which agent is gone.)
- */
-function seatTitle(seat: SeatView): string {
-  if (seat.agent_name !== null) return seat.agent_name;
-  if (seat.agent_id !== null) return seat.agent_id;
-  const trimmed = seat.kind.trim();
-  return trimmed === "" ? "unnamed seat" : trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
-}
-
-/**
- * The seat's round-0 answer — the text every ranking was cast over, which is
- * why it stays on the card whatever happened after it.
- */
-function answerStep(seat: SeatView): StepView | undefined {
-  return seat.steps.find((step) => step.round === 0 && step.phase === "answer");
-}
-
-/** What a step is called on a card: "answer", or "round 1 · critique". */
-function stepLabel(step: StepView): string {
-  return step.round === 0 && step.phase === "answer" ? "answer" : `round ${step.round} · ${step.phase}`;
-}
-
-/**
- * A critique that settled and ranked nobody. A blank vote is a real answer to a
- * critique round, not a failure and not a gap — the seat chose not to rank.
- * A critique with no readable payload is not this: the daemon marks that one
- * `invalid`, and it reads as such.
- */
-function abstained(step: StepView): boolean {
-  return step.phase === "critique" && step.status === "ok" && (step.critique?.ranking.length ?? 0) === 0;
-}
-
-function SeatCard({ seat, running }: { seat: SeatView; running: boolean }) {
-  const [full, setFull] = useState(false);
-  const answer = answerStep(seat);
-  const latest = seat.steps.length === 0 ? undefined : seat.steps[seat.steps.length - 1];
-  const tailing = seat.steps.find((step) => step.status === "pending" && step.run_id !== null);
-  // An agent that answered and is no longer in the catalogue. Told apart from a
-  // model-named seat by `agent_id`, which the row keeps forever.
-  const agentIsGone = seat.agent_id !== null && seat.agent_name === null;
-
-  return (
-    <Row className="council-seat">
-      <div className="council-seat-head">
-        <span
-          className={
-            seat.agent_id === null ? "council-seat-name" : "council-seat-name council-seat-agent"
-          }
-        >
-          {seatTitle(seat)}
-        </span>
-        <span className="council-seat-idx">seat {seat.seat_idx}</span>
-      </div>
-      <p className="council-seat-ref">{seat.ref}</p>
-      {seat.role !== null && <p className="council-seat-role">plays the {seat.role.replace(/_/g, " ")}</p>}
-      {agentIsGone && (
-        <p className="council-seat-gone">this agent is no longer in the catalogue</p>
-      )}
-
-      {answer === undefined ? (
-        <p className="council-seat-answer">no answer recorded</p>
-      ) : (
-        <>
-          <StepHead step={answer} />
-          {answer.answer !== null ? (
-            <>
-              <div className={full ? "council-seat-answer" : "council-seat-answer council-seat-answer-clamped"}>
-                <CouncilRich text={answer.answer} />
-              </div>
-              {/* The clamp is a few lines, and a seat's answer is routinely
-                  longer. The control unclamps this same block rather than
-                  printing a second copy of it underneath. */}
-              <Button variant="quiet" aria-expanded={full} onClick={() => setFull(!full)}>
-                {full ? "less" : "more"}
-              </Button>
-            </>
-          ) : (
-            // `ok` with no text is the pruned case: the seat did answer, and the
-            // transcript that held it is simply gone now.
-            <p className="council-seat-answer">
-              {answer.status === "ok" ? "answered — the text has expired" : "no answer recorded"}
-            </p>
-          )}
-        </>
-      )}
-
-      {latest !== undefined && latest !== answer && <LatestStep step={latest} />}
-      {/* What the seat is writing right now. Only while the step is pending and
-          the council still runs: a settled step has its stored result above,
-          and a council that ended will never write another byte to any tail. */}
-      {running && tailing !== undefined && tailing.run_id !== null && (
-        <StepTail key={tailing.run_id} runId={tailing.run_id} name={seatName(seat)} />
-      )}
-    </Row>
-  );
-}
-
-/** One step's label, its badge, and the daemon's sentence when it did not go well. */
-function StepHead({ step }: { step: StepView }) {
-  return (
-    <>
-      <div className="council-seat-stage">
-        <span className="council-seat-stage-label">{stepLabel(step)}</span>
-        <StateBadge domain="council_seat" state={step.status} />
-      </div>
-      {step.error !== null && (
-        <p className="council-seat-error" role="alert">
-          {step.error}
-        </p>
-      )}
-    </>
-  );
-}
-
-/**
- * The seat's latest step, when it is not the answer above. Only the latest: the
- * round-by-round account is a timeline of its own, and the card says where the
- * seat stands now.
- */
-function LatestStep({ step }: { step: StepView }) {
-  return (
-    <>
-      <StepHead step={step} />
-      {abstained(step) && <p className="council-seat-abstained">abstained</p>}
-      {step.phase === "revise" && step.status === "ok" && (
-        <>
-          {step.changed === false ? (
-            <p className="council-seat-note">kept its answer</p>
-          ) : step.answer !== null ? (
-            <div className="council-seat-answer">
-              <CouncilRich text={step.answer} />
-            </div>
-          ) : null}
-          {step.why !== null && <p className="council-seat-note">{step.why}</p>}
-        </>
-      )}
-    </>
-  );
 }
 
 /* ------------------------------------------------------------- leaderboard -- */

@@ -281,17 +281,30 @@
 
 /* =================================================================== seats == */
 
-/* A seat's row stacks its head, answers and phases a step further apart than the
-   row's own default. */
-.council-seat {
-  gap: var(--space-2);
+/**
+ * One round across every seat, side by side: the comparison a reader actually
+ * makes. Columns of at least `16rem`, as many as fit — four at ~1200px — and
+ * they wrap rather than shrink past what an answer can be read at.
+ */
+.council-seats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: var(--space-4);
+  margin: 0;
+  padding: var(--space-3) 0 0;
+  list-style: none;
 }
 
-.council-seat-head {
+/* A seat's column: identity first, then that round's steps. A hairline on the
+   leading edge, not a box — this is inside a `Panel`, and a card per seat would
+   be the boxes-in-boxes the system forbids. */
+.council-seat {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
+  flex-direction: column;
   gap: var(--space-2);
+  min-width: 0;
+  padding-left: var(--space-3);
+  border-left: 1px solid var(--border);
 }
 
 .council-seat-name {
@@ -312,8 +325,8 @@
   overflow-wrap: anywhere;
 }
 
-/* Pulled up against the head: the ref names what the line above it ran, and the
-   inset's own column gap would read as a break between two separate facts. */
+/* Pulled up against the name: the ref names what the line above it ran, and the
+   column's own gap would read as a break between two separate facts. */
 .council-seat-ref {
   margin: calc(var(--space-2) * -1) 0 0;
   overflow-wrap: anywhere;
@@ -356,8 +369,9 @@
  *
  * Not `ErrorNote`, and the reason is one declaration: every string this page
  * shows from the daemon carries `overflow-wrap: anywhere`, and `.ui-note` has
- * no such rule. A seat sits in a `16rem` grid column, so one unbroken token in
- * a stage error — a path, a URL, a model id — pushes the whole grid sideways.
+ * no such rule. A seat is one column of `.council-seats`, a `16rem` auto-fill
+ * grid, so one unbroken token in a stage error — a path, a URL, a model id —
+ * would widen its column and push every column beside it sideways.
  * The primitive is right about everything else here; when `.ui-note` can wrap,
  * this rule and `.council-chairman-failed` below both go.
  */
@@ -412,11 +426,9 @@
   color: var(--text-faint);
 }
 
-/* The role a seat was asked to play, and a revision's own account of itself
-   (kept its answer, and why). Both are said about the seat, not by it, so they
-   sit at the metadata size beside the answer rather than inside it. */
-.council-seat-role,
-.council-seat-note {
+/* The role a seat was asked to play. Said about the seat, not by it, so it
+   sits at the metadata size beside the answer rather than inside it. */
+.council-seat-role {
   margin: 0;
   font-size: var(--text-xs);
   color: var(--text-muted);
@@ -526,8 +538,9 @@
  * `Row layout="line"`.
  *
  * The sizes stay here because `.ui-rows-row` deliberately sets none: a row
- * inherits the body size, and these three parts are metadata about a seat
- * rather than the reading matter of the page.
+ * inherits the body size, and the name, the score and the ballot count are
+ * metadata about a seat rather than the reading matter of the page. The fourth
+ * part, the bar, draws a length and carries no type to size.
  */
 .council-leaderboard-seat {
   min-width: 0;
@@ -596,34 +609,7 @@
 /* The round the council stopped at. Its own line, apart from the facts row in
    the header: the header says THAT it stopped, this says WHERE. */
 .council-stopped {
-  margin-bottom: var(--space-2);
-}
-
-.council-round {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  padding-top: var(--space-2);
-}
-
-.council-round-seat {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding-bottom: var(--space-3);
-  border-bottom: 1px solid var(--border);
-}
-
-.council-round-seat:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
-}
-
-.council-round-seat-name {
-  margin: 0;
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  color: var(--text);
+  margin-top: var(--space-2);
 }
 
 /* A ballot is read top-down as a ranking, so the browser's own numbering is
