@@ -1,5 +1,5 @@
 //! The council's steps: one row per (seat, round, phase) in `council_rounds`, and the council's
-//! position, progress and synthesis on `council_runs`. See `0154_council_rounds.sql` for the shape
+//! position, progress and synthesis on `council_runs`. See `0155_council_rounds.sql` for the shape
 //! and why it replaced a column triple per phase.
 
 use sqlx::SqlitePool;
@@ -171,9 +171,9 @@ mod tests {
 
     use crate::config::{CouncilSeat, SeatKind};
 
-    /// A database as it stood the day before 0154: the three migrations that shaped the council
-    /// tables, applied raw. `migrate!()` would also work and would prove nothing — it runs 0154
-    /// against EMPTY tables, and the data copy is the part of 0154 that can be wrong. Same reasoning
+    /// A database as it stood the day before 0155: the three migrations that shaped the council
+    /// tables, applied raw. `migrate!()` would also work and would prove nothing — it runs 0155
+    /// against EMPTY tables, and the data copy is the part of 0155 that can be wrong. Same reasoning
     /// as `email::tests::the_rebuild_keeps_the_mail_and_its_attachments`.
     async fn legacy_pool() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -191,14 +191,14 @@ mod tests {
         pool
     }
 
-    async fn apply_0154(pool: &sqlx::SqlitePool) {
-        sqlx::raw_sql(include_str!("../../migrations/0154_council_rounds.sql"))
+    async fn apply_0155(pool: &sqlx::SqlitePool) {
+        sqlx::raw_sql(include_str!("../../migrations/0155_council_rounds.sql"))
             .execute(pool)
             .await
             .unwrap();
     }
 
-    /// An old-shape council row, with only the columns the pre-0154 schema requires.
+    /// An old-shape council row, with only the columns the pre-0155 schema requires.
     async fn old_council(pool: &sqlx::SqlitePool, id: &str, status: &str, stage: i64, rounds: i64) {
         sqlx::query(
             "INSERT INTO council_runs
@@ -308,7 +308,7 @@ mod tests {
         )
         .await;
 
-        apply_0154(&pool).await;
+        apply_0155(&pool).await;
 
         let steps = steps_of(&pool, "c1").await.unwrap();
         let shapes: Vec<_> = steps.iter().map(shape).collect();
@@ -442,7 +442,7 @@ mod tests {
         )
         .await;
 
-        apply_0154(&pool).await;
+        apply_0155(&pool).await;
 
         let steps = steps_of(&pool, "c1").await.unwrap();
         let critique = |seat: i64| {
@@ -503,7 +503,7 @@ mod tests {
         )
         .await;
 
-        apply_0154(&pool).await;
+        apply_0155(&pool).await;
 
         let one: Vec<String> = steps_of(&pool, "one")
             .await
@@ -570,7 +570,7 @@ mod tests {
         )
         .await;
 
-        apply_0154(&pool).await;
+        apply_0155(&pool).await;
 
         let at = |round: i64, phase: &str| (round, phase.to_string());
         let mut seen = Vec::new();

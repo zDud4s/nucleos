@@ -308,7 +308,7 @@ pub struct CouncilRow {
     pub status: String,
     /// Legacy and no longer advanced: written as 1 when a council convenes and never moved, because
     /// `current_round`/`current_phase` replaced it. Kept because `job.rs` and `hooks.rs` fixtures
-    /// write it (see `0154_council_rounds.sql`).
+    /// write it (see `0155_council_rounds.sql`).
     pub stage: i64,
     /// Critique rounds asked for, 1 to `config::MAX_COUNCIL_ROUNDS`, fixed when the council
     /// convened. `rounds_run` is how many actually ran.
@@ -5436,7 +5436,7 @@ mod tests {
         let pool = &state.pool;
         bare_council(pool, "c1", 3, 2).await;
         set_anon_map(pool, "c1", &abc()).await.unwrap();
-        // The legacy `leaderboard` column is gone (0154 drops it), so there is no stale copy left
+        // The legacy `leaderboard` column is gone (0155 drops it), so there is no stale copy left
         // for the view to serve by mistake: the ballots below are the only source.
         assert!(
             sqlx::query("SELECT leaderboard FROM council_runs WHERE id = 'c1'")
@@ -5514,7 +5514,7 @@ mod tests {
         assert_eq!(view.anon_map, abc());
     }
 
-    /// A council recorded before rounds existed is read in the shape `0154` copied it into: answers
+    /// A council recorded before rounds existed is read in the shape `0155` copied it into: answers
     /// with no payload (the prose is in the transcript) and critiques that are a bare ballot with no
     /// reviews. It still gets its text and a Borda leaderboard.
     #[tokio::test]
@@ -6654,6 +6654,148 @@ mod tests {
         );
         // 3 answers + 3 critiques + 3 revisions + 3 critiques + 1 chairman.
         assert_eq!(runner.seen.lock().unwrap().len(), 13);
+    }
+
+    /// A CLI seat's stdout is its whole `stream-json` transcript, the shape `runner::extract_reply`
+    /// unwraps. A critique that arrives inside one must be parsed from the REPLY, not from the
+    /// stream: read raw, the first line is a `system` event and the ballot is an escaped string,
+    /// so the step would be `invalid` and the vote lost.
+    #[tokio::test]
+    async fn a_stream_json_seat_reply_becomes_a_valid_critique() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = three_originals();
+        let critique = critique_json(&["A", "B", "C"]);
+        let stream = [
+            serde_json::json!({ "type": "system", "subtype": "init", "session_id": "s" }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": { "content": [{ "type": "text", "text": "thinking it over" }] },
+            }),
+            serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "result": critique,
+                "total_cost_usd": 0.01,
+            }),
+        ]
+        .iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        *runner.critique.lock().unwrap() = replies(3, &stream);
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start_with(&state, "why?", None, Some(1), BTreeMap::new())
+            .await
+            .unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+
+        let steps = steps_for(&state, &id).await;
+        for seat_idx in 0..3 {
+            let step = step_at(&steps, seat_idx, 1, store::PHASE_CRITIQUE)
+                .unwrap_or_else(|| panic!("seat {seat_idx} has no critique: {steps:?}"));
+            assert_ne!(step.status, store::STEP_INVALID, "{step:?}");
+            assert_eq!(step.status, SEAT_OK, "{step:?}");
+            assert!(
+                !ranked_labels(&steps, seat_idx, 1).is_empty(),
+                "the ballot was kept: {step:?}"
+            );
+        }
+
+        // The ballots were counted: every answer was shown to, and ranked by, the two other seats.
+        let view = view_of(&state, &id).await;
+        assert_eq!(view.leaderboard.len(), 3, "{:?}", view.leaderboard);
+        assert!(
+            view.leaderboard.iter().all(|row| row.n == 2),
+            "{:?}",
+            view.leaderboard
+        );
+    }
+
+    /// The chairman's first reply will not parse and its retry's RUN fails outright. The first
+    /// reply is still text the chairman wrote, so the council settles `done` with it as a degraded
+    /// synthesis, and the reason names both failures — not just the last one.
+    #[tokio::test]
+    async fn a_failed_chairman_retry_settles_degraded_with_both_reasons() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = [
+            Scripted::Answers("answer zero".into()),
+            Scripted::Answers("answer one".into()),
+        ]
+        .into();
+        let first = "first attempt, no JSON at all";
+        *runner.chairman.lock().unwrap() = [
+            Scripted::Answers(first.into()),
+            Scripted::Fails("the chairman retry crashed".into()),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(roster(2))).await;
+
+        let id = start(&state, "why?", None).await.unwrap();
+        let row = settled(&state, &id).await;
+
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+        assert_eq!(row.error, None);
+        assert_eq!(
+            prompts_with(&runner, prompts::CHAIRMAN_MARKER).len(),
+            2,
+            "retried exactly once"
+        );
+        assert_eq!(row.synthesis_status.as_deref(), Some("degraded"));
+        let synthesis: formats::Synthesis =
+            serde_json::from_str(row.synthesis_json.as_deref().expect("a degraded synthesis"))
+                .unwrap();
+        assert_eq!(synthesis.answer, first, "the first reply is what is kept");
+        let reason = synthesis
+            .degraded_reason
+            .as_deref()
+            .expect("a degraded synthesis says why");
+        let parse_failure =
+            formats::parse_synthesis(first).expect_err("the first reply does not parse");
+        assert!(
+            reason.contains(&parse_failure),
+            "the parse failure is named: {reason}"
+        );
+        assert!(
+            reason.contains("the retry failed"),
+            "the retry is named: {reason}"
+        );
+        assert!(
+            reason.contains("the chairman retry crashed"),
+            "the retry's own error is carried: {reason}"
+        );
+    }
+
+    /// The `round < rounds` guard: a stable order across rounds stops a council EARLY only when a
+    /// round is still left to skip. At rounds = 2 the second round is the last one asked for, so
+    /// the council ran everything it was given and did not stop early.
+    #[tokio::test]
+    async fn two_rounds_with_a_stable_order_do_not_stop_early() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = three_originals();
+        // The same ballots in both rounds and no dispute anywhere.
+        *runner.critique.lock().unwrap() = replies(6, &critique_json(&["A", "B", "C"]));
+        *runner.revise.lock().unwrap() = replies(3, &revision_json(false, "", ""));
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start_with(&state, "why?", None, Some(2), BTreeMap::new())
+            .await
+            .unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+        assert_eq!(row.rounds, 2);
+        assert_eq!(row.rounds_run, 2, "both critique rounds ran");
+        assert!(
+            !row.stopped_early,
+            "the last round asked for is not an early stop"
+        );
+
+        assert_eq!(prompts_with(&runner, prompts::CRITIQUE_MARKER).len(), 6);
+        assert_eq!(prompts_with(&runner, prompts::REVISE_MARKER).len(), 3);
+        assert_eq!(prompts_with(&runner, prompts::CHAIRMAN_MARKER).len(), 1);
+        let view = view_of(&state, &id).await;
+        assert!(!view.stopped_early);
     }
 
     #[tokio::test]

@@ -15,7 +15,8 @@
 -- insert council rows that name it, and a column their fixtures write is not this migration's to
 -- take away.
 --
--- Numbered 0154: master's highest when this was written was 0153. The rule `0065_council.sql`
+-- Numbered 0155: master took 0154 (`0154_runs_large_columns_last.sql`) while this branch was open,
+-- so this file moved up one. The rule `0065_council.sql`
 -- states at length stands — the BRANCH gives way, master's lineage stands — so re-check the number
 -- at every merge.
 
@@ -36,8 +37,10 @@ CREATE TABLE IF NOT EXISTS council_rounds (
     -- the run finished and what it wrote could not be read.
     status     TEXT NOT NULL,
     error      TEXT,
-    -- What the step produced that is NOT prose. A critique's `{"reviews": [...], "ranking": [...]}`;
-    -- NULL for an answer and a revision, whose prose lives in the run's transcript, never here.
+    -- What the step produced, as JSON. A critique's `{"reviews": [...], "ranking": [...]}`; an
+    -- answer's `{"answer": text}`; a revision's `{"changed", "answer", "why"}`. NULL when the step
+    -- did not end `ok` (and for the answers and revisions copied below from the old columns, whose
+    -- prose was only ever in the run's transcript — the reader falls back to it).
     payload    TEXT,
     PRIMARY KEY (council_id, round, seat_idx, phase)
 );
