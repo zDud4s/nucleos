@@ -394,6 +394,9 @@ func (d *Driver) forgetRefs(entry *session) {
 	entry.blockedLast = browser.Refusal{}
 	entry.ferried = 0
 	entry.carrying = 0
+	// What is still in flight belongs to the document that is gone; its count-downs must not land
+	// on this one. See ferryEpoch.
+	entry.ferryEpoch++
 	// A question the document that is gone asked is not one this one is asking.
 	entry.dialogs = nil
 	// A redraw of the document that is gone is not news about the one that replaced it.

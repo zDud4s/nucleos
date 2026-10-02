@@ -41,12 +41,7 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser
 	// Before the walk, because a link's address is shortened against the page's own origin and the
 	// walk is where the elements are built.
 	facts := d.locate(ctx, entry.cdp)
-	if facts.URL != "" {
-		entry.final = facts.URL
-	}
-	if facts.Title != "" {
-		entry.title = facts.Title
-	}
+	final, title := d.notePlace(entry, facts.URL, facts.Title)
 	// An empty readyState is a page that could not be asked, and is not evidence of anything. Said
 	// only when something actually says it: a reading that guesses "unfinished" would send the agent
 	// round a loop it can never leave.
@@ -57,13 +52,13 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser
 	// ones it was not, and an embedded dashboard is usually one of them.
 	facts.Unread = mergeUnread(facts.Unread, d.unreadInFrames(ctx, entry))
 
-	read := collect(root, req, entry.final)
+	read := collect(root, req, final)
 	elements, gone := d.name(entry, read.elements, req.ChangesOnly)
 
 	return browser.Snapshot{
 		SessionID:    id,
-		URL:          entry.final,
-		Title:        entry.title,
+		URL:          final,
+		Title:        title,
 		Elements:     elements,
 		Truncated:    read.truncated,
 		TextNext:     read.textNext,
