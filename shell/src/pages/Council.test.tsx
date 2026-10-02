@@ -1219,7 +1219,7 @@ describe("Council - the leaderboard", () => {
     expect(within(board).queryByText(/^seat \d+$/)).toBeNull();
     // The Borda score, and n beside it always: one ballot and four are not the same claim.
     expect(rows[0].textContent).toContain("1.00");
-    expect(rows[0].textContent).toContain("n = 1");
+    expect(rows[0].textContent).toContain("1 ballot");
     expect(board.textContent).not.toMatch(/avg rank/);
   });
 });
@@ -1676,11 +1676,11 @@ describe("Council - the structured synthesis", () => {
   });
 
   it("badges how far the ballots agreed, in words", async () => {
-    const cases: Array<[string, string]> = [
-      ["strong", "strong consensus"],
-      ["split", "split"],
-      ["none", "no consensus"],
-      ["insufficient", "too few votes"],
+    const cases: Array<[string, RegExp]> = [
+      ["strong", /τ 0\.40 · strong consensus/],
+      ["split", /τ 0\.40 · split/],
+      ["none", /τ 0\.40 · no consensus/],
+      ["insufficient", /too few votes/],
     ];
     for (const [level, words] of cases) {
       const view = synthesisView({
@@ -1702,9 +1702,7 @@ describe("Council - the structured synthesis", () => {
     const panel = await panelFor("Synthesis");
 
     expect(await within(panel).findByText("high confidence")).toBeDefined();
-    for (const words of ["strong consensus", "split", "no consensus", "too few votes"]) {
-      expect(within(panel).queryByText(words)).toBeNull();
-    }
+    expect(within(panel).queryByText(/^τ |too few votes/)).toBeNull();
   });
 });
 
@@ -1856,5 +1854,167 @@ describe("Council - the live tail of a running step", () => {
     await panelFor("This council");
     expect(screen.queryByRole("log")).toBeNull();
     expect(tailAsks()).toHaveLength(0);
+  });
+});
+
+describe("Council - the detail, redesigned", () => {
+  it("orders the detail as question, synthesis, leaderboard", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": synthesisView() }));
+
+    await renderCouncil("/council/c-1");
+    await panelFor("Synthesis");
+
+    const headings = screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent);
+    expect(headings.slice(0, 3)).toEqual(["This council", "Synthesis", "Leaderboard"]);
+  });
+
+  it("replaces the list and composer with a way back while a council is open", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": synthesisView() }));
+
+    await renderCouncil("/council/c-1");
+    await panelFor("Synthesis");
+
+    expect(screen.queryByRole("heading", { level: 2, name: "Councils" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Councils" })).toBeNull();
+    const back = screen.getByRole("link", { name: "Councils" });
+    expect(back.getAttribute("href")).toBe("/council");
+    expect(screen.queryByLabelText("Question")).toBeNull();
+  });
+
+  it("says why the chairman is confident in visible text", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": synthesisView() }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await panelFor("Synthesis");
+
+    const level = await within(panel).findByText("high confidence");
+    expect(level.getAttribute("title")).toBeNull();
+    expect(within(panel).getByText("every ballot agrees")).toBeDefined();
+    expect(panel.querySelector("[title]")).toBeNull();
+  });
+
+  it("draws each leaderboard score as a bar against the maximum possible", async () => {
+    const view = councilView({
+      status: "done",
+      seats: [
+        seatView({ seat_idx: 0, ref: "gpt-5" }),
+        seatView({ seat_idx: 1, agent_id: "ag-7", agent_name: "the sceptic" }),
+      ],
+      leaderboard: [
+        { seat_idx: 1, score: 1, n: 1 },
+        { seat_idx: 0, score: 0.5, n: 1 },
+      ],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    const first = await renderCouncil("/council/c-1");
+    expect(await screen.findByRole("img", { name: "the sceptic: 1.00 of 1.00" })).toBeDefined();
+    expect(screen.getByRole("img", { name: "gpt-5: 0.50 of 1.00" })).toBeDefined();
+    first.unmount();
+
+    // An older council scored above 1: the bar's ceiling is its top score.
+    const legacy = councilView({
+      status: "done",
+      seats: [seatView({ seat_idx: 1, agent_id: "ag-7", agent_name: "the sceptic" })],
+      leaderboard: [{ seat_idx: 1, score: 1.5, n: 1 }],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": legacy }));
+    await renderCouncil("/council/c-1");
+    expect(await screen.findByRole("img", { name: "the sceptic: 1.50 of 1.50" })).toBeDefined();
+  });
+
+  it("offers ask again on a settled council and prefills the composer with its question, panel and rounds", async () => {
+    let sent: unknown = "nothing was posted";
+    const view = councilView({
+      status: "done",
+      rounds: 3,
+      rounds_run: 3,
+      question: "is the migration safe?",
+      chairman_kind: "cloud",
+      chairman_ref: "claude-opus-5",
+      chairman_agent_id: "ag-1",
+      chairman_agent_name: "the sceptic",
+      seats: [
+        seatView({ seat_idx: 0, kind: "local", ref: "qwen3.5:4b", role: "skeptic" }),
+        seatView({ seat_idx: 1, kind: "cloud", ref: "claude-opus-5", agent_id: "ag-1", agent_name: "the sceptic" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": view }, {
+        agents: [agentRow()],
+        models: [modelRow(), modelRow({ id: "qwen3.5:4b", label: "Qwen 4b", brain: "local" })],
+        onCreate: (body) => {
+          sent = body;
+          return { id: "new-1" };
+        },
+      }),
+    );
+
+    const { router } = await renderCouncil("/council/c-1");
+    fireEvent.click(await screen.findByRole("button", { name: "Ask again" }));
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/council"));
+    const question = (await screen.findByLabelText("Question")) as HTMLTextAreaElement;
+    expect(question.value).toBe("is the migration safe?");
+    await conveneWhenReady();
+
+    await waitFor(() =>
+      expect(sent).toEqual({
+        question: "is the migration safe?",
+        roster: {
+          chairman: { agent: "ag-1" },
+          members: [
+            { kind: "local", ref: "qwen3.5:4b" },
+            { agent: "ag-1" },
+          ],
+        },
+        roles: { "0": "skeptic" },
+        rounds: 3,
+      }),
+    );
+  });
+
+  it("offers no ask again while a council runs", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": councilView({ status: "running" }) }),
+    );
+
+    await renderCouncil("/council/c-1");
+    await screen.findByRole("heading", { level: 2, name: "This council" });
+
+    expect(screen.queryByRole("button", { name: "Ask again" })).toBeNull();
+  });
+
+  it("ask again leaves a deleted agent's seat unchosen", async () => {
+    const view = councilView({
+      status: "done",
+      seats: [
+        seatView({ seat_idx: 0, kind: "cloud", ref: "claude-opus-5", agent_id: "ag-gone", agent_name: null }),
+      ],
+      chairman_ref: "claude-opus-5",
+    });
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": view }, {
+        agents: [agentRow()],
+        models: [modelRow()],
+      }),
+    );
+
+    const { router } = await renderCouncil("/council/c-1");
+    fireEvent.click(await screen.findByRole("button", { name: "Ask again" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/council"));
+
+    const seat = (await screen.findByLabelText("Seat 1")) as HTMLSelectElement;
+    expect(seat.value).toBe("");
+    expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(true);
+  });
+
+  it("says an empty leaderboard in one short line", async () => {
+    const view = councilView({ status: "done", leaderboard: [] });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+
+    expect(await screen.findByText("No ranking — fewer than two answers to rank.")).toBeDefined();
   });
 });

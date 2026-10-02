@@ -1,4 +1,4 @@
-import { Fragment, useId, useState } from "react";
+import { Fragment, useEffect, useId, useState } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { canTakeASeat, useAgents, type Agent } from "../data/agents";
 import { useAssistantModels, type ModelChoice } from "../data/chats";
@@ -29,11 +29,14 @@ import {
 import { CouncilRich } from "./CouncilRich";
 import { CouncilRounds, StepTail } from "./CouncilRounds";
 import { CouncilSynthesis } from "./CouncilSynthesis";
+import { clearDraft, draftFrom, offerDraft, peekDraft } from "./council-draft";
 import {
   Button,
   ConfirmButton,
   Count,
+  Crumb,
   ErrorNote,
+  Meter,
   PageHeader,
   Panel,
   Quiet,
@@ -48,16 +51,16 @@ import {
 import "./council.css";
 
 /**
- * Council — one component serving `/council` and `/council/$councilId`, the
- * `Projects` pattern: a list that is always on screen, with the detail added
- * below it once something is selected rather than replacing it.
+ * Council — one component serving `/council` and `/council/$councilId`. The
+ * list and the ask bar are the first; an open council replaces both, with a
+ * crumb back to the list above its header, so the detail is read on its own.
  *
- * The phases are always drawn in the same order regardless of how far a council
- * got: seats (every phase a seat took part in, one card per seat) and the
- * leaderboard (the ranking's output) render whenever there are seats at all,
- * and only the synthesis panel changes shape when the chairman never wrote one
- * — a council whose chairman failed still has real answers on it, and hiding
- * them behind the one panel that failed would throw the rest away.
+ * The detail ranks the verdict above the process: the question, then the
+ * synthesis, then the leaderboard, then the deliberation that produced them.
+ * The order holds however far a council got, and only the synthesis panel
+ * changes shape when the chairman never wrote one — a council whose chairman
+ * failed still has real answers on it, and hiding them behind the one panel
+ * that failed would throw the rest away.
  *
  * Progress is told as a round and a phase — "round 1 · critique" — because a
  * council now runs as many critique rounds as it was asked for, and a fixed
@@ -74,22 +77,27 @@ export function Council() {
 
   return (
     <>
+      {councilId !== null && <Crumb to="/council">Councils</Crumb>}
       <PageHeader title="Council" headline={headlineFor(rows, councils.data !== undefined)} />
 
-      {councilId === null && <Composer />}
+      {councilId === null ? (
+        <>
+          <Composer />
 
-      {stale && <StaleNote dataUpdatedAt={councils.dataUpdatedAt} />}
-      {councils.isError && councils.data === undefined && <ListError error={councils.error} />}
+          {stale && <StaleNote dataUpdatedAt={councils.dataUpdatedAt} />}
+          {councils.isError && councils.data === undefined && <ListError error={councils.error} />}
 
-      <CouncilList rows={rows} answered={councils.data !== undefined} selected={councilId} />
+          <CouncilList rows={rows} answered={councils.data !== undefined} />
 
-      {councilId === null && councils.data !== undefined && rows.length === 0 && (
-        <Teach title="No council has met yet">
-          <p>Ask a question above. Each seat answers on its own, and the chair writes one answer.</p>
-        </Teach>
+          {councils.data !== undefined && rows.length === 0 && (
+            <Teach title="No council has met yet">
+              <p>Ask a question above. Each seat answers on its own, and the chair writes one answer.</p>
+            </Teach>
+          )}
+        </>
+      ) : (
+        <CouncilDetail key={councilId} id={councilId} />
       )}
-
-      {councilId !== null && <CouncilDetail key={councilId} id={councilId} />}
     </>
   );
 }
@@ -249,7 +257,12 @@ function conveneBlocked(
  * Not a panel — the question is the page's first act, not a card among cards.
  */
 function Composer() {
-  const [question, setQuestion] = useState("");
+  /*
+   * "Ask again" leaves a draft behind. The initialisers only peek at it and the
+   * mount effect drops it, so StrictMode's second initialiser run still sees it
+   * and a later visit to the page starts empty.
+   */
+  const [question, setQuestion] = useState(() => peekDraft()?.question ?? "");
   const [focused, setFocused] = useState(false);
   /**
    * Shut, and shut is the whole point.
@@ -261,9 +274,9 @@ function Composer() {
    * control should not add two requests to every visit of a page that is
    * usually used without it.
    */
-  const [choosing, setChoosing] = useState(false);
-  const [chairman, setChairman] = useState<RosterSeat | null>(null);
-  const [members, setMembers] = useState<(RosterSeat | null)[]>([null]);
+  const [choosing, setChoosing] = useState(() => peekDraft() !== null);
+  const [chairman, setChairman] = useState<RosterSeat | null>(() => peekDraft()?.chairman ?? null);
+  const [members, setMembers] = useState<(RosterSeat | null)[]>(() => peekDraft()?.members ?? [null]);
   const create = useCreateCouncil();
   const navigate = useNavigate();
   const reasonId = useId();
@@ -282,9 +295,10 @@ function Composer() {
    * and "untouched" has to stay distinguishable from "chose the default" for
    * the request to keep leaving the key off.
    */
-  const [pickedRounds, setPickedRounds] = useState<number | null>(null);
+  const [pickedRounds, setPickedRounds] = useState<number | null>(() => peekDraft()?.rounds ?? null);
   /** A role per member row, keyed by the row's index. Absent means "no role". */
-  const [roles, setRoles] = useState<Record<number, string>>({});
+  const [roles, setRoles] = useState<Record<number, string>>(() => peekDraft()?.roles ?? {});
+  useEffect(() => clearDraft(), []);
 
   const roster = rosterFrom(chairman, members);
   const halfChosen = choosing && roster === null;
@@ -677,15 +691,7 @@ function ConveneRefusal({ error }: { error: unknown }) {
 
 /* ------------------------------------------------------------------- list -- */
 
-function CouncilList({
-  rows,
-  answered,
-  selected,
-}: {
-  rows: CouncilSummary[];
-  answered: boolean;
-  selected: string | null;
-}) {
+function CouncilList({ rows, answered }: { rows: CouncilSummary[]; answered: boolean }) {
   if (answered && rows.length === 0) return null;
 
   return (
@@ -698,7 +704,7 @@ function CouncilList({
       {rows.length > 0 && (
         <Rows label="Councils">
           {rows.map((row, index) => (
-            <CouncilRow key={row.id} row={row} active={row.id === selected} readOutcome={index < OUTCOME_ROWS} />
+            <CouncilRow key={row.id} row={row} readOutcome={index < OUTCOME_ROWS} />
           ))}
         </Rows>
       )}
@@ -706,14 +712,6 @@ function CouncilList({
   );
 }
 
-/**
- * One council in the list, as a whole-row link.
- *
- * The row you are on is marked by `Row current` — `.ui-current`, a 2px rule on
- * the leading edge, in a neutral — and by nothing else. The link fills the row
- * and carries the hit area; `aria-current` on it is the same fact said to a
- * screen reader and stays beside it.
- */
 /**
  * Where a council is: "round 1 · critique". Round 0 is the seats answering on
  * their own, and the synthesis is named by its phase alone because it belongs
@@ -731,18 +729,20 @@ function progressOf(council: { current_round: number; current_phase: string }): 
  */
 const OUTCOME_ROWS = 10;
 
-function CouncilRow({ row, active, readOutcome }: { row: CouncilSummary; active: boolean; readOutcome: boolean }) {
+/**
+ * One council in the list, as a whole-row link. The list is only drawn while no
+ * council is open, so no row is ever the current one.
+ */
+function CouncilRow({ row, readOutcome }: { row: CouncilSummary; readOutcome: boolean }) {
   const running = councilIsAlive(row.status);
   // A running council's detail is still moving and is read on its own page,
   // polled; the row says where it is from the summary alone.
   const outcome = useCouncilOutcome(row.id, readOutcome && !running);
-  // The open council's outcome is said in full by its detail below, so its row
-  // does not say it a second time.
-  const ended = !active && outcome.data !== undefined ? outcomeOf(outcome.data) : null;
+  const ended = outcome.data !== undefined ? outcomeOf(outcome.data) : null;
   const second = running ? progressOf(row) : ended;
   return (
-    <Row current={active}>
-      <Link className="council-row-link" to={`/council/${row.id}`} aria-current={active ? "page" : undefined}>
+    <Row>
+      <Link className="council-row-link" to={`/council/${row.id}`}>
         <span className="council-row-question">{row.question}</span>
         <StateBadge domain="council" state={row.status} />
         <RelativeTime at={row.created_at} />
@@ -757,6 +757,7 @@ function CouncilRow({ row, active, readOutcome }: { row: CouncilSummary; active:
 function CouncilDetail({ id }: { id: string }) {
   const council = useCouncil(id);
   const cancel = useCancelCouncil();
+  const navigate = useNavigate();
   const detail = council.data;
 
   if (detail === undefined) {
@@ -785,7 +786,19 @@ function CouncilDetail({ id }: { id: string }) {
               disabled={cancel.isPending}
               onConfirm={() => cancel.mutate(id)}
             />
-          ) : undefined
+          ) : (
+            // Back to the ask bar with this council's question, panel and
+            // rounds already in it — one press of Convene asks it again.
+            <Button
+              variant="ghost"
+              onClick={() => {
+                offerDraft(draftFrom(detail));
+                void navigate({ to: "/council" });
+              }}
+            >
+              Ask again
+            </Button>
+          )
         }
       >
         <p className="council-question">{detail.question}</p>
@@ -794,7 +807,7 @@ function CouncilDetail({ id }: { id: string }) {
           <span className="council-phase">{progressOf(detail)}</span>
           <span className="council-phase">
             {detail.rounds_run} of {detail.rounds} {detail.rounds === 1 ? "round" : "rounds"} run
-            {detail.stopped_early ? " — stopped early, nothing left to change" : ""}
+            {detail.stopped_early ? " · stopped early" : ""}
           </span>
           <span className="council-chairman">{chairmanLine(detail)}</span>
           <RelativeTime at={detail.created_at} />
@@ -809,15 +822,16 @@ function CouncilDetail({ id }: { id: string }) {
         )}
       </Panel>
 
+      {/* The verdict before the process: what the chairman concluded, then how
+          the seats ranked each other, then the deliberation itself. */}
+      <CouncilSynthesis view={detail} />
+      <Leaderboard leaderboard={detail.leaderboard} seats={detail.seats} />
       <SeatGrid seats={detail.seats} running={councilIsAlive(detail.status)} />
-      {/* How each seat got where the grid shows it: round by round, after the
-          grid and before the leaderboard that the rounds produced. Only once a
+      {/* How each seat got where the grid shows it, round by round. Only once a
           critique round has run: before that its one tab, "Answers", is the
           seat grid again, word for word — and while a seat is still answering,
           the copy would show its settled answer twice beside the live tail. */}
       {detail.rounds_run >= 1 && <CouncilRounds view={detail} />}
-      <Leaderboard leaderboard={detail.leaderboard} seats={detail.seats} />
-      <CouncilSynthesis view={detail} />
     </>
   );
 }
@@ -1034,33 +1048,45 @@ function LatestStep({ step }: { step: StepView }) {
 /**
  * The last critique round's Borda leaderboard, in the order the daemon served
  * it. Each seat by name — "seat 1" is a number the reader then has to carry up
- * to the seat grid to decode — with the score and `n` beside it: one ballot
- * and four are not the same claim.
+ * to the seat grid to decode — with its score drawn as a bar, the figure, and
+ * the ballots behind it: one ballot and four are not the same claim.
+ *
+ * The bar's ceiling is the best score possible. `tally.rs` scores a seat as its
+ * per-ballot normalised mean, so that is 1; councils from before the
+ * normalisation scored above it, and there the top score is the ceiling.
  */
 function Leaderboard({ leaderboard, seats }: { leaderboard: BordaRow[]; seats: SeatView[] }) {
+  const max = Math.max(1, ...leaderboard.map((entry) => entry.score));
   return (
     <Panel title="Leaderboard">
       {leaderboard.length === 0 ? (
-        <p className="council-note">
-          Fewer than two seats have a valid answer to rank, so there is nothing to show here —
-          that does not stop the chairman from writing a synthesis.
-        </p>
+        <Quiet says="No ranking — fewer than two answers to rank." />
       ) : (
         /* A column read by scanning down it rather than picked out of, so it is
-           `Rows` and not a stack of boxes — and the three parts of a ranking sit
-           on one baseline, which is what `layout="line"` is. */
+           `Rows` and not a stack of boxes; the four parts of a ranking line up
+           as columns across the rows. */
         <Rows label="Leaderboard">
           {leaderboard.map((entry) => {
             const seat = seats.find((candidate) => candidate.seat_idx === entry.seat_idx);
+            // A row naming a seat the view does not carry is the daemon's
+            // inconsistency, said as such rather than as a bare number.
+            const name = seat === undefined ? `an unrecorded seat (#${entry.seat_idx})` : seatName(seat);
             return (
-              <Row layout="line" key={entry.seat_idx}>
-                <span className="council-leaderboard-seat">
-                  {/* A row naming a seat the view does not carry is the daemon's
-                      inconsistency, said as such rather than as a bare number. */}
-                  {seat === undefined ? `an unrecorded seat (#${entry.seat_idx})` : seatName(seat)}
-                </span>
-                <span className="council-leaderboard-rank">score {entry.score.toFixed(2)}</span>
-                <span className="council-leaderboard-n">n = {entry.n}</span>
+              <Row layout="line" className="council-leaderboard-row" key={entry.seat_idx}>
+                <span className="council-leaderboard-seat">{name}</span>
+                {/* A div, because `Meter` draws a paragraph. */}
+                <div className="council-leaderboard-bar">
+                  <Meter
+                    label={name}
+                    value={entry.score}
+                    ceiling={max}
+                    tone="quantity"
+                    head={false}
+                    format={(value) => value.toFixed(2)}
+                  />
+                </div>
+                <span className="council-leaderboard-rank">{entry.score.toFixed(2)}</span>
+                <span className="council-leaderboard-n">{`${entry.n} ${entry.n === 1 ? "ballot" : "ballots"}`}</span>
               </Row>
             );
           })}

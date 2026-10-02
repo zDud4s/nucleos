@@ -254,10 +254,13 @@
 
 /* ================================================================= detail == */
 
+/* The question heads the detail: the one sentence the whole page answers. */
 .council-question {
   margin: 0 0 var(--space-2);
-  font-size: var(--text-base);
-  font-weight: var(--weight-medium);
+  max-width: var(--measure-prose);
+  font-family: var(--font-body);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
   line-height: var(--leading-snug);
   overflow-wrap: anywhere;
 }
@@ -527,8 +530,24 @@
  * rather than the reading matter of the page.
  */
 .council-leaderboard-seat {
+  min-width: 0;
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
+  overflow-wrap: anywhere;
+}
+
+/* Four columns that line up down the board: name | bar | score | ballots. A
+   grid on the row rather than the line layout's wrap, so every bar starts at
+   the same x and two scores can be compared by length alone. */
+.council-leaderboard-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 14rem) minmax(6rem, 1fr) auto auto;
+  align-items: center;
+  column-gap: var(--space-3);
+}
+
+.council-leaderboard-bar {
+  min-width: 0;
 }
 
 .council-leaderboard-rank {
@@ -544,7 +563,7 @@
   margin: 0;
   max-width: var(--measure-prose);
   font-size: var(--text-base);
-  line-height: var(--leading-normal);
+  line-height: var(--leading-relaxed);
   color: var(--text);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -735,22 +754,36 @@
 
 /* ===================================================== structured synthesis == */
 
-/* The chairman's confidence and the ballots' agreement. Neutral on purpose:
-   neither is a lifecycle state, so neither borrows a state tone — the word is
-   the whole message. */
-.council-synthesis-badges {
+/* The verdict under the answer: the chairman's confidence and its reason, then
+   the ballots' agreement. Neutral on purpose — neither is a lifecycle state, so
+   neither borrows a state tone; the words are the whole message. */
+.council-synthesis-verdict {
   display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-  margin-bottom: var(--space-2);
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-3) 0 0;
+  max-width: var(--measure-prose);
 }
 
-.council-synthesis-badge {
-  padding: 0 var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+.council-synthesis-confidence {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+.council-synthesis-why {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* τ and the ballot count are the daemon's figures, so they are mono. */
+.council-synthesis-agreement {
+  font-family: var(--font-mono);
   font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
+  font-variant-numeric: tabular-nums;
   color: var(--text-muted);
 }
 
