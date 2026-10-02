@@ -1,4 +1,8 @@
+import { useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { lineDiff } from "../lib/line-diff";
+import { keys } from "../data/keys";
+import { RECORDED, useRunTail, type RunTailChunk } from "../data/runs";
 import {
   deanonymise,
   seatName,
@@ -318,5 +322,63 @@ function RankEvolution({
         ))}
       </tbody>
     </table>
+  );
+}
+
+/* -------------------------------------------------------------- live tail -- */
+
+/**
+ * What a seat's running step has written so far, read off its run's live tail.
+ *
+ * Mounted only while the step is pending and the council runs — the caller
+ * decides that, so a settled step or an ended council never asks for a tail at
+ * all. It reads exactly as `RunDetail.tsx::RunTail` does: each chunk is taken
+ * once, by object identity (react-query hands back the same object for a
+ * deep-equal refetch, and a StrictMode remount would otherwise append a chunk
+ * twice), and the next read starts at `chunk.next`, the daemon's own BYTE
+ * offset. Counting the text here instead would drift on the first non-ASCII
+ * byte, since JavaScript counts UTF-16 units.
+ *
+ * On unmount the tail's cache entry is dropped. A settled step's stored result
+ * is the truth from then on, and an inactive query with data is still
+ * refetched by anything that refetches by key — reading a tail nobody shows.
+ * It also keeps a later mount from starting at offset 0 with a stale chunk
+ * already in the cache, which it would take as the whole of the output.
+ */
+export function StepTail({ runId, name }: { runId: number; name: string }) {
+  const queryClient = useQueryClient();
+  const [since, setSince] = useState(0);
+  const [text, setText] = useState("");
+  const tail = useRunTail(runId, since, true);
+  const chunk = tail.data;
+
+  const consumed = useRef<RunTailChunk | null>(null);
+  useEffect(() => {
+    if (chunk === undefined || chunk === RECORDED) return;
+    if (consumed.current === chunk) return;
+    consumed.current = chunk;
+    if (chunk.text === "") return;
+    setText((current) => current + chunk.text);
+    setSince(chunk.next);
+  }, [chunk]);
+
+  useEffect(
+    () => () => {
+      const queryKey = keys.runs.tail(runId);
+      const query = queryClient.getQueryCache().find({ queryKey, exact: true });
+      // Only when nobody else is reading the same run — another screen's
+      // observer keeps its own tail.
+      if (query !== undefined && query.getObserversCount() === 0) {
+        void queryClient.cancelQueries({ queryKey, exact: true });
+        queryClient.removeQueries({ queryKey, exact: true });
+      }
+    },
+    [queryClient, runId],
+  );
+
+  return (
+    <pre className="council-seat-tail" role="log" aria-label={`Live tail of ${name}`}>
+      {text}
+    </pre>
   );
 }

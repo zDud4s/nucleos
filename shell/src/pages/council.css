@@ -688,3 +688,92 @@
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
+
+/* ===================================================== structured synthesis == */
+
+/* The chairman's confidence and the ballots' agreement. Neutral on purpose:
+   neither is a lifecycle state, so neither borrows a state tone — the word is
+   the whole message. */
+.council-synthesis-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.council-synthesis-badge {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-muted);
+}
+
+.council-synthesis-card {
+  margin-top: var(--space-3);
+  max-width: var(--measure-prose);
+}
+
+.council-synthesis-card-name {
+  margin: 0 0 var(--space-1);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-muted);
+}
+
+.council-synthesis-list {
+  margin: 0;
+  padding-left: var(--space-4);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.council-synthesis-topic + .council-synthesis-topic {
+  margin-top: var(--space-2);
+}
+
+.council-synthesis-topic-name,
+.council-synthesis-text {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.council-synthesis-seats {
+  color: var(--text-muted);
+}
+
+/* The chairman wrote prose the daemon could not read as its structure. Said in
+   the paused tone — nothing failed, and the text below is still the chairman's. */
+.council-synthesis-degraded {
+  margin: 0 0 var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--tone-paused-bg);
+  color: var(--tone-paused-fg);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+/* ================================================================ live tail == */
+
+/* What a running seat has written so far. Capped and scrollable: a seat can
+   write pages before it settles, and the card is a summary. */
+.council-seat-tail {
+  margin: var(--space-2) 0 0;
+  max-height: 12rem;
+  overflow-y: auto;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

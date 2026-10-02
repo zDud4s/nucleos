@@ -29,7 +29,9 @@ import type {
   Critique,
   SeatView,
   StepView,
+  Synthesis,
 } from "../data/council";
+import type { RunTailChunk } from "../data/runs";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
 import { readState } from "../ui/state-map";
@@ -147,6 +149,8 @@ function councilFetch(
     models?: unknown[];
     /** `GET /council/config`. */
     config?: CouncilConfig;
+    /** `GET /runs/<id>/tail?since=<n>`; `undefined` is the daemon's 204. Handed the run and the offset. */
+    tail?: (runId: number, since: number) => RunTailChunk | undefined;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -163,6 +167,10 @@ function councilFetch(
     // BEFORE the detail regex: `/council/config` matches `^/council/([^/]+)$`
     // too, and answered there it would be a 404 for a council called "config".
     if (path === "/council/config") return opts.config ?? councilConfig();
+    const tailMatch = /^\/runs\/(\d+)\/tail\?since=(\d+)$/.exec(path);
+    if (tailMatch !== null) {
+      return opts.tail === undefined ? undefined : opts.tail(Number(tailMatch[1]), Number(tailMatch[2]));
+    }
     const cancelMatch = /^\/council\/([^/]+)\/cancel$/.exec(path);
     if (cancelMatch !== null && init?.method === "POST") {
       if (opts.onCancel !== undefined) return opts.onCancel(cancelMatch[1]);
@@ -1344,5 +1352,283 @@ describe("Council - round by round", () => {
     await renderCouncil("/council/c-1");
     await screen.findByRole("tablist", { name: "Rounds" });
     expect(screen.queryByText(/Stopped early at round/)).toBeNull();
+  });
+});
+
+/* ------------------------------------------------- S5: structured synthesis -- */
+
+/**
+ * UI contract (what `CouncilSynthesis.tsx` must render inside the panel headed "Synthesis", which
+ * replaces the old `Synthesis` function in `Council.tsx`):
+ *  - `synthesis_structured` set (and status not "degraded"): the `answer` through `CouncilRich`, then
+ *    - a confidence badge whose whole text is "<level> confidence" ("high confidence", ...);
+ *    - when `view.agreement` is set, an agreement badge whose whole text is, by `agreement.level`:
+ *      "strong" -> "strong consensus", "split" -> "split", "none" -> "no consensus",
+ *      "insufficient" -> "too few votes". No badge when `agreement` is null;
+ *    - four `group`s named "Consensus", "Disagreements", "Minority", "Open questions". Consensus and
+ *      Open questions hold one `listitem` per string; Disagreements holds each topic and, per position,
+ *      one `listitem` carrying the `seatName` of EVERY seat in `position.seats` (seats resolved against
+ *      `view.seats`) and the position's `view`; Minority holds the minority text. A card with nothing
+ *      to say (empty list, `minority` null) is not rendered.
+ *  - `synthesis_status === "degraded"`: the raw `synthesis` text plus a warning containing
+ *    "unstructured synthesis"; none of the four groups and no badges.
+ *  - `synthesis_structured === null` with text and status null (an old council): the rich text only,
+ *    no warning, no badges, no groups.
+ */
+function structuredSynthesis(overrides: Partial<Synthesis> = {}): Synthesis {
+  return {
+    answer: "Ship it behind a flag.",
+    consensus: ["the tests carry the proof"],
+    disagreements: [
+      {
+        topic: "rollout speed",
+        positions: [
+          { seats: [0, 2], view: "ship now" },
+          { seats: [1], view: "wait a sprint" },
+        ],
+      },
+    ],
+    minority: "the migration may be riskier than the seats assume",
+    confidence: { level: "high", why: "every ballot agrees" },
+    open_questions: ["who owns the rollback?"],
+    ...overrides,
+  };
+}
+
+function synthesisView(overrides: Partial<CouncilView> = {}): CouncilView {
+  return roundsView({
+    synthesis: "Ship it behind a flag.",
+    synthesis_structured: structuredSynthesis(),
+    synthesis_status: "ok",
+    agreement: { tau: 0.9, level: "strong", ballots: 3, comparisons: 3 },
+    ...overrides,
+  });
+}
+
+describe("Council - the structured synthesis", () => {
+  it("renders the answer, the consensus, the named disagreements, the minority and the open questions", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": synthesisView() }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await panelFor("Synthesis");
+
+    expect(await within(panel).findByText("Ship it behind a flag.")).toBeDefined();
+    const consensus = within(panel).getByRole("group", { name: "Consensus" });
+    expect(within(consensus).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "the tests carry the proof",
+    ]);
+
+    const disagreements = within(panel).getByRole("group", { name: "Disagreements" });
+    expect(disagreements.textContent).toContain("rollout speed");
+    const positions = within(disagreements).getAllByRole("listitem");
+    expect(positions).toHaveLength(2);
+    // Seats are named, never numbered: "seat 2" would send the reader back to the grid.
+    expect(positions[0].textContent).toContain("alpha");
+    expect(positions[0].textContent).toContain("gamma");
+    expect(positions[0].textContent).toContain("ship now");
+    expect(positions[0].textContent).not.toContain("beta");
+    expect(positions[1].textContent).toContain("beta");
+    expect(positions[1].textContent).toContain("wait a sprint");
+
+    const minority = within(panel).getByRole("group", { name: "Minority" });
+    expect(minority.textContent).toContain("riskier than the seats assume");
+    const open = within(panel).getByRole("group", { name: "Open questions" });
+    expect(within(open).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["who owns the rollback?"]);
+  });
+
+  it("badges the chairman's confidence", async () => {
+    const view = synthesisView({
+      synthesis_structured: structuredSynthesis({ confidence: { level: "low", why: "the seats barely overlap" } }),
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await panelFor("Synthesis");
+
+    expect(await within(panel).findByText("low confidence")).toBeDefined();
+    expect(within(panel).queryByText("high confidence")).toBeNull();
+  });
+
+  it("badges how far the ballots agreed, in words", async () => {
+    const cases: Array<[string, string]> = [
+      ["strong", "strong consensus"],
+      ["split", "split"],
+      ["none", "no consensus"],
+      ["insufficient", "too few votes"],
+    ];
+    for (const [level, words] of cases) {
+      const view = synthesisView({
+        agreement: { tau: level === "insufficient" ? null : 0.4, level, ballots: 3, comparisons: 3 },
+      });
+      daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+      const rendered = await renderCouncil("/council/c-1");
+      const panel = await panelFor("Synthesis");
+      expect(await within(panel).findByText(words)).toBeDefined();
+      rendered.unmount();
+    }
+  });
+
+  it("draws no agreement badge while there is no agreement to report", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": synthesisView({ agreement: null }) }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await panelFor("Synthesis");
+
+    expect(await within(panel).findByText("high confidence")).toBeDefined();
+    for (const words of ["strong consensus", "split", "no consensus", "too few votes"]) {
+      expect(within(panel).queryByText(words)).toBeNull();
+    }
+  });
+});
+
+describe("Council - a degraded synthesis", () => {
+  it("shows the raw text with an unstructured-synthesis warning and none of the cards", async () => {
+    const view = synthesisView({
+      synthesis: "the chairman rambled without structure",
+      synthesis_structured: null,
+      synthesis_status: "degraded",
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await panelFor("Synthesis");
+
+    expect(await within(panel).findByText(/the chairman rambled without structure/)).toBeDefined();
+    expect(within(panel).getByText(/unstructured synthesis/i)).toBeDefined();
+    for (const name of ["Consensus", "Disagreements", "Minority", "Open questions"]) {
+      expect(within(panel).queryByRole("group", { name })).toBeNull();
+    }
+    expect(within(panel).queryByText(/confidence$/)).toBeNull();
+  });
+
+  it("reads an old council, with text and no structure, as plain rich text without a warning", async () => {
+    const view = synthesisView({
+      synthesis: "an old synthesis from before structure",
+      synthesis_structured: null,
+      synthesis_status: null,
+      agreement: null,
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await panelFor("Synthesis");
+
+    expect(await within(panel).findByText(/an old synthesis from before structure/)).toBeDefined();
+    expect(within(panel).queryByText(/unstructured synthesis/i)).toBeNull();
+    expect(within(panel).queryByRole("group", { name: "Consensus" })).toBeNull();
+    expect(within(panel).queryByText(/confidence$/)).toBeNull();
+  });
+});
+
+/* ----------------------------------------------------------- S5: live tail -- */
+
+/**
+ * UI contract for the live tail (rendered in the seat grid's card, by a `StepTail` component):
+ *  - a seat step with `status === "pending"`, a `run_id`, while the council `status` is "running"
+ *    renders `role="log"` named "Live tail of <seatName>" whose text is the chunks read so far,
+ *    concatenated. It reads `useRunTail(run_id, since, true)`, takes each NEW chunk once (by identity)
+ *    and asks next for `since = chunk.next`, exactly as `RunDetail.tsx::RunTail` does.
+ *  - once the step settles (status no longer "pending") or the council is no longer running, the log
+ *    is gone, the stored result is shown instead, and the tail query is no longer read.
+ */
+function pendingView(overrides: Partial<CouncilView> = {}): CouncilView {
+  return councilView({
+    status: "running",
+    current_round: 0,
+    current_phase: "answer",
+    seats: [seatNamed("alpha", 0, [stepView({ status: "pending", run_id: 7, answer: null })])],
+    ...overrides,
+  });
+}
+
+function tailAsks(): string[] {
+  return daemon.apiFetch.mock.calls.map((call) => String(call[0])).filter((path) => path.startsWith("/runs/7/tail"));
+}
+
+describe("Council - the live tail of a running step", () => {
+  it("shows what the running step has written and continues from the chunk's own offset", async () => {
+    const chunks: Record<number, RunTailChunk> = {
+      0: { text: "reading the diff, ", next: 18, live: true },
+      18: { text: "then weighing it", next: 34, live: true },
+    };
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": pendingView() }, { tail: (_run, since) => chunks[since] }),
+    );
+
+    const { queryClient } = await renderCouncil("/council/c-1");
+    const log = await screen.findByRole("log", { name: "Live tail of alpha" });
+    await waitFor(() => expect(log.textContent).toContain("reading the diff, "));
+
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: keys.runs.tail(7) });
+    });
+    await waitFor(() => expect(log.textContent).toBe("reading the diff, then weighing it"));
+    // The offset is the daemon's byte cursor, handed back as it came.
+    expect(tailAsks()).toContain("/runs/7/tail?since=18");
+  });
+
+  it("does not repeat a chunk the daemon sends twice", async () => {
+    const same: RunTailChunk = { text: "once only", next: 9, live: true };
+    daemon.apiFetch.mockImplementation(
+      councilFetch(
+        [councilSummary()],
+        { "c-1": pendingView() },
+        { tail: (_run, since) => (since === 0 ? same : { text: "", next: 9, live: true }) },
+      ),
+    );
+
+    const { queryClient } = await renderCouncil("/council/c-1");
+    const log = await screen.findByRole("log", { name: "Live tail of alpha" });
+    await waitFor(() => expect(log.textContent).toBe("once only"));
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: keys.runs.tail(7) });
+    });
+    expect(log.textContent).toBe("once only");
+  });
+
+  it("stops reading the tail, and shows the stored answer, once the step settles", async () => {
+    const views: Record<string, CouncilView> = { "c-1": pendingView() };
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], views, { tail: () => ({ text: "still thinking", next: 14, live: true }) }),
+    );
+
+    const { queryClient } = await renderCouncil("/council/c-1");
+    const log = await screen.findByRole("log", { name: "Live tail of alpha" });
+    await waitFor(() => expect(log.textContent).toContain("still thinking"));
+
+    views["c-1"] = pendingView({
+      seats: [seatNamed("alpha", 0, [stepView({ status: "ok", run_id: 7, answer: "the settled answer" })])],
+    });
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: [...keys.council.all, "detail", "c-1"] });
+    });
+
+    await waitFor(() => expect(screen.queryByRole("log", { name: "Live tail of alpha" })).toBeNull());
+    expect(await screen.findByText("the settled answer")).toBeDefined();
+    const before = tailAsks().length;
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: keys.runs.tail(7) });
+    });
+    expect(tailAsks()).toHaveLength(before);
+  });
+
+  it("shows no tail for a step that is not pending, nor for a pending step of a council that has ended", async () => {
+    const tail = () => ({ text: "x", next: 1, live: true });
+    const settled = councilView({ status: "running", seats: [seatNamed("alpha", 0, [stepView()])] });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": settled }, { tail }));
+    const first = await renderCouncil("/council/c-1");
+    await panelFor("This council");
+    expect(screen.queryByRole("log")).toBeNull();
+    first.unmount();
+
+    const ended = pendingView({ status: "error" });
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary({ status: "error" })], { "c-1": ended }, { tail }),
+    );
+    await renderCouncil("/council/c-1");
+    await panelFor("This council");
+    expect(screen.queryByRole("log")).toBeNull();
+    expect(tailAsks()).toHaveLength(0);
   });
 });

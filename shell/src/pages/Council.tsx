@@ -10,6 +10,7 @@ import {
   useCreateCouncil,
   useCouncilConfig,
   ceilingCalls,
+  councilIsAlive,
   seatName,
   type BordaRow,
   type CouncilSummary,
@@ -20,7 +21,8 @@ import {
   type StepView,
 } from "../data/council";
 import { CouncilRich } from "./CouncilRich";
-import { CouncilRounds } from "./CouncilRounds";
+import { CouncilRounds, StepTail } from "./CouncilRounds";
+import { CouncilSynthesis } from "./CouncilSynthesis";
 import {
   Button,
   ConfirmButton,
@@ -707,12 +709,15 @@ function CouncilDetail({ id }: { id: string }) {
         )}
       </Panel>
 
-      <SeatGrid seats={detail.seats} />
+      <SeatGrid seats={detail.seats} running={councilIsAlive(detail.status)} />
       {/* How each seat got where the grid shows it: round by round, after the
-          grid and before the leaderboard that the rounds produced. */}
-      <CouncilRounds view={detail} />
+          grid and before the leaderboard that the rounds produced. Only once a
+          critique round has run: before that its one tab, "Answers", is the
+          seat grid again, word for word — and while a seat is still answering,
+          the copy would show its settled answer twice beside the live tail. */}
+      {detail.rounds_run >= 1 && <CouncilRounds view={detail} />}
       <Leaderboard leaderboard={detail.leaderboard} seats={detail.seats} />
-      <Synthesis synthesis={detail.synthesis} error={detail.error} />
+      <CouncilSynthesis view={detail} />
     </>
   );
 }
@@ -754,7 +759,7 @@ function CancelRefusal({ error }: { error: unknown }) {
 
 /* ------------------------------------------------------------------- seats -- */
 
-function SeatGrid({ seats }: { seats: SeatView[] }) {
+function SeatGrid({ seats, running }: { seats: SeatView[]; running: boolean }) {
   return (
     <Panel title="Seats" aside={<Count n={seats.length} />}>
       {seats.length === 0 ? (
@@ -762,7 +767,7 @@ function SeatGrid({ seats }: { seats: SeatView[] }) {
       ) : (
         <Rows label="Seats">
           {seats.map((seat) => (
-            <SeatCard key={seat.seat_idx} seat={seat} />
+            <SeatCard key={seat.seat_idx} seat={seat} running={running} />
           ))}
         </Rows>
       )}
@@ -816,10 +821,11 @@ function abstained(step: StepView): boolean {
   return step.phase === "critique" && step.status === "ok" && (step.critique?.ranking.length ?? 0) === 0;
 }
 
-function SeatCard({ seat }: { seat: SeatView }) {
+function SeatCard({ seat, running }: { seat: SeatView; running: boolean }) {
   const [full, setFull] = useState(false);
   const answer = answerStep(seat);
   const latest = seat.steps.length === 0 ? undefined : seat.steps[seat.steps.length - 1];
+  const tailing = seat.steps.find((step) => step.status === "pending" && step.run_id !== null);
   // An agent that answered and is no longer in the catalogue. Told apart from a
   // model-named seat by `agent_id`, which the row keeps forever.
   const agentIsGone = seat.agent_id !== null && seat.agent_name === null;
@@ -870,6 +876,12 @@ function SeatCard({ seat }: { seat: SeatView }) {
       )}
 
       {latest !== undefined && latest !== answer && <LatestStep step={latest} />}
+      {/* What the seat is writing right now. Only while the step is pending and
+          the council still runs: a settled step has its stored result above,
+          and a council that ended will never write another byte to any tail. */}
+      {running && tailing !== undefined && tailing.run_id !== null && (
+        <StepTail key={tailing.run_id} runId={tailing.run_id} name={seatName(seat)} />
+      )}
     </Row>
   );
 }
@@ -954,42 +966,6 @@ function Leaderboard({ leaderboard, seats }: { leaderboard: BordaRow[]; seats: S
           })}
         </Rows>
       )}
-    </Panel>
-  );
-}
-
-/* --------------------------------------------------------------- synthesis -- */
-
-/**
- * The chairman's synthesis — or the fact that the chairman never produced one.
- *
- * A `null` synthesis with `error` set is not a reason to hide the rounds: the
- * seats and the leaderboard above this panel are real answers regardless of
- * what the chairman did with them, and only this one panel changes shape.
- * The text is markdown, drawn through `CouncilRich`, never as HTML.
- */
-function Synthesis({ synthesis, error }: { synthesis: string | null; error: string | null }) {
-  if (synthesis !== null) {
-    return (
-      <Panel title="Synthesis">
-        <div className="council-synthesis">
-          <CouncilRich text={synthesis} />
-        </div>
-      </Panel>
-    );
-  }
-  if (error !== null) {
-    return (
-      <Panel title="Synthesis">
-        <p className="council-chairman-failed" role="alert">
-          the chairman failed to write a synthesis: {error}
-        </p>
-      </Panel>
-    );
-  }
-  return (
-    <Panel title="Synthesis">
-      <Quiet says="no synthesis yet." />
     </Panel>
   );
 }
