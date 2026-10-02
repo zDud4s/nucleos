@@ -337,6 +337,7 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     run "gates: summary"  . "$py" scripts/test-gates-summary.py
     run "gates: own target" . "$py" scripts/test-own-cargo-target.py
     run "gates: build slot" . "$py" scripts/test-build-slot.py
+    run "daemon: from copy" . "$py" scripts/test-run-daemon.py
     run "eval: approver"  . "$py" scripts/eval/test-auto-approve.py
     run "eval: promote"   . "$py" scripts/eval/test-promote.py
     run "eval: ingest"    . "$py" scripts/eval/test-ingest.py
