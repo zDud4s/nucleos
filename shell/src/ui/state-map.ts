@@ -569,9 +569,9 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
   },
 
   /**
-   * One seat's status within one phase — `core/src/council.rs:28-34`. The same
-   * six literals serve both `stage1_status` and `stage2_status`; a card reads
-   * this table twice, once per stage.
+   * One seat's status within one step — `core/src/council.rs`. The same
+   * literals serve every step a seat takes (answer, critique, revise); a card
+   * reads this table once per step it draws.
    *
    * Two pairs the design's §7 will not let collapse. `timeout` is a seat that
    * ran out of time, not a seat that failed — it gets the held tone, never the
@@ -590,6 +590,10 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     error: { tone: "danger", label: "failed" },
     cancelled: { tone: "off", label: "cancelled" },
     skipped: { tone: "off", label: "not asked" },
+    // A step whose run answered and whose payload did not parse. Not the seat's
+    // run failing — the model spoke, just not in the shape asked for — so it is
+    // held, like `timeout`, rather than danger, and it is not silence either.
+    invalid: { tone: "paused", label: "invalid" },
   },
 
   /**
