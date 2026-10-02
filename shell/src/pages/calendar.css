@@ -233,9 +233,16 @@
   align-items: stretch;
   gap: var(--space-1);
   /* Six rows of this is the height the month is promised to keep — see
-     `monthMatrix`. The chips are capped at three so nothing can grow it. */
-  min-height: 6.5rem;
-  padding: var(--space-2);
+     `monthMatrix` — and those six rows have to fit the window: 6.5rem a row
+     was 39rem of grid before the header, the panel and the frame, and on a
+     laptop screen the bottom week sat below the fold. So the row is the
+     window's height less what stands above and around the grid, over six,
+     between a floor that still holds the date and one chip and the old
+     6.5rem. The chips are capped to match (`useChipCap`), so nothing can
+     grow it. */
+  height: clamp(4.25rem, calc((100dvh - 19rem) / 6), 6.5rem);
+  overflow: hidden;
+  padding: var(--space-1) var(--space-2);
   border: 0;
   background: var(--surface);
   color: var(--text);
@@ -334,6 +341,7 @@
 }
 
 .calendar-day-more {
+  margin-left: auto;
   padding-left: var(--space-1);
   font-size: var(--text-xs);
   color: var(--text-faint);
@@ -468,7 +476,8 @@
   anybody works — the panel was showing the part of the day the config says is not the day.
 */
 .calendar-week-scroll {
-  max-height: 32rem;
+  /* The window follows the screen for the same reason the month's rows do. */
+  max-height: clamp(14rem, calc(100dvh - 18rem), 32rem);
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;
@@ -664,14 +673,14 @@
 
 /* ========================================================== occurrences == */
 
-`/*
-`  Both of this sheet's lists — the day's occurrences and the held notifications —
-`  are \`Rows\`: a hairline-ruled column read by scanning down it, each item a row
-`  laid out on one grid line. The list keeps only its margin reset here; the frame,
-`  the rules and the fill are the shared layer's.
-`*/
-`.calendar-occurrence-list,
-`.calendar-notifications {
+/*
+  Both of this sheet's lists — the day's occurrences and the held notifications —
+  are `Rows`: a hairline-ruled column read by scanning down it, each item a row
+  laid out on one grid line. The list keeps only its margin reset here; the frame,
+  the rules and the fill are the shared layer's.
+*/
+.calendar-occurrence-list,
+.calendar-notifications {
   margin: 0;
 }
 
@@ -739,27 +748,6 @@
   display: flex;
   align-items: baseline;
   gap: var(--space-2);
-}
-
-.calendar-occurrence-more {
-  position: relative;
-}
-
-.calendar-occurrence-more summary {
-  cursor: pointer;
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-
-.calendar-occurrence-more summary:hover {
-  text-decoration: underline;
-}
-
-.calendar-occurrence-more > .ui-button {
-  position: absolute;
-  top: calc(100% + var(--space-1));
-  right: 0;
-  z-index: var(--z-overlay);
 }
 
 /* ============================================================ draft form == */

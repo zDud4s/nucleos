@@ -185,7 +185,7 @@ describe("skipping and deleting", () => {
   it("makes the extra actions a word rather than a glyph", () => {
     renderWithQuery(<OccurrenceActions occurrence={occurrence()} />);
 
-    expect(screen.getByText("Delete series", { selector: "summary" }).tagName).toBe("SUMMARY");
+    expect(screen.getByRole("button", { name: "Delete series" })).toBeDefined();
     expect(screen.queryByText("…")).toBeNull();
   });
 
@@ -206,19 +206,30 @@ describe("skipping and deleting", () => {
     );
   });
 
-  /** The most destructive control on the page, and it had never been exercised. */
-  it("deletes the whole series by id, and only behind the interlock", async () => {
+  /** The most destructive control on the page: asked in a modal, and sent only from it. */
+  it("deletes the whole series by id, and only once the modal is answered", async () => {
     const seen = recorder();
     renderWithQuery(<OccurrenceActions occurrence={occurrence()} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Delete whole series" }));
-    // Armed but not fired: nothing has been sent yet.
+    fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
+    // Asked, not sent: the question is on screen and nothing has gone out.
+    expect(screen.getByRole("dialog", { name: "Delete the whole series?" })).toBeDefined();
     expect(seen["DELETE /calendar/events/4"]).toBeUndefined();
 
-    await afterDwell();
     fireEvent.click(screen.getByRole("button", { name: "Delete every occurrence" }));
 
     await waitFor(() => expect(seen["DELETE /calendar/events/4"]).toBeDefined());
+  });
+
+  it("leaves the series standing when the modal is cancelled", () => {
+    const seen = recorder();
+    renderWithQuery(<OccurrenceActions occurrence={occurrence()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(seen["DELETE /calendar/events/4"]).toBeUndefined();
   });
 });
 

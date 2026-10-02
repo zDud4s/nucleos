@@ -15,7 +15,7 @@ import {
 } from "../data/calendar";
 import { inputFromStamp, occurrenceMinutes, stampFromInput } from "../lib/calendar-grid";
 import { UI_LOCALE } from "../lib/locale";
-import { Badge, Button, ConfirmButton, ErrorNote, Quiet, RefusalNote, Row, Rows } from "../ui";
+import { Badge, Button, ConfirmButton, ErrorNote, Modal, Quiet, RefusalNote, Row, Rows } from "../ui";
 import { placementOf, slotStamp, type Slot } from "./slot";
 
 /**
@@ -246,6 +246,7 @@ export function OccurrenceActions({ occurrence }: { occurrence: EventOccurrence 
   const move = useMoveOccurrence();
   const deleteSeries = useDeleteSeries();
   const placement = placementOf(occurrence);
+  const [asking, setAsking] = useState(false);
   const [moveTo, setMoveTo] = useState(() => inputFromStamp(localInput(placement.startsAt)));
 
   function submitMove() {
@@ -303,20 +304,46 @@ export function OccurrenceActions({ occurrence }: { occurrence: EventOccurrence 
             Move
           </Button>
         </div>
-        <details className="calendar-occurrence-more">
-          <summary>Delete series</summary>
-          <ConfirmButton
-            label="Delete whole series"
-            confirmLabel="Delete every occurrence"
-            variant="danger"
-            disabled={deleteSeries.isPending}
-            onConfirm={() => deleteSeries.mutate(occurrence.event_id)}
-          />
-        </details>
+        <Button variant="quiet" onClick={() => setAsking(true)}>
+          Delete series
+        </Button>
       </div>
       {cancel.isError && <OccurrenceError error={cancel.error} what="not skipped" />}
       {move.isError && <OccurrenceError error={move.error} what="not moved" />}
-      {deleteSeries.isError && <OccurrenceError error={deleteSeries.error} what="the series was not deleted" />}
+      {/*
+        The most destructive write on the page, so it is asked as a question over the page rather
+        than armed in place: the modal names the series and says what goes with it, and Cancel,
+        Escape and a click outside all leave it standing. It stays open on a refusal, so the
+        reason is read where the decision was made.
+      */}
+      <Modal
+        open={asking}
+        onOpenChange={(open) => {
+          setAsking(open);
+          if (!open) deleteSeries.reset();
+        }}
+        title="Delete the whole series?"
+        description={
+          <>
+            Every occurrence of <strong>{occurrence.title}</strong> goes with it — past and future,
+            moved or not. Skipping only this one is the other button.
+          </>
+        }
+        footer={
+          <>
+            <Button onClick={() => setAsking(false)}>Cancel</Button>
+            <Button
+              variant="danger-solid"
+              disabled={deleteSeries.isPending}
+              onClick={() => deleteSeries.mutate(occurrence.event_id, { onSuccess: () => setAsking(false) })}
+            >
+              Delete every occurrence
+            </Button>
+          </>
+        }
+      >
+        {deleteSeries.isError && <OccurrenceError error={deleteSeries.error} what="the series was not deleted" />}
+      </Modal>
     </Row>
   );
 }
