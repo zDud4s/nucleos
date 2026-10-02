@@ -12,55 +12,29 @@ import { NAV, NAV_ITEMS, NAV_PATHS, SYSTEM_ITEM, navItemForPath, sliceOf } from 
  * expects to find.
  */
 describe("the nav table", () => {
-  it("has the three groups of §3.1 plus Projetos, in reading order", () => {
-    expect(NAV.map((group) => group.id)).toEqual(["operate", "projects", "work", "pillars"]);
-    expect(NAV.map((group) => group.label)).toEqual(["Operate", "Projects", "Work", "Pillars"]);
+  it("has the three groups of §3.1, in reading order", () => {
+    expect(NAV.map((group) => group.id)).toEqual(["operate", "work", "pillars"]);
+    expect(NAV.map((group) => group.label)).toEqual(["Operate", "Work", "Pillars"]);
   });
 
   /**
-   * The workspace design changes the sidebar in exactly one way, and this is the
-   * test that holds it to that. "Projetos goes between Operate and Work" is easy
-   * to honour while also nudging something else on the way past, and a rail that
-   * drifts a little with each feature is how it ends up unrecognisable without
-   * any single change having been wrong.
-   */
-  it("leaves the other three groups untouched", () => {
-    const byId = Object.fromEntries(NAV.map((group) => [group.id, group]));
-    expect(byId.operate.items.map((item) => item.id)).toEqual([
-      // `projects` is gone from here on purpose — it was promoted into the group
-      // below, not copied into it. Everything else is exactly as it was.
-      "home", "fleet", "autopilot", "waiting", "runs", "feed", "learned",
-    ]);
-    expect(byId.work.items.map((item) => item.id)).toEqual([
-      "chats", "teams", "agents", "council",
-    ]);
-    expect(byId.pillars.items.map((item) => item.id)).toEqual([
-      "mail", "contacts", "calendar", "voice", "web", "browser", "files",
-    ]);
-  });
-
-  /**
-   * The one group whose contents are not in this table.
+   * Projects is one plain row in Operate, right after Fleet, and nothing more.
    *
-   * Every other group's items are known when the app is compiled, which is what
-   * lets `NAV_PATHS` be the route list. A project is a row in the daemon's
-   * roster, so its path exists only at runtime — the group declares its
-   * *position* here and is filled by whoever has the roster. `roster` is how the
-   * sidebar knows which group that is, rather than hardcoding an id.
+   * It was a group of its own until 2026-10-02, filled at runtime with one row
+   * per project. The rail is a fixed list of destinations; the switcher is the
+   * one list of projects. A project row creeping back into this table is the
+   * regression this test exists to catch.
    */
-  it("declares Projetos as a position, not a list", () => {
-    const projects = NAV.find((group) => group.id === "projects");
-    // One static entry — the roster page, which is a fleet-wide reading no
-    // single workspace can give — and the project rows are appended to it.
-    expect(projects?.items.map((item) => item.path)).toEqual(["/projects"]);
-    expect(projects?.roster).toBe(true);
-    expect(NAV.filter((group) => group.roster === true)).toHaveLength(1);
+  it("keeps Projects a plain Operate item, with no project rows in the table", () => {
+    const projects = navItemForPath("/projects");
+    expect(projects?.label).toBe("Projects");
+    expect(sliceOf(projects!)).toBe("Operate");
+    expect(NAV[0].items.map((item) => item.id).slice(0, 3)).toEqual(["home", "fleet", "projects"]);
   });
 
   /**
-   * The roster group must not smuggle paths into the route list: `router.tsx`
-   * builds one route per entry in `NAV_PATHS`, and a project path is a
-   * parameterised detail route instead.
+   * A project path is a parameterised detail route, never a static entry:
+   * `router.tsx` builds one route per entry in `NAV_PATHS`.
    */
   it("keeps every path in the route list static", () => {
     expect(NAV_PATHS.some((path) => path.startsWith("/projects/"))).toBe(false);
@@ -70,6 +44,9 @@ describe("the nav table", () => {
     expect(NAV[0].items.map((item) => item.label)).toEqual([
       "Home",
       "Fleet",
+      // Not in §3.1's Operate: it was a group of its own until 2026-10-02, and
+      // came back here as one row when the switcher took over the project list.
+      "Projects",
       "Autopilot",
       "Waiting",
       "Runs",
@@ -85,7 +62,7 @@ describe("the nav table", () => {
   });
 
   it("lists Work exactly as the design draws it", () => {
-    expect(NAV[2].items.map((item) => item.label)).toEqual([
+    expect(NAV[1].items.map((item) => item.label)).toEqual([
       "Chats",
       "Teams",
       "Agents",
@@ -94,7 +71,7 @@ describe("the nav table", () => {
   });
 
   it("lists Pillars exactly as the design draws it", () => {
-    expect(NAV[3].items.map((item) => item.label)).toEqual([
+    expect(NAV[2].items.map((item) => item.label)).toEqual([
       "Mail",
       "Contacts",
       "Calendar",
@@ -152,8 +129,8 @@ describe("the nav table", () => {
 
   it("names the slice that brings each page", () => {
     expect(sliceOf(NAV[0].items[1])).toBe("Operate");
-    expect(sliceOf(NAV[2].items[0])).toBe("Work");
-    expect(sliceOf(NAV[3].items[0])).toBe("Pillars");
+    expect(sliceOf(NAV[1].items[0])).toBe("Work");
+    expect(sliceOf(NAV[2].items[0])).toBe("Pillars");
     // System belongs to no group and must still answer.
     expect(sliceOf(SYSTEM_ITEM)).toBe("System");
   });

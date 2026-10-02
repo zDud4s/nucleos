@@ -9,14 +9,13 @@ import { ErrorNote } from "../ui/ErrorNote";
 import { RefusalNote } from "../ui/RefusalNote";
 
 /**
- * Taking a project off the roster, asked for where the project is compared with the others.
+ * Taking a project off the roster, asked for from inside the project's own State mode.
  *
  * **Inline, and not a dialog.** `ConfirmButton` already wrote this argument down for the whole app:
  * a modal asking *are you sure?* trains people to click through it, and it takes the decision away
  * from the thing that caused it. The workflows guard is the same shape — a `role="group"` that
- * opens under the control, with the page still on screen behind it. This follows both, and the row
- * it belongs to stays visible while somebody reads it, which is the entire reason the decision is
- * being taken on a page that shows every project at once.
+ * opens under the control, with the page still on screen behind it. This follows both, and the
+ * project it is about stays on screen around it while somebody reads it.
  *
  * **A plain remove is one press; remove-and-forget is armed and confirmed.** The plain remove is
  * reversible — the folder stays, the history stays, adding the project back finds both — so the
@@ -33,7 +32,7 @@ export interface RemoveProjectProps {
   projectId: string;
   /** The recorded root, or `null` for a project nobody ever pointed anywhere. */
   projectRoot: string | null;
-  /** Told what left and how, so the page can say so where the row was. */
+  /** Told what left and how, so the roster can say so once the project is gone from it. */
   onDone: (removed: Removed) => void;
   onCancel: () => void;
 }
@@ -44,6 +43,22 @@ export interface Removed {
   projectRoot: string | null;
   /** Whether its history went with it. */
   forgot: boolean;
+}
+
+/*
+  How a removal reaches the roster: on the history entry the State page navigates with.
+
+  The removal is asked for inside the project and acknowledged on `/projects`, so it has to cross a
+  navigation. History state is the one carrier that is typed and scoped to exactly that entry, so it is
+  not carried by any later one: a search param would put "spent left the roster" in a URL somebody can
+  bookmark, and a module-level store would say it again on every later visit to the roster.
+  Augmented on `@tanstack/history` because that is where `HistoryState` is declared (the router
+  augments it there too).
+*/
+declare module "@tanstack/history" {
+  interface HistoryState {
+    leftTheRoster?: Removed;
+  }
 }
 
 export function RemoveProject({ id, projectId, projectRoot, onDone, onCancel }: RemoveProjectProps) {
