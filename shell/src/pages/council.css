@@ -348,13 +348,13 @@
   white-space: pre-wrap;
 }
 
-/* Three lines until somebody asks for the rest — the button beside it is what
-   unclamps this same paragraph, so the full text is never on the page twice. */
+/* A few lines until somebody asks for the rest — the button beside it is what
+   unclamps this same block, so the full text is never on the page twice. A
+   height and not `line-clamp`: the answer is rich text now, a stack of blocks,
+   and `-webkit-line-clamp` only counts the lines of one inline formatting
+   context. */
 .council-seat-answer-clamped {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
+  max-height: 6lh;
   overflow: hidden;
 }
 
@@ -363,6 +363,107 @@
   font-size: var(--text-xs);
   font-style: italic;
   color: var(--text-faint);
+}
+
+/* The role a seat was asked to play, and a revision's own account of itself
+   (kept its answer, and why). Both are said about the seat, not by it, so they
+   sit at the metadata size beside the answer rather than inside it. */
+.council-seat-role,
+.council-seat-note {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* ================================================================ rich text == */
+
+/**
+ * `CouncilRich` — a seat's answer or the synthesis, as the markdown it was
+ * written in. Every block is its own element, so the spacing between them is
+ * set here; the colours and size come from the container (`.council-seat-answer`
+ * or `.council-synthesis`), which is why none are set on the text itself.
+ */
+.council-rich {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  white-space: normal;
+}
+
+.council-rich-line,
+.council-rich-heading,
+.council-rich-quote,
+.council-rich-bullet {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+/* The author's blank line: the paragraph break, given room so two thoughts do
+   not run together. */
+.council-rich-gap {
+  margin: 0;
+  height: var(--space-1);
+}
+
+.council-rich-rule {
+  margin: var(--space-1) 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+.council-rich-heading {
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+.council-rich-quote {
+  padding-left: var(--space-2);
+  border-left: 2px solid var(--border);
+  font-style: italic;
+}
+
+.council-rich-bullet {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.council-rich-marker {
+  flex: none;
+  color: var(--text-faint);
+}
+
+.council-rich-link {
+  text-decoration: underline;
+  text-decoration-style: dotted;
+}
+
+.council-rich-code {
+  margin: 0;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+/* A table scrolls inside its own frame rather than widening the card. */
+.council-rich-table-wrap {
+  overflow-x: auto;
+}
+
+.council-rich-table {
+  border-collapse: collapse;
+  font-size: var(--text-xs);
+}
+
+.council-rich-table th,
+.council-rich-table td {
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border);
+  text-align: left;
 }
 
 /* ============================================================= leaderboard == */
@@ -424,5 +525,255 @@
   color: var(--tone-danger-fg);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+}
+
+/* ================================================================ rounds == */
+
+/* The round the council stopped at. Its own line, apart from the facts row in
+   the header: the header says THAT it stopped, this says WHERE. */
+.council-stopped {
+  margin-bottom: var(--space-2);
+}
+
+.council-round {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding-top: var(--space-2);
+}
+
+.council-round-seat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.council-round-seat:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.council-round-seat-name {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+/* A ballot is read top-down as a ranking, so the browser's own numbering is
+   the position — no hand-written "1." to drift from the order. */
+.council-ballot {
+  margin: 0;
+  padding-left: var(--space-3);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+}
+
+.council-critiques {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.council-critique-on {
+  margin: 0;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-muted);
+}
+
+.council-points {
+  margin: 0;
+  padding-left: var(--space-3);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+}
+
+.council-point-stance {
+  font-weight: var(--weight-medium);
+}
+
+.council-point-why {
+  color: var(--text-muted);
+}
+
+.council-revision {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.council-revision-verdict {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* A revision against the text it replaced. The `+`/`-` sign and the
+   `<ins>`/`<del>` elements carry the meaning; the tint only repeats it, the
+   same tones `ui/Diff.tsx` paints a git diff with. */
+.council-diff {
+  margin: 0;
+  padding: var(--space-1) 0;
+  list-style: none;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  overflow-x: auto;
+}
+
+.council-diff-line {
+  padding: 0 var(--space-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+}
+
+.council-diff-line ins,
+.council-diff-line del {
+  text-decoration: none;
+}
+
+.council-diff-line[data-kind="added"] {
+  background: var(--tone-active-bg);
+  color: var(--text);
+}
+
+.council-diff-line[data-kind="removed"] {
+  background: var(--tone-danger-bg);
+  color: var(--text);
+}
+
+.council-diff-sign {
+  display: inline-block;
+  width: 1.5ch;
+  color: var(--text-faint);
+}
+
+/* Seat by round, each cell a Borda position. Numbers line up in their column
+   so a seat's climb or fall is read by eye down the row. */
+.council-evolution {
+  margin-top: var(--space-3);
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.council-evolution-caption {
+  text-align: left;
+  padding-bottom: var(--space-1);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-muted);
+}
+
+.council-evolution th,
+.council-evolution td {
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  font-weight: normal;
+}
+
+.council-evolution td {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* ===================================================== structured synthesis == */
+
+/* The chairman's confidence and the ballots' agreement. Neutral on purpose:
+   neither is a lifecycle state, so neither borrows a state tone — the word is
+   the whole message. */
+.council-synthesis-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.council-synthesis-badge {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-muted);
+}
+
+.council-synthesis-card {
+  margin-top: var(--space-3);
+  max-width: var(--measure-prose);
+}
+
+.council-synthesis-card-name {
+  margin: 0 0 var(--space-1);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-muted);
+}
+
+.council-synthesis-list {
+  margin: 0;
+  padding-left: var(--space-4);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.council-synthesis-topic + .council-synthesis-topic {
+  margin-top: var(--space-2);
+}
+
+.council-synthesis-topic-name,
+.council-synthesis-text {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.council-synthesis-seats {
+  color: var(--text-muted);
+}
+
+/* The chairman wrote prose the daemon could not read as its structure. Said in
+   the paused tone — nothing failed, and the text below is still the chairman's. */
+.council-synthesis-degraded {
+  margin: 0 0 var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--tone-paused-bg);
+  color: var(--tone-paused-fg);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+/* ================================================================ live tail == */
+
+/* What a running seat has written so far. Capped and scrollable: a seat can
+   write pages before it settles, and the card is a summary. */
+.council-seat-tail {
+  margin: var(--space-2) 0 0;
+  max-height: 12rem;
+  overflow-y: auto;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text);
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }

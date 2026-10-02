@@ -903,6 +903,9 @@ pub fn build_router(state: AppState) -> Router {
             "/council",
             get(crate::council::list_councils).post(crate::council::post_council),
         )
+        // The form's defaults. A static segment, so the router prefers it over `{id}` whatever
+        // the order — it sits first anyway, so a reader does not need to know that to see it win.
+        .route("/council/config", get(crate::council::get_council_config))
         .route("/council/{id}", get(crate::council::get_council))
         .route(
             "/council/{id}/cancel",
@@ -16384,6 +16387,7 @@ mod tests {
             ("GET", "/council"),
             ("GET", "/council/abc"),
             ("POST", "/council/abc/cancel"),
+            ("GET", "/council/config"),
         ] {
             let response = build_router(state.clone())
                 .oneshot(
@@ -16429,6 +16433,17 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // `/council/config` is its own route, not a council whose id is "config": the static
+        // segment must win over `{id}`, or the form's defaults read as "no such council". With no
+        // roster on this test daemon the answer is a 200 that says so, not a 503 — the form still
+        // needs the bounds and the roles to draw itself.
+        let response =
+            api_token_request(state.clone(), "GET", "/council/config", "test-token", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["configured"], serde_json::json!(false), "{body}");
+        assert!(body["default_roster"].is_null(), "{body}");
     }
 
     /// The weakest key in the house reaches capacity for real — through the production router, not

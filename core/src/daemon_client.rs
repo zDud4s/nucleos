@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::autopilot::{Mode, ProjectSummary};
 
@@ -745,10 +746,15 @@ impl DaemonClient {
     /// `(StatusCode, String)` written in prose — which panel refused, which seat was wrong, what
     /// the budget had left — and a caller told "the core refused: 400" instead would have to guess
     /// at what to do differently.
-    pub async fn ask_council(&self, question: &str) -> Result<String, String> {
+    pub async fn ask_council(
+        &self,
+        question: &str,
+        rounds: Option<u32>,
+        roles: Option<BTreeMap<String, String>>,
+    ) -> Result<String, String> {
         let response = self
             .request(reqwest::Method::POST, "/council")
-            .json(&serde_json::json!({ "question": question }))
+            .json(&council_ask_body(question, rounds, roles))
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -1242,6 +1248,24 @@ pub fn vcs_submit_body(
         project_id: project_id.to_owned(),
         operation: crate::vcs::Op::from_request(operation, source, target)?,
     })
+}
+
+/// PURE: the `POST /council` body for one question. `rounds` and `roles` become keys only when
+/// given. An absent key is the daemon's documented "use the file's default"; a `null` reads the same
+/// today only because of how serde treats an `Option`, and a wire contract should not lean on that.
+pub fn council_ask_body(
+    question: &str,
+    rounds: Option<u32>,
+    roles: Option<BTreeMap<String, String>>,
+) -> Value {
+    let mut body = serde_json::json!({ "question": question });
+    if let Some(rounds) = rounds {
+        body["rounds"] = serde_json::json!(rounds);
+    }
+    if let Some(roles) = roles {
+        body["roles"] = serde_json::json!(roles);
+    }
+    body
 }
 
 /// PURE: which of the two ticket routes to call. Extracted so the choice is asserted somewhere —

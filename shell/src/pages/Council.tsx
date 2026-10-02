@@ -8,13 +8,21 @@ import {
   useCouncil,
   useCouncils,
   useCreateCouncil,
+  useCouncilConfig,
+  ceilingCalls,
+  councilIsAlive,
+  seatName,
+  type BordaRow,
   type CouncilSummary,
   type CouncilView,
-  type LeaderboardEntry,
   type RosterOverride,
   type RosterSeat,
   type SeatView,
+  type StepView,
 } from "../data/council";
+import { CouncilRich } from "./CouncilRich";
+import { CouncilRounds, StepTail } from "./CouncilRounds";
+import { CouncilSynthesis } from "./CouncilSynthesis";
 import {
   Button,
   ConfirmButton,
@@ -45,10 +53,10 @@ import "./council.css";
  * — a council whose chairman failed still has real answers on it, and hiding
  * them behind the one panel that failed would throw the rest away.
  *
- * How many phases there are is the council's own fact, not this page's:
- * `stages_total` is three, or four where a second round was configured, and
- * every phase counter here reads it rather than assuming the number it was
- * true to assume until revisions existed.
+ * Progress is told as a round and a phase — "round 1 · critique" — because a
+ * council now runs as many critique rounds as it was asked for, and a fixed
+ * "phase N of M" counter has no meaning over rounds. How many rounds there are
+ * is the council's own fact (`rounds`), never this page's assumption.
  */
 export function Council() {
   const params = useParams({ strict: false }) as { councilId?: string };
@@ -72,9 +80,9 @@ export function Council() {
       {councilId === null && (
         <Teach title="Choose a council">
           <p>
-            Pick a question from the list, or convene a new one above. Each row says how many
-            phases its council has — four where a second round adds a revision before the
-            synthesis — and this page shows all of them whichever one a council has reached.
+            Pick a question from the list, or convene a new one above. Each row says which round
+            its council has reached and what it is doing in it, and this page shows every seat's
+            answer and latest step whichever round that is.
           </p>
         </Teach>
       )}
@@ -217,9 +225,28 @@ function ConveneForm() {
   const [members, setMembers] = useState<(RosterSeat | null)[]>([null]);
   const create = useCreateCouncil();
   const navigate = useNavigate();
+  // One cheap read on every visit, unlike the catalogues above: the bounds it
+  // carries are what a council convened from here will run under, and saying
+  // so before the question is asked is the point of the endpoint.
+  const config = useCouncilConfig();
+
+  /**
+   * The rounds somebody picked, or `null` while they have picked none.
+   *
+   * `null` and not the config's default copied into state: the config answers
+   * after the form mounts, so a copy taken at mount would be the wrong number,
+   * and "untouched" has to stay distinguishable from "chose the default" for
+   * the request to keep leaving the key off.
+   */
+  const [pickedRounds, setPickedRounds] = useState<number | null>(null);
+  /** A role per member row, keyed by the row's index. Absent means "no role". */
+  const [roles, setRoles] = useState<Record<number, string>>({});
 
   const roster = rosterFrom(chairman, members);
   const halfChosen = choosing && roster === null;
+  const defaultRounds = config.data?.default_rounds;
+  const rounds = pickedRounds ?? defaultRounds;
+  const estimate = estimateMembers(choosing, members, config.data?.default_roster?.members.length);
 
   return (
     <Panel title="Convene a council">
@@ -228,6 +255,13 @@ function ConveneForm() {
         on its own, ranks the others blind, and a chairman writes a synthesis. A panel chosen below
         stands in for that roster for this one question, and never rewrites the file.
       </p>
+      {config.data !== undefined && (
+        <p className="council-note">
+          {config.data.default_rounds} critique{" "}
+          {config.data.default_rounds === 1 ? "round" : "rounds"} by default, at most{" "}
+          {config.data.max_rounds}.
+        </p>
+      )}
       <form
         className="council-form"
         onSubmit={(event) => {
@@ -236,7 +270,17 @@ function ConveneForm() {
           create.mutate(
             // `undefined` and not `null`: the key is left off the request
             // entirely when nothing is being overridden. See `data/council.ts`.
-            { question: question.trim(), roster: choosing && roster !== null ? roster : undefined },
+            {
+              question: question.trim(),
+              roster: choosing && roster !== null ? roster : undefined,
+              // Only a departure from the file's default travels; the default
+              // itself is the daemon's to apply, as it is for every request
+              // that never had this control.
+              rounds: rounds !== undefined && rounds !== defaultRounds ? rounds : undefined,
+              // Roles belong to the chosen panel's rows, so they travel with it
+              // and never on their own against a roster this form did not draw.
+              roles: choosing && roster !== null ? rolesBody(roles, members.length) : undefined,
+            },
             {
               onSuccess: (result) => {
                 setQuestion("");
@@ -265,13 +309,40 @@ function ConveneForm() {
           <span>Put this question to a chosen panel</span>
         </label>
 
+        <label className="council-field">
+          <span>Rounds</span>
+          <select
+            className="council-select"
+            aria-label="Rounds"
+            value={rounds === undefined ? "" : String(rounds)}
+            disabled={config.data === undefined}
+            onChange={(event) => setPickedRounds(Number(event.target.value))}
+          >
+            {roundChoices(config.data?.max_rounds).map((choice) => (
+              <option key={choice} value={String(choice)}>
+                {choice}
+              </option>
+            ))}
+          </select>
+        </label>
+
         {choosing && (
           <RosterPicker
             chairman={chairman}
             members={members}
+            roles={roles}
+            roleChoices={config.data?.roles ?? []}
             onChairman={setChairman}
             onMembers={setMembers}
+            onRoles={setRoles}
           />
+        )}
+
+        {/* One template string, so the line is one text node a reader and a
+            test both find whole. A ceiling, not a forecast: a council that
+            stops early spends less. */}
+        {estimate !== undefined && rounds !== undefined && (
+          <p className="council-note">{`up to ${ceilingCalls(estimate, rounds)} calls`}</p>
         )}
 
         <Button
@@ -287,6 +358,59 @@ function ConveneForm() {
   );
 }
 
+/** PURE: 1..max, or nothing while the config has not answered. */
+function roundChoices(max: number | undefined): number[] {
+  if (max === undefined) return [];
+  return Array.from({ length: max }, (_, at) => at + 1);
+}
+
+/**
+ * PURE: how many members the estimate counts, or `undefined` when nothing says.
+ *
+ * The chosen rows once the picker is open and at least one row is filled — the
+ * panel on screen is the one that would run — and otherwise the configured
+ * roster the request would fall back to. With neither there is no honest
+ * number, and the line is left off rather than guessed.
+ */
+function estimateMembers(
+  choosing: boolean,
+  members: (RosterSeat | null)[],
+  configured: number | undefined,
+): number | undefined {
+  if (choosing) {
+    const chosen = members.filter((member) => member !== null).length;
+    if (chosen > 0) return chosen;
+  }
+  return configured;
+}
+
+/**
+ * PURE: the `roles` key as the daemon reads it — the row's index as a string —
+ * or `undefined` when no row plays one, so the key stays off the request.
+ * Rows past the panel's end are ignored: a role is only ever a row's.
+ */
+function rolesBody(roles: Record<number, string>, rows: number): Record<string, string> | undefined {
+  const body: Record<string, string> = {};
+  for (const [index, role] of Object.entries(roles)) {
+    if (role !== "" && Number(index) < rows) body[index] = role;
+  }
+  return Object.keys(body).length > 0 ? body : undefined;
+}
+
+/**
+ * PURE: the roles after row `removed` comes out. The rows below it move up one,
+ * and their roles have to move with them or a role would land on its neighbour.
+ */
+function rolesWithout(roles: Record<number, string>, removed: number): Record<number, string> {
+  const next: Record<number, string> = {};
+  for (const [key, role] of Object.entries(roles)) {
+    const index = Number(key);
+    if (index < removed) next[index] = role;
+    else if (index > removed) next[index - 1] = role;
+  }
+  return next;
+}
+
 /**
  * Who sits on the panel for this question.
  *
@@ -298,13 +422,19 @@ function ConveneForm() {
 function RosterPicker({
   chairman,
   members,
+  roles,
+  roleChoices,
   onChairman,
   onMembers,
+  onRoles,
 }: {
   chairman: RosterSeat | null;
   members: (RosterSeat | null)[];
+  roles: Record<number, string>;
+  roleChoices: string[];
   onChairman: (seat: RosterSeat | null) => void;
   onMembers: (seats: (RosterSeat | null)[]) => void;
+  onRoles: (roles: Record<number, string>) => void;
 }) {
   const agents = useAgents();
   const models = useAssistantModels();
@@ -339,6 +469,23 @@ function RosterPicker({
               models={choices}
               onChange={(seat) => onMembers(members.map((old, at) => (at === index ? seat : old)))}
             />
+            {/* The chairman has no role: it synthesises, it does not argue. */}
+            <label className="council-field">
+              <span>Role</span>
+              <select
+                className="council-select"
+                aria-label={`Role for seat ${index}`}
+                value={roles[index] ?? ""}
+                onChange={(event) => onRoles({ ...roles, [index]: event.target.value })}
+              >
+                <option value="">no role</option>
+                {roleChoices.map((role) => (
+                  <option key={role} value={role}>
+                    {role}
+                  </option>
+                ))}
+              </select>
+            </label>
             {/* The last row does not come out: `council::start` refuses a roster
                 with no members, so an empty panel would be a refusal rather
                 than a way back to the file. Unticking the box is that. */}
@@ -346,7 +493,10 @@ function RosterPicker({
               variant="quiet"
               aria-label={`Remove seat ${index}`}
               disabled={members.length === 1}
-              onClick={() => onMembers(members.filter((_, at) => at !== index))}
+              onClick={() => {
+                onMembers(members.filter((_, at) => at !== index));
+                onRoles(rolesWithout(roles, index));
+              }}
             >
               Remove
             </Button>
@@ -479,13 +629,23 @@ function CouncilList({
  * and carries the hit area; `aria-current` on it is the same fact said to a
  * screen reader and stays beside it.
  */
+/**
+ * Where a council is: "round 1 · critique". Round 0 is the seats answering on
+ * their own, and the synthesis is named by its phase alone because it belongs
+ * to no round.
+ */
+function progressOf(council: { current_round: number; current_phase: string }): string {
+  if (council.current_phase === "synthesis") return "synthesis";
+  return `round ${council.current_round} · ${council.current_phase}`;
+}
+
 function CouncilRow({ row, active }: { row: CouncilSummary; active: boolean }) {
   return (
     <Row current={active}>
       <Link className="council-row-link" to={`/council/${row.id}`} aria-current={active ? "page" : undefined}>
         <span className="council-row-question">{row.question}</span>
         <StateBadge domain="council" state={row.status} />
-        <span className="council-phase">phase {row.stage} of {row.stages_total}</span>
+        <span className="council-phase">{progressOf(row)}</span>
         <RelativeTime at={row.created_at} />
       </Link>
     </Row>
@@ -531,7 +691,11 @@ function CouncilDetail({ id }: { id: string }) {
         <p className="council-question">{detail.question}</p>
         <div className="council-facts">
           <StateBadge domain="council" state={detail.status} />
-          <span className="council-phase">phase {detail.stage} of {detail.stages_total}</span>
+          <span className="council-phase">{progressOf(detail)}</span>
+          <span className="council-phase">
+            {detail.rounds_run} of {detail.rounds} {detail.rounds === 1 ? "round" : "rounds"} run
+            {detail.stopped_early ? " — stopped early, nothing left to change" : ""}
+          </span>
           <span className="council-chairman">{chairmanLine(detail)}</span>
           <RelativeTime at={detail.created_at} />
         </div>
@@ -545,9 +709,15 @@ function CouncilDetail({ id }: { id: string }) {
         )}
       </Panel>
 
-      <SeatGrid seats={detail.seats} stagesTotal={detail.stages_total} />
-      <Leaderboard leaderboard={detail.leaderboard} />
-      <Synthesis synthesis={detail.synthesis} error={detail.error} />
+      <SeatGrid seats={detail.seats} running={councilIsAlive(detail.status)} />
+      {/* How each seat got where the grid shows it: round by round, after the
+          grid and before the leaderboard that the rounds produced. Only once a
+          critique round has run: before that its one tab, "Answers", is the
+          seat grid again, word for word — and while a seat is still answering,
+          the copy would show its settled answer twice beside the live tail. */}
+      {detail.rounds_run >= 1 && <CouncilRounds view={detail} />}
+      <Leaderboard leaderboard={detail.leaderboard} seats={detail.seats} />
+      <CouncilSynthesis view={detail} />
     </>
   );
 }
@@ -589,15 +759,7 @@ function CancelRefusal({ error }: { error: unknown }) {
 
 /* ------------------------------------------------------------------- seats -- */
 
-/**
- * `stagesTotal` travels down to the cards, and is not derived inside them.
- *
- * A one-round council leaves `revision_status` at `pending` on every seat and
- * never writes `skipped`, so a card reading that field alone cannot tell "no
- * revision was ever going to happen" from "the revision has not started yet".
- * The council row knows, so the council row is asked.
- */
-function SeatGrid({ seats, stagesTotal }: { seats: SeatView[]; stagesTotal: number }) {
+function SeatGrid({ seats, running }: { seats: SeatView[]; running: boolean }) {
   return (
     <Panel title="Seats" aside={<Count n={seats.length} />}>
       {seats.length === 0 ? (
@@ -605,7 +767,7 @@ function SeatGrid({ seats, stagesTotal }: { seats: SeatView[]; stagesTotal: numb
       ) : (
         <Rows label="Seats">
           {seats.map((seat) => (
-            <SeatCard key={seat.seat_idx} seat={seat} stagesTotal={stagesTotal} />
+            <SeatCard key={seat.seat_idx} seat={seat} running={running} />
           ))}
         </Rows>
       )}
@@ -625,7 +787,9 @@ function SeatGrid({ seats, stagesTotal }: { seats: SeatView[]; stagesTotal: numb
  * The agent's id stands in when the name is gone. `agent_name` is read from
  * the catalogue as the view is built, so a `null` beside a set `agent_id`
  * means the agent has been deleted since it answered — a real state the seat
- * says out loud rather than papering over with a blank line.
+ * says out loud rather than papering over with a blank line. (`seatName`, used
+ * away from the card, falls back to the model instead: there the card is not
+ * beside it to say which agent is gone.)
  */
 function seatTitle(seat: SeatView): string {
   if (seat.agent_name !== null) return seat.agent_name;
@@ -635,42 +799,33 @@ function seatTitle(seat: SeatView): string {
 }
 
 /**
- * What a seat's answer reads as.
- *
- * `answer === null` is ambiguous on its own — nothing written yet, or a
- * transcript that has since been pruned — and the two must not read the same.
- * `stage1_status === "ok"` with no answer is the pruned case: the seat did
- * answer, and the text is simply gone now.
+ * The seat's round-0 answer — the text every ranking was cast over, which is
+ * why it stays on the card whatever happened after it.
  */
-function answerText(seat: SeatView): string {
-  if (seat.answer !== null) return seat.answer;
-  if (seat.stage1_status === "ok") return "answered — the text has expired";
-  return "no answer recorded";
+function answerStep(seat: SeatView): StepView | undefined {
+  return seat.steps.find((step) => step.round === 0 && step.phase === "answer");
+}
+
+/** What a step is called on a card: "answer", or "round 1 · critique". */
+function stepLabel(step: StepView): string {
+  return step.round === 0 && step.phase === "answer" ? "answer" : `round ${step.round} · ${step.phase}`;
 }
 
 /**
- * The same three readings for the revised answer, and a fourth this one needs.
- *
- * A seat may legitimately produce no revision on a council that ran one — its
- * run failed, or timed out, or the ranking never happened — and the chairman
- * then read its FIRST answer. Saying so is the point: a blank here would look
- * like text that went missing, when it is a seat that stood by what it wrote.
+ * A critique that settled and ranked nobody. A blank vote is a real answer to a
+ * critique round, not a failure and not a gap — the seat chose not to rank.
+ * A critique with no readable payload is not this: the daemon marks that one
+ * `invalid`, and it reads as such.
  */
-function revisedText(seat: SeatView): string {
-  if (seat.revised_answer !== null) return seat.revised_answer;
-  if (seat.revision_status === "ok") return "revised — the text has expired";
-  if (seat.revision_status === "skipped") return "not asked to revise";
-  return "the first answer stood";
+function abstained(step: StepView): boolean {
+  return step.phase === "critique" && step.status === "ok" && (step.critique?.ranking.length ?? 0) === 0;
 }
 
-function SeatCard({ seat, stagesTotal }: { seat: SeatView; stagesTotal: number }) {
+function SeatCard({ seat, running }: { seat: SeatView; running: boolean }) {
   const [full, setFull] = useState(false);
-  const abstained = seat.stage2_status === "ok" && seat.rankings.length === 0;
-  // Four phases means a revision round was configured for this council, so the
-  // seat has a third block to draw even while it is still `pending`. Three
-  // means there was never going to be one, and a block reading "waiting" would
-  // promise a phase that is not coming.
-  const revised = stagesTotal > 3;
+  const answer = answerStep(seat);
+  const latest = seat.steps.length === 0 ? undefined : seat.steps[seat.steps.length - 1];
+  const tailing = seat.steps.find((step) => step.status === "pending" && step.run_id !== null);
   // An agent that answered and is no longer in the catalogue. Told apart from a
   // model-named seat by `agent_id`, which the row keeps forever.
   const agentIsGone = seat.agent_id !== null && seat.agent_name === null;
@@ -688,67 +843,101 @@ function SeatCard({ seat, stagesTotal }: { seat: SeatView; stagesTotal: number }
         <span className="council-seat-idx">seat {seat.seat_idx}</span>
       </div>
       <p className="council-seat-ref">{seat.ref}</p>
+      {seat.role !== null && <p className="council-seat-role">plays the {seat.role.replace(/_/g, " ")}</p>}
       {agentIsGone && (
         <p className="council-seat-gone">this agent is no longer in the catalogue</p>
       )}
 
-      <div className="council-seat-stage">
-        <span className="council-seat-stage-label">stage 1</span>
-        <StateBadge domain="council_seat" state={seat.stage1_status} />
-      </div>
-      {seat.stage1_error !== null && (
-        <p className="council-seat-error" role="alert">
-          {seat.stage1_error}
-        </p>
-      )}
-      <p className={full ? "council-seat-answer" : "council-seat-answer council-seat-answer-clamped"}>
-        {answerText(seat)}
-      </p>
-      {/* The clamp is three lines, and a seat's answer is routinely longer. The
-          control unclamps the paragraph rather than printing a second copy of
-          it underneath: two elements holding the same text read as the seat
-          having answered twice, which on a council that revises is a real
-          thing and must not be said by accident. */}
-      {seat.answer !== null && (
-        <Button variant="quiet" aria-expanded={full} onClick={() => setFull(!full)}>
-          {full ? "less" : "more"}
-        </Button>
-      )}
-
-      <div className="council-seat-stage">
-        <span className="council-seat-stage-label">stage 2</span>
-        <StateBadge domain="council_seat" state={seat.stage2_status} />
-      </div>
-      {seat.stage2_error !== null && (
-        <p className="council-seat-error" role="alert">
-          {seat.stage2_error}
-        </p>
-      )}
-      {/* A blank vote is a valid outcome, not a failure — the seat answered ok
-          and simply ranked nobody. */}
-      {abstained && <p className="council-seat-abstained">abstained</p>}
-
-      {revised && (
+      {answer === undefined ? (
+        <p className="council-seat-answer">no answer recorded</p>
+      ) : (
         <>
-          <div className="council-seat-stage">
-            <span className="council-seat-stage-label">revision</span>
-            <StateBadge domain="council_seat" state={seat.revision_status} />
-          </div>
-          {seat.revision_error !== null && (
-            <p className="council-seat-error" role="alert">
-              {seat.revision_error}
+          <StepHead step={answer} />
+          {answer.answer !== null ? (
+            <>
+              <div className={full ? "council-seat-answer" : "council-seat-answer council-seat-answer-clamped"}>
+                <CouncilRich text={answer.answer} />
+              </div>
+              {/* The clamp is a few lines, and a seat's answer is routinely
+                  longer. The control unclamps this same block rather than
+                  printing a second copy of it underneath. */}
+              <Button variant="quiet" aria-expanded={full} onClick={() => setFull(!full)}>
+                {full ? "less" : "more"}
+              </Button>
+            </>
+          ) : (
+            // `ok` with no text is the pruned case: the seat did answer, and the
+            // transcript that held it is simply gone now.
+            <p className="council-seat-answer">
+              {answer.status === "ok" ? "answered — the text has expired" : "no answer recorded"}
             </p>
           )}
-          <p className="council-seat-answer">{revisedText(seat)}</p>
         </>
+      )}
+
+      {latest !== undefined && latest !== answer && <LatestStep step={latest} />}
+      {/* What the seat is writing right now. Only while the step is pending and
+          the council still runs: a settled step has its stored result above,
+          and a council that ended will never write another byte to any tail. */}
+      {running && tailing !== undefined && tailing.run_id !== null && (
+        <StepTail key={tailing.run_id} runId={tailing.run_id} name={seatName(seat)} />
       )}
     </Row>
   );
 }
 
+/** One step's label, its badge, and the daemon's sentence when it did not go well. */
+function StepHead({ step }: { step: StepView }) {
+  return (
+    <>
+      <div className="council-seat-stage">
+        <span className="council-seat-stage-label">{stepLabel(step)}</span>
+        <StateBadge domain="council_seat" state={step.status} />
+      </div>
+      {step.error !== null && (
+        <p className="council-seat-error" role="alert">
+          {step.error}
+        </p>
+      )}
+    </>
+  );
+}
+
+/**
+ * The seat's latest step, when it is not the answer above. Only the latest: the
+ * round-by-round account is a timeline of its own, and the card says where the
+ * seat stands now.
+ */
+function LatestStep({ step }: { step: StepView }) {
+  return (
+    <>
+      <StepHead step={step} />
+      {abstained(step) && <p className="council-seat-abstained">abstained</p>}
+      {step.phase === "revise" && step.status === "ok" && (
+        <>
+          {step.changed === false ? (
+            <p className="council-seat-note">kept its answer</p>
+          ) : step.answer !== null ? (
+            <div className="council-seat-answer">
+              <CouncilRich text={step.answer} />
+            </div>
+          ) : null}
+          {step.why !== null && <p className="council-seat-note">{step.why}</p>}
+        </>
+      )}
+    </>
+  );
+}
+
 /* ------------------------------------------------------------- leaderboard -- */
 
-function Leaderboard({ leaderboard }: { leaderboard: LeaderboardEntry[] }) {
+/**
+ * The last critique round's Borda leaderboard, in the order the daemon served
+ * it. Each seat by name — "seat 1" is a number the reader then has to carry up
+ * to the seat grid to decode — with the score and `n` beside it: one ballot
+ * and four are not the same claim.
+ */
+function Leaderboard({ leaderboard, seats }: { leaderboard: BordaRow[]; seats: SeatView[] }) {
   return (
     <Panel title="Leaderboard">
       {leaderboard.length === 0 ? (
@@ -761,50 +950,22 @@ function Leaderboard({ leaderboard }: { leaderboard: LeaderboardEntry[] }) {
            `Rows` and not a stack of boxes — and the three parts of a ranking sit
            on one baseline, which is what `layout="line"` is. */
         <Rows label="Leaderboard">
-          {leaderboard.map((entry) => (
-            <Row layout="line" key={entry.seat_idx}>
-              <span className="council-leaderboard-seat">seat {entry.seat_idx}</span>
-              <span className="council-leaderboard-rank">avg rank {entry.avg_rank.toFixed(2)}</span>
-              {/* n travels with the average always: one vote and five votes are
-                  not the same claim, and dropping this would present them as one. */}
-              <span className="council-leaderboard-n">n = {entry.n}</span>
-            </Row>
-          ))}
+          {leaderboard.map((entry) => {
+            const seat = seats.find((candidate) => candidate.seat_idx === entry.seat_idx);
+            return (
+              <Row layout="line" key={entry.seat_idx}>
+                <span className="council-leaderboard-seat">
+                  {/* A row naming a seat the view does not carry is the daemon's
+                      inconsistency, said as such rather than as a bare number. */}
+                  {seat === undefined ? `an unrecorded seat (#${entry.seat_idx})` : seatName(seat)}
+                </span>
+                <span className="council-leaderboard-rank">score {entry.score.toFixed(2)}</span>
+                <span className="council-leaderboard-n">n = {entry.n}</span>
+              </Row>
+            );
+          })}
         </Rows>
       )}
-    </Panel>
-  );
-}
-
-/* --------------------------------------------------------------- synthesis -- */
-
-/**
- * Phase 3's output — or the fact that the chairman never produced one.
- *
- * A `null` synthesis with `error` set is not a reason to hide phases 1 and 2:
- * the seats and the leaderboard above this panel are real answers regardless
- * of what the chairman did with them, and only this one panel changes shape.
- */
-function Synthesis({ synthesis, error }: { synthesis: string | null; error: string | null }) {
-  if (synthesis !== null) {
-    return (
-      <Panel title="Synthesis">
-        <p className="council-synthesis">{synthesis}</p>
-      </Panel>
-    );
-  }
-  if (error !== null) {
-    return (
-      <Panel title="Synthesis">
-        <p className="council-chairman-failed" role="alert">
-          the chairman failed to write a synthesis: {error}
-        </p>
-      </Panel>
-    );
-  }
-  return (
-    <Panel title="Synthesis">
-      <Quiet says="no synthesis yet." />
     </Panel>
   );
 }

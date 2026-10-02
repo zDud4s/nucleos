@@ -22,9 +22,19 @@ vi.mock("../data/client", async (original) => ({
 import { Council } from "./Council";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
-import type { CouncilSummary, CouncilView, SeatView } from "../data/council";
+import type {
+  CouncilConfig,
+  CouncilSummary,
+  CouncilView,
+  Critique,
+  SeatView,
+  StepView,
+  Synthesis,
+} from "../data/council";
+import type { RunTailChunk } from "../data/runs";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
+import { readState } from "../ui/state-map";
 import { daemonFetch, daemonState, renderApp } from "../test/harness";
 
 beforeEach(() => {
@@ -44,8 +54,26 @@ function councilSummary(overrides: Partial<CouncilSummary> = {}): CouncilSummary
     created_at: "2026-08-18T09:00:00Z",
     question: "should we ship the frontend rewrite?",
     status: "running",
-    stage: 1,
-    stages_total: 3,
+    rounds: 1,
+    rounds_run: 0,
+    current_round: 0,
+    current_phase: "answer",
+    ...overrides,
+  };
+}
+
+/** One step of one seat. The default is the round-0 answer, settled. */
+function stepView(overrides: Partial<StepView> = {}): StepView {
+  return {
+    round: 0,
+    phase: "answer",
+    run_id: 1,
+    status: "ok",
+    error: null,
+    answer: "yes, ship it — the tests carry the proof",
+    critique: null,
+    changed: null,
+    why: null,
     ...overrides,
   };
 }
@@ -57,15 +85,8 @@ function seatView(overrides: Partial<SeatView> = {}): SeatView {
     ref: "claude-opus-4",
     agent_id: null,
     agent_name: null,
-    stage1_status: "ok",
-    stage1_error: null,
-    answer: "yes, ship it — the tests carry the proof",
-    stage2_status: "ok",
-    stage2_error: null,
-    rankings: [{ anon: "B", rank: 1 }],
-    revision_status: "pending",
-    revision_error: null,
-    revised_answer: null,
+    role: null,
+    steps: [stepView()],
     ...overrides,
   };
 }
@@ -76,17 +97,36 @@ function councilView(overrides: Partial<CouncilView> = {}): CouncilView {
     created_at: "2026-08-18T09:00:00Z",
     question: "should we ship the frontend rewrite?",
     status: "running",
-    stage: 2,
-    stages_total: 3,
+    rounds: 1,
+    rounds_run: 0,
+    stopped_early: false,
+    current_round: 1,
+    current_phase: "critique",
     error: null,
     chairman_kind: "cloud",
     chairman_ref: "claude-opus-4",
     chairman_agent_id: null,
     chairman_agent_name: null,
-    synthesis: null,
-    anon_map: { A: 0, B: 1 },
+    agreement: null,
     leaderboard: [],
+    leaderboard_by_round: [],
+    synthesis: null,
+    synthesis_structured: null,
+    synthesis_status: null,
+    anon_map: { A: 0, B: 1 },
     seats: [seatView()],
+    ...overrides,
+  };
+}
+
+/** `GET /council/config` — a configured roster, two rounds by default. */
+function councilConfig(overrides: Partial<CouncilConfig> = {}): CouncilConfig {
+  return {
+    configured: true,
+    default_rounds: 2,
+    max_rounds: 3,
+    roles: ["skeptic", "pragmatist"],
+    default_roster: null,
     ...overrides,
   };
 }
@@ -107,6 +147,10 @@ function councilFetch(
     agents?: unknown[];
     /** `GET /assistant/models`, likewise. */
     models?: unknown[];
+    /** `GET /council/config`. */
+    config?: CouncilConfig;
+    /** `GET /runs/<id>/tail?since=<n>`; `undefined` is the daemon's 204. Handed the run and the offset. */
+    tail?: (runId: number, since: number) => RunTailChunk | undefined;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -120,6 +164,13 @@ function councilFetch(
       return { id: "new-1" };
     }
     if (path === "/council") return summaries;
+    // BEFORE the detail regex: `/council/config` matches `^/council/([^/]+)$`
+    // too, and answered there it would be a 404 for a council called "config".
+    if (path === "/council/config") return opts.config ?? councilConfig();
+    const tailMatch = /^\/runs\/(\d+)\/tail\?since=(\d+)$/.exec(path);
+    if (tailMatch !== null) {
+      return opts.tail === undefined ? undefined : opts.tail(Number(tailMatch[1]), Number(tailMatch[2]));
+    }
     const cancelMatch = /^\/council\/([^/]+)\/cancel$/.exec(path);
     if (cancelMatch !== null && init?.method === "POST") {
       if (opts.onCancel !== undefined) return opts.onCancel(cancelMatch[1]);
@@ -196,9 +247,22 @@ describe("Council - the empty catalogue", () => {
 /* --------------------------------------------------------- A10: abstained -- */
 
 describe("Council - a seat that abstained", () => {
-  it("reads a stage-2 ok seat with no rankings as an abstention, not a failure (A10)", async () => {
+  it("reads an ok critique that ranked nobody as an abstention, not a failure (A10)", async () => {
     const view = councilView({
-      seats: [seatView({ stage1_status: "ok", stage2_status: "ok", rankings: [] })],
+      seats: [
+        seatView({
+          steps: [
+            stepView(),
+            stepView({
+              round: 1,
+              phase: "critique",
+              run_id: 2,
+              answer: null,
+              critique: { reviews: [], ranking: [] },
+            }),
+          ],
+        }),
+      ],
     });
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
@@ -207,9 +271,8 @@ describe("Council - a seat that abstained", () => {
     const abstained = await screen.findByText("abstained");
     const seatCard = abstained.closest("li");
     if (seatCard === null) throw new Error("no seat card found");
-    // Both stages read "answered" — a blank vote is a real answer to stage 2,
-    // not a gap where an outcome should be.
-    expect(within(seatCard as HTMLElement).getAllByText("answered")).toHaveLength(2);
+    // A blank vote is a real answer to a critique round, not a gap where an
+    // outcome should be.
     expect(within(seatCard as HTMLElement).queryByText(/fail/i)).toBeNull();
   });
 });
@@ -217,15 +280,144 @@ describe("Council - a seat that abstained", () => {
 /* --------------------------------------------------------- A11: expired -- */
 
 describe("Council - an expired answer", () => {
-  it("reads a stage-1 ok seat with a null answer as answered, not empty or failed (A11)", async () => {
+  it("reads an ok round-0 answer with no text as answered, not empty or failed (A11)", async () => {
     const view = councilView({
-      seats: [seatView({ stage1_status: "ok", answer: null })],
+      seats: [seatView({ steps: [stepView({ status: "ok", answer: null })] })],
     });
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
     await renderCouncil("/council/c-1");
 
     expect(await screen.findByText("answered — the text has expired")).toBeDefined();
+  });
+});
+
+/* ------------------------------------------------ the answer, as rich text -- */
+
+describe("Council - a seat's answer", () => {
+  it("renders its markdown as rich text, and never as HTML", async () => {
+    const view = councilView({
+      seats: [
+        seatView({
+          steps: [stepView({ answer: "**ship it** — <img src=x onerror=alert(1)> is just text" })],
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+
+    const seats = await panelFor("Seats");
+    // The emphasis is an element, and the asterisks are gone with it.
+    await waitFor(() => {
+      const strong = Array.from(seats.querySelectorAll("strong")).find(
+        (node) => node.textContent === "ship it",
+      );
+      expect(strong).toBeDefined();
+    });
+    expect(seats.textContent).not.toContain("**ship it**");
+    // Markup a seat wrote is text on the page. A model's answer is not trusted
+    // input, and a renderer that passed HTML through would run whatever it said.
+    expect(seats.querySelector("img")).toBeNull();
+    expect(seats.textContent).toContain("<img src=x onerror=alert(1)>");
+  });
+
+  it("keeps the round-0 answer on the card after later steps have run", async () => {
+    const view = councilView({
+      rounds: 2,
+      rounds_run: 2,
+      seats: [
+        seatView({
+          steps: [
+            stepView(),
+            stepView({ round: 1, phase: "critique", run_id: 2, answer: null, critique: { reviews: [], ranking: ["B"] } }),
+            stepView({
+              round: 1,
+              phase: "revise",
+              run_id: 3,
+              answer: "still yes, and the migration is the part to watch",
+              changed: true,
+              why: "the migration risk",
+            }),
+          ],
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+
+    // The ranking was cast over the FIRST answers, so a card that dropped the
+    // round-0 answer for a later one would be showing a leaderboard of text it
+    // never displayed.
+    const seats = await panelFor("Seats");
+    await waitFor(() =>
+      expect(seats.textContent).toContain("yes, ship it — the tests carry the proof"),
+    );
+  });
+
+  it("shows the error of a latest step that failed", async () => {
+    const view = councilView({
+      seats: [
+        seatView({
+          steps: [
+            stepView(),
+            stepView({
+              round: 1,
+              phase: "critique",
+              run_id: 2,
+              status: "error",
+              error: "the seat timed out",
+              answer: null,
+            }),
+          ],
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+
+    const seats = await panelFor("Seats");
+    expect(within(seats).getByText("the seat timed out")).toBeDefined();
+    expect(within(seats).getByText("failed")).toBeDefined();
+  });
+});
+
+/* ------------------------------------------------------- an invalid step -- */
+
+describe("Council - a step the daemon could not read", () => {
+  it("has its own reading in the state map: paused, labelled invalid", () => {
+    // `invalid` is a step whose run answered and whose payload did not parse.
+    // Not a failure of the seat's run, and not silence either.
+    expect(readState("council_seat", "invalid")).toEqual({ tone: "paused", label: "invalid" });
+  });
+
+  it("reads an invalid latest step as invalid on the seat card", async () => {
+    const view = councilView({
+      seats: [
+        seatView({
+          steps: [
+            stepView(),
+            stepView({
+              round: 1,
+              phase: "critique",
+              run_id: 2,
+              status: "invalid",
+              error: "critique did not parse: expected value",
+              answer: null,
+            }),
+          ],
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+
+    const seats = await panelFor("Seats");
+    expect(within(seats).getByText("invalid")).toBeDefined();
+    expect(within(seats).queryByText("failed")).toBeNull();
   });
 });
 
@@ -450,7 +642,7 @@ describe("Council - the detail's cadence", () => {
 
     expect(computedInterval()).toBe(POLL.council);
 
-    views["c-1"] = councilView({ status: "done", stage: 3, synthesis: "the seats agree." });
+    views["c-1"] = councilView({ status: "done", current_phase: "synthesis", synthesis: "the seats agree." });
     await act(async () => {
       await queryClient.refetchQueries({ queryKey: [...keys.council.all, "detail", "c-1"] });
     });
@@ -466,14 +658,14 @@ describe("Council - a chairman that failed", () => {
   it("still renders the seats and the leaderboard when synthesis is null and error is set", async () => {
     const view = councilView({
       status: "error",
-      stage: 3,
+      current_phase: "synthesis",
       error: "the chairman's run ended in timeout",
       synthesis: null,
       seats: [
         seatView({ seat_idx: 0 }),
-        seatView({ seat_idx: 1, kind: "local", ref: "local-model", rankings: [] }),
+        seatView({ seat_idx: 1, kind: "local", ref: "local-model" }),
       ],
-      leaderboard: [{ seat_idx: 0, avg_rank: 1.5, n: 2 }],
+      leaderboard: [{ seat_idx: 0, score: 1.5, n: 2 }],
     });
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary({ status: "error" })], { "c-1": view }));
 
@@ -675,73 +867,768 @@ describe("Council - convening with a chosen panel", () => {
   });
 });
 
-/* --------------------------------------------------------- the second round -- */
+/* ------------------------------------------------- rounds, roles, estimate -- */
 
-describe("Council - a council that runs a second round", () => {
-  it("counts its phases out of four and draws the revision", async () => {
-    const view = councilView({
-      stage: 3,
-      stages_total: 4,
-      seats: [
-        seatView({
-          revision_status: "ok",
-          revised_answer: "still yes, and the migration is the part to watch",
-        }),
+/** A configured roster of three, so the estimate has a member count before anyone opens the picker. */
+function threeSeatConfig(): CouncilConfig {
+  return councilConfig({
+    default_roster: {
+      chairman: { kind: "cloud", ref: "claude-opus-4" },
+      members: [
+        { kind: "cloud", ref: "claude-opus-4" },
+        { kind: "cloud", ref: "claude-opus-5" },
+        { kind: "local", ref: "qwen3.5:4b" },
       ],
-    });
+    },
+  });
+}
+
+describe("Council - convening with rounds, roles and an estimate", () => {
+  it("offers rounds 1 to max, defaulting to the config's, and sends none when untouched", async () => {
+    let sent: unknown = "nothing was posted";
     daemon.apiFetch.mockImplementation(
-      councilFetch([councilSummary({ stage: 3, stages_total: 4 })], { "c-1": view }),
+      councilFetch([], {}, {
+        onCreate: (body) => {
+          sent = body;
+          return { id: "new-1" };
+        },
+      }),
     );
 
-    await renderCouncil("/council/c-1");
+    await renderCouncil("/council");
+    const rounds = (await screen.findByLabelText("Rounds")) as HTMLSelectElement;
+    // The config answers after the form mounts: the default is read, not assumed.
+    await waitFor(() => expect(rounds.value).toBe("2"));
+    expect(within(rounds).getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "1",
+      "2",
+      "3",
+    ]);
 
-    // The total is the council's own fact, read off the row. A page that had
-    // gone on saying "of 3" would have reported a council on its third of four
-    // phases as finished.
-    expect(await screen.findByText("phase 3 of 4")).toBeDefined();
+    fireEvent.change(screen.getByLabelText("Question"), { target: { value: "well?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
 
-    const seats = await panelFor("Seats");
-    expect(within(seats).getByText("revision")).toBeDefined();
-    expect(
-      within(seats).getByText("still yes, and the migration is the part to watch"),
-    ).toBeDefined();
-    // Beside the first answer, never instead of it: the ranking was cast over
-    // the first one, so a card showing only the revision would be showing a
-    // leaderboard of text it never displayed.
-    expect(within(seats).getByText("yes, ship it — the tests carry the proof")).toBeDefined();
+    // Choosing nothing is not choosing the default: the key stays off the request.
+    await waitFor(() => expect(sent).toEqual({ question: "well?" }));
+    expect(Object.keys(sent as object)).toEqual(["question"]);
   });
 
-  it("says the first answer stood when a seat did not revise", async () => {
+  it("sends rounds only when it differs from the default", async () => {
+    let sent: unknown = "nothing was posted";
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        onCreate: (body) => {
+          sent = body;
+          return { id: "new-1" };
+        },
+      }),
+    );
+
+    await renderCouncil("/council");
+    const rounds = (await screen.findByLabelText("Rounds")) as HTMLSelectElement;
+    await waitFor(() => expect(rounds.value).toBe("2"));
+
+    fireEvent.change(rounds, { target: { value: "3" } });
+    fireEvent.change(screen.getByLabelText("Question"), { target: { value: "well?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+
+    await waitFor(() => expect(sent).toEqual({ question: "well?", rounds: 3 }));
+  });
+
+  it("sends the roles chosen per seat, keyed by the seat's index", async () => {
+    let sent: unknown = "nothing was posted";
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        agents: [agentRow()],
+        models: [modelRow(), modelRow({ id: "qwen3.5:4b", label: "Qwen 4b", brain: "local" })],
+        onCreate: (body) => {
+          sent = body;
+          return { id: "new-1" };
+        },
+      }),
+    );
+
+    await renderCouncil("/council");
+    fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
+    await openTheRoster();
+    fireEvent.click(screen.getByRole("button", { name: "Add a seat" }));
+
+    // "no role" first, then the config's roles in the daemon's declared order.
+    const second = (await screen.findByLabelText("Role for seat 1")) as HTMLSelectElement;
+    expect(within(second).getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "no role",
+      "skeptic",
+      "pragmatist",
+    ]);
+    expect(second.value).toBe("");
+
+    fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
+    fireEvent.change(screen.getByLabelText("Seat 0"), { target: { value: "model:claude-opus-5" } });
+    fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:qwen3.5:4b" } });
+    // Only seat 1 is given a role; seat 0 keeps "no role" and must not appear.
+    fireEvent.change(second, { target: { value: "skeptic" } });
+    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+
+    await waitFor(() =>
+      expect(sent).toEqual({
+        question: "well?",
+        roster: {
+          chairman: { agent: "ag-1" },
+          members: [
+            { kind: "cloud", ref: "claude-opus-5" },
+            { kind: "local", ref: "qwen3.5:4b" },
+          ],
+        },
+        roles: { "1": "skeptic" },
+      }),
+    );
+  });
+
+  it("sends no roles key when no seat was given a role", async () => {
+    let sent: unknown = "nothing was posted";
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        agents: [agentRow()],
+        models: [modelRow()],
+        onCreate: (body) => {
+          sent = body;
+          return { id: "new-1" };
+        },
+      }),
+    );
+
+    await renderCouncil("/council");
+    fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
+    await openTheRoster();
+    fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
+    fireEvent.change(screen.getByLabelText("Seat 0"), { target: { value: "model:claude-opus-5" } });
+    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+
+    await waitFor(() => expect(sent).not.toBe("nothing was posted"));
+    expect(Object.keys(sent as object)).toEqual(["question", "roster"]);
+  });
+
+  it("shows up to X calls for the configured roster at the default rounds, and follows the rounds select", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}, { config: threeSeatConfig() }));
+
+    await renderCouncil("/council");
+    // N=3, R=2: 3 answers + 6 critiques + 3 revisions + 2 chairman = 14.
+    expect(await screen.findByText("up to 14 calls")).toBeDefined();
+
+    // N=3, R=3: 3 + 9 + 6 + 2 = 20.
+    fireEvent.change(screen.getByLabelText("Rounds"), { target: { value: "3" } });
+    expect(await screen.findByText("up to 20 calls")).toBeDefined();
+  });
+
+  it("counts the chosen members, not the configured roster, once a panel is chosen", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        config: threeSeatConfig(),
+        agents: [agentRow()],
+        models: [modelRow()],
+      }),
+    );
+
+    await renderCouncil("/council");
+    expect(await screen.findByText("up to 14 calls")).toBeDefined();
+
+    await openTheRoster();
+    fireEvent.click(screen.getByRole("button", { name: "Add a seat" }));
+    fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
+    fireEvent.change(screen.getByLabelText("Seat 0"), { target: { value: "model:claude-opus-5" } });
+    fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:claude-opus-5" } });
+
+    // N=2, R=2: 2 + 4 + 2 + 2 = 10.
+    expect(await screen.findByText("up to 10 calls")).toBeDefined();
+  });
+});
+
+/* -------------------------------------------------------------- leaderboard -- */
+
+describe("Council - the leaderboard", () => {
+  it("names the seats rather than numbering them, with the score and n beside each", async () => {
     const view = councilView({
-      stage: 4,
-      stages_total: 4,
-      seats: [seatView({ revision_status: "error", revision_error: "the seat timed out" })],
+      status: "done",
+      seats: [
+        seatView({ seat_idx: 0, ref: "gpt-5" }),
+        seatView({ seat_idx: 1, agent_id: "ag-7", agent_name: "the sceptic" }),
+      ],
+      leaderboard: [
+        { seat_idx: 1, score: 1, n: 1 },
+        { seat_idx: 0, score: 0, n: 1 },
+      ],
     });
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
     await renderCouncil("/council/c-1");
 
-    // The chairman read this seat's FIRST answer, and the card says so. A blank
-    // would read as text that went missing rather than as a seat whose revision
-    // failed and whose original answer was used.
-    const seats = await panelFor("Seats");
-    expect(within(seats).getByText("the first answer stood")).toBeDefined();
-    expect(within(seats).getByText("the seat timed out")).toBeDefined();
+    const board = await screen.findByRole("list", { name: "Leaderboard" });
+    const rows = within(board).getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    // `seatName`: the agent's name, else the model that answered. "seat 1" is a
+    // number the reader then has to carry up to the seat grid to decode.
+    expect(rows[0].textContent).toContain("the sceptic");
+    expect(rows[1].textContent).toContain("gpt-5");
+    expect(within(board).queryByText(/^seat \d+$/)).toBeNull();
+    // The Borda score, and n beside it always: one ballot and four are not the same claim.
+    expect(rows[0].textContent).toContain("1.00");
+    expect(rows[0].textContent).toContain("n = 1");
+    expect(board.textContent).not.toMatch(/avg rank/);
   });
+});
 
-  it("draws no revision at all on a council of one round", async () => {
+/* ------------------------------------------------ the list and the config -- */
+
+describe("Council - the list row and the config", () => {
+  it("reads the council config and the list row says the round and the phase", async () => {
     daemon.apiFetch.mockImplementation(
-      councilFetch([councilSummary()], { "c-1": councilView() }),
+      councilFetch(
+        [councilSummary({ rounds: 2, current_round: 1, current_phase: "critique" })],
+        {},
+      ),
     );
+
+    await renderCouncil("/council");
+
+    const link = await screen.findByRole("link", { name: /should we ship the frontend rewrite\?/ });
+    await waitFor(() => expect(link.textContent).toContain("round 1 · critique"));
+    // The phase-of-three counter belonged to the staged council and has no
+    // meaning over rounds.
+    expect(link.textContent).not.toMatch(/phase \d+ of \d+/);
+    await waitFor(() =>
+      expect(daemon.apiFetch.mock.calls.map((call) => call[0])).toContain("/council/config"),
+    );
+  });
+});
+
+/* ---------------------------------------------- the round-by-round timeline -- */
+
+/**
+ * Three named seats through two critique rounds. `anon_map` is label -> seat, so
+ * "B" is beta and "C" is gamma. Every assertion below is scoped to the tab panel
+ * or to a named group, because the seat grid above the timeline repeats the
+ * answers and the latest step and would otherwise satisfy a query by accident.
+ *
+ * UI contract (what `CouncilRounds.tsx` must render):
+ *  - a level-2 heading "Rounds" and a `tablist` named "Rounds" with one `tab` per round 0..rounds_run:
+ *    "Answers" (round 0), "Round 1", "Round 2"; "Answers" is selected on first render. Tabs are Radix
+ *    (`ui/Tabs`), so they are selected by `mouseDown`, and only the selected `tabpanel` is mounted.
+ *  - round 0 panel: each seat's answer text, under the seat's `seatName`.
+ *  - round n panel, per seat that voted: a `list` named "Ballot of <seatName>" whose `listitem`s are the
+ *    DE-ANONYMISED ranking, best first, as seat names -- never the bare labels.
+ *  - per reviewing seat a `group` named "Critiques by <seatName>"; inside, one `group` per reviewed
+ *    answer named "On <seatName>'s answer"; its text carries each point's stance, claim and why.
+ *  - per seat with a `revise` step in that round a `group` named "Revision by <seatName>": the text
+ *    "changed its answer" or "kept its answer", the step's `why`, and -- only when it changed -- a `list`
+ *    named "Diff" of `lineDiff(previous answer, new answer)` where each `listitem` carries
+ *    `data-kind` = "context" | "removed" | "added" and its textContent contains the line's text.
+ *  - a `table` named "Rank evolution", only when `leaderboard_by_round.length >= 2`, outside the tab
+ *    panels: one `columnheader` per critique round ("Round 1", ...) after an empty first one, one row per
+ *    seat with its `seatName` in the `rowheader` and one `cell` per round holding the seat's 1-based
+ *    position in that round's leaderboard ("1" is best), or "-" (en dash) when the seat is not on it.
+ *  - when `stopped_early`, a note reading "Stopped early at round <rounds_run>"; absent otherwise.
+ */
+function seatNamed(name: string, idx: number, steps: StepView[]): SeatView {
+  return seatView({
+    seat_idx: idx,
+    ref: `model-${idx}`,
+    agent_id: `ag-${idx}`,
+    agent_name: name,
+    steps,
+  });
+}
+
+function critiqueStep(round: number, ranking: string[], reviews: Critique["reviews"] = []): StepView {
+  return stepView({
+    round,
+    phase: "critique",
+    run_id: 10 + round,
+    answer: null,
+    critique: { reviews, ranking },
+  });
+}
+
+function roundsView(overrides: Partial<CouncilView> = {}): CouncilView {
+  return councilView({
+    status: "done",
+    rounds: 2,
+    rounds_run: 2,
+    current_round: 2,
+    current_phase: "synthesis",
+    anon_map: { A: 0, B: 1, C: 2 },
+    seats: [
+      seatNamed("alpha", 0, [
+        stepView({ answer: "line one\nline two" }),
+        critiqueStep(1, ["C", "B"], [
+          {
+            label: "B",
+            points: [{ claim: "beta overreaches", stance: "disagree", why: "no evidence given" }],
+          },
+          {
+            label: "C",
+            points: [{ claim: "gamma is sound", stance: "agree", why: "the numbers add up" }],
+          },
+        ]),
+        stepView({
+          round: 1,
+          phase: "revise",
+          run_id: 20,
+          answer: "line one\nline three",
+          changed: true,
+          why: "folded in the evidence",
+        }),
+        critiqueStep(2, ["B", "C"]),
+      ]),
+      seatNamed("beta", 1, [
+        stepView({ answer: "beta says ship" }),
+        critiqueStep(1, ["A", "C"]),
+        stepView({
+          round: 1,
+          phase: "revise",
+          run_id: 21,
+          answer: null,
+          changed: false,
+          why: "my answer stands",
+        }),
+        critiqueStep(2, ["A", "C"]),
+      ]),
+      seatNamed("gamma", 2, [
+        stepView({ answer: "gamma says wait" }),
+        critiqueStep(1, ["A", "B"]),
+        critiqueStep(2, ["A", "B"]),
+      ]),
+    ],
+    ...overrides,
+  });
+}
+
+async function openRound(name: string) {
+  // Radix selects a tab on pointer-down, not on click (see `Bench.test.tsx`).
+  fireEvent.mouseDown(await screen.findByRole("tab", { name }));
+  return screen.findByRole("tabpanel");
+}
+
+describe("Council - round by round", () => {
+  it("offers one tab per round, with the seats' answers in round 0", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
 
     await renderCouncil("/council/c-1");
 
-    // The non-regression half, and the reason the card is TOLD the total rather
-    // than reading `revision_status`: a one-round council leaves every seat at
-    // `pending` forever, so a card deciding for itself would have drawn a
-    // "waiting" badge for a phase that was never coming.
-    const seats = await panelFor("Seats");
-    expect(within(seats).queryByText("revision")).toBeNull();
-    expect(await screen.findByText("phase 2 of 3")).toBeDefined();
+    expect(await screen.findByRole("heading", { level: 2, name: "Rounds" })).toBeDefined();
+    const tabs = within(await screen.findByRole("tablist", { name: "Rounds" })).getAllByRole("tab");
+    expect(tabs.map((tab) => tab.textContent)).toEqual(["Answers", "Round 1", "Round 2"]);
+    expect(tabs[0].getAttribute("aria-selected")).toBe("true");
+
+    const panel = await screen.findByRole("tabpanel");
+    expect(panel.textContent).toContain("alpha");
+    expect(panel.textContent).toContain("line one");
+    expect(panel.textContent).toContain("beta says ship");
+    expect(panel.textContent).toContain("gamma says wait");
+  });
+
+  it("de-anonymises a ballot into seat names, best first", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await openRound("Round 1");
+
+    // alpha ranked ["C", "B"]: gamma first, beta second.
+    const ballot = within(panel).getByRole("list", { name: "Ballot of alpha" });
+    const items = within(ballot).getAllByRole("listitem");
+    expect(items).toHaveLength(2);
+    expect(items[0].textContent).toContain("gamma");
+    expect(items[1].textContent).toContain("beta");
+    // The labels were the blinding; they never reach the reader.
+    expect(within(ballot).queryByText(/^[ABC]$/)).toBeNull();
+  });
+
+  it("lists the critiques a seat gave, grouped by the answer reviewed", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await openRound("Round 1");
+
+    const given = within(panel).getByRole("group", { name: "Critiques by alpha" });
+    const onBeta = within(given).getByRole("group", { name: "On beta's answer" });
+    expect(onBeta.textContent).toContain("disagree");
+    expect(onBeta.textContent).toContain("beta overreaches");
+    expect(onBeta.textContent).toContain("no evidence given");
+    const onGamma = within(given).getByRole("group", { name: "On gamma's answer" });
+    expect(onGamma.textContent).toContain("agree");
+    expect(onGamma.textContent).toContain("gamma is sound");
+    // Reviews of beta do not leak into the group about gamma.
+    expect(onGamma.textContent).not.toContain("beta overreaches");
+  });
+
+  it("shows a revision's changed/why and the line diff against the previous answer", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await openRound("Round 1");
+
+    const revision = within(panel).getByRole("group", { name: "Revision by alpha" });
+    expect(revision.textContent).toContain("changed its answer");
+    expect(revision.textContent).toContain("folded in the evidence");
+    const diff = within(revision).getByRole("list", { name: "Diff" });
+    const lines = within(diff).getAllByRole("listitem");
+    expect(lines.map((item) => item.getAttribute("data-kind"))).toEqual([
+      "context",
+      "removed",
+      "added",
+    ]);
+    expect(lines[0].textContent).toContain("line one");
+    expect(lines[1].textContent).toContain("line two");
+    expect(lines[2].textContent).toContain("line three");
+
+    // A seat that kept its answer says so and draws no diff.
+    const kept = within(panel).getByRole("group", { name: "Revision by beta" });
+    expect(kept.textContent).toContain("kept its answer");
+    expect(kept.textContent).toContain("my answer stands");
+    expect(within(kept).queryByRole("list", { name: "Diff" })).toBeNull();
+  });
+
+  it("draws the rank evolution only once there are two votes", async () => {
+    const one = roundsView({
+      rounds: 1,
+      rounds_run: 1,
+      leaderboard_by_round: [
+        [
+          { seat_idx: 0, score: 2, n: 3 },
+          { seat_idx: 1, score: 1, n: 3 },
+        ],
+      ],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": one }));
+
+    const first = await renderCouncil("/council/c-1");
+    await screen.findByRole("tablist", { name: "Rounds" });
+    expect(screen.queryByRole("table", { name: "Rank evolution" })).toBeNull();
+    first.unmount();
+
+    const two = roundsView({
+      leaderboard_by_round: [
+        [
+          { seat_idx: 0, score: 2, n: 3 },
+          { seat_idx: 1, score: 1, n: 3 },
+        ],
+        [
+          { seat_idx: 1, score: 2, n: 3 },
+          { seat_idx: 0, score: 1, n: 3 },
+          { seat_idx: 2, score: 0, n: 3 },
+        ],
+      ],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": two }));
+
+    await renderCouncil("/council/c-1");
+    const table = await screen.findByRole("table", { name: "Rank evolution" });
+    expect(within(table).getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
+      "",
+      "Round 1",
+      "Round 2",
+    ]);
+    const cellsOf = (name: string) => {
+      const row = within(table).getByRole("rowheader", { name }).closest("tr");
+      if (row === null) throw new Error(`no row for ${name}`);
+      return within(row as HTMLElement)
+        .getAllByRole("cell")
+        .map((cell) => cell.textContent);
+    };
+    expect(cellsOf("alpha")).toEqual(["1", "2"]);
+    expect(cellsOf("beta")).toEqual(["2", "1"]);
+    // gamma was not on the first leaderboard at all.
+    expect(cellsOf("gamma")).toEqual(["–", "3"]);
+  });
+
+  it("announces that it stopped early, at the round it stopped", async () => {
+    const stopped = roundsView({ rounds: 3, rounds_run: 1, stopped_early: true });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": stopped }));
+
+    const first = await renderCouncil("/council/c-1");
+    expect(await screen.findByText(/Stopped early at round 1/)).toBeDefined();
+    first.unmount();
+
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+    await renderCouncil("/council/c-1");
+    await screen.findByRole("tablist", { name: "Rounds" });
+    expect(screen.queryByText(/Stopped early at round/)).toBeNull();
+  });
+});
+
+/* ------------------------------------------------- S5: structured synthesis -- */
+
+/**
+ * UI contract (what `CouncilSynthesis.tsx` must render inside the panel headed "Synthesis", which
+ * replaces the old `Synthesis` function in `Council.tsx`):
+ *  - `synthesis_structured` set (and status not "degraded"): the `answer` through `CouncilRich`, then
+ *    - a confidence badge whose whole text is "<level> confidence" ("high confidence", ...);
+ *    - when `view.agreement` is set, an agreement badge whose whole text is, by `agreement.level`:
+ *      "strong" -> "strong consensus", "split" -> "split", "none" -> "no consensus",
+ *      "insufficient" -> "too few votes". No badge when `agreement` is null;
+ *    - four `group`s named "Consensus", "Disagreements", "Minority", "Open questions". Consensus and
+ *      Open questions hold one `listitem` per string; Disagreements holds each topic and, per position,
+ *      one `listitem` carrying the `seatName` of EVERY seat in `position.seats` (seats resolved against
+ *      `view.seats`) and the position's `view`; Minority holds the minority text. A card with nothing
+ *      to say (empty list, `minority` null) is not rendered.
+ *  - `synthesis_status === "degraded"`: the raw `synthesis` text plus a warning containing
+ *    "unstructured synthesis"; none of the four groups and no badges.
+ *  - `synthesis_structured === null` with text and status null (an old council): the rich text only,
+ *    no warning, no badges, no groups.
+ */
+function structuredSynthesis(overrides: Partial<Synthesis> = {}): Synthesis {
+  return {
+    answer: "Ship it behind a flag.",
+    consensus: ["the tests carry the proof"],
+    disagreements: [
+      {
+        topic: "rollout speed",
+        positions: [
+          { seats: [0, 2], view: "ship now" },
+          { seats: [1], view: "wait a sprint" },
+        ],
+      },
+    ],
+    minority: "the migration may be riskier than the seats assume",
+    confidence: { level: "high", why: "every ballot agrees" },
+    open_questions: ["who owns the rollback?"],
+    ...overrides,
+  };
+}
+
+function synthesisView(overrides: Partial<CouncilView> = {}): CouncilView {
+  return roundsView({
+    synthesis: "Ship it behind a flag.",
+    synthesis_structured: structuredSynthesis(),
+    synthesis_status: "ok",
+    agreement: { tau: 0.9, level: "strong", ballots: 3, comparisons: 3 },
+    ...overrides,
+  });
+}
+
+describe("Council - the structured synthesis", () => {
+  it("renders the answer, the consensus, the named disagreements, the minority and the open questions", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": synthesisView() }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await panelFor("Synthesis");
+
+    expect(await within(panel).findByText("Ship it behind a flag.")).toBeDefined();
+    const consensus = within(panel).getByRole("group", { name: "Consensus" });
+    expect(within(consensus).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "the tests carry the proof",
+    ]);
+
+    const disagreements = within(panel).getByRole("group", { name: "Disagreements" });
+    expect(disagreements.textContent).toContain("rollout speed");
+    const positions = within(disagreements).getAllByRole("listitem");
+    expect(positions).toHaveLength(2);
+    // Seats are named, never numbered: "seat 2" would send the reader back to the grid.
+    expect(positions[0].textContent).toContain("alpha");
+    expect(positions[0].textContent).toContain("gamma");
+    expect(positions[0].textContent).toContain("ship now");
+    expect(positions[0].textContent).not.toContain("beta");
+    expect(positions[1].textContent).toContain("beta");
+    expect(positions[1].textContent).toContain("wait a sprint");
+
+    const minority = within(panel).getByRole("group", { name: "Minority" });
+    expect(minority.textContent).toContain("riskier than the seats assume");
+    const open = within(panel).getByRole("group", { name: "Open questions" });
+    expect(within(open).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["who owns the rollback?"]);
+  });
+
+  it("badges the chairman's confidence", async () => {
+    const view = synthesisView({
+      synthesis_structured: structuredSynthesis({ confidence: { level: "low", why: "the seats barely overlap" } }),
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await panelFor("Synthesis");
+
+    expect(await within(panel).findByText("low confidence")).toBeDefined();
+    expect(within(panel).queryByText("high confidence")).toBeNull();
+  });
+
+  it("badges how far the ballots agreed, in words", async () => {
+    const cases: Array<[string, string]> = [
+      ["strong", "strong consensus"],
+      ["split", "split"],
+      ["none", "no consensus"],
+      ["insufficient", "too few votes"],
+    ];
+    for (const [level, words] of cases) {
+      const view = synthesisView({
+        agreement: { tau: level === "insufficient" ? null : 0.4, level, ballots: 3, comparisons: 3 },
+      });
+      daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+      const rendered = await renderCouncil("/council/c-1");
+      const panel = await panelFor("Synthesis");
+      expect(await within(panel).findByText(words)).toBeDefined();
+      rendered.unmount();
+    }
+  });
+
+  it("draws no agreement badge while there is no agreement to report", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": synthesisView({ agreement: null }) }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await panelFor("Synthesis");
+
+    expect(await within(panel).findByText("high confidence")).toBeDefined();
+    for (const words of ["strong consensus", "split", "no consensus", "too few votes"]) {
+      expect(within(panel).queryByText(words)).toBeNull();
+    }
+  });
+});
+
+describe("Council - a degraded synthesis", () => {
+  it("shows the raw text with an unstructured-synthesis warning and none of the cards", async () => {
+    const view = synthesisView({
+      synthesis: "the chairman rambled without structure",
+      synthesis_structured: null,
+      synthesis_status: "degraded",
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await panelFor("Synthesis");
+
+    expect(await within(panel).findByText(/the chairman rambled without structure/)).toBeDefined();
+    expect(within(panel).getByText(/unstructured synthesis/i)).toBeDefined();
+    for (const name of ["Consensus", "Disagreements", "Minority", "Open questions"]) {
+      expect(within(panel).queryByRole("group", { name })).toBeNull();
+    }
+    expect(within(panel).queryByText(/confidence$/)).toBeNull();
+  });
+
+  it("reads an old council, with text and no structure, as plain rich text without a warning", async () => {
+    const view = synthesisView({
+      synthesis: "an old synthesis from before structure",
+      synthesis_structured: null,
+      synthesis_status: null,
+      agreement: null,
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await panelFor("Synthesis");
+
+    expect(await within(panel).findByText(/an old synthesis from before structure/)).toBeDefined();
+    expect(within(panel).queryByText(/unstructured synthesis/i)).toBeNull();
+    expect(within(panel).queryByRole("group", { name: "Consensus" })).toBeNull();
+    expect(within(panel).queryByText(/confidence$/)).toBeNull();
+  });
+});
+
+/* ----------------------------------------------------------- S5: live tail -- */
+
+/**
+ * UI contract for the live tail (rendered in the seat grid's card, by a `StepTail` component):
+ *  - a seat step with `status === "pending"`, a `run_id`, while the council `status` is "running"
+ *    renders `role="log"` named "Live tail of <seatName>" whose text is the chunks read so far,
+ *    concatenated. It reads `useRunTail(run_id, since, true)`, takes each NEW chunk once (by identity)
+ *    and asks next for `since = chunk.next`, exactly as `RunDetail.tsx::RunTail` does.
+ *  - once the step settles (status no longer "pending") or the council is no longer running, the log
+ *    is gone, the stored result is shown instead, and the tail query is no longer read.
+ */
+function pendingView(overrides: Partial<CouncilView> = {}): CouncilView {
+  return councilView({
+    status: "running",
+    current_round: 0,
+    current_phase: "answer",
+    seats: [seatNamed("alpha", 0, [stepView({ status: "pending", run_id: 7, answer: null })])],
+    ...overrides,
+  });
+}
+
+function tailAsks(): string[] {
+  return daemon.apiFetch.mock.calls.map((call) => String(call[0])).filter((path) => path.startsWith("/runs/7/tail"));
+}
+
+describe("Council - the live tail of a running step", () => {
+  it("shows what the running step has written and continues from the chunk's own offset", async () => {
+    const chunks: Record<number, RunTailChunk> = {
+      0: { text: "reading the diff, ", next: 18, live: true },
+      18: { text: "then weighing it", next: 34, live: true },
+    };
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": pendingView() }, { tail: (_run, since) => chunks[since] }),
+    );
+
+    const { queryClient } = await renderCouncil("/council/c-1");
+    const log = await screen.findByRole("log", { name: "Live tail of alpha" });
+    await waitFor(() => expect(log.textContent).toContain("reading the diff, "));
+
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: keys.runs.tail(7) });
+    });
+    await waitFor(() => expect(log.textContent).toBe("reading the diff, then weighing it"));
+    // The offset is the daemon's byte cursor, handed back as it came.
+    expect(tailAsks()).toContain("/runs/7/tail?since=18");
+  });
+
+  it("does not repeat a chunk the daemon sends twice", async () => {
+    const same: RunTailChunk = { text: "once only", next: 9, live: true };
+    daemon.apiFetch.mockImplementation(
+      councilFetch(
+        [councilSummary()],
+        { "c-1": pendingView() },
+        { tail: (_run, since) => (since === 0 ? same : { text: "", next: 9, live: true }) },
+      ),
+    );
+
+    const { queryClient } = await renderCouncil("/council/c-1");
+    const log = await screen.findByRole("log", { name: "Live tail of alpha" });
+    await waitFor(() => expect(log.textContent).toBe("once only"));
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: keys.runs.tail(7) });
+    });
+    expect(log.textContent).toBe("once only");
+  });
+
+  it("stops reading the tail, and shows the stored answer, once the step settles", async () => {
+    const views: Record<string, CouncilView> = { "c-1": pendingView() };
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], views, { tail: () => ({ text: "still thinking", next: 14, live: true }) }),
+    );
+
+    const { queryClient } = await renderCouncil("/council/c-1");
+    const log = await screen.findByRole("log", { name: "Live tail of alpha" });
+    await waitFor(() => expect(log.textContent).toContain("still thinking"));
+
+    views["c-1"] = pendingView({
+      seats: [seatNamed("alpha", 0, [stepView({ status: "ok", run_id: 7, answer: "the settled answer" })])],
+    });
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: [...keys.council.all, "detail", "c-1"] });
+    });
+
+    await waitFor(() => expect(screen.queryByRole("log", { name: "Live tail of alpha" })).toBeNull());
+    expect(await screen.findByText("the settled answer")).toBeDefined();
+    const before = tailAsks().length;
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: keys.runs.tail(7) });
+    });
+    expect(tailAsks()).toHaveLength(before);
+  });
+
+  it("shows no tail for a step that is not pending, nor for a pending step of a council that has ended", async () => {
+    const tail = () => ({ text: "x", next: 1, live: true });
+    const settled = councilView({ status: "running", seats: [seatNamed("alpha", 0, [stepView()])] });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": settled }, { tail }));
+    const first = await renderCouncil("/council/c-1");
+    await panelFor("This council");
+    expect(screen.queryByRole("log")).toBeNull();
+    first.unmount();
+
+    const ended = pendingView({ status: "error" });
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary({ status: "error" })], { "c-1": ended }, { tail }),
+    );
+    await renderCouncil("/council/c-1");
+    await panelFor("This council");
+    expect(screen.queryByRole("log")).toBeNull();
+    expect(tailAsks()).toHaveLength(0);
   });
 });

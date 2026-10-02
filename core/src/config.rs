@@ -1468,11 +1468,14 @@ pub const DEFAULT_COUNCIL_ROUNDS: u32 = 1;
 
 /// The most rounds this file accepts.
 ///
-/// Two, and the ceiling is a decision rather than an arbitrary stop. A third round would ask every
-/// seat to revise a revision it has already seen ranked, and there is no third ranking to revise
-/// against — `.ai/specs/2026-08-11-council-design.md` §10 named exactly one further round, not a
-/// loop. When somebody wants the loop they can argue for it here.
-pub const MAX_COUNCIL_ROUNDS: u32 = 2;
+/// Three, and the ceiling is a decision rather than an arbitrary stop. The owner chose 1-3 rounds
+/// with an early stop (spec 2026-10-02): each round after the first revises against the ranking
+/// and critiques of the one before, and a round whose Borda order did not move and that disputes
+/// no new answer ends the deliberation rather than paying for another (`council::tally::
+/// should_stop_early`). Three is where that stops being bounded by money the operator can see
+/// coming — `council::tally::call_ceiling` is the bill — and past it a council is a loop, which
+/// is an argument to have here rather than a value to type into a roster.
+pub const MAX_COUNCIL_ROUNDS: u32 = 3;
 
 /// Where one seat's answer comes from.
 ///
@@ -1665,13 +1668,14 @@ impl CouncilSeat {
 pub struct CouncilConfig {
     #[serde(default = "default_council_timeout")]
     pub timeout_seconds: u64,
-    /// 1 or 2. Two adds a second deliberation round: after the blind ranking every seat is shown
-    /// the same anonymised peer answers it ranked, plus where the council placed them, and revises
-    /// its own answer — and the chairman then synthesises the revised ones.
+    /// 1 to `MAX_COUNCIL_ROUNDS`. Each round past the first is a further deliberation round: after
+    /// the blind ranking every seat is shown the same anonymised peer answers it ranked, plus where
+    /// the council placed them, and revises its own answer — and the chairman then synthesises the
+    /// revised ones. A round that changes nothing ends the deliberation early.
     ///
     /// A FAULT rather than a clamp when it is anything else, which is the one place this field
     /// parts company with `timeout_seconds` two lines up. A clock outside its bounds has an obvious
-    /// nearest legal value and costs nothing to guess at; `rounds: 3` does not, because both
+    /// nearest legal value and costs nothing to guess at; `rounds: 4` does not, because both
     /// candidates are defensible and they differ by the price of a whole extra round. So it joins
     /// the fault list and the council stays off, which is the branch `load_council_config` took
     /// over `load_models_config`'s on purpose: the operator is told, and nothing is spent guessing.
@@ -1739,11 +1743,11 @@ impl CouncilConfig {
             ));
         }
         // Named in the list rather than clamped. See the field's own note: there is no obvious
-        // nearest legal value for a third round, and guessing one spends money the operator did not
-        // agree to spend.
+        // nearest legal value for a round count past the ceiling, and guessing one spends money the
+        // operator did not agree to spend.
         if !(1..=MAX_COUNCIL_ROUNDS).contains(&self.rounds) {
             faults.push(format!(
-                "rounds is {}; a council runs 1 round or {MAX_COUNCIL_ROUNDS}",
+                "rounds is {}; a council runs 1 to {MAX_COUNCIL_ROUNDS} rounds",
                 self.rounds
             ));
         }
@@ -3586,13 +3590,17 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
 
     /// A round count outside `1..=MAX_COUNCIL_ROUNDS` is a FAULT, not a clamp — the whole council is
     /// refused and the operator is told, rather than quietly handed whichever neighbour the loader
-    /// guessed. The difference is money: rounding `rounds: 3` down to 2 still buys a second round
+    /// guessed. The difference is money: rounding `rounds: 4` down to 3 still buys a third round
     /// nobody asked for, and rounding it up is not a shape this file knows how to run at all.
+    ///
+    /// Three is the ceiling since the owner chose 1-3 rounds with an early stop (spec 2026-10-02),
+    /// so `rounds: 3` moves from the refused list to the accepted one and `rounds: 4` takes its
+    /// place as the first value past the edge.
     ///
     /// The clock in the test above IS clamped, and the asymmetry is the thing being held: a clock
     /// has an obvious nearest legal value and a round count does not.
     #[test]
-    fn a_third_round_is_not_a_shape_this_file_accepts() {
+    fn a_fourth_round_is_not_a_shape_this_file_accepts() {
         assert_eq!(
             council_config_from(A_GOOD_ROSTER, true).unwrap().rounds,
             DEFAULT_COUNCIL_ROUNDS,
@@ -3604,8 +3612,15 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
                 .rounds,
             2
         );
+        assert_eq!(
+            council_config_from(&format!("rounds: 3\n{A_GOOD_ROSTER}"), true)
+                .unwrap()
+                .rounds,
+            3,
+            "three rounds is the ceiling, and the ceiling itself is a shape this file runs"
+        );
 
-        for refused in ["rounds: 0", "rounds: 3", "rounds: 99"] {
+        for refused in ["rounds: 0", "rounds: 4", "rounds: 99"] {
             assert!(
                 council_config_from(&format!("{refused}\n{A_GOOD_ROSTER}"), true).is_none(),
                 "`{refused}` must leave the council off rather than be clamped into one"
