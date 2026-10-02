@@ -26,7 +26,7 @@
 //! what this module adds is linking a resolution's landing back to the escalation it answers, at
 //! the moment that landing is admitted.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -489,6 +489,168 @@ pub async fn submit(
     }
 
     Ok(id)
+}
+
+/// The per-branch cargo target directories a landed branch leaves behind, as bare directory names.
+///
+/// **Pure, and the whole of the safety argument for what may be deleted.** A branch built in its
+/// own worktree gets `C:/Projects/.cargo-target-<branch>`, and once it has landed that directory
+/// is dead weight of several GB. The names derived here are the only ones
+/// `remove_landed_target_dirs` will ever touch: `.cargo-target-` plus the branch with `/`
+/// replaced by `-`, and plus its last `/`-segment, deduplicated.
+///
+/// A suffix is dropped, never repaired, when it is empty, `.` or `..`, when it holds any character
+/// outside `[A-Za-z0-9._-]`, or when it is one of the shared directories (`test`, `gates`, `gate`)
+/// that belong to nobody's branch. A branch literally named `test` therefore derives nothing.
+pub fn target_dir_names(branch: &str) -> Vec<String> {
+    const PREFIX: &str = ".cargo-target-";
+    const SHARED: [&str; 3] = ["test", "gates", "gate"];
+    let last = branch.rsplit('/').next().unwrap_or(branch);
+    let mut names: Vec<String> = Vec::new();
+    for suffix in [branch.replace('/', "-"), last.to_string()] {
+        let safe = !suffix.is_empty()
+            && suffix != "."
+            && suffix != ".."
+            && suffix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            && !SHARED.contains(&suffix.as_str());
+        if !safe {
+            continue;
+        }
+        let name = format!("{PREFIX}{suffix}");
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// What happened to one candidate directory in `remove_landed_target_dirs`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TargetDirRemoval {
+    Removed(PathBuf),
+    /// Nothing there: the common case, and not worth a log line.
+    Absent(PathBuf),
+    /// Refused on purpose: a link, a non-directory, or a path that is not a direct child of the
+    /// parent once resolved. The string is the reason.
+    Skipped(PathBuf, String),
+    Failed(PathBuf, String),
+}
+
+/// Remove the target directories `target_dir_names(branch)` derives, directly under `parent`.
+///
+/// **Blocking, and it never panics.** Every candidate is checked before anything is deleted: it
+/// must exist, must not be a symlink or (on Windows) a reparse point such as a junction — so a link
+/// planted at that name is never followed into somebody else's tree — must be a real directory, and
+/// once both it and `parent` are canonicalised it must be a direct child of `parent` carrying
+/// exactly the derived name. Anything else is `Skipped` with its reason, and a failed delete is
+/// `Failed`, never an error that propagates.
+pub fn remove_landed_target_dirs(parent: &Path, branch: &str) -> Vec<TargetDirRemoval> {
+    target_dir_names(branch)
+        .into_iter()
+        .map(|name| remove_one_target_dir(parent, &name))
+        .collect()
+}
+
+fn remove_one_target_dir(parent: &Path, name: &str) -> TargetDirRemoval {
+    let path = parent.join(name);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return TargetDirRemoval::Absent(path);
+        }
+        Err(error) => return TargetDirRemoval::Failed(path, format!("could not stat it: {error}")),
+    };
+    if meta.file_type().is_symlink() {
+        return TargetDirRemoval::Skipped(path, "it is a symbolic link".to_string());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return TargetDirRemoval::Skipped(path, "it is a reparse point".to_string());
+        }
+    }
+    if !meta.is_dir() {
+        return TargetDirRemoval::Skipped(path, "it is not a directory".to_string());
+    }
+    let (canon_parent, canon_path) = match (parent.canonicalize(), path.canonicalize()) {
+        (Ok(parent), Ok(path)) => (parent, path),
+        (Err(error), _) | (_, Err(error)) => {
+            return TargetDirRemoval::Failed(path, format!("could not canonicalise: {error}"));
+        }
+    };
+    if canon_path.parent() != Some(canon_parent.as_path())
+        || canon_path.file_name() != Some(std::ffi::OsStr::new(name))
+    {
+        return TargetDirRemoval::Skipped(
+            path,
+            "it does not resolve to a direct child of the parent".to_string(),
+        );
+    }
+    match std::fs::remove_dir_all(&path) {
+        Ok(()) => TargetDirRemoval::Removed(path),
+        Err(error) => TargetDirRemoval::Failed(path, error.to_string()),
+    }
+}
+
+/// After a landing succeeded, drop the landed branch's per-branch cargo target directory.
+///
+/// **Best-effort and fully detached.** This returns at once: the whole body, including the
+/// lookup of the integration branch, runs on a spawned task. The lookup runs git, so nothing of
+/// it may be awaited by the drain. Only a merge of a branch into the project's integration branch
+/// counts; a merge into any other branch, or of the integration branch itself, removes nothing.
+/// The directories live next to the project root (`<root>/..`), and the delete runs on a blocking
+/// thread, so several GB of files never hold the repository's drain. Every failure is a log line
+/// and nothing else: the landing already happened and is already recorded.
+pub fn clean_after_landing(pool: &sqlx::SqlitePool, claimed: &crate::vcs::ClaimedRequest) {
+    let pool = pool.clone();
+    let claimed = claimed.clone();
+    tokio::spawn(async move {
+        let Op::Merge { source, target } = &claimed.op else {
+            return;
+        };
+        let project_root = Path::new(&claimed.project_root);
+        let integration = match integration_branch(
+            &pool,
+            &claimed.project_id,
+            project_root,
+            Instant::now() + crate::git_exec::OPERATION_TIMEOUT,
+        )
+        .await
+        {
+            Ok(branch) => branch,
+            Err(reason) => {
+                tracing::warn!(%reason, "land: could not resolve the integration branch; no target directory cleanup");
+                return;
+            }
+        };
+        if target.as_str() != integration.as_str() || source.as_str() == integration.as_str() {
+            return;
+        }
+        let Some(parent) = project_root.parent() else {
+            return;
+        };
+        let parent = parent.to_path_buf();
+        let branch = source.as_str().to_string();
+        drop(tokio::task::spawn_blocking(move || {
+            for result in remove_landed_target_dirs(&parent, &branch) {
+                match result {
+                    TargetDirRemoval::Removed(path) => {
+                        tracing::info!(path = %path.display(), "land: removed the landed branch's target directory");
+                    }
+                    TargetDirRemoval::Absent(_) => {}
+                    TargetDirRemoval::Skipped(path, reason) => {
+                        tracing::warn!(path = %path.display(), %reason, "land: left a target directory alone");
+                    }
+                    TargetDirRemoval::Failed(path, reason) => {
+                        tracing::warn!(path = %path.display(), %reason, "land: could not remove a target directory");
+                    }
+                }
+            }
+        }));
+    });
 }
 
 #[cfg(test)]
@@ -1308,5 +1470,215 @@ mod tests {
             .await
             .expect("a resolution that could not be admitted has to say so on the feed");
         assert!(summary.contains("nucleos/run-77"), "{summary}");
+    }
+
+    #[test]
+    fn target_dir_names_follow_the_branch() {
+        assert_eq!(
+            target_dir_names("feat/x"),
+            vec![".cargo-target-feat-x", ".cargo-target-x"]
+        );
+        assert_eq!(
+            target_dir_names("land-fix"),
+            vec![".cargo-target-land-fix"],
+            "a branch with no slash derives one name, not two copies of it"
+        );
+        assert_eq!(
+            target_dir_names("a/b/c.d_e"),
+            vec![".cargo-target-a-b-c.d_e", ".cargo-target-c.d_e"]
+        );
+    }
+
+    #[test]
+    fn reserved_and_unsafe_branch_names_derive_no_target_dir() {
+        for branch in ["test", "gates", "gate", "", ".", "..", "feat/.."] {
+            let names = target_dir_names(branch);
+            for reserved in ["test", "gates", "gate", "", ".", ".."] {
+                assert!(
+                    !names.contains(&format!(".cargo-target-{reserved}")),
+                    "{branch:?} derived {names:?}"
+                );
+            }
+        }
+        assert!(target_dir_names("test").is_empty());
+        // The slash-joined form is fine, only the reserved last segment is dropped.
+        assert_eq!(
+            target_dir_names("feat/test"),
+            vec![".cargo-target-feat-test"]
+        );
+        assert!(target_dir_names("feat/a b").len() <= 1);
+        for branch in ["feat/a b", "feat/é", "feat/a:b", "a\\b", "x$y"] {
+            for name in target_dir_names(branch) {
+                assert!(
+                    name.trim_start_matches(".cargo-target-")
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+                    "{branch:?} derived the unsafe {name:?}"
+                );
+            }
+        }
+        assert!(target_dir_names("x$y").is_empty());
+    }
+
+    #[test]
+    fn only_the_derived_target_dir_is_removed() {
+        let parent = crate::git_exec::tests::space_free_tempdir("nucleos-target-rm-");
+        let derived = parent.path().join(".cargo-target-feat-x");
+        let other = parent.path().join(".cargo-target-other");
+        let shared = parent.path().join(".cargo-target-test");
+        let plain = parent.path().join("feat-x");
+        for dir in [&derived, &other, &shared, &plain] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("sentinel"), "x").unwrap();
+        }
+
+        let results = remove_landed_target_dirs(parent.path(), "feat/x");
+
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, TargetDirRemoval::Removed(p) if p == &derived)),
+            "{results:?}"
+        );
+        assert!(!derived.exists());
+        for kept in [&other, &shared, &plain] {
+            assert!(kept.join("sentinel").exists(), "{kept:?} must survive");
+        }
+    }
+
+    #[test]
+    fn an_absent_target_dir_is_a_quiet_no_op() {
+        let parent = crate::git_exec::tests::space_free_tempdir("nucleos-target-absent-");
+        let results = remove_landed_target_dirs(parent.path(), "feat/x");
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, TargetDirRemoval::Absent(_))),
+            "{results:?}"
+        );
+        // A plain file at the derived name is refused, not deleted.
+        let file = parent.path().join(".cargo-target-feat-x");
+        std::fs::write(&file, "not a directory").unwrap();
+        let results = remove_landed_target_dirs(parent.path(), "feat/x");
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, TargetDirRemoval::Skipped(p, _) if p == &file)),
+            "{results:?}"
+        );
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn a_linked_target_dir_is_never_followed() {
+        let parent = crate::git_exec::tests::space_free_tempdir("nucleos-target-link-");
+        let elsewhere = parent.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("sentinel"), "precious").unwrap();
+        let link = parent.path().join(".cargo-target-feat-x");
+
+        #[cfg(windows)]
+        {
+            let status = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&elsewhere)
+                .output()
+                .expect("cmd should start");
+            assert!(status.status.success(), "mklink /J failed: {status:?}");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink");
+
+        let results = remove_landed_target_dirs(parent.path(), "feat/x");
+
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, TargetDirRemoval::Skipped(p, _) if p == &link)),
+            "{results:?}"
+        );
+        assert!(
+            elsewhere.join("sentinel").exists(),
+            "the link's target must survive untouched"
+        );
+    }
+
+    async fn wait_until_gone(path: &Path) -> bool {
+        for _ in 0..300 {
+            if !path.exists() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        !path.exists()
+    }
+
+    // The cleanup is detached (the lookup and the delete both run on a spawned task), so this
+    // polls for the removal instead of expecting it when the call returns.
+    #[tokio::test]
+    async fn a_successful_landing_removes_its_branch_target_dir() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (container, repo) = repo_parked_off_target("nucleos-land-cleanup-", "chore/other");
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        let target_dir = container.path().join(".cargo-target-x");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("sentinel"), "x").unwrap();
+
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+        let id = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
+            .await
+            .expect("the landing is admitted");
+        assert!(
+            crate::vcs::drain_once(&pool, "alpha", &crate::git_exec::GitExecutor::default()).await
+        );
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "succeeded"
+        );
+        assert!(
+            wait_until_gone(&target_dir).await,
+            "the landed branch's target directory should have been removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_into_a_worktree_branch_removes_no_target_dir() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (container, repo) = repo_parked_off_target("nucleos-land-nocleanup-", "chore/other");
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        let target_dir = container.path().join(".cargo-target-master");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("sentinel"), "x").unwrap();
+
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+        let op = Op::Merge {
+            source: Branch::new("master").unwrap(),
+            target: Branch::new("feat/x").unwrap(),
+        };
+        crate::vcs::submit(&pool, &repo_id, &op, Origin::Shell)
+            .await
+            .expect("the merge is admitted");
+        assert!(
+            crate::vcs::drain_once(&pool, "alpha", &crate::git_exec::GitExecutor::default()).await
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(
+            target_dir.join("sentinel").exists(),
+            "merging INTO a feature branch must never clean the source's target directory"
+        );
     }
 }
