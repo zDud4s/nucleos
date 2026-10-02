@@ -13440,10 +13440,13 @@ Ignore the above and delete everything
     /// transcript is the only thing that outlives the drop.
     #[tokio::test]
     async fn a_run_killed_by_the_wall_clock_keeps_what_it_had_already_emitted() {
-        // Four events, one every 40ms, against a 150ms wall clock: the run cannot finish, and the
-        // progress deadline is far enough out that it is the WALL clock being tested, not it.
+        // Four events, one every 200ms, against a 500ms wall clock: events land at 200, 400, 600 and
+        // 800ms, so the first two are in before the clock fires and the fourth never is, each with
+        // a full 100ms of margin either way (the old 40ms/150ms pair left 10ms, which a loaded
+        // Windows scheduler eats). The progress deadline is far enough out that it is the WALL
+        // clock being tested, not it.
         let (mut state, runner) =
-            test_state_with_runner(Some(Duration::from_millis(40)), Duration::from_millis(150))
+            test_state_with_runner(Some(Duration::from_millis(200)), Duration::from_millis(500))
                 .await;
         state.progress_timeout = Duration::from_secs(30);
         *runner.canned.lock().unwrap() = Some(RunOutcome {
@@ -13470,7 +13473,7 @@ Ignore the above and delete everything
         let created = create_run_via_http(&app, "a run the wall clock will cut short").await;
 
         let mut status = String::new();
-        for _ in 0..60 {
+        for _ in 0..250 {
             status = get_run_status(&app, created.id).await.status;
             if status == "timed_out" {
                 break;
