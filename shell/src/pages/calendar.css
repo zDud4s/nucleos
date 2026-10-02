@@ -664,14 +664,14 @@
 
 /* ========================================================== occurrences == */
 
-`/*
-`  Both of this sheet's lists — the day's occurrences and the held notifications —
-`  are \`Rows\`: a hairline-ruled column read by scanning down it, each item a row
-`  laid out on one grid line. The list keeps only its margin reset here; the frame,
-`  the rules and the fill are the shared layer's.
-`*/
-`.calendar-occurrence-list,
-`.calendar-notifications {
+/*
+  Both of this sheet's lists — the day's occurrences and the held notifications —
+  are `Rows`: a hairline-ruled column read by scanning down it, each item a row
+  laid out on one grid line. The list keeps only its margin reset here; the frame,
+  the rules and the fill are the shared layer's.
+*/
+.calendar-occurrence-list,
+.calendar-notifications {
   margin: 0;
 }
 
