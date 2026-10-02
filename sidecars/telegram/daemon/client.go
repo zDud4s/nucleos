@@ -3,8 +3,8 @@ package daemon
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
