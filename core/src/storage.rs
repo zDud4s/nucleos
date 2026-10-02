@@ -55,6 +55,16 @@ pub fn write_atomic(dest: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     commit(staged, dest)
 }
 
+/// How much of the database each connection maps into memory. Mapped pages live in the OS file
+/// cache, shared by every connection, so this costs address space rather than five copies of RAM —
+/// and a scan of an already-read table stops being thousands of `ReadFile` calls.
+const MMAP_SIZE_BYTES: i64 = 256 * 1024 * 1024;
+
+/// Each connection's private page cache. SQLite's default is 2 MiB, which no hot table here fits.
+/// Kept modest because it is per connection, times `max_connections`; the map above does the
+/// heavy lifting.
+const CACHE_SIZE_KIB: i64 = 16 * 1024;
+
 pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(sqlx::Error::Io)?;
@@ -70,7 +80,9 @@ pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         // SQLite disables foreign keys per connection unless asked. The schema declares them
         // (`worktrees.run_id`, `action_grants.proposal_id`, ...), so without this they were
         // documentation: an orphaned row was free to exist and nothing said so.
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .pragma("mmap_size", MMAP_SIZE_BYTES.to_string())
+        .pragma("cache_size", (-CACHE_SIZE_KIB).to_string());
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)
@@ -150,6 +162,181 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every column of `runs` as `(name, declared type, not null, default)`, in table order.
+    async fn runs_columns(pool: &SqlitePool) -> Vec<(String, String, bool, Option<String>)> {
+        sqlx::query_as(
+            "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('runs') ORDER BY cid",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Every stored value of `runs`, quoted, keyed by row and column — a byte-level snapshot.
+    async fn runs_values(pool: &SqlitePool) -> Vec<(i64, String, String)> {
+        let mut values = Vec::new();
+        for (column, ..) in runs_columns(pool).await {
+            let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT id, quote(\"{column}\") FROM runs ORDER BY id"
+            )))
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            values.extend(rows.into_iter().map(|(id, v)| (id, column.clone(), v)));
+        }
+        values.sort();
+        values
+    }
+
+    async fn schema_of(pool: &SqlitePool, sql: &str) -> Vec<String> {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Migration `0154` rebuilds `runs` with its large text columns last.
+    ///
+    /// SQLite keeps a value too large for its page in a chain of overflow pages, and reading any
+    /// column declared AFTER that value means walking the chain. `stdout` was the seventh column
+    /// of 56, so `budget`'s scan of `mode`/`cost_usd`/`created_at` read every run's whole output:
+    /// 118 ms per call on the owner's 229 MB database, several calls every three seconds. The
+    /// rebuild may move columns and nothing else — every row, value, default, index, foreign key
+    /// and the AUTOINCREMENT high-water mark has to come out the other side unchanged.
+    #[tokio::test]
+    async fn migration_0154_moves_the_large_runs_columns_last_and_keeps_everything_else() {
+        let pool = crate::testdb::pool_migrated_through(153).await;
+        // The real pool runs with foreign keys on; the rebuild has to survive that.
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let big = "x".repeat(20_000);
+        for (id, successor) in [(1_i64, None), (2, Some(1_i64)), (3, None)] {
+            sqlx::query(
+                "INSERT INTO runs (id, project_id, prompt, status, stdout, stderr, gate_output, \
+                 created_at, mode, cost_usd, successor_run_id, tools_used, thought) \
+                 VALUES (?, 'p', 'ask', 'completed', ?, 'err', 'gate', '2026-10-01T00:00:00Z', \
+                 'shadow', 0.25, ?, '[\"Read\"]', 'hm')",
+            )
+            .bind(id)
+            .bind(&big)
+            .bind(successor)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // The high-water mark sits above the highest surviving id; a rebuild that re-derived it
+        // from the rows would hand id 3 out again.
+        sqlx::query("DELETE FROM runs WHERE id = 3")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let columns_before = runs_columns(&pool).await;
+        let values_before = runs_values(&pool).await;
+        let indexes_before = schema_of(
+            &pool,
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'runs' \
+             AND sql IS NOT NULL ORDER BY name",
+        )
+        .await;
+        let children_before = schema_of(
+            &pool,
+            "SELECT m.name || '.' || f.\"from\" FROM sqlite_master m, pragma_foreign_key_list(m.name) f \
+             WHERE m.type = 'table' AND f.\"table\" = 'runs' ORDER BY 1",
+        )
+        .await;
+
+        crate::testdb::apply_migrations_after(&pool, 153).await;
+
+        let columns_after = runs_columns(&pool).await;
+        let tail: Vec<&str> = columns_after[columns_after.len() - 7..]
+            .iter()
+            .map(|(name, ..)| name.as_str())
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                "tools_used",
+                "prompt_images",
+                "thought",
+                "prompt",
+                "gate_output",
+                "stderr",
+                "stdout"
+            ]
+        );
+        let mut sorted_before = columns_before.clone();
+        let mut sorted_after = columns_after.clone();
+        sorted_before.sort();
+        sorted_after.sort();
+        assert_eq!(
+            sorted_after, sorted_before,
+            "a column changed beyond its position"
+        );
+        assert_eq!(runs_values(&pool).await, values_before);
+        assert_eq!(
+            schema_of(
+                &pool,
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'runs' \
+                 AND sql IS NOT NULL ORDER BY name",
+            )
+            .await,
+            indexes_before
+        );
+        assert_eq!(
+            schema_of(
+                &pool,
+                "SELECT m.name || '.' || f.\"from\" FROM sqlite_master m, pragma_foreign_key_list(m.name) f \
+                 WHERE m.type = 'table' AND f.\"table\" = 'runs' ORDER BY 1",
+            )
+            .await,
+            children_before
+        );
+        let violations: Vec<String> =
+            sqlx::query_scalar("SELECT \"table\" FROM pragma_foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            foreign_keys, 1,
+            "the migration must hand the connection back with foreign keys on"
+        );
+
+        let next: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, created_at) VALUES ('q', 'running', 'now') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(next, 4);
+    }
+
+    /// The pool reads the database through a memory map and a page cache sized for it, rather than
+    /// SQLite's 2 MiB default, so a repeated scan is served from memory instead of `ReadFile`.
+    #[tokio::test]
+    async fn every_connection_maps_the_database_and_keeps_a_real_page_cache() {
+        let db = TempDb::new().await;
+        let mmap: i64 = sqlx::query_scalar("PRAGMA mmap_size")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let cache: i64 = sqlx::query_scalar("PRAGMA cache_size")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        db.close().await;
+        assert_eq!(mmap, MMAP_SIZE_BYTES);
+        assert_eq!(cache, -CACHE_SIZE_KIB);
     }
 
     #[test]
