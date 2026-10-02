@@ -1967,7 +1967,9 @@ fn default_true() -> bool {
 pub struct GraphConfig {
     #[serde(default = "default_max_items")]
     max_items: usize,
-    #[serde(default = "default_true")]
+    // Off unless a rule asks (owner decision, 2026-10-02): one core suite per intermediate item paid
+    // for states nobody ships. The last item's gate runs regardless, over the merged job branch.
+    #[serde(default)]
     pub gate_after_each_item: bool,
     #[serde(default = "default_true")]
     pub review: bool,
@@ -3070,14 +3072,14 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     }
 
     #[test]
-    fn a_graph_block_defaults_to_gating_each_item_and_reviewing() {
+    fn a_graph_block_defaults_to_gating_only_the_last_item_and_reviewing() {
         let rules = rules_from(
             "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph: {}\n",
         )
         .expect("an empty graph block is valid and fully defaulted");
         let graph = rules.schedules[0].graph.as_ref().expect("graph present");
         assert_eq!(graph.max_items(), MAX_ITEMS_CEILING);
-        assert!(graph.gate_after_each_item);
+        assert!(!graph.gate_after_each_item);
         assert!(graph.review);
     }
 
