@@ -9,6 +9,7 @@ import {
   useCouncils,
   useCreateCouncil,
   useCouncilConfig,
+  ceilingCalls,
   seatName,
   type BordaRow,
   type CouncilSummary,
@@ -226,8 +227,23 @@ function ConveneForm() {
   // so before the question is asked is the point of the endpoint.
   const config = useCouncilConfig();
 
+  /**
+   * The rounds somebody picked, or `null` while they have picked none.
+   *
+   * `null` and not the config's default copied into state: the config answers
+   * after the form mounts, so a copy taken at mount would be the wrong number,
+   * and "untouched" has to stay distinguishable from "chose the default" for
+   * the request to keep leaving the key off.
+   */
+  const [pickedRounds, setPickedRounds] = useState<number | null>(null);
+  /** A role per member row, keyed by the row's index. Absent means "no role". */
+  const [roles, setRoles] = useState<Record<number, string>>({});
+
   const roster = rosterFrom(chairman, members);
   const halfChosen = choosing && roster === null;
+  const defaultRounds = config.data?.default_rounds;
+  const rounds = pickedRounds ?? defaultRounds;
+  const estimate = estimateMembers(choosing, members, config.data?.default_roster?.members.length);
 
   return (
     <Panel title="Convene a council">
@@ -251,7 +267,17 @@ function ConveneForm() {
           create.mutate(
             // `undefined` and not `null`: the key is left off the request
             // entirely when nothing is being overridden. See `data/council.ts`.
-            { question: question.trim(), roster: choosing && roster !== null ? roster : undefined },
+            {
+              question: question.trim(),
+              roster: choosing && roster !== null ? roster : undefined,
+              // Only a departure from the file's default travels; the default
+              // itself is the daemon's to apply, as it is for every request
+              // that never had this control.
+              rounds: rounds !== undefined && rounds !== defaultRounds ? rounds : undefined,
+              // Roles belong to the chosen panel's rows, so they travel with it
+              // and never on their own against a roster this form did not draw.
+              roles: choosing && roster !== null ? rolesBody(roles, members.length) : undefined,
+            },
             {
               onSuccess: (result) => {
                 setQuestion("");
@@ -280,13 +306,40 @@ function ConveneForm() {
           <span>Put this question to a chosen panel</span>
         </label>
 
+        <label className="council-field">
+          <span>Rounds</span>
+          <select
+            className="council-select"
+            aria-label="Rounds"
+            value={rounds === undefined ? "" : String(rounds)}
+            disabled={config.data === undefined}
+            onChange={(event) => setPickedRounds(Number(event.target.value))}
+          >
+            {roundChoices(config.data?.max_rounds).map((choice) => (
+              <option key={choice} value={String(choice)}>
+                {choice}
+              </option>
+            ))}
+          </select>
+        </label>
+
         {choosing && (
           <RosterPicker
             chairman={chairman}
             members={members}
+            roles={roles}
+            roleChoices={config.data?.roles ?? []}
             onChairman={setChairman}
             onMembers={setMembers}
+            onRoles={setRoles}
           />
+        )}
+
+        {/* One template string, so the line is one text node a reader and a
+            test both find whole. A ceiling, not a forecast: a council that
+            stops early spends less. */}
+        {estimate !== undefined && rounds !== undefined && (
+          <p className="council-note">{`up to ${ceilingCalls(estimate, rounds)} calls`}</p>
         )}
 
         <Button
@@ -302,6 +355,59 @@ function ConveneForm() {
   );
 }
 
+/** PURE: 1..max, or nothing while the config has not answered. */
+function roundChoices(max: number | undefined): number[] {
+  if (max === undefined) return [];
+  return Array.from({ length: max }, (_, at) => at + 1);
+}
+
+/**
+ * PURE: how many members the estimate counts, or `undefined` when nothing says.
+ *
+ * The chosen rows once the picker is open and at least one row is filled — the
+ * panel on screen is the one that would run — and otherwise the configured
+ * roster the request would fall back to. With neither there is no honest
+ * number, and the line is left off rather than guessed.
+ */
+function estimateMembers(
+  choosing: boolean,
+  members: (RosterSeat | null)[],
+  configured: number | undefined,
+): number | undefined {
+  if (choosing) {
+    const chosen = members.filter((member) => member !== null).length;
+    if (chosen > 0) return chosen;
+  }
+  return configured;
+}
+
+/**
+ * PURE: the `roles` key as the daemon reads it — the row's index as a string —
+ * or `undefined` when no row plays one, so the key stays off the request.
+ * Rows past the panel's end are ignored: a role is only ever a row's.
+ */
+function rolesBody(roles: Record<number, string>, rows: number): Record<string, string> | undefined {
+  const body: Record<string, string> = {};
+  for (const [index, role] of Object.entries(roles)) {
+    if (role !== "" && Number(index) < rows) body[index] = role;
+  }
+  return Object.keys(body).length > 0 ? body : undefined;
+}
+
+/**
+ * PURE: the roles after row `removed` comes out. The rows below it move up one,
+ * and their roles have to move with them or a role would land on its neighbour.
+ */
+function rolesWithout(roles: Record<number, string>, removed: number): Record<number, string> {
+  const next: Record<number, string> = {};
+  for (const [key, role] of Object.entries(roles)) {
+    const index = Number(key);
+    if (index < removed) next[index] = role;
+    else if (index > removed) next[index - 1] = role;
+  }
+  return next;
+}
+
 /**
  * Who sits on the panel for this question.
  *
@@ -313,13 +419,19 @@ function ConveneForm() {
 function RosterPicker({
   chairman,
   members,
+  roles,
+  roleChoices,
   onChairman,
   onMembers,
+  onRoles,
 }: {
   chairman: RosterSeat | null;
   members: (RosterSeat | null)[];
+  roles: Record<number, string>;
+  roleChoices: string[];
   onChairman: (seat: RosterSeat | null) => void;
   onMembers: (seats: (RosterSeat | null)[]) => void;
+  onRoles: (roles: Record<number, string>) => void;
 }) {
   const agents = useAgents();
   const models = useAssistantModels();
@@ -354,6 +466,23 @@ function RosterPicker({
               models={choices}
               onChange={(seat) => onMembers(members.map((old, at) => (at === index ? seat : old)))}
             />
+            {/* The chairman has no role: it synthesises, it does not argue. */}
+            <label className="council-field">
+              <span>Role</span>
+              <select
+                className="council-select"
+                aria-label={`Role for seat ${index}`}
+                value={roles[index] ?? ""}
+                onChange={(event) => onRoles({ ...roles, [index]: event.target.value })}
+              >
+                <option value="">no role</option>
+                {roleChoices.map((role) => (
+                  <option key={role} value={role}>
+                    {role}
+                  </option>
+                ))}
+              </select>
+            </label>
             {/* The last row does not come out: `council::start` refuses a roster
                 with no members, so an empty panel would be a refusal rather
                 than a way back to the file. Unticking the box is that. */}
@@ -361,7 +490,10 @@ function RosterPicker({
               variant="quiet"
               aria-label={`Remove seat ${index}`}
               disabled={members.length === 1}
-              onClick={() => onMembers(members.filter((_, at) => at !== index))}
+              onClick={() => {
+                onMembers(members.filter((_, at) => at !== index));
+                onRoles(rolesWithout(roles, index));
+              }}
             >
               Remove
             </Button>

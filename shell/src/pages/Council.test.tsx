@@ -858,6 +858,182 @@ describe("Council - convening with a chosen panel", () => {
   });
 });
 
+/* ------------------------------------------------- rounds, roles, estimate -- */
+
+/** A configured roster of three, so the estimate has a member count before anyone opens the picker. */
+function threeSeatConfig(): CouncilConfig {
+  return councilConfig({
+    default_roster: {
+      chairman: { kind: "cloud", ref: "claude-opus-4" },
+      members: [
+        { kind: "cloud", ref: "claude-opus-4" },
+        { kind: "cloud", ref: "claude-opus-5" },
+        { kind: "local", ref: "qwen3.5:4b" },
+      ],
+    },
+  });
+}
+
+describe("Council - convening with rounds, roles and an estimate", () => {
+  it("offers rounds 1 to max, defaulting to the config's, and sends none when untouched", async () => {
+    let sent: unknown = "nothing was posted";
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        onCreate: (body) => {
+          sent = body;
+          return { id: "new-1" };
+        },
+      }),
+    );
+
+    await renderCouncil("/council");
+    const rounds = (await screen.findByLabelText("Rounds")) as HTMLSelectElement;
+    // The config answers after the form mounts: the default is read, not assumed.
+    await waitFor(() => expect(rounds.value).toBe("2"));
+    expect(within(rounds).getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "1",
+      "2",
+      "3",
+    ]);
+
+    fireEvent.change(screen.getByLabelText("Question"), { target: { value: "well?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+
+    // Choosing nothing is not choosing the default: the key stays off the request.
+    await waitFor(() => expect(sent).toEqual({ question: "well?" }));
+    expect(Object.keys(sent as object)).toEqual(["question"]);
+  });
+
+  it("sends rounds only when it differs from the default", async () => {
+    let sent: unknown = "nothing was posted";
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        onCreate: (body) => {
+          sent = body;
+          return { id: "new-1" };
+        },
+      }),
+    );
+
+    await renderCouncil("/council");
+    const rounds = (await screen.findByLabelText("Rounds")) as HTMLSelectElement;
+    await waitFor(() => expect(rounds.value).toBe("2"));
+
+    fireEvent.change(rounds, { target: { value: "3" } });
+    fireEvent.change(screen.getByLabelText("Question"), { target: { value: "well?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+
+    await waitFor(() => expect(sent).toEqual({ question: "well?", rounds: 3 }));
+  });
+
+  it("sends the roles chosen per seat, keyed by the seat's index", async () => {
+    let sent: unknown = "nothing was posted";
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        agents: [agentRow()],
+        models: [modelRow(), modelRow({ id: "qwen3.5:4b", label: "Qwen 4b", brain: "local" })],
+        onCreate: (body) => {
+          sent = body;
+          return { id: "new-1" };
+        },
+      }),
+    );
+
+    await renderCouncil("/council");
+    fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
+    await openTheRoster();
+    fireEvent.click(screen.getByRole("button", { name: "Add a seat" }));
+
+    // "no role" first, then the config's roles in the daemon's declared order.
+    const second = (await screen.findByLabelText("Role for seat 1")) as HTMLSelectElement;
+    expect(within(second).getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "no role",
+      "skeptic",
+      "pragmatist",
+    ]);
+    expect(second.value).toBe("");
+
+    fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
+    fireEvent.change(screen.getByLabelText("Seat 0"), { target: { value: "model:claude-opus-5" } });
+    fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:qwen3.5:4b" } });
+    // Only seat 1 is given a role; seat 0 keeps "no role" and must not appear.
+    fireEvent.change(second, { target: { value: "skeptic" } });
+    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+
+    await waitFor(() =>
+      expect(sent).toEqual({
+        question: "well?",
+        roster: {
+          chairman: { agent: "ag-1" },
+          members: [
+            { kind: "cloud", ref: "claude-opus-5" },
+            { kind: "local", ref: "qwen3.5:4b" },
+          ],
+        },
+        roles: { "1": "skeptic" },
+      }),
+    );
+  });
+
+  it("sends no roles key when no seat was given a role", async () => {
+    let sent: unknown = "nothing was posted";
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        agents: [agentRow()],
+        models: [modelRow()],
+        onCreate: (body) => {
+          sent = body;
+          return { id: "new-1" };
+        },
+      }),
+    );
+
+    await renderCouncil("/council");
+    fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
+    await openTheRoster();
+    fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
+    fireEvent.change(screen.getByLabelText("Seat 0"), { target: { value: "model:claude-opus-5" } });
+    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+
+    await waitFor(() => expect(sent).not.toBe("nothing was posted"));
+    expect(Object.keys(sent as object)).toEqual(["question", "roster"]);
+  });
+
+  it("shows up to X calls for the configured roster at the default rounds, and follows the rounds select", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}, { config: threeSeatConfig() }));
+
+    await renderCouncil("/council");
+    // N=3, R=2: 3 answers + 6 critiques + 3 revisions + 2 chairman = 14.
+    expect(await screen.findByText("up to 14 calls")).toBeDefined();
+
+    // N=3, R=3: 3 + 9 + 6 + 2 = 20.
+    fireEvent.change(screen.getByLabelText("Rounds"), { target: { value: "3" } });
+    expect(await screen.findByText("up to 20 calls")).toBeDefined();
+  });
+
+  it("counts the chosen members, not the configured roster, once a panel is chosen", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        config: threeSeatConfig(),
+        agents: [agentRow()],
+        models: [modelRow()],
+      }),
+    );
+
+    await renderCouncil("/council");
+    expect(await screen.findByText("up to 14 calls")).toBeDefined();
+
+    await openTheRoster();
+    fireEvent.click(screen.getByRole("button", { name: "Add a seat" }));
+    fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
+    fireEvent.change(screen.getByLabelText("Seat 0"), { target: { value: "model:claude-opus-5" } });
+    fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:claude-opus-5" } });
+
+    // N=2, R=2: 2 + 4 + 2 + 2 = 10.
+    expect(await screen.findByText("up to 10 calls")).toBeDefined();
+  });
+});
+
 /* -------------------------------------------------------------- leaderboard -- */
 
 describe("Council - the leaderboard", () => {
