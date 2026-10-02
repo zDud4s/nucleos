@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { DAEMON_URL, apiText, isApiRefusal, isApiUnavailable } from "../data/client";
 import { keys } from "../data/keys";
-import { POLL } from "../data/poll";
+import { POLL, backgroundCadence } from "../data/poll";
 import { useHealth } from "../data/system";
 
 /**
@@ -72,7 +72,7 @@ export function ConnectionGate({ children }: ConnectionGateProps) {
   const status = useQuery({
     queryKey: keys.status,
     queryFn: () => apiText("/status"),
-    refetchInterval: POLL.fast,
+    refetchInterval: backgroundCadence(POLL.fast),
     refetchIntervalInBackground: true,
     enabled: health.data === true,
   });

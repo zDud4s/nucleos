@@ -1172,6 +1172,17 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         return state.projects;
       case "/proposals":
         return state.proposals;
+      // `GET /waiting/count`, from the one decision list this fake holds; the rest are empty.
+      case "/waiting/count":
+        return {
+          wheel: 0,
+          approvals: state.proposals.length,
+          team_actions: 0,
+          recruits: 0,
+          merges: 0,
+          exclusions: 0,
+          git: 0,
+        };
       case "/concurrency":
         return state.concurrency;
       default:

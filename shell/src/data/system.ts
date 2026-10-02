@@ -4,7 +4,7 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 import { apiFetch, probeHealth } from "./client";
 import type { NotifyPolicy } from "./feed";
 import { keys } from "./keys";
-import { POLL } from "./poll";
+import { POLL, backgroundCadence } from "./poll";
 
 /** Autopilot's three settings for a project. `off` is not "broken" and `shadow` is not "on". */
 export type AutopilotMode = "off" | "shadow" | "active";
@@ -133,7 +133,7 @@ export function useHealth() {
   return useQuery({
     queryKey: keys.health,
     queryFn: probeHealth,
-    refetchInterval: POLL.fast,
+    refetchInterval: backgroundCadence(POLL.fast),
     refetchIntervalInBackground: true,
   });
 }
@@ -150,7 +150,7 @@ export function useKillSwitch() {
   return useQuery({
     queryKey: keys.autopilot.kill,
     queryFn: () => apiFetch<KillSwitchState>("/autopilot/kill"),
-    refetchInterval: POLL.fast,
+    refetchInterval: backgroundCadence(POLL.fast),
     refetchIntervalInBackground: true,
   });
 }

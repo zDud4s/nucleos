@@ -80,3 +80,34 @@ export function pollWhile<T>(
     return alive(data) ? cadence : false;
   };
 }
+
+/**
+ * Where the window stands: `focused` polls at the pages' own cadences, `blurred` (visible, not
+ * focused) refreshes at the blurred cadence in `app/pacing.ts`, and `hidden` (minimised or in the tray) leaves
+ * only the queries that say they must keep going.
+ */
+export type Attention = "focused" | "blurred" | "hidden";
+
+export function attentionOf(visible: boolean, focused: boolean): Attention {
+  if (!visible) return "hidden";
+  return focused ? "focused" : "blurred";
+}
+
+export function currentAttention(): Attention {
+  if (typeof document === "undefined") return "focused";
+  return attentionOf(document.visibilityState !== "hidden", document.hasFocus());
+}
+
+/**
+ * The cadence for a query that keeps polling in the background, slowed while the window is
+ * hidden.
+ *
+ * Health, the kill switch, the credential check and the chat list keep going in the tray, each for
+ * a reason written beside it — but none of those reasons needs three seconds. Coming back from the
+ * tray refetches every stale query at once anyway (react-query's refetch on focus), so a hidden
+ * window only has to notice a change eventually, and the window somebody returns to is current the
+ * instant it is shown. React-query re-reads this after every fetch, which is when it switches.
+ */
+export function backgroundCadence(visibleMs: number): () => number {
+  return () => (currentAttention() === "hidden" ? POLL.slow : visibleMs);
+}

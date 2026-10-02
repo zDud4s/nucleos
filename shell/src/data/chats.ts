@@ -2,6 +2,7 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 import {
   anyTurnLive,
   merge,
+  settledWatermark,
   turnFromRow,
   type AssistantTurnRow,
   type Brain,
@@ -10,7 +11,7 @@ import {
 } from "../lib/turns";
 import { apiFetch, apiText } from "./client";
 import { keys } from "./keys";
-import { POLL } from "./poll";
+import { POLL, backgroundCadence } from "./poll";
 
 /**
  * Chats, as hooks: the list, one conversation's transcript, and the seven
@@ -533,7 +534,7 @@ export function useChats() {
   return useQuery({
     queryKey: keys.chats.all,
     queryFn: () => apiFetch<ChatSummary[]>("/assistant/chats"),
-    refetchInterval: POLL.fast,
+    refetchInterval: backgroundCadence(POLL.fast),
     refetchIntervalInBackground: true,
     placeholderData: keepPreviousData,
   });
@@ -559,6 +560,27 @@ export function useAssistantModels(chatId?: string) {
   });
 }
 
+/** The transcript route's answer. */
+interface TranscriptRead {
+  handed: Exchange[];
+  turns: AssistantTurnRow[];
+  queued: Waiting[];
+  asks: Ask[];
+  more?: boolean;
+  notices: ChatNotice[];
+}
+
+/**
+ * How long the transcript's poll goes on incremental reads before it reads in full again.
+ *
+ * The incremental read cannot see a settled turn change — a relay sent from it, a compaction
+ * mark — and this bounds how long such a change can go unseen when nothing invalidated the query.
+ */
+export const TRANSCRIPT_FULL_READ_MS = 15_000;
+
+/** When each conversation was last read in full, by chat id. */
+const lastFullRead = new Map<string, number>();
+
 /**
  * One conversation's transcript, oldest first.
  *
@@ -573,24 +595,36 @@ export function useAssistantModels(chatId?: string) {
  * Cadence is 1.5 s while any turn is live and 3 s once the conversation has
  * settled — never off, because a turn can land from Telegram while this
  * window is simply sitting open on the conversation.
+ *
+ * Most polls are incremental: the page asks only for the turns past its
+ * settled watermark (`?after=`), and `merge` keeps the rest as they were —
+ * the same objects, so a settled turn is not rebuilt on every tick. A full
+ * read still happens on the first load, after an invalidation (something
+ * changed that the page knows about), when the incremental read says the
+ * page fell too far behind, and every {@link TRANSCRIPT_FULL_READ_MS}, which
+ * is what catches a settled turn changing under the page.
  */
 export function useChatTranscript(chatId: string | null) {
   const queryKey = keys.chats.detail(chatId ?? "");
   return useQuery({
     queryKey,
     queryFn: async ({ client }): Promise<Transcript> => {
-      const read = await apiFetch<{
-        handed: Exchange[];
-        turns: AssistantTurnRow[];
-        queued: Waiting[];
-        asks: Ask[];
-        more?: boolean;
-        notices: ChatNotice[];
-      }>(
-        `/assistant/chats/${encodeURIComponent(chatId ?? "")}`,
-      );
-      const fresh = read.turns.map(turnFromRow);
+      const path = `/assistant/chats/${encodeURIComponent(chatId ?? "")}`;
       const held = client.getQueryData<Transcript>(queryKey);
+      const watermark = settledWatermark(held?.turns);
+      const lastFull = lastFullRead.get(chatId ?? "") ?? 0;
+      const invalidated = client.getQueryState(queryKey)?.isInvalidated ?? false;
+      let incremental =
+        watermark !== null && !invalidated && Date.now() - lastFull < TRANSCRIPT_FULL_READ_MS;
+      let read = await apiFetch<TranscriptRead>(incremental ? `${path}?after=${watermark}` : path);
+      if (incremental && read.more) {
+        // More turns past the watermark than one read returns: catching up piecewise would leave a
+        // hole between the pieces, so this one is read in full.
+        incremental = false;
+        read = await apiFetch<TranscriptRead>(path);
+      }
+      if (!incremental) lastFullRead.set(chatId ?? "", Date.now());
+      const fresh = read.turns.map(turnFromRow);
       const local = held?.turns ?? [];
       const turns = merge(fresh, local);
       // `more` is about the oldest turn the PAGE holds, and this read only ever asks about the
@@ -607,7 +641,9 @@ export function useChatTranscript(chatId: string | null) {
         handed: read.handed ?? [],
         queued: read.queued ?? [],
         asks: read.asks ?? [],
-        more: reachesFurther ? (held?.more ?? false) : (read.more ?? false),
+        // An incremental read says nothing about what lies above the page, so the held answer stands.
+        more:
+          incremental || reachesFurther ? (held?.more ?? false) : (read.more ?? false),
         notices: read.notices ?? [],
         turns,
       };

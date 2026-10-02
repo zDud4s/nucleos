@@ -1274,6 +1274,19 @@
   gap: var(--space-2);
 }
 
+/*
+  A turn scrolled out of view is not laid out or painted. A long conversation holds a hundred turns
+  a page, each a block of rendered markdown, and the browser was laying out every one of them
+  whenever anything on the page changed. `auto` in the intrinsic size remembers a turn's real height
+  once it has been drawn, so scrolling back over it does not jump; the estimate is only for a turn
+  never seen yet. The last three always render — they are where the page is pinned, and pinning to
+  the bottom measures their real height.
+*/
+.chats-turn:not(:nth-last-child(-n + 3)) {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 12rem;
+}
+
 /**
  * The person's half of the exchange, on the right.
  *

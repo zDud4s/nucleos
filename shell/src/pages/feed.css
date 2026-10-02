@@ -1113,6 +1113,15 @@
   transition: background-color var(--dur-settle) var(--ease);
 }
 
+/*
+  The timeline keeps up to `FEED_TIMELINE_CAP` lines, and a line out of view is neither laid out
+  nor painted. `auto` remembers each line's height once drawn; the estimate is one line of text.
+*/
+.feed-line {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 2.75rem;
+}
+
 .feed-line-routine {
   padding-block: var(--space-2);
 }

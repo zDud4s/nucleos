@@ -3,7 +3,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { ChevronDown, ChevronRight } from "lucide-react";
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { isApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
 import { UI_LOCALE } from "../lib/locale";
@@ -166,9 +166,16 @@ export function Feed() {
   const searching = feedIsSearching(filters);
   const projects = useProjects();
 
-  function applyFilters(patch: Partial<FeedSearch>) {
-    void navigate({ to: "/feed", search: validateFeedSearch({ ...filters, ...patch }) });
-  }
+  // Stable across renders, read through a ref: it is handed to every line of the timeline, and a
+  // new function each render would re-render all of them on every poll (`FeedLine` is memoised).
+  const filtersNow = useRef(filters);
+  filtersNow.current = filters;
+  const applyFilters = useCallback(
+    (patch: Partial<FeedSearch>) => {
+      void navigate({ to: "/feed", search: validateFeedSearch({ ...filtersNow.current, ...patch }) });
+    },
+    [navigate],
+  );
   const backToLive = () =>
     applyFilters({ q: undefined, kind: undefined, since: undefined, until: undefined, limit: undefined });
 
@@ -1121,7 +1128,12 @@ function RoutineFold({
   );
 }
 
-function FeedLine({
+/**
+ * Memoised: the timeline holds up to `FEED_TIMELINE_CAP` lines and polls every few seconds, and a
+ * poll that lands one new line should not re-render the other thousands. A line's entry is the same
+ * object across polls (the query's structural sharing keeps it), and `onFilter` is stable.
+ */
+const FeedLine = memo(function FeedLine({
   entry,
   onFilter,
 }: {
@@ -1158,7 +1170,7 @@ function FeedLine({
       </div>
     </li>
   );
-}
+});
 
 /**
  * Where a line can be acted on, when that place exists.

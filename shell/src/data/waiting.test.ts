@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { countWaitingDecisions } from "./waiting";
+import { countWaitingDecisions, sumWaitingCount } from "./waiting";
 
 describe("countWaitingDecisions", () => {
   it("the queue's arithmetic is the seven decision lists", () => {
@@ -53,5 +53,25 @@ describe("countWaitingDecisions", () => {
         wheel: [], approvals: [{}], teamActions: [], recruits: [], merges: [], exclusions: [], git: [],
       }),
     ).toBe(1);
+  });
+});
+
+describe("sumWaitingCount", () => {
+  const none = {
+    wheel: null,
+    approvals: null,
+    team_actions: null,
+    recruits: null,
+    merges: null,
+    exclusions: null,
+    git: null,
+  };
+
+  it("is no answer when every list failed, as with no list at all", () => {
+    expect(sumWaitingCount(none)).toBeUndefined();
+  });
+
+  it("sums what was counted and treats a failed list as nothing", () => {
+    expect(sumWaitingCount({ ...none, approvals: 2, git: 1, merges: 0 })).toBe(3);
   });
 });
