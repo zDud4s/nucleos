@@ -1,7 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { QueryClientProvider } from "@tanstack/react-query";
-import { RouterProvider } from "@tanstack/react-router";
 import "./fonts.css";
 import "./tokens.css";
 import "./tailwind.css";
@@ -9,10 +8,8 @@ import "./base.css";
 import "./ui.css";
 import "./app.css";
 import { createAppQueryClient } from "./app/queryClient";
-import { lastPlace, rememberPlace } from "./app/last-place";
 import { NotchWindow } from "./app/NotchWindow";
 import { windowKind } from "./app/notch-mode";
-import { createAppRouter } from "./router";
 import { adoptStyleNonce } from "./lib/style-nonce";
 
 /**
@@ -27,9 +24,10 @@ import { adoptStyleNonce } from "./lib/style-nonce";
  * to unlayered ones, so a utility can never quietly outrank a stylesheet that
  * has not been migrated yet.
  *
- * One cache and one router for the life of the window, built out here and
- * handed down. Building either inside a component would throw the app's entire
- * state away on any re-render of the root.
+ * One cache for the life of the window, built out here and handed down (the
+ * router is built once too, in `app/main-window.tsx`). Building either inside
+ * a component would throw the app's entire state away on any re-render of the
+ * root.
  */
 /*
   Before anything renders, because the first modal can open before any effect would have run. What
@@ -57,24 +55,11 @@ if (windowKind(window.location.search) === "notch") {
     </React.StrictMode>,
   );
 } else {
-  /**
-   * Opened where it was left, and remembered as it moves.
-   *
-   * `onResolved` and not `onBeforeLoad`: what is worth remembering is where the window ENDED UP,
-   * and a navigation that is redirected away resolves somewhere else than it started. Subscribed
-   * once, out here beside the router it belongs to, because the router lives for the life of the
-   * window and an effect inside a component would attach and detach with a re-render.
-   */
-  const router = createAppRouter(lastPlace());
-  router.subscribe("onResolved", ({ toLocation }) => {
-    rememberPlace(toLocation.pathname);
+  /*
+    Loaded rather than imported: the router pulls in every page, and the notch above has no use for
+    any of them. `app/main-window.tsx` says the rest.
+  */
+  void import("./app/main-window").then(({ mountMainWindow }) => {
+    mountMainWindow(root, queryClient);
   });
-
-  root.render(
-    <React.StrictMode>
-      <QueryClientProvider client={queryClient}>
-        <RouterProvider router={router} />
-      </QueryClientProvider>
-    </React.StrictMode>,
-  );
 }

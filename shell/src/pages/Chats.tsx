@@ -1,5 +1,6 @@
 import {
   createContext,
+  memo,
   useCallback,
   useContext,
   useEffect,
@@ -1221,6 +1222,8 @@ function ChatDetail({
    * alone would fire once and then quietly stop working.
    */
   const [reuse, setReuse] = useState<{ text: string; at: number } | null>(null);
+  // Stable, because it is handed to every turn and `TurnBlock` is memoised.
+  const reuseQuestion = useCallback((text: string) => setReuse({ text, at: Date.now() }), []);
 
   // Once per chat opened, after the transcript has loaded — not on every poll
   // tick that follows. `markedSeen` is fresh per mount, and `ChatDetail` is
@@ -1288,7 +1291,7 @@ function ChatDetail({
             find={find}
             follows={follows}
             keepUp={keepUp}
-            onReuse={(text) => setReuse({ text, at: Date.now() })}
+            onReuse={reuseQuestion}
           />
         )}
         {/* Below the transcript and above the box, which is where these words are in time: said
@@ -4185,7 +4188,13 @@ function DepartmentSaid({ notice }: { notice: ChatNotice }) {
   );
 }
 
-function TurnBlock({
+/**
+ * Memoised: the transcript polls every 1.5–3 s and holds up to a hundred turns a page, each one
+ * parsing its answer's markdown when it renders. A settled turn is the same object from one poll to
+ * the next (the incremental read leaves it alone, and structural sharing keeps it on a full one), so
+ * only the turns that changed draw again.
+ */
+const TurnBlock = memo(function TurnBlock({
   turn,
   previous,
   clearedAfter,
@@ -4279,7 +4288,7 @@ function TurnBlock({
       </div>
     </li>
   );
-}
+});
 
 /**
  * A model's answer, drawn as the shapes it was written in.

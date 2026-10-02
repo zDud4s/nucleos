@@ -3,11 +3,6 @@ import { apiFetch } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
 import type { Proposal } from "./system";
-import { useProposals } from "./system";
-import { useWheelRequests } from "./browser";
-import { useContactMerges } from "./contacts";
-import { useExclusionRequests } from "./fleet";
-import { useRecruitProposals, useTeamActionProposals } from "./teams";
 
 /**
  * The single decision queue, as hooks — one per list that actually exists.
@@ -196,29 +191,46 @@ export function countWaitingDecisions(lists: {
   );
 }
 
+/** `GET /waiting/count` — each decision list's length as the daemon counted it, `null` where it failed. */
+export interface WaitingCountRead {
+  wheel: number | null;
+  approvals: number | null;
+  team_actions: number | null;
+  recruits: number | null;
+  merges: number | null;
+  exclusions: number | null;
+  git: number | null;
+}
+
 /**
- * Reads the seven decision lists for the one shared "waiting on you" arithmetic.
+ * The daemon's per-list counts summed the way `countWaitingDecisions` sums the lists.
  *
- * The partial count remains more useful than a blank when one route fails;
- * `countWaitingDecisions` is the sole owner of the bare phrase's number.
+ * A failed list is `null` and counts as nothing, as an `undefined` list does there; every list
+ * failing is `undefined`, the same "no answer yet" that function returns.
+ */
+export function sumWaitingCount(read: WaitingCountRead): number | undefined {
+  const values = Object.values(read);
+  if (values.every((value) => value === null)) return undefined;
+  return values.reduce<number>((sum, value) => sum + (value ?? 0), 0);
+}
+
+/**
+ * The one shared "waiting on you" number, as a single read.
+ *
+ * It used to mount the seven decision lists and take their lengths — seven polls from every
+ * page, each shipping a whole list for a number. `GET /waiting/count` counts the same lists the
+ * same way on the daemon (`countWaitingDecisions` stays the owner of the arithmetic for the
+ * Waiting page, which draws the lists anyway). A partial count is still more useful than a
+ * blank when one list fails.
  */
 export function useWaitingCount(): number | undefined {
-  const wheel = useWheelRequests();
-  const approvals = useProposals();
-  const teamActions = useTeamActionProposals();
-  const recruits = useRecruitProposals();
-  const merges = useContactMerges();
-  const exclusions = useExclusionRequests();
-  const git = useVcsRequests();
-  return countWaitingDecisions({
-    wheel: wheel.data,
-    approvals: approvals.data,
-    teamActions: teamActions.data,
-    recruits: recruits.data,
-    merges: merges.data,
-    exclusions: exclusions.data,
-    git: git.data,
+  const read = useQuery({
+    queryKey: keys.waiting.count,
+    queryFn: () => apiFetch<WaitingCountRead>("/waiting/count"),
+    refetchInterval: POLL.fast,
+    placeholderData: keepPreviousData,
   });
+  return read.data === undefined ? undefined : sumWaitingCount(read.data);
 }
 
 /** §8 — what the night put down without doing. A record to read, not a queue to work. */

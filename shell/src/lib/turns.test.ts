@@ -3,6 +3,7 @@ import {
   anyTurnLive,
   marksBetween,
   merge,
+  settledWatermark,
   turnFromRow,
   unreadTotal,
   type AssistantTurnRow,
@@ -304,5 +305,27 @@ describe("unreadTotal", () => {
 
   it("is zero for an empty list", () => {
     expect(unreadTotal([])).toBe(0);
+  });
+});
+
+describe("settledWatermark", () => {
+  it("is null when nothing is held, so the first read is a full one", () => {
+    expect(settledWatermark(undefined)).toBeNull();
+    expect(settledWatermark([])).toBeNull();
+  });
+
+  it("is the last turn when every turn has settled", () => {
+    expect(settledWatermark([turn({ id: 4 }), turn({ id: 7 })])).toBe(7);
+  });
+
+  it("stops below the first live turn, so the live one is read again", () => {
+    expect(
+      settledWatermark([
+        turn({ id: 4 }),
+        turn({ id: 7, status: "running" }),
+        turn({ id: 9, status: "completed" }),
+      ]),
+    ).toBe(4);
+    expect(settledWatermark([turn({ id: 4, status: "pending" })])).toBe(3);
   });
 });

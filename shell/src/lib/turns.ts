@@ -337,6 +337,20 @@ export function anyTurnLive(turns: Turn[] | undefined): boolean {
 }
 
 /**
+ * The highest turn id below which the page holds nothing that can still change.
+ *
+ * Everything up to the first live turn is settled, so the transcript's poll asks the daemon only
+ * for what lies past it — the live turn included, since it is the one still being written.
+ * `null` when the page holds nothing yet, which is the read that must be made in full.
+ */
+export function settledWatermark(turns: Turn[] | undefined): number | null {
+  if (turns === undefined || turns.length === 0) return null;
+  const live = turns.findIndex((turn) => turnIsLive(turn.status));
+  if (live === -1) return turns[turns.length - 1].id;
+  return live === 0 ? turns[0].id - 1 : turns[live - 1].id;
+}
+
+/**
  * The daemon's transcript, plus any turn the page knows about that the
  * daemon's read has not caught up with yet.
  *

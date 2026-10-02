@@ -44,7 +44,7 @@ describe("Home", () => {
     // Summed, not counted: one project holding seven decisions is not the same
     // news as seven projects holding one.
     expect(within(await card("Shadow decisions pending")).getByText("7")).toBeDefined();
-    expect(within(await card("Waiting on you")).getByText("2")).toBeDefined();
+    expect(await within(await card("Waiting on you")).findByText("2")).toBeDefined();
     expect((await card("Waiting on you")).textContent).toContain(
       "decisions held for you — not records, and not the calendar",
     );
@@ -59,13 +59,16 @@ describe("Home", () => {
 
   it("the headline counts the whole waiting queue", async () => {
     const answer = daemonFetch(daemonState({ proposals: [proposal({ id: 1 })] }));
+    // The badge reads the daemon's own count; one approval and one team action are two lists.
     daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
-      path === "/proposals/team-actions" ? [proposal({ id: 2, kind: "team-action" })] : answer(path, init),
+      path === "/waiting/count"
+        ? { ...(await answer(path, init) as object), team_actions: 1 }
+        : answer(path, init),
     );
 
     await renderWithRouter(<Home />);
 
-    expect(within(await card("Waiting on you")).getByText("2")).toBeDefined();
+    expect(await within(await card("Waiting on you")).findByText("2")).toBeDefined();
     expect((await screen.findByText(/2 waiting on you/)).textContent).toMatch(/; 2 waiting on you$/);
   });
 

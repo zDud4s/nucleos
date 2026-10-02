@@ -662,6 +662,8 @@ pub fn build_router(state: AppState) -> Router {
         // the two cannot shadow each other whatever a turn id looks like.
         .route("/assistant/{turn_id}/live", get(get_assistant_live))
         .route("/proposals", get(get_proposals))
+        // The sidebar's "waiting on you" number, read in one request instead of seven.
+        .route("/waiting/count", get(get_waiting_count))
         // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
         // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
         // that `/runs/awaiting-approval` raises does not arise here.
@@ -10545,6 +10547,14 @@ struct TranscriptQuery {
     /// only ever appended, so an offset from the end shifts under a conversation that answers
     /// while somebody is reading it and a page boundary would repeat or skip a turn.
     before: Option<i64>,
+    /// Read only the turns AFTER this one — the poll's incremental read.
+    ///
+    /// A page that already holds every settled turn up to this id asks only for what lies past it,
+    /// rather than having the newest hundred turns, answers and thoughts included, re-sent every
+    /// second and a half. `more` keeps its meaning: there were more rows in the window than the
+    /// limit returned, which on this read tells the page its watermark is too far behind to catch
+    /// up incrementally and a full read is the answer.
+    after: Option<i64>,
 }
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
@@ -10977,6 +10987,8 @@ async fn get_assistant_chat(
     // hold, so one query serves both the recent end and a page above it. Two queries differing by
     // a single clause is how the two come to disagree about ordering.
     let before = query.before.unwrap_or(i64::MAX);
+    // Absent reads as 0, below every id, for the same reason `before` reads as `i64::MAX`.
+    let after = query.after.unwrap_or(0);
     // One more than asked for, and it is never returned. Whether there is anything above this page
     // is a question about the row after the last one, and asking for it here answers it for the
     // price of a row rather than with a second COUNT over the same index.
@@ -10996,12 +11008,13 @@ async fn get_assistant_chat(
            FROM runs r
            LEFT JOIN chat_relays rel ON rel.id = r.from_relay_id
            LEFT JOIN chats src ON src.chat_id = rel.from_chat_id
-          WHERE r.chat_id = ? AND r.mode = 'assistant' AND r.id < ?
+          WHERE r.chat_id = ? AND r.mode = 'assistant' AND r.id < ? AND r.id > ?
           ORDER BY r.id DESC
           LIMIT ?",
     )
     .bind(&chat_id)
     .bind(before)
+    .bind(after)
     .bind(ASSISTANT_TRANSCRIPT_LIMIT + 1)
     .fetch_all(&state.pool)
     .await
@@ -13452,6 +13465,64 @@ async fn get_proposals(
 /// proposal so the morning knows what was set aside. `list_pending` deliberately does not carry
 /// those (approving one would resume nothing), which left the record with no door at all: measured
 /// on 2026-08-08, two items skipped and the only way to read either was to open the database.
+/// How many of each decision list are waiting on a person — `GET /waiting/count`.
+///
+/// One field per list the shell's `countWaitingDecisions` sums, counted the way that function
+/// counts it. A list that fails to read is `null` rather than a 500, because the shell already
+/// treats a partial count as more useful than a blank one.
+#[derive(Debug, Default, serde::Serialize)]
+struct WaitingCount {
+    wheel: Option<usize>,
+    approvals: Option<usize>,
+    team_actions: Option<usize>,
+    recruits: Option<usize>,
+    merges: Option<usize>,
+    exclusions: Option<usize>,
+    git: Option<usize>,
+}
+
+/// The vcs statuses that need a person — the shell's `VCS_WANTS_A_PERSON`.
+const VCS_WANTS_A_PERSON: [&str; 2] = ["escalated", "blocked"];
+
+/// The badge every page of the shell draws, as one read.
+///
+/// It used to be seven polls from every window, each shipping a whole list only for its length to
+/// be taken. The lists themselves stay where they were for the pages that draw them; this is only
+/// the number.
+async fn get_waiting_count(State(state): State<AppState>) -> Json<WaitingCount> {
+    let pool = &state.pool;
+    let (wheel, approvals, team_actions, recruits, merges, exclusions, git) = tokio::join!(
+        crate::browser::open_sessions(pool),
+        crate::proposals::list_pending(pool),
+        crate::proposals::list_pending_team_actions(pool),
+        crate::proposals::list_pending_recruits(pool, None),
+        crate::contacts::pending_merges(pool),
+        crate::exclusion::pending_requests(pool),
+        vcs::list(pool, None),
+    );
+    Json(WaitingCount {
+        // The shell's `isWheelRequest`: an agent asked for the wheel and a proposal stands behind it.
+        wheel: wheel.ok().map(|sessions| {
+            sessions
+                .iter()
+                .filter(|session| {
+                    session.mode == "wheel-requested" && session.proposal_id.is_some()
+                })
+                .count()
+        }),
+        approvals: approvals.ok().map(|rows| rows.len()),
+        team_actions: team_actions.ok().map(|rows| rows.len()),
+        recruits: recruits.ok().map(|rows| rows.len()),
+        merges: merges.ok().map(|rows| rows.len()),
+        exclusions: exclusions.ok().map(|rows| rows.len()),
+        git: git.ok().map(|rows| {
+            rows.iter()
+                .filter(|row| VCS_WANTS_A_PERSON.contains(&row.status.as_str()))
+                .count()
+        }),
+    })
+}
+
 async fn get_skipped_items(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
@@ -26309,6 +26380,51 @@ mod tests {
         );
     }
 
+    /// The poll's read: only what lies past the turns the page already holds settled.
+    ///
+    /// Every turn at or below the watermark stays out of the answer. `more` on this read is the
+    /// page's cue that it fell too far behind to catch up incrementally.
+    #[tokio::test]
+    async fn the_poll_asks_only_for_the_turns_after_its_watermark() {
+        let state = test_state().await;
+        let chat_id = seed_chat(&state, "the date parser").await;
+        let mut ids = Vec::new();
+        for turn in 0..4 {
+            ids.push(seed_turn(&state, &chat_id, &format!("q{turn}"), "a", None).await);
+        }
+
+        let tail = get_json(
+            &state,
+            &format!("/assistant/chats/{chat_id}?after={}", ids[1]),
+        )
+        .await;
+        let turns = tail["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 2, "two turns lay past the watermark");
+        assert_eq!(turns[0]["asked"], "q2");
+        assert_eq!(turns[1]["asked"], "q3");
+        assert_eq!(tail["more"], false);
+
+        let caught_up = get_json(
+            &state,
+            &format!("/assistant/chats/{chat_id}?after={}", ids[3]),
+        )
+        .await;
+        assert_eq!(caught_up["turns"].as_array().unwrap().len(), 0);
+
+        for turn in 0..(ASSISTANT_TRANSCRIPT_LIMIT + 1) {
+            seed_turn(&state, &chat_id, &format!("late{turn}"), "a", None).await;
+        }
+        let behind = get_json(
+            &state,
+            &format!("/assistant/chats/{chat_id}?after={}", ids[3]),
+        )
+        .await;
+        assert_eq!(
+            behind["more"], true,
+            "a page this far behind must be told to read in full"
+        );
+    }
+
     /* --------------------------------------- what a tool answered -- */
 
     /// The transcript names the tools and never carries what they said.
@@ -33417,6 +33533,68 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The badge's one read counts what the seven lists would have, and only the pending.
+    #[tokio::test]
+    async fn the_waiting_count_counts_each_list_in_one_read() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = build_router(state);
+        let read = |app: Router| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/waiting/count")
+                        .header("Authorization", "Bearer test-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+
+        let empty = read(app.clone()).await;
+        for list in [
+            "wheel",
+            "approvals",
+            "team_actions",
+            "recruits",
+            "merges",
+            "exclusions",
+            "git",
+        ] {
+            assert_eq!(empty[list], 0, "{list} on an empty database");
+        }
+
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, created_at)
+             VALUES (10, 'r', 'awaiting_approval', 'worktree', '2026-07-20T12:00:00Z'),
+                    (11, 'r', 'awaiting_approval', 'worktree', '2026-07-20T12:01:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        proposals::create_action_approval(&pool, 10, Some("s"), Some("p"), "Bash", "x", None)
+            .await
+            .unwrap();
+        let approved =
+            proposals::create_action_approval(&pool, 11, Some("s"), Some("p"), "Edit", "y", None)
+                .await
+                .unwrap();
+        assert!(
+            proposals::transition(&pool, approved, "approved", "x")
+                .await
+                .unwrap()
+        );
+
+        let counted = read(app).await;
+        assert_eq!(counted["approvals"], 1, "only the pending approval counts");
     }
 
     #[tokio::test]
