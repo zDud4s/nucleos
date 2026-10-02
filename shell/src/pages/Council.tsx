@@ -20,6 +20,7 @@ import {
   type StepView,
 } from "../data/council";
 import { CouncilRich } from "./CouncilRich";
+import { CouncilRounds } from "./CouncilRounds";
 import {
   Button,
   ConfirmButton,
@@ -707,6 +708,9 @@ function CouncilDetail({ id }: { id: string }) {
       </Panel>
 
       <SeatGrid seats={detail.seats} />
+      {/* How each seat got where the grid shows it: round by round, after the
+          grid and before the leaderboard that the rounds produced. */}
+      <CouncilRounds view={detail} />
       <Leaderboard leaderboard={detail.leaderboard} seats={detail.seats} />
       <Synthesis synthesis={detail.synthesis} error={detail.error} />
     </>

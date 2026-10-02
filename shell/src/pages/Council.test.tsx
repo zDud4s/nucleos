@@ -26,6 +26,7 @@ import type {
   CouncilConfig,
   CouncilSummary,
   CouncilView,
+  Critique,
   SeatView,
   StepView,
 } from "../data/council";
@@ -1089,5 +1090,259 @@ describe("Council - the list row and the config", () => {
     await waitFor(() =>
       expect(daemon.apiFetch.mock.calls.map((call) => call[0])).toContain("/council/config"),
     );
+  });
+});
+
+/* ---------------------------------------------- the round-by-round timeline -- */
+
+/**
+ * Three named seats through two critique rounds. `anon_map` is label -> seat, so
+ * "B" is beta and "C" is gamma. Every assertion below is scoped to the tab panel
+ * or to a named group, because the seat grid above the timeline repeats the
+ * answers and the latest step and would otherwise satisfy a query by accident.
+ *
+ * UI contract (what `CouncilRounds.tsx` must render):
+ *  - a level-2 heading "Rounds" and a `tablist` named "Rounds" with one `tab` per round 0..rounds_run:
+ *    "Answers" (round 0), "Round 1", "Round 2"; "Answers" is selected on first render. Tabs are Radix
+ *    (`ui/Tabs`), so they are selected by `mouseDown`, and only the selected `tabpanel` is mounted.
+ *  - round 0 panel: each seat's answer text, under the seat's `seatName`.
+ *  - round n panel, per seat that voted: a `list` named "Ballot of <seatName>" whose `listitem`s are the
+ *    DE-ANONYMISED ranking, best first, as seat names -- never the bare labels.
+ *  - per reviewing seat a `group` named "Critiques by <seatName>"; inside, one `group` per reviewed
+ *    answer named "On <seatName>'s answer"; its text carries each point's stance, claim and why.
+ *  - per seat with a `revise` step in that round a `group` named "Revision by <seatName>": the text
+ *    "changed its answer" or "kept its answer", the step's `why`, and -- only when it changed -- a `list`
+ *    named "Diff" of `lineDiff(previous answer, new answer)` where each `listitem` carries
+ *    `data-kind` = "context" | "removed" | "added" and its textContent contains the line's text.
+ *  - a `table` named "Rank evolution", only when `leaderboard_by_round.length >= 2`, outside the tab
+ *    panels: one `columnheader` per critique round ("Round 1", ...) after an empty first one, one row per
+ *    seat with its `seatName` in the `rowheader` and one `cell` per round holding the seat's 1-based
+ *    position in that round's leaderboard ("1" is best), or "-" (en dash) when the seat is not on it.
+ *  - when `stopped_early`, a note reading "Stopped early at round <rounds_run>"; absent otherwise.
+ */
+function seatNamed(name: string, idx: number, steps: StepView[]): SeatView {
+  return seatView({
+    seat_idx: idx,
+    ref: `model-${idx}`,
+    agent_id: `ag-${idx}`,
+    agent_name: name,
+    steps,
+  });
+}
+
+function critiqueStep(round: number, ranking: string[], reviews: Critique["reviews"] = []): StepView {
+  return stepView({
+    round,
+    phase: "critique",
+    run_id: 10 + round,
+    answer: null,
+    critique: { reviews, ranking },
+  });
+}
+
+function roundsView(overrides: Partial<CouncilView> = {}): CouncilView {
+  return councilView({
+    status: "done",
+    rounds: 2,
+    rounds_run: 2,
+    current_round: 2,
+    current_phase: "synthesis",
+    anon_map: { A: 0, B: 1, C: 2 },
+    seats: [
+      seatNamed("alpha", 0, [
+        stepView({ answer: "line one\nline two" }),
+        critiqueStep(1, ["C", "B"], [
+          {
+            label: "B",
+            points: [{ claim: "beta overreaches", stance: "disagree", why: "no evidence given" }],
+          },
+          {
+            label: "C",
+            points: [{ claim: "gamma is sound", stance: "agree", why: "the numbers add up" }],
+          },
+        ]),
+        stepView({
+          round: 1,
+          phase: "revise",
+          run_id: 20,
+          answer: "line one\nline three",
+          changed: true,
+          why: "folded in the evidence",
+        }),
+        critiqueStep(2, ["B", "C"]),
+      ]),
+      seatNamed("beta", 1, [
+        stepView({ answer: "beta says ship" }),
+        critiqueStep(1, ["A", "C"]),
+        stepView({
+          round: 1,
+          phase: "revise",
+          run_id: 21,
+          answer: null,
+          changed: false,
+          why: "my answer stands",
+        }),
+        critiqueStep(2, ["A", "C"]),
+      ]),
+      seatNamed("gamma", 2, [
+        stepView({ answer: "gamma says wait" }),
+        critiqueStep(1, ["A", "B"]),
+        critiqueStep(2, ["A", "B"]),
+      ]),
+    ],
+    ...overrides,
+  });
+}
+
+async function openRound(name: string) {
+  // Radix selects a tab on pointer-down, not on click (see `Bench.test.tsx`).
+  fireEvent.mouseDown(await screen.findByRole("tab", { name }));
+  return screen.findByRole("tabpanel");
+}
+
+describe("Council - round by round", () => {
+  it("offers one tab per round, with the seats' answers in round 0", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+
+    await renderCouncil("/council/c-1");
+
+    expect(await screen.findByRole("heading", { level: 2, name: "Rounds" })).toBeDefined();
+    const tabs = within(await screen.findByRole("tablist", { name: "Rounds" })).getAllByRole("tab");
+    expect(tabs.map((tab) => tab.textContent)).toEqual(["Answers", "Round 1", "Round 2"]);
+    expect(tabs[0].getAttribute("aria-selected")).toBe("true");
+
+    const panel = await screen.findByRole("tabpanel");
+    expect(panel.textContent).toContain("alpha");
+    expect(panel.textContent).toContain("line one");
+    expect(panel.textContent).toContain("beta says ship");
+    expect(panel.textContent).toContain("gamma says wait");
+  });
+
+  it("de-anonymises a ballot into seat names, best first", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await openRound("Round 1");
+
+    // alpha ranked ["C", "B"]: gamma first, beta second.
+    const ballot = within(panel).getByRole("list", { name: "Ballot of alpha" });
+    const items = within(ballot).getAllByRole("listitem");
+    expect(items).toHaveLength(2);
+    expect(items[0].textContent).toContain("gamma");
+    expect(items[1].textContent).toContain("beta");
+    // The labels were the blinding; they never reach the reader.
+    expect(within(ballot).queryByText(/^[ABC]$/)).toBeNull();
+  });
+
+  it("lists the critiques a seat gave, grouped by the answer reviewed", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await openRound("Round 1");
+
+    const given = within(panel).getByRole("group", { name: "Critiques by alpha" });
+    const onBeta = within(given).getByRole("group", { name: "On beta's answer" });
+    expect(onBeta.textContent).toContain("disagree");
+    expect(onBeta.textContent).toContain("beta overreaches");
+    expect(onBeta.textContent).toContain("no evidence given");
+    const onGamma = within(given).getByRole("group", { name: "On gamma's answer" });
+    expect(onGamma.textContent).toContain("agree");
+    expect(onGamma.textContent).toContain("gamma is sound");
+    // Reviews of beta do not leak into the group about gamma.
+    expect(onGamma.textContent).not.toContain("beta overreaches");
+  });
+
+  it("shows a revision's changed/why and the line diff against the previous answer", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+
+    await renderCouncil("/council/c-1");
+    const panel = await openRound("Round 1");
+
+    const revision = within(panel).getByRole("group", { name: "Revision by alpha" });
+    expect(revision.textContent).toContain("changed its answer");
+    expect(revision.textContent).toContain("folded in the evidence");
+    const diff = within(revision).getByRole("list", { name: "Diff" });
+    const lines = within(diff).getAllByRole("listitem");
+    expect(lines.map((item) => item.getAttribute("data-kind"))).toEqual([
+      "context",
+      "removed",
+      "added",
+    ]);
+    expect(lines[0].textContent).toContain("line one");
+    expect(lines[1].textContent).toContain("line two");
+    expect(lines[2].textContent).toContain("line three");
+
+    // A seat that kept its answer says so and draws no diff.
+    const kept = within(panel).getByRole("group", { name: "Revision by beta" });
+    expect(kept.textContent).toContain("kept its answer");
+    expect(kept.textContent).toContain("my answer stands");
+    expect(within(kept).queryByRole("list", { name: "Diff" })).toBeNull();
+  });
+
+  it("draws the rank evolution only once there are two votes", async () => {
+    const one = roundsView({
+      rounds: 1,
+      rounds_run: 1,
+      leaderboard_by_round: [
+        [
+          { seat_idx: 0, score: 2, n: 3 },
+          { seat_idx: 1, score: 1, n: 3 },
+        ],
+      ],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": one }));
+
+    const first = await renderCouncil("/council/c-1");
+    await screen.findByRole("tablist", { name: "Rounds" });
+    expect(screen.queryByRole("table", { name: "Rank evolution" })).toBeNull();
+    first.unmount();
+
+    const two = roundsView({
+      leaderboard_by_round: [
+        [
+          { seat_idx: 0, score: 2, n: 3 },
+          { seat_idx: 1, score: 1, n: 3 },
+        ],
+        [
+          { seat_idx: 1, score: 2, n: 3 },
+          { seat_idx: 0, score: 1, n: 3 },
+          { seat_idx: 2, score: 0, n: 3 },
+        ],
+      ],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": two }));
+
+    await renderCouncil("/council/c-1");
+    const table = await screen.findByRole("table", { name: "Rank evolution" });
+    expect(within(table).getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
+      "",
+      "Round 1",
+      "Round 2",
+    ]);
+    const cellsOf = (name: string) => {
+      const row = within(table).getByRole("rowheader", { name }).closest("tr");
+      if (row === null) throw new Error(`no row for ${name}`);
+      return within(row as HTMLElement)
+        .getAllByRole("cell")
+        .map((cell) => cell.textContent);
+    };
+    expect(cellsOf("alpha")).toEqual(["1", "2"]);
+    expect(cellsOf("beta")).toEqual(["2", "1"]);
+    // gamma was not on the first leaderboard at all.
+    expect(cellsOf("gamma")).toEqual(["–", "3"]);
+  });
+
+  it("announces that it stopped early, at the round it stopped", async () => {
+    const stopped = roundsView({ rounds: 3, rounds_run: 1, stopped_early: true });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": stopped }));
+
+    const first = await renderCouncil("/council/c-1");
+    expect(await screen.findByText(/Stopped early at round 1/)).toBeDefined();
+    first.unmount();
+
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
+    await renderCouncil("/council/c-1");
+    await screen.findByRole("tablist", { name: "Rounds" });
+    expect(screen.queryByText(/Stopped early at round/)).toBeNull();
   });
 });

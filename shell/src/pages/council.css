@@ -527,3 +527,164 @@
   line-height: var(--leading-normal);
   overflow-wrap: anywhere;
 }
+
+/* ================================================================ rounds == */
+
+/* The round the council stopped at. Its own line, apart from the facts row in
+   the header: the header says THAT it stopped, this says WHERE. */
+.council-stopped {
+  margin-bottom: var(--space-2);
+}
+
+.council-round {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding-top: var(--space-2);
+}
+
+.council-round-seat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.council-round-seat:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.council-round-seat-name {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+/* A ballot is read top-down as a ranking, so the browser's own numbering is
+   the position — no hand-written "1." to drift from the order. */
+.council-ballot {
+  margin: 0;
+  padding-left: var(--space-3);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+}
+
+.council-critiques {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.council-critique-on {
+  margin: 0;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-muted);
+}
+
+.council-points {
+  margin: 0;
+  padding-left: var(--space-3);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+}
+
+.council-point-stance {
+  font-weight: var(--weight-medium);
+}
+
+.council-point-why {
+  color: var(--text-muted);
+}
+
+.council-revision {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.council-revision-verdict {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* A revision against the text it replaced. The `+`/`-` sign and the
+   `<ins>`/`<del>` elements carry the meaning; the tint only repeats it, the
+   same tones `ui/Diff.tsx` paints a git diff with. */
+.council-diff {
+  margin: 0;
+  padding: var(--space-1) 0;
+  list-style: none;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  overflow-x: auto;
+}
+
+.council-diff-line {
+  padding: 0 var(--space-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+}
+
+.council-diff-line ins,
+.council-diff-line del {
+  text-decoration: none;
+}
+
+.council-diff-line[data-kind="added"] {
+  background: var(--tone-active-bg);
+  color: var(--text);
+}
+
+.council-diff-line[data-kind="removed"] {
+  background: var(--tone-danger-bg);
+  color: var(--text);
+}
+
+.council-diff-sign {
+  display: inline-block;
+  width: 1.5ch;
+  color: var(--text-faint);
+}
+
+/* Seat by round, each cell a Borda position. Numbers line up in their column
+   so a seat's climb or fall is read by eye down the row. */
+.council-evolution {
+  margin-top: var(--space-3);
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.council-evolution-caption {
+  text-align: left;
+  padding-bottom: var(--space-1);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-muted);
+}
+
+.council-evolution th,
+.council-evolution td {
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  font-weight: normal;
+}
+
+.council-evolution td {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
