@@ -944,6 +944,7 @@ pub async fn start_with(
         timeout: std::time::Duration::from_secs(configured.timeout_seconds),
         rounds,
         roles,
+        launched: std::sync::atomic::AtomicUsize::new(0),
     };
     tokio::spawn(async move {
         let _guard = guard;
@@ -997,11 +998,15 @@ struct Driver {
     /// Critique rounds asked for, as the row records it. Read from the driver rather than from the
     /// row at each phase boundary, because it cannot change under a running council: the file may be
     /// edited mid-flight and the deliberation that is already paid for has to finish the shape it
-    /// started. One critique round runs whatever the count, for now; the revise rounds that make
-    /// the count matter come with the next packet of council-deliberacao.
+    /// started. Between two critique rounds every seat revises; the early-stop rule may end the
+    /// council before the last one.
     rounds: i64,
     /// The role each seat plays, by `seat_idx`; `None` for a plain seat.
     roles: Vec<Option<formats::Role>>,
+    /// Runner launches made so far, held against `tally::call_ceiling`. The loop below is shaped so
+    /// it never reaches the ceiling; this is the wall that keeps a future change to that loop from
+    /// turning a bug into an unbounded bill.
+    launched: std::sync::atomic::AtomicUsize,
 }
 
 /// Where a seat's state is recorded.
@@ -1043,18 +1048,146 @@ impl Driver {
             tracing::warn!(council = %self.id, %error, "could not record the anonymisation map");
         }
 
-        let critiques = self.critique_phase(1, &answers, &anon).await;
-        let rounds_run = i64::from(critiques.is_some());
-        if let Err(error) = store::set_progress(&self.state.pool, &self.id, rounds_run, false).await
-        {
-            tracing::warn!(council = %self.id, %error, "could not record the council's progress");
-        }
-        if self.was_settled().await {
-            return;
+        // The answer each seat currently stands behind. Starts as its round-0 answer and is replaced
+        // only by a revision that claimed a change and said why; the round-0 step itself is never
+        // rewritten, so what a seat first said stays readable beside what it ended up saying.
+        let mut current = answers;
+        let mut changes: Vec<(String, String)> = Vec::new();
+        let mut rounds_run = 0;
+        let mut stopped_early = false;
+        let mut last_critiques = BTreeMap::new();
+        // The previous round's Borda order and contested set, for the early-stop rule.
+        let mut previous: Option<(Vec<usize>, std::collections::BTreeSet<usize>)> = None;
+
+        for round in 1..=self.rounds {
+            let Some(critiques) = self.critique_phase(round, &current, &anon).await else {
+                break;
+            };
+            rounds_run = round;
+            last_critiques = critiques;
+
+            // One ballot is not a vote: below two readable critiques there is nothing to revise
+            // against and nothing to compare the next round with, so the chairman takes it from here.
+            let mut stop = last_critiques.len() < 2;
+            if !stop {
+                let ballots = ballots_of(&last_critiques);
+                let order: Vec<usize> = tally::borda(&ballots, &anon.anon_map)
+                    .into_iter()
+                    .map(|row| row.seat_idx)
+                    .collect();
+                let disputed = tally::contested(&disputes_of(&last_critiques), &anon.anon_map);
+                // "Early" means before the last round asked for: a council that ran every round it
+                // was given did not stop early, whatever the last two rounds looked like.
+                if round < self.rounds
+                    && let Some((previous_order, previous_disputed)) = &previous
+                    && tally::should_stop_early(
+                        previous_order,
+                        previous_disputed,
+                        &order,
+                        &disputed,
+                    )
+                {
+                    stopped_early = true;
+                    stop = true;
+                }
+                previous = Some((order, disputed));
+            }
+
+            if let Err(error) =
+                store::set_progress(&self.state.pool, &self.id, rounds_run, stopped_early).await
+            {
+                tracing::warn!(council = %self.id, %error, "could not record the council's progress");
+            }
+            if self.was_settled().await {
+                return;
+            }
+            if stop || round == self.rounds {
+                break;
+            }
+
+            let changed = self
+                .revise_phase(round, &mut current, &anon, &last_critiques)
+                .await;
+            changes.extend(changed);
+            if self.was_settled().await {
+                return;
+            }
         }
 
-        self.chairman_phase(rounds_run, &answers, &anon, &critiques.unwrap_or_default())
+        self.chairman_phase(rounds_run, &current, &anon, &last_critiques, changes)
             .await;
+    }
+
+    /// A revise round — every seat that answered is shown its own current answer and the points
+    /// its anonymous reviewers made about it in critique round `round`, and decides whether to
+    /// change it.
+    ///
+    /// Recorded at the same `round` as the critique it answers. Never shown: a peer's answer, a
+    /// model, a label or any standing — a seat that knew where it placed would revise towards the
+    /// winner rather than towards the argument. No tools, for the reason the critique has none.
+    ///
+    /// A changed revision replaces the seat's entry in `current`; an unchanged one, an unreadable
+    /// one and a failed run all leave it as it was. Returns `(seat name, why)` for each change.
+    async fn revise_phase(
+        &self,
+        round: i64,
+        current: &mut BTreeMap<usize, String>,
+        anon: &Anonymized,
+        critiques: &BTreeMap<usize, formats::Critique>,
+    ) -> Vec<(String, String)> {
+        self.move_to(round, store::PHASE_REVISE).await;
+
+        let revising = current.iter().filter_map(|(seat_idx, own)| {
+            let seat = self.members.get(*seat_idx)?;
+            let received = points_received(*seat_idx, critiques, &anon.anon_map);
+            let prompt =
+                prompts::revise_prompt(&self.question, self.role_of(*seat_idx), own, &received);
+            Some(async move {
+                let slot = Slot::Step {
+                    round,
+                    seat_idx: *seat_idx,
+                    phase: store::PHASE_REVISE,
+                    shown: Vec::new(),
+                };
+                let outcome = self.run_seat(slot, seat, prompt, false).await;
+                (*seat_idx, outcome)
+            })
+        });
+        let outcomes = crate::join::all(revising).await;
+
+        // Parsed again rather than handed back by `record`, as in the critique phase: the parse is
+        // pure, so the answer that stands and the payload the step stores cannot differ.
+        let mut changes = Vec::new();
+        for (seat_idx, outcome) in outcomes {
+            if outcome.status != SEAT_OK {
+                continue;
+            }
+            if let Ok(formats::Revision {
+                changed: true,
+                answer: Some(answer),
+                why,
+            }) = formats::parse_revision(&outcome.answer)
+            {
+                current.insert(seat_idx, answer);
+                changes.push((self.seat_name(seat_idx), why.unwrap_or_default()));
+            }
+        }
+
+        let _ = crate::feed::append(
+            &self.state.pool,
+            None,
+            "council_stage",
+            &format!(
+                "council revision after round {round}: {} of {} seats changed their answer",
+                changes.len(),
+                current.len()
+            ),
+            None,
+            Some(&crate::feed::Subject::Council(self.id.clone())),
+        )
+        .await;
+
+        changes
     }
 
     /// Moves the council's position, warning rather than failing: the position is what a reader is
@@ -1247,21 +1380,21 @@ impl Driver {
     /// refused; if that also cannot be used, its raw text is kept as a `degraded` synthesis — shown
     /// as it came, with the reason — rather than thrown away.
     ///
-    /// `answers` are the final answers by seat. A seat whose answer failed is absent, so the
-    /// chairman is never asked to weigh a position nobody stated.
+    /// `answers` are the final answers by seat — the latest each seat stood behind — and
+    /// `critiques` the last round's. A seat whose answer failed is absent, so the chairman is never
+    /// asked to weigh a position nobody stated. `changes` is every revision that changed an answer,
+    /// as `(seat name, why)`, across every round.
     async fn chairman_phase(
         &self,
         rounds_run: i64,
         answers: &BTreeMap<usize, String>,
         anon: &Anonymized,
         critiques: &BTreeMap<usize, formats::Critique>,
+        changes: Vec<(String, String)>,
     ) {
         self.move_to(rounds_run, PHASE_CHAIRMAN).await;
 
-        let ballots: BTreeMap<usize, Vec<String>> = critiques
-            .iter()
-            .map(|(critic, critique)| (*critic, critique.ranking.clone()))
-            .collect();
+        let ballots = ballots_of(critiques);
         let agreement = tally::agreement(&ballots, &anon.anon_map);
         // A seat no ballot scored has no standing to report; listing it at 0.00 would read as
         // "ranked last" when the truth is "never ranked".
@@ -1294,8 +1427,7 @@ impl Driver {
             critiques: critique_counts(critiques, &anon.anon_map),
             leaderboard_lines,
             agreement_level: agreement.level.clone(),
-            // Nothing is revised yet; the revise rounds arrive with the next packet.
-            changes: Vec::new(),
+            changes,
         };
         let seats: std::collections::BTreeSet<usize> = answers.keys().copied().collect();
         let judge = |raw: &str| -> Result<formats::Synthesis, String> {
@@ -1456,6 +1588,26 @@ impl Driver {
         // `mcp_only` is exactly what a seat gets today and `unrestricted` never reaches the
         // catalogue.
         let with_tools = with_tools && seat.allows_tools();
+
+        // The hard wall on spend: the most launches a council of this shape may ever make. Counted
+        // before anything is opened, so a launch past it costs nothing and leaves no run behind.
+        let rounds = u32::try_from(self.rounds).unwrap_or(u32::MAX);
+        let ceiling = tally::call_ceiling(self.members.len(), rounds);
+        if self
+            .launched
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            >= ceiling
+        {
+            let outcome = SeatOutcome {
+                status: SEAT_ERROR,
+                answer: String::new(),
+                error: Some(format!(
+                    "the council reached its ceiling of {ceiling} runner calls"
+                )),
+            };
+            self.record(&slot, None, &outcome).await;
+            return outcome;
+        }
 
         let (run_id, session_id) = match self.open_run(&prompt).await {
             Ok(opened) => opened,
@@ -1977,10 +2129,73 @@ fn step_record(
             Err(reason) => (store::STEP_INVALID, Some(reason), None),
         };
     }
+    if phase == store::PHASE_REVISE {
+        // Keeping an answer is a valid revision and is stored as one (`changed: false`, no answer);
+        // only a reply that cannot be read is `invalid`, and the seat's previous answer stands.
+        return match formats::parse_revision(&outcome.answer) {
+            Ok(revision) => (SEAT_OK, None, serde_json::to_string(&revision).ok()),
+            Err(reason) => (store::STEP_INVALID, Some(reason), None),
+        };
+    }
     let payload = formats::AnswerPayload {
         answer: outcome.answer.clone(),
     };
     (SEAT_OK, None, serde_json::to_string(&payload).ok())
+}
+
+/// PURE: a round's ballots, `critic seat -> ranked labels`, the shape `tally` reads.
+fn ballots_of(critiques: &BTreeMap<usize, formats::Critique>) -> BTreeMap<usize, Vec<String>> {
+    critiques
+        .iter()
+        .map(|(critic, critique)| (*critic, critique.ranking.clone()))
+        .collect()
+}
+
+/// PURE: for each critic, every label it reviewed and whether any of its points disagreed — the
+/// shape `tally::contested` reads.
+fn disputes_of(
+    critiques: &BTreeMap<usize, formats::Critique>,
+) -> BTreeMap<usize, Vec<(String, bool)>> {
+    critiques
+        .iter()
+        .map(|(critic, critique)| {
+            let notes = critique
+                .reviews
+                .iter()
+                .map(|review| {
+                    let disagrees = review
+                        .points
+                        .iter()
+                        .any(|point| point.stance == formats::Stance::Disagree);
+                    (review.label.clone(), disagrees)
+                })
+                .collect();
+            (*critic, notes)
+        })
+        .collect()
+}
+
+/// PURE: the points `seat_idx`'s answer received in one critique round, one entry per reviewer.
+///
+/// Only the points: the reviewer is anonymous to the seat it reviewed, exactly as the seat was to
+/// its reviewer, so nothing here says who wrote them or how they ranked. A review of a label that
+/// names no seat, or of the critic's own answer, is ignored — the critic was never shown it.
+fn points_received(
+    seat_idx: usize,
+    critiques: &BTreeMap<usize, formats::Critique>,
+    anon_map: &BTreeMap<String, usize>,
+) -> Vec<Vec<formats::Point>> {
+    critiques
+        .iter()
+        .filter(|(critic, _)| **critic != seat_idx)
+        .flat_map(|(_, critique)| {
+            critique
+                .reviews
+                .iter()
+                .filter(|review| anon_map.get(&review.label) == Some(&seat_idx))
+                .map(|review| review.points.clone())
+        })
+        .collect()
 }
 
 /// PURE: how the critiques landed on each answer — stance counts and the reasons given against it,
@@ -6145,5 +6360,583 @@ mod tests {
             chairman[0]
         );
         assert!(!chairman[0].contains(paragraph));
+    }
+
+    // --- council-deliberacao P7: revise rounds, early stop, the call ceiling. ---
+    //
+    // The anonymous labels are a shuffle seeded by the council's id, and a phase's seats are
+    // launched together, so no test here knows which seat drew which label or which scripted
+    // reply. Every assertion is therefore about a property that holds whatever the shuffle and
+    // the arrival order: replies within a phase are identical, or the assertion counts.
+
+    /// A critique that ranks `ranking` and reviews every label of a three-seat council with one
+    /// point of `stance`. `parse_critique` keeps only the labels the critic was shown, so each
+    /// answer ends up reviewed by exactly the two seats that were shown it.
+    fn critique_with_points(ranking: &[&str], stance: &str) -> String {
+        let reviews: Vec<serde_json::Value> = ["A", "B", "C"]
+            .into_iter()
+            .map(|label| {
+                serde_json::json!({
+                    "label": label,
+                    "points": [{
+                        "claim": "the claim the reviewer made",
+                        "stance": stance,
+                        "why": "the reason the reviewer gave",
+                    }],
+                })
+            })
+            .collect();
+        serde_json::json!({ "reviews": reviews, "ranking": ranking }).to_string()
+    }
+
+    /// A revision reply in the `formats::Revision` shape.
+    fn revision_json(changed: bool, why: &str, answer: &str) -> String {
+        if changed {
+            serde_json::json!({ "changed": true, "why": why, "answer": answer }).to_string()
+        } else {
+            serde_json::json!({ "changed": false }).to_string()
+        }
+    }
+
+    const ORIGINALS: [&str; 3] = ["answer zero", "answer one", "answer two"];
+
+    fn three_originals() -> std::collections::VecDeque<Scripted> {
+        ORIGINALS
+            .iter()
+            .map(|text| Scripted::Answers(text.to_string()))
+            .collect()
+    }
+
+    fn replies(count: usize, text: &str) -> std::collections::VecDeque<Scripted> {
+        (0..count)
+            .map(|_| Scripted::Answers(text.to_string()))
+            .collect()
+    }
+
+    /// The critique prompts of one round, by position: a council of `members` sends `members`
+    /// critique prompts per round, and a round's prompts all arrive before the next round's.
+    fn critique_round(runner: &ScriptedRunner, members: usize, round: usize) -> Vec<String> {
+        prompts_with(runner, prompts::CRITIQUE_MARKER)
+            .into_iter()
+            .skip((round - 1) * members)
+            .take(members)
+            .collect()
+    }
+
+    /// The labels a seat's critique step at `round` ranked — the labels it was shown.
+    fn ranked_labels(
+        steps: &[store::StepRow],
+        seat_idx: i64,
+        round: i64,
+    ) -> std::collections::BTreeSet<String> {
+        let step = step_at(steps, seat_idx, round, store::PHASE_CRITIQUE)
+            .unwrap_or_else(|| panic!("seat {seat_idx} has no critique at round {round}"));
+        let ballot: formats::Critique =
+            serde_json::from_str(step.payload.as_deref().expect("a critique payload")).unwrap();
+        ballot.ranking.into_iter().collect()
+    }
+
+    #[tokio::test]
+    async fn driver_two_rounds_revise_and_vote_again() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = three_originals();
+        // Round 1 ranks A > B > C and round 2 the reverse, so the Borda order moves between the
+        // rounds and nothing about early stopping is in play.
+        let mut critiques = replies(3, &critique_with_points(&["A", "B", "C"], "agree"));
+        critiques.extend(replies(3, &critique_with_points(&["C", "B", "A"], "agree")));
+        *runner.critique.lock().unwrap() = critiques;
+        *runner.revise.lock().unwrap() = replies(
+            3,
+            &revision_json(true, "the critique convinced me", "revised answer"),
+        );
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start_with(&state, "why?", None, Some(2), BTreeMap::new())
+            .await
+            .unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+        assert_eq!(row.rounds_run, 2, "both critique rounds ran");
+        assert!(
+            !row.stopped_early,
+            "the order moved, so nothing stopped early"
+        );
+
+        let steps = steps_for(&state, &id).await;
+        for (seat_idx, original) in ORIGINALS.iter().enumerate() {
+            let seat_idx = seat_idx as i64;
+            // Round 0 is never overwritten by a revision.
+            let answer = step_at(&steps, seat_idx, 0, store::PHASE_ANSWER).unwrap();
+            let payload: serde_json::Value =
+                serde_json::from_str(answer.payload.as_deref().unwrap()).unwrap();
+            assert_eq!(payload, serde_json::json!({ "answer": original }));
+
+            // The revision is recorded at the round whose critique it answers, as a Revision.
+            let revise = step_at(&steps, seat_idx, 1, store::PHASE_REVISE)
+                .unwrap_or_else(|| panic!("seat {seat_idx} has no revise step: {steps:?}"));
+            assert_eq!(revise.status, SEAT_OK, "{revise:?}");
+            assert!(revise.run_id.is_some());
+            let revision: formats::Revision =
+                serde_json::from_str(revise.payload.as_deref().expect("a revision payload"))
+                    .unwrap();
+            assert!(revision.changed);
+            assert_eq!(revision.answer.as_deref(), Some("revised answer"));
+
+            // Critiqued again, under the same letters as in round 1.
+            assert_eq!(
+                step_at(&steps, seat_idx, 2, store::PHASE_CRITIQUE)
+                    .unwrap()
+                    .status,
+                SEAT_OK
+            );
+            assert_eq!(
+                ranked_labels(&steps, seat_idx, 1),
+                ranked_labels(&steps, seat_idx, 2),
+                "a seat is shown the same letters every round"
+            );
+        }
+        // No revise after the last round's critique.
+        assert!(step_at(&steps, 0, 2, store::PHASE_REVISE).is_none());
+
+        // Each seat revises behind its own answer and the points it received — two reviewers,
+        // anonymous — and is shown no peer's answer, no model and no standing.
+        let revises = prompts_with(&runner, prompts::REVISE_MARKER);
+        assert_eq!(revises.len(), 3);
+        for prompt in &revises {
+            let own = ORIGINALS.iter().filter(|a| prompt.contains(*a)).count();
+            assert_eq!(own, 1, "a revision shows its own answer only:\n{prompt}");
+            assert!(prompt.contains("the claim the reviewer made"), "{prompt}");
+            assert!(prompt.contains("Reviewer 2:"), "{prompt}");
+            assert!(!prompt.contains("Reviewer 3:"), "{prompt}");
+            assert!(!prompt.contains("model-"), "{prompt}");
+            assert!(!prompt.contains("Leaderboard"), "{prompt}");
+        }
+
+        // Round 2 critiques the CURRENT answers, i.e. the revised ones.
+        let second = critique_round(&runner, 3, 2);
+        assert_eq!(second.len(), 3);
+        for prompt in &second {
+            assert!(prompt.contains("revised answer"), "{prompt}");
+            assert!(
+                ORIGINALS.iter().all(|a| !prompt.contains(a)),
+                "a superseded answer was critiqued again:\n{prompt}"
+            );
+        }
+
+        // The chairman reads the latest answers and every change with its why.
+        let chairman = prompts_with(&runner, prompts::CHAIRMAN_MARKER);
+        assert_eq!(chairman.len(), 1);
+        assert!(chairman[0].contains("revised answer"), "{}", chairman[0]);
+        assert!(!chairman[0].contains("No seat changed its answer."));
+        for k in 0..3 {
+            assert!(
+                chairman[0].contains(&format!("model-{k}: the critique convinced me")),
+                "{}",
+                chairman[0]
+            );
+        }
+
+        // 3 answers + 3 critiques + 3 revisions + 3 critiques + 1 chairman.
+        assert_eq!(runner.seen.lock().unwrap().len(), 13);
+    }
+
+    #[tokio::test]
+    async fn driver_three_rounds_stop_early_when_nothing_moves() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = three_originals();
+        // The same ballots in every round and no dispute anywhere: round 2 moves nothing.
+        *runner.critique.lock().unwrap() = replies(9, &critique_json(&["A", "B", "C"]));
+        *runner.revise.lock().unwrap() = replies(6, &revision_json(false, "", ""));
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start_with(&state, "why?", None, Some(3), BTreeMap::new())
+            .await
+            .unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+        assert!(
+            row.stopped_early,
+            "nothing moved, so round 3 is not paid for"
+        );
+        assert_eq!(row.rounds_run, 2);
+        assert_eq!(row.rounds, 3, "the request's count is kept beside what ran");
+
+        assert_eq!(prompts_with(&runner, prompts::CRITIQUE_MARKER).len(), 6);
+        assert_eq!(prompts_with(&runner, prompts::REVISE_MARKER).len(), 3);
+        assert_eq!(prompts_with(&runner, prompts::CHAIRMAN_MARKER).len(), 1);
+        let steps = steps_for(&state, &id).await;
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.round <= 2
+                    && !(step.round == 2 && step.phase == store::PHASE_REVISE)),
+            "nothing after the round that stopped: {steps:?}"
+        );
+        // 3 answers + 3 critiques + 3 revisions + 3 critiques + 1 chairman.
+        assert_eq!(runner.seen.lock().unwrap().len(), 13);
+    }
+
+    #[tokio::test]
+    async fn driver_unchanged_revision_keeps_the_previous_answer() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = three_originals();
+        let mut critiques = replies(3, &critique_json(&["A", "B", "C"]));
+        critiques.extend(replies(3, &critique_json(&["C", "B", "A"])));
+        *runner.critique.lock().unwrap() = critiques;
+        // Two seats keep their answer, one changes it.
+        let mut revisions = replies(2, &revision_json(false, "", ""));
+        revisions.push_back(Scripted::Answers(revision_json(
+            true,
+            "one critique was right",
+            "the one revised answer",
+        )));
+        *runner.revise.lock().unwrap() = revisions;
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start_with(&state, "why?", None, Some(2), BTreeMap::new())
+            .await
+            .unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+
+        let steps = steps_for(&state, &id).await;
+        let revises: Vec<&store::StepRow> = steps
+            .iter()
+            .filter(|step| step.phase == store::PHASE_REVISE)
+            .collect();
+        assert_eq!(revises.len(), 3, "{steps:?}");
+        assert!(
+            revises.iter().all(|step| step.status == SEAT_OK),
+            "keeping an answer is a valid revision: {revises:?}"
+        );
+
+        // Round 2 shows the two kept answers and the one revised answer, nothing else.
+        let second = critique_round(&runner, 3, 2);
+        assert_eq!(second.len(), 3);
+        let kept: std::collections::BTreeSet<&str> = ORIGINALS
+            .iter()
+            .copied()
+            .filter(|a| second.iter().any(|prompt| prompt.contains(a)))
+            .collect();
+        assert_eq!(kept.len(), 2, "the two unchanged answers stand: {second:?}");
+        assert_eq!(
+            second
+                .iter()
+                .filter(|prompt| prompt.contains("the one revised answer"))
+                .count(),
+            2,
+            "the revised answer is shown to both of its peers"
+        );
+
+        let chairman = prompts_with(&runner, prompts::CHAIRMAN_MARKER);
+        assert_eq!(chairman.len(), 1);
+        assert!(chairman[0].contains("the one revised answer"));
+        for answer in &kept {
+            assert!(chairman[0].contains(answer), "{}", chairman[0]);
+        }
+        // Exactly one change reaches the chairman.
+        assert_eq!(chairman[0].matches("one critique was right").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn driver_all_revisions_invalid_still_runs_the_next_round() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = three_originals();
+        let mut critiques = replies(3, &critique_json(&["A", "B", "C"]));
+        critiques.extend(replies(3, &critique_json(&["C", "B", "A"])));
+        *runner.critique.lock().unwrap() = critiques;
+        *runner.revise.lock().unwrap() = replies(3, "I have thought about it, no JSON though.");
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start_with(&state, "why?", None, Some(2), BTreeMap::new())
+            .await
+            .unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+        assert_eq!(
+            row.rounds_run, 2,
+            "an unreadable revision does not end the council"
+        );
+
+        let steps = steps_for(&state, &id).await;
+        for seat_idx in 0..3 {
+            let revise = step_at(&steps, seat_idx, 1, store::PHASE_REVISE)
+                .unwrap_or_else(|| panic!("seat {seat_idx} has no revise step: {steps:?}"));
+            assert_eq!(revise.status, store::STEP_INVALID, "{revise:?}");
+            assert!(
+                revise
+                    .error
+                    .as_deref()
+                    .is_some_and(|reason| !reason.trim().is_empty()),
+                "{revise:?}"
+            );
+            assert!(revise.run_id.is_some(), "the run finished and is kept");
+            assert_eq!(
+                step_at(&steps, seat_idx, 2, store::PHASE_CRITIQUE)
+                    .unwrap_or_else(|| panic!("seat {seat_idx} was not critiqued again"))
+                    .status,
+                SEAT_OK
+            );
+        }
+
+        // The previous answers stand, so round 2 critiques the originals again.
+        let second = critique_round(&runner, 3, 2);
+        assert_eq!(second.len(), 3);
+        for prompt in &second {
+            assert_eq!(
+                ORIGINALS.iter().filter(|a| prompt.contains(*a)).count(),
+                2,
+                "{prompt}"
+            );
+        }
+        let chairman = prompts_with(&runner, prompts::CHAIRMAN_MARKER);
+        assert_eq!(chairman.len(), 1);
+        assert!(chairman[0].contains("No seat changed its answer."));
+    }
+
+    #[tokio::test]
+    async fn driver_round_with_fewer_than_two_critiques_goes_to_the_chairman() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = three_originals();
+        let mut critiques = replies(1, &critique_json(&["A", "B", "C"]));
+        critiques.extend(replies(2, "No ranking from me."));
+        *runner.critique.lock().unwrap() = critiques;
+        *runner.revise.lock().unwrap() =
+            replies(6, &revision_json(true, "should never be asked", "x"));
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start_with(&state, "why?", None, Some(3), BTreeMap::new())
+            .await
+            .unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+        assert_eq!(row.rounds_run, 1);
+
+        // One ballot is not a vote: nobody is asked to revise against it.
+        assert!(prompts_with(&runner, prompts::REVISE_MARKER).is_empty());
+        assert_eq!(prompts_with(&runner, prompts::CRITIQUE_MARKER).len(), 3);
+        assert_eq!(prompts_with(&runner, prompts::CHAIRMAN_MARKER).len(), 1);
+        let steps = steps_for(&state, &id).await;
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.phase != store::PHASE_REVISE && step.round <= 1),
+            "{steps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_never_exceeds_the_call_ceiling() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = three_originals();
+        // The order flips every round and every seat changes every time, so all three rounds run;
+        // the chairman then fails validation twice. That is the most a council can spend.
+        let mut critiques = replies(3, &critique_json(&["A", "B", "C"]));
+        critiques.extend(replies(3, &critique_json(&["C", "B", "A"])));
+        critiques.extend(replies(3, &critique_json(&["A", "B", "C"])));
+        *runner.critique.lock().unwrap() = critiques;
+        *runner.revise.lock().unwrap() =
+            replies(6, &revision_json(true, "moved again", "a new answer"));
+        *runner.chairman.lock().unwrap() = [
+            Scripted::Answers("first attempt, no JSON at all".into()),
+            Scripted::Answers("second attempt, still prose".into()),
+        ]
+        .into();
+        let state = council_state(runner.clone(), Some(roster(3))).await;
+
+        let id = start_with(&state, "why?", None, Some(3), BTreeMap::new())
+            .await
+            .unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+        assert_eq!(row.rounds_run, 3);
+        assert!(!row.stopped_early);
+        assert_eq!(row.synthesis_status.as_deref(), Some("degraded"));
+
+        let calls = runner.seen.lock().unwrap().len();
+        let ceiling = tally::call_ceiling(3, 3);
+        assert!(
+            calls <= ceiling,
+            "{calls} calls against a ceiling of {ceiling}"
+        );
+        // And this path IS the worst case: 3 + 3*3 + 2*3 + 2.
+        assert_eq!(calls, ceiling);
+        assert_eq!(prompts_with(&runner, prompts::REVISE_MARKER).len(), 6);
+        assert_eq!(prompts_with(&runner, prompts::CRITIQUE_MARKER).len(), 9);
+        assert_eq!(prompts_with(&runner, prompts::CHAIRMAN_MARKER).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn driver_cancel_mid_round_stops_the_next_phase() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = three_originals();
+        *runner.critique.lock().unwrap() = replies(6, &critique_json(&["A", "B", "C"]));
+        *runner.revise.lock().unwrap() = [Scripted::Hangs, Scripted::Hangs, Scripted::Hangs].into();
+        let mut config = roster(3);
+        config.timeout_seconds = 600;
+        let state = council_state(runner.clone(), Some(config)).await;
+
+        let id = start_with(&state, "why?", None, Some(2), BTreeMap::new())
+            .await
+            .unwrap();
+        // Wait until all three revisions are in flight, each with its run on its step.
+        for _ in 0..300 {
+            let steps = steps_for(&state, &id).await;
+            let revising: Vec<&store::StepRow> = steps
+                .iter()
+                .filter(|step| step.phase == store::PHASE_REVISE)
+                .collect();
+            if prompts_with(&runner, prompts::REVISE_MARKER).len() == 3
+                && revising.len() == 3
+                && revising.iter().all(|step| step.run_id.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(prompts_with(&runner, prompts::REVISE_MARKER).len(), 3);
+
+        assert!(cancel(&state, &id).await.unwrap());
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_CANCELLED);
+
+        let mut steps = Vec::new();
+        for _ in 0..300 {
+            steps = steps_for(&state, &id).await;
+            if steps
+                .iter()
+                .filter(|step| step.phase == store::PHASE_REVISE)
+                .all(|step| step.status == SEAT_CANCELLED)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for step in steps
+            .iter()
+            .filter(|step| step.phase == store::PHASE_REVISE)
+        {
+            assert_eq!(step.status, SEAT_CANCELLED, "{step:?}");
+        }
+        // Give a driver that ignored the cancel the time to start round 2 — it must not.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            prompts_with(&runner, prompts::CRITIQUE_MARKER).len(),
+            3,
+            "round 2 started after the cancel"
+        );
+        assert!(prompts_with(&runner, prompts::CHAIRMAN_MARKER).is_empty());
+        assert!(
+            steps_for(&state, &id)
+                .await
+                .iter()
+                .all(|step| step.round <= 1),
+            "no step was written past the cancelled round"
+        );
+    }
+
+    /// The multi-round counterpart of `each_routed_seat_reports_its_outcome_once_to_the_router`:
+    /// the revise phase and the second critique go through the same routed launch, and each
+    /// decision is reported exactly once.
+    #[tokio::test]
+    async fn driver_every_phase_of_a_multi_round_council_is_routed_and_reported_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        *runner.stage1.lock().unwrap() = three_originals();
+        let mut critiques = replies(3, &critique_json(&["A", "B", "C"]));
+        critiques.extend(replies(3, &critique_json(&["C", "B", "A"])));
+        *runner.critique.lock().unwrap() = critiques;
+        *runner.revise.lock().unwrap() = replies(
+            3,
+            &revision_json(true, "the critique convinced me", "revised answer"),
+        );
+
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        let counter = asked.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/route",
+                axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "decision_id": format!("rt_{n}"),
+                            "runner": "claude",
+                            "model": request["models"][0],
+                            "effort": "low",
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/route/{id}/outcome",
+                axum::routing::post(
+                    move |axum::extract::Path(id): axum::extract::Path<String>,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let sent = sent.clone();
+                        async move {
+                            let status = body["status"].as_str().unwrap_or_default().to_owned();
+                            let _ = sent.send((id, status));
+                            axum::http::StatusCode::OK
+                        }
+                    },
+                ),
+            );
+        let url = crate::router_client::test_support::serve(app).await;
+        let inner: std::sync::Arc<dyn crate::runner::CommandRunner> = runner.clone();
+        let router = std::sync::Arc::new(crate::route_advice::Router::new(
+            crate::route_advice::RouterConfig {
+                mode: crate::route_advice::Mode::Off,
+                url,
+                surfaces: [("council", crate::route_advice::Mode::Shadow)]
+                    .into_iter()
+                    .collect(),
+                ..crate::route_advice::RouterConfig::off()
+            },
+            crate::route_advice::Available {
+                kind: crate::route_advice::RunnerKind::Claude,
+                runner: inner.clone(),
+                default_model: "claude-sonnet-5".into(),
+                models: vec!["claude-*".into()],
+            },
+            Vec::new(),
+        ));
+        let mut state = council_state(runner.clone(), Some(roster(3))).await;
+        state.runner = std::sync::Arc::new(crate::route_advice::RoutedRunner { inner, router });
+
+        let id = start_with(&state, "why?", None, Some(2), BTreeMap::new())
+            .await
+            .unwrap();
+        let row = settled(&state, &id).await;
+        assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
+        assert_eq!(row.rounds_run, 2);
+
+        let mut reports = Vec::new();
+        while let Ok(Some(report)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), received.recv()).await
+        {
+            reports.push(report);
+        }
+        let routed = asked.load(Ordering::SeqCst);
+        assert!(routed > 3, "only the answers were routed: {routed}");
+        assert_eq!(
+            reports.len(),
+            routed,
+            "one report per decision: {reports:?}"
+        );
+        let ids: std::collections::BTreeSet<&str> =
+            reports.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids.len(), reports.len(), "a decision was reported twice");
+        assert!(
+            reports.iter().all(|(_, status)| status == "pass"),
+            "{reports:?}"
+        );
+        // Every launch — answers, both critiques, the revisions, the chairman — went through the
+        // router: 3 + 3 + 3 + 3 + 1.
+        let launched = runner.seen.lock().unwrap().len();
+        assert_eq!(routed, launched, "a phase launched around the router");
+        assert_eq!(launched, 13);
+        assert_eq!(prompts_with(&runner, prompts::REVISE_MARKER).len(), 3);
     }
 }

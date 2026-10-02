@@ -83,7 +83,6 @@ fn stance_word(stance: Stance) -> &'static str {
 /// placed would revise towards the winner rather than towards the argument, and a label would tell
 /// it which one it was — exactly what the critique phase withheld. A test holds the text below to
 /// that, down to never using the word for an ordering.
-#[allow(dead_code)] // Sent by the revise phase, council-deliberacao P7.
 pub fn revise_prompt(
     question: &str,
     role: Option<Role>,

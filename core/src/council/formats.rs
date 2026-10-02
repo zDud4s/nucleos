@@ -88,8 +88,6 @@ pub struct Critique {
     pub ranking: Vec<String>,
 }
 
-// The revise phase that reads these lands in the next packet of council-deliberacao (P7).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Revision {
     #[serde(default)]
@@ -172,7 +170,6 @@ pub fn parse_critique(text: &str, shown: &[String]) -> Result<Critique, String> 
 
 /// A revision. Claiming a change requires saying what changed and why; an unchanged revision's
 /// answer is dropped, because the seat's earlier answer is the one that stands.
-#[allow(dead_code)] // Called by the revise phase, council-deliberacao P7.
 pub fn parse_revision(text: &str) -> Result<Revision, String> {
     let mut revision: Revision = serde_json::from_str(extract_json(text))
         .map_err(|e| format!("revision did not parse: {e}"))?;
