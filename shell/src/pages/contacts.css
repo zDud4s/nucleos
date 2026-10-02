@@ -175,36 +175,94 @@
 
 /* ===================================================================== roster == */
 
-/* The head line of one address row. The row and the column around it are
-   `Rows`/`Row`; only the arrangement inside the row is this page's. */
-.contacts-row-head {
+/**
+ * The roster as profile cards, wrapping rather than scrolling sideways — the
+ * `.fleet-columns` recipe.
+ *
+ * Every card is the same height, across rows too — the owner's call
+ * (2026-10-02): a grid of profiles whose cards grow with their badges and
+ * buttons reads as ragged. `grid-auto-rows: 1fr` sizes every implicit row to
+ * the tallest card, and the default `stretch` fills each cell; the actions
+ * then sit on the bottom edge (`margin-top: auto` below) so they line up.
+ *
+ * Each card is `.ui-panel-inset`, the one card rank a Panel may hold; this
+ * file only arranges what is inside it.
+ */
+.contacts-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
+  grid-auto-rows: 1fr;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.contacts-card {
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.contacts-card-head {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-3);
+  min-width: 0;
 }
 
-.contacts-row-head > .ui-reading-time {
-  margin-left: auto;
-}
-
-.contacts-row-address {
-  font-family: var(--font-mono);
+/* Initials in a disc. The accent's quiet tint is identity, not state — the
+   same reading `.ui-who-leads` gives the accent ring. */
+.contacts-avatar {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: var(--radius-pill);
+  background: var(--accent-quiet);
+  color: var(--text);
   font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.02em;
+}
+
+.contacts-card-who {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.contacts-card-name {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
   color: var(--text);
   overflow-wrap: anywhere;
 }
 
-.contacts-row-name {
+/* Never truncated: a lookalike address only shows up if nothing is cut. */
+.contacts-card-address {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
   color: var(--text-muted);
-  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
 }
 
-/* Wider than `.contacts-actions`, and it holds two of them: the gap has to say
-   which buttons belong to which group. */
-.contacts-row-actions {
+.contacts-card-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+/* Two `.contacts-actions` groups; the wider gap says which buttons belong
+   to which, and the rule sets the controls apart from the profile. */
+.contacts-card-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-3);
+  margin-top: auto;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
 }

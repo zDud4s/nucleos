@@ -584,6 +584,12 @@ const SHOTS_TO_TAKE = [
      arriving and retention keeps pruning — so the header is the only thing that can say it, and
      this is the shot that proves it does. `?disarmed` is read by `preview/daemon.ts`. */
   ["76-mail-disarmed", { path: "/mail?disarmed=1" }],
+  /* Contacts as profile cards, from `daemon.ts`'s `CONTACTS`, whose cards carry deliberately
+     unequal content: every card must still be one height, across rows too. The narrow shot is
+     the wrap to fewer columns. */
+  ["80-contacts", { path: "/contacts" }],
+  ["81-contacts-light", { path: "/contacts", theme: "light" }],
+  ["82-contacts-narrow", { path: "/contacts", viewport: { width: 800, height: 600 } }],
   /* Files, filled from `daemon.ts`'s `FILES`: folders, a name long enough to wrap, a file with
      no modified time, and `scans`, whose listing refuses — the tree's unread mark shows once it
      is expanded, which a still shot cannot do, so it is the test that holds that half. The
