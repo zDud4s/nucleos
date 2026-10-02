@@ -78,15 +78,27 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
 
 const EMAIL_CLASS_KINDS = ["email_urgent"];
 
+function stringConstants(body: string): Map<string, string> {
+  return new Map([...body.matchAll(/const (\w+): &str = "([^"]+)";/g)].map(([, key, value]) => [key, value]));
+}
+
+/** `land.rs` -> `crate::land`, `judge/mod.rs` -> `crate::judge`, `judge/row.rs` -> `crate::judge::row`. */
+function modulePath(name: string): string {
+  return `crate::${name.replace(/\.rs$/, "").replace(/\/mod$/, "").replace(/\//g, "::")}`;
+}
+
 function writtenFeedKinds(): { kinds: Set<string>; files: number; unresolved: string[] } {
   const kinds = new Set<string>();
   const unresolved: string[] = [];
   const files = coreFiles();
+  // A writer may name another module's constant by path (`crate::land::RESOLUTION_FAILED_KIND`),
+  // so every module's constants are read before any call is resolved.
+  const byModule = new Map(
+    files.map(({ name, source }) => [modulePath(name), stringConstants(source.slice(0, cutAtTestModule(source)))]),
+  );
   for (const { name, source } of files) {
     const body = source.slice(0, cutAtTestModule(source));
-    const constants = new Map(
-      [...body.matchAll(/const (\w+): &str = "([^"]+)";/g)].map(([, key, value]) => [key, value]),
-    );
+    const constants = stringConstants(body);
     for (const writer of WRITERS) {
       const call = new RegExp(`(?<![A-Za-z0-9_])${writer.name}\\s*\\(`, "g");
       for (const match of body.matchAll(call)) {
@@ -101,6 +113,13 @@ function writtenFeedKinds(): { kinds: Set<string>; files: number; unresolved: st
         if (/^[A-Z][A-Z0-9_]*$/.test(argument)) {
           const value = constants.get(argument);
           if (value === undefined) unresolved.push(`${name}: ${argument}`);
+          else kinds.add(value);
+          continue;
+        }
+        const qualified = /^(crate(?:::\w+)+)::([A-Z][A-Z0-9_]*)$/.exec(argument.replace(/\s+/g, ""));
+        if (qualified) {
+          const value = byModule.get(qualified[1])?.get(qualified[2]);
+          if (value === undefined) unresolved.push(`${name}: ${qualified[0]}`);
           else kinds.add(value);
           continue;
         }
