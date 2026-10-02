@@ -32,8 +32,42 @@ import { dateKeyOf, groupByLocalDay, placementOf, type DragHandlers, type Slot }
  * without a daemon or a router behind it.
  */
 
-/** Three, per design §6.14. The fourth line of a cell is the count, not an event. */
+/** Three, per design §6.14 — on a window tall enough for six rows of three. */
 const MAX_CHIPS = 3;
+
+/**
+ * The chip cap a window of this height can afford.
+ *
+ * The cell's height follows the window (`calendar.css`, `.calendar-day`), so that the six rows fit
+ * on screen without scrolling the page, and a shorter cell holds fewer chips. Three on a tall
+ * window, then two, then one; the rest is the count beside the date either way. Read through
+ * `matchMedia` so a resized window re-renders, and three where there is none (jsdom), which is the
+ * design's own number.
+ */
+const CHIP_STEPS: readonly [query: string, cap: number][] = [
+  ["(max-height: 720px)", 1],
+  ["(max-height: 900px)", 2],
+];
+
+function chipCapNow(): number {
+  if (typeof window.matchMedia !== "function") return MAX_CHIPS;
+  for (const [query, cap] of CHIP_STEPS) if (window.matchMedia(query).matches) return cap;
+  return MAX_CHIPS;
+}
+
+function useChipCap(): number {
+  const [cap, setCap] = useState(chipCapNow);
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const lists = CHIP_STEPS.map(([query]) => window.matchMedia(query));
+    const update = () => setCap(chipCapNow());
+    for (const list of lists) list.addEventListener("change", update);
+    return () => {
+      for (const list of lists) list.removeEventListener("change", update);
+    };
+  }, []);
+  return cap;
+}
 
 export interface MonthGridProps {
   anchor: Date;
@@ -118,6 +152,8 @@ export function MonthGrid({
     setMoves((count) => count + 1);
   }
 
+  const maxChips = useChipCap();
+
   return (
     <div className="calendar-month">
       <div className="calendar-weekdays" aria-hidden="true">
@@ -150,6 +186,7 @@ export function MonthGrid({
                 selected={sameDay(day, selected.day)}
                 onSelect={onSelect}
                 drag={drag}
+                maxChips={maxChips}
               />
             ))}
           </div>
@@ -168,6 +205,7 @@ interface DayCellProps {
   selected: boolean;
   onSelect: (slot: Slot) => void;
   drag: DragHandlers;
+  maxChips: number;
 }
 
 /**
@@ -186,10 +224,10 @@ interface DayCellProps {
  * what an earlier draft did, dimming both the outside days and the weekends —
  * makes a Saturday in the next month indistinguishable from either.
  */
-function DayCell({ day, inMonth, occurrences, now, working, selected, onSelect, drag }: DayCellProps) {
+function DayCell({ day, inMonth, occurrences, now, working, selected, onSelect, drag, maxChips }: DayCellProps) {
   const hours = dayHours(day);
   const today = sameDay(day, now);
-  const shown = occurrences.slice(0, MAX_CHIPS);
+  const shown = occurrences.slice(0, maxChips);
   const hidden = occurrences.length - shown.length;
 
   /*
@@ -262,6 +300,9 @@ function DayCell({ day, inMonth, occurrences, now, working, selected, onSelect, 
               {hours.hours}h
             </span>
           )}
+          {/* Beside the date rather than under the chips: a line of its own was the line a
+              short cell could not spare. */}
+          {hidden > 0 && <span className="calendar-day-more">+{hidden} more</span>}
         </span>
 
         {today && <NowLine day={day} now={now} />}
@@ -274,7 +315,6 @@ function DayCell({ day, inMonth, occurrences, now, working, selected, onSelect, 
               drag={drag}
             />
           ))}
-          {hidden > 0 && <span className="calendar-day-more">+{hidden} more</span>}
         </span>
       </button>
     </div>

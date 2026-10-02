@@ -339,6 +339,14 @@ pub struct AppState {
     /// (`http::files_root`). An `Option` rather than the empty path it used to be: "no folder" and
     /// "the folder at the empty path" are different facts, and only one of them can be a bug.
     pub files_root: Option<std::path::PathBuf>,
+    /// Where a delete under `files_root` puts what it removed: a sibling of the root, never inside
+    /// it, so no route over the root can reach it (`files::trash_for`). Canonicalised once at
+    /// startup like the root, for the same reason.
+    ///
+    /// `None` means startup could not make it, and `DELETE /files` then answers 503 like every
+    /// other route with no folder to work in — a delete never falls back to removing for good,
+    /// because "the trash is unavailable" must not turn into the one act nobody can undo.
+    pub files_trash: Option<std::path::PathBuf>,
     /// Where this machine keeps its workflow bundles, resolved once at startup.
     ///
     /// The same shape `files_root` above has, and for the same two reasons. One: it is a path that

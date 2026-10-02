@@ -402,6 +402,12 @@ const SHOTS_TO_TAKE = [
      from the one above and had none of its controls for a long time without anybody being able to
      see that from a test — jsdom computes no layout and applies no stylesheet. */
   ["09g-chat-front-door", { path: "/chats" }],
+  /* The governance cockpit: the fan first under the header, and the brakes whose columns have to
+     line up from row to row — a thing only a stylesheet can get wrong. */
+  ["09h-autopilot", { path: "/autopilot" }],
+  /* A run still going: the stage row centred over the page, and the live tail read as events
+     rather than as the stream-json it arrives in. */
+  ["09i-run-live", { path: "/runs/2" }],
   ["10-catalogue-dark", { path: "/agents" }],
   ["11-catalogue-light", { path: "/agents", theme: "light" }],
   /* The editor, which is the half of the page that is not on screen at rest —
@@ -509,6 +515,10 @@ const SHOTS_TO_TAKE = [
   ["54-calendar-dst-week", { path: "/calendar?view=week&on=2026-03-29" }],
   /* A month with nothing in it, which must read as an empty calendar and not
      as a page that failed to load — the state every grid gets wrong first. */
+  /* A laptop window, the size the calendar was reported at: the six weeks, and the week's
+     hours, have to sit above the fold rather than below it. */
+  ["55a-calendar-month-laptop", { path: "/calendar?on=2026-08-24", viewport: { width: 1256, height: 760 } }],
+  ["55b-calendar-week-laptop", { path: "/calendar?view=week&on=2026-08-25", viewport: { width: 1256, height: 760 } }],
   ["55-calendar-empty", { path: "/calendar?on=2027-02-15" }],
   ["56-calendar-empty-light", { path: "/calendar?on=2027-02-15", theme: "light" }],
   /* Mid-drag, which is the only state where the drop targets exist at all —
@@ -526,19 +536,19 @@ const SHOTS_TO_TAKE = [
      gives it. A `viewport` frames it with a little room around the drawing instead of the harness's
      default 1440x960 canvas, which would photograph a couple hundred pixels of notch on most of a
      thousand pixels of black. */
-  ["60-notch-floating-folded", { path: "/teams", window: "notch", viewport: { width: 640, height: 240 } }],
+  ["60-notch-floating-folded", { path: "/teams", window: "notch", viewport: { width: 640, height: 280 } }],
   /* Unfolded, via `hover` rather than `press`: `QuotaNotch` opens on `onPointerEnter`, and this is
      the one state of it nothing could photograph before — a click would land on whichever control
      sits under the pointer instead of on the wrapper the gesture actually needs. This is the
      provider names, the arcs read in full, and — if the sidecar has gone stale — the way back into
      the app, none of which the folded shot above shows at all. */
-  ["61-notch-floating-unfolded", { path: "/teams", window: "notch", hover: ".quota-notch", viewport: { width: 640, height: 240 } }],
+  ["61-notch-floating-unfolded", { path: "/teams", window: "notch", hover: ".quota-notch", viewport: { width: 640, height: 620 } }],
   /* And in light, for the reason several pairs above already are one: the unfolded notch draws its
      "last known" caption on `--text-faint`, and whether faint text over a transparent, borderless
      window still reads is a contrast question a dark shot alone cannot answer. */
   [
     "62-notch-floating-unfolded-light",
-    { path: "/teams", window: "notch", hover: ".quota-notch", viewport: { width: 640, height: 240 }, theme: "light" },
+    { path: "/teams", window: "notch", hover: ".quota-notch", viewport: { width: 640, height: 620 }, theme: "light" },
   ],
   /* The other host, same component: `host="contained"` draws it at the top of an ordinary page
      (`AppShell.tsx`) rather than floating, and needs none of the options above — `contained` is
@@ -557,6 +567,14 @@ const SHOTS_TO_TAKE = [
      arriving and retention keeps pruning — so the header is the only thing that can say it, and
      this is the shot that proves it does. `?disarmed` is read by `preview/daemon.ts`. */
   ["76-mail-disarmed", { path: "/mail?disarmed=1" }],
+  /* Files, filled from `daemon.ts`'s `FILES`: folders, a name long enough to wrap, a file with
+     no modified time, and `scans`, whose listing refuses — the tree's unread mark shows once it
+     is expanded, which a still shot cannot do, so it is the test that holds that half. The
+     narrow shot is the one-column collapse; `?empty` is the Teach state. */
+  ["90-files", { path: "/files" }],
+  ["91-files-light", { path: "/files", theme: "light" }],
+  ["92-files-narrow", { path: "/files", viewport: { width: 800, height: 600 } }],
+  ["93-files-empty", { path: "/files?empty=1" }],
 ];
 
 const wanted = SHOTS_TO_TAKE.filter(([name]) => ONLY === undefined || name.includes(ONLY));

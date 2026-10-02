@@ -79,6 +79,19 @@ html {
   scrollbar-gutter: stable;
 }
 
+/*
+  Given back while the app's own frame is mounted, which is exactly when the root cannot scroll:
+  `.app-shell` is `height: 100vh; overflow: hidden`, and `.app-main` does the scrolling. With no
+  root scrollbar there is no shift for the gutter to prevent — and what it did instead was take a
+  strip out of the box every `position: fixed` element is laid against, so the contained quota notch
+  hung ten pixels short of the window's right edge with a stripe of page beyond it (measured:
+  `documentElement.clientWidth` 1430 in a 1440 window). Scoped with `:has` rather than dropped, so
+  a takeover that renders instead of the frame, and can be taller than the window, keeps its guard.
+*/
+html:has(.app-shell) {
+  scrollbar-gutter: auto;
+}
+
 body {
   min-height: 100vh;
   background: var(--bg);

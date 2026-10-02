@@ -55,7 +55,6 @@ import {
   Row,
   Rows,
   Section,
-  StatCard,
   StaleNote,
   StateBadge,
   Teach,
@@ -170,12 +169,6 @@ export function Autopilot() {
         <BudgetPausedBanner budget={budget.data} />
       )}
 
-      <Statusline
-        projects={projects.data}
-        budget={budget.data}
-        pending={proposals.data?.length}
-      />
-
       {stale && <StaleNote dataUpdatedAt={projects.dataUpdatedAt} />}
       {projects.isError && projects.data === undefined && (
         <RosterError error={projects.error} />
@@ -190,6 +183,11 @@ export function Autopilot() {
           onSelect={setChosen}
           refusals={refusals}
           onRefusals={setRefusals}
+        />
+        <Ledger
+          projects={projects.data}
+          budget={budget.data}
+          pending={proposals.data?.length}
         />
         <ShadowReviewPanel projectId={selected} project={focused} />
         <ScoreboardPanel projectId={selected} project={focused} />
@@ -265,9 +263,15 @@ function BudgetPausedBanner({ budget }: { budget: BudgetView }) {
   );
 }
 
-/* -------------------------------------------------------------- statusline -- */
+/* ---------------------------------------------------------------- the ledger -- */
 
-function Statusline({
+/**
+ * What the four stat cards used to say that nothing else on the page says: the open proposals and
+ * the window's spend. The acting/shadow/off counts are the headline's, and the roster's size is the
+ * carousel's own count, so those cards repeated them. Two facts do not earn a card each, nor the top
+ * of the page above the roster — one quiet line under the carousel.
+ */
+function Ledger({
   projects,
   budget,
   pending,
@@ -276,51 +280,27 @@ function Statusline({
   budget: BudgetView | undefined;
   pending: number | undefined;
 }) {
-  const active = projects?.filter((row) => row.mode === "active").length;
-  const shadow = projects?.filter((row) => row.mode === "shadow").length;
   const held = projects?.filter((row) => row.queue_full).length ?? 0;
-
+  const spend =
+    budget === undefined
+      ? undefined
+      : `$${budget.window_spend_usd.toFixed(2)} spent${
+          budget.limit_usd === null
+            ? ", no ceiling set"
+            : ` of $${budget.limit_usd.toFixed(2)} per ${PERIOD_NOUN[budget.period] ?? budget.period}`
+        }`;
+  if (pending === undefined && spend === undefined) return null;
   return (
-    <div className="ap-stats">
-      <StatCard
-        label="Acting on their own"
-        value={active}
-        detail={
-          projects === undefined
-            ? undefined
-            : `${projects.length} ${projects.length === 1 ? "project" : "projects"} on the roster`
-        }
-      />
-      <StatCard
-        label="Watching in shadow"
-        value={shadow}
-        detail="deciding without enforcing, to earn the promotion"
-      />
-      <StatCard
-        label="To review"
-        value={pending}
-        detail={
-          held === 0
-            ? "across the roster"
-            : `across the roster — ${held} project queue full`
-        }
-      />
-      <StatCard
-        label="Window spend"
-        value={
-          budget === undefined
-            ? undefined
-            : `$${budget.window_spend_usd.toFixed(2)}`
-        }
-        detail={
-          budget === undefined
-            ? undefined
-            : budget.limit_usd === null
-              ? "no ceiling set"
-              : `of $${budget.limit_usd.toFixed(2)} per ${PERIOD_NOUN[budget.period] ?? budget.period}`
-        }
-      />
-    </div>
+    <p className="ap-ledger">
+      {pending !== undefined && (
+        <Link className="ap-link" to="/waiting">
+          {pending} to review across the roster
+        </Link>
+      )}
+      {pending !== undefined && held > 0 && ` — ${held} project queue full`}
+      {pending !== undefined && spend !== undefined && " · "}
+      {spend}
+    </p>
   );
 }
 
@@ -732,11 +712,9 @@ function ProjectCarousel({
     .join(" ");
 
   return (
-    <Panel
-      title="Projects"
-      variant="flat"
-      aside={<Count n={answered ? rows.length : undefined} />}
-    >
+    // The fan is the first thing under the header: no section title above it (the index says
+    // "1 of N"), and the index, the note and the setting all follow it rather than push it down.
+    <section className="ap-fan" aria-label="Projects">
       {answered && rows.length === 0 && (
         <Teach title="No project is under autopilot">
           <p>
@@ -749,12 +727,33 @@ function ProjectCarousel({
       {!answered && <p className="ap-loading">reading the roster…</p>}
       {focused !== undefined && (
         <>
-          {/* What each setting means, said once rather than on every card, in the map's words. */}
-          <p className="ap-note ap-fan-note">
-            Three settings and not two. <strong>Off</strong> means {MODE_MEANING.off}.{" "}
-            <strong>Shadow</strong> means {MODE_MEANING.shadow}.{" "}
-            <strong>Active</strong> means {MODE_MEANING.active}.
-          </p>
+          <div
+            ref={stageRef}
+            className={stageClass}
+            aria-hidden="true"
+            onPointerDown={onStageDown}
+            onPointerMove={onStageMove}
+            onPointerUp={onStageUp}
+            onPointerCancel={onStageUp}
+          >
+            {shown.map((row, at) => (
+              <article
+                key={row.project_id}
+                ref={(element) => {
+                  if (element === null) cards.current.delete(row.project_id);
+                  else cards.current.set(row.project_id, element);
+                }}
+                data-index={at}
+                className={at === index ? "ap-fan-card ap-fan-card-focus" : "ap-fan-card"}
+              >
+                <FanCard
+                  project={row}
+                  refused={refusals.has(row.project_id)}
+                  cardW={cfg.cardW}
+                />
+              </article>
+            ))}
+          </div>
 
           {many && (
             <>
@@ -817,33 +816,12 @@ function ProjectCarousel({
             </>
           )}
 
-          <div
-            ref={stageRef}
-            className={stageClass}
-            aria-hidden="true"
-            onPointerDown={onStageDown}
-            onPointerMove={onStageMove}
-            onPointerUp={onStageUp}
-            onPointerCancel={onStageUp}
-          >
-            {shown.map((row, at) => (
-              <article
-                key={row.project_id}
-                ref={(element) => {
-                  if (element === null) cards.current.delete(row.project_id);
-                  else cards.current.set(row.project_id, element);
-                }}
-                data-index={at}
-                className={at === index ? "ap-fan-card ap-fan-card-focus" : "ap-fan-card"}
-              >
-                <FanCard
-                  project={row}
-                  refused={refusals.has(row.project_id)}
-                  cardW={cfg.cardW}
-                />
-              </article>
-            ))}
-          </div>
+          {/* What each setting means, said once rather than on every card, in the map's words. */}
+          <p className="ap-note ap-fan-note">
+            Three settings and not two. <strong>Off</strong> means {MODE_MEANING.off}.{" "}
+            <strong>Shadow</strong> means {MODE_MEANING.shadow}.{" "}
+            <strong>Active</strong> means {MODE_MEANING.active}.
+          </p>
 
           <div
             className="ap-fan-focus"
@@ -865,7 +843,7 @@ function ProjectCarousel({
       <p className="sr-only" aria-live="polite">
         {said}
       </p>
-    </Panel>
+    </section>
   );
 }
 
@@ -1539,10 +1517,14 @@ function TriggerKills() {
                       engaged: !engaged,
                     })
                   }
+                  aria-label={
+                    engaged
+                      ? `Release ${scope.label.toLowerCase()}`
+                      : `Hold ${scope.label.toLowerCase()}`
+                  }
                 >
-                  {engaged
-                    ? `Release ${scope.label.toLowerCase()}`
-                    : `Hold ${scope.label.toLowerCase()}`}
+                  {/* The row already names the scope; the verb alone keeps every button one width. */}
+                  {engaged ? "Release" : "Hold"}
                 </Button>
               ) : (
                 <p className="ap-trigger-note">

@@ -2446,6 +2446,143 @@ ol.ui-well {
   text-align: center;
 }
 
+/* ----------------------------------------------------------------- modal -- */
+
+/**
+ * A panel lifted off the page, and the page dimmed and blurred under it.
+ *
+ * The box is `.ui-panel`'s recipe — surface, hairline, `--radius-lg`, the same
+ * heading size — with `--shadow-lg` instead of `--shadow-sm`, because it is the
+ * one thing on screen standing above everything else. The scrim is a token
+ * (`--scrim`) so the light theme can lay a lighter one: the dark theme's
+ * near-black over a white page reads as the app crashing.
+ *
+ * The blur is small on purpose. Enough that the page stops competing for the
+ * eye; not so much that it stops being recognisably the page you were on —
+ * the modal is a question about that page, and the reader should still see it.
+ */
+.ui-modal-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-top);
+  background: var(--scrim);
+  backdrop-filter: blur(3px);
+}
+
+.ui-modal {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: var(--z-top);
+  display: flex;
+  flex-direction: column;
+  width: calc(100vw - 2 * var(--space-4));
+  max-height: calc(100dvh - 2 * var(--space-6));
+  translate: -50% -50%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  outline: none;
+}
+
+.ui-modal-sm {
+  max-width: 26rem;
+}
+
+.ui-modal-md {
+  max-width: 34rem;
+}
+
+/* The panel's heading row, with the close button where the panel's aside sits. */
+.ui-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-4) 0 var(--space-5);
+}
+
+.ui-modal-title {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.ui-modal-description {
+  margin: var(--space-2) 0 0;
+  padding: 0 var(--space-5);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+/* Only the body scrolls: the title and the answers stay on screen however long
+   the middle gets. */
+.ui-modal-body {
+  min-height: 0;
+  overflow-y: auto;
+  margin-top: var(--space-4);
+  padding: 0 var(--space-5);
+}
+
+.ui-modal-foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-5);
+  padding: var(--space-4) var(--space-5);
+  border-top: 1px solid var(--border);
+}
+
+/* A modal with neither a body nor answers still needs its bottom edge. */
+.ui-modal > :last-child:not(.ui-modal-foot) {
+  margin-bottom: var(--space-5);
+}
+
+/* Arriving: the scrim fades, the box fades and rises a few pixels into place.
+   Leaving is the same, shorter — Radix waits for `animationend` before it
+   unmounts, so the close is seen rather than cut. */
+.ui-modal-scrim[data-state="open"] {
+  animation: ui-modal-fade var(--dur-settle) var(--ease);
+}
+
+.ui-modal-scrim[data-state="closed"] {
+  animation: ui-modal-fade var(--dur-quick) var(--ease) reverse;
+}
+
+.ui-modal[data-state="open"] {
+  animation: ui-modal-rise var(--dur-settle) var(--ease);
+}
+
+.ui-modal[data-state="closed"] {
+  animation: ui-modal-rise var(--dur-quick) var(--ease) reverse;
+}
+
+@keyframes ui-modal-fade {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes ui-modal-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
 /* ------------------------------------------------------------- run pipe -- */
 
 /**
@@ -2472,9 +2609,9 @@ ol.ui-well {
 .ui-runpipe {
   display: block;
   width: 100%;
-  max-width: 720px;
+  max-width: 806px;
   height: auto;
-  margin-bottom: var(--space-4);
+  margin: 0 auto var(--space-4);
 }
 
 /* The grey that makes no claim. It is the base for every stage, so a tone class

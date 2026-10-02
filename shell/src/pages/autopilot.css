@@ -23,18 +23,11 @@
   gap: var(--space-4);
 }
 
-/* The stat row under the header — the same shape the Fleet page uses. */
-.ap-stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
-  gap: var(--space-3);
-  margin-bottom: var(--space-4);
-}
-
-/* Every card's detail is two lines tall, so a detail that gains a line — a queue filling, a
-   project promoted — never pushes the page down, and the row of cards stays one height. */
-.ap-stats .ui-stat-detail {
-  min-height: 2lh;
+/* The two facts that outlived the stat cards, said as one line under the carousel. */
+.ap-ledger {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
 /* =============================================================== banners == */
@@ -291,12 +284,19 @@
 /* ============================================================ the carousel == */
 
 /**
- * The roster as a fan: an index above it, one card per project, and the setting for the project
- * in focus below it. Ported from the approved prototype, its `apc-` classes renamed `ap-fan-`.
+ * The roster as a fan: one card per project at the top of the page, the index under it, and the
+ * setting for the project in focus below that. Ported from the approved prototype, its `apc-` classes renamed `ap-fan-`.
  *
  * Everything that moves is written by the component through `element.style` (CSSOM), which the
  * production CSP allows; nothing here is animated by a stylesheet except the index's tick height.
  */
+
+/* Stage first, then the index that walks it, then the setting for the card in focus. */
+.ap-fan {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
 
 /* The note about the three settings is prose, and takes prose's measure. */
 .ap-fan-note {
@@ -444,7 +444,7 @@
 /* ------------------------------------------------------------- the stage -- */
 
 /**
- * Pointer only — the index above is the keyboard's way in, so the stage takes no focus and its edge
+ * Pointer only — the index below is the keyboard's way in, so the stage takes no focus and its edge
  * fade can never swallow a focus ring. The fade is the horizontal twin of `--scroll-fade`: a card
  * cut hard at the edge reads as broken. The card size is the component's (`--ap-fan-card-w/h`, from
  * `fanConfig` and the stage's own width); the values here are only what it starts from.
@@ -920,9 +920,11 @@
 
 /* ============================================================ trigger brakes == */
 
+/* Each row is its own grid, so `auto` columns would size to that row's own badge and button and
+   the column edges would wander from row to row. Fixed tracks keep them one column down the panel. */
 .ap-trigger-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) 6.5rem 7rem;
   align-items: center;
   gap: var(--space-3);
 }
@@ -932,6 +934,15 @@
   font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
   color: var(--text);
+}
+
+.ap-trigger-row > .ui-badge {
+  justify-self: start;
+}
+
+.ap-trigger-row > button {
+  justify-self: stretch;
+  justify-content: center;
 }
 
 .ap-trigger-note {

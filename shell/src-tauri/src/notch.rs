@@ -261,10 +261,124 @@ pub fn hang(
     window_height: u32,
     rest_height: u32,
 ) -> (i32, i32) {
-    let x = area_width.saturating_sub(window_width);
-    let centred = area_height.saturating_sub(rest_height.min(window_height)) / 2;
-    let y = centred.min(area_height.saturating_sub(window_height));
+    hang_along(
+        area_x,
+        area_y,
+        area_width,
+        area_height,
+        window_width,
+        window_height,
+        rest_height,
+        0.5,
+    )
+}
+
+/// [`hang`], with the folded notch's middle at `along` of the way down the work area rather than
+/// at half of it: 0 the top, 1 the bottom. It is where the owner dragged it (`QuotaNotch`), kept
+/// by the page and sent with every fit.
+///
+/// A fraction, not pixels, because it has to survive what pixels do not: a taskbar that moves, a
+/// resolution change, the notch moving to a monitor of another height, and the other host — the
+/// contained notch hangs from the same fraction of the same work area (`screen-line.ts`). One that
+/// is not a number is the middle; one outside [0, 1] is the nearer end. Near an end the folded
+/// notch would run off the area, and it stops at the edge instead: the same saturation as the
+/// centred case, where a notch taller than the area sits at its top.
+#[allow(clippy::too_many_arguments)]
+pub fn hang_along(
+    area_x: i32,
+    area_y: i32,
+    area_width: u32,
+    area_height: u32,
+    window_width: u32,
+    window_height: u32,
+    rest_height: u32,
+    along: f64,
+) -> (i32, i32) {
+    hang_on(
+        Edge::Right,
+        area_x,
+        area_y,
+        area_width,
+        area_height,
+        window_width,
+        window_height,
+        rest_height,
+        along,
+    )
+}
+
+/// The edge of the work area the notch hangs from. The page keeps it (`notch-place.ts`) and sends
+/// it with every fit; anything it does not recognise is the right, where the notch always hung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    Right,
+    Left,
+    Top,
+    Bottom,
+}
+
+impl Edge {
+    pub fn from_word(word: Option<&str>) -> Self {
+        match word {
+            Some("left") => Self::Left,
+            Some("top") => Self::Top,
+            Some("bottom") => Self::Bottom,
+            _ => Self::Right,
+        }
+    }
+
+    fn is_vertical(self) -> bool {
+        matches!(self, Self::Right | Self::Left)
+    }
+}
+
+/// [`hang_along`] on any edge. `rest` is the folded drawing's length ALONG the edge — its height on
+/// a side edge, its width on the top or bottom — and the window is flush with the edge it hangs
+/// from, so an unfold grows it away from that edge: leftwards from the right, rightwards from the
+/// left, down from the top and up from the bottom. Along the edge the arithmetic is the one
+/// [`hang_along`] documents, on whichever axis the edge runs.
+#[allow(clippy::too_many_arguments)]
+pub fn hang_on(
+    edge: Edge,
+    area_x: i32,
+    area_y: i32,
+    area_width: u32,
+    area_height: u32,
+    window_width: u32,
+    window_height: u32,
+    rest: u32,
+    along: f64,
+) -> (i32, i32) {
+    let along = if along.is_finite() {
+        along.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let (x, y) = if edge.is_vertical() {
+        let x = match edge {
+            Edge::Left => 0,
+            _ => area_width.saturating_sub(window_width),
+        };
+        (x, slide(area_height, window_height, rest, along))
+    } else {
+        let y = match edge {
+            Edge::Top => 0,
+            _ => area_height.saturating_sub(window_height),
+        };
+        (slide(area_width, window_width, rest, along), y)
+    };
     (area_x + x as i32, area_y + y as i32)
+}
+
+/// Where along an edge `span` long a window `window` long starts, so that its folded `rest` is
+/// centred `along` of the way down it — clamped so the folded drawing stays on the edge, and then
+/// so the whole window does.
+fn slide(span: u32, window: u32, rest: u32, along: f64) -> u32 {
+    let rest = rest.min(window);
+    let wanted = (f64::from(span) * along - f64::from(rest) / 2.0).floor();
+    let highest = span.saturating_sub(rest);
+    let start = (wanted.max(0.0) as u32).min(highest);
+    start.min(span.saturating_sub(window))
 }
 
 /// Which window may be fitted to its content: the notch's, and no other. The main window asking
@@ -347,19 +461,27 @@ fn place(window: &WebviewWindow, asked: Asked) -> Result<(), String> {
     ) else {
         return window.hide().map_err(|e| e.to_string());
     };
-    // The folded height goes through the same scaling as the window's. One that is not a size —
-    // an older page that sent none, a NaN — is the window's own height, which is the centring
-    // this module did before it knew the difference.
+    // The folded length goes through the same scaling as the window's. One that is not a size —
+    // an older page that sent none, a NaN — is the window's own length along the edge, which is
+    // the centring this module did before it knew the difference.
+    let vertical = asked.edge.is_vertical();
     let rest = fit_size(
-        asked.width,
+        asked.rest,
         asked.rest,
         scale,
         area.size.width,
         area.size.height,
     )
-    .map_or(height, |(_, rest)| rest);
+    .map_or(if vertical { height } else { width }, |(across, down)| {
+        if vertical {
+            down
+        } else {
+            across
+        }
+    });
     let size = tauri::PhysicalSize::new(width, height);
-    let (x, y) = hang(
+    let (x, y) = hang_on(
+        asked.edge,
         area.position.x,
         area.position.y,
         area.size.width,
@@ -367,6 +489,7 @@ fn place(window: &WebviewWindow, asked: Asked) -> Result<(), String> {
         width,
         height,
         rest,
+        asked.along,
     );
     let position = tauri::PhysicalPosition::new(x, y);
     // Written only when it is not already so. `Moved` is one of the events that brings us back here
@@ -432,12 +555,15 @@ fn set_bounds(
     window.set_position(position).map_err(|e| e.to_string())
 }
 
-/// What the page last asked for, in CSS pixels: the drawing's box, and how tall it is folded.
+/// What the page last asked for, in CSS pixels: the drawing's box, how tall it is folded, and how
+/// far down the edge the owner put it (a fraction of the work area — see [`hang_along`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Asked {
     width: f64,
     height: f64,
     rest: f64,
+    along: f64,
+    edge: Edge,
 }
 
 /// The last box the page asked for.
@@ -452,7 +578,11 @@ static ASKED: Mutex<Option<Asked>> = Mutex::new(None);
 /// and `hang` opens it leftwards and downwards from the corner the folded notch occupied.
 ///
 /// `rest` is the drawing's height while folded, which is what the window is centred on (see
-/// `hang`). Optional, so a page that sends none is centred on its whole height as before.
+/// `hang`). Optional, so a page that sends none is centred on its whole height as before. `along`
+/// is how far down the edge the owner dragged it, a fraction of the work area; optional, so a page
+/// that sends none hangs in the middle as before. `edge` is which edge of the work area it hangs
+/// from (`right`, `left`, `top`, `bottom`); optional, so a page that sends none hangs on the right
+/// as before. On the top or bottom edge, `rest` is the folded drawing's WIDTH (see [`hang_on`]).
 ///
 /// Zero in either dimension hides the window. That is what the page sends when it has nothing to
 /// draw, and a hidden window is the only honest picture of "nothing measured yet".
@@ -464,12 +594,17 @@ pub fn notch_fit(
     width: f64,
     height: f64,
     rest: Option<f64>,
+    along: Option<f64>,
+    edge: Option<String>,
 ) -> Result<(), String> {
     may_be_fitted(window.label())?;
+    let edge = Edge::from_word(edge.as_deref());
     let asked = Asked {
         width,
         height,
-        rest: rest.unwrap_or(height),
+        rest: rest.unwrap_or(if edge.is_vertical() { height } else { width }),
+        along: along.unwrap_or(0.5),
+        edge,
     };
     if let Ok(mut last) = ASKED.lock() {
         *last = Some(asked);
@@ -589,6 +724,52 @@ mod tests {
         assert_eq!(hang(0, 0, 1920, 1040, 62, 114, 400), folded);
     }
 
+    /// Where the owner dragged it: the folded notch's middle at that fraction of the work area. At
+    /// one half it is exactly the centred notch, which is what keeps every page that sends no
+    /// fraction where it was.
+    #[test]
+    fn the_notch_hangs_where_it_was_dragged_down_the_edge() {
+        // A 140px fold in a 1040px area: middle at 260 for a quarter, so the top at 190.
+        assert_eq!(
+            hang_along(0, 0, 1920, 1040, 200, 140, 140, 0.25),
+            (1720, 190)
+        );
+        assert_eq!(
+            hang_along(0, 0, 1920, 1040, 200, 140, 140, 0.5),
+            hang(0, 0, 1920, 1040, 200, 140, 140)
+        );
+        // The work area's own origin carries through, as it does for the centred notch.
+        assert_eq!(
+            hang_along(-1920, 40, 1920, 1000, 200, 140, 140, 0.25),
+            (-200, 220)
+        );
+    }
+
+    /// Dragged to an end, the folded notch stops at the edge of the work area instead of hanging
+    /// half off it; out of range is the nearer end, and not a number is the middle.
+    #[test]
+    fn a_notch_dragged_past_an_end_stops_at_the_edge() {
+        assert_eq!(hang_along(0, 0, 1920, 1040, 200, 140, 140, 0.0), (1720, 0));
+        assert_eq!(
+            hang_along(0, 0, 1920, 1040, 200, 140, 140, 1.0),
+            (1720, 900)
+        );
+        assert_eq!(hang_along(0, 0, 1920, 1040, 200, 140, 140, -3.0), (1720, 0));
+        assert_eq!(
+            hang_along(0, 0, 1920, 1040, 200, 140, 140, 7.0),
+            (1720, 900)
+        );
+        assert_eq!(
+            hang_along(0, 0, 1920, 1040, 200, 140, 140, f64::NAN),
+            hang(0, 0, 1920, 1040, 200, 140, 140)
+        );
+        // Unfolded near the bottom, the panel is still lifted to fit rather than run off.
+        assert_eq!(
+            hang_along(0, 0, 1920, 1040, 280, 300, 140, 1.0),
+            (1640, 740)
+        );
+    }
+
     /// Opening downwards never runs past the bottom of the work area; the panel is lifted just
     /// enough to fit, and no further.
     #[test]
@@ -649,6 +830,55 @@ mod tests {
     /// The notch never grows past the screen it hangs from. Unclamped, an infinity became a
     /// `u32::MAX` window — transparent, always on top, over the whole desktop, and with the pin
     /// that would dock it underneath.
+    /// Every edge holds the window flush against it, so an unfold grows away from that edge, and
+    /// the folded drawing's middle sits `along` of the way down (or across) it.
+    #[test]
+    fn the_notch_hangs_flush_against_whichever_edge_it_was_dragged_to() {
+        // A 200x140 window whose folded drawing is 140 long, on a 1920x1040 area at the origin.
+        assert_eq!(
+            hang_on(Edge::Right, 0, 0, 1920, 1040, 200, 140, 140, 0.5),
+            (1720, 450)
+        );
+        assert_eq!(
+            hang_on(Edge::Left, 0, 0, 1920, 1040, 200, 140, 140, 0.5),
+            (0, 450)
+        );
+        // On the top and bottom the folded length is a width: 200 centred on 960 starts at 860.
+        assert_eq!(
+            hang_on(Edge::Top, 0, 0, 1920, 1040, 200, 140, 200, 0.5),
+            (860, 0)
+        );
+        assert_eq!(
+            hang_on(Edge::Bottom, 0, 0, 1920, 1040, 200, 140, 200, 0.5),
+            (860, 900)
+        );
+        // An unfold on the top edge grows the window rightwards from where the folded one started.
+        assert_eq!(
+            hang_on(Edge::Top, 0, 0, 1920, 1040, 320, 300, 200, 0.5),
+            (860, 0)
+        );
+        // Offset areas (a second monitor) carry through, and the ends clamp onto the edge.
+        assert_eq!(
+            hang_on(Edge::Bottom, -1920, 40, 1920, 1000, 200, 140, 200, 1.0),
+            (-200, 900)
+        );
+        assert_eq!(
+            hang_on(Edge::Left, -1920, 40, 1920, 1000, 200, 140, 140, 0.0),
+            (-1920, 40)
+        );
+    }
+
+    /// The page's word for an edge, and anything else — an older page sending none — is the right.
+    #[test]
+    fn an_unknown_edge_is_the_right_one() {
+        assert_eq!(Edge::from_word(Some("left")), Edge::Left);
+        assert_eq!(Edge::from_word(Some("top")), Edge::Top);
+        assert_eq!(Edge::from_word(Some("bottom")), Edge::Bottom);
+        assert_eq!(Edge::from_word(Some("right")), Edge::Right);
+        assert_eq!(Edge::from_word(Some("diagonal")), Edge::Right);
+        assert_eq!(Edge::from_word(None), Edge::Right);
+    }
+
     #[test]
     fn the_notch_is_never_bigger_than_the_work_area() {
         assert_eq!(
@@ -682,6 +912,8 @@ mod tests {
             width: 200.0,
             height: 40.0,
             rest: 40.0,
+            along: 0.5,
+            edge: Edge::Right,
         };
         *asked = Some(box_);
         assert_eq!(*asked, Some(box_));

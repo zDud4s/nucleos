@@ -160,9 +160,39 @@ func an_unmeasured_reading_uses_the_shorter_error_ttl(t *testing.T) {
 	}
 }
 
+// An unreadable provider must go out as `"windows": []`, never `null`.
+//
+// reading.Unavailable leaves the slice nil, and encoding/json writes a nil slice as null. The núcleo
+// reads that field as a list, and a null there failed its WHOLE decode — so one rate-limited
+// provider turned the other provider's live figures into last-known ones (captured 2026-09-24:
+// every fresh read "error decoding response body" while the usage endpoint answered 429). The wire
+// is the one place every reader's answer passes through, so it is where a nil becomes empty.
+func an_unreadable_provider_goes_out_with_an_empty_window_list(t *testing.T) {
+	var claudeCalls, codexCalls int
+	at := time.Now()
+	readers := stubReaders(&claudeCalls, &codexCalls,
+		reading.Unavailable("claude", "the usage endpoint answered 429", at), official("codex", at))
+	handler := authorized("tok", quotaHandler(config.Config{SuccessTTL: time.Minute, ErrorTTL: time.Second}, readers, &cache{}, time.Now))
+
+	rec, _ := doGet(t, handler, "tok")
+
+	var raw struct {
+		Providers []map[string]json.RawMessage `json:"providers"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decoding response: %v (body: %s)", err, rec.Body.String())
+	}
+	for _, provider := range raw.Providers {
+		if got := string(provider["windows"]); got != "[]" {
+			t.Errorf("provider %s: windows = %s, want [] (body: %s)", provider["provider"], got, rec.Body.String())
+		}
+	}
+}
+
 func TestServe(t *testing.T) {
 	t.Run("a missing or wrong bearer gets 401", a_missing_or_wrong_bearer_gets_401)
 	t.Run("a correct bearer gets 200", a_correct_bearer_gets_200)
 	t.Run("a second call within TTL returns cached", a_second_call_within_ttl_returns_cached)
 	t.Run("an unmeasured reading uses the shorter error TTL", an_unmeasured_reading_uses_the_shorter_error_ttl)
+	t.Run("an unreadable provider goes out with an empty window list", an_unreadable_provider_goes_out_with_an_empty_window_list)
 }

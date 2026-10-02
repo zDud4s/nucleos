@@ -35,15 +35,37 @@ import type { BadgeTone } from "./Badge";
  * distance is written once in `ui.css`, and a gap of another length would need a second one.
  */
 const BOX: Record<StageKey, readonly [number, number]> = {
-  prompt: [8, 150],
-  agent: [198, 180],
-  gate: [418, 150],
-  result: [608, 104],
+  prompt: [8, 160],
+  agent: [208, 190],
+  gate: [438, 160],
+  result: [638, 160],
 };
-const MID = 48;
+/** The viewBox: the row's right edge plus the same 8-unit margin it starts with. */
+const VIEW_W = 806;
+const VIEW_H = 100;
+const MID = 50;
 /** The agent box is the tall one: it is where a live run actually is. */
-const TALL = 76;
-const SHORT = 56;
+const TALL = 88;
+const SHORT = 66;
+
+/**
+ * Where each line sits inside its box, from the box's top. Three lines and, in the agent box, the
+ * working dots under them: each baseline is far enough below the last that the 14px title's
+ * descenders clear the 10px line under it, which they did not at 56 units tall.
+ */
+const LINES = {
+  short: { kind: 19, title: 40, sub: 56 },
+  tall: { kind: 20, title: 43, sub: 60, dots: 76 },
+};
+
+/** Roughly how wide a character of the title is at 14px — enough to cut a long name before the edge. */
+const TITLE_CHAR = 7.2;
+
+/** The title cut to its box, from the end, with an ellipsis — the full one is in the aria-label. */
+function fit(text: string, width: number): string {
+  const room = Math.floor((width - 20) / TITLE_CHAR);
+  return text.length <= room ? text : `${text.slice(0, Math.max(1, room - 1))}…`;
+}
 
 export type StageKey = "prompt" | "agent" | "gate" | "result";
 
@@ -174,7 +196,7 @@ export function RunPipeline({ run, alive }: RunPipelineProps) {
   return (
     <svg
       className="ui-runpipe"
-      viewBox="0 0 720 96"
+      viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
       role="img"
       aria-label={`This run: ${stages.map((stage) => `${stage.kind.toLowerCase()} ${stage.title}`).join(", ")}`}
     >
@@ -217,27 +239,28 @@ export function RunPipeline({ run, alive }: RunPipelineProps) {
         const height = tall ? TALL : SHORT;
         const y = MID - height / 2;
         const cx = x + width / 2;
+        const at = tall ? LINES.tall : LINES.short;
         return (
           <g
             key={stage.key}
             className={`ui-runpipe-stage ui-runpipe-${tone(stage)}${stage.reached ? "" : " ui-runpipe-unreached"}`}
           >
             <rect className="ui-runpipe-box" x={x} y={y} width={width} height={height} rx={tall ? 10 : 8} />
-            <text className="ui-runpipe-kind" x={cx} y={y + 19} textAnchor="middle">
+            <text className="ui-runpipe-kind" x={cx} y={y + at.kind} textAnchor="middle">
               {stage.kind}
             </text>
-            <text className="ui-runpipe-title" x={cx} y={y + (tall ? 42 : 39)} textAnchor="middle">
-              {stage.title}
+            <text className="ui-runpipe-title" x={cx} y={y + at.title} textAnchor="middle">
+              {fit(stage.title, width)}
             </text>
             {stage.sub !== "" && (
-              <text className="ui-runpipe-sub" x={cx} y={y + (tall ? 58 : 51)} textAnchor="middle">
+              <text className="ui-runpipe-sub" x={cx} y={y + at.sub} textAnchor="middle">
                 {stage.sub}
               </text>
             )}
             {tall && alive && (
               <g className="ui-runpipe-work">
                 {[-12, 0, 12].map((dx) => (
-                  <circle key={dx} className="ui-runpipe-workdot" cx={cx + dx} cy={y + height - 14} r={2.6} />
+                  <circle key={dx} className="ui-runpipe-workdot" cx={cx + dx} cy={y + LINES.tall.dots} r={2.6} />
                 ))}
               </g>
             )}

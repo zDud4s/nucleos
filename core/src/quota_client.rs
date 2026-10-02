@@ -40,7 +40,11 @@ pub struct ProviderReading {
     /// deserialisation that fails and takes the other providers down with it.
     pub fidelity: String,
     pub read_at: chrono::DateTime<chrono::Utc>,
-    #[serde(default)]
+    /// Absent AND `null` both read as no windows. `#[serde(default)]` alone covers only the absent
+    /// field, and the sidecar sends `null`: Go writes a nil slice that way, and every provider it
+    /// could not read has one. That null used to fail the whole report, so one rate-limited
+    /// provider took the other provider's live figures down with it (2026-09-24).
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub windows: Vec<WindowReading>,
     /// Why a reading is `unmeasured`, in words meant for the owner. Never a token, a header, or a
     /// URL with a credential in it — the sidecar's `claude` package is tested for exactly that.
@@ -49,6 +53,15 @@ pub struct ProviderReading {
     /// The vendor's own word for how bad this is. Recorded and never acted on.
     #[serde(default)]
     pub severity: String,
+}
+
+/// A list that may arrive as `null`, read as empty. See [`ProviderReading::windows`].
+fn null_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,7 +139,7 @@ impl QuotaClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|error| QuotaError(error.to_string()))?;
+            .map_err(|error| QuotaError(with_causes(&error)))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -136,8 +149,29 @@ impl QuotaClient {
         response
             .json::<QuotaReport>()
             .await
-            .map_err(|error| QuotaError(error.to_string()))
+            .map_err(|error| QuotaError(with_causes(&error)))
     }
+}
+
+/// An error and every cause under it, on one line.
+///
+/// `reqwest::Error`'s own text is only its outermost layer — "error decoding response body" — and
+/// the reason is one `source()` down. That one line was the whole of what the daemon recorded while
+/// the null-window bug above failed every fresh read, and it named no field and no type: the
+/// cause, `invalid type: null, expected a sequence`, was there all along and never printed. Nothing
+/// under it carries a credential — serde reports a position, not the text it was reading.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        let said = next.to_string();
+        if !text.contains(&said) {
+            text.push_str(": ");
+            text.push_str(&said);
+        }
+        cause = next.source();
+    }
+    text
 }
 
 #[cfg(test)]
@@ -182,6 +216,55 @@ mod tests {
         assert_eq!(report.providers.len(), 1);
         assert_eq!(report.providers[0].provider, "gemini");
         assert!(report.providers[0].windows.is_empty());
+    }
+
+    /// An unreadable provider arrives as `"windows": null`, and it must not take the other one down.
+    ///
+    /// That is what the sidecar actually sends: `reading.Unavailable` leaves the Go slice nil, and
+    /// `encoding/json` writes a nil slice as `null`, not `[]`. `#[serde(default)]` covers an ABSENT
+    /// field only — the test above — so the null failed the whole report, and the daemon fell back
+    /// to stored figures for a provider that was answering perfectly well. Captured 2026-09-24 with
+    /// the usage endpoint rate-limiting: every fresh read failed with "error decoding response
+    /// body", and the notch marked BOTH providers last-known for as long as the 429s lasted.
+    #[test]
+    fn an_unreadable_provider_sent_as_null_windows_leaves_the_other_one_readable() {
+        let report: QuotaReport = serde_json::from_str(
+            r#"{"providers":[
+                 {"provider":"claude","fidelity":"unmeasured","read_at":"2026-09-24T20:52:04Z",
+                  "windows":null,"detail":"the usage endpoint answered 429"},
+                 {"provider":"codex","fidelity":"derived","read_at":"2026-09-24T20:52:04Z",
+                  "windows":[{"window":"5h","used_fraction":0.12,
+                              "resets_at":"2026-09-24T22:35:55Z","stale":false}],
+                  "detail":"plan plus"}],
+               "cached":false}"#,
+        )
+        .expect("a null window list is an unmeasured provider, not a failed report");
+
+        assert!(report.providers[0].windows.is_empty());
+        assert_eq!(report.providers[1].windows.len(), 1);
+    }
+
+    /// The reason a decode failed has to reach the log, not just the fact that it did.
+    #[test]
+    fn a_decode_failure_names_its_cause() {
+        #[derive(Debug)]
+        struct Outer(serde_json::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error decoding response body")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let inner = serde_json::from_str::<Vec<u8>>("null").unwrap_err();
+
+        let said = with_causes(&Outer(inner));
+
+        assert!(said.starts_with("error decoding response body: "), "{said}");
+        assert!(said.contains("invalid type: null"), "{said}");
     }
 
     /// A window with no reset is a real answer (the 2026-09-19 capture had one), and `severity` is

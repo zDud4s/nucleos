@@ -24,6 +24,7 @@ export { Inset, type InsetAs, type InsetProps } from "./Inset";
  * and splitting them is how the next ceiling gets drawn as the wrong one.
  */
 export { LimitChip, Meter, usd, type LimitChipProps, type MeterProps, type MeterTone } from "./Meter";
+export { Modal, type ModalProps, type ModalSize } from "./Modal";
 export { ModeSwitch, type ModeSwitchProps, type SwitchMode } from "./ModeSwitch";
 export { PageHeader, type PageHeaderProps } from "./PageHeader";
 /**

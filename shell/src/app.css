@@ -64,95 +64,262 @@
  * that outranked them would be a quota reading covering the control somebody opened.
  */
 .quota-notch {
+  /*
+    The notch's own ground, and it is one step darker than anything else in the app on purpose:
+    it is a piece of the edge of the screen, not a panel on it — the owner's reference draws it as
+    the black of a hardware notch — and against that black the arcs are the only colour there is.
+    The bubble wears the same ground, because it is the same object reaching out.
+  */
+  --quota-notch-ground: var(--surface-sunken);
+  /* The concave flare where each end of the rail meets the edge, and the convex corner it turns
+     through on its way to the rail's long side. Together they are the S the reference draws, and
+     they are an S only while the two radii add up to the rail's width (62px, see
+     `.app-main-notched`): any less leaves a flat step between the curves, which is what the first
+     photograph of this shape had. Local rather than tokens because they are only right at this
+     size. */
+  --quota-notch-flare: 31px;
+  --quota-notch-curve: 31px;
   z-index: 1;
   width: fit-content;
   display: flex;
+  /* The bubble and the rail both hang from the start of the drawing: the bubble's own offset is
+     what lines its tail up with a ring (`QuotaNotch`, `aim`). */
+  align-items: flex-start;
+}
+
+/* The bubble always opens away from the edge the rail hangs from. The DOM is bubble-then-rail, which
+   is the right edge's order; every other edge turns it round. */
+.quota-notch[data-edge="left"] {
+  flex-direction: row-reverse;
+}
+
+.quota-notch[data-edge="top"] {
+  flex-direction: column-reverse;
+}
+
+.quota-notch[data-edge="bottom"] {
   flex-direction: column;
-  /* The rings are what is glued to the edge, so they are what the column aligns by. Unfolded, each
-     slot grows leftwards from its own ring and the ring does not move — the alternative is a
-     drawing that jumps sideways the moment the pointer arrives. */
-  align-items: flex-end;
-  /* Folded only. Tightened from `--space-3` after the first photograph: two rings with that much
-     air between them read as two separate things parked beside each other rather than as one
-     reading. Unfolded the same distance is too little, and the rule further down says why — the
-     right gap depends on what is in the column, which is the one thing that changes here. */
-  gap: var(--space-2);
-  padding: var(--space-2);
-  background: var(--surface-raised);
-  border: 1px solid var(--border);
-  /* Round on the left, square against the edge: it hangs off the side rather than floating free,
-     which is the whole shape of a notch. */
-  border-right: none;
-  border-radius: var(--radius-lg) 0 0 var(--radius-lg);
 }
 
 /**
  * The width the page gives back so the folded notch stands beside it rather than on top of it.
  *
  * Measured off the drawing rather than derived from it, because the drawing's width comes from its
- * content and CSS cannot ask: a 44px ring, `--space-2` of padding either side, one border — 61px,
- * rounded up to a whole rem, which also absorbs the three pixels of slack `Ring`'s own arithmetic
- * leaves. The first photograph of this design is what made it necessary —
- * pinned over a page at 1440px wide, the folded notch sat on the right-hand column of the Teams
- * table and hid the pulse bars in it.
+ * content and CSS cannot ask: a 38px ring and `--space-3` of padding either side — 62px, rounded
+ * up to a whole rem with the slack `Ring`'s own arithmetic leaves. The rail never widens, so this
+ * is also its width unfolded; the bubble covers the page for as long as somebody is reading it,
+ * which is the right trade against a page that reflowed every time the pointer crossed the notch.
+ * Anything that changes `Ring`'s size or the rail's padding has to come back here.
  *
- * Unfolding still covers something, and that is the right trade: a page that reflowed every time
- * the pointer crossed the notch would be worse than a panel that overlaps for as long as somebody
- * is reading it. Anything that changes `Ring`'s size or this element's padding has to come back
- * here.
+ * **Reserved whether the notch is contained or floating.** Only while contained, as it was, moving
+ * the notch moved the app: the page centres in what the main column leaves it, so every page slid
+ * sideways the moment the notch floated out or docked back.
  */
 .app-main-notched {
-  padding-right: 4rem;
+  padding-right: 4.5rem;
 }
 
 /*
-  Unfolded, each slot is three lines of text tall instead of one ring, and `--space-2` between two
-  of them stops reading as a gap at all — the second provider's window names sit right under the
-  first's fidelity line. The padding is deliberately NOT part of this: it is what holds the rings
-  off the edge, and changing it would slide them sideways every time the pointer arrived.
+  The rail: the flared top, the rings, the flared bottom, flush against the edge.
+
+  The shadow is a `drop-shadow` filter and not a `box-shadow`, because the rail's outline is three
+  boxes — two flares and a body — and a box shadow would outline each of them, drawing a seam at
+  both joins. A filter shadows the painted shape, so the notch casts one shadow as one object.
 */
-.quota-notch[data-unfolded="true"] {
-  gap: var(--space-3);
+.quota-notch-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  /* A drag is a vertical gesture on this element, and on a touch screen the browser would take it
+     for a scroll of whatever is under the notch. */
+  touch-action: none;
+  user-select: none;
+  filter: drop-shadow(0 6px 18px rgba(0, 0, 0, 0.35));
+}
+
+/* The rail is the notch's handle (`QuotaNotch`, the drag); the cursor is how that is found out. */
+/* Flush with the edge it hangs from, whichever that is; side by side on the top and bottom. */
+.quota-notch[data-edge="left"] .quota-notch-rail {
+  align-items: flex-start;
+}
+
+.quota-notch[data-edge="top"] .quota-notch-rail,
+.quota-notch[data-edge="bottom"] .quota-notch-rail {
+  flex-direction: row;
+  align-items: flex-start;
+}
+
+.quota-notch[data-edge="bottom"] .quota-notch-rail {
+  align-items: flex-end;
+}
+
+.quota-notch-rail[data-draggable="true"] {
+  cursor: grab;
+}
+
+.quota-notch-rail[data-dragging="true"] {
+  cursor: grabbing;
+}
+
+/*
+  Each flare is the square just above (or below) the body, flush with the edge, filled everywhere
+  except a quarter circle centred on its far corner. What is left is a concave curve that starts
+  at the body's end and sweeps out to meet the edge — the shape of a notch cut into the bezel,
+  rather than of a lozenge that happens to be parked beside it.
+*/
+.quota-notch-flare {
+  display: block;
+  width: var(--quota-notch-flare);
+  height: var(--quota-notch-flare);
+}
+
+.quota-notch-flare-top {
+  background: radial-gradient(
+    circle at 0 0,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+.quota-notch-flare-bottom {
+  background: radial-gradient(
+    circle at 0 100%,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+/* The same two flares on every other edge: the hollow is always centred on the corner away from
+   the edge and away from the body. `top`/`bottom` in the class names are the rail's start and end,
+   which on a top or bottom edge are its left and right. */
+.quota-notch[data-edge="left"] .quota-notch-flare-top {
+  background: radial-gradient(
+    circle at 100% 0,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+.quota-notch[data-edge="left"] .quota-notch-flare-bottom {
+  background: radial-gradient(
+    circle at 100% 100%,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+.quota-notch[data-edge="top"] .quota-notch-flare-top {
+  background: radial-gradient(
+    circle at 0 100%,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+.quota-notch[data-edge="top"] .quota-notch-flare-bottom {
+  background: radial-gradient(
+    circle at 100% 100%,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+.quota-notch[data-edge="bottom"] .quota-notch-flare-top {
+  background: radial-gradient(
+    circle at 0 0,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+.quota-notch[data-edge="bottom"] .quota-notch-flare-bottom {
+  background: radial-gradient(
+    circle at 100% 0,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+/* Round on the left, square against the edge and against both flares, which carry the outline on
+   from its corners to the edge. */
+.quota-notch-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /* Between two providers. A slot is two lines — the ring and its figure — so this has to beat the
+     distance inside one, or the eye pairs each figure with the ring below it. */
+  gap: var(--space-4);
+  /* `--space-3` above and below, not less: at a 31px corner the curve is still 8px in from the
+     rail's side at that depth, which is what clears the first and last ring. */
+  padding: var(--space-3);
+  background: var(--quota-notch-ground);
+  border-radius: var(--quota-notch-curve) 0 0 var(--quota-notch-curve);
+}
+
+/* Round on the side away from the edge, whichever edge that is; side by side on the top and
+   bottom, where the edge runs across. */
+.quota-notch[data-edge="left"] .quota-notch-body {
+  border-radius: 0 var(--quota-notch-curve) var(--quota-notch-curve) 0;
+}
+
+.quota-notch[data-edge="top"] .quota-notch-body,
+.quota-notch[data-edge="bottom"] .quota-notch-body {
+  flex-direction: row;
+}
+
+.quota-notch[data-edge="top"] .quota-notch-body {
+  border-radius: 0 0 var(--quota-notch-curve) var(--quota-notch-curve);
+}
+
+.quota-notch[data-edge="bottom"] .quota-notch-body {
+  border-radius: var(--quota-notch-curve) var(--quota-notch-curve) 0 0;
+}
+
+/*
+  Against the notch's black the ring's usual groove — the sunken ground — is the notch's own colour
+  and vanishes, leaving arcs floating with no track to be read against. The groove is the shape of
+  the question; here it takes the hairline instead. Not on an unmeasured track, which draws its
+  own dashed stroke and must keep it.
+*/
+.quota-notch .ui-ring-groove:not(.ui-ring-unmeasured) {
+  stroke: var(--border);
 }
 
 /**
  * Every figure in here is a last-known one.
  *
  * `source: "stored"` means the sidecar could not be reached and these numbers are whatever was
- * recorded last. Unfolded, the notch says so in words; folded — which is the state it spends
- * its whole life in — it said nothing at all, and drew an hour-old reading exactly as it draws
- * a live one. That is the single thing this app forbids itself (`PRODUCT.md`: stale, refused and
- * empty are different things and must never render as one), and a hairline is a cheap place to say
- * it.
+ * recorded last. Unfolded, the bubble says so in words; folded — which is the state the notch
+ * spends its whole life in — the rail has to say it alone (`PRODUCT.md`: stale, refused and empty
+ * are different things and must never render as one).
  *
- * **Dashed, and not coloured.** This app has already decided how it says stale: `.ui-note-stale`
- * carries no tone whatever — muted italic text — and a dash is what `.ui-ring-unmeasured`
- * and `.ui-runpipe-unreached` already mean by *this is not a live fact*. Borrowing a state tone
- * here would say something about the quota, and the quota is not what changed; the connection to
- * the thing that measures it is.
+ * **Quieter, and not outlined.** This was a dashed line round the rail, the mark `.ui-ring-
+ * unmeasured` uses for *this is not a live fact*. The owner did not want it: the sidecar misses a
+ * refresh now and then, and each miss drew a dashed box round the notch for as long as it lasted —
+ * a frame flickering on and off the edge of the screen. The readings go quiet instead, at the
+ * opacity this app already uses for a mark that must not compete. Still no tone: the quota is not
+ * what changed, the connection to the thing that measures it is.
  */
-.quota-notch[data-stored="true"] {
-  border-style: dashed;
+.quota-notch[data-stored="true"] .quota-notch-slot {
+  opacity: var(--opacity-quiet);
 }
 
 /**
  * Pinned to the middle of the window's right edge. See the header for why this is `fixed`.
  *
- * **`right: 0` is ten pixels short of the right edge, and no value here can close them.** `html`
- * carries `scrollbar-gutter: stable` (`base.css`), so the browser reserves a strip for a scrollbar
- * and takes it out of the box a fixed element is positioned against: measured in the engine rather
- * than guessed, `documentElement.clientWidth` answers 1430 in a 1440px window. The notch therefore
- * hangs off a line ten pixels inside the glass, with its square right-hand edge and a stripe of
- * page beyond it.
+ * **`right: 0` is the glass, and it was not always.** `html` reserves a scrollbar gutter
+ * (`base.css`), and a reserved gutter comes out of the box a fixed element is laid against — the
+ * notch hung ten pixels short of the window's edge, with a stripe of page beyond its flares.
+ * `calc(100% - 100vw)` cannot close it (Chromium resolves `100vw` to the same reduced box), so the
+ * fix is at the source: `base.css` gives the gutter back while `.app-shell` is mounted, which is
+ * exactly when the root cannot scroll and the gutter had nothing to guard.
  *
- * `calc(100% - 100vw)` was tried here and is a no-op: Chromium resolves `100vw` to that same
- * reduced box, so the difference is zero and CSS has no way to ask how wide the gutter is. The
- * only honest fixes are outside this rule — either a hardcoded offset, which is a guess about an
- * engine that has changed its scrollbar width twice, or `base.css` giving the gutter up. That
- * gutter guards the scroll-lock compensation at the end of that file and nothing else in this app
- * scrolls the root (`.app-shell` is `overflow: hidden`, `.app-main` does the scrolling), so it may
- * well be reservable for nothing — but deciding that is a change to every surface, not to this
- * one. Left measured and named rather than papered over.
+ * **Hung from the same line of the screen as the floating notch.** Centred in this window, as it
+ * was, the two hosts agreed only by accident: the floating notch centres on the monitor's work
+ * area (`notch.rs`, `hang`), this one centred on the page area, which starts under the title bar
+ * and moves and shrinks with the window — so docking or floating the notch moved it up or down.
+ * `useScreenLine` asks Tauri where this window sits, and the rule after this one hangs the notch
+ * from the work area's middle, clamped into the window when the window does not reach it.
  *
  * **Hung by the top of the folded drawing, not centred on the drawing it is.** `translateY(-50%)`
  * re-centred the notch on every unfold, so the panel opened by moving both rings up by half of
@@ -163,66 +330,148 @@
 .quota-notch-contained {
   position: fixed;
   right: 0;
-  top: calc(50% - var(--quota-notch-rest, 0px) / 2);
+  /* Where the owner dragged it (`--quota-notch-along`, the middle until they do), as a fraction of
+     this window when there is no screen line to hang from — and clamped, so a notch dragged to an
+     end stops at the window's edge rather than hanging half off it. */
+  top: clamp(
+    0px,
+    calc(var(--quota-notch-along, 0.5) * 100% - var(--quota-notch-rest, 0px) / 2),
+    calc(100% - var(--quota-notch-rest, 0px))
+  );
+}
+
+/* Hung from the line the floating notch is centred on (`useScreenLine`), so docking and floating do
+   not move it. Clamped into the window: one that does not reach that line cannot draw the notch on
+   it, and the nearest edge is the honest second best. Without an anchor — outside Tauri, in the
+   preview and the tests — the centring above stands. */
+.quota-notch-contained[data-anchored="true"] {
+  top: clamp(
+    0px,
+    calc(var(--quota-notch-line) - var(--quota-notch-rest, 0px) / 2),
+    calc(100% - var(--quota-notch-rest, 0px))
+  );
+}
+
+/* The other edges. Left is the window's left edge, over the rail of destinations: the notch is about
+   the screen, and the left edge of the screen is where the owner put it. On the top and bottom the
+   same clamp runs across the window instead of down it, and `--quota-notch-rest` is the folded
+   drawing's width (`QuotaNotch`). */
+.quota-notch-contained[data-edge="left"] {
+  right: auto;
+  left: 0;
+}
+
+.quota-notch-contained[data-edge="top"],
+.quota-notch-contained[data-edge="bottom"] {
+  right: auto;
+  left: clamp(
+    0px,
+    calc(var(--quota-notch-along, 0.5) * 100% - var(--quota-notch-rest, 0px) / 2),
+    calc(100% - var(--quota-notch-rest, 0px))
+  );
+}
+
+.quota-notch-contained[data-anchored="true"][data-edge="top"],
+.quota-notch-contained[data-anchored="true"][data-edge="bottom"] {
+  left: clamp(
+    0px,
+    calc(var(--quota-notch-line) - var(--quota-notch-rest, 0px) / 2),
+    calc(100% - var(--quota-notch-rest, 0px))
+  );
+}
+
+.quota-notch-contained[data-edge="top"],
+.quota-notch-contained[data-anchored="true"][data-edge="top"] {
+  top: 0;
+}
+
+.quota-notch-contained[data-edge="bottom"],
+.quota-notch-contained[data-anchored="true"][data-edge="bottom"] {
+  top: auto;
+  bottom: 0;
+}
+
+/* One provider on the rail: its ring, and the figure it adds up to. Centred on each other, so the
+   percentage sits under the middle of the arcs whatever it is wide. */
+.quota-notch-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
 }
 
 /*
-  One provider: its rings, and — unfolded — what they add up to in words.
+  The one reading the notch prints at rest: how much of the tightest window is gone, and which
+  window that is, on one line so a slot stays two lines tall.
 
-  `row-reverse` rather than a different DOM order. The ring comes first in the markup because it is
-  the thing, and its detail second because it is about the thing: that is the order assistive tech
-  reads and the order focus moves in. Reversing only the drawing puts the ring against the edge
-  without lying to either.
+  In the display face, which `DESIGN.md` gives to titles and figures — the reference sets it large
+  and plain under each ring, and mono at this size read as a code fragment rather than as a number
+  somebody looks up at. Tabular all the same: a percentage that drifts sideways as its digits
+  change, under a ring that does not move, is the kind of jitter nobody can name.
 */
-.quota-notch-slot {
+.quota-notch-headline {
   display: flex;
-  flex-direction: row-reverse;
-  /* The ring hangs from the top of its figures rather than sitting on their middle. Centred, it
-     moved down by half of what the three lines outgrow it by every time the panel opened, and the
-     whole point of hanging the notch from its top edge is that the ring the pointer is on does not
-     move at all. */
-  align-items: flex-start;
-  gap: var(--space-3);
+  align-items: baseline;
+  gap: 0.2em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.quota-notch-headline-percent {
+  font-family: var(--font-display);
+  /* `--text-sm`, down from `--text-md` on the owner's call: at the larger size the figure was the
+     widest thing on the rail and set its width, not the ring. */
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+/* Which window the figure is about. The unit, not the reading: small and faint, so it qualifies the
+   number without competing with it. */
+.quota-notch-headline-window {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* No window could be read now, so there is no figure. A bold em dash reads as a value somebody
+   measured, which is the one thing an absence must not do. */
+.quota-notch-headline-absent {
+  font-weight: var(--weight-regular);
+  color: var(--text-faint);
 }
 
 /**
- * The numbers, in three columns: the window, its percentage, and when it reopens.
+ * The bubble: one provider's reading, beside the rail, with a tail pointing at its ring.
  *
- * One grid for both windows, with each line `display: contents`, so the three columns line up
- * across them — `7d` over `5h`, `46%` over `82%`, and the two reset phrases sharing a left edge.
- * A grid per line would align nothing, and two rows of independently sized text read as a list of
- * fragments rather than as a table of one provider's state.
+ * **Beside the rail, never inside it.** It is a flex item to the left of the rail, so the drawing
+ * grows leftwards and the rail — rings, flares and all — stays exactly where it was. Its top is
+ * pushed along the edge by `--quota-notch-pop-at`, which `QuotaNotch` measures so the tail lands on the
+ * middle of the ring the bubble is about.
  *
- * `text-align: right` on the percentage is what makes `46%` and `100%` end at the same place. It
- * is the only column whose width changes with its content.
+ * **Sized, not fitted.** `min-width`, because what is inside is mostly bars, and a bar takes its
+ * meaning from its length: a bubble that shrank to its longest phrase would draw the same
+ * percentage at two lengths for two providers.
+ *
+ * The margin on the right is the room the tail points across.
  */
-.quota-notch-detail {
-  display: grid;
-  grid-template-columns: auto auto auto;
-  /* Three mono columns at `--space-2` ran together into one stripe of text: `7d` `46%` `resets in
-     3d` read as a single word before it read as three facts. */
-  column-gap: var(--space-3);
-  /* Was 1px, which is not a gap — two lines of mono at that distance are a block, and the unfolded
-     notch read as a paragraph nobody would finish. */
-  row-gap: var(--space-1);
-  /* Three columns of text at three sizes, and the default aligns their BOXES: every line is a grid
-     item stretched to the row's height with its own line box at the top of it, so the 13px
-     percentage sat about a pixel below the 11px label it belongs to. A row of text is read along
-     its baseline, so that is what has to line up — the kind of pixel nobody can name and
-     everybody sees. */
-  align-items: baseline;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  /* The daemon's own figures, so the app's rule applies: mono, and tabular. Right-aligning the
-     percentage was half the job — `46%` and `100%` end at the same place — and proportional
-     digits undid the other half, because `11%` and `46%` are then different widths and the column's
-     left edge frays. `.ui-pips-count` and `.ui-limit` already say it this way. */
-  font-variant-numeric: tabular-nums;
-  color: var(--text-muted);
-  white-space: nowrap;
-  /* One authored moment, and it is the reveal itself: the panel arrives from under the ring it
-     belongs to, 4px, the distance being a hint about where it came from rather than a journey.
-     `--dur-quick` because somebody is mid-glance, not watching.
+.quota-notch-pop {
+  position: relative;
+  margin-top: var(--quota-notch-pop-at, 0px);
+  margin-right: var(--space-3);
+  /* Where the bubble arrives from: the rail, so towards the edge it hangs from. */
+  --quota-notch-from: translateX(4px);
+  min-width: 15rem;
+  padding: var(--space-3) var(--space-4) var(--space-3);
+  background: var(--quota-notch-ground);
+  /* The reference draws no edge, and on the desktop it needs none. Over this app's own dark page
+     the notch's black is one step from the page's, so a hairline is what keeps the bubble from
+     dissolving into whatever it covers. */
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  box-shadow: var(--shadow-lg);
+  /* One authored moment, and it is the reveal itself: the bubble arrives from the ring it belongs
+     to, 4px, the distance being a hint about where it came from rather than a journey.
 
      **Opacity and a transform, and never the geometry.** The floating host is a window the Rust
      side fits round this drawing — `NotchWindow`'s `ResizeObserver` calls `notch_fit` with the
@@ -233,111 +482,286 @@
   animation: quota-notch-unfold var(--dur-quick) var(--ease);
 }
 
+/* Away from whichever edge the rail hangs from, and pushed along that edge. */
+.quota-notch[data-edge="left"] .quota-notch-pop {
+  margin-right: 0;
+  margin-left: var(--space-3);
+  --quota-notch-from: translateX(-4px);
+}
+
+.quota-notch[data-edge="top"] .quota-notch-pop,
+.quota-notch[data-edge="bottom"] .quota-notch-pop {
+  margin-top: 0;
+  margin-right: 0;
+  margin-left: var(--quota-notch-pop-at, 0px);
+}
+
+.quota-notch[data-edge="top"] .quota-notch-pop {
+  margin-top: var(--space-3);
+  --quota-notch-from: translateY(-4px);
+}
+
+.quota-notch[data-edge="bottom"] .quota-notch-pop {
+  margin-bottom: var(--space-3);
+  --quota-notch-from: translateY(4px);
+}
+
 @keyframes quota-notch-unfold {
   from {
     opacity: 0;
-    transform: translateX(4px);
+    transform: var(--quota-notch-from);
   }
 }
 
-/* The way out is the way in, played back: the same 4px towards the ring, the same duration.
-   `forwards` holds the last frame, so nothing flashes back to full ink in the instant between the
-   animation ending and `QuotaNotch` taking the panel away (`FOLD_MS`, which is this duration). */
+/* The way out is the way in, played back. `forwards` holds the last frame, so nothing flashes back
+   to full ink between the animation ending and `QuotaNotch` taking the bubble away (`FOLD_MS`,
+   which is this duration). */
 @keyframes quota-notch-fold {
   to {
     opacity: 0;
-    transform: translateX(4px);
+    transform: var(--quota-notch-from);
   }
 }
 
-/* The rest of what the unfold brings — the move control and the "last known" line — arrives with
-   the figures rather than a frame before them, so the panel appears as one thing. A little after
-   them, because they are about the reading and not the reading itself. */
-.quota-notch[data-unfolded="true"] > .quota-notch-control,
-.quota-notch[data-unfolded="true"] > .quota-notch-stale {
-  animation: quota-notch-unfold var(--dur-quick) var(--ease) 40ms backwards;
-}
-
-.quota-notch[data-folding="true"] .quota-notch-detail,
-.quota-notch[data-folding="true"] > .quota-notch-control,
-.quota-notch[data-folding="true"] > .quota-notch-stale {
+.quota-notch[data-folding="true"] .quota-notch-pop {
   animation: quota-notch-fold var(--dur-quick) var(--ease) forwards;
 }
 
-.quota-notch-line {
-  display: contents;
+/*
+  The tail: a square turned an eighth, with only the two edges that end up facing the ring carrying
+  the hairline, so the seam with the bubble is invisible and the outline runs unbroken round both.
+  Its middle is `--quota-notch-tail-at` from the bubble's start — the ring's centre, measured.
+*/
+.quota-notch-pop::after {
+  content: "";
+  position: absolute;
+  top: calc(var(--quota-notch-tail-at, 26px) - 7px);
+  right: -8px;
+  width: 14px;
+  height: 14px;
+  background: var(--quota-notch-ground);
+  border-top: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  border-top-right-radius: var(--radius-sm);
+  transform: rotate(45deg);
 }
 
-/*
-  The figure the unfold exists to show, so it is the one thing here drawn at full size and full ink
-  — the window beside it and the reset after it are its labels, and a percentage set in the same
-  small grey as both of them is a table with no subject.
-*/
-.quota-notch-percent {
-  text-align: right;
-  font-size: var(--text-sm);
-  font-weight: var(--weight-semibold);
+/* The tail on the other edges: on the bubble's side facing the rail, with the two edges that end up
+   facing the ring carrying the hairline. */
+.quota-notch[data-edge="left"] .quota-notch-pop::after {
+  right: auto;
+  left: -8px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+  border-radius: 0 0 0 var(--radius-sm);
+}
+
+.quota-notch[data-edge="top"] .quota-notch-pop::after,
+.quota-notch[data-edge="bottom"] .quota-notch-pop::after {
+  right: auto;
+  left: calc(var(--quota-notch-tail-at, 26px) - 7px);
+  border: 0;
+}
+
+.quota-notch[data-edge="top"] .quota-notch-pop::after {
+  top: -8px;
+  border-top: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+  border-radius: var(--radius-sm) 0 0 0;
+}
+
+.quota-notch[data-edge="bottom"] .quota-notch-pop::after {
+  top: auto;
+  bottom: -8px;
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  border-radius: 0 0 var(--radius-sm) 0;
+}
+
+/* The reading, in the face a person reads: names and phrases in the body face, figures in the
+   display face. Only the fidelity line, which is the daemon's own vocabulary, stays mono. */
+.quota-notch-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* The mark and the name, as the reference titles its bubble. */
+.quota-notch-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
   color: var(--text);
 }
 
+.quota-notch-name {
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+}
+
+/* Shown only when the sidecar could not be reached. The figures below it are real and old. Pushed
+   to the far end of the title, where it qualifies the whole bubble rather than one row of it. */
+.quota-notch-stale {
+  margin-left: auto;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
 /*
-  A window nobody could read has no figure, and an em dash is not one. Drawn in the weight and the
-  full ink of a percentage it reads as a value somebody measured — a bold absence, which is the
-  one thing an absence must not be. It is a fact about the source, so it is set like the phrase
-  beside it that explains the source.
+  One window: what it is and when it reopens, the bar, and the figure. The three lines sit at
+  `--space-1`, tighter than the `--space-3` between two windows — the blocks have to read as blocks
+  before the lines inside them read as lines.
 */
+.quota-notch-line {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* The window's name against its reset, at the two ends of the bar they are about. */
+.quota-notch-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+/* The subject of the three lines under it, so the one thing in the row in full ink. */
+.quota-notch-window {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+.quota-notch-reset {
+  color: var(--text-faint);
+}
+
+/*
+  The same fraction as the arc, laid flat. The pill is not decoration: a rounded end keeps a 2%
+  window from drawing as a hard little tick that reads like a scale marker rather than like the
+  start of a fill. The track is the hairline colour, the same one the ring's groove takes here.
+*/
+.quota-notch-bar {
+  display: block;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--border);
+  /* The fill is a pill too, so at 100% its right end would round inside a track that does not.
+     Clipping is what makes a full window look full. */
+  overflow: hidden;
+}
+
+/* Nobody could read this window, so there is no length to draw. Dashed and empty, the convention
+   `.ui-ring-unmeasured` already carries: an empty bar and an unread one must not be one picture. */
+.quota-notch-bar-absent {
+  background: none;
+  border: 1px dashed var(--tone-off-border);
+}
+
+/* No transition on the width, where the arc beside it does animate its own fill. The arc moves a
+   dash pattern, which is paint; a width is layout. And the bubble is built on the unfold, so a fill
+   is mounted at its final width — only a reading landing while somebody holds the notch open would
+   have anything to animate. `.ui-gauge-fill`, the app's own bar, settled this the same way. */
+.quota-notch-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--radius-pill);
+}
+
+/* The tone comes from the one map (`readState`, via `toneOf` in `QuotaNotch.tsx`), so a bar and
+   the arc drawn from the same track cannot disagree about what it means. */
+.quota-notch-bar-info {
+  background: var(--tone-info-fg);
+}
+
+.quota-notch-bar-pending {
+  background: var(--tone-pending-fg);
+}
+
+.quota-notch-bar-danger {
+  background: var(--tone-danger-fg);
+}
+
+.quota-notch-bar-off {
+  background: var(--tone-off-fg);
+}
+
+/* The figure and the word after it, on one baseline. */
+.quota-notch-figure {
+  display: flex;
+  align-items: baseline;
+  gap: 0.3em;
+}
+
+/* The figure the bubble exists to show: full ink, in the face `DESIGN.md` gives to figures. */
+.quota-notch-percent {
+  font-family: var(--font-display);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+/* A window nobody could read has no figure, and an em dash is not one. Set like the phrase that
+   explains the source, not like a measurement. */
 .quota-notch-percent-absent {
   font-weight: var(--weight-regular);
   color: var(--text-faint);
 }
 
-.quota-notch-reset,
-.quota-notch-fidelity {
-  color: var(--text-faint);
+/* What the percentage is OF. `46%` alone is a quantity with no verb: used, left, or of some
+   ceiling nobody named. */
+.quota-notch-used {
+  color: var(--text-muted);
 }
 
-/*
-  Across all three columns, under them, and ruled off: it is about the reading, not about one
-  window of it, and without the rule it read as a third window whose name had gone missing.
-*/
-.quota-notch-fidelity {
-  grid-column: 1 / -1;
-  margin-top: var(--space-1);
-  padding-top: var(--space-1);
-  border-top: 1px solid var(--border);
-}
-
-/**
- * The wrapper round the way to the other host, ruled off from the readings above it.
- *
- * **The rule is the point.** Stacked in the same narrow column, at the same size, with the same air
- * round it, a control reads as a third instrument: the first photograph of the contained notch has
- * a pin glyph sitting under two rings like a provider nobody had drawn a quota for. This app admits
- * two categories of thing on a screen, instruments and controls, and one hairline is enough to say
- * which of them this is.
- *
- * **A flex row, where this used to be `display: contents`.** The wrapper was transparent to the
- * layout so that the button, and not the span, was the flex item — an inline span would have sat
- * on a baseline instead of on the notch's centre line and grown the strip by a descender it never
- * needed. A flex container has no baseline to sit on either, so it keeps that property, and unlike
- * `display: contents` it has a box to hang the rule on.
- *
- * In the floating host, folded, this class is swapped for `.sr-only` (`QuotaNotch.tsx`): the
- * control stays reachable by focus without being drawn, and nothing of it — the rule included
- * — measures anything for the window the Rust side fits round the drawing.
- */
-.quota-notch-control {
-  align-self: stretch;
+/* How the reading was come by, and the way to the other host, sharing the bubble's last line. */
+.quota-notch-foot {
   display: flex;
-  justify-content: flex-end;
-  padding-top: var(--space-2);
-  border-top: 1px solid var(--border);
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
 }
 
-/* Shown only when the sidecar could not be reached. The figures above it are real and old. */
-.quota-notch-stale {
+/* The daemon's own words for its source — `official`, `derived` — so the mono face, and quiet. */
+.quota-notch-fidelity {
+  font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* The way to the other host: a control, and nothing about the reading, so it sits at the far end
+   of the footer out of the reading's way. Folded it has no class at all — it is inside the
+   `.sr-only` bubble, reachable by focus and drawn nowhere (`QuotaNotch.tsx`). */
+.quota-notch-control {
+  display: flex;
+  gap: var(--space-1);
+  margin-left: auto;
+}
+
+/* The update control's glyph turns while a reading is on its way. Under reduced motion the global
+   guard in `base.css` stops it, and `aria-busy` still says the same thing. */
+.quota-notch-update {
+  display: flex;
+}
+
+.quota-notch-update[data-busy="true"] .ui-icon-button-glyph {
+  animation: quota-notch-turn 0.9s linear infinite;
+}
+
+@keyframes quota-notch-turn {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /**
@@ -853,47 +1277,21 @@
   mask-image: var(--scroll-fade);
   -webkit-mask-image: var(--scroll-fade);
   /*
-    A thin scrollbar, and the fade above still does the other half of the job.
+    No scrollbar: the owner's call (2026-09-24). The region still scrolls by wheel, touchpad and
+    keyboard; only the bar is gone, and the fade above is what says the list continues.
 
-    This region used to have no scrollbar at all. The argument for that was
-    real and is kept here, because it is the argument this 4px bar has to
-    answer rather than contradict: a classic scrollbar is ~15px of the 40px
-    inside a collapsed rail, taken from the right, which pushed every icon five
-    pixels off the centre it was supposed to sit on. That is a genuine cost and
-    it is why the default bar is not what is here.
-
-    What the no-bar version got wrong is the other half. Hiding the furniture is
-    how the pasted design lost eight destinations, and the mask alone does not
-    replace it: the fade says "this continues", which is the oldest signal there
-    is, but it says nothing about HOW MUCH continues or where in the list you
-    are. On a rail of twenty destinations that is the difference between one more
-    row below the fold and twelve.
-
-    4px is the width at which both are true. It is a quarter of the ~15px the old
-    comment objected to, so a collapsed rail keeps 36 of its 40 and the icons stay
-    where the axis puts them; and it is a real thumb, sized to the list, so the
-    depth of the list is visible. The mask stays exactly as it was — the two are
-    not alternatives, they answer different questions.
+    It had a 4px bar before this, with a case worth keeping in view: the fade says THAT the list
+    continues but not how much of it is left, and on a short window the rail's twenty destinations
+    can run a long way below the fold. That is the cost this choice accepts. The older objection to
+    a bar — a classic ~15px one pushed every icon of the collapsed rail off its axis — no longer
+    applies to anything, since nothing is drawn at all.
   */
-  scrollbar-width: thin;
-  scrollbar-color: var(--border-strong) transparent;
+  scrollbar-width: none;
 }
 
-/* WebKit says the same thing in its own vocabulary — this is the same 4px bar
-   the two `scrollbar-*` properties above declare, not a second decision. The
-   track is transparent so the rail's own surface runs under it: a track with a
-   colour would read as a second edge beside the one the rail already has. */
+/* WebKit's spelling of the same decision: no bar, and so nothing for it to take from the rail. */
 .nav-scroll::-webkit-scrollbar {
-  width: 4px;
-}
-
-.nav-scroll::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border-radius: 2px;
-}
-
-.nav-scroll::-webkit-scrollbar-track {
-  background: transparent;
+  display: none;
 }
 
 .nav-group + .nav-group {

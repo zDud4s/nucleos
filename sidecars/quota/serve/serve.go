@@ -94,10 +94,10 @@ func quotaHandler(
 			return
 		}
 
-		providers := []reading.Provider{
+		providers := onTheWire([]reading.Provider{
 			readers.Claude(r.Context(), at),
 			readers.Codex(at),
-		}
+		})
 
 		// The shorter TTL wins whenever anything failed: a provider that is down should be retried
 		// on the error cadence even while the other one is happily cached. Holding a bad answer for
@@ -113,6 +113,23 @@ func quotaHandler(
 		c.at, c.answer, c.ttl = at, providers, ttl
 		writeJSON(w, Response{Providers: providers, Cached: false})
 	}
+}
+
+// onTheWire gives every provider an empty window list where it has none, so it is sent as `[]`.
+//
+// encoding/json writes a nil slice as null, and reading.Unavailable — every provider that could not
+// be read — leaves Windows nil. The núcleo decodes the field as a list, and a null there failed its
+// whole decode: one rate-limited provider made the other one's live figures read as last-known
+// (2026-09-24, while the usage endpoint answered 429). Done here, once, because this is the one
+// place every reader's answer passes through on its way out, and before the answer is cached so a
+// cache hit carries the same bytes as the fresh read that filled it.
+func onTheWire(providers []reading.Provider) []reading.Provider {
+	for i := range providers {
+		if providers[i].Windows == nil {
+			providers[i].Windows = []reading.Window{}
+		}
+	}
+	return providers
 }
 
 // authorized wraps a handler with the bearer check. Constant-time, like the web and email sidecars'.

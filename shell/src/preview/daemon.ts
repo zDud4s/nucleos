@@ -1909,6 +1909,62 @@ const RUN_STOP = {
 
 const RUN_TAIL = { text: "", next: 0, live: false } satisfies RunTailChunk;
 
+/**
+ * A run still going, the case the live tail exists for: run 2, with a tail in the runner's own
+ * stream-json — envelopes, a tool result printed twice, the thinking-token estimate — so the shot
+ * shows the readable view against the wire it has to read, not against tidy text.
+ */
+const LIVE_RUN_DETAIL = {
+  ...RUN_DETAIL,
+  id: 2,
+  project_id: "bravo",
+  status: "running",
+  gate_status: null,
+  gate_exit_code: null,
+  exit_code: null,
+  stdout: null,
+  cost_usd: null,
+  num_turns: null,
+  session_id: "6ea4f44e-a137-4b99-ae21-211a852c7439",
+} satisfies RunDetail;
+
+const LIVE_TAIL_TEXT = [
+  { type: "system", subtype: "init", model: "claude-sonnet-5-5", session_id: "6ea4f44e" },
+  {
+    type: "assistant",
+    message: {
+      content: [
+        { type: "text", text: "I'll start by checking which processes hold the approval queue's lock." },
+        { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ps -ef | grep nucleos", description: "List the daemon's processes" } },
+      ],
+    },
+  },
+  {
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "     PID    PPID    PGID     WINPID   TTY  UID    STIME COMMAND\n    1412       1    1412      10988  ?    197609 17:31:02 /c/Projects/nucleos/nucleos-core\n    1530    1412    1412      11204  ?    197609 17:31:04 /usr/bin/git", is_error: false }] },
+    tool_use_result: { stdout: "PID PPID ..." },
+  },
+  { type: "system", subtype: "thinking_tokens", estimated_tokens: 50 },
+  {
+    type: "assistant",
+    message: {
+      content: [
+        { type: "tool_use", id: "toolu_2", name: "Read", input: { file_path: "core/src/queue.rs" } },
+      ],
+    },
+  },
+  {
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "toolu_2", content: Array.from({ length: 14 }, (_, at) => `${at + 1}\tfn line_${at + 1}() {}`).join("\n"), is_error: false }] },
+  },
+  {
+    type: "assistant",
+    message: { content: [{ type: "text", text: "The lock is taken in `admit` and released only on the success path — an early return leaves it held. The fix is a guard that drops it on every path." }] },
+  },
+]
+  .map((line) => JSON.stringify(line))
+  .join("\n") + "\n";
+
 const EMAIL_DETAIL = {
   id: 1,
   from_addr: "mira.chen@example.com",
@@ -2072,6 +2128,29 @@ const QUOTA: QuotaReport = {
   ],
 };
 
+/** The files root by folder path, as `GET /files?path=` lists it. */
+const FILES: Record<string, { name: string; is_dir: boolean; size_bytes: number; modified: string | null }[]> = {
+  "": [
+    { name: "invoices", is_dir: true, size_bytes: 0, modified: ago(2 * DAY) },
+    { name: "mail-filing", is_dir: true, size_bytes: 0, modified: ago(3 * HOUR) },
+    { name: "scans", is_dir: true, size_bytes: 0, modified: ago(9 * DAY) },
+    { name: "team-alpha", is_dir: true, size_bytes: 0, modified: ago(DAY) },
+    { name: "notes.md", is_dir: false, size_bytes: 4_812, modified: ago(40 * MINUTE) },
+    {
+      name: "2026-09-18-quarterly-supplier-reconciliation-with-all-attachments-merged-final-v3.pdf",
+      is_dir: false,
+      size_bytes: 3_418_902,
+      modified: ago(6 * DAY),
+    },
+    { name: "roster-export.csv", is_dir: false, size_bytes: 91_220, modified: null },
+  ],
+  invoices: [
+    { name: "2026", is_dir: true, size_bytes: 0, modified: ago(2 * DAY) },
+    { name: "INV-20417.pdf", is_dir: false, size_bytes: 211_004, modified: ago(2 * DAY) },
+  ],
+  "mail-filing": [{ name: "from-accountant", is_dir: true, size_bytes: 0, modified: ago(3 * HOUR) }],
+};
+
 export function answer(path: string, init?: RequestInit): unknown {
   /*
     The house's capacity, with nobody holding a slot. It is here so the Codigo
@@ -2115,6 +2194,10 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (/^\/jobs\/\d+$/.test(path)) return JOB_VIEW;
   if (path === "/route/report" || path.startsWith("/route/report?")) return ROUTE_REPORT;
   if (/^\/runs\/\d+\/stop$/.test(path)) return RUN_STOP;
+  if (/^\/runs\/2\/tail\?since=0$/.test(path)) {
+    return { text: LIVE_TAIL_TEXT, next: LIVE_TAIL_TEXT.length, live: true } satisfies RunTailChunk;
+  }
+  if (/^\/runs\/2\/tail/.test(path)) return { text: "", next: LIVE_TAIL_TEXT.length, live: true } satisfies RunTailChunk;
   if (/^\/runs\/\d+\/tail/.test(path)) return RUN_TAIL;
   if ((path === "/runs" || path.startsWith("/runs?")) && init?.method === undefined) {
     const [, query] = splitQuery(path);
@@ -2132,6 +2215,7 @@ export function answer(path: string, init?: RequestInit): unknown {
     const limit = rawLimit === null ? Number.NaN : Number(rawLimit);
     return Number.isFinite(limit) ? runs.slice(0, limit) : runs;
   }
+  if (path === "/runs/2" && init?.method === undefined) return LIVE_RUN_DETAIL;
   if (/^\/runs\/\d+$/.test(path) && init?.method === undefined) return RUN_DETAIL;
   if (/^\/email\/\d+$/.test(path) && init?.method === undefined) return EMAIL_DETAIL;
   if (path === "/email/queue" || path.startsWith("/email/queue?")) {
@@ -2151,6 +2235,37 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path.startsWith("/email/cursor?")) return { uidvalidity: 1_694_512_331, last_uid: 48_213 };
 
   if (path === "/projects") return PROJECTS;
+
+  /*
+    The files root, filled — every other page's shots had content and this one only ever had
+    its empty state, which hides the table, the tree, long names and the selection bar. `?empty`
+    keeps that state photographable. `scans` is the folder `refusal` below turns into a 500, so
+    the tree's unread mark is in the shot rather than only in a test.
+  */
+  if (path.startsWith("/files?")) {
+    const empty = typeof location !== "undefined" && location.search.includes("empty");
+    return empty ? [] : (FILES[splitQuery(path)[1].get("path") ?? ""] ?? []);
+  }
+  // Two entries in the trash, a file and a folder, so the Recently deleted
+  // fold has rows to draw when a shot opens it.
+  if (path === "/files/trash") {
+    return [
+      {
+        id: "20260924T090500123-a1",
+        path: "invoices/2026-08-draft.pdf",
+        is_dir: false,
+        size_bytes: 88_210,
+        deleted_at: "2026-09-24T09:05:00Z",
+      },
+      {
+        id: "20260921T171200004-b7",
+        path: "old-exports",
+        is_dir: true,
+        size_bytes: 0,
+        deleted_at: "2026-09-21T17:12:00Z",
+      },
+    ];
+  }
 
   /*
     The inspector's readers, which are the only routes here that carry a query
@@ -2611,7 +2726,8 @@ export function answerText(path: string): string | null {
  * apart. Left at 200 it would be the one absence nobody could ever photograph.
  */
 export function refusal(path: string): number | null {
-  const [route] = splitQuery(path);
+  const [route, query] = splitQuery(path);
+  if (route === "/files" && query.get("path") === "scans") return 500;
   const reader = /^\/projects\/([^/]+)\/(ls|cat|grep|diff)$/.exec(route);
   if (reader === null) return null;
   const root = PROJECTS.find((row) => row.project_id === reader[1])?.project_root ?? null;

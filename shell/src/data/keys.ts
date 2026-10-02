@@ -552,6 +552,8 @@ export const keys = {
     all: ["files"] as const,
     list: (path: string) => ["files", "list", path] as const,
     search: (path: string, q: string) => ["files", "search", path, q] as const,
+    /** `GET /files/trash` — under `all`, so every files mutation refreshes it too. */
+    trash: ["files", "trash"] as const,
   },
 
   system: {

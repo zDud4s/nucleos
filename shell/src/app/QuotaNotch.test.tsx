@@ -79,24 +79,44 @@ describe("QuotaNotch", () => {
   });
 
   /**
-   * The provider's name is not drawn, in either host and in either state — the whole point of the
-   * mark that replaced it. Asserted as its own test because it is a decision somebody will
-   * eventually be tempted to undo by adding a caption back "for clarity", and this is where that
-   * conversation should happen.
+   * On the rail the provider is a mark, never a word: at that size the word cost more room than the
+   * drawing it labelled. The bubble has the room, and titles itself with the name — the first thing
+   * a reader of it wants, and what the owner's reference for this design puts at its head.
    *
-   * What still says it: the ring's sentence for assistive tech, which the test above reads, and the
-   * slot's hover text, which this one checks.
+   * What says it on the rail: the ring's sentence for assistive tech, which the test above reads,
+   * and the slot's hover text, which this one checks.
    */
-  it("names the provider in its mark and its hover text, never in print", async () => {
-    const { container, queryByText } = await folded();
+  it("names the provider by its mark on the rail, and in words in the bubble", async () => {
+    const { container, findByText, queryByText } = await folded();
     expect(container.querySelector(".ui-provider-mark path")).not.toBeNull();
     expect(container.querySelector(".quota-notch-slot")?.getAttribute("title")).toContain("claude");
+    // Folded, no caption anywhere: `queryByText` matches a whole text node, which a caption would be.
+    expect(queryByText(/claude usage/i)).toBeNull();
 
     fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
-    await waitFor(() => expect(container.querySelector(".quota-notch-detail")).not.toBeNull());
-    // Unfolded, and still nowhere: `queryByText` matches a whole text node, which is what a caption
-    // would be. The sentence for assistive tech is longer than the name, so it is not a false hit.
-    expect(queryByText("claude")).toBeNull();
+    expect((await findByText("Claude usage")).closest(".quota-notch-pop")).not.toBeNull();
+  });
+
+  /**
+   * The bubble is about ONE provider — the ring the pointer is on — and follows the pointer down
+   * the rail. Opened some other way (focus, or the rail between rings) it is about the first.
+   */
+  it("opens its bubble for the ring the pointer reaches", async () => {
+    answer({
+      providers: [claude(), claude({ provider: "codex", fidelity: "unmeasured", windows: [], detail: "no rollouts" })],
+    });
+    const { container, findByText, queryByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/codex: 7d /);
+
+    fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
+    await findByText("Claude usage");
+    expect(queryByText("Codex usage")).toBeNull();
+
+    fireEvent.pointerEnter(container.querySelectorAll(".quota-notch-slot")[1]);
+    await findByText("Codex usage");
+    expect(queryByText("Claude usage")).toBeNull();
+    // One bubble, never one per provider: the rail does not become a wall of readings.
+    expect(container.querySelectorAll(".quota-notch-pop")).toHaveLength(1);
   });
 
   /**
@@ -133,14 +153,151 @@ describe("QuotaNotch", () => {
    * which is what says whether an hour-old reading is normal or alarming.
    */
   it("unfolds to the figures, their resets and the fidelity", async () => {
-    const { container, findByText } = await folded();
+    const { container, findAllByText, findByText } = await folded();
     fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
 
     await findByText("46%");
-    await findByText("56%");
+    // Twice, and that is the notch working rather than a duplicate: 56% is the fullest window, so
+    // the figure the rings carry at rest says it too. `findAllByText` rather than a scoped query
+    // because both of them being there is the assertion.
+    expect(await findAllByText("56%")).toHaveLength(2);
     await findByText("resets in 3d");
     await findByText("resets in 3h");
     await findByText("official, 1h ago");
+  });
+
+  /**
+   * The panel draws each window's fill flat, and takes its colour from the one map.
+   *
+   * The arc and the bar are two drawings of the same track, so the day they disagree — a ring gone
+   * amber beside a bar still drawn in the informational tone — is the day the notch is lying about
+   * one of them. `readState` is what makes that structural; this is what stops somebody hardcoding
+   * a colour into the bar "just for the panel".
+   */
+  it("draws each window as a bar, in the tone its own state maps to", async () => {
+    answer({
+      providers: [
+        claude({
+          windows: [
+            { window: "5h", used_fraction: 0.82, resets_at: inHours(3.5), stale: false, state: "warn" },
+            { window: "7d", used_fraction: 0.46, resets_at: inHours(72.5), stale: false, state: "ok" },
+          ],
+        }),
+      ],
+    });
+    const { container, findByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/claude: 7d 46% /);
+    fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
+    // The long window's figure, which the rest figure does not repeat here: at 82% the short one
+    // is the fuller of the two, so it is what the ring carries.
+    await findByText("46%");
+
+    // Outermost first, as the rings are: the long window, then the short one.
+    const fills = container.querySelectorAll<HTMLElement>(".quota-notch-bar-fill");
+    expect(fills).toHaveLength(2);
+    expect(fills[0].style.width).toBe("46%");
+    expect(fills[0].className).toContain("quota-notch-bar-info");
+    expect(fills[1].style.width).toBe("82%");
+    expect(fills[1].className).toContain("quota-notch-bar-pending");
+  });
+
+  /** A window nobody read has no length to draw: the track is dashed and carries no fill at all. */
+  it("draws no fill for a window it could not read", async () => {
+    answer({
+      providers: [claude({ provider: "codex", fidelity: "unmeasured", windows: [], detail: "no rollouts" })],
+    });
+    const { container, findByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/codex: 7d /);
+    fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
+    await findByText("no rollouts");
+
+    expect(container.querySelectorAll(".quota-notch-bar-absent")).toHaveLength(2);
+    expect(container.querySelectorAll(".quota-notch-bar-fill")).toHaveLength(0);
+  });
+
+  /**
+   * What the notch says without being asked: one figure per provider, and which window it is about.
+   *
+   * A reversal, recorded here because it undoes what this file used to assert — the folded notch
+   * was arcs alone and every number waited for the pointer. An arc says roughly how much; the
+   * number is what somebody acts on, and charging a hover for it made the notch's whole subject the
+   * one thing it would not print.
+   *
+   * The FULLEST window, and never a fixed one: the constraint that binds first is what a glance
+   * needs, and a 7d window at 96% is the news even when the 5h one has just rolled over. The name
+   * beside it is not decoration either — a bare percentage over a provider with two windows is a
+   * figure nobody can attribute.
+   */
+  it("carries the fullest window under each ring, named, before anybody hovers", async () => {
+    answer({ providers: [claude()] });
+    const { container, findByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/claude: 7d 46% /);
+
+    const headline = container.querySelector(".quota-notch-headline")!;
+    expect(headline.textContent).toBe("56%5h");
+    // Folded: the other window, its reset and the fidelity are still the pointer's to ask for.
+    expect(container.querySelector(".quota-notch-detail")).toBeNull();
+  });
+
+  /** The long window is the news when it is the fuller one, whatever the short one has left. */
+  it("names the long window at rest when that is the one running out", async () => {
+    answer({
+      providers: [
+        claude({
+          windows: [
+            { window: "5h", used_fraction: 0.04, resets_at: inHours(3.5), stale: false, state: "ok" },
+            { window: "7d", used_fraction: 0.96, resets_at: inHours(12.5), stale: false, state: "warn" },
+          ],
+        }),
+      ],
+    });
+    const { container, findByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/claude: 7d 96% /);
+    expect(container.querySelector(".quota-notch-headline")!.textContent).toBe("96%7d");
+  });
+
+  /**
+   * A window that has already rolled over is not the figure a glance gets.
+   *
+   * The reading is real — 97% of a window that reset an hour ago — and printing it under a ring at
+   * rest would state it as what is gone right now, which is the one thing this app forbids itself.
+   * The panel may print it, because "reset 1h ago" is on the line beside it; the rest figure has no
+   * such line, so it says nothing and the arcs carry the reading alone.
+   */
+  it("prints no rest figure for a window that has since reset", async () => {
+    answer({
+      providers: [
+        claude({
+          provider: "codex",
+          fidelity: "derived",
+          windows: [
+            { window: "5h", used_fraction: 0.97, resets_at: inHours(-1.5), stale: true, state: "stale" },
+          ],
+        }),
+      ],
+    });
+    const { container, findByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/codex: 7d /);
+    expect(container.querySelector(".quota-notch-headline")!.textContent).toBe("—");
+
+    // And the figure itself is still one hover away, where the sentence beside it can explain it.
+    fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
+    await findByText("97%");
+    await findByText("reset 1h ago");
+  });
+
+  /**
+   * A provider with nothing readable prints no figure at rest — the dash, set as the panel's dash
+   * is, so that an absence is never drawn in the weight of a measurement.
+   */
+  it("prints a dash at rest for a provider whose windows nobody could read", async () => {
+    answer({
+      providers: [claude({ provider: "codex", fidelity: "unmeasured", windows: [], detail: "no rollouts" })],
+    });
+    const { container, findByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/codex: 7d /);
+    expect(container.querySelector(".quota-notch-headline")!.textContent).toBe("—");
+    expect(container.querySelector(".quota-notch-headline-absent")).not.toBeNull();
   });
 
   /**
@@ -188,7 +345,7 @@ describe("QuotaNotch", () => {
    *
    * In BOTH states, which is the half this used to miss. Unfolded it says so in words; folded it
    * is nothing but rings, and a ring drawn from an hour-old answer looked exactly like one drawn a
-   * second ago. `data-stored` is what the dashed edge hangs off (`app.css`), and the state it has
+   * second ago. `data-stored` is what the quieted readings hang off (`app.css`), and the state it has
    * to be right in is the one nobody is hovering.
    */
   it("says the figures are last known when the sidecar could not be reached", async () => {
@@ -349,11 +506,18 @@ describe("QuotaNotch", () => {
     });
     const { container, findByText } = renderWithQuery(<QuotaNotch />);
     await findByText(/codex: 7d /);
-    fireEvent.pointerEnter(container.querySelector(".quota-notch")!);
+    const [first, second] = container.querySelectorAll(".quota-notch-slot");
 
+    fireEvent.pointerEnter(first);
     await findByText("46%");
-    // Four windows drawn, and the two nobody could read are the two that say so.
-    expect(container.querySelectorAll(".quota-notch-percent")).toHaveLength(4);
+    // Both of claude's windows carry a figure, so neither is set as an absence.
+    expect(container.querySelectorAll(".quota-notch-percent")).toHaveLength(2);
+    expect(container.querySelectorAll(".quota-notch-percent-absent")).toHaveLength(0);
+
+    fireEvent.pointerEnter(second);
+    await findByText("none");
+    // And codex's two, which nobody could read, are the two that say so.
+    expect(container.querySelectorAll(".quota-notch-percent")).toHaveLength(2);
     expect(container.querySelectorAll(".quota-notch-percent-absent")).toHaveLength(2);
   });
 
@@ -390,6 +554,137 @@ describe("QuotaNotch", () => {
    * is the hairline that says which of the two categories it belongs to, and both hosts wear it
    * once unfolded — folded the control is `.sr-only` in both, and must measure nothing.
    */
+  /**
+   * The rail is the handle. Pressed and carried up or down, it moves the notch along the edge by
+   * the fraction of the screen's work area the pointer travelled — screen pixels, because in the
+   * floating host the window moves under the pointer — and the bubble goes while it does, since it
+   * points at a ring that is leaving. The drop is the only step marked done.
+   */
+  it("moves along the edge when its rail is dragged", async () => {
+    answer({ providers: [claude()] });
+    const onPlace = vi.fn();
+    const frames: FrameRequestCallback[] = [];
+    const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((step) => {
+      frames.push(step);
+      return frames.length;
+    });
+    Object.defineProperty(window.screen, "availHeight", { value: 1000, configurable: true });
+    Object.defineProperty(window.screen, "availWidth", { value: 1920, configurable: true });
+    const { container, findByText, queryByText } = renderWithQuery(
+      <QuotaNotch place={{ edge: "right", along: 0.5 }} onPlace={onPlace} />,
+    );
+    await findByText(/claude: 7d 46% /);
+    const notch = container.querySelector(".quota-notch")!;
+    const rail = container.querySelector(".quota-notch-rail")!;
+    fireEvent.pointerEnter(notch);
+    await findByText("Claude usage");
+
+    fireEvent.pointerDown(rail, { button: 0, screenX: 1900, screenY: 500, pointerId: 1 });
+    fireEvent.pointerMove(rail, { screenX: 1900, screenY: 400, pointerId: 1 });
+    // The bubble went the moment it became a drag, and the rail says it is being carried.
+    await waitFor(() => expect(queryByText("Claude usage")).toBeNull());
+    expect(rail.getAttribute("data-dragging")).toBe("true");
+    // Steps go out once a frame, and as steps.
+    frames.splice(0).forEach((step) => step(0));
+    expect(onPlace).toHaveBeenLastCalledWith({ edge: "right", along: 0.4 }, false);
+
+    fireEvent.pointerUp(rail, { screenX: 1900, screenY: 300, pointerId: 1 });
+    expect(onPlace).toHaveBeenLastCalledWith({ edge: "right", along: 0.3 }, true);
+    expect(rail.getAttribute("data-dragging")).toBe("false");
+    raf.mockRestore();
+  });
+
+  /**
+   * Carried towards another edge of the screen, the notch goes there: the nearest edge to the
+   * pointer, with its middle under it. Near a corner it stays on the edge it was on until another
+   * is clearly nearer, so it does not flip between two edges on every pixel.
+   */
+  it("moves to another edge of the screen when its rail is dragged there", async () => {
+    answer({ providers: [claude()] });
+    const onPlace = vi.fn();
+    Object.defineProperty(window.screen, "availHeight", { value: 1000, configurable: true });
+    Object.defineProperty(window.screen, "availWidth", { value: 1920, configurable: true });
+    const { container, findByText } = renderWithQuery(
+      <QuotaNotch place={{ edge: "right", along: 0.5 }} onPlace={onPlace} />,
+    );
+    await findByText(/claude: 7d 46% /);
+    const rail = container.querySelector(".quota-notch-rail")!;
+
+    fireEvent.pointerDown(rail, { button: 0, screenX: 1900, screenY: 500, pointerId: 1 });
+    // Into the top-right corner: as near the top as the right, so still the right.
+    fireEvent.pointerMove(rail, { screenX: 1900, screenY: 20, pointerId: 1 });
+    fireEvent.pointerUp(rail, { screenX: 1900, screenY: 20, pointerId: 1 });
+    expect(onPlace).toHaveBeenLastCalledWith({ edge: "right", along: expect.closeTo(0.02, 6) }, true);
+
+    fireEvent.pointerDown(rail, { button: 0, screenX: 1900, screenY: 500, pointerId: 2 });
+    fireEvent.pointerMove(rail, { screenX: 480, screenY: 10, pointerId: 2 });
+    fireEvent.pointerUp(rail, { screenX: 480, screenY: 10, pointerId: 2 });
+    expect(onPlace).toHaveBeenLastCalledWith({ edge: "top", along: 0.25 }, true);
+  });
+
+  /** Each edge lays the notch out its own way, and the drawing says which. */
+  it("marks the edge it hangs from", async () => {
+    answer({ providers: [claude()] });
+    const { container, findByText } = renderWithQuery(
+      <QuotaNotch place={{ edge: "bottom", along: 0.5 }} onPlace={() => {}} />,
+    );
+    await findByText(/claude: 7d 46% /);
+    expect(container.querySelector(".quota-notch")!.getAttribute("data-edge")).toBe("bottom");
+  });
+
+  /** The update control asks for a new reading now, instead of waiting for the next poll. */
+  it("reads the quota again when asked to update", async () => {
+    answer({ providers: [claude()] });
+    const { getByRole, findByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/claude: 7d 46% /);
+    const before = daemon.apiFetch.mock.calls.length;
+
+    fireEvent.click(getByRole("button", { name: "Update the quota reading" }));
+
+    await waitFor(() => expect(daemon.apiFetch.mock.calls.length).toBe(before + 1));
+    expect(daemon.apiFetch).toHaveBeenLastCalledWith("/quota");
+  });
+
+  /** A press that barely moves is a click on the notch, not a drag of it. */
+  it("does not take a press that barely moves for a drag", async () => {
+    answer({ providers: [claude()] });
+    const onPlace = vi.fn();
+    const { container, findByText } = renderWithQuery(
+      <QuotaNotch place={{ edge: "right", along: 0.5 }} onPlace={onPlace} />,
+    );
+    await findByText(/claude: 7d 46% /);
+    const rail = container.querySelector(".quota-notch-rail")!;
+
+    fireEvent.pointerDown(rail, { button: 0, screenX: 1000, screenY: 500, pointerId: 1 });
+    fireEvent.pointerMove(rail, { screenX: 1000, screenY: 502, pointerId: 1 });
+    fireEvent.pointerUp(rail, { screenX: 1000, screenY: 502, pointerId: 1 });
+
+    expect(onPlace).not.toHaveBeenCalled();
+    expect(rail.getAttribute("data-dragging")).toBe("false");
+  });
+
+  /** A double click puts it back in the middle, where it hung before anybody moved it. */
+  it("goes back to the middle of the edge on a double click", async () => {
+    answer({ providers: [claude()] });
+    const onPlace = vi.fn();
+    const { container, findByText } = renderWithQuery(
+      <QuotaNotch place={{ edge: "left", along: 0.2 }} onPlace={onPlace} />,
+    );
+    await findByText(/claude: 7d 46% /);
+
+    fireEvent.doubleClick(container.querySelector(".quota-notch-rail")!);
+
+    expect(onPlace).toHaveBeenCalledWith({ edge: "left", along: 0.5 }, true);
+  });
+
+  /** With nowhere to keep a position, the rail is not a handle at all. */
+  it("offers no drag where the host keeps no position", async () => {
+    answer({ providers: [claude()] });
+    const { container, findByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/claude: 7d 46% /);
+    expect(container.querySelector(".quota-notch-rail")!.getAttribute("data-draggable")).toBe("false");
+  });
+
   it("rules the move control off from the rings", async () => {
     const onMove = vi.fn();
     answer({ providers: [claude()] });
@@ -415,6 +710,8 @@ describe("QuotaNotch", () => {
   /** A notch with nowhere else to go offers nowhere else. */
   it("draws no move control when it is given none", async () => {
     const { container } = await folded();
-    expect(container.querySelector("button")).toBeNull();
+    // The update control is the only button left: it belongs to the reading, not to a host.
+    const buttons = [...container.querySelectorAll("button")].map((button) => button.getAttribute("aria-label"));
+    expect(buttons).toEqual(["Update the quota reading"]);
   });
 });

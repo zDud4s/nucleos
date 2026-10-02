@@ -1,8 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
-import { Pin, PinOff } from "lucide-react";
+import { AppWindow, PictureInPicture2, RefreshCw } from "lucide-react";
 import { useQuota, type QuotaProvider, type QuotaWindow } from "../data/quota";
-import { IconButton, ProviderMark, Ring, relativeText, type RingTrack } from "../ui";
+import { IconButton, ProviderMark, Ring, readState, relativeText, type RingTrack } from "../ui";
 import type { NotchMode } from "./notch-mode";
+import { EDGES, isVertical, MIDDLE, type NotchEdge, type NotchPlace } from "./notch-place";
 
 /**
  * The two windows every provider is drawn with, outermost first.
@@ -31,6 +32,93 @@ const LINGER_MS = 240;
 const FOLD_MS = 140;
 
 /**
+ * Where the bubble's tail sits when nothing pushes it: level with the middle of the title row.
+ *
+ * The bubble is placed so the tail lands on the middle of the ring it is about, and this is the
+ * distance from the bubble's top edge to that tail. A ring too near the top of the notch to keep it
+ * — the first one always is — moves the tail up instead of the bubble, so the bubble never starts
+ * above the drawing, where the floating window has no room for it.
+ */
+const TAIL_AT = 26;
+
+/**
+ * The rings' outer diameter on the rail. `.app-main-notched` and the flare radii in `app.css` are
+ * measured off it (38 + `--space-3` either side = a 62px rail) and have to follow it.
+ */
+const RING_SIZE = 38;
+
+/**
+ * How far a press has to move, in screen pixels, before it is a drag rather than a click. Four is
+ * past the jitter of a hand settling on a touchpad and short of anything anybody would call a move.
+ */
+const DRAG_SLOP = 4;
+
+/**
+ * How much nearer, in screen pixels, another edge has to be than the one the notch is on before a
+ * drag carries it over. Without it a pointer near a corner is equally near two edges, and the notch
+ * would flip between them on every pixel.
+ */
+const EDGE_STICK = 48;
+
+/**
+ * A drag of the rail: the screen point it started at, the place it started from, the edge it is on
+ * now, and whether it has moved past `DRAG_SLOP` yet.
+ */
+interface Drag {
+  x: number;
+  y: number;
+  start: NotchPlace;
+  edge: NotchEdge;
+  moved: boolean;
+}
+
+/**
+ * The box a drag is measured against: the screen's work area, in CSS pixels — the same area the
+ * fraction is a fraction of. The window's own size where the screen reports none (jsdom does).
+ * `availLeft`/`availTop` are Chromium's, which is what WebView2 is; absent, the area starts at 0.
+ */
+function screenBox(): { left: number; top: number; width: number; height: number } {
+  const screen = window.screen as (Screen & { availLeft?: number; availTop?: number }) | undefined;
+  const width = screen?.availWidth ?? 0;
+  const height = screen?.availHeight ?? 0;
+  return {
+    left: screen?.availLeft ?? 0,
+    top: screen?.availTop ?? 0,
+    width: width > 0 ? width : Math.max(1, window.innerWidth),
+    height: height > 0 ? height : Math.max(1, window.innerHeight),
+  };
+}
+
+/**
+ * Where a drag that has reached this screen point puts the notch.
+ *
+ * The edge is the one nearest the pointer — kept until another is nearer by `EDGE_STICK`. On the
+ * edge the drag started from, the notch moves by as much as the pointer did, so the grip does not
+ * jump to the notch's middle; on any other edge there is no grip to keep, and the notch's middle
+ * follows the pointer.
+ */
+function follow(drag: Drag, screenX: number, screenY: number): NotchPlace {
+  const box = screenBox();
+  const x = screenX - box.left;
+  const y = screenY - box.top;
+  const distance: Record<NotchEdge, number> = {
+    left: x,
+    right: box.width - x,
+    top: y,
+    bottom: box.height - y,
+  };
+  const nearest = EDGES.reduce((best, edge) => (distance[edge] < distance[best] ? edge : best));
+  if (distance[nearest] + EDGE_STICK < distance[drag.edge]) drag.edge = nearest;
+  const edge = drag.edge;
+  const vertical = isVertical(edge);
+  if (edge === drag.start.edge) {
+    const moved = vertical ? (screenY - drag.y) / box.height : (screenX - drag.x) / box.width;
+    return { edge, along: drag.start.along + moved };
+  }
+  return { edge, along: vertical ? y / box.height : x / box.width };
+}
+
+/**
  * Folded and open are the two states; `folding` is the moment between them, when the panel is
  * still drawn and playing its way out. The drawing only shrinks once that is done — which in the
  * floating host is also when its window shrinks — so what the owner sees go is the panel, never a
@@ -52,17 +140,35 @@ export interface QuotaNotchProps {
    * no second host to offer does not offer one.
    */
   onMove?: () => void;
+  /**
+   * The line of the screen the floating notch is centred on, in this window's CSS pixels
+   * (`useScreenLine`). The contained host hangs from it so docking and floating do not move the
+   * notch; absent, it centres in the window. A prop rather than measured here, because this file is
+   * also the floating window's page, and that window may not call the window API at all.
+   */
+  line?: number;
+  /**
+   * Which edge the notch hangs from and how far along it, a fraction of the screen's work area
+   * (`notch-place.ts`). The edge decides the drawing's axis; the fraction is used here only for the
+   * fallback when there is no `line` to hang from — the host that owns it turns it into a place.
+   * Absent, the right edge's middle.
+   */
+  place?: NotchPlace;
+  /**
+   * Moves the notch: `done` false for every step of a drag, true for the drop. A drag carries it
+   * along its edge, or to whichever edge of the screen the pointer takes it nearest. Absent, the
+   * rail cannot be dragged — a test or a preview with nowhere to keep a position.
+   */
+  onPlace?: (place: NotchPlace, done: boolean) => void;
 }
 
 /**
  * How much of each assistant's usage window is gone, hanging off an edge.
  *
- * **A column against the right edge, and not a bar along the top.** The edge decides the axis:
- * left and right keep a vertical column, top and bottom would lay the readings out side by side.
- * The right edge is what this draws, because it is the edge with the most room to grow into — the
- * app's own page is centred with slack on both sides, and a screen has more width to spare than
- * height. The choice becomes a setting with the rest of the policy (design D9's phase), and the
- * shape here is what that setting will switch between rather than something it has to undo.
+ * **Any edge of the screen, and the edge decides the axis.** Left and right keep a vertical column;
+ * top and bottom lay the readings out side by side (`data-edge`, `app.css`). The right edge is where
+ * it starts, because it is the edge with the most room to grow into; dragging the rail to another
+ * edge moves it there (`follow`), and the bubble always opens away from the edge it hangs from.
  *
  * **Folded at rest, in both hosts, and that changed.** The contained host used to be drawn open
  * always, on the argument that a page has room to spare. A lateral column makes that argument
@@ -85,36 +191,91 @@ export interface QuotaNotchProps {
  * last recorded — so an outage arrives as numbers rather than as an error. Unfolded, the notch
  * says "last known" in words. Folded, which is where it spends its life, it said nothing whatever,
  * and that is the one thing this app forbids itself: stale and current may never render as one. So
- * the whole drawing carries `data-stored` and its edge goes dashed, which is what a dash already
- * means here — `.ui-ring-unmeasured`, `.ui-runpipe-unreached` — *this is not a live fact*. No
- * tone, because `.ui-note-stale` settled the house style: say stale without borrowing a colour
- * that would claim something about the quota instead of about the reading of it.
+ * the whole drawing carries `data-stored`, and the rail's readings go quiet (`app.css`). It was a
+ * dashed edge once, and the owner did not want a frame flickering round the notch every time the
+ * sidecar missed a refresh. No tone either way, because `.ui-note-stale` settled the house style:
+ * say stale without borrowing a colour that would claim something about the quota instead of
+ * about the reading of it.
  *
- * **It is never the only thing that says a number, and it no longer says a name.** The provider's
- * name was printed beside its rings and is now a mark inside them: at this size the word cost more
- * room than the drawing it labelled. What carries the reading instead is text that is worth more —
- * unfolded, every window prints its own percentage and when it reopens. The name is still in the
- * ring's sentence for assistive tech, and still in the hover text over the slot. Colour reinforces
- * and never states.
+ * **The rail never changes shape; the reading opens beside it.** The unfolded notch used to grow
+ * the rail itself into a wide panel holding every provider at once. It now opens a bubble to the
+ * left of the rail for ONE provider — the ring under the pointer — with a tail pointing at that
+ * ring, which is the owner's reference for this design. The rail keeps its width, its flared ends
+ * and its rings exactly where they were, so nothing the pointer is on moves.
+ *
+ * **A mark on the rail, a name in the bubble.** On the rail the provider is a glyph inside its ring:
+ * at that size the word cost more room than the drawing it labelled. The bubble has the room, and
+ * titles itself with the mark and the name — the first thing a reader of it wants to know, and the
+ * one thing the ring beside it could only imply. Colour reinforces and never states.
+ *
+ * **One figure at rest, and that is a reversal.** The folded notch used to be arcs alone — the
+ * numbers waited for the pointer — and the owner's reference for this design puts a percentage
+ * under every ring, which is what the rest of the drawing was already implying and refusing to
+ * say. An arc answers *roughly how much*; the number beside it is what somebody decides on, and
+ * making them hover for it costs a gesture to read the one thing the notch exists for. So each
+ * ring now carries the fullest of its windows, WITH that window's name — a bare percentage over
+ * two windows would be a figure nobody can attribute. Everything else still waits for the pointer:
+ * the second window, the resets, the fidelity and the way to the other host.
  */
-export function QuotaNotch({ host = "contained", onMove }: QuotaNotchProps) {
+export function QuotaNotch({ host = "contained", onMove, line, place, onPlace }: QuotaNotchProps) {
   const quota = useQuota();
+  const edge = place?.edge ?? "right";
+  const vertical = isVertical(edge);
   const [phase, setPhase] = useState<Phase>("folded");
+  // Which provider the bubble is about: the ring the pointer last reached, or the first one when
+  // the notch was opened some other way (focus, or the pointer arriving on the rail between rings).
+  const [active, setActive] = useState(0);
   const timer = useRef<number | undefined>(undefined);
   const drawing = useRef<HTMLDivElement>(null);
-  // The drawing's height folded, for the contained host to hang from (`app.css`,
-  // `.quota-notch-contained`). Measured rather than derived: it is two rings or three, a border
+  const rail = useRef<HTMLDivElement>(null);
+  // The drawing's length along its edge folded — its height on a side edge, its width on the top or
+  // bottom — for the contained host to hang from (`app.css`, `.quota-notch-contained`). Measured rather than derived: it is two rings or three, the flares
   // and some padding, and a sum of tokens written out here would be one more thing to keep equal.
   const [rest, setRest] = useState<number | undefined>(undefined);
+  // Where the bubble sits and where its tail points, both measured along the edge from the drawing's
+  // start — its top on a side edge, its left on the top or bottom.
+  const [aim, setAim] = useState({ at: 0, tail: TAIL_AT });
   const count = quota.data?.providers.length ?? 0;
+  const reached = phase !== "folded";
+  // A drag of the rail under way: where it started, and whether it has moved far enough to be one.
+  const drag = useRef<Drag | null>(null);
+  const [dragging, setDragging] = useState(false);
+  // The latest position of a drag not yet handed over, coalesced to one per frame.
+  const pending = useRef<{ frame: number; place: NotchPlace } | null>(null);
 
-  useEffect(() => () => window.clearTimeout(timer.current), []);
+  useEffect(
+    () => () => {
+      window.clearTimeout(timer.current);
+      if (pending.current !== null) window.cancelAnimationFrame(pending.current.frame);
+    },
+    [],
+  );
 
   // Before paint, so the first frame is already hung from the right place.
   useLayoutEffect(() => {
     if (phase !== "folded" || drawing.current === null) return;
-    setRest(drawing.current.getBoundingClientRect().height);
-  }, [phase, count]);
+    const box = drawing.current.getBoundingClientRect();
+    setRest(vertical ? box.height : box.width);
+  }, [phase, count, vertical]);
+
+  // The tail points at the middle of the ring the bubble is about. Measured, because the ring's
+  // place in the rail depends on how many providers sit above it; and the bubble moves down only as
+  // far as it has to, so the first ring's bubble starts level with the top of the notch instead of
+  // above it, where the floating window has no room.
+  useLayoutEffect(() => {
+    if (!reached || drawing.current === null || rail.current === null) return;
+    const ring = rail.current.querySelectorAll(".ui-ring")[active];
+    if (ring === undefined) return;
+    const face = ring.getBoundingClientRect();
+    const box = drawing.current.getBoundingClientRect();
+    const centre = vertical
+      ? face.top + face.height / 2 - box.top
+      : face.left + face.width / 2 - box.left;
+    const at = Math.max(0, centre - TAIL_AT);
+    setAim((current) =>
+      current.at === at && current.tail === centre - at ? current : { at, tail: centre - at },
+    );
+  }, [reached, active, count, vertical]);
 
   // Nothing until the first answer. A notch drawn empty would say "nothing is burned", which is the
   // most misleading thing this feature could claim — and it would say it at exactly the moment
@@ -126,11 +287,39 @@ export function QuotaNotch({ host = "contained", onMove }: QuotaNotchProps) {
   // notch cannot be counted against two different nows — a difference of milliseconds that shows
   // up as "resets in 1h" beside "resets in 59min".
   const now = Date.now();
-  const reached = phase !== "folded";
+  const shown = providers[Math.min(active, providers.length - 1)];
+  const shownTracks = tracksOf(shown);
 
   const unfold = () => {
+    // Nothing opens under a drag: the pointer is on the notch because it is carrying it.
+    if (drag.current?.moved) return;
     window.clearTimeout(timer.current);
     setPhase("open");
+  };
+
+  // Every step of a drag goes to the host once per frame at most. The floating host answers each
+  // with a fit, which moves a window — sixty of those a second is the ceiling worth paying, and a
+  // pointer reports far more often than that on a fast mouse.
+  const carry = (next: NotchPlace) => {
+    if (onPlace === undefined) return;
+    if (pending.current !== null) {
+      pending.current.place = next;
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const last = pending.current;
+      pending.current = null;
+      if (last !== null) onPlace(last.place, false);
+    });
+    pending.current = { frame, place: next };
+  };
+
+  const drop = (next: NotchPlace) => {
+    if (pending.current !== null) {
+      window.cancelAnimationFrame(pending.current.frame);
+      pending.current = null;
+    }
+    onPlace?.(next, true);
   };
   // Every step checks where it is before it moves, so a leave that arrives with the notch already
   // folded plays nothing, and a pointer back inside before the linger is up folds nothing.
@@ -149,104 +338,279 @@ export function QuotaNotch({ host = "contained", onMove }: QuotaNotchProps) {
     <div
       ref={drawing}
       className={`quota-notch quota-notch-${host}`}
+      data-edge={edge}
       data-unfolded={reached}
       data-folding={phase === "folding"}
       data-stored={source === "stored"}
-      style={rest === undefined ? undefined : ({ "--quota-notch-rest": `${rest}px` } as CSSProperties)}
+      data-anchored={line !== undefined}
+      style={
+        rest === undefined
+          ? undefined
+          : ({
+              "--quota-notch-rest": `${rest}px`,
+              "--quota-notch-along": `${place?.along ?? MIDDLE}`,
+              ...(line === undefined ? {} : { "--quota-notch-line": `${line}px` }),
+            } as CSSProperties)
+      }
       onPointerEnter={unfold}
       onPointerLeave={() => fold(LINGER_MS)}
       onFocus={unfold}
       onBlur={(event) => {
-        // Focus has nothing to slip off, so it lingers for nothing — but the panel still plays out.
+        // Focus has nothing to slip off, so it lingers for nothing — but the bubble still plays out.
         if (!event.currentTarget.contains(event.relatedTarget as Node | null)) fold(0);
       }}
     >
-      {providers.map((provider) => (
-        <div className="quota-notch-slot" key={provider.provider} title={titleOf(provider)}>
-          <Ring
-            label={provider.provider}
-            tracks={tracksOf(provider)}
-            mark={<ProviderMark provider={provider.provider} />}
-          />
-          {reached && (
-            <div className="quota-notch-detail">
-              {tracksOf(provider).map((track) => (
-                <span className="quota-notch-line" key={track.name}>
-                  <span className="quota-notch-window">{track.name}</span>
+      {/*
+        The bubble: one provider's reading, beside the rail and pointing at its ring.
+
+        Always in the tree, and `.sr-only` while folded, for the move control's sake — see the
+        comment on it below. Folded it holds nothing else, so nothing of the reading is on the page,
+        drawn or not, until somebody asks.
+      */}
+      <div
+        className={reached ? "quota-notch-pop" : "sr-only"}
+        style={
+          reached
+            ? ({
+                "--quota-notch-pop-at": `${aim.at}px`,
+                "--quota-notch-tail-at": `${aim.tail}px`,
+              } as CSSProperties)
+            : undefined
+        }
+      >
+        {reached && (
+          <div className="quota-notch-detail">
+            {/*
+              Whose reading this is, in words as well as in the mark. The bubble is the one place
+              with room for the name, and it is the first thing a reader of it wants.
+            */}
+            <span className="quota-notch-title">
+              <ProviderMark provider={shown.provider} size={16} />
+              <span className="quota-notch-name">{`${displayName(shown.provider)} usage`}</span>
+              {source === "stored" && (
+                /*
+                  The last known figures, with the sidecar unreachable. Said rather than implied:
+                  these numbers are real and they are old, and a reader who takes them for live ones
+                  is reading a quota that may have moved a long way since.
+                */
+                <span className="quota-notch-stale" title={unreachable}>
+                  last known
+                </span>
+              )}
+            </span>
+            {shownTracks.map((track) => (
+              <span className="quota-notch-line" key={track.name}>
+                <span className="quota-notch-head">
+                  <span className="quota-notch-window">{windowTitle(track.name)}</span>
+                  <span className="quota-notch-reset">{resetPhrase(shown, track.name, now)}</span>
+                </span>
+                {/*
+                  The same fraction the ring's arc draws, laid flat: a length is what the eye
+                  compares without arithmetic. `aria-hidden`, because the percentage under it is the
+                  same fact in words and the ring already carries the sentence.
+                */}
+                <span
+                  className={track.measured ? "quota-notch-bar" : "quota-notch-bar quota-notch-bar-absent"}
+                  aria-hidden="true"
+                >
+                  {track.measured && (
+                    <span
+                      className={`quota-notch-bar-fill quota-notch-bar-${toneOf(track)}`}
+                      style={{ width: `${Math.min(100, Math.max(0, track.used * 100))}%` }}
+                    />
+                  )}
+                </span>
+                <span className="quota-notch-figure">
                   {/*
-                    The dash takes a class of its own because it is not a figure. In the weight
-                    and the ink the percentages wear, an em dash reads as a value somebody
-                    measured; what it means is that nobody could.
+                    The dash takes a class of its own because it is not a figure. In the weight and
+                    the ink the percentages wear, an em dash reads as a value somebody measured; what
+                    it means is that nobody could.
                   */}
                   <span
                     className={
-                      track.measured
-                        ? "quota-notch-percent"
-                        : "quota-notch-percent quota-notch-percent-absent"
+                      track.measured ? "quota-notch-percent" : "quota-notch-percent quota-notch-percent-absent"
                     }
                   >
                     {track.measured ? `${Math.round(track.used * 100)}%` : "—"}
                   </span>
-                  <span className="quota-notch-reset">{resetPhrase(provider, track.name, now)}</span>
+                  {/* Only beside a figure: "— used" would say something about a window nobody read. */}
+                  {track.measured && <span className="quota-notch-used">used</span>}
                 </span>
+              </span>
+            ))}
+          </div>
+        )}
+        <span className="quota-notch-foot">
+          {/*
+            How the figure was come by, and how old it is — the two facts that decide what the
+            percentages above are worth. `derived` is named rather than hidden because it means
+            something the owner has to weigh: that reading only moves when they run something, so an
+            hour-old one is normal and an hour-old `official` one is not.
+          */}
+          {reached && <span className="quota-notch-fidelity">{fidelityPhrase(shown, now)}</span>}
+          {/*
+            Folded, the controls are still THERE, inside the `.sr-only` bubble rather than left
+            unrendered. Rendered only when unfolded they could not be reached by a keyboard at all:
+            the wrapper's `onFocus` fires from a child, and these buttons are its only focusable
+            children, so focus would have nowhere to land and the notch would never unfold. Hidden
+            that way they are out of flow — they measure nothing, so neither the page nor the window
+            the Rust side fits round this drawing changes size — and each is a tab stop, which
+            unfolds the notch and brings itself into view. They stay the same elements across the
+            unfold, because nothing above them in the tree changes shape.
+
+            What that does NOT buy in the floating host: reaching its window from the keyboard in
+            the first place. It is built `skip_taskbar(true)` (`notch.rs`), which on Windows means
+            WS_EX_TOOLWINDOW and no place in the Alt+Tab order, and `focused(false)`, so it never
+            takes focus by itself. Focus arrives when the owner clicks the notch, or through
+            assistive tech that can move it. So an owner working from the keyboard alone cannot
+            reach the way back at all, and the main window has no other: `AppShell` draws no notch
+            while the mode is `global`, by design, and the mode has no home in settings yet. That
+            gap is named here rather than implied away.
+          */}
+          <span className={reached ? "quota-notch-control" : undefined}>
+            {/*
+              A new reading now rather than at the next poll. `GET /quota` asks the sidecar on every
+              request, so a refetch is a fresh figure. The glyph turns while the request is out, so
+              a click that changed no number still visibly did something.
+            */}
+            <span className="quota-notch-update" data-busy={quota.isFetching}>
+              <IconButton
+                label="Update the quota reading"
+                icon={RefreshCw}
+                aria-busy={quota.isFetching}
+                onClick={() => void quota.refetch()}
+              />
+            </span>
+            {/*
+              The way to the other host. Not a pin any more: a pin reads as "keep this here", and
+              the two moves are out into a window of its own and back into the app.
+            */}
+            {onMove !== undefined &&
+              (host === "contained" ? (
+                <IconButton
+                  label="Keep the notch in front of every window"
+                  icon={PictureInPicture2}
+                  onClick={onMove}
+                />
+              ) : (
+                <IconButton label="Put the notch back inside NucleOS" icon={AppWindow} onClick={onMove} />
               ))}
-              {/*
-                How the figure was come by, and how old it is, on one line — the two facts that
-                decide what the percentages above are worth. `derived` is named rather than hidden
-                because it means something the owner has to weigh: that reading only moves when
-                they run something, so an hour-old one is normal and an hour-old `official` one is
-                not.
-              */}
-              <span className="quota-notch-fidelity">{fidelityPhrase(provider, now)}</span>
-            </div>
-          )}
+          </span>
+        </span>
+      </div>
+      {/*
+        The rail: the part of the notch that is always there, and never changes width. The bubble
+        opens beside it rather than inside it, so reaching a ring never moves a ring.
+
+        The two flares are the ends of the notch, where it curves out to meet the edge it hangs
+        from — the shape that says this is attached to the edge of the screen rather than parked
+        near it. Elements rather than pseudo-elements, so they are in the flow and the floating
+        window, fitted to the drawing's measured box, has room for them.
+      */}
+      {/*
+        The rail is also the handle: pressed and moved, it carries the notch along its edge, or to
+        whichever edge of the screen the pointer takes it nearest (`follow`; `notch-place.ts` keeps
+        where it was left). A press that moves less than `DRAG_SLOP` is not a drag, so a click on a
+        ring stays a click. Measured in SCREEN pixels against the screen's work area, because in the
+        floating host the window moves under the pointer on every step — `clientY` would be measured
+        from a window that is itself on the move — and because the fraction it produces is a
+        fraction of that same work area. Pointer capture keeps the moves coming when the pointer
+        outruns the notch. A double click puts it back in the middle of the edge it is on.
+      */}
+      <div
+        className="quota-notch-rail"
+        ref={rail}
+        data-draggable={onPlace !== undefined && place !== undefined}
+        data-dragging={dragging}
+        onPointerDown={(event) => {
+          if (onPlace === undefined || place === undefined || event.button !== 0) return;
+          drag.current = { x: event.screenX, y: event.screenY, start: place, edge: place.edge, moved: false };
+          event.currentTarget.setPointerCapture?.(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          const current = drag.current;
+          if (current === null) return;
+          if (!current.moved) {
+            const moved = Math.hypot(event.screenX - current.x, event.screenY - current.y);
+            if (moved < DRAG_SLOP) return;
+            current.moved = true;
+            setDragging(true);
+            // The bubble goes at once rather than playing out: it points at a ring that is leaving.
+            window.clearTimeout(timer.current);
+            setPhase("folded");
+          }
+          carry(follow(current, event.screenX, event.screenY));
+        }}
+        onPointerUp={(event) => {
+          const current = drag.current;
+          drag.current = null;
+          if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }
+          if (current === null || !current.moved) return;
+          setDragging(false);
+          drop(follow(current, event.screenX, event.screenY));
+        }}
+        onPointerCancel={() => {
+          const current = drag.current;
+          drag.current = null;
+          if (current === null || !current.moved) return;
+          // Cancelled by the system mid-drag: the notch stays where it was carried to, and that is
+          // what is remembered — the last position it was actually drawn at.
+          setDragging(false);
+          if (pending.current !== null) drop(pending.current.place);
+          else if (place !== undefined) drop(place);
+        }}
+        onDoubleClick={() => onPlace?.({ edge, along: MIDDLE }, true)}
+      >
+        <span className="quota-notch-flare quota-notch-flare-top" aria-hidden="true" />
+        <div className="quota-notch-body">
+          {providers.map((provider, index) => {
+            // One reading of the windows for the slot: the ring and the figure under it are two
+            // drawings of the same tracks, and building them twice is how they start disagreeing.
+            const tracks = tracksOf(provider);
+            const worst = fullest(tracks);
+            return (
+              <div
+                className="quota-notch-slot"
+                key={provider.provider}
+                title={titleOf(provider)}
+                onPointerEnter={() => setActive(index)}
+              >
+                {/*
+                  Smaller than `Ring`'s default, on the owner's call: the notch was taking more of
+                  the edge than its reading is worth. At 38 the hole is 16px, so the mark drops to
+                  12 to keep air round it. `RING_SIZE` drives the rail's width in `app.css`.
+                */}
+                <Ring
+                  label={provider.provider}
+                  tracks={tracks}
+                  size={RING_SIZE}
+                  mark={<ProviderMark provider={provider.provider} size={12} />}
+                />
+                {/*
+                  The one figure the notch says at rest: the window with least left in it, named. A
+                  provider has two windows, and a bare percentage would be a number nobody can
+                  attribute — 56% of five hours and 56% of seven days mean entirely different things
+                  about what is left to spend. The fullest rather than the shorter, because the
+                  constraint that binds first is what a glance needs.
+                */}
+                <span className="quota-notch-headline">
+                  {worst === undefined ? (
+                    <span className="quota-notch-headline-percent quota-notch-headline-absent">—</span>
+                  ) : (
+                    <>
+                      <span className="quota-notch-headline-percent">{`${Math.round(worst.used * 100)}%`}</span>
+                      <span className="quota-notch-headline-window">{worst.name}</span>
+                    </>
+                  )}
+                </span>
+              </div>
+            );
+          })}
         </div>
-      ))}
-      {source === "stored" && reached && (
-        /*
-          The last known figures, with the sidecar unreachable. Said rather than implied: these
-          numbers are real and they are old, and a reader who takes them for live ones is reading a
-          quota that may have moved a long way since.
-        */
-        <span className="quota-notch-stale" title={unreachable}>
-          last known
-        </span>
-      )}
-      {onMove !== undefined && (
-        /*
-          Folded, the notch is the rings and nothing else, in BOTH hosts — the owner's call: a pin
-          drawn under two rings at rest was one more thing on the edge of every page, for an action
-          taken once. The contained host used to be the exception, drawn in both states as the way
-          out to the floating one, and that way is still one hover away.
-
-          Folded, the control is still THERE, tucked into `.sr-only` rather than left unrendered.
-          Rendered only when unfolded it could not be reached by a keyboard at all: the wrapper's
-          `onFocus` fires from a child, and the only focusable child is this button, so focus would
-          have nowhere to land and the notch would never unfold. Tucked away it is out of flow — it
-          measures nothing, so neither the page nor the window the Rust side fits round this drawing
-          changes size — and it is a tab stop, which unfolds the notch and brings itself into view.
-          The wrapper, drawn, is what rules it off from the rings above it: stacked in the same
-          column, at the same size, a control reads as a third provider (`app.css`).
-
-          What that does NOT buy in the floating host: reaching its window from the keyboard in the
-          first place. It is built `skip_taskbar(true)` (`notch.rs`), which on Windows means
-          WS_EX_TOOLWINDOW and no place in the Alt+Tab order, and `focused(false)`, so it never
-          takes focus by itself. Focus arrives when the owner clicks the notch, or through assistive
-          tech that can move it; Alt+F4 closes the window — which docks it — only once focus is
-          already there. So an owner working from the keyboard alone cannot reach the way back at
-          all, and the main window has no other: `AppShell` draws no notch while the mode is
-          `global`, by design, and the mode has no home in settings yet. That gap is named here
-          rather than implied away — closing it is a decision about where such a control belongs in
-          the app, not a line of this component.
-        */
-        <span className={reached ? "quota-notch-control" : "sr-only"}>
-          {host === "contained" ? (
-            <IconButton label="Keep the notch in front of every window" icon={Pin} onClick={onMove} />
-          ) : (
-            <IconButton label="Put the notch back inside NucleOS" icon={PinOff} onClick={onMove} />
-          )}
-        </span>
-      )}
+        <span className="quota-notch-flare quota-notch-flare-bottom" aria-hidden="true" />
+      </div>
     </div>
   );
 }
@@ -268,6 +632,62 @@ function tracksOf(provider: QuotaProvider): RingTrack[] {
       measured: true,
     };
   });
+}
+
+/**
+ * The window with least left in it, or nothing when none of them is a live figure.
+ *
+ * **A stale window is not a candidate, and that is the whole care in this function.** `stale` means
+ * the figure is real and the window it describes has already rolled over — so the number is almost
+ * certainly no longer true, and what is left of that window is probably all of it. The panel can
+ * print such a figure because it prints "reset 2h ago" beside it; the rest figure has one line and
+ * no room to say so, and 97% under a ring whose arc is grey would be the app drawing stale and
+ * current as one thing (`PRODUCT.md`). A provider with nothing but stale windows says the same dash
+ * as one nobody could read at all: no current figure. The arcs still carry the reading, and the
+ * hover text still explains it.
+ *
+ * Ties go to the outermost track, which is the order `WINDOWS` is written in — two windows at the
+ * same percentage are the same news, and the long one is the one that stays true longer.
+ */
+function fullest(tracks: RingTrack[]): RingTrack | undefined {
+  return tracks
+    .filter((track) => track.measured && track.state !== "stale")
+    .reduce<RingTrack | undefined>(
+      (worst, track) => (worst === undefined || track.used > worst.used ? track : worst),
+      undefined,
+    );
+}
+
+/**
+ * The bar's tone, from the one map — the same reading `Ring` paints its arc with.
+ *
+ * Never chosen here, for the reason the ring gives: a bar and an arc drawn from the same track may
+ * not disagree about what it means, and `readState` is what makes that structural rather than
+ * remembered. A state the map has no reading for falls to `off`, the tone with the least claim in
+ * it.
+ */
+function toneOf(track: RingTrack): string {
+  return readState(track.domain, track.state)?.tone ?? "off";
+}
+
+/**
+ * The provider's name as a title: the daemon's own word, capitalised. `claude` becomes `Claude`
+ * and an unknown provider still gets a name, which is what the fallback mark does for its glyph.
+ */
+function displayName(provider: string): string {
+  const name = provider.trim();
+  return name === "" ? "Unknown" : name[0].toUpperCase() + name.slice(1);
+}
+
+/**
+ * A window's name in words, for the bubble's rows. The ring and the rest figure keep the daemon's
+ * short form (`5h`), where room is what runs out; the bubble has the room, and "5h" as the heading
+ * of a row reads as a duration somebody measured rather than as the name of a window.
+ */
+function windowTitle(name: string): string {
+  if (name === "5h") return "5-hour window";
+  if (name === "7d") return "7-day window";
+  return name;
 }
 
 /**

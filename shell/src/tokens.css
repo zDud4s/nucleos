@@ -163,6 +163,9 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
   --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45);
   --shadow-lg: 0 18px 48px rgba(0, 0, 0, 0.55);
+  /* What a modal lays over the page: dark enough that the page reads as paused, light enough that
+     it is still recognisably the page you were on. */
+  --scrim: rgba(5, 7, 10, 0.62);
 
   /* ------------------------------------------------------------ motion -- */
   /**
@@ -307,5 +310,6 @@
     --shadow-sm: 0 1px 2px rgba(18, 21, 27, 0.08);
     --shadow-md: 0 4px 14px rgba(18, 21, 27, 0.1);
     --shadow-lg: 0 18px 48px rgba(18, 21, 27, 0.16);
+    --scrim: rgba(18, 21, 27, 0.38);
   }
 }
