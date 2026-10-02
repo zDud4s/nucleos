@@ -46,8 +46,9 @@ run() {
   # were printed: rustfmt's diff goes to one and cargo's `error:` to the other. The daemon already
   # reads the two as one stream. The cost: a step that leaves a background process holding its
   # output now holds the gate until that process lets go, since `tee` waits for every writer.
-  # A heavy cargo subcommand takes a build slot (see `slot_run`). It is decided HERE and not written
-  # on each gate line, because the classifier test reads those lines as plain commands.
+  # A heavy cargo subcommand takes a build slot (see `slot_run`; check|clippy pass through it
+  # without one). It is decided HERE and not written on each gate line, because the classifier
+  # test reads those lines as plain commands.
   if [ "$1" = cargo ]; then
     case "$2" in build|check|clippy|test|run|doc) set -- slot_run "$@" ;; esac
   fi
@@ -95,6 +96,8 @@ print_summary() {
 # guaranteed under Git bash, so the lock is portable: one file per holder, `held/<pid>`, and a slot
 # whose pid no longer answers `kill -0` is reaped by the next acquirer (a SIGKILLed holder cannot
 # clean up after itself). A short-lived `mkdir` mutex makes reap-count-claim one atomic step.
+#
+# `cargo check` and `cargo clippy` are free: `slot_run` runs them directly, without a slot.
 #
 # The logic lives HERE and not in a file this one sources, for the tamper-check reason below;
 # scripts/build-slot.sh is a thin wrapper that sources this file and calls `slot_run`.
@@ -159,6 +162,12 @@ slot_run() {
   local dir="${NUCLEOS_BUILD_SLOTS_DIR:-${HOME:-}/.nucleos/build-slots}"
   local n="${NUCLEOS_BUILD_SLOTS:-2}" timeout="${NUCLEOS_BUILD_SLOT_TIMEOUT:-1800}"
   local waited=0 child="" status
+  # `cargo check` and `cargo clippy` never take a slot. Measured 2026-10-02: a 15s clippy waited 49
+  # minutes behind two other sessions' long suites. With sccache they are cheap; the slot exists to
+  # protect the heavy build and test steps, not these.
+  if [ "$1" = cargo ]; then
+    case "$2" in check|clippy) "$@"; return $? ;; esac
+  fi
   case "$n" in
     ''|*[!0-9]*) echo "build-slot: NUCLEOS_BUILD_SLOTS must be a non-negative integer, got '$n'" >&2; return 2 ;;
   esac
