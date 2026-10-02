@@ -13,7 +13,7 @@
 # Every stack runs even when an earlier one fails — a summary of three real failures beats
 # stopping at the first and re-running twice to discover the other two.
 #
-# Usage: scripts/gates.sh [core|sidecars|shell|hooks|security|all]   (default: all)
+# Usage: scripts/gates.sh [core|sidecars|shell|tauri|hooks|security|all]   (default: all)
 set -uo pipefail
 
 failures=""
@@ -221,8 +221,8 @@ fi
 
 target="${1:-all}"
 case "$target" in
-  core|sidecars|shell|hooks|security|all) ;;
-  *) echo "usage: $0 [core|sidecars|shell|hooks|security|all]" >&2; exit 2 ;;
+  core|sidecars|shell|tauri|hooks|security|all) ;;
+  *) echo "usage: $0 [core|sidecars|shell|tauri|hooks|security|all]" >&2; exit 2 ;;
 esac
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -287,7 +287,9 @@ if [ "$target" = shell ] || [ "$target" = all ]; then
     # first ran. Builds its own bundle (~30s) rather than trusting one on disk.
     run "shell: csp"       . node scripts/csp-gate.mjs
   fi
+fi
 
+if [ "$target" = tauri ] || [ "$target" = all ]; then
   # shell/src-tauri is deliberately excluded from the cargo workspace (see the root Cargo.toml),
   # which means the root `cargo fmt --all`, `cargo clippy --all-targets` and `cargo test
   # -p nucleos-core` every one of them miss it. Until these three lines existed its Rust side was
