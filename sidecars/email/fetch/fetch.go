@@ -63,30 +63,57 @@ func handler(cfg config.Config) http.HandlerFunc {
 		}
 
 		attachment, content, err := read(cfg, uid, position)
-		if errors.Is(err, extract.ErrNoSuchAttachment) {
-			// The stored description and the live message disagree — the message was replaced or
-			// removed. A 404 rather than an empty file, which a caller would happily save.
-			http.Error(w, "no attachment at that position", http.StatusNotFound)
-			return
-		}
-		if err != nil {
-			log.Printf("attachment %d of uid %d: %v", position, uid, err)
-			http.Error(w, "could not read the attachment", http.StatusBadGateway)
-			return
-		}
+		serveAttachment(w, uid, position, attachment, content, err)
+	}
+}
 
-		// ALWAYS octet-stream, never the type the sender declared. The bytes and the label both come
-		// from a stranger, and a message that says `text/html` would otherwise be handed to a
-		// browser as a page to run rather than a file to save. The declared type is shown in the UI
-		// as information; it is not honoured here.
-		w.Header().Set("Content-Type", "application/octet-stream")
-		// Percent-encoded so a filename carrying CR or LF cannot inject a header of its own — the
-		// name arrives from the sender and is the least trustworthy string in the exchange.
-		w.Header().Set("X-Attachment-Filename", url.PathEscape(attachment.Filename))
-		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
-		if _, err := w.Write(content); err != nil {
-			log.Printf("writing attachment %d of uid %d: %v", position, uid, err)
-		}
+// tooLarge is the body of the 413 answer: the attachment is bigger than the cap, so the sidecar
+// refuses to hand over a cut-off file. The true size lets the caller say how big it really is.
+type tooLarge struct {
+	Error     string `json:"error"`
+	SizeBytes int64  `json:"size_bytes"`
+	MaxBytes  int64  `json:"max_bytes"`
+}
+
+// serveAttachment turns the outcome of one read into the HTTP answer.
+//
+// A truncated attachment is a 413, never the capped bytes with a 200: the consumers save the file
+// into a folder or hand it to a person, and a file silently cut at the cap is a corrupt file that
+// looks complete. A distinct status also tells the núcleo apart from a 502 (sidecar trouble).
+func serveAttachment(w http.ResponseWriter, uid imapv2.UID, position int, attachment attachment, content []byte, err error) {
+	if errors.Is(err, extract.ErrAttachmentTruncated) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_ = json.NewEncoder(w).Encode(tooLarge{
+			Error:     "attachment_too_large",
+			SizeBytes: attachment.SizeBytes,
+			MaxBytes:  extract.MaxAttachmentBytes,
+		})
+		return
+	}
+	if errors.Is(err, extract.ErrNoSuchAttachment) {
+		// The stored description and the live message disagree — the message was replaced or
+		// removed. A 404 rather than an empty file, which a caller would happily save.
+		http.Error(w, "no attachment at that position", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		log.Printf("attachment %d of uid %d: %v", position, uid, err)
+		http.Error(w, "could not read the attachment", http.StatusBadGateway)
+		return
+	}
+
+	// ALWAYS octet-stream, never the type the sender declared. The bytes and the label both come
+	// from a stranger, and a message that says `text/html` would otherwise be handed to a
+	// browser as a page to run rather than a file to save. The declared type is shown in the UI
+	// as information; it is not honoured here.
+	w.Header().Set("Content-Type", "application/octet-stream")
+	// Percent-encoded so a filename carrying CR or LF cannot inject a header of its own — the
+	// name arrives from the sender and is the least trustworthy string in the exchange.
+	w.Header().Set("X-Attachment-Filename", url.PathEscape(attachment.Filename))
+	w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+	if _, err := w.Write(content); err != nil {
+		log.Printf("writing attachment %d of uid %d: %v", position, uid, err)
 	}
 }
 
@@ -98,6 +125,25 @@ type bulkAttachment struct {
 	MimeType  string `json:"mime_type,omitempty"`
 	SizeBytes int64  `json:"size_bytes"`
 	Content   string `json:"content_base64"`
+	// Truncated is true when Content is only the first MaxAttachmentBytes of the file; SizeBytes
+	// still carries the true size. A caller must not save or forward a truncated entry as complete.
+	Truncated bool `json:"truncated"`
+}
+
+func bulkPayload(described []daemon.Attachment, contents map[int][]byte) []bulkAttachment {
+	payload := make([]bulkAttachment, 0, len(described))
+	for _, attachment := range described {
+		content := contents[attachment.Position]
+		payload = append(payload, bulkAttachment{
+			Position:  attachment.Position,
+			Filename:  attachment.Filename,
+			MimeType:  attachment.MimeType,
+			SizeBytes: attachment.SizeBytes,
+			Content:   base64.StdEncoding.EncodeToString(content),
+			Truncated: attachment.SizeBytes > int64(len(content)),
+		})
+	}
+	return payload
 }
 
 // allHandler answers with every attachment of one message, read in a single pass.
@@ -120,17 +166,7 @@ func allHandler(cfg config.Config) http.HandlerFunc {
 			return
 		}
 
-		payload := make([]bulkAttachment, 0, len(described))
-		for _, attachment := range described {
-			content := contents[attachment.Position]
-			payload = append(payload, bulkAttachment{
-				Position:  attachment.Position,
-				Filename:  attachment.Filename,
-				MimeType:  attachment.MimeType,
-				SizeBytes: attachment.SizeBytes,
-				Content:   base64.StdEncoding.EncodeToString(content),
-			})
-		}
+		payload := bulkPayload(described, contents)
 
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(payload); err != nil {
@@ -223,12 +259,14 @@ func read(cfg config.Config, uid imapv2.UID, position int) (attachment, []byte, 
 
 	described, content, err := extract.Attachment(raw.Body, position)
 	if err != nil {
-		return attachment{}, nil, err
+		// Truncation carries the description with the error, so the 413 can name the true size.
+		return attachment{Filename: described.Filename, SizeBytes: described.SizeBytes}, content, err
 	}
-	return attachment{Filename: described.Filename}, content, nil
+	return attachment{Filename: described.Filename, SizeBytes: described.SizeBytes}, content, nil
 }
 
 // attachment is the sliver of the description this package needs on the way out.
 type attachment struct {
-	Filename string
+	Filename  string
+	SizeBytes int64
 }
