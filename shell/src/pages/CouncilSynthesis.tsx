@@ -1,23 +1,7 @@
 import type { ReactNode } from "react";
-import { seatName, type CouncilView, type Synthesis } from "../data/council";
+import { agreementText, seatName, type CouncilView, type Synthesis } from "../data/council";
 import { Panel, Quiet } from "../ui";
 import { CouncilRich } from "./CouncilRich";
-
-/**
- * How far the ballots agreed, in the words a reader uses.
- *
- * The daemon's `tally::Agreement` level is a code ("strong", "none"); "none"
- * printed bare reads as "no data", which is the opposite of what it says — the
- * seats were compared and did not agree. A level this table does not know is
- * printed as the daemon sent it rather than hidden: an unknown word is still
- * the fact, and a missing badge would claim there was nothing to report.
- */
-const AGREEMENT_WORDS: Record<string, string> = {
-  strong: "strong consensus",
-  split: "split",
-  none: "no consensus",
-  insufficient: "too few votes",
-};
 
 /**
  * The chairman's synthesis — or the fact that the chairman never produced one.
@@ -38,9 +22,10 @@ const AGREEMENT_WORDS: Record<string, string> = {
  * what the chairman did with them, and only this one panel changes shape.
  * Every text is markdown, drawn through `CouncilRich`, never as HTML.
  *
- * The badges are hand-rolled spans rather than `Badge`: a tone is a state-map
+ * The verdict line is plain spans rather than `Badge`: a tone is a state-map
  * decision (`ui/badge-authorship.test.ts`), and neither the chairman's
- * confidence nor the ballots' agreement is a lifecycle state of anything.
+ * confidence nor the ballots' agreement is a lifecycle state of anything. The
+ * chairman's reason for its confidence is printed, not hidden in a `title`.
  */
 export function CouncilSynthesis({ view }: { view: CouncilView }) {
   const structured = view.synthesis_structured;
@@ -93,18 +78,19 @@ function StructuredSynthesis({ synthesis, view }: { synthesis: Synthesis; view: 
 
   return (
     <>
-      <div className="council-synthesis-badges">
-        <span className="council-synthesis-badge" title={synthesis.confidence.why}>
-          {`${synthesis.confidence.level} confidence`}
-        </span>
-        {agreement !== null && (
-          <span className="council-synthesis-badge">
-            {AGREEMENT_WORDS[agreement.level] ?? agreement.level}
-          </span>
-        )}
-      </div>
       <div className="council-synthesis">
         <CouncilRich text={synthesis.answer} />
+      </div>
+      {/* The verdict after the answer it qualifies: how sure the chairman is
+          and why, then how far the ballots agreed and how many there were. */}
+      <div className="council-synthesis-verdict">
+        <span className="council-synthesis-confidence">{`${synthesis.confidence.level} confidence`}</span>
+        <p className="council-synthesis-why">{synthesis.confidence.why}</p>
+        {agreement !== null && (
+          <span className="council-synthesis-agreement">
+            {`${agreementText(agreement)} · ${agreement.ballots} ${agreement.ballots === 1 ? "ballot" : "ballots"}`}
+          </span>
+        )}
       </div>
 
       {synthesis.consensus.length > 0 && (
@@ -159,7 +145,7 @@ function StructuredSynthesis({ synthesis, view }: { synthesis: Synthesis; view: 
 
 function SynthesisCard({ name, children }: { name: string; children: ReactNode }) {
   return (
-    <div className="council-synthesis-card" role="group" aria-label={name}>
+    <div className="council-synthesis-card ui-panel-inset" role="group" aria-label={name}>
       <h3 className="council-synthesis-card-name">{name}</h3>
       {children}
     </div>
